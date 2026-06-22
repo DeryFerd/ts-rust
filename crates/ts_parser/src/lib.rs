@@ -233,6 +233,13 @@ impl<'a> Parser<'a> {
         let start = self.current.full_start;
         let mut statements = Vec::new();
         while self.current.kind != terminator && self.current.kind != SyntaxKind::EndOfFile {
+            if terminator == SyntaxKind::EndOfFile
+                && self.current.kind == SyntaxKind::CloseBraceToken
+            {
+                self.error_code_at(self.current.range, 1128, std::iter::empty::<String>());
+                self.bump();
+                continue;
+            }
             let before = (self.current.kind, self.current.range);
             statements.push(self.parse_statement());
             if before == (self.current.kind, self.current.range) {
@@ -934,7 +941,11 @@ impl<'a> Parser<'a> {
 
     fn parse_interface_declaration(&mut self) -> NodeId {
         let start = self.consume().range.start;
-        let name = self.parse_identifier("Expected an interface name.");
+        if is_keyword_type(self.current.kind) {
+            let name = token_value(&self.current);
+            self.error_code_at(self.current.range, 2427, [name]);
+        }
+        let name = self.parse_identifier_name("Expected an interface name.");
         let type_parameters = self.parse_type_parameters();
         let heritage_clauses = self.parse_heritage_clauses();
         let members = self.parse_class_members(true);
@@ -1038,9 +1049,15 @@ impl<'a> Parser<'a> {
         }
         self.bump();
         let mut members = Vec::new();
+        let mut recovered_at_statement = false;
         while self.current.kind != SyntaxKind::CloseBraceToken
             && self.current.kind != SyntaxKind::EndOfFile
         {
+            if !signature_only && self.current.kind == SyntaxKind::VarKeyword {
+                self.error_code_at(self.current.range, 1068, std::iter::empty::<String>());
+                recovered_at_statement = true;
+                break;
+            }
             let before = (self.current.kind, self.current.range);
             if self.current.kind == SyntaxKind::SemicolonToken {
                 self.bump();
@@ -1056,7 +1073,9 @@ impl<'a> Parser<'a> {
                 self.bump();
             }
         }
-        let end = if self.current.kind == SyntaxKind::CloseBraceToken {
+        let end = if recovered_at_statement {
+            self.current.full_start
+        } else if self.current.kind == SyntaxKind::CloseBraceToken {
             self.consume().range.end
         } else {
             self.error_current("Expected '}'.");
@@ -1078,6 +1097,7 @@ impl<'a> Parser<'a> {
         while self.current.kind.is_modifier() {
             modifier_nodes.push(self.consume_token_node());
         }
+        self.recover_invalid_class_var_modifier(&mut modifier_nodes);
         let modifiers = (!modifier_nodes.is_empty()).then(|| ModifierList {
             list: NodeList {
                 range: TextRange::new(start, self.current.range.start),
@@ -1167,6 +1187,17 @@ impl<'a> Parser<'a> {
                 })),
                 &children,
             )
+        }
+    }
+
+    fn recover_invalid_class_var_modifier(&mut self, modifier_nodes: &mut Vec<NodeId>) {
+        if self.current.kind != SyntaxKind::VarKeyword || modifier_nodes.is_empty() {
+            return;
+        }
+        self.error_code_at(self.current.range, 1440, std::iter::empty::<String>());
+        self.bump();
+        while self.current.kind.is_modifier() {
+            modifier_nodes.push(self.consume_token_node());
         }
     }
 
@@ -3240,7 +3271,10 @@ impl<'a> Parser<'a> {
                                 token = self.scanner.scan();
                             }
                         }
-                        let result = token.kind == SyntaxKind::EqualsGreaterThanToken;
+                        let result = matches!(
+                            token.kind,
+                            SyntaxKind::EqualsGreaterThanToken | SyntaxKind::OpenBraceToken
+                        );
                         self.scanner.rewind(checkpoint);
                         return result;
                     }
@@ -5040,6 +5074,24 @@ impl<'a> Parser<'a> {
             .push(parser_diagnostic(self.current.range, message));
     }
 
+    fn error_code_at(
+        &mut self,
+        range: TextRange,
+        code: u32,
+        arguments: impl IntoIterator<Item = String>,
+    ) {
+        let message = message_by_code(code).expect("parser diagnostic code exists");
+        let arguments = arguments.into_iter().collect::<Vec<_>>();
+        self.diagnostics.push(Diagnostic::typescript(
+            range,
+            code,
+            parser_diagnostic_category(message.category()),
+            message
+                .format(&arguments)
+                .expect("parser diagnostic arguments match catalog message"),
+        ));
+    }
+
     fn bump(&mut self) {
         self.current = self.scanner.scan();
     }
@@ -6163,6 +6215,67 @@ mod tests {
                 SyntaxKind::PropertyAccessExpression | SyntaxKind::ElementAccessExpression
             ));
         }
+    }
+
+    #[test]
+    fn keeps_keyword_named_interfaces_as_single_erased_declarations() {
+        let result = parse_source_file("interface string {}");
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .filter_map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [2427]
+        );
+        let statements = source_statements(&result);
+        assert_eq!(statements.len(), 1);
+        let NodeData::InterfaceDeclaration(interface) =
+            &result.arena.get(statements[0]).unwrap().data
+        else {
+            panic!("expected interface declaration");
+        };
+        let NodeData::Identifier(name) = &result.arena.get(interface.name).unwrap().data else {
+            panic!("expected interface name");
+        };
+        assert_eq!(name.text, "string");
+    }
+
+    #[test]
+    fn recovers_variable_and_arrow_statements_after_a_malformed_class_member() {
+        let result = parse_source_file(
+            "class C { public const var export foo = 10; var constructor() { } }",
+        );
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .filter_map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [1440, 1068, 1005, 1005, 1128]
+        );
+        let statements = source_statements(&result);
+        assert_eq!(statements.len(), 3, "{:?}", result.diagnostics);
+        assert_eq!(
+            statements
+                .iter()
+                .map(|statement| result.arena.get(*statement).unwrap().kind)
+                .collect::<Vec<_>>(),
+            [
+                SyntaxKind::ClassDeclaration,
+                SyntaxKind::VariableStatement,
+                SyntaxKind::ExpressionStatement,
+            ]
+        );
+        let NodeData::ExpressionStatement(statement) =
+            &result.arena.get(statements[2]).unwrap().data
+        else {
+            panic!("expected expression statement");
+        };
+        assert_eq!(
+            result.arena.get(statement.expression).unwrap().kind,
+            SyntaxKind::ArrowFunction
+        );
     }
 
     #[test]
