@@ -14,6 +14,7 @@ fn parses_all_available_upstream_compiler_cases() {
         Path::new(&repository).join("_submodules/TypeScript/tests/cases/conformance"),
     ];
     let mut parsed = 0;
+    let mut parsed_units = 0;
     let mut invalid_utf8 = 0;
     for root in roots {
         visit(&root, &mut |path| {
@@ -23,9 +24,13 @@ fn parses_all_available_upstream_compiler_cases() {
             if std::str::from_utf8(&bytes).is_err() {
                 invalid_utf8 += 1;
             }
-            Case::parse(path, bytes).unwrap_or_else(|error| {
+            let case = Case::parse(path, bytes).unwrap_or_else(|error| {
                 panic!("failed to parse upstream case {}: {error}", path.display())
             });
+            for unit in &case.units {
+                let _ = ts_parser::parse_source_file(unit.source_text.as_scannable_str());
+                parsed_units += 1;
+            }
             parsed += 1;
         });
     }
@@ -36,6 +41,10 @@ fn parses_all_available_upstream_compiler_cases() {
     assert!(
         invalid_utf8 > 0,
         "expected invalid-UTF-8 scanner fixtures to remain visible"
+    );
+    assert!(
+        parsed_units >= parsed,
+        "expected at least one parsed source unit per fixture"
     );
 }
 

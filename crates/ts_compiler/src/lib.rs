@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use ts_ast::{NodeData, NodeId};
 use ts_binder::{BindResult, bind_source_file};
 use ts_checker::{CheckResult, check_source_file};
-use ts_config::{ConfigDiagnostic, parse_config_file};
+use ts_config::{ConfigDiagnostic, resolve_config_file};
 use ts_core::TextRange;
 use ts_diagnostics::message_by_code;
 use ts_glob::{DiscoveryOptions, discover_files};
@@ -13,7 +13,8 @@ use ts_module::{ResolutionOptions, Resolver};
 use ts_options::{CompilerOptions, parse_project_options};
 use ts_parser::{ParseResult, parse_source_file};
 use ts_path::{CaseSensitivity, canonicalize, is_absolute, resolve_path};
-use ts_printer::emit_source_file;
+use ts_printer::emit_source_file_with_settings;
+use ts_sourcemap::SourceMap;
 use ts_vfs::FileSystem;
 
 /// One parsed source file owned by a Program.
@@ -124,7 +125,7 @@ impl Program {
     /// Include/exclude glob expansion is added by the file-loader layer.
     #[must_use]
     pub fn from_config(file_system: &dyn FileSystem, config_path: &str) -> Self {
-        let parsed = parse_config_file(file_system, config_path);
+        let parsed = resolve_config_file(file_system, config_path);
         let mut config_diagnostics: Vec<_> =
             parsed.diagnostics.iter().map(config_diagnostic).collect();
         let Some(config) = parsed.value else {
@@ -214,11 +215,33 @@ impl Program {
             if ts_path::is_declaration_file(&source_file.file_name) {
                 continue;
             }
-            match emit_source_file(&source_file.parse.arena, source_file.parse.source_file) {
-                Ok(emitted) => output.files.push(OutputFile {
-                    file_name: javascript_output_path(&source_file.file_name),
-                    text: emitted.code,
-                }),
+            match emit_source_file_with_settings(
+                &source_file.parse.arena,
+                source_file.parse.source_file,
+                &source_file.file_name,
+                &source_file.source_text,
+                self.options.printer_settings(),
+            ) {
+                Ok(mut emitted) => {
+                    let file_name = javascript_output_path(&source_file.file_name);
+                    if let Some(mut source_map) = emitted.source_map {
+                        let map_file_name = format!("{file_name}.map");
+                        source_map.file = file_name.rsplit('/').next().map(str::to_owned);
+                        emitted.code.push_str("//# sourceMappingURL=");
+                        emitted
+                            .code
+                            .push_str(map_file_name.rsplit('/').next().unwrap_or(&map_file_name));
+                        emitted.code.push('\n');
+                        output.files.push(OutputFile {
+                            file_name: map_file_name,
+                            text: serialize_source_map(&source_map),
+                        });
+                    }
+                    output.files.push(OutputFile {
+                        file_name,
+                        text: emitted.code,
+                    });
+                }
                 Err(error) => output.diagnostics.push(ProgramDiagnostic {
                     file_name: Some(source_file.file_name.clone()),
                     range: source_file
@@ -306,6 +329,29 @@ fn javascript_output_path(file_name: &str) -> String {
     file_name.to_owned()
 }
 
+fn serialize_source_map(source_map: &SourceMap) -> String {
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct SerializedSourceMap<'a> {
+        version: u8,
+        file: &'a Option<String>,
+        source_root: &'static str,
+        sources: &'a [String],
+        names: &'a [String],
+        mappings: &'a str,
+    }
+
+    serde_json::to_string(&SerializedSourceMap {
+        version: source_map.version,
+        file: &source_map.file,
+        source_root: "",
+        sources: &source_map.sources,
+        names: &source_map.names,
+        mappings: &source_map.mappings,
+    })
+    .expect("source map fields are JSON-serializable")
+}
+
 fn module_specifiers(parse: &ParseResult) -> Vec<(String, TextRange)> {
     parse
         .arena
@@ -379,7 +425,11 @@ mod tests {
         fs.write_file("/project/main.ts", "const answer: number = 40 + 2;")
             .unwrap();
         let program = Program::new(&fs, "/project", &["main.ts".to_owned()]);
-        assert!(program.diagnostics().is_empty());
+        assert!(
+            program.diagnostics().is_empty(),
+            "{:?}",
+            program.diagnostics()
+        );
         assert_eq!(program.source_files().len(), 1);
         assert!(program.source_file("/project/main.ts").is_some());
     }
@@ -434,6 +484,50 @@ mod tests {
         let program = Program::from_config(&fs, "/project/tsconfig.json");
         assert_eq!(program.source_files().len(), 2);
         assert!(program.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn resolves_inherited_options_and_base_relative_globs() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/repo/base/tsconfig.json",
+            r#"{
+                "include": ["src/**/*.ts"],
+                "exclude": ["src/generated"],
+                "compilerOptions": { "target": "es2015" }
+            }"#,
+        )
+        .unwrap();
+        fs.write_file(
+            "/repo/app/tsconfig.json",
+            r#"{"extends":"../base/tsconfig.json"}"#,
+        )
+        .unwrap();
+        fs.write_file("/repo/base/src/a.ts", "const a = 1;")
+            .unwrap();
+        fs.write_file("/repo/base/src/nested/b.ts", "const b = 2;")
+            .unwrap();
+        fs.write_file("/repo/base/src/generated/skip.ts", "const skip = 3;")
+            .unwrap();
+        fs.write_file("/repo/app/unrelated.ts", "const unrelated = 4;")
+            .unwrap();
+
+        let program = Program::from_config(&fs, "/repo/app/tsconfig.json");
+        assert!(
+            program.diagnostics().is_empty(),
+            "{:?}",
+            program.diagnostics()
+        );
+        assert_eq!(program.options().target, ts_options::ScriptTarget::Es2015);
+        assert_eq!(program.source_files().len(), 2);
+        assert!(program.source_file("/repo/base/src/a.ts").is_some());
+        assert!(program.source_file("/repo/base/src/nested/b.ts").is_some());
+        assert!(
+            program
+                .source_file("/repo/base/src/generated/skip.ts")
+                .is_none()
+        );
+        assert!(program.source_file("/repo/app/unrelated.ts").is_none());
     }
 
     #[test]
@@ -502,7 +596,7 @@ mod tests {
         let emitted = program.emit();
         assert!(emitted.diagnostics.is_empty());
         assert_eq!(emitted.files[0].file_name, "/project/main.js");
-        assert_eq!(emitted.files[0].text, "const point = { x: 1 };\n");
+        assert_eq!(emitted.files[0].text, "var point = { x: 1 };\n");
     }
 
     #[test]
@@ -533,5 +627,45 @@ mod tests {
         assert!(program.diagnostics().is_empty());
         assert!(program.options().no_emit);
         assert!(program.emit().files.is_empty());
+    }
+
+    #[test]
+    fn config_options_control_target_module_and_source_maps() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/tsconfig.json",
+            "{ \"files\": [\"main.ts\"], \"compilerOptions\": { \"target\": \"es2015\", \"module\": \"commonjs\", \"sourceMap\": true } }",
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/main.ts",
+            "const value = (input: number) => input; export { value };",
+        )
+        .unwrap();
+        let program = Program::from_config(&fs, "/project/tsconfig.json");
+        assert!(
+            program.diagnostics().is_empty(),
+            "{:?}",
+            program.diagnostics()
+        );
+        let emitted = program.emit();
+        assert!(emitted.diagnostics.is_empty());
+        assert_eq!(emitted.files.len(), 2);
+        let map = emitted
+            .files
+            .iter()
+            .find(|file| file.file_name.rsplit('/').next() == Some("main.js.map"))
+            .unwrap();
+        assert!(
+            map.text
+                .starts_with("{\"version\":3,\"file\":\"main.js\",\"sourceRoot\":\"\"")
+        );
+        let javascript = emitted
+            .files
+            .iter()
+            .find(|file| file.file_name.rsplit('/').next() == Some("main.js"))
+            .unwrap();
+        assert!(javascript.text.contains("exports.value"));
+        assert!(javascript.text.contains("sourceMappingURL=main.js.map"));
     }
 }

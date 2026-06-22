@@ -8,6 +8,7 @@ license.workspace = true
 ts_config = { path = "../ts_config" }
 ts_diagnostics = { path = "../ts_diagnostics" }
 ts_module = { path = "../ts_module" }
+ts_path = { path = "../ts_path" }
 
 [lints]
 workspace = true

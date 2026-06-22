@@ -11,5 +11,8 @@ path = "src/lib.rs"
 [dependencies]
 ts_core = { path = "../../crates/ts_core" }
 
+[dev-dependencies]
+ts_parser = { path = "../../crates/ts_parser" }
+
 [lints]
 workspace = true

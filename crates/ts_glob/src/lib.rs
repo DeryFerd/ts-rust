@@ -18,21 +18,19 @@ pub struct GlobPattern {
     components: Vec<Component>,
     case_sensitive: bool,
     exclude: bool,
+    absolute: bool,
 }
 
 impl GlobPattern {
     #[must_use]
     pub fn compile(
         spec: &str,
-        base_path: &str,
+        _base_path: &str,
         case_sensitive: bool,
         exclude: bool,
     ) -> Option<Self> {
         let mut spec = normalize_path(spec);
-        let base = normalize_path(base_path);
-        if is_absolute(&spec) {
-            spec = relative_to(&spec, &base)?.to_owned();
-        }
+        let absolute = is_absolute(&spec);
         spec = spec.trim_start_matches("./").to_owned();
         let mut parts: Vec<String> = spec
             .split('/')
@@ -64,6 +62,7 @@ impl GlobPattern {
             components,
             case_sensitive,
             exclude,
+            absolute,
         })
     }
 
@@ -76,6 +75,10 @@ impl GlobPattern {
             .collect();
         let mut memo = HashMap::new();
         self.matches_from(&parts, 0, 0, &mut memo)
+    }
+
+    fn matches_candidate(&self, absolute: &str, relative: &str) -> bool {
+        self.matches(if self.absolute { absolute } else { relative })
     }
 
     fn matches_from(
@@ -157,11 +160,18 @@ pub fn discover_files<F: FileSystem + ?Sized>(
 ) -> io::Result<Vec<String>> {
     let base = normalize_path(&options.base_path);
     let case_sensitive = file_system.use_case_sensitive_file_names();
-    let includes: Vec<_> = options
-        .include
-        .iter()
-        .filter_map(|spec| GlobPattern::compile(spec, &base, case_sensitive, false))
-        .collect();
+    let mut includes = Vec::new();
+    let mut traversal_roots = Vec::new();
+    let mut seen_roots = HashSet::new();
+    for spec in &options.include {
+        if let Some(pattern) = GlobPattern::compile(spec, &base, case_sensitive, false) {
+            let root = include_traversal_root(file_system, spec, &base);
+            if seen_roots.insert(canonical(&root, case_sensitive)) {
+                traversal_roots.push(root);
+            }
+            includes.push(pattern);
+        }
+    }
     let excludes: Vec<_> = options
         .exclude
         .iter()
@@ -178,15 +188,19 @@ pub fn discover_files<F: FileSystem + ?Sized>(
     }
 
     let mut buckets = vec![Vec::new(); includes.len().max(1)];
-    visit(
-        file_system,
-        &base,
-        &base,
-        &includes,
-        &excludes,
-        &options.extensions,
-        &mut buckets,
-    )?;
+    for root in traversal_roots {
+        if file_system.directory_exists(&root) {
+            visit(
+                file_system,
+                &base,
+                &root,
+                &includes,
+                &excludes,
+                &options.extensions,
+                &mut buckets,
+            )?;
+        }
+    }
     for bucket in buckets {
         for file in bucket {
             if seen.insert(canonical(&file, case_sensitive)) {
@@ -215,12 +229,15 @@ fn visit<F: FileSystem + ?Sized>(
         }
         let absolute = join(directory, &file);
         let relative = relative_to(&absolute, base).unwrap_or(&absolute);
-        if excludes.iter().any(|pattern| pattern.matches(relative)) {
+        if excludes
+            .iter()
+            .any(|pattern| pattern.matches_candidate(&absolute, relative))
+        {
             continue;
         }
         let include_index = includes
             .iter()
-            .position(|pattern| pattern.matches(relative));
+            .position(|pattern| pattern.matches_candidate(&absolute, relative));
         if let Some(index) = include_index {
             buckets[index].push(absolute);
         }
@@ -228,7 +245,10 @@ fn visit<F: FileSystem + ?Sized>(
     for child in entries.directories {
         let absolute = join(directory, &child);
         let relative = relative_to(&absolute, base).unwrap_or(&absolute);
-        if excludes.iter().any(|pattern| pattern.matches(relative)) {
+        if excludes
+            .iter()
+            .any(|pattern| pattern.matches_candidate(&absolute, relative))
+        {
             continue;
         }
         visit(
@@ -242,6 +262,48 @@ fn visit<F: FileSystem + ?Sized>(
         )?;
     }
     Ok(())
+}
+
+fn include_traversal_root<F: FileSystem + ?Sized>(
+    file_system: &F,
+    spec: &str,
+    base: &str,
+) -> String {
+    let normalized = normalize_path(spec);
+    if !is_absolute(&normalized) {
+        return base.to_owned();
+    }
+    if let Some(wildcard) = normalized.find(['*', '?']) {
+        let prefix = &normalized[..wildcard];
+        if prefix.ends_with('/') {
+            let root = prefix.trim_end_matches('/');
+            return if root.is_empty() { "/" } else { root }.to_owned();
+        }
+        return prefix.rsplit_once('/').map_or_else(
+            || "/".to_owned(),
+            |(directory, _)| {
+                if directory.is_empty() {
+                    "/".to_owned()
+                } else {
+                    directory.to_owned()
+                }
+            },
+        );
+    }
+    if file_system.directory_exists(&normalized) {
+        normalized
+    } else {
+        normalized.rsplit_once('/').map_or_else(
+            || base.to_owned(),
+            |(directory, _)| {
+                if directory.is_empty() {
+                    "/".to_owned()
+                } else {
+                    directory.to_owned()
+                }
+            },
+        )
+    }
 }
 
 fn wildcard_component_matches(pattern: &str, value: &str, case_sensitive: bool) -> bool {
@@ -410,5 +472,33 @@ mod tests {
         let mut options = DiscoveryOptions::new("/dev");
         options.include = vec!["**".into()];
         assert!(discover_files(&fs, &options).unwrap().is_empty());
+    }
+
+    #[test]
+    fn discovers_absolute_patterns_across_config_directories() {
+        let fs = file_system(
+            true,
+            &[
+                "/repo/base/src/a.ts",
+                "/repo/base/src/nested/b.ts",
+                "/repo/base/src/generated/skip.ts",
+                "/repo/app/local/c.ts",
+                "/repo/app/local/skip/d.ts",
+            ],
+        );
+        let mut options = DiscoveryOptions::new("/repo/app");
+        options.include = vec![
+            "/repo/base/src/**/*.ts".into(),
+            "/repo/app/local/**/*.ts".into(),
+        ];
+        options.exclude = vec!["/repo/base/src/generated".into(), "local/skip".into()];
+        assert_eq!(
+            discover_files(&fs, &options).unwrap(),
+            vec![
+                "/repo/base/src/a.ts",
+                "/repo/base/src/nested/b.ts",
+                "/repo/app/local/c.ts"
+            ]
+        );
     }
 }

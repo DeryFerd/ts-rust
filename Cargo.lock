@@ -108,6 +108,14 @@ dependencies = [
  "ts_ast",
  "ts_core",
  "ts_diagnostics",
+ "ts_parser",
+]
+
+[[package]]
+name = "ts_bundled"
+version = "7.0.0-dev"
+dependencies = [
+ "ts_options",
 ]
 
 [[package]]
@@ -118,6 +126,7 @@ dependencies = [
  "ts_binder",
  "ts_core",
  "ts_diagnostics",
+ "ts_parser",
 ]
 
 [[package]]
@@ -140,6 +149,8 @@ version = "7.0.0-dev"
 name = "ts_compiler"
 version = "7.0.0-dev"
 dependencies = [
+ "serde",
+ "serde_json",
  "ts_ast",
  "ts_binder",
  "ts_checker",
@@ -152,6 +163,7 @@ dependencies = [
  "ts_parser",
  "ts_path",
  "ts_printer",
+ "ts_sourcemap",
  "ts_vfs",
 ]
 
@@ -184,6 +196,7 @@ name = "ts_fixture"
 version = "7.0.0-dev"
 dependencies = [
  "ts_core",
+ "ts_parser",
 ]
 
 [[package]]
@@ -210,6 +223,7 @@ dependencies = [
  "ts_config",
  "ts_diagnostics",
  "ts_module",
+ "ts_path",
 ]
 
 [[package]]
@@ -230,7 +244,9 @@ name = "ts_printer"
 version = "7.0.0-dev"
 dependencies = [
  "ts_ast",
+ "ts_options",
  "ts_parser",
+ "ts_sourcemap",
 ]
 
 [[package]]
@@ -240,6 +256,10 @@ dependencies = [
  "ts_ast",
  "ts_core",
 ]
+
+[[package]]
+name = "ts_sourcemap"
+version = "7.0.0-dev"
 
 [[package]]
 name = "ts_vfs"

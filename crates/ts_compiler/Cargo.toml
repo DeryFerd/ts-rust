@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 ts_binder = { path = "../ts_binder" }
 ts_checker = { path = "../ts_checker" }
 ts_ast = { path = "../ts_ast" }
@@ -17,6 +19,7 @@ ts_options = { path = "../ts_options" }
 ts_parser = { path = "../ts_parser" }
 ts_path = { path = "../ts_path" }
 ts_printer = { path = "../ts_printer" }
+ts_sourcemap = { path = "../ts_sourcemap" }
 ts_vfs = { path = "../ts_vfs" }
 
 [lints]

@@ -5,7 +5,7 @@ use std::{
     ops::{BitOr, BitOrAssign},
 };
 
-use ts_ast::{NodeArena, NodeData, NodeFlags, NodeId, SymbolId};
+use ts_ast::{NodeArena, NodeData, NodeFlags, NodeId, SymbolId, SyntaxKind};
 use ts_diagnostics::{Diagnostic, message_by_code};
 
 /// TypeScript symbol meanings. Bit positions match the upstream compiler.
@@ -23,12 +23,20 @@ impl SymbolFlags {
     pub const INTERFACE: Self = Self(1 << 6);
     pub const CONST_ENUM: Self = Self(1 << 7);
     pub const REGULAR_ENUM: Self = Self(1 << 8);
+    pub const VALUE_MODULE: Self = Self(1 << 9);
+    pub const NAMESPACE_MODULE: Self = Self(1 << 10);
+    pub const METHOD: Self = Self(1 << 13);
+    pub const CONSTRUCTOR: Self = Self(1 << 14);
+    pub const GET_ACCESSOR: Self = Self(1 << 15);
+    pub const SET_ACCESSOR: Self = Self(1 << 16);
     pub const TYPE_PARAMETER: Self = Self(1 << 18);
     pub const TYPE_ALIAS: Self = Self(1 << 19);
+    pub const ALIAS: Self = Self(1 << 21);
 
     pub const VARIABLE: Self =
         Self(Self::FUNCTION_SCOPED_VARIABLE.0 | Self::BLOCK_SCOPED_VARIABLE.0);
     pub const ENUM: Self = Self(Self::CONST_ENUM.0 | Self::REGULAR_ENUM.0);
+    pub const MODULE: Self = Self(Self::VALUE_MODULE.0 | Self::NAMESPACE_MODULE.0);
 
     #[must_use]
     pub const fn bits(self) -> u32 {
@@ -70,6 +78,7 @@ pub struct Symbol {
     pub value_declaration: Option<NodeId>,
     pub parent: Option<SymbolId>,
     pub members: SymbolTable,
+    pub target: Option<SymbolId>,
 }
 
 /// Stable storage for symbols allocated in binding order.
@@ -121,6 +130,7 @@ impl SymbolArena {
             value_declaration: is_value(flags).then_some(declaration),
             parent,
             members: SymbolTable::default(),
+            target: None,
         });
         id
     }
@@ -174,6 +184,8 @@ pub enum ScopeKind {
     Class,
     Interface,
     Enum,
+    Module,
+    TypeAlias,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -200,6 +212,7 @@ pub struct BindResult {
     pub node_symbols: BTreeMap<NodeId, SymbolId>,
     pub node_scopes: BTreeMap<NodeId, ScopeId>,
     pub containers: BTreeMap<NodeId, NodeId>,
+    pub exports: SymbolTable,
     pub diagnostics: Vec<BindDiagnostic>,
 }
 
@@ -284,20 +297,34 @@ impl<'a> Binder<'a> {
                 }
             }
             NodeData::ModuleBlock(data) => {
-                let block_scope = self.create_scope(ScopeKind::Block, node_id, Some(scope));
-                self.result.node_scopes.insert(node_id, block_scope);
+                self.result.node_scopes.insert(node_id, scope);
                 for statement in &data.statements.nodes {
-                    self.bind_node(*statement, block_scope, node_id, parent_symbol);
+                    self.bind_node(*statement, scope, node_id, parent_symbol);
                 }
             }
             NodeData::FunctionDeclaration(data) => {
                 let symbol = data.name.and_then(|name| {
-                    self.declare_named(scope, node_id, name, SymbolFlags::FUNCTION, parent_symbol)
+                    self.declare_and_export(
+                        scope,
+                        node_id,
+                        name,
+                        SymbolFlags::FUNCTION,
+                        parent_symbol,
+                    )
                 });
                 let function_scope = self.create_scope(ScopeKind::Function, node_id, Some(scope));
                 self.result.node_scopes.insert(node_id, function_scope);
+                self.bind_type_parameters(
+                    data.type_parameters.as_ref(),
+                    function_scope,
+                    node_id,
+                    symbol,
+                );
                 for parameter in &data.parameters.nodes {
                     self.bind_parameter(*parameter, function_scope, node_id, symbol);
+                }
+                if let Some(return_type) = data.type_ {
+                    self.bind_node(return_type, function_scope, node_id, symbol);
                 }
                 if let Some(body) = data.body {
                     self.bind_node(body, function_scope, node_id, symbol);
@@ -305,14 +332,27 @@ impl<'a> Binder<'a> {
             }
             NodeData::ClassDeclaration(data) => {
                 let symbol = data.name.and_then(|name| {
-                    self.declare_named(scope, node_id, name, SymbolFlags::CLASS, parent_symbol)
+                    self.declare_and_export(scope, node_id, name, SymbolFlags::CLASS, parent_symbol)
                 });
                 let class_scope = self.create_scope(ScopeKind::Class, node_id, Some(scope));
                 self.result.node_scopes.insert(node_id, class_scope);
-                self.bind_children(node_id, class_scope, node_id, symbol);
+                self.bind_type_parameters(
+                    data.type_parameters.as_ref(),
+                    class_scope,
+                    node_id,
+                    symbol,
+                );
+                for member in &data.members.nodes {
+                    self.bind_node(*member, class_scope, node_id, symbol);
+                }
+                if let Some(heritage) = &data.heritage_clauses {
+                    for clause in &heritage.nodes {
+                        self.bind_node(*clause, class_scope, node_id, symbol);
+                    }
+                }
             }
             NodeData::InterfaceDeclaration(data) => {
-                let symbol = self.declare_named(
+                let symbol = self.declare_and_export(
                     scope,
                     node_id,
                     data.name,
@@ -321,19 +361,45 @@ impl<'a> Binder<'a> {
                 );
                 let interface_scope = self.create_scope(ScopeKind::Interface, node_id, Some(scope));
                 self.result.node_scopes.insert(node_id, interface_scope);
-                self.bind_children(node_id, interface_scope, node_id, symbol);
+                self.bind_type_parameters(
+                    data.type_parameters.as_ref(),
+                    interface_scope,
+                    node_id,
+                    symbol,
+                );
+                for member in &data.members.nodes {
+                    self.bind_node(*member, interface_scope, node_id, symbol);
+                }
+                if let Some(heritage) = &data.heritage_clauses {
+                    for clause in &heritage.nodes {
+                        self.bind_node(*clause, interface_scope, node_id, symbol);
+                    }
+                }
             }
             NodeData::TypeAliasDeclaration(data) => {
-                self.declare_named(
+                let symbol = self.declare_and_export(
                     scope,
                     node_id,
                     data.name,
                     SymbolFlags::TYPE_ALIAS,
                     parent_symbol,
                 );
+                if data.type_parameters.is_some() {
+                    let alias_scope = self.create_scope(ScopeKind::TypeAlias, node_id, Some(scope));
+                    self.result.node_scopes.insert(node_id, alias_scope);
+                    self.bind_type_parameters(
+                        data.type_parameters.as_ref(),
+                        alias_scope,
+                        node_id,
+                        symbol,
+                    );
+                    self.bind_node(data.type_, alias_scope, node_id, symbol);
+                } else {
+                    self.bind_node(data.type_, scope, container, symbol);
+                }
             }
             NodeData::EnumDeclaration(data) => {
-                let symbol = self.declare_named(
+                let symbol = self.declare_and_export(
                     scope,
                     node_id,
                     data.name,
@@ -344,6 +410,20 @@ impl<'a> Binder<'a> {
                 self.result.node_scopes.insert(node_id, enum_scope);
                 for member in &data.members.nodes {
                     self.bind_node(*member, enum_scope, node_id, symbol);
+                }
+            }
+            NodeData::ModuleDeclaration(data) => {
+                let symbol = self.declare_and_export(
+                    scope,
+                    node_id,
+                    data.name,
+                    SymbolFlags::NAMESPACE_MODULE,
+                    parent_symbol,
+                );
+                let module_scope = self.create_scope(ScopeKind::Module, node_id, Some(scope));
+                self.result.node_scopes.insert(node_id, module_scope);
+                if let Some(body) = data.body {
+                    self.bind_node(body, module_scope, node_id, symbol);
                 }
             }
             NodeData::EnumMember(data) => {
@@ -369,6 +449,173 @@ impl<'a> Binder<'a> {
                     SymbolFlags::BLOCK_SCOPED_VARIABLE,
                     parent_symbol,
                 );
+            }
+            NodeData::PropertyDeclaration(data) => {
+                self.declare_named(
+                    scope,
+                    node_id,
+                    data.name,
+                    SymbolFlags::PROPERTY,
+                    parent_symbol,
+                );
+                if let Some(initializer) = data.initializer {
+                    self.bind_node(initializer, scope, container, parent_symbol);
+                }
+                if let Some(type_) = data.type_ {
+                    self.bind_node(type_, scope, container, parent_symbol);
+                }
+            }
+            NodeData::PropertySignatureDeclaration(data) => {
+                self.declare_named(
+                    scope,
+                    node_id,
+                    data.name,
+                    SymbolFlags::PROPERTY,
+                    parent_symbol,
+                );
+                self.bind_node(data.type_, scope, container, parent_symbol);
+            }
+            NodeData::MethodDeclaration(data) => {
+                let symbol = self.declare_named(
+                    scope,
+                    node_id,
+                    data.name,
+                    SymbolFlags::METHOD,
+                    parent_symbol,
+                );
+                self.bind_function_like(
+                    node_id,
+                    scope,
+                    symbol,
+                    data.type_parameters.as_ref(),
+                    &data.parameters.nodes,
+                    data.body,
+                );
+                if let Some(type_) = data.type_ {
+                    self.bind_node(type_, scope, node_id, symbol);
+                }
+            }
+            NodeData::MethodSignatureDeclaration(data) => {
+                let symbol = self.declare_named(
+                    scope,
+                    node_id,
+                    data.name,
+                    SymbolFlags::METHOD,
+                    parent_symbol,
+                );
+                self.bind_function_like(
+                    node_id,
+                    scope,
+                    symbol,
+                    data.type_parameters.as_ref(),
+                    &data.parameters.nodes,
+                    None,
+                );
+                if let Some(type_) = data.type_ {
+                    self.bind_node(type_, scope, node_id, symbol);
+                }
+            }
+            NodeData::GetAccessorDeclaration(data) => {
+                let symbol = self.declare_named(
+                    scope,
+                    node_id,
+                    data.name,
+                    SymbolFlags::GET_ACCESSOR,
+                    parent_symbol,
+                );
+                self.bind_function_like(
+                    node_id,
+                    scope,
+                    symbol,
+                    data.type_parameters.as_ref(),
+                    &data.parameters.nodes,
+                    data.body,
+                );
+            }
+            NodeData::SetAccessorDeclaration(data) => {
+                let symbol = self.declare_named(
+                    scope,
+                    node_id,
+                    data.name,
+                    SymbolFlags::SET_ACCESSOR,
+                    parent_symbol,
+                );
+                self.bind_function_like(
+                    node_id,
+                    scope,
+                    symbol,
+                    data.type_parameters.as_ref(),
+                    &data.parameters.nodes,
+                    data.body,
+                );
+            }
+            NodeData::ConstructorDeclaration(data) => {
+                let symbol = self.declare_synthetic(
+                    scope,
+                    node_id,
+                    "__constructor",
+                    SymbolFlags::CONSTRUCTOR,
+                    parent_symbol,
+                );
+                self.bind_function_like(
+                    node_id,
+                    scope,
+                    Some(symbol),
+                    data.type_parameters.as_ref(),
+                    &data.parameters.nodes,
+                    data.body,
+                );
+            }
+            NodeData::ArrowFunction(data) => {
+                self.bind_function_like(
+                    node_id,
+                    scope,
+                    parent_symbol,
+                    data.type_parameters.as_ref(),
+                    &data.parameters.nodes,
+                    Some(data.body),
+                );
+            }
+            NodeData::TypeParameterDeclaration(data) => {
+                self.declare_named(
+                    scope,
+                    node_id,
+                    data.name,
+                    SymbolFlags::TYPE_PARAMETER,
+                    parent_symbol,
+                );
+                if let Some(constraint) = data.constraint {
+                    self.bind_node(constraint, scope, container, parent_symbol);
+                }
+                if let Some(default_type) = data.default_type {
+                    self.bind_node(default_type, scope, container, parent_symbol);
+                }
+            }
+            NodeData::ImportDeclaration(data) => {
+                if let Some(clause) = data.import_clause {
+                    self.bind_import_clause(clause, scope, container, parent_symbol);
+                }
+                self.bind_node(data.module_specifier, scope, container, parent_symbol);
+            }
+            NodeData::ImportEqualsDeclaration(data) => {
+                self.declare_named(scope, node_id, data.name, SymbolFlags::ALIAS, parent_symbol);
+            }
+            NodeData::ExportDeclaration(data) => {
+                if let Some(clause) = data.export_clause {
+                    self.bind_export_clause(clause, scope, container, parent_symbol);
+                }
+                if let Some(module_specifier) = data.module_specifier {
+                    self.bind_node(module_specifier, scope, container, parent_symbol);
+                }
+            }
+            NodeData::ExportAssignment(data) => {
+                let name = if data.is_export_equals {
+                    "export="
+                } else {
+                    "default"
+                };
+                self.declare_export_alias(node_id, name, None, parent_symbol);
+                self.bind_node(data.expression, scope, container, parent_symbol);
             }
             _ => self.bind_children(node_id, scope, container, parent_symbol),
         }
@@ -404,13 +651,16 @@ impl<'a> Binder<'a> {
             if let Some(NodeData::VariableDeclaration(declaration_data)) =
                 self.arena.get(*declaration).map(|node| &node.data)
             {
-                self.declare_binding_name(
-                    target_scope,
-                    *declaration,
-                    declaration_data.name,
-                    flags,
-                    parent_symbol,
-                );
+                let name = declaration_data.name;
+                let type_ = declaration_data.type_;
+                let initializer = declaration_data.initializer;
+                self.declare_binding_name(target_scope, *declaration, name, flags, parent_symbol);
+                if let Some(type_) = type_ {
+                    self.bind_node(type_, scope, container, parent_symbol);
+                }
+                if let Some(initializer) = initializer {
+                    self.bind_node(initializer, scope, container, parent_symbol);
+                }
             }
         }
     }
@@ -426,13 +676,146 @@ impl<'a> Binder<'a> {
         if let Some(NodeData::ParameterDeclaration(data)) =
             self.arena.get(parameter).map(|node| &node.data)
         {
+            let name = data.name;
+            let type_ = data.type_;
+            let initializer = data.initializer;
             self.declare_binding_name(
                 scope,
                 parameter,
-                data.name,
+                name,
                 SymbolFlags::FUNCTION_SCOPED_VARIABLE,
                 parent_symbol,
             );
+            if let Some(type_) = type_ {
+                self.bind_node(type_, scope, container, parent_symbol);
+            }
+            if let Some(initializer) = initializer {
+                self.bind_node(initializer, scope, container, parent_symbol);
+            }
+        }
+    }
+
+    fn bind_type_parameters(
+        &mut self,
+        type_parameters: Option<&ts_ast::NodeList>,
+        scope: ScopeId,
+        container: NodeId,
+        parent_symbol: Option<SymbolId>,
+    ) {
+        if let Some(type_parameters) = type_parameters {
+            for type_parameter in &type_parameters.nodes {
+                self.bind_node(*type_parameter, scope, container, parent_symbol);
+            }
+        }
+    }
+
+    fn bind_function_like(
+        &mut self,
+        node_id: NodeId,
+        parent_scope: ScopeId,
+        parent_symbol: Option<SymbolId>,
+        type_parameters: Option<&ts_ast::NodeList>,
+        parameters: &[NodeId],
+        body: Option<NodeId>,
+    ) {
+        let function_scope = self.create_scope(ScopeKind::Function, node_id, Some(parent_scope));
+        self.result.node_scopes.insert(node_id, function_scope);
+        self.bind_type_parameters(type_parameters, function_scope, node_id, parent_symbol);
+        for parameter in parameters {
+            self.bind_parameter(*parameter, function_scope, node_id, parent_symbol);
+        }
+        if let Some(body) = body {
+            self.bind_node(body, function_scope, node_id, parent_symbol);
+        }
+    }
+
+    fn bind_import_clause(
+        &mut self,
+        clause: NodeId,
+        scope: ScopeId,
+        container: NodeId,
+        parent_symbol: Option<SymbolId>,
+    ) {
+        self.result.containers.insert(clause, container);
+        let Some(NodeData::ImportClause(data)) = self.arena.get(clause).map(|node| &node.data)
+        else {
+            return;
+        };
+        if let Some(name) = data.name {
+            self.declare_named(scope, clause, name, SymbolFlags::ALIAS, parent_symbol);
+        }
+        let Some(bindings) = data.named_bindings else {
+            return;
+        };
+        self.result.containers.insert(bindings, container);
+        match self.arena.get(bindings).map(|node| &node.data) {
+            Some(NodeData::NamedImports(imports)) => {
+                let elements = imports.elements.nodes.clone();
+                for specifier in elements {
+                    self.result.containers.insert(specifier, container);
+                    if let Some(NodeData::ImportSpecifier(specifier_data)) =
+                        self.arena.get(specifier).map(|node| &node.data)
+                    {
+                        if let Some(property_name) = specifier_data.property_name {
+                            self.result.containers.insert(property_name, container);
+                        }
+                        self.declare_named(
+                            scope,
+                            specifier,
+                            specifier_data.name,
+                            SymbolFlags::ALIAS,
+                            parent_symbol,
+                        );
+                    }
+                }
+            }
+            Some(NodeData::NamespaceImport(import)) => {
+                self.declare_named(
+                    scope,
+                    bindings,
+                    import.name,
+                    SymbolFlags::ALIAS,
+                    parent_symbol,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    fn bind_export_clause(
+        &mut self,
+        clause: NodeId,
+        scope: ScopeId,
+        container: NodeId,
+        parent_symbol: Option<SymbolId>,
+    ) {
+        self.result.containers.insert(clause, container);
+        let Some(NodeData::NamedExports(exports)) = self.arena.get(clause).map(|node| &node.data)
+        else {
+            return;
+        };
+        let elements = exports.elements.nodes.clone();
+        for specifier in elements {
+            self.result.containers.insert(specifier, container);
+            let Some(NodeData::ExportSpecifier(data)) =
+                self.arena.get(specifier).map(|node| &node.data)
+            else {
+                continue;
+            };
+            let Some(name) = self.identifier_text(data.name).map(str::to_owned) else {
+                continue;
+            };
+            let local_name_node = data.property_name.unwrap_or(data.name);
+            let target = self
+                .identifier_text(local_name_node)
+                .and_then(|name| self.lookup_symbol(scope, name));
+            self.result.containers.insert(local_name_node, container);
+            if let Some(target) = target {
+                self.result.node_symbols.insert(local_name_node, target);
+            }
+            let alias = self.declare_export_alias(specifier, &name, target, parent_symbol);
+            self.result.node_symbols.insert(data.name, alias);
+            self.result.node_symbols.insert(specifier, alias);
         }
     }
 
@@ -479,7 +862,67 @@ impl<'a> Binder<'a> {
         flags: SymbolFlags,
         parent_symbol: Option<SymbolId>,
     ) -> Option<SymbolId> {
-        let name = self.identifier_text(name_node)?.to_owned();
+        let name = self.declaration_name_text(name_node)?.to_owned();
+        let id = self.declare_name(scope, declaration, name, flags, parent_symbol)?;
+        self.result.node_symbols.insert(declaration, id);
+        self.result.node_symbols.insert(name_node, id);
+        if let Some(container) = self.result.containers.get(&declaration).copied() {
+            self.result.containers.insert(name_node, container);
+        }
+        Some(id)
+    }
+
+    fn declare_and_export(
+        &mut self,
+        scope: ScopeId,
+        declaration: NodeId,
+        name_node: NodeId,
+        flags: SymbolFlags,
+        parent_symbol: Option<SymbolId>,
+    ) -> Option<SymbolId> {
+        let id = self.declare_named(scope, declaration, name_node, flags, parent_symbol)?;
+        if self.has_modifier(declaration, SyntaxKind::ExportKeyword) {
+            let export_name = if self.has_modifier(declaration, SyntaxKind::DefaultKeyword) {
+                "default".to_owned()
+            } else {
+                self.identifier_text(name_node)?.to_owned()
+            };
+            if let Some(parent) = parent_symbol {
+                self.result
+                    .symbols
+                    .get_mut(parent)?
+                    .members
+                    .insert(export_name, id);
+            } else {
+                self.result.exports.insert(export_name, id);
+            }
+        }
+        Some(id)
+    }
+
+    fn declare_synthetic(
+        &mut self,
+        scope: ScopeId,
+        declaration: NodeId,
+        name: &str,
+        flags: SymbolFlags,
+        parent_symbol: Option<SymbolId>,
+    ) -> SymbolId {
+        let id = self
+            .declare_name(scope, declaration, name.to_owned(), flags, parent_symbol)
+            .expect("scope and symbol IDs originate from this binder");
+        self.result.node_symbols.insert(declaration, id);
+        id
+    }
+
+    fn declare_name(
+        &mut self,
+        scope: ScopeId,
+        declaration: NodeId,
+        name: String,
+        flags: SymbolFlags,
+        parent_symbol: Option<SymbolId>,
+    ) -> Option<SymbolId> {
         let existing = self.result.scopes[scope.index()].symbols.get(&name);
         let id = if let Some(existing) = existing {
             let existing_flags = self.result.symbols.get(existing)?.flags;
@@ -522,9 +965,63 @@ impl<'a> Binder<'a> {
             }
             id
         };
-        self.result.node_symbols.insert(declaration, id);
-        self.result.node_symbols.insert(name_node, id);
         Some(id)
+    }
+
+    fn declare_export_alias(
+        &mut self,
+        declaration: NodeId,
+        name: &str,
+        target: Option<SymbolId>,
+        parent_symbol: Option<SymbolId>,
+    ) -> SymbolId {
+        let id = self.result.symbols.alloc(
+            name.to_owned(),
+            SymbolFlags::ALIAS,
+            declaration,
+            parent_symbol,
+        );
+        self.result.symbols.get_mut(id).unwrap().target = target;
+        if let Some(parent) = parent_symbol {
+            self.result
+                .symbols
+                .get_mut(parent)
+                .unwrap()
+                .members
+                .insert(name.to_owned(), id);
+        } else {
+            self.result.exports.insert(name.to_owned(), id);
+        }
+        id
+    }
+
+    fn lookup_symbol(&self, mut scope: ScopeId, name: &str) -> Option<SymbolId> {
+        loop {
+            let current = self.result.scope(scope)?;
+            if let Some(symbol) = current.symbols.get(name) {
+                return Some(symbol);
+            }
+            scope = current.parent?;
+        }
+    }
+
+    fn has_modifier(&self, declaration: NodeId, modifier: SyntaxKind) -> bool {
+        let modifiers = match &self.arena.get(declaration).map(|node| &node.data) {
+            Some(NodeData::FunctionDeclaration(data)) => data.modifiers.as_ref(),
+            Some(NodeData::ClassDeclaration(data)) => data.modifiers.as_ref(),
+            Some(NodeData::InterfaceDeclaration(data)) => data.modifiers.as_ref(),
+            Some(NodeData::TypeAliasDeclaration(data)) => data.modifiers.as_ref(),
+            Some(NodeData::EnumDeclaration(data)) => data.modifiers.as_ref(),
+            Some(NodeData::ModuleDeclaration(data)) => data.modifiers.as_ref(),
+            _ => None,
+        };
+        modifiers.is_some_and(|modifiers| {
+            modifiers.list.nodes.iter().any(|node| {
+                self.arena
+                    .get(*node)
+                    .is_some_and(|node| node.kind == modifier)
+            })
+        })
     }
 
     fn bind_children(
@@ -570,6 +1067,16 @@ impl<'a> Binder<'a> {
             _ => None,
         }
     }
+
+    fn declaration_name_text(&self, node: NodeId) -> Option<&str> {
+        match &self.arena.get(node)?.data {
+            NodeData::Identifier(identifier) => Some(&identifier.text),
+            NodeData::PrivateIdentifier(identifier) => Some(&identifier.text),
+            NodeData::StringLiteral(literal) => Some(&literal.text),
+            NodeData::NumericLiteral(literal) => Some(&literal.text),
+            _ => None,
+        }
+    }
 }
 
 fn can_merge(existing: SymbolFlags, new: SymbolFlags) -> bool {
@@ -578,6 +1085,9 @@ fn can_merge(existing: SymbolFlags, new: SymbolFlags) -> bool {
         || (existing == SymbolFlags::FUNCTION && new == SymbolFlags::FUNCTION)
         || (existing == SymbolFlags::INTERFACE && new == SymbolFlags::INTERFACE)
         || (existing == SymbolFlags::REGULAR_ENUM && new == SymbolFlags::REGULAR_ENUM)
+        || (existing == SymbolFlags::NAMESPACE_MODULE && new == SymbolFlags::NAMESPACE_MODULE)
+        || (existing == SymbolFlags::GET_ACCESSOR && new == SymbolFlags::SET_ACCESSOR)
+        || (existing == SymbolFlags::SET_ACCESSOR && new == SymbolFlags::GET_ACCESSOR)
         || (new == SymbolFlags::CLASS
             && existing.contains(SymbolFlags::INTERFACE)
             && !existing.contains(SymbolFlags::CLASS))
@@ -592,7 +1102,12 @@ fn is_value(flags: SymbolFlags) -> bool {
             | SymbolFlags::ENUM_MEMBER
             | SymbolFlags::FUNCTION
             | SymbolFlags::CLASS
-            | SymbolFlags::ENUM,
+            | SymbolFlags::ENUM
+            | SymbolFlags::MODULE
+            | SymbolFlags::METHOD
+            | SymbolFlags::CONSTRUCTOR
+            | SymbolFlags::GET_ACCESSOR
+            | SymbolFlags::SET_ACCESSOR,
     )
 }
 
@@ -606,6 +1121,7 @@ mod tests {
         VariableDeclarationListData, VariableStatementData,
     };
     use ts_core::TextRange;
+    use ts_parser::parse_source_file;
 
     use super::{ScopeKind, SymbolFlags, bind_source_file};
 
@@ -1001,6 +1517,130 @@ mod tests {
         assert_eq!(
             result.diagnostics[0].diagnostic.render().unwrap(),
             "Duplicate identifier 'Conflict'."
+        );
+    }
+
+    #[test]
+    fn binds_parsed_import_and_export_aliases() {
+        let parsed = parse_source_file(
+            r#"
+                import DefaultThing, { source as local, same } from "pkg";
+                const value = 1;
+                export { value as renamed };
+                export default function make<T>(input: T): T { return input; }
+            "#,
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let result = bind_source_file(&parsed.arena, parsed.source_file);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+
+        let root = result.root_scope().unwrap();
+        for name in ["DefaultThing", "local", "same"] {
+            let symbol = result.symbols.get(root.symbols.get(name).unwrap()).unwrap();
+            assert!(symbol.flags.contains(SymbolFlags::ALIAS));
+            assert!(symbol.target.is_none());
+        }
+        let value = root.symbols.get("value").unwrap();
+        let renamed = result
+            .symbols
+            .get(result.exports.get("renamed").unwrap())
+            .unwrap();
+        assert!(renamed.flags.contains(SymbolFlags::ALIAS));
+        assert_eq!(renamed.target, Some(value));
+
+        let make = root.symbols.get("make").unwrap();
+        assert_eq!(result.exports.get("default"), Some(make));
+        let function_scope = result
+            .scopes
+            .iter()
+            .find(|scope| scope.kind == ScopeKind::Function && scope.symbols.get("input").is_some())
+            .unwrap();
+        assert!(
+            result
+                .symbols
+                .get(function_scope.symbols.get("T").unwrap())
+                .unwrap()
+                .flags
+                .contains(SymbolFlags::TYPE_PARAMETER)
+        );
+    }
+
+    #[test]
+    fn binds_parsed_modules_and_class_interface_members() {
+        let parsed = parse_source_file(
+            r"
+                namespace Outer {
+                    export function run() {}
+                    function hidden() {}
+                }
+                namespace Outer { export function second() {} }
+                class Model<T> {
+                    value: T;
+                    read(input: T): T { return input; }
+                }
+                interface Shape {
+                    width: number;
+                }
+            ",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let result = bind_source_file(&parsed.arena, parsed.source_file);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+
+        let root = result.root_scope().unwrap();
+        let outer_id = root.symbols.get("Outer").unwrap();
+        let outer = result.symbols.get(outer_id).unwrap();
+        assert!(outer.flags.contains(SymbolFlags::NAMESPACE_MODULE));
+        assert_eq!(outer.declarations.len(), 2);
+        assert!(outer.members.get("run").is_some());
+        assert!(outer.members.get("second").is_some());
+        assert!(outer.members.get("hidden").is_none());
+
+        let model = result
+            .symbols
+            .get(root.symbols.get("Model").unwrap())
+            .unwrap();
+        assert!(
+            result
+                .symbols
+                .get(model.members.get("value").unwrap())
+                .unwrap()
+                .flags
+                .contains(SymbolFlags::PROPERTY)
+        );
+        let method_id = model.members.get("read").unwrap();
+        assert!(
+            result
+                .symbols
+                .get(method_id)
+                .unwrap()
+                .flags
+                .contains(SymbolFlags::METHOD)
+        );
+        let method_scope = result
+            .scopes
+            .iter()
+            .find(|scope| scope.kind == ScopeKind::Function && scope.symbols.get("input").is_some())
+            .unwrap();
+        assert_eq!(
+            result
+                .symbols
+                .get(method_scope.symbols.get("input").unwrap())
+                .unwrap()
+                .parent,
+            Some(method_id)
+        );
+
+        let shape = result
+            .symbols
+            .get(root.symbols.get("Shape").unwrap())
+            .unwrap();
+        assert!(shape.members.get("width").is_some());
+        assert!(
+            result
+                .scopes
+                .iter()
+                .any(|scope| scope.kind == ScopeKind::Module)
         );
     }
 }

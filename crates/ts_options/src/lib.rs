@@ -53,6 +53,7 @@ pub enum ScriptTarget {
     Es2022,
     Es2023,
     Es2024,
+    Es2025,
     EsNext,
 }
 
@@ -81,6 +82,10 @@ pub struct CompilerOptions {
     pub target: ScriptTarget,
     pub jsx: JsxEmit,
     pub resolve_json_module: bool,
+    pub source_map: bool,
+    pub base_url: Option<String>,
+    pub paths: BTreeMap<String, Vec<String>>,
+    pub root_dirs: Vec<String>,
 }
 
 impl Default for CompilerOptions {
@@ -96,6 +101,10 @@ impl Default for CompilerOptions {
             target: ScriptTarget::Es5,
             jsx: JsxEmit::Preserve,
             resolve_json_module: false,
+            source_map: false,
+            base_url: None,
+            paths: BTreeMap::new(),
+            root_dirs: Vec::new(),
         }
     }
 }
@@ -108,6 +117,7 @@ pub struct PrinterSettings {
     pub jsx: JsxEmit,
     pub emit_javascript: bool,
     pub emit_declarations: bool,
+    pub source_map: bool,
 }
 
 /// Result of parsing a `compilerOptions` JSON object.
@@ -127,7 +137,7 @@ impl ParseOptionsResult {
 impl CompilerOptions {
     /// Converts these options to the module resolver's settings.
     #[must_use]
-    pub const fn module_resolution_options(&self) -> ResolutionOptions {
+    pub fn module_resolution_options(&self) -> ResolutionOptions {
         ResolutionOptions {
             mode: match self.module_resolution {
                 ModuleResolutionKind::Classic => ResolutionMode::Classic,
@@ -139,6 +149,9 @@ impl CompilerOptions {
             allow_javascript: self.allow_js,
             resolve_json: self.resolve_json_module,
             prefer_types: true,
+            base_url: self.base_url.clone(),
+            paths: self.paths.clone(),
+            root_dirs: self.root_dirs.clone(),
         }
     }
 
@@ -151,6 +164,7 @@ impl CompilerOptions {
             jsx: self.jsx,
             emit_javascript: !self.no_emit && !self.emit_declaration_only,
             emit_declarations: !self.no_emit && self.declaration,
+            source_map: self.source_map && !self.no_emit && !self.emit_declaration_only,
         }
     }
 }
@@ -170,7 +184,19 @@ pub fn parse_compiler_options(value: &JsonValue) -> ParseOptionsResult {
 /// Parses the compiler options retained by a project configuration.
 #[must_use]
 pub fn parse_project_options(config: &ProjectConfig) -> ParseOptionsResult {
-    parse_compiler_options_map(&config.compiler_options)
+    let mut result = parse_compiler_options_map(&config.compiler_options);
+    let directory = config.path.rsplit_once('/').map_or(".", |(path, _)| path);
+    if let Some(base_url) = &mut result.options.base_url
+        && !ts_path::is_absolute(base_url)
+    {
+        *base_url = ts_path::resolve_path(directory, &[base_url]);
+    }
+    for root_dir in &mut result.options.root_dirs {
+        if !ts_path::is_absolute(root_dir) {
+            *root_dir = ts_path::resolve_path(directory, &[root_dir]);
+        }
+    }
+    result
 }
 
 /// Parses and normalizes a map of compiler option values.
@@ -193,6 +219,10 @@ pub fn parse_compiler_options_map(options: &BTreeMap<String, JsonValue>) -> Pars
             "resolvejsonmodule" => {
                 parsed.resolve_json_module = boolean(original_name, value, &mut diagnostics);
             }
+            "sourcemap" => parsed.source_map = boolean(original_name, value, &mut diagnostics),
+            "baseurl" => parsed.base_url = string(original_name, value, &mut diagnostics),
+            "paths" => parsed.paths = paths(original_name, value, &mut diagnostics),
+            "rootdirs" => parsed.root_dirs = string_array(original_name, value, &mut diagnostics),
             "module" => parsed.module = enum_value(original_name, value, &mut diagnostics, module),
             "moduleresolution" => {
                 parsed.module_resolution =
@@ -222,6 +252,10 @@ struct PartialOptions {
     target: Option<ScriptTarget>,
     jsx: Option<JsxEmit>,
     resolve_json_module: Option<bool>,
+    source_map: Option<bool>,
+    base_url: Option<String>,
+    paths: Option<BTreeMap<String, Vec<String>>>,
+    root_dirs: Option<Vec<String>>,
 }
 
 impl PartialOptions {
@@ -242,6 +276,10 @@ impl PartialOptions {
             target: self.target.unwrap_or_default(),
             jsx: self.jsx.unwrap_or_default(),
             resolve_json_module: self.resolve_json_module.unwrap_or(false),
+            source_map: self.source_map.unwrap_or(false),
+            base_url: self.base_url,
+            paths: self.paths.unwrap_or_default(),
+            root_dirs: self.root_dirs.unwrap_or_default(),
         }
     }
 }
@@ -324,6 +362,65 @@ fn boolean(name: &str, value: &JsonValue, diagnostics: &mut Vec<Diagnostic>) -> 
     }
 }
 
+fn string(name: &str, value: &JsonValue, diagnostics: &mut Vec<Diagnostic>) -> Option<String> {
+    if let Some(value) = value.as_str() {
+        Some(value.to_owned())
+    } else {
+        diagnostics.push(diagnostic(5024, [name, "string"]));
+        None
+    }
+}
+
+fn string_array(
+    name: &str,
+    value: &JsonValue,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<Vec<String>> {
+    let Some(values) = value.as_array() else {
+        diagnostics.push(diagnostic(5024, [name, "Array"]));
+        return None;
+    };
+    let result = values
+        .iter()
+        .filter_map(JsonValue::as_str)
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if result.len() != values.len() {
+        diagnostics.push(diagnostic(5024, [name, "Array"]));
+        return None;
+    }
+    Some(result)
+}
+
+fn paths(
+    name: &str,
+    value: &JsonValue,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<BTreeMap<String, Vec<String>>> {
+    let Some(object) = value.as_object() else {
+        diagnostics.push(diagnostic(5024, [name, "object"]));
+        return None;
+    };
+    let mut result = BTreeMap::new();
+    for (pattern, substitutions) in object {
+        let Some(substitutions) = substitutions.as_array() else {
+            diagnostics.push(diagnostic(5024, [name, "object"]));
+            return None;
+        };
+        let values = substitutions
+            .iter()
+            .filter_map(JsonValue::as_str)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if values.len() != substitutions.len() {
+            diagnostics.push(diagnostic(5024, [name, "object"]));
+            return None;
+        }
+        result.insert(pattern.clone(), values);
+    }
+    Some(result)
+}
+
 fn enum_value<T>(
     name: &str,
     value: &JsonValue,
@@ -386,6 +483,7 @@ fn target(value: &str) -> Option<ScriptTarget> {
         "es2022" => ScriptTarget::Es2022,
         "es2023" => ScriptTarget::Es2023,
         "es2024" => ScriptTarget::Es2024,
+        "es2025" => ScriptTarget::Es2025,
         "esnext" | "latest" => ScriptTarget::EsNext,
         _ => return None,
     })
@@ -445,12 +543,12 @@ mod tests {
     #[test]
     fn parses_names_and_enum_values_case_insensitively() {
         let result = parse_compiler_options(&object([
-            ("TARGET", JsonValue::String("ES2022".into())),
+            ("TARGET", JsonValue::String("ES2025".into())),
             ("Module", JsonValue::String("NodeNext".into())),
             ("JsX", JsonValue::String("React-JSX".into())),
         ]));
         assert!(result.is_ok());
-        assert_eq!(result.options.target, ScriptTarget::Es2022);
+        assert_eq!(result.options.target, ScriptTarget::Es2025);
         assert_eq!(result.options.module, ModuleKind::NodeNext);
         assert_eq!(result.options.jsx, JsxEmit::ReactJsx);
         assert_eq!(
@@ -504,7 +602,7 @@ mod tests {
     fn parses_project_config_and_converts_resolution_settings() {
         let config = parse_config_text(
             "/repo/tsconfig.json",
-            r#"{"compilerOptions":{"allowJs":true,"resolveJsonModule":true,"moduleResolution":"Bundler"}}"#,
+            r#"{"compilerOptions":{"allowJs":true,"resolveJsonModule":true,"moduleResolution":"Bundler","baseUrl":".","paths":{"@app/*":["src/*"]},"rootDirs":["src","generated"]}}"#,
         )
         .value
         .unwrap();
@@ -515,7 +613,10 @@ mod tests {
                 mode: ResolutionMode::Bundler,
                 allow_javascript: true,
                 resolve_json: true,
-                prefer_types: true,
+                base_url: Some("/repo".into()),
+                paths: BTreeMap::from([("@app/*".into(), vec!["src/*".into()])]),
+                root_dirs: vec!["/repo/src".into(), "/repo/generated".into()],
+                ..ResolutionOptions::default()
             }
         );
     }

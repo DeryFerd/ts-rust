@@ -4,10 +4,13 @@ use std::error::Error;
 use std::fmt;
 
 use ts_ast::{Node, NodeArena, NodeData, NodeId, NodeList, SyntaxKind};
+use ts_options::{ModuleKind, PrinterSettings, ScriptTarget};
+use ts_sourcemap::{SourceMap, SourceMapBuilder};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct EmitResult {
     pub code: String,
+    pub source_map: Option<SourceMap>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -35,9 +38,44 @@ impl Error for EmitError {}
 /// Returns an error when the tree contains a node not supported by the initial
 /// emitter layer or references a missing arena node.
 pub fn emit_source_file(arena: &NodeArena, source_file: NodeId) -> Result<EmitResult, EmitError> {
+    emit_source_file_with_settings(
+        arena,
+        source_file,
+        "source.ts",
+        "",
+        PrinterSettings {
+            target: ScriptTarget::EsNext,
+            module: ModuleKind::EsNext,
+            jsx: ts_options::JsxEmit::Preserve,
+            emit_javascript: true,
+            emit_declarations: false,
+            source_map: false,
+        },
+    )
+}
+
+/// Emits one source file using target, module, and source-map settings.
+///
+/// # Errors
+///
+/// Returns an error when the tree contains an unsupported or missing node.
+pub fn emit_source_file_with_settings(
+    arena: &NodeArena,
+    source_file: NodeId,
+    source_name: &str,
+    source_text: &str,
+    settings: PrinterSettings,
+) -> Result<EmitResult, EmitError> {
+    if !settings.emit_javascript {
+        return Ok(EmitResult::default());
+    }
     let mut printer = Printer {
         arena,
         writer: Writer::default(),
+        settings,
+        source_map: settings.source_map.then(SourceMapBuilder::new),
+        source_text,
+        source_line_starts: settings.source_map.then(|| line_starts(source_text)),
     };
     let node = printer.node(source_file)?.clone();
     let NodeData::SourceFile(data) = &node.data else {
@@ -46,8 +84,12 @@ pub fn emit_source_file(arena: &NodeArena, source_file: NodeId) -> Result<EmitRe
     for statement in &data.statements.nodes {
         printer.emit_statement(*statement)?;
     }
+    let source_map = printer
+        .source_map
+        .map(|builder| builder.finish(None, vec![source_name.to_owned()]));
     Ok(EmitResult {
         code: printer.writer.finish(),
+        source_map,
     })
 }
 
@@ -56,6 +98,8 @@ struct Writer {
     output: String,
     indent: usize,
     line_start: bool,
+    line: u32,
+    column: u32,
 }
 
 impl Writer {
@@ -63,10 +107,12 @@ impl Writer {
         if self.line_start {
             for _ in 0..self.indent {
                 self.output.push_str("  ");
+                self.column += 2;
             }
             self.line_start = false;
         }
         self.output.push_str(text);
+        self.column += u32::try_from(text.len()).unwrap_or(u32::MAX);
     }
 
     fn newline(&mut self) {
@@ -75,6 +121,8 @@ impl Writer {
         }
         self.output.push('\n');
         self.line_start = true;
+        self.line += 1;
+        self.column = 0;
     }
 
     fn finish(mut self) -> String {
@@ -86,11 +134,51 @@ impl Writer {
         }
         self.output
     }
+
+    fn position(&self) -> (u32, u32) {
+        let column = if self.line_start {
+            u32::try_from(self.indent)
+                .unwrap_or(u32::MAX)
+                .saturating_mul(2)
+        } else {
+            self.column
+        };
+        (self.line, column)
+    }
+}
+
+fn line_starts(source: &str) -> Vec<usize> {
+    let mut starts = vec![0];
+    starts.extend(
+        source
+            .bytes()
+            .enumerate()
+            .filter_map(|(index, byte)| (byte == b'\n').then_some(index + 1)),
+    );
+    starts
+}
+
+fn original_position(source: &str, line_starts: &[usize], byte_offset: u32) -> (u32, u32) {
+    let offset = usize::try_from(byte_offset)
+        .unwrap_or(source.len())
+        .min(source.len());
+    let line = line_starts
+        .partition_point(|line_start| *line_start <= offset)
+        .saturating_sub(1);
+    let column = source[line_starts[line]..offset].encode_utf16().count();
+    (
+        u32::try_from(line).unwrap_or(u32::MAX),
+        u32::try_from(column).unwrap_or(u32::MAX),
+    )
 }
 
 struct Printer<'a> {
     arena: &'a NodeArena,
     writer: Writer,
+    settings: PrinterSettings,
+    source_map: Option<SourceMapBuilder>,
+    source_text: &'a str,
+    source_line_starts: Option<Vec<usize>>,
 }
 
 impl Printer<'_> {
@@ -105,6 +193,23 @@ impl Printer<'_> {
         EmitError { node: id, kind }
     }
 
+    fn record_mapping(&mut self, node: &Node) {
+        if self.source_map.is_none() {
+            return;
+        }
+        let (line, column) = self.writer.position();
+        let (original_line, original_column) = original_position(
+            self.source_text,
+            self.source_line_starts
+                .as_deref()
+                .expect("source line starts exist when source maps are enabled"),
+            node.range.start.get(),
+        );
+        if let Some(builder) = &mut self.source_map {
+            let _ = builder.add_mapping(line, column, 0, original_line, original_column);
+        }
+    }
+
     fn emit_statement(&mut self, id: NodeId) -> Result<(), EmitError> {
         let node = self.node(id)?.clone();
         match &node.data {
@@ -112,6 +217,7 @@ impl Printer<'_> {
             NodeData::FunctionDeclaration(data) if data.body.is_none() => return Ok(()),
             _ => {}
         }
+        self.record_mapping(&node);
         match &node.data {
             NodeData::Block(_) => self.emit_block(id)?,
             NodeData::EmptyStatement(_) => self.writer.write(";"),
@@ -179,7 +285,11 @@ impl Printer<'_> {
             }
             NodeData::ImportDeclaration(data) => self.emit_import(data)?,
             NodeData::ExportAssignment(data) => {
-                self.writer.write("export default ");
+                if self.settings.module == ModuleKind::CommonJs {
+                    self.writer.write("exports.default = ");
+                } else {
+                    self.writer.write("export default ");
+                }
                 self.emit_expression(data.expression, 0)?;
                 self.writer.write(";");
             }
@@ -228,7 +338,9 @@ impl Printer<'_> {
         let NodeData::VariableDeclarationList(data) = &node.data else {
             return Err(Self::unsupported(id, node.kind));
         };
-        let keyword = if node.flags.0 & (1 << 1) != 0 {
+        let keyword = if self.settings.target < ScriptTarget::Es2015 {
+            "var"
+        } else if node.flags.0 & (1 << 1) != 0 {
             "const"
         } else if node.flags.0 & 1 != 0 {
             "let"
@@ -393,6 +505,9 @@ impl Printer<'_> {
     }
 
     fn emit_import(&mut self, data: &ts_ast::ImportDeclarationData) -> Result<(), EmitError> {
+        if self.settings.module == ModuleKind::CommonJs {
+            return self.emit_commonjs_import(data);
+        }
         self.writer.write("import ");
         if let Some(clause) = data.import_clause {
             let clause_node = self.node(clause)?.clone();
@@ -412,6 +527,64 @@ impl Printer<'_> {
         }
         self.emit_expression(data.module_specifier, 0)?;
         self.writer.write(";");
+        Ok(())
+    }
+
+    fn emit_commonjs_import(
+        &mut self,
+        data: &ts_ast::ImportDeclarationData,
+    ) -> Result<(), EmitError> {
+        let Some(clause_id) = data.import_clause else {
+            self.writer.write("require(");
+            self.emit_expression(data.module_specifier, 0)?;
+            self.writer.write(");");
+            return Ok(());
+        };
+        let clause_node = self.node(clause_id)?.clone();
+        let NodeData::ImportClause(clause) = &clause_node.data else {
+            return Err(Self::unsupported(clause_id, clause_node.kind));
+        };
+        if let Some(name) = clause.name {
+            self.writer.write(self.variable_keyword());
+            self.writer.write(" ");
+            self.emit_expression(name, 0)?;
+            self.writer.write(" = require(");
+            self.emit_expression(data.module_specifier, 0)?;
+            self.writer.write(").default;");
+            if clause.named_bindings.is_some() {
+                self.writer.newline();
+            }
+        }
+        if let Some(bindings) = clause.named_bindings {
+            self.writer.write(self.variable_keyword());
+            self.writer.write(" { ");
+            self.emit_commonjs_named_imports(bindings)?;
+            self.writer.write(" } = require(");
+            self.emit_expression(data.module_specifier, 0)?;
+            self.writer.write(");");
+        }
+        Ok(())
+    }
+
+    fn emit_commonjs_named_imports(&mut self, id: NodeId) -> Result<(), EmitError> {
+        let node = self.node(id)?.clone();
+        let NodeData::NamedImports(data) = &node.data else {
+            return Err(Self::unsupported(id, node.kind));
+        };
+        for (index, specifier) in data.elements.nodes.iter().enumerate() {
+            if index != 0 {
+                self.writer.write(", ");
+            }
+            let node = self.node(*specifier)?.clone();
+            let NodeData::ImportSpecifier(specifier) = &node.data else {
+                return Err(Self::unsupported(*specifier, node.kind));
+            };
+            if let Some(property) = specifier.property_name {
+                self.emit_expression(property, 0)?;
+                self.writer.write(": ");
+            }
+            self.emit_expression(specifier.name, 0)?;
+        }
         Ok(())
     }
 
@@ -440,6 +613,9 @@ impl Printer<'_> {
     }
 
     fn emit_export(&mut self, data: &ts_ast::ExportDeclarationData) -> Result<(), EmitError> {
+        if self.settings.module == ModuleKind::CommonJs {
+            return self.emit_commonjs_export(data);
+        }
         self.writer.write("export ");
         if let Some(clause) = data.export_clause {
             let node = self.node(clause)?.clone();
@@ -473,6 +649,54 @@ impl Printer<'_> {
         Ok(())
     }
 
+    fn emit_commonjs_export(
+        &mut self,
+        data: &ts_ast::ExportDeclarationData,
+    ) -> Result<(), EmitError> {
+        let Some(clause) = data.export_clause else {
+            self.writer.write("Object.assign(exports, require(");
+            if let Some(module) = data.module_specifier {
+                self.emit_expression(module, 0)?;
+            } else {
+                write_quoted(&mut self.writer, "");
+            }
+            self.writer.write("));");
+            return Ok(());
+        };
+        let node = self.node(clause)?.clone();
+        let NodeData::NamedExports(exports) = &node.data else {
+            return Err(Self::unsupported(clause, node.kind));
+        };
+        for (index, specifier_id) in exports.elements.nodes.iter().enumerate() {
+            if index != 0 {
+                self.writer.newline();
+            }
+            let node = self.node(*specifier_id)?.clone();
+            let NodeData::ExportSpecifier(specifier) = &node.data else {
+                return Err(Self::unsupported(*specifier_id, node.kind));
+            };
+            self.writer.write("exports.");
+            self.emit_expression(specifier.name, 0)?;
+            self.writer.write(" = ");
+            if let Some(module) = data.module_specifier {
+                self.writer.write("require(");
+                self.emit_expression(module, 0)?;
+                self.writer.write(").");
+            }
+            self.emit_expression(specifier.property_name.unwrap_or(specifier.name), 0)?;
+            self.writer.write(";");
+        }
+        Ok(())
+    }
+
+    fn variable_keyword(&self) -> &'static str {
+        if self.settings.target < ScriptTarget::Es2015 {
+            "var"
+        } else {
+            "const"
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     fn emit_expression(&mut self, id: NodeId, parent_precedence: u8) -> Result<(), EmitError> {
         let node = self.node(id)?.clone();
@@ -494,6 +718,12 @@ impl Printer<'_> {
             }
             NodeData::BinaryExpression(data) => {
                 let operator = self.node(data.operator_token)?.kind;
+                if operator == SyntaxKind::QuestionQuestionToken
+                    && self.settings.target < ScriptTarget::Es2020
+                {
+                    self.emit_downlevel_nullish(data.left, data.right, parent_precedence)?;
+                    return Ok(());
+                }
                 let (precedence, right_associative) = binary_precedence(operator)
                     .ok_or_else(|| Self::unsupported(data.operator_token, operator))?;
                 let wrap = precedence < parent_precedence;
@@ -520,15 +750,40 @@ impl Printer<'_> {
                 }
             }
             NodeData::PropertyAccessExpression(data) => {
-                self.emit_expression(data.expression, 18)?;
-                self.writer.write(".");
-                self.emit_expression(data.name, 18)?;
+                if data.question_dot_token.is_some() && self.settings.target < ScriptTarget::Es2020
+                {
+                    self.emit_downlevel_optional_property(
+                        data.expression,
+                        data.name,
+                        parent_precedence,
+                    )?;
+                } else {
+                    self.emit_expression(data.expression, 18)?;
+                    self.writer.write(if data.question_dot_token.is_some() {
+                        "?."
+                    } else {
+                        "."
+                    });
+                    self.emit_expression(data.name, 18)?;
+                }
             }
             NodeData::CallExpression(data) => {
-                self.emit_expression(data.expression, 18)?;
-                self.writer.write("(");
-                self.emit_expression_list(&data.arguments)?;
-                self.writer.write(")");
+                if data.question_dot_token.is_some() && self.settings.target < ScriptTarget::Es2020
+                {
+                    self.emit_downlevel_optional_call(
+                        data.expression,
+                        &data.arguments,
+                        parent_precedence,
+                    )?;
+                } else {
+                    self.emit_expression(data.expression, 18)?;
+                    if data.question_dot_token.is_some() {
+                        self.writer.write("?.");
+                    }
+                    self.writer.write("(");
+                    self.emit_expression_list(&data.arguments)?;
+                    self.writer.write(")");
+                }
             }
             NodeData::ArrayLiteralExpression(data) => {
                 self.writer.write("[");
@@ -552,6 +807,26 @@ impl Printer<'_> {
                 self.writer.write(" }");
             }
             NodeData::ArrowFunction(data) => {
+                if self.settings.target < ScriptTarget::Es2015 {
+                    let wrap = parent_precedence > 1;
+                    if wrap {
+                        self.writer.write("(");
+                    }
+                    self.writer.write("function ");
+                    self.emit_parameters(&data.parameters)?;
+                    self.writer.write(" ");
+                    if matches!(&self.node(data.body)?.data, NodeData::Block(_)) {
+                        self.emit_block(data.body)?;
+                    } else {
+                        self.writer.write("{ return ");
+                        self.emit_expression(data.body, 0)?;
+                        self.writer.write("; }");
+                    }
+                    if wrap {
+                        self.writer.write(")");
+                    }
+                    return Ok(());
+                }
                 let wrap = parent_precedence > 1;
                 if wrap {
                     self.writer.write("(");
@@ -568,12 +843,127 @@ impl Printer<'_> {
                 }
             }
             NodeData::NoSubstitutionTemplateLiteral(data) => {
-                self.writer.write("`");
-                write_template_text(&mut self.writer, &data.text);
-                self.writer.write("`");
+                if self.settings.target < ScriptTarget::Es2015 {
+                    write_quoted(&mut self.writer, &data.text);
+                } else {
+                    self.writer.write("`");
+                    write_template_text(&mut self.writer, &data.text);
+                    self.writer.write("`");
+                }
             }
-            NodeData::TemplateExpression(data) => self.emit_template(data)?,
+            NodeData::TemplateExpression(data) => {
+                if self.settings.target < ScriptTarget::Es2015 {
+                    self.emit_downlevel_template(data, parent_precedence)?;
+                } else {
+                    self.emit_template(data)?;
+                }
+            }
             _ => return Err(Self::unsupported(id, node.kind)),
+        }
+        Ok(())
+    }
+
+    fn emit_downlevel_nullish(
+        &mut self,
+        left: NodeId,
+        right: NodeId,
+        parent_precedence: u8,
+    ) -> Result<(), EmitError> {
+        let wrap = parent_precedence > 2;
+        if wrap {
+            self.writer.write("(");
+        }
+        self.emit_expression(left, 10)?;
+        self.writer.write(" !== null && ");
+        self.emit_expression(left, 10)?;
+        self.writer.write(" !== void 0 ? ");
+        self.emit_expression(left, 2)?;
+        self.writer.write(" : ");
+        self.emit_expression(right, 2)?;
+        if wrap {
+            self.writer.write(")");
+        }
+        Ok(())
+    }
+
+    fn emit_downlevel_optional_property(
+        &mut self,
+        expression: NodeId,
+        name: NodeId,
+        parent_precedence: u8,
+    ) -> Result<(), EmitError> {
+        let wrap = parent_precedence > 2;
+        if wrap {
+            self.writer.write("(");
+        }
+        self.emit_expression(expression, 10)?;
+        self.writer.write(" === null || ");
+        self.emit_expression(expression, 10)?;
+        self.writer.write(" === void 0 ? void 0 : ");
+        self.emit_expression(expression, 18)?;
+        self.writer.write(".");
+        self.emit_expression(name, 18)?;
+        if wrap {
+            self.writer.write(")");
+        }
+        Ok(())
+    }
+
+    fn emit_downlevel_optional_call(
+        &mut self,
+        expression: NodeId,
+        arguments: &NodeList,
+        parent_precedence: u8,
+    ) -> Result<(), EmitError> {
+        let wrap = parent_precedence > 2;
+        if wrap {
+            self.writer.write("(");
+        }
+        self.emit_expression(expression, 10)?;
+        self.writer.write(" === null || ");
+        self.emit_expression(expression, 10)?;
+        self.writer.write(" === void 0 ? void 0 : ");
+        self.emit_expression(expression, 18)?;
+        self.writer.write("(");
+        self.emit_expression_list(arguments)?;
+        self.writer.write(")");
+        if wrap {
+            self.writer.write(")");
+        }
+        Ok(())
+    }
+
+    fn emit_downlevel_template(
+        &mut self,
+        data: &ts_ast::TemplateExpressionData,
+        parent_precedence: u8,
+    ) -> Result<(), EmitError> {
+        let wrap = parent_precedence > 12;
+        if wrap {
+            self.writer.write("(");
+        }
+        let head = self.node(data.head)?.clone();
+        let NodeData::TemplateHead(head) = &head.data else {
+            return Err(Self::unsupported(data.head, head.kind));
+        };
+        write_quoted(&mut self.writer, &head.text);
+        for span_id in &data.template_spans.nodes {
+            let node = self.node(*span_id)?.clone();
+            let NodeData::TemplateSpan(span) = &node.data else {
+                return Err(Self::unsupported(*span_id, node.kind));
+            };
+            self.writer.write(" + ");
+            self.emit_expression(span.expression, 13)?;
+            self.writer.write(" + ");
+            let literal = self.node(span.literal)?.clone();
+            match &literal.data {
+                NodeData::TemplateMiddle(data) => write_quoted(&mut self.writer, &data.text),
+                NodeData::TemplateTail(data) => write_quoted(&mut self.writer, &data.text),
+                _ => return Err(Self::unsupported(span.literal, literal.kind)),
+            }
+        }
+        if wrap {
+            self.writer.write(")");
         }
         Ok(())
     }
@@ -751,8 +1141,10 @@ fn binary_precedence(kind: SyntaxKind) -> Option<(u8, bool)> {
 
 #[cfg(test)]
 mod tests {
-    use super::emit_source_file;
+    use ts_options::{JsxEmit, ModuleKind, PrinterSettings, ScriptTarget};
     use ts_parser::parse_source_file;
+
+    use super::{emit_source_file, emit_source_file_with_settings, original_position};
 
     fn emit(source: &str) -> String {
         let parsed = parse_source_file(source);
@@ -760,6 +1152,26 @@ mod tests {
         emit_source_file(&parsed.arena, parsed.source_file)
             .unwrap()
             .code
+    }
+
+    fn emit_with(source: &str, target: ScriptTarget, module: ModuleKind) -> super::EmitResult {
+        let parsed = parse_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        emit_source_file_with_settings(
+            &parsed.arena,
+            parsed.source_file,
+            "input.ts",
+            source,
+            PrinterSettings {
+                target,
+                module,
+                jsx: JsxEmit::Preserve,
+                emit_javascript: true,
+                emit_declarations: false,
+                source_map: true,
+            },
+        )
+        .unwrap()
     }
 
     #[test]
@@ -798,5 +1210,49 @@ mod tests {
             emit("enum Color { Red, Green = 4, Blue, Label = 'blue' }"),
             "var Color;\n(function (Color) {\n  Color[Color[\"Red\"] = 0] = \"Red\";\n  Color[Color[\"Green\"] = 4] = \"Green\";\n  Color[Color[\"Blue\"] = 5] = \"Blue\";\n  Color[\"Label\"] = \"blue\";\n})(Color || (Color = {}));\n"
         );
+    }
+
+    #[test]
+    fn downlevels_es2015_and_es2020_expressions_for_es5() {
+        let result = emit_with(
+            "const greet = (name: string) => `hi ${name}`; let result = value ?? fallback;",
+            ScriptTarget::Es5,
+            ModuleKind::EsNext,
+        );
+        assert_eq!(
+            result.code,
+            "var greet = function (name) { return \"hi \" + name + \"\"; };\nvar result = value !== null && value !== void 0 ? value : fallback;\n"
+        );
+    }
+
+    #[test]
+    fn transforms_es_modules_to_commonjs() {
+        let result = emit_with(
+            "import main, { read as load, write } from 'pkg'; import 'side'; export { load as result }; export * from 'other'; export default main;",
+            ScriptTarget::Es2015,
+            ModuleKind::CommonJs,
+        );
+        assert_eq!(
+            result.code,
+            "const main = require(\"pkg\").default;\nconst { read: load, write } = require(\"pkg\");\nrequire(\"side\");\nexports.result = load;\nObject.assign(exports, require(\"other\"));\nexports.default = main;\n"
+        );
+    }
+
+    #[test]
+    fn produces_monotonic_source_map_mappings() {
+        let result = emit_with(
+            "const first = 1;\nconst second = first + 1;",
+            ScriptTarget::EsNext,
+            ModuleKind::EsNext,
+        );
+        let map = result.source_map.unwrap();
+        assert_eq!(map.version, 3);
+        assert_eq!(map.sources, ["input.ts"]);
+        assert_eq!(map.mappings, "AAAA;AACA");
+    }
+
+    #[test]
+    fn source_map_columns_use_utf16_code_units() {
+        assert_eq!(original_position("😀 value", &[0], 5), (0, 3));
     }
 }

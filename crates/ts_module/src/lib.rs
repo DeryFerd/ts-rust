@@ -1,5 +1,7 @@
 //! Foundational TypeScript module resolution.
 
+use std::collections::BTreeMap;
+
 use serde_json::Value;
 use ts_path::{FileExtension, is_absolute, is_relative, normalize_path, resolve_path, root_length};
 use ts_vfs::FileSystem;
@@ -14,12 +16,15 @@ pub enum ResolutionMode {
     Bundler,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolutionOptions {
     pub mode: ResolutionMode,
     pub allow_javascript: bool,
     pub resolve_json: bool,
     pub prefer_types: bool,
+    pub base_url: Option<String>,
+    pub paths: BTreeMap<String, Vec<String>>,
+    pub root_dirs: Vec<String>,
 }
 
 impl Default for ResolutionOptions {
@@ -29,6 +34,9 @@ impl Default for ResolutionOptions {
             allow_javascript: true,
             resolve_json: false,
             prefer_types: true,
+            base_url: None,
+            paths: BTreeMap::new(),
+            root_dirs: Vec::new(),
         }
     }
 }
@@ -66,6 +74,8 @@ pub struct PackageJson {
     pub typings: Option<String>,
     pub main: Option<String>,
     pub package_type: Option<String>,
+    pub exports: Option<Value>,
+    pub types_versions: Option<Value>,
 }
 
 pub struct Resolver<'a, F: FileSystem + ?Sized> {
@@ -83,8 +93,8 @@ impl<'a, F: FileSystem + ?Sized> Resolver<'a, F> {
     }
 
     #[must_use]
-    pub const fn options(&self) -> ResolutionOptions {
-        self.options
+    pub fn options(&self) -> ResolutionOptions {
+        self.options.clone()
     }
 
     #[must_use]
@@ -96,11 +106,19 @@ impl<'a, F: FileSystem + ?Sized> Resolver<'a, F> {
         let containing_directory = directory_path(containing_file);
         let resolved = if is_relative(specifier) || is_absolute(specifier) {
             let candidate = resolve_path(&containing_directory, &[specifier]);
-            state.resolve_candidate(&candidate, false)
+            state.resolve_candidate(&candidate, false).or_else(|| {
+                if is_relative(specifier) {
+                    state.resolve_root_dirs(specifier, &containing_directory)
+                } else {
+                    None
+                }
+            })
         } else if self.options.mode == ResolutionMode::Classic {
-            None
+            state.resolve_paths_or_base_url(specifier)
         } else {
-            state.resolve_node_modules(specifier, &containing_directory)
+            state
+                .resolve_paths_or_base_url(specifier)
+                .or_else(|| state.resolve_node_modules(specifier, &containing_directory))
         };
         ResolutionResult {
             resolved,
@@ -114,7 +132,65 @@ struct ResolutionState<'a, 'fs, F: FileSystem + ?Sized> {
     failed_lookups: Vec<FailedLookup>,
 }
 
+enum PackageMetadataResolution {
+    NotApplicable,
+    Resolved(ResolvedModule),
+    Blocked,
+}
+
 impl<F: FileSystem + ?Sized> ResolutionState<'_, '_, F> {
+    fn resolve_paths_or_base_url(&mut self, specifier: &str) -> Option<ResolvedModule> {
+        if let Some((capture, substitutions)) =
+            best_path_match(&self.resolver.options.paths, specifier)
+        {
+            let base = self
+                .resolver
+                .options
+                .base_url
+                .clone()
+                .unwrap_or_else(|| ".".to_owned());
+            for substitution in substitutions {
+                let mapped = substitution.replace('*', &capture);
+                let candidate = resolve_path(&base, &[&mapped]);
+                if let Some(resolved) = self.resolve_candidate(&candidate, false) {
+                    return Some(resolved);
+                }
+            }
+        }
+        let base = self.resolver.options.base_url.as_deref()?;
+        let candidate = resolve_path(base, &[specifier]);
+        self.resolve_candidate(&candidate, false)
+    }
+
+    fn resolve_root_dirs(
+        &mut self,
+        specifier: &str,
+        containing_directory: &str,
+    ) -> Option<ResolvedModule> {
+        let roots = self.resolver.options.root_dirs.clone();
+        let normalized_containing = normalize_path(containing_directory);
+        let (_, suffix) = roots
+            .iter()
+            .filter_map(|root| {
+                let normalized_root = normalize_path(root);
+                path_suffix(&normalized_containing, &normalized_root)
+                    .map(|suffix| (normalized_root.len(), suffix.to_owned()))
+            })
+            .max_by_key(|(length, _)| *length)?;
+        for root in roots {
+            let candidate_directory = if suffix.is_empty() {
+                normalize_path(&root)
+            } else {
+                resolve_path(&root, &[&suffix])
+            };
+            let candidate = resolve_path(&candidate_directory, &[specifier]);
+            if let Some(resolved) = self.resolve_candidate(&candidate, false) {
+                return Some(resolved);
+            }
+        }
+        None
+    }
+
     fn resolve_node_modules(
         &mut self,
         specifier: &str,
@@ -127,6 +203,11 @@ impl<F: FileSystem + ?Sized> ResolutionState<'_, '_, F> {
             }
             let node_modules = join(&ancestor, "node_modules");
             let package_directory = join(&node_modules, package_name);
+            match self.resolve_package_metadata(&package_directory, rest) {
+                PackageMetadataResolution::Resolved(resolved) => return Some(resolved),
+                PackageMetadataResolution::Blocked => return None,
+                PackageMetadataResolution::NotApplicable => {}
+            }
             let candidate = if rest.is_empty() {
                 package_directory
             } else {
@@ -136,6 +217,75 @@ impl<F: FileSystem + ?Sized> ResolutionState<'_, '_, F> {
                 resolved.is_external_library_import = true;
                 return Some(resolved);
             }
+        }
+        None
+    }
+
+    fn resolve_package_metadata(
+        &mut self,
+        package_directory: &str,
+        rest: &str,
+    ) -> PackageMetadataResolution {
+        let package_json_path = join(package_directory, "package.json");
+        if !self.resolver.file_system.file_exists(&package_json_path) {
+            return PackageMetadataResolution::NotApplicable;
+        }
+        let Some(package) = self.read_package_json(&package_json_path) else {
+            return PackageMetadataResolution::NotApplicable;
+        };
+        if let Some(exports) = &package.exports
+            && matches!(
+                self.resolver.options.mode,
+                ResolutionMode::Node16 | ResolutionMode::NodeNext | ResolutionMode::Bundler
+            )
+        {
+            let key = if rest.is_empty() {
+                ".".to_owned()
+            } else {
+                format!("./{rest}")
+            };
+            let Some(target) =
+                package_export_target(exports, &key, self.resolver.options.prefer_types)
+            else {
+                return PackageMetadataResolution::Blocked;
+            };
+            let candidate = resolve_path(package_directory, &[target.trim_start_matches("./")]);
+            if let Some(mut resolved) =
+                self.resolve_candidate_with_package(&candidate, &package_json_path)
+            {
+                resolved.is_external_library_import = true;
+                return PackageMetadataResolution::Resolved(resolved);
+            }
+            return PackageMetadataResolution::Blocked;
+        }
+        if !rest.is_empty()
+            && let Some(types_versions) = &package.types_versions
+            && let Some(targets) = types_version_targets(types_versions, rest)
+        {
+            for target in targets {
+                let candidate = resolve_path(package_directory, &[&target]);
+                if let Some(mut resolved) =
+                    self.resolve_candidate_with_package(&candidate, &package_json_path)
+                {
+                    resolved.is_external_library_import = true;
+                    return PackageMetadataResolution::Resolved(resolved);
+                }
+            }
+            return PackageMetadataResolution::Blocked;
+        }
+        PackageMetadataResolution::NotApplicable
+    }
+
+    fn resolve_candidate_with_package(
+        &mut self,
+        candidate: &str,
+        package_json: &str,
+    ) -> Option<ResolvedModule> {
+        if let Some(resolved) = self.resolve_file(candidate, true, Some(package_json)) {
+            return Some(resolved);
+        }
+        if self.resolver.file_system.directory_exists(candidate) {
+            return self.resolve_index(candidate, true, Some(package_json));
         }
         None
     }
@@ -275,7 +425,118 @@ pub fn parse_package_json(contents: &str) -> serde_json::Result<PackageJson> {
         typings: string_field(&value, "typings"),
         main: string_field(&value, "main"),
         package_type: string_field(&value, "type"),
+        exports: value.get("exports").cloned(),
+        types_versions: value.get("typesVersions").cloned(),
     })
+}
+
+fn best_path_match(
+    paths: &BTreeMap<String, Vec<String>>,
+    specifier: &str,
+) -> Option<(String, Vec<String>)> {
+    paths
+        .iter()
+        .filter_map(|(pattern, substitutions)| {
+            match_pattern(pattern, specifier).map(|capture| {
+                (
+                    pattern.len().saturating_sub(1),
+                    capture,
+                    substitutions.as_slice(),
+                )
+            })
+        })
+        .max_by_key(|(specificity, _, _)| *specificity)
+        .map(|(_, capture, substitutions)| (capture.to_owned(), substitutions.to_vec()))
+}
+
+fn match_pattern<'a>(pattern: &str, value: &'a str) -> Option<&'a str> {
+    let Some(star) = pattern.find('*') else {
+        return (pattern == value).then_some("");
+    };
+    let (prefix, suffix_with_star) = pattern.split_at(star);
+    let suffix = &suffix_with_star[1..];
+    value
+        .strip_prefix(prefix)?
+        .strip_suffix(suffix)
+        .filter(|_| value.len() >= prefix.len() + suffix.len())
+}
+
+fn path_suffix<'a>(path: &'a str, root: &str) -> Option<&'a str> {
+    let suffix = path.strip_prefix(root)?;
+    if suffix.is_empty() {
+        Some("")
+    } else {
+        suffix.strip_prefix('/')
+    }
+}
+
+fn package_export_target(exports: &Value, key: &str, prefer_types: bool) -> Option<String> {
+    if let Some(object) = exports.as_object() {
+        if object.keys().any(|name| name.starts_with('.')) {
+            if let Some(value) = object.get(key) {
+                return select_export_condition(value, prefer_types).map(str::to_owned);
+            }
+            let (value, capture) = wildcard_export(object, key)?;
+            return select_export_condition(value, prefer_types)
+                .map(|target| target.replace('*', &capture));
+        }
+        return select_export_condition(exports, prefer_types).map(str::to_owned);
+    }
+    (key == ".")
+        .then(|| select_export_condition(exports, prefer_types))
+        .flatten()
+        .map(str::to_owned)
+}
+
+fn wildcard_export<'a>(
+    exports: &'a serde_json::Map<String, Value>,
+    key: &str,
+) -> Option<(&'a Value, String)> {
+    exports
+        .iter()
+        .filter_map(|(pattern, value)| {
+            match_pattern(pattern, key).map(|capture| (pattern.len(), value, capture))
+        })
+        .max_by_key(|(specificity, _, _)| *specificity)
+        .map(|(_, value, capture)| (value, capture.to_owned()))
+}
+
+fn select_export_condition(value: &Value, prefer_types: bool) -> Option<&str> {
+    if let Some(target) = value.as_str() {
+        return Some(target);
+    }
+    let object = value.as_object()?;
+    let conditions: &[&str] = if prefer_types {
+        &["types", "import", "require", "default"]
+    } else {
+        &["import", "require", "default", "types"]
+    };
+    conditions
+        .iter()
+        .find_map(|condition| object.get(*condition))
+        .and_then(|value| select_export_condition(value, prefer_types))
+}
+
+fn types_version_targets(types_versions: &Value, rest: &str) -> Option<Vec<String>> {
+    let versions = types_versions.as_object()?;
+    let mapping = versions
+        .get("*")
+        .or_else(|| versions.values().next())?
+        .as_object()?;
+    let (_, capture, targets) = mapping
+        .iter()
+        .filter_map(|(pattern, targets)| {
+            match_pattern(pattern, rest)
+                .map(|capture| (pattern.len().saturating_sub(1), capture, targets.as_array()))
+        })
+        .max_by_key(|(specificity, _, _)| *specificity)?;
+    Some(
+        targets?
+            .iter()
+            .filter_map(Value::as_str)
+            .map(|target| target.replace('*', capture))
+            .collect(),
+    )
 }
 
 fn string_field(value: &Value, field: &str) -> Option<String> {
@@ -471,6 +732,128 @@ mod tests {
                 .unwrap()
                 .extension,
             Some(FileExtension::Json)
+        );
+    }
+
+    #[test]
+    fn resolves_base_url_paths_with_wildcards_and_fallbacks() {
+        let fs = fs(&[
+            ("/repo/src/lib/exact.ts", ""),
+            ("/repo/generated/models/user.ts", ""),
+            ("/repo/src/plain.ts", ""),
+        ]);
+        let options = ResolutionOptions {
+            base_url: Some("/repo".into()),
+            paths: BTreeMap::from([
+                (
+                    "@lib/exact".into(),
+                    vec!["missing.ts".into(), "src/lib/exact".into()],
+                ),
+                ("@models/*".into(), vec!["generated/models/*".into()]),
+            ]),
+            ..ResolutionOptions::default()
+        };
+        let resolver = Resolver::new(&fs, options);
+        assert_eq!(
+            resolver
+                .resolve("@lib/exact", "/repo/app/main.ts")
+                .resolved
+                .unwrap()
+                .resolved_file_name,
+            "/repo/src/lib/exact.ts"
+        );
+        assert_eq!(
+            resolver
+                .resolve("@models/user", "/repo/app/main.ts")
+                .resolved
+                .unwrap()
+                .resolved_file_name,
+            "/repo/generated/models/user.ts"
+        );
+        assert_eq!(
+            resolver
+                .resolve("src/plain", "/repo/app/main.ts")
+                .resolved
+                .unwrap()
+                .resolved_file_name,
+            "/repo/src/plain.ts"
+        );
+    }
+
+    #[test]
+    fn resolves_relative_modules_across_root_dirs() {
+        let fs = fs(&[("/generated/views/template.ts", "")]);
+        let options = ResolutionOptions {
+            root_dirs: vec!["/src".into(), "/generated".into()],
+            ..ResolutionOptions::default()
+        };
+        let result = Resolver::new(&fs, options).resolve("./template", "/src/views/page.ts");
+        assert_eq!(
+            result.resolved.unwrap().resolved_file_name,
+            "/generated/views/template.ts"
+        );
+    }
+
+    #[test]
+    fn resolves_package_exports_and_types_conditions() {
+        let fs = fs(&[
+            (
+                "/app/node_modules/pkg/package.json",
+                r#"{"exports":{".":{"types":"./types/index.d.ts","default":"./dist/index.js"},"./features/*":{"types":"./types/features/*.d.ts","default":"./dist/features/*.js"}}}"#,
+            ),
+            ("/app/node_modules/pkg/types/index.d.ts", ""),
+            ("/app/node_modules/pkg/types/features/tool.d.ts", ""),
+            ("/app/node_modules/pkg/private.ts", ""),
+        ]);
+        let options = ResolutionOptions {
+            mode: ResolutionMode::NodeNext,
+            ..ResolutionOptions::default()
+        };
+        let resolver = Resolver::new(&fs, options);
+        assert_eq!(
+            resolver
+                .resolve("pkg", "/app/src/main.ts")
+                .resolved
+                .unwrap()
+                .resolved_file_name,
+            "/app/node_modules/pkg/types/index.d.ts"
+        );
+        assert_eq!(
+            resolver
+                .resolve("pkg/features/tool", "/app/src/main.ts")
+                .resolved
+                .unwrap()
+                .resolved_file_name,
+            "/app/node_modules/pkg/types/features/tool.d.ts"
+        );
+        assert!(
+            resolver
+                .resolve("pkg/private", "/app/src/main.ts")
+                .resolved
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn resolves_package_types_versions_subpaths() {
+        let fs = fs(&[
+            (
+                "/app/node_modules/pkg/package.json",
+                r#"{"typesVersions":{"*":{"feature/*":["types/feature/*"],"*":["types/*"]}}}"#,
+            ),
+            ("/app/node_modules/pkg/types/feature/tool.d.ts", ""),
+        ]);
+        let resolved = Resolver::new(&fs, ResolutionOptions::default())
+            .resolve("pkg/feature/tool", "/app/src/main.ts")
+            .resolved
+            .unwrap();
+        assert_eq!(
+            resolved.resolved_file_name,
+            "/app/node_modules/pkg/types/feature/tool.d.ts"
+        );
+        assert_eq!(
+            resolved.package_json.as_deref(),
+            Some("/app/node_modules/pkg/package.json")
         );
     }
 }

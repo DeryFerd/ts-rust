@@ -103,27 +103,42 @@ fn parse(path: Option<&String>) -> ExitCode {
         return ExitCode::from(2);
     };
     let result = ts_parser::parse_source_file(&source);
+    let line_starts = line_starts(&source);
     println!(
         "parsed {} AST nodes with {} diagnostics",
         result.arena.len(),
         result.diagnostics.len()
     );
     for diagnostic in result.diagnostics {
-        let (line, column) = line_and_column(&source, diagnostic.range.start.get());
+        let (line, column) = line_and_column(&source, &line_starts, diagnostic.range.start.get());
         println!("{path}({line},{column}): error: {}", diagnostic.message);
     }
     ExitCode::SUCCESS
 }
 
-fn line_and_column(source: &str, byte_position: u32) -> (usize, usize) {
+fn line_starts(source: &str) -> Vec<usize> {
+    let mut starts = vec![0];
+    starts.extend(
+        source
+            .bytes()
+            .enumerate()
+            .filter_map(|(index, byte)| (byte == b'\n').then_some(index + 1)),
+    );
+    starts
+}
+
+fn line_and_column(source: &str, line_starts: &[usize], byte_position: u32) -> (usize, usize) {
     let position = usize::try_from(byte_position)
         .unwrap_or(source.len())
         .min(source.len());
-    let prefix = &source[..position];
-    let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
-    let line_start = prefix.rfind(['\n', '\r']).map_or(0, |index| index + 1);
-    let column = prefix[line_start..].encode_utf16().count() + 1;
-    (line, column)
+    let line_index = line_starts
+        .partition_point(|line_start| *line_start <= position)
+        .saturating_sub(1);
+    let column = source[line_starts[line_index]..position]
+        .encode_utf16()
+        .count()
+        + 1;
+    (line_index + 1, column)
 }
 
 fn tokenize(path: Option<&String>) -> ExitCode {

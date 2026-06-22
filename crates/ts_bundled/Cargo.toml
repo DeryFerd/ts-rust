@@ -1,0 +1,12 @@
+[package]
+name = "ts_bundled"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[dependencies]
+ts_options = { path = "../ts_options" }
+
+[lints]
+workspace = true

@@ -196,6 +196,30 @@ impl ProjectConfig {
             .map(|path| resolve_extends_path(file_system, &self.path, path))
             .collect()
     }
+
+    /// Resolves project reference paths relative to this configuration file.
+    #[must_use]
+    pub fn resolved_references(&self, file_system: &dyn FileSystem) -> Vec<ProjectReference> {
+        let directory = config_directory(&self.path);
+        self.references
+            .iter()
+            .map(|reference| {
+                let mut path = if is_relative_path(&reference.path) {
+                    resolve_relative(directory, &reference.path)
+                } else {
+                    normalize_path(&reference.path)
+                };
+                if file_system.directory_exists(&path) {
+                    path = resolve_relative(&path, "tsconfig.json");
+                }
+                ProjectReference {
+                    path,
+                    prepend: reference.prepend,
+                    circular: reference.circular,
+                }
+            })
+            .collect()
+    }
 }
 
 /// Parses project configuration source text.
@@ -239,6 +263,157 @@ pub fn parse_config_file(
             )],
         },
     }
+}
+
+/// Loads a project configuration and recursively applies all `extends` bases.
+/// Later bases override earlier bases, and the leaf configuration overrides
+/// every base. Project references are intentionally not inherited. File,
+/// include, and exclude entries are normalized relative to the config file
+/// which declared them before merging.
+#[must_use]
+pub fn resolve_config_file(
+    file_system: &dyn FileSystem,
+    file_name: &str,
+) -> ParseResult<ProjectConfig> {
+    let mut state = ConfigResolutionState {
+        file_system,
+        stack: Vec::new(),
+        diagnostics: Vec::new(),
+    };
+    let value = state.resolve(&normalize_path(file_name));
+    ParseResult {
+        value,
+        diagnostics: state.diagnostics,
+    }
+}
+
+struct ConfigResolutionState<'a> {
+    file_system: &'a dyn FileSystem,
+    stack: Vec<String>,
+    diagnostics: Vec<ConfigDiagnostic>,
+}
+
+impl ConfigResolutionState<'_> {
+    fn resolve(&mut self, file_name: &str) -> Option<ProjectConfig> {
+        let file_name = normalize_path(file_name);
+        if let Some(index) = self.stack.iter().position(|path| path == &file_name) {
+            let mut cycle = self.stack[index..].to_vec();
+            cycle.push(file_name.clone());
+            self.diagnostics
+                .push(diagnostic(&file_name, 0, 18_000, [cycle.join(" -> ")]));
+            return None;
+        }
+        if !self.file_system.file_exists(&file_name) {
+            self.diagnostics
+                .push(diagnostic(&file_name, 0, 5_083, [file_name.clone()]));
+            return None;
+        }
+
+        self.stack.push(file_name.clone());
+        let parsed = parse_config_file(self.file_system, &file_name);
+        self.diagnostics.extend(parsed.diagnostics);
+        let Some(config) = parsed.value else {
+            self.stack.pop();
+            return None;
+        };
+        let config = resolve_config_patterns(config);
+
+        let mut merged = None;
+        if let Some(extends) = &config.extends {
+            for extends_path in extends.paths() {
+                let Some(base_path) =
+                    resolve_base_config_path(self.file_system, &config.path, extends_path)
+                else {
+                    self.diagnostics.push(diagnostic(
+                        &config.path,
+                        0,
+                        5_083,
+                        [extends_path.to_owned()],
+                    ));
+                    continue;
+                };
+                if let Some(base) = self.resolve(&base_path) {
+                    merged = Some(match merged {
+                        Some(previous) => merge_configs(previous, base),
+                        None => base,
+                    });
+                }
+            }
+        }
+        self.stack.pop();
+        Some(match merged {
+            Some(base) => merge_configs(base, config),
+            None => without_extends(config),
+        })
+    }
+}
+
+fn merge_configs(mut base: ProjectConfig, child: ProjectConfig) -> ProjectConfig {
+    let ProjectConfig {
+        path,
+        references,
+        include,
+        exclude,
+        files,
+        compiler_options,
+        raw,
+        ..
+    } = child;
+    if files.is_some() {
+        base.files = files;
+    }
+    if include.is_some() {
+        base.include = include;
+    }
+    if exclude.is_some() {
+        base.exclude = exclude;
+    }
+    base.compiler_options.extend(compiler_options);
+    base.raw.extend(raw);
+    base.path = path;
+    base.extends = None;
+    base.references = references;
+    base.raw.remove("extends");
+    base.raw.insert(
+        "compilerOptions".to_owned(),
+        JsonValue::Object(base.compiler_options.clone()),
+    );
+    base
+}
+
+fn without_extends(mut config: ProjectConfig) -> ProjectConfig {
+    config.extends = None;
+    config.raw.remove("extends");
+    config
+}
+
+fn resolve_config_patterns(mut config: ProjectConfig) -> ProjectConfig {
+    let directory = config_directory(&config.path);
+    for values in [&mut config.files, &mut config.include, &mut config.exclude]
+        .into_iter()
+        .flatten()
+    {
+        for value in values {
+            if !Path::new(value).is_absolute() {
+                *value = resolve_relative(directory, value);
+            }
+        }
+    }
+    if let Some(JsonValue::String(base_url)) = config.compiler_options.get_mut("baseUrl")
+        && !Path::new(base_url).is_absolute()
+    {
+        *base_url = resolve_relative(directory, base_url);
+    }
+    if let Some(JsonValue::Array(root_dirs)) = config.compiler_options.get_mut("rootDirs") {
+        for root_dir in root_dirs {
+            if let JsonValue::String(root_dir) = root_dir
+                && !Path::new(root_dir.as_str()).is_absolute()
+            {
+                *root_dir = resolve_relative(directory, root_dir);
+            }
+        }
+    }
+    config
 }
 
 fn parse_extends(value: &JsonValue) -> Option<Extends> {
@@ -311,6 +486,84 @@ fn resolve_extends_path(
     }
 }
 
+fn resolve_base_config_path(
+    file_system: &dyn FileSystem,
+    config_path: &str,
+    extends_path: &str,
+) -> Option<String> {
+    if is_relative_path(extends_path) || Path::new(extends_path).is_absolute() {
+        let candidate = if is_relative_path(extends_path) {
+            resolve_relative(config_directory(config_path), extends_path)
+        } else {
+            normalize_path(extends_path)
+        };
+        return existing_config_candidate(file_system, &candidate);
+    }
+
+    let mut directory = config_directory(config_path).to_owned();
+    loop {
+        let candidate = resolve_relative(&directory, &format!("node_modules/{extends_path}"));
+        if let Some(path) = existing_config_candidate(file_system, &candidate) {
+            return Some(path);
+        }
+        let parent = directory
+            .rsplit_once('/')
+            .map_or("", |(parent, _)| parent)
+            .to_owned();
+        if parent == directory || (parent.is_empty() && directory.is_empty()) {
+            break;
+        }
+        directory = parent;
+    }
+    None
+}
+
+fn existing_config_candidate(file_system: &dyn FileSystem, candidate: &str) -> Option<String> {
+    let candidate = normalize_path(candidate);
+    if file_system.file_exists(&candidate) {
+        return Some(candidate);
+    }
+    if Path::new(&candidate).extension().is_none() {
+        let json = format!("{candidate}.json");
+        if file_system.file_exists(&json) {
+            return Some(json);
+        }
+    }
+    if file_system.directory_exists(&candidate) {
+        let package_json = resolve_relative(&candidate, "package.json");
+        if file_system.file_exists(&package_json)
+            && let Ok(source) = file_system.read_file(&package_json)
+            && let Some(value) = parse_jsonc(&package_json, &source).value
+            && let Some(tsconfig) = value
+                .as_object()
+                .and_then(|object| object.get("tsconfig"))
+                .and_then(JsonValue::as_str)
+        {
+            let configured = resolve_relative(&candidate, tsconfig);
+            if file_system.file_exists(&configured) {
+                return Some(configured);
+            }
+        }
+        let tsconfig = resolve_relative(&candidate, "tsconfig.json");
+        if file_system.file_exists(&tsconfig) {
+            return Some(tsconfig);
+        }
+    }
+    None
+}
+
+fn config_directory(path: &str) -> &str {
+    path.rsplit_once('/').map_or("", |(directory, _)| directory)
+}
+
+fn resolve_relative(directory: &str, path: &str) -> String {
+    if directory.is_empty() {
+        normalize_path(path)
+    } else {
+        normalize_path(&format!("{directory}/{path}"))
+    }
+}
+
 fn is_relative_path(path: &str) -> bool {
     path == "." || path == ".." || path.starts_with("./") || path.starts_with("../")
 }
@@ -333,7 +586,9 @@ pub(crate) fn diagnostic(
 mod tests {
     use ts_vfs::{FileSystem, MemoryFileSystem};
 
-    use super::{Extends, JsonValue, parse_config_file, parse_config_text, parse_jsonc};
+    use super::{
+        Extends, JsonValue, parse_config_file, parse_config_text, parse_jsonc, resolve_config_file,
+    };
 
     #[test]
     fn parses_jsonc_project_fields_and_retains_compiler_option_types() {
@@ -504,5 +759,157 @@ mod tests {
             result.value.unwrap().resolved_extends(&file_system),
             ["base.json"]
         );
+    }
+
+    #[test]
+    fn resolves_extends_and_merges_leaf_over_base() {
+        let file_system = MemoryFileSystem::default();
+        file_system
+            .write_file(
+                "/repo/base.json",
+                r#"{
+                    "files": ["base.ts"],
+                    "include": ["base/**/*.ts"],
+                    "exclude": ["base/out"],
+                    "compilerOptions": { "strict": true, "target": "es2019" }
+                }"#,
+            )
+            .unwrap();
+        file_system
+            .write_file(
+                "/repo/app/tsconfig.json",
+                r#"{
+                    "extends": "../base",
+                    "include": ["src/**/*.ts"],
+                    "compilerOptions": { "target": "es2022", "noEmit": true }
+                }"#,
+            )
+            .unwrap();
+
+        let result = resolve_config_file(&file_system, "/repo/app/tsconfig.json");
+        assert!(result.is_ok(), "{:?}", result.diagnostics);
+        let config = result.value.unwrap();
+        assert_eq!(config.files.unwrap(), ["/repo/base.ts"]);
+        assert_eq!(config.include.unwrap(), ["/repo/app/src/**/*.ts"]);
+        assert_eq!(config.exclude.unwrap(), ["/repo/base/out"]);
+        assert_eq!(
+            config.compiler_options.get("strict"),
+            Some(&JsonValue::Bool(true))
+        );
+        assert_eq!(
+            config
+                .compiler_options
+                .get("target")
+                .and_then(JsonValue::as_str),
+            Some("es2022")
+        );
+        assert_eq!(
+            config.compiler_options.get("noEmit"),
+            Some(&JsonValue::Bool(true))
+        );
+        assert!(config.extends.is_none());
+    }
+
+    #[test]
+    fn applies_multiple_bases_left_to_right_and_supports_package_configs() {
+        let file_system = MemoryFileSystem::default();
+        file_system
+            .write_file(
+                "/repo/first.json",
+                r#"{"compilerOptions":{"target":"es2018","strict":true}}"#,
+            )
+            .unwrap();
+        file_system
+            .write_file(
+                "/repo/node_modules/preset/package.json",
+                r#"{"tsconfig":"config/base.json"}"#,
+            )
+            .unwrap();
+        file_system
+            .write_file(
+                "/repo/node_modules/preset/config/base.json",
+                r#"{"compilerOptions":{"target":"es2021","declaration":true}}"#,
+            )
+            .unwrap();
+        file_system
+            .write_file(
+                "/repo/app/tsconfig.json",
+                r#"{"extends":["../first","preset"],"files":[]}"#,
+            )
+            .unwrap();
+
+        let config = resolve_config_file(&file_system, "/repo/app/tsconfig.json")
+            .value
+            .unwrap();
+        assert_eq!(config.files, Some(Vec::new()));
+        assert_eq!(
+            config
+                .compiler_options
+                .get("target")
+                .and_then(JsonValue::as_str),
+            Some("es2021")
+        );
+        assert_eq!(
+            config.compiler_options.get("strict"),
+            Some(&JsonValue::Bool(true))
+        );
+        assert_eq!(
+            config.compiler_options.get("declaration"),
+            Some(&JsonValue::Bool(true))
+        );
+    }
+
+    #[test]
+    fn reports_missing_and_circular_base_configs() {
+        let file_system = MemoryFileSystem::default();
+        file_system
+            .write_file("/repo/a.json", r#"{"extends":["./b","./missing"]}"#)
+            .unwrap();
+        file_system
+            .write_file("/repo/b.json", r#"{"extends":"./a"}"#)
+            .unwrap();
+
+        let result = resolve_config_file(&file_system, "/repo/a.json");
+        assert!(result.value.is_some());
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(super::ConfigDiagnostic::code)
+                .collect::<Vec<_>>(),
+            [18_000, 5_083]
+        );
+        assert!(result.diagnostics[0].render().contains("/repo/a.json"));
+    }
+
+    #[test]
+    fn resolves_leaf_project_references_without_inheriting_base_references() {
+        let file_system = MemoryFileSystem::default();
+        file_system
+            .write_file(
+                "/repo/base.json",
+                r#"{"references":[{"path":"./base-project"}]}"#,
+            )
+            .unwrap();
+        file_system
+            .write_file(
+                "/repo/app/tsconfig.json",
+                r#"{"extends":"../base","references":[{"path":"../lib","prepend":true},{"path":"../types.json","circular":false}]}"#,
+            )
+            .unwrap();
+        file_system
+            .write_file("/repo/lib/tsconfig.json", "{}")
+            .unwrap();
+        file_system.write_file("/repo/types.json", "{}").unwrap();
+
+        let config = resolve_config_file(&file_system, "/repo/app/tsconfig.json")
+            .value
+            .unwrap();
+        let references = config.resolved_references(&file_system);
+        assert_eq!(references.len(), 2);
+        assert_eq!(references[0].path, "/repo/lib/tsconfig.json");
+        assert_eq!(references[0].prepend, Some(true));
+        assert_eq!(references[1].path, "/repo/types.json");
+        assert_eq!(references[1].circular, Some(false));
     }
 }
