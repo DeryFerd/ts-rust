@@ -423,7 +423,7 @@ fn compare_case_emitted_output_sections(
         }
         let name = normalize_section_name(&path);
         let basename = section_basename(&name);
-        let source = normalize_emitted_section(unit.source_text.as_scannable_str());
+        let source = normalize_declaration_input_section(unit.source_text.as_scannable_str());
         let candidates = [
             baseline_sections
                 .contains_key(&name)
@@ -991,6 +991,14 @@ fn normalize_emitted_section(text: &str) -> String {
         normalized.push('\n');
     }
     normalized
+}
+
+fn normalize_declaration_input_section(text: &str) -> String {
+    let normalized = normalize_emitted_section(text);
+    normalized
+        .strip_prefix('\n')
+        .unwrap_or(&normalized)
+        .to_owned()
 }
 
 /// One virtual source file declared by a fixture.
@@ -1563,6 +1571,59 @@ mod tests {
                 run.comparison.differences
             );
         }
+    }
+
+    #[test]
+    fn ignores_leading_separator_for_declaration_input_but_compares_generated_namesakes() {
+        let case = Case::parse(
+            "ambientRequireFunction.ts",
+            concat!(
+                "// @declaration: true\n",
+                "// @filename: node.d.ts\n",
+                "\n",
+                "declare function require(name: string): any;\n",
+                "// @filename: app.ts\n",
+                "export const value = 1;\n",
+            ),
+        )
+        .unwrap();
+        let baseline = concat!(
+            "//// [node.d.ts] ////\n",
+            "declare function require(name: string): any;\n",
+            "//// [app.d.ts] ////\n",
+            "export declare const value = 1;\n",
+        );
+        let outputs = BTreeMap::from([(
+            "/case/out/app.d.ts".into(),
+            "export declare const value = 1;\n".into(),
+        )]);
+        assert!(
+            compare_case_emitted_output_sections(
+                &outputs,
+                baseline,
+                &case,
+                &OptionVariant::default(),
+            )
+            .is_match()
+        );
+
+        let mut with_generated_namesake = outputs;
+        with_generated_namesake.insert(
+            "/case/out/nested/node.d.ts".into(),
+            "declare const generated: true;\n".into(),
+        );
+        let comparison = compare_case_emitted_output_sections(
+            &with_generated_namesake,
+            baseline,
+            &case,
+            &OptionVariant::default(),
+        );
+        assert_eq!(comparison.differences.len(), 1);
+        assert_eq!(comparison.differences[0].section, "out/nested/node.d.ts");
+        assert!(matches!(
+            comparison.differences[0].kind,
+            OutputDifferenceKind::Unexpected { .. }
+        ));
     }
 
     #[test]
