@@ -495,6 +495,7 @@ impl Program {
                         && ts_path::is_declaration_file(&source_file.file_name),
                     checker_options: CheckerOptions {
                         allow_unreachable_code: self.options.allow_unreachable_code,
+                        exact_optional_property_types: self.options.exact_optional_property_types,
                         no_fallthrough_cases_in_switch: self.options.no_fallthrough_cases_in_switch,
                         strict_null_checks: self.options.strict_null_checks,
                         no_implicit_any: self.options.no_implicit_any,
@@ -1955,6 +1956,55 @@ mod tests {
         .unwrap();
         let loose = Program::from_config(&fs, "/project/tsconfig.json");
         assert!(loose.diagnostics().is_empty(), "{:?}", loose.diagnostics());
+    }
+
+    #[test]
+    fn enforces_exact_optional_property_types_from_config() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/tsconfig.json",
+            r#"{
+                "files": ["main.ts"],
+                "compilerOptions": {
+                    "noLib": true,
+                    "strictNullChecks": true,
+                    "exactOptionalPropertyTypes": true
+                }
+            }"#,
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/main.ts",
+            "declare function take(value: { text?: string }): void; take({ text: undefined });",
+        )
+        .unwrap();
+        let program = Program::from_config(&fs, "/project/tsconfig.json");
+        assert_eq!(
+            program
+                .diagnostics()
+                .iter()
+                .filter_map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [2379]
+        );
+
+        fs.write_file(
+            "/project/tsconfig.json",
+            r#"{
+                "files": ["main.ts"],
+                "compilerOptions": { "noLib": true, "exactOptionalPropertyTypes": true }
+            }"#,
+        )
+        .unwrap();
+        let invalid = Program::from_config(&fs, "/project/tsconfig.json");
+        assert_eq!(
+            invalid
+                .diagnostics()
+                .iter()
+                .filter_map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [5052]
+        );
     }
 
     #[test]

@@ -90,6 +90,7 @@ pub struct CompilerOptions {
     pub declaration_map: bool,
     pub emit_declaration_only: bool,
     pub es_module_interop: bool,
+    pub exact_optional_property_types: bool,
     pub force_consistent_casing_in_file_names: bool,
     pub isolated_modules: bool,
     pub module_detection: ModuleDetectionKind,
@@ -140,6 +141,7 @@ impl Default for CompilerOptions {
             declaration_map: false,
             emit_declaration_only: false,
             es_module_interop: false,
+            exact_optional_property_types: false,
             force_consistent_casing_in_file_names: false,
             isolated_modules: false,
             module_detection: ModuleDetectionKind::Auto,
@@ -233,6 +235,9 @@ impl CompilerOptions {
                         self.allow_synthetic_default_imports =
                             overrides.allow_synthetic_default_imports;
                     }
+                }
+                "exactoptionalpropertytypes" => {
+                    self.exact_optional_property_types = overrides.exact_optional_property_types;
                 }
                 "forceconsistentcasinginfilenames" => {
                     self.force_consistent_casing_in_file_names =
@@ -412,6 +417,10 @@ pub fn parse_compiler_options_map(options: &BTreeMap<String, JsonValue>) -> Pars
             "esmoduleinterop" => {
                 parsed.es_module_interop = boolean(original_name, value, &mut diagnostics);
             }
+            "exactoptionalpropertytypes" => {
+                parsed.exact_optional_property_types =
+                    boolean(original_name, value, &mut diagnostics);
+            }
             "forceconsistentcasinginfilenames" => {
                 parsed.force_consistent_casing_in_file_names =
                     boolean(original_name, value, &mut diagnostics);
@@ -512,6 +521,7 @@ struct PartialOptions {
     declaration_map: Option<bool>,
     emit_declaration_only: Option<bool>,
     es_module_interop: Option<bool>,
+    exact_optional_property_types: Option<bool>,
     force_consistent_casing_in_file_names: Option<bool>,
     isolated_modules: Option<bool>,
     module_detection: Option<ModuleDetectionKind>,
@@ -574,6 +584,7 @@ impl PartialOptions {
             declaration_map: self.declaration_map.unwrap_or(false),
             emit_declaration_only,
             es_module_interop,
+            exact_optional_property_types: self.exact_optional_property_types.unwrap_or(false),
             force_consistent_casing_in_file_names: self
                 .force_consistent_casing_in_file_names
                 .unwrap_or(false),
@@ -635,6 +646,16 @@ fn validate_options(options: &PartialOptions, diagnostics: &mut Vec<Diagnostic>)
     }
     if options.no_lib == Some(true) && options.lib.is_some() {
         diagnostics.push(diagnostic(5053, ["lib", "noLib"]));
+    }
+    if options.exact_optional_property_types == Some(true)
+        && !options
+            .strict_null_checks
+            .unwrap_or(options.strict.unwrap_or(false))
+    {
+        diagnostics.push(diagnostic(
+            5052,
+            ["exactOptionalPropertyTypes", "strictNullChecks"],
+        ));
     }
 
     let (Some(module), Some(resolution)) = (options.module, options.module_resolution) else {
@@ -969,6 +990,53 @@ mod tests {
         assert!(result.options.isolated_modules);
         assert!(result.options.force_consistent_casing_in_file_names);
         assert_eq!(result.options.module_detection, ModuleDetectionKind::Force);
+    }
+
+    #[test]
+    fn parses_and_validates_exact_optional_property_types() {
+        let enabled = parse_compiler_options(&object([
+            ("strictNullChecks", JsonValue::Bool(true)),
+            ("exactOptionalPropertyTypes", JsonValue::Bool(true)),
+        ]));
+        assert!(enabled.is_ok(), "{:?}", enabled.diagnostics);
+        assert!(enabled.options.exact_optional_property_types);
+
+        let implied_by_strict = parse_compiler_options(&object([
+            ("strict", JsonValue::Bool(true)),
+            ("exactOptionalPropertyTypes", JsonValue::Bool(true)),
+        ]));
+        assert!(
+            implied_by_strict.is_ok(),
+            "{:?}",
+            implied_by_strict.diagnostics
+        );
+
+        let invalid = parse_compiler_options(&object([(
+            "exactOptionalPropertyTypes",
+            JsonValue::Bool(true),
+        )]));
+        assert_eq!(
+            invalid
+                .diagnostics
+                .iter()
+                .map(ts_diagnostics::Diagnostic::code)
+                .collect::<Vec<_>>(),
+            [5052]
+        );
+
+        let explicitly_disabled = parse_compiler_options(&object([
+            ("strict", JsonValue::Bool(true)),
+            ("strictNullChecks", JsonValue::Bool(false)),
+            ("exactOptionalPropertyTypes", JsonValue::Bool(true)),
+        ]));
+        assert_eq!(
+            explicitly_disabled
+                .diagnostics
+                .iter()
+                .map(ts_diagnostics::Diagnostic::code)
+                .collect::<Vec<_>>(),
+            [5052]
+        );
     }
 
     #[test]

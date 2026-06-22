@@ -326,6 +326,7 @@ pub struct CheckResult {
 #[allow(clippy::struct_excessive_bools)]
 pub struct CheckerOptions {
     pub allow_unreachable_code: Option<bool>,
+    pub exact_optional_property_types: bool,
     pub no_fallthrough_cases_in_switch: bool,
     pub strict_null_checks: bool,
     pub no_implicit_any: bool,
@@ -339,6 +340,7 @@ impl Default for CheckerOptions {
     fn default() -> Self {
         Self {
             allow_unreachable_code: None,
+            exact_optional_property_types: false,
             no_fallthrough_cases_in_switch: false,
             strict_null_checks: true,
             no_implicit_any: false,
@@ -1486,8 +1488,10 @@ impl<'a> Checker<'a> {
                             .unwrap_or_else(|| self.result.types.any());
                         if self.is_question_token(data.postfix_token) {
                             optional_properties.insert(name.clone());
-                            let undefined = self.result.types.undefined();
-                            property_type = self.result.types.union([property_type, undefined]);
+                            if !self.options.exact_optional_property_types {
+                                let undefined = self.result.types.undefined();
+                                property_type = self.result.types.union([property_type, undefined]);
+                            }
                         }
                         if self
                             .has_ast_modifier(data.modifiers.as_ref(), SyntaxKind::ReadonlyKeyword)
@@ -1502,8 +1506,10 @@ impl<'a> Checker<'a> {
                         let mut property_type = self.type_from_type_node(data.type_);
                         if self.is_question_token(data.postfix_token) {
                             optional_properties.insert(name.clone());
-                            let undefined = self.result.types.undefined();
-                            property_type = self.result.types.union([property_type, undefined]);
+                            if !self.options.exact_optional_property_types {
+                                let undefined = self.result.types.undefined();
+                                property_type = self.result.types.union([property_type, undefined]);
+                            }
                         }
                         if self
                             .has_ast_modifier(data.modifiers.as_ref(), SyntaxKind::ReadonlyKeyword)
@@ -1536,7 +1542,7 @@ impl<'a> Checker<'a> {
                             optional_properties.insert(name.clone());
                         }
                         self.insert_callable_property(&mut properties, name.clone(), method_type);
-                        if optional {
+                        if optional && !self.options.exact_optional_property_types {
                             let method = properties[&name];
                             let undefined = self.result.types.undefined();
                             properties.insert(name, self.result.types.union([method, undefined]));
@@ -1555,7 +1561,7 @@ impl<'a> Checker<'a> {
                             optional_properties.insert(name.clone());
                         }
                         self.insert_callable_property(&mut properties, name.clone(), method_type);
-                        if optional {
+                        if optional && !self.options.exact_optional_property_types {
                             let method = properties[&name];
                             let undefined = self.result.types.undefined();
                             properties.insert(name, self.result.types.union([method, undefined]));
@@ -1612,8 +1618,10 @@ impl<'a> Checker<'a> {
                 .unwrap_or_else(|| self.result.types.any());
             if self.is_question_token(data.question_token) {
                 optional_properties.insert(name.clone());
-                let undefined = self.result.types.undefined();
-                property_type = self.result.types.union([property_type, undefined]);
+                if !self.options.exact_optional_property_types {
+                    let undefined = self.result.types.undefined();
+                    property_type = self.result.types.union([property_type, undefined]);
+                }
             }
             if self.has_ast_modifier(data.modifiers.as_ref(), SyntaxKind::ReadonlyKeyword) {
                 readonly_properties.insert(name.clone());
@@ -2176,6 +2184,7 @@ impl<'a> Checker<'a> {
                     self.result.types.alloc(TypeKind::BooleanLiteral(false))
                 }
                 SyntaxKind::NullKeyword => self.result.types.null(),
+                SyntaxKind::UndefinedKeyword => self.result.types.undefined(),
                 _ => self.result.types.unknown(),
             },
             NodeData::Identifier(identifier) => self.identifier_type(node_id, &identifier.text),
@@ -2189,6 +2198,10 @@ impl<'a> Checker<'a> {
                     .arena
                     .get(data.operator_token)
                     .map_or(SyntaxKind::Unknown, |node| node.kind);
+                let assignment_target = (operator == SyntaxKind::EqualsToken)
+                    .then(|| self.assignment_target_type(data.left))
+                    .flatten()
+                    .unwrap_or(left);
                 if operator == SyntaxKind::EqualsToken
                     && let Some(symbol) = self.narrowing_subject(data.left)
                 {
@@ -2207,12 +2220,12 @@ impl<'a> Checker<'a> {
                     && let Some(name) = self.readonly_assignment_name(data.left)
                 {
                     self.error(node_id, 2540, [name]);
-                    if !self.is_assignable(right, left) {
-                        self.assignability_error(node_id, right, left);
+                    if !self.is_assignable(right, assignment_target) {
+                        self.assignability_error(node_id, right, assignment_target);
                     }
                     right
                 } else {
-                    self.check_binary(node_id, operator, left, right)
+                    self.check_binary(node_id, operator, assignment_target, right)
                 }
             }
             NodeData::ObjectLiteralExpression(data) => {
@@ -2248,6 +2261,11 @@ impl<'a> Checker<'a> {
                             self.type_of_expression_context(property_data.initializer, expected);
                         if let Some(expected) = expected
                             && !self.is_assignable(actual, expected)
+                            && !(self.options.exact_optional_property_types
+                                && contextual_object.as_ref().is_some_and(|object| {
+                                    object.optional_properties.contains(&name)
+                                        && self.type_includes_undefined(actual)
+                                }))
                         {
                             self.assignability_error(*property, actual, expected);
                         }
@@ -2586,13 +2604,13 @@ impl<'a> Checker<'a> {
     fn lookup_property_type(&mut self, receiver: TypeId, name: &str) -> Option<TypeId> {
         match self.result.types.get(receiver)?.kind.clone() {
             TypeKind::Any => Some(self.result.types.any()),
-            TypeKind::Object(object) => object.properties.get(name).copied(),
+            TypeKind::Object(object) => self.object_property_type(&object, name, true),
             TypeKind::Array(_) if name == "length" => Some(self.result.types.number()),
             TypeKind::Array(element) => {
                 let descriptor = self.external_names.get("Array")?.clone();
                 let array = self.import_alias(&descriptor, &[element]);
                 match self.result.types.get(array)?.kind.clone() {
-                    TypeKind::Object(object) => object.properties.get(name).copied(),
+                    TypeKind::Object(object) => self.object_property_type(&object, name, true),
                     _ => None,
                 }
             }
@@ -2617,6 +2635,59 @@ impl<'a> Checker<'a> {
                     .filter_map(|member| self.lookup_property_type(member, name))
                     .collect::<Vec<_>>();
                 (!properties.is_empty()).then(|| self.result.types.intersection(properties))
+            }
+            _ => None,
+        }
+    }
+
+    fn lookup_property_write_type(&mut self, receiver: TypeId, name: &str) -> Option<TypeId> {
+        match self.result.types.get(receiver)?.kind.clone() {
+            TypeKind::Any => Some(self.result.types.any()),
+            TypeKind::Object(object) => self.object_property_type(&object, name, false),
+            TypeKind::Union(members) => {
+                let properties = members
+                    .into_iter()
+                    .map(|member| self.lookup_property_write_type(member, name))
+                    .collect::<Option<Vec<_>>>()?;
+                Some(self.result.types.union(properties))
+            }
+            TypeKind::Intersection(members) => {
+                let properties = members
+                    .into_iter()
+                    .filter_map(|member| self.lookup_property_write_type(member, name))
+                    .collect::<Vec<_>>();
+                (!properties.is_empty()).then(|| self.result.types.intersection(properties))
+            }
+            _ => self.lookup_property_type(receiver, name),
+        }
+    }
+
+    fn object_property_type(
+        &mut self,
+        object: &ObjectType,
+        name: &str,
+        read: bool,
+    ) -> Option<TypeId> {
+        let property = object.properties.get(name).copied()?;
+        if read && object.optional_properties.contains(name) {
+            let undefined = self.result.types.undefined();
+            Some(self.result.types.union([property, undefined]))
+        } else {
+            Some(property)
+        }
+    }
+
+    fn assignment_target_type(&mut self, node: NodeId) -> Option<TypeId> {
+        match self.arena.get(node).map(|node| node.data.clone())? {
+            NodeData::PropertyAccessExpression(access) => {
+                let receiver = self.type_of_expression(access.expression);
+                let name = self.property_name(access.name)?;
+                self.lookup_property_write_type(receiver, &name)
+            }
+            NodeData::ElementAccessExpression(access) => {
+                let receiver = self.type_of_expression(access.expression);
+                let index = self.type_of_expression(access.argument_expression);
+                self.lookup_indexed_write_type(receiver, index)
             }
             _ => None,
         }
@@ -2682,7 +2753,7 @@ impl<'a> Checker<'a> {
             },
             TypeKind::Object(object_type) => match index_kind {
                 TypeKind::StringLiteral(name) | TypeKind::NumberLiteral(name) => {
-                    object_type.properties.get(&name).copied()
+                    self.object_property_type(&object_type, &name, true)
                 }
                 _ => None,
             },
@@ -2708,6 +2779,40 @@ impl<'a> Checker<'a> {
                 (!values.is_empty()).then(|| self.result.types.intersection(values))
             }
             _ => None,
+        }
+    }
+
+    fn lookup_indexed_write_type(&mut self, object: TypeId, index: TypeId) -> Option<TypeId> {
+        let index_kind = self.result.types.get(index)?.kind.clone();
+        if let TypeKind::Union(indices) = index_kind {
+            let values = indices
+                .into_iter()
+                .map(|index| self.lookup_indexed_write_type(object, index))
+                .collect::<Option<Vec<_>>>()?;
+            return Some(self.result.types.union(values));
+        }
+        match self.result.types.get(object)?.kind.clone() {
+            TypeKind::Object(object_type) => match index_kind {
+                TypeKind::StringLiteral(name) | TypeKind::NumberLiteral(name) => {
+                    self.object_property_type(&object_type, &name, false)
+                }
+                _ => None,
+            },
+            TypeKind::Union(members) => {
+                let values = members
+                    .into_iter()
+                    .map(|member| self.lookup_indexed_write_type(member, index))
+                    .collect::<Option<Vec<_>>>()?;
+                Some(self.result.types.union(values))
+            }
+            TypeKind::Intersection(members) => {
+                let values = members
+                    .into_iter()
+                    .filter_map(|member| self.lookup_indexed_write_type(member, index))
+                    .collect::<Vec<_>>();
+                (!values.is_empty()).then(|| self.result.types.intersection(values))
+            }
+            _ => self.lookup_indexed_type(object, index),
         }
     }
 
@@ -2789,9 +2894,14 @@ impl<'a> Checker<'a> {
             self.infer_type_parameters(*parameter, actual, &mut inference);
             let expected = self.substitute_type(*parameter, &inference);
             if !self.is_assignable(actual, expected) {
+                let code = if self.exact_optional_property_mismatch(actual, expected) {
+                    2379
+                } else {
+                    2345
+                };
                 self.error(
                     *argument,
-                    2345,
+                    code,
                     [
                         self.result.types.display(actual),
                         self.result.types.display(expected),
@@ -3545,10 +3655,16 @@ impl<'a> Checker<'a> {
                 Some(false) => false,
                 None => preserve_optional,
             };
-            if optional_modifier == Some(false) && preserve_optional {
+            if optional_modifier == Some(false)
+                && preserve_optional
+                && !self.options.exact_optional_property_types
+            {
                 property_type = self.without_undefined(property_type);
             }
-            if is_optional && !self.type_includes_undefined(property_type) {
+            if is_optional
+                && !self.options.exact_optional_property_types
+                && !self.type_includes_undefined(property_type)
+            {
                 let undefined = self.result.types.undefined();
                 property_type = self.result.types.union([property_type, undefined]);
             }
@@ -3815,6 +3931,30 @@ impl<'a> Checker<'a> {
                 .collect(),
             _ => Vec::new(),
         }
+    }
+
+    fn exact_optional_property_mismatch(&self, source: TypeId, target: TypeId) -> bool {
+        if !self.options.exact_optional_property_types {
+            return false;
+        }
+        let Some(Type {
+            kind: TypeKind::Object(target),
+            ..
+        }) = self.result.types.get(target)
+        else {
+            return false;
+        };
+        target.optional_properties.iter().any(|name| {
+            let Some(target_type) = target.properties.get(name) else {
+                return false;
+            };
+            self.property_types(source, name)
+                .into_iter()
+                .any(|source_type| {
+                    self.type_includes_undefined(source_type)
+                        && !self.is_assignable(source_type, *target_type)
+                })
+        })
     }
 
     #[allow(clippy::too_many_lines)]
@@ -5789,5 +5929,58 @@ mod tests {
             result.diagnostics[1].diagnostic.render().unwrap(),
             "Object literal may only specify known properties, and 'extra' does not exist in type '{ id: number; label: undefined | string; value: string }'."
         );
+    }
+
+    #[test]
+    fn enforces_exact_optional_property_write_types() {
+        let parsed = parse_source_file(
+            r#"
+                declare function take(value: { text?: string }): void;
+                take({ text: undefined });
+
+                declare let options: {
+                    text?: string;
+                    explicit?: string | undefined;
+                };
+                const read: string | undefined = options.text;
+                options.text = undefined;
+                options["text"] = undefined;
+                options.explicit = undefined;
+                options["explicit"] = undefined;
+            "#,
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let exact = check_source_file_with_options(
+            &parsed.arena,
+            parsed.source_file,
+            &bindings,
+            CheckerOptions {
+                exact_optional_property_types: true,
+                ..CheckerOptions::default()
+            },
+        );
+        assert_eq!(
+            exact
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2379, 2322, 2322],
+            "{:?}",
+            exact
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.render().unwrap())
+                .collect::<Vec<_>>()
+        );
+
+        let legacy = check_source_file_with_options(
+            &parsed.arena,
+            parsed.source_file,
+            &bindings,
+            CheckerOptions::default(),
+        );
+        assert!(legacy.diagnostics.is_empty(), "{:?}", legacy.diagnostics);
     }
 }

@@ -575,6 +575,7 @@ const SCALAR_OPTION_NAMES: &[&str] = &[
     "declarationDir",
     "emitDeclarationOnly",
     "esModuleInterop",
+    "exactOptionalPropertyTypes",
     "forceConsistentCasingInFileNames",
     "incremental",
     "inlineSourceMap",
@@ -1159,6 +1160,33 @@ mod tests {
             ]
         );
         assert_eq!(compile_case_matrix(&case).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn applies_exact_optional_property_types_directives() {
+        let case = Case::parse(
+            "exactOptionalPropertyTypesArgumentError.ts",
+            concat!(
+                "// @strictNullChecks: true\n",
+                "// @exactOptionalPropertyTypes: true\n",
+                "// @noEmit: true\n",
+                "declare function f(o: { y?: string }): void;\n",
+                "f({ y: undefined });\n",
+            ),
+        )
+        .unwrap();
+        let variants = expand_option_matrix(&case);
+        assert_eq!(variants.len(), 1);
+        assert_eq!(variants[0].values["exactOptionalPropertyTypes"], "true");
+        let compilation = compile_case(&case).unwrap();
+        assert_eq!(
+            compilation
+                .diagnostics
+                .iter()
+                .filter_map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [2379]
+        );
     }
 
     #[test]
