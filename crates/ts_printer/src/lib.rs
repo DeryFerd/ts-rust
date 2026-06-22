@@ -3102,18 +3102,24 @@ impl Printer<'_> {
         self.writer.newline();
         self.writer.indent += 1;
         let has_constructor = data.members.nodes.iter().any(|member| {
-            let Some(NodeData::MethodDeclaration(method)) =
-                self.arena.get(*member).map(|node| &node.data)
-            else {
+            let Some(node) = self.arena.get(*member) else {
                 return false;
             };
-            method.body.is_some() && self.is_constructor_name(method.name)
+            let NodeData::MethodDeclaration(method) = &node.data else {
+                return false;
+            };
+            !self.class_member_is_abstract(node)
+                && method.body.is_some()
+                && self.is_constructor_name(method.name)
         });
         if lower_fields && self.has_instance_field_initializers(data) && !has_constructor {
             self.emit_synthesized_native_constructor(data, has_base)?;
         }
-        for member in &data.members.nodes {
+        for (index, member) in data.members.nodes.iter().enumerate() {
             let node = self.node(*member)?.clone();
+            if self.class_member_is_abstract(&node) {
+                continue;
+            }
             match &node.data {
                 NodeData::MethodDeclaration(method) if method.body.is_some() => {
                     if lower_fields && self.is_constructor_name(method.name) {
@@ -3149,7 +3155,7 @@ impl Printer<'_> {
                     self.writer.write(";");
                     self.writer.newline();
                 }
-                NodeData::GetAccessorDeclaration(accessor) if accessor.body.is_some() => {
+                NodeData::GetAccessorDeclaration(accessor) => {
                     if self.has_modifier(accessor.modifiers.as_ref(), SyntaxKind::StaticKeyword) {
                         self.writer.write("static ");
                     }
@@ -3160,7 +3166,7 @@ impl Printer<'_> {
                     self.emit_accessor_body(accessor.body)?;
                     self.writer.newline();
                 }
-                NodeData::SetAccessorDeclaration(accessor) if accessor.body.is_some() => {
+                NodeData::SetAccessorDeclaration(accessor) => {
                     if self.has_modifier(accessor.modifiers.as_ref(), SyntaxKind::StaticKeyword) {
                         self.writer.write("static ");
                     }
@@ -3178,6 +3184,15 @@ impl Printer<'_> {
                 }
                 _ => return Err(Self::unsupported(*member, node.kind)),
             }
+            if Self::class_member_has_body(&node) {
+                let separator_end = data
+                    .members
+                    .nodes
+                    .get(index + 1)
+                    .and_then(|next| self.arena.get(*next))
+                    .map_or(data.members.range.end.get(), |next| next.range.start.get());
+                self.emit_class_empty_elements_between(node.range.end.get(), separator_end);
+            }
         }
         self.writer.indent -= 1;
         self.writer.write("}");
@@ -3193,10 +3208,10 @@ impl Printer<'_> {
         has_base: bool,
     ) -> Result<(), EmitError> {
         if has_base {
-            self.writer.write("constructor(...args) {");
+            self.writer.write("constructor() {");
             self.writer.newline();
             self.writer.indent += 1;
-            self.writer.write("super(...args);");
+            self.writer.write("super(...arguments);");
             self.writer.newline();
         } else {
             self.writer.write("constructor() {");
@@ -3312,6 +3327,9 @@ impl Printer<'_> {
         };
         for member in &data.members.nodes {
             let node = self.node(*member)?.clone();
+            if self.class_member_is_abstract(&node) {
+                continue;
+            }
             let NodeData::PropertyDeclaration(property) = &node.data else {
                 continue;
             };
@@ -3359,11 +3377,14 @@ impl Printer<'_> {
         }
 
         let constructor = data.members.nodes.iter().find_map(|member| {
-            let NodeData::MethodDeclaration(method) = &self.arena.get(*member)?.data else {
+            let node = self.arena.get(*member)?;
+            let NodeData::MethodDeclaration(method) = &node.data else {
                 return None;
             };
-            (method.body.is_some() && self.is_constructor_name(method.name))
-                .then_some(method.as_ref())
+            (!self.class_member_is_abstract(node)
+                && method.body.is_some()
+                && self.is_constructor_name(method.name))
+            .then_some(method.as_ref())
         });
         self.writer.write("function ");
         self.writer.write(&name);
@@ -3440,35 +3461,52 @@ impl Printer<'_> {
             self.writer.newline();
         }
 
-        for member in &data.members.nodes {
+        for (index, member) in data.members.nodes.iter().enumerate() {
             let node = self.node(*member)?.clone();
-            let NodeData::MethodDeclaration(method) = &node.data else {
-                continue;
-            };
-            if method.body.is_none() || self.is_constructor_name(method.name) {
-                continue;
+            if self.class_member_is_abstract(&node) {
+                // Abstract members have no runtime representation.
+            } else {
+                match &node.data {
+                    NodeData::MethodDeclaration(method)
+                        if method.body.is_some() && !self.is_constructor_name(method.name) =>
+                    {
+                        self.writer.write(&name);
+                        if !self.has_modifier(method.modifiers.as_ref(), SyntaxKind::StaticKeyword)
+                        {
+                            self.writer.write(".prototype");
+                        }
+                        self.emit_downlevel_member_access(method.name)?;
+                        self.writer.write(" = ");
+                        if self.has_modifier(method.modifiers.as_ref(), SyntaxKind::AsyncKeyword) {
+                            self.writer.write("async ");
+                        }
+                        self.writer.write("function");
+                        if method.asterisk_token.is_some() {
+                            self.writer.write("*");
+                        }
+                        self.writer.write(" ");
+                        self.emit_parameters(&method.parameters)?;
+                        self.writer.write(" ");
+                        self.emit_block(method.body.expect("body checked"))?;
+                        self.writer.write(";");
+                        self.writer.newline();
+                    }
+                    NodeData::GetAccessorDeclaration(_) | NodeData::SetAccessorDeclaration(_) => {
+                        self.emit_downlevel_accessor(data, &name, index)?;
+                    }
+                    _ => {}
+                }
             }
-            self.writer.write(&name);
-            if !self.has_modifier(method.modifiers.as_ref(), SyntaxKind::StaticKeyword) {
-                self.writer.write(".prototype");
+            if Self::class_member_has_body(&node) {
+                let separator_end = data
+                    .members
+                    .nodes
+                    .get(index + 1)
+                    .and_then(|next| self.arena.get(*next))
+                    .map_or(data.members.range.end.get(), |next| next.range.start.get());
+                self.emit_class_empty_elements_between(node.range.end.get(), separator_end);
             }
-            self.emit_downlevel_member_access(method.name)?;
-            self.writer.write(" = ");
-            if self.has_modifier(method.modifiers.as_ref(), SyntaxKind::AsyncKeyword) {
-                self.writer.write("async ");
-            }
-            self.writer.write("function");
-            if method.asterisk_token.is_some() {
-                self.writer.write("*");
-            }
-            self.writer.write(" ");
-            self.emit_parameters(&method.parameters)?;
-            self.writer.write(" ");
-            self.emit_block(method.body.expect("body checked"))?;
-            self.writer.write(";");
-            self.writer.newline();
         }
-        self.emit_downlevel_accessors(data, &name)?;
         self.emit_static_fields(data, &name)?;
         self.writer.write("return ");
         self.writer.write(&name);
@@ -3483,75 +3521,77 @@ impl Printer<'_> {
         Ok(())
     }
 
-    fn emit_downlevel_accessors(
+    fn emit_downlevel_accessor(
         &mut self,
         class: &ts_ast::ClassDeclarationData,
         class_name: &str,
+        index: usize,
     ) -> Result<(), EmitError> {
-        for (index, member) in class.members.nodes.iter().enumerate() {
-            let Some((_, name, is_static, key)) = self.accessor_info(*member) else {
+        let member = class.members.nodes[index];
+        let Some((_, name, is_static, key)) = self.accessor_info(member) else {
+            return Ok(());
+        };
+        if class.members.nodes[..index].iter().any(|previous| {
+            self.accessor_info(*previous)
+                .is_some_and(|(_, _, previous_static, previous_key)| {
+                    previous_static == is_static && previous_key == key
+                })
+        }) {
+            return Ok(());
+        }
+        let mut getter = None;
+        let mut setter = None;
+        for candidate in &class.members.nodes {
+            let Some((is_getter, _, candidate_static, candidate_key)) =
+                self.accessor_info(*candidate)
+            else {
                 continue;
             };
-            if class.members.nodes[..index].iter().any(|previous| {
-                self.accessor_info(*previous).is_some_and(
-                    |(_, _, previous_static, previous_key)| {
-                        previous_static == is_static && previous_key == key
-                    },
-                )
-            }) {
-                continue;
-            }
-            let mut getter = None;
-            let mut setter = None;
-            for candidate in &class.members.nodes {
-                let Some((is_getter, _, candidate_static, candidate_key)) =
-                    self.accessor_info(*candidate)
-                else {
-                    continue;
-                };
-                if candidate_static == is_static && candidate_key == key {
-                    if is_getter {
-                        getter = Some(*candidate);
-                    } else {
-                        setter = Some(*candidate);
-                    }
+            if candidate_static == is_static && candidate_key == key {
+                if is_getter {
+                    getter = Some(*candidate);
+                } else {
+                    setter = Some(*candidate);
                 }
             }
-            self.writer.write("Object.defineProperty(");
-            self.writer.write(class_name);
-            if !is_static {
-                self.writer.write(".prototype");
-            }
-            self.writer.write(", ");
-            self.emit_downlevel_property_name(name)?;
-            self.writer.write(", {");
-            self.writer.newline();
-            self.writer.indent += 1;
-            if let Some(getter) = getter {
-                self.writer.write("get: ");
-                self.emit_downlevel_accessor_function(getter)?;
-                self.writer.write(",");
-                self.writer.newline();
-            }
-            if let Some(setter) = setter {
-                self.writer.write("set: ");
-                self.emit_downlevel_accessor_function(setter)?;
-                self.writer.write(",");
-                self.writer.newline();
-            }
-            self.writer.write("enumerable: false,");
-            self.writer.newline();
-            self.writer.write("configurable: true");
-            self.writer.newline();
-            self.writer.indent -= 1;
-            self.writer.write("});");
+        }
+        self.writer.write("Object.defineProperty(");
+        self.writer.write(class_name);
+        if !is_static {
+            self.writer.write(".prototype");
+        }
+        self.writer.write(", ");
+        self.emit_downlevel_property_name(name)?;
+        self.writer.write(", {");
+        self.writer.newline();
+        self.writer.indent += 1;
+        if let Some(getter) = getter {
+            self.writer.write("get: ");
+            self.emit_downlevel_accessor_function(getter)?;
+            self.writer.write(",");
             self.writer.newline();
         }
+        if let Some(setter) = setter {
+            self.writer.write("set: ");
+            self.emit_downlevel_accessor_function(setter)?;
+            self.writer.write(",");
+            self.writer.newline();
+        }
+        self.writer.write("enumerable: false,");
+        self.writer.newline();
+        self.writer.write("configurable: true");
+        self.writer.newline();
+        self.writer.indent -= 1;
+        self.writer.write("});");
+        self.writer.newline();
         Ok(())
     }
 
     fn accessor_info(&self, id: NodeId) -> Option<(bool, NodeId, bool, String)> {
         let node = self.arena.get(id)?;
+        if self.class_member_is_abstract(node) {
+            return None;
+        }
         let (is_getter, name, modifiers) = match &node.data {
             NodeData::GetAccessorDeclaration(accessor) => {
                 (true, accessor.name, accessor.modifiers.as_ref())
@@ -3696,12 +3736,16 @@ impl Printer<'_> {
 
     fn has_instance_field_initializers(&self, data: &ts_ast::ClassDeclarationData) -> bool {
         data.members.nodes.iter().any(|member| {
-            matches!(
-                self.arena.get(*member).map(|node| &node.data),
-                Some(NodeData::PropertyDeclaration(property))
-                    if property.initializer.is_some()
-                        && !self.has_modifier(property.modifiers.as_ref(), SyntaxKind::StaticKeyword)
-            )
+            let Some(node) = self.arena.get(*member) else {
+                return false;
+            };
+            !self.class_member_is_abstract(node)
+                && matches!(
+                    &node.data,
+                    NodeData::PropertyDeclaration(property)
+                        if property.initializer.is_some()
+                            && !self.has_modifier(property.modifiers.as_ref(), SyntaxKind::StaticKeyword)
+                )
         })
     }
 
@@ -3712,6 +3756,9 @@ impl Printer<'_> {
     ) -> Result<(), EmitError> {
         for member in &data.members.nodes {
             let node = self.node(*member)?.clone();
+            if self.class_member_is_abstract(&node) {
+                continue;
+            }
             let NodeData::PropertyDeclaration(property) = &node.data else {
                 continue;
             };
@@ -3738,6 +3785,9 @@ impl Printer<'_> {
     ) -> Result<(), EmitError> {
         for member in &data.members.nodes {
             let node = self.node(*member)?.clone();
+            if self.class_member_is_abstract(&node) {
+                continue;
+            }
             let NodeData::PropertyDeclaration(property) = &node.data else {
                 continue;
             };
@@ -4314,6 +4364,56 @@ impl Printer<'_> {
                     .is_some_and(|node| node.kind == kind)
             })
         })
+    }
+
+    fn class_member_is_abstract(&self, node: &Node) -> bool {
+        let modifiers = match &node.data {
+            NodeData::MethodDeclaration(member) => member.modifiers.as_ref(),
+            NodeData::PropertyDeclaration(member) => member.modifiers.as_ref(),
+            NodeData::GetAccessorDeclaration(member) => member.modifiers.as_ref(),
+            NodeData::SetAccessorDeclaration(member) => member.modifiers.as_ref(),
+            _ => None,
+        };
+        self.has_modifier(modifiers, SyntaxKind::AbstractKeyword)
+    }
+
+    fn class_member_has_body(node: &Node) -> bool {
+        match &node.data {
+            NodeData::MethodDeclaration(member) => member.body.is_some(),
+            NodeData::GetAccessorDeclaration(member) => member.body.is_some(),
+            NodeData::SetAccessorDeclaration(member) => member.body.is_some(),
+            NodeData::ClassStaticBlockDeclaration(_) => true,
+            _ => false,
+        }
+    }
+
+    fn emit_class_empty_elements_between(&mut self, start: u32, end: u32) {
+        let start = usize::try_from(start).unwrap_or(usize::MAX);
+        let end = usize::try_from(end).unwrap_or(usize::MAX);
+        let Some(trivia) = self.source_text.get(start..end) else {
+            return;
+        };
+        let bytes = trivia.as_bytes();
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index..].starts_with(b"//") {
+                index = bytes[index..]
+                    .iter()
+                    .position(|byte| *byte == b'\n' || *byte == b'\r')
+                    .map_or(bytes.len(), |offset| index + offset);
+            } else if bytes[index..].starts_with(b"/*") {
+                index = bytes[index + 2..]
+                    .windows(2)
+                    .position(|window| window == b"*/")
+                    .map_or(bytes.len(), |offset| index + offset + 4);
+            } else {
+                if bytes[index] == b';' {
+                    self.writer.write(";");
+                    self.writer.newline();
+                }
+                index += 1;
+            }
+        }
     }
 
     fn emit_runtime_declaration_modifiers(&mut self, modifiers: Option<&ts_ast::ModifierList>) {
@@ -6393,6 +6493,19 @@ mod tests {
         assert_eq!(
             emit_with(source, ScriptTarget::Es5, ModuleKind::EsNext).code,
             "var C = /** @class */ (function () {\n    function C() {\n    }\n    Object.defineProperty(C.prototype, \"X\", {\n        get: function () { return 1; },\n        set: function (v) {\n            if (v === void 0) { v = 0; }\n        },\n        enumerable: false,\n        configurable: true\n    });\n    Object.defineProperty(C, \"Y\", {\n        get: function () { return 2; },\n        enumerable: false,\n        configurable: true\n    });\n    return C;\n}());\n"
+        );
+    }
+
+    #[test]
+    fn erases_abstract_members_and_preserves_concrete_accessor_halves() {
+        let source = "abstract class A { abstract prop: string; abstract get erased(): number; abstract get mixed(): number; set mixed(v: number) {} get recovered(): number; get paired() { return 1; } abstract set paired(v: number); }";
+        assert_eq!(
+            emit_with(source, ScriptTarget::Es2015, ModuleKind::EsNext).code,
+            "class A {\n    set mixed(v) { }\n    get recovered() { }\n    get paired() { return 1; }\n}\n"
+        );
+        assert_eq!(
+            emit_with(source, ScriptTarget::Es5, ModuleKind::EsNext).code,
+            "var A = /** @class */ (function () {\n    function A() {\n    }\n    Object.defineProperty(A.prototype, \"mixed\", {\n        set: function (v) { },\n        enumerable: false,\n        configurable: true\n    });\n    Object.defineProperty(A.prototype, \"recovered\", {\n        get: function () { },\n        enumerable: false,\n        configurable: true\n    });\n    Object.defineProperty(A.prototype, \"paired\", {\n        get: function () { return 1; },\n        enumerable: false,\n        configurable: true\n    });\n    return A;\n}());\n"
         );
     }
 
