@@ -57,6 +57,24 @@ pub struct ParseResult {
     pub arena: NodeArena,
     pub source_file: NodeId,
     pub diagnostics: Vec<Diagnostic>,
+    pub amd_dependencies: Vec<AmdDependency>,
+    pub amd_module_name: Option<String>,
+    pub amd_module_names: Vec<AmdModuleName>,
+}
+
+/// One leading `amd-dependency` triple-slash directive.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AmdDependency {
+    pub path: String,
+    pub name: Option<String>,
+    pub range: TextRange,
+}
+
+/// One leading `amd-module` triple-slash directive.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AmdModuleName {
+    pub name: String,
+    pub range: TextRange,
 }
 
 /// Result of parsing a standalone `JSDoc` comment.
@@ -77,6 +95,145 @@ pub fn parse_source_file(source: &str) -> ParseResult {
 #[must_use]
 pub fn parse_jsx_source_file(source: &str) -> ParseResult {
     Parser::new_with_variant(source, LanguageVariant::Jsx).parse_source_file()
+}
+
+fn parse_amd_pragmas(source: &str) -> (Vec<AmdDependency>, Vec<AmdModuleName>, Vec<Diagnostic>) {
+    let mut dependencies = Vec::new();
+    let mut module_names = Vec::new();
+    let mut diagnostics = Vec::new();
+    for range in leading_line_comment_ranges(source) {
+        let start = usize::try_from(range.start.get()).unwrap_or(usize::MAX);
+        let end = usize::try_from(range.end.get()).unwrap_or(usize::MAX);
+        let Some(comment) = source.get(start..end) else {
+            continue;
+        };
+        let Some(directive) = comment.strip_prefix("///").map(str::trim_start) else {
+            continue;
+        };
+        if let Some(attributes) = pragma_attributes(directive, "amd-dependency") {
+            if let Some(path) = pragma_attribute(&attributes, "path") {
+                dependencies.push(AmdDependency {
+                    path: path.to_owned(),
+                    name: pragma_attribute(&attributes, "name").map(str::to_owned),
+                    range,
+                });
+            }
+        } else if let Some(attributes) = pragma_attributes(directive, "amd-module")
+            && let Some(name) = pragma_attribute(&attributes, "name")
+        {
+            if !module_names.is_empty() {
+                diagnostics.push(diagnostic_with_code(range, 2458));
+            }
+            module_names.push(AmdModuleName {
+                name: name.to_owned(),
+                range,
+            });
+        }
+    }
+    (dependencies, module_names, diagnostics)
+}
+
+fn leading_line_comment_ranges(source: &str) -> Vec<TextRange> {
+    let bytes = source.as_bytes();
+    let mut ranges = Vec::new();
+    let mut position = if bytes.starts_with(&[0xef, 0xbb, 0xbf]) {
+        3
+    } else {
+        0
+    };
+    while position < bytes.len() {
+        while bytes.get(position).is_some_and(u8::is_ascii_whitespace) {
+            position += 1;
+        }
+        if bytes.get(position..position.saturating_add(2)) == Some(b"//") {
+            let start = position;
+            position += 2;
+            while bytes
+                .get(position)
+                .is_some_and(|byte| !matches!(byte, b'\r' | b'\n'))
+            {
+                position += 1;
+            }
+            ranges.push(text_range(start, position));
+            continue;
+        }
+        if bytes.get(position..position.saturating_add(2)) == Some(b"/*") {
+            position += 2;
+            while position < bytes.len()
+                && bytes.get(position..position.saturating_add(2)) != Some(b"*/")
+            {
+                position += 1;
+            }
+            position = position.saturating_add(2).min(bytes.len());
+            continue;
+        }
+        break;
+    }
+    ranges
+}
+
+fn pragma_attributes<'a>(directive: &'a str, name: &str) -> Option<Vec<(&'a str, &'a str)>> {
+    let body = directive.strip_prefix('<')?;
+    let body = body.strip_prefix(name)?;
+    if !body.as_bytes().first().is_some_and(u8::is_ascii_whitespace) {
+        return None;
+    }
+    let body = body.trim_end().strip_suffix("/>")?;
+    parse_pragma_attributes(body)
+}
+
+fn parse_pragma_attributes(mut text: &str) -> Option<Vec<(&str, &str)>> {
+    let mut attributes = Vec::new();
+    loop {
+        text = text.trim_start();
+        if text.is_empty() {
+            return Some(attributes);
+        }
+        let name_end = text
+            .find(|character: char| {
+                !(character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+            })
+            .unwrap_or(text.len());
+        if name_end == 0 {
+            return None;
+        }
+        let name = &text[..name_end];
+        text = text[name_end..].trim_start();
+        text = text.strip_prefix('=')?.trim_start();
+        let quote = text.chars().next()?;
+        if !matches!(quote, '\'' | '"') {
+            return None;
+        }
+        text = &text[quote.len_utf8()..];
+        let value_end = text.find(quote)?;
+        attributes.push((name, &text[..value_end]));
+        text = &text[value_end + quote.len_utf8()..];
+    }
+}
+
+fn pragma_attribute<'a>(attributes: &[(&'a str, &'a str)], name: &str) -> Option<&'a str> {
+    attributes
+        .iter()
+        .find_map(|(attribute, value)| (*attribute == name).then_some(*value))
+}
+
+fn text_range(start: usize, end: usize) -> TextRange {
+    TextRange::new(
+        TextPos::new(u32::try_from(start).unwrap_or(u32::MAX)),
+        TextPos::new(u32::try_from(end).unwrap_or(u32::MAX)),
+    )
+}
+
+fn diagnostic_with_code(range: TextRange, code: u32) -> Diagnostic {
+    let message = message_by_code(code).expect("parser diagnostic code exists");
+    Diagnostic::typescript(
+        range,
+        code,
+        parser_diagnostic_category(message.category()),
+        message
+            .format(&[])
+            .expect("parser diagnostic arguments match catalog message"),
+    )
 }
 
 /// Parse the text and tag names of a standalone `/** ... */` comment.
@@ -174,6 +331,8 @@ struct Parser<'a> {
     language_variant: LanguageVariant,
     arena: NodeArena,
     diagnostics: Vec<Diagnostic>,
+    amd_dependencies: Vec<AmdDependency>,
+    amd_module_names: Vec<AmdModuleName>,
 }
 
 impl<'a> Parser<'a> {
@@ -182,6 +341,7 @@ impl<'a> Parser<'a> {
     }
 
     fn new_with_variant(source: &'a str, variant: LanguageVariant) -> Self {
+        let (amd_dependencies, amd_module_names, diagnostics) = parse_amd_pragmas(source);
         let mut scanner = Scanner::new(source);
         scanner.set_language_variant(variant);
         let current = scanner.scan();
@@ -190,7 +350,9 @@ impl<'a> Parser<'a> {
             current,
             language_variant: variant,
             arena: NodeArena::new(),
-            diagnostics: Vec::new(),
+            diagnostics,
+            amd_dependencies,
+            amd_module_names,
         }
     }
 
@@ -226,6 +388,12 @@ impl<'a> Parser<'a> {
             arena: self.arena,
             source_file,
             diagnostics: self.diagnostics,
+            amd_dependencies: self.amd_dependencies,
+            amd_module_name: self
+                .amd_module_names
+                .last()
+                .map(|directive| directive.name.clone()),
+            amd_module_names: self.amd_module_names,
         }
     }
 
@@ -5357,6 +5525,84 @@ mod tests {
         NODE_FLAG_AWAIT_USING, NODE_FLAG_USING, ParseResult, parse_jsdoc_comment,
         parse_jsx_source_file, parse_source_file,
     };
+
+    #[test]
+    fn parses_leading_amd_pragmas_and_reports_duplicate_module_names() {
+        let source = concat!(
+            "\u{feff}/* header */\n",
+            "/// <reference path='types.d.ts' />\n",
+            "  /// <amd-dependency name = \"first\" path = 'alpha' />\r\n",
+            "///<amd-dependency path=\"beta\"/>\n",
+            "///<amd-module name='First'/>\n",
+            "/// <amd-module name = \"Second\" />\n",
+            "const value = 1;\n",
+            "///<amd-dependency path='late'/>\n",
+        );
+        let result = parse_source_file(source);
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .filter_map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [2458]
+        );
+        assert_eq!(
+            result
+                .amd_dependencies
+                .iter()
+                .map(|dependency| (dependency.path.as_str(), dependency.name.as_deref()))
+                .collect::<Vec<_>>(),
+            [("alpha", Some("first")), ("beta", None)]
+        );
+        assert_eq!(
+            result
+                .amd_module_names
+                .iter()
+                .map(|directive| directive.name.as_str())
+                .collect::<Vec<_>>(),
+            ["First", "Second"]
+        );
+        assert_eq!(result.amd_module_name.as_deref(), Some("Second"));
+        assert_eq!(
+            result.diagnostics[0].range,
+            result.amd_module_names[1].range
+        );
+
+        for range in result
+            .amd_dependencies
+            .iter()
+            .map(|dependency| dependency.range)
+            .chain(
+                result
+                    .amd_module_names
+                    .iter()
+                    .map(|directive| directive.range),
+            )
+        {
+            let start = usize::try_from(range.start.get()).unwrap();
+            let end = usize::try_from(range.end.get()).unwrap();
+            assert!(source[start..end].starts_with("///"));
+            assert!(!source[start..end].contains('\n'));
+            assert!(!source[start..end].contains('\r'));
+        }
+    }
+
+    #[test]
+    fn ignores_malformed_and_non_leading_amd_pragmas() {
+        let source = concat!(
+            "///<amd-dependency name='missing-path'/>\n",
+            "///<amd-module />\n",
+            "const value = 1;\n",
+            "///<amd-dependency path='late'/>\n",
+            "///<amd-module name='Late'/>\n",
+        );
+        let result = parse_source_file(source);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert!(result.amd_dependencies.is_empty());
+        assert!(result.amd_module_names.is_empty());
+        assert!(result.amd_module_name.is_none());
+    }
 
     #[test]
     fn parses_variable_types_and_binary_precedence() {
