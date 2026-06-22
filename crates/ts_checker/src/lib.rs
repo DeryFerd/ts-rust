@@ -699,6 +699,7 @@ struct Checker<'a> {
     type_parameter_scopes: Vec<HashMap<String, TypeId>>,
     local_scopes: Vec<HashMap<String, TypeId>>,
     narrowings: Vec<HashMap<SymbolId, TypeId>>,
+    flow_types: HashMap<SymbolId, TypeId>,
     alias_stack: Vec<SymbolId>,
     external_symbols: HashMap<SymbolId, TypeDescriptor>,
     external_names: BTreeMap<String, TypeDescriptor>,
@@ -732,6 +733,7 @@ impl<'a> Checker<'a> {
             type_parameter_scopes: Vec::new(),
             local_scopes: Vec::new(),
             narrowings: Vec::new(),
+            flow_types: HashMap::new(),
             alias_stack: Vec::new(),
             external_symbols: HashMap::new(),
             external_names: BTreeMap::new(),
@@ -863,8 +865,13 @@ impl<'a> Checker<'a> {
                 }
             }
             NodeData::Block(data) => {
+                let mut terminated = false;
                 for statement in &data.statements.nodes {
+                    if terminated {
+                        self.error(*statement, 7027, std::iter::empty());
+                    }
                     self.check_node(*statement, expected_return, saw_return);
+                    terminated |= self.statement_definitely_terminates(*statement);
                 }
             }
             NodeData::ModuleBlock(data) => {
@@ -921,16 +928,61 @@ impl<'a> Checker<'a> {
             }
             NodeData::IfStatement(data) => {
                 self.type_of_expression(data.expression);
+                let before = self.flow_types.clone();
                 let then_narrowing = self.condition_narrowing(data.expression, true);
                 self.narrowings.push(then_narrowing);
                 self.check_node(data.then_statement, expected_return, saw_return);
                 self.narrowings.pop();
+                let then_flow = self.flow_types.clone();
+                self.flow_types.clone_from(&before);
                 if let Some(else_statement) = data.else_statement {
                     let else_narrowing = self.condition_narrowing(data.expression, false);
                     self.narrowings.push(else_narrowing);
                     self.check_node(else_statement, expected_return, saw_return);
                     self.narrowings.pop();
                 }
+                let else_flow = self.flow_types.clone();
+                self.flow_types = self.join_flow_types(&then_flow, &else_flow);
+                let then_terminates = self.statement_definitely_terminates(data.then_statement);
+                let else_terminates = data
+                    .else_statement
+                    .is_some_and(|statement| self.statement_definitely_terminates(statement));
+                if then_terminates && !else_terminates {
+                    let narrowing = self.condition_narrowing(data.expression, false);
+                    self.flow_types.extend(narrowing);
+                } else if else_terminates && !then_terminates {
+                    let narrowing = self.condition_narrowing(data.expression, true);
+                    self.flow_types.extend(narrowing);
+                }
+            }
+            NodeData::WhileStatement(data) => {
+                self.type_of_expression(data.expression);
+                let before = self.flow_types.clone();
+                let narrowing = self.condition_narrowing(data.expression, true);
+                self.narrowings.push(narrowing);
+                self.check_node(data.statement, expected_return, saw_return);
+                self.narrowings.pop();
+                let after = self.flow_types.clone();
+                self.flow_types = self.join_flow_types(&before, &after);
+            }
+            NodeData::ForStatement(data) => {
+                if let Some(initializer) = data.initializer {
+                    self.check_node(initializer, expected_return, saw_return);
+                    self.type_of_expression(initializer);
+                }
+                if let Some(condition) = data.condition {
+                    self.type_of_expression(condition);
+                }
+                let before = self.flow_types.clone();
+                self.check_node(data.statement, expected_return, saw_return);
+                if let Some(incrementor) = data.incrementor {
+                    self.type_of_expression(incrementor);
+                }
+                let after = self.flow_types.clone();
+                self.flow_types = self.join_flow_types(&before, &after);
+            }
+            NodeData::SwitchStatement(data) => {
+                self.check_switch(data, expected_return, saw_return);
             }
             NodeData::ReturnStatement(data) => {
                 *saw_return = true;
@@ -957,6 +1009,205 @@ impl<'a> Checker<'a> {
                 }
             }
         }
+    }
+
+    fn join_flow_types(
+        &mut self,
+        left: &HashMap<SymbolId, TypeId>,
+        right: &HashMap<SymbolId, TypeId>,
+    ) -> HashMap<SymbolId, TypeId> {
+        let mut symbols = left.keys().chain(right.keys()).copied().collect::<Vec<_>>();
+        symbols.sort_by_key(|symbol| symbol.0);
+        symbols.dedup();
+        symbols
+            .into_iter()
+            .map(|symbol| {
+                let original = self
+                    .result
+                    .symbol_types
+                    .get(&symbol)
+                    .copied()
+                    .unwrap_or_else(|| self.result.types.any());
+                let left = left.get(&symbol).copied().unwrap_or(original);
+                let right = right.get(&symbol).copied().unwrap_or(original);
+                (symbol, self.result.types.union([left, right]))
+            })
+            .collect()
+    }
+
+    fn statement_definitely_terminates(&self, statement: NodeId) -> bool {
+        let Some(node) = self.arena.get(statement) else {
+            return false;
+        };
+        match &node.data {
+            NodeData::ReturnStatement(_) | NodeData::ThrowStatement(_) => true,
+            NodeData::Block(block) => block
+                .statements
+                .nodes
+                .iter()
+                .any(|statement| self.statement_definitely_terminates(*statement)),
+            NodeData::IfStatement(statement) => statement.else_statement.is_some_and(|other| {
+                self.statement_definitely_terminates(statement.then_statement)
+                    && self.statement_definitely_terminates(other)
+            }),
+            NodeData::WhileStatement(statement) => {
+                self.expression_is_always_truthy(statement.expression)
+            }
+            NodeData::SwitchStatement(statement) => {
+                let Some(NodeData::CaseBlock(block)) =
+                    self.arena.get(statement.case_block).map(|node| &node.data)
+                else {
+                    return false;
+                };
+                let has_default = block.clauses.nodes.iter().any(|clause| {
+                    self.arena
+                        .get(*clause)
+                        .is_some_and(|node| node.kind == SyntaxKind::DefaultClause)
+                });
+                (has_default || self.switch_is_exhaustive(statement))
+                    && !block.clauses.nodes.is_empty()
+                    && block.clauses.nodes.iter().all(|clause| {
+                        let Some(NodeData::CaseOrDefaultClause(clause)) =
+                            self.arena.get(*clause).map(|node| &node.data)
+                        else {
+                            return false;
+                        };
+                        clause
+                            .statements
+                            .nodes
+                            .iter()
+                            .any(|statement| self.statement_definitely_terminates(*statement))
+                    })
+            }
+            _ => false,
+        }
+    }
+
+    fn expression_is_always_truthy(&self, expression: NodeId) -> bool {
+        let Some(node) = self.arena.get(expression) else {
+            return false;
+        };
+        match &node.data {
+            NodeData::KeywordExpression(_) => node.kind == SyntaxKind::TrueKeyword,
+            NodeData::NumericLiteral(value) => value.text != "0",
+            _ => false,
+        }
+    }
+
+    fn switch_is_exhaustive(&self, statement: &ts_ast::SwitchStatementData) -> bool {
+        let Some(subject) = self.result.node_types.get(&statement.expression).copied() else {
+            return false;
+        };
+        let Some(NodeData::CaseBlock(block)) =
+            self.arena.get(statement.case_block).map(|node| &node.data)
+        else {
+            return false;
+        };
+        let cases = block
+            .clauses
+            .nodes
+            .iter()
+            .filter_map(|clause| {
+                let node = self.arena.get(*clause)?;
+                if node.kind == SyntaxKind::DefaultClause {
+                    return None;
+                }
+                let NodeData::CaseOrDefaultClause(clause) = &node.data else {
+                    return None;
+                };
+                self.result.node_types.get(&clause.expression).copied()
+            })
+            .collect::<Vec<_>>();
+        self.union_members(subject).iter().all(|member| {
+            cases.iter().any(|case| {
+                self.is_assignable(*member, *case) && self.is_assignable(*case, *member)
+            })
+        })
+    }
+
+    fn check_switch(
+        &mut self,
+        data: &ts_ast::SwitchStatementData,
+        expected_return: Option<TypeId>,
+        saw_return: &mut bool,
+    ) {
+        let subject_type = self.type_of_expression(data.expression);
+        let subject = self.narrowing_subject(data.expression);
+        let property_subject = self.property_narrowing_subject(data.expression);
+        let Some(NodeData::CaseBlock(block)) = self
+            .arena
+            .get(data.case_block)
+            .map(|node| node.data.clone())
+        else {
+            return;
+        };
+        let before = self.flow_types.clone();
+        let mut exits = Vec::new();
+        let mut case_types = Vec::new();
+        let mut has_default = false;
+        for clause_id in block.clauses.nodes {
+            let Some(clause_node) = self.arena.get(clause_id).cloned() else {
+                continue;
+            };
+            let NodeData::CaseOrDefaultClause(clause) = clause_node.data else {
+                continue;
+            };
+            self.flow_types.clone_from(&before);
+            let mut narrowing = HashMap::new();
+            if clause_node.kind == SyntaxKind::DefaultClause {
+                has_default = true;
+            } else {
+                let case_type = self.type_of_expression(clause.expression);
+                case_types.push(case_type);
+                if let Some(subject) = subject {
+                    let narrowed = self.narrow_to_comparison(subject, case_type, true);
+                    narrowing.insert(subject, narrowed);
+                } else if let Some((subject, ref property)) = property_subject {
+                    let narrowed = self.narrow_discriminant(subject, property, case_type, true);
+                    narrowing.insert(subject, narrowed);
+                }
+            }
+            self.narrowings.push(narrowing);
+            let mut terminated = false;
+            for statement in clause.statements.nodes {
+                if terminated {
+                    self.error(statement, 7027, std::iter::empty());
+                }
+                self.check_node(statement, expected_return, saw_return);
+                terminated |= self.statement_definitely_terminates(statement);
+            }
+            self.narrowings.pop();
+            exits.push(self.flow_types.clone());
+        }
+        let exhaustive = has_default
+            || self.union_members(subject_type).iter().all(|member| {
+                case_types.iter().any(|case| {
+                    self.is_assignable(*member, *case) && self.is_assignable(*case, *member)
+                })
+            });
+        if !exhaustive {
+            exits.push(before.clone());
+        }
+        self.flow_types = exits
+            .into_iter()
+            .reduce(|left, right| self.join_flow_types(&left, &right))
+            .unwrap_or(before);
+    }
+
+    fn narrow_to_comparison(
+        &mut self,
+        subject: SymbolId,
+        comparison: TypeId,
+        include_match: bool,
+    ) -> TypeId {
+        let original = self.current_symbol_type(subject);
+        let members = self.union_members(original);
+        let filtered = members.into_iter().filter(|member| {
+            let matches =
+                self.is_assignable(*member, comparison) && self.is_assignable(comparison, *member);
+            matches == include_match
+        });
+        self.result.types.union(filtered.collect::<Vec<_>>())
     }
 
     fn check_function(&mut self, node_id: NodeId, data: &ts_ast::FunctionDeclarationData) {
@@ -1009,7 +1260,9 @@ impl<'a> Checker<'a> {
         }
         self.local_scopes.pop();
         if data.body.is_some()
-            && !saw_return
+            && !data
+                .body
+                .is_some_and(|body| self.statement_definitely_terminates(body))
             && !matches!(
                 self.result.types.get(return_type).map(|value| &value.kind),
                 Some(TypeKind::Any | TypeKind::Void | TypeKind::Undefined)
@@ -1298,14 +1551,32 @@ impl<'a> Checker<'a> {
         scope
     }
 
+    #[allow(clippy::too_many_lines)]
     fn condition_narrowing(
         &mut self,
         expression: NodeId,
         truthy: bool,
     ) -> HashMap<SymbolId, TypeId> {
-        let mut result = HashMap::new();
-        let Some(NodeData::BinaryExpression(binary)) =
+        if let Some(NodeData::ParenthesizedExpression(parenthesized)) =
             self.arena.get(expression).map(|node| &node.data)
+        {
+            return self.condition_narrowing(parenthesized.expression, truthy);
+        }
+        if let Some(NodeData::PrefixUnaryExpression(prefix)) =
+            self.arena.get(expression).map(|node| &node.data)
+            && prefix.operator == SyntaxKind::ExclamationToken
+        {
+            return self.condition_narrowing(prefix.operand, !truthy);
+        }
+        let mut result = HashMap::new();
+        if let Some(subject) = self.narrowing_subject(expression) {
+            let original = self.current_symbol_type(subject);
+            let narrowed = self.narrow_truthiness(original, truthy);
+            result.insert(subject, narrowed);
+            return result;
+        }
+        let Some(NodeData::BinaryExpression(binary)) =
+            self.arena.get(expression).map(|node| node.data.clone())
         else {
             return result;
         };
@@ -1313,6 +1584,34 @@ impl<'a> Checker<'a> {
             .arena
             .get(binary.operator_token)
             .map_or(SyntaxKind::Unknown, |node| node.kind);
+        if operator == SyntaxKind::InKeyword {
+            let Some(property) = self.literal_expression_name(binary.left) else {
+                return result;
+            };
+            let Some(subject) = self.narrowing_subject(binary.right) else {
+                return result;
+            };
+            let narrowed = self.narrow_by_property(subject, &property, truthy);
+            result.insert(subject, narrowed);
+            return result;
+        }
+        if operator == SyntaxKind::InstanceOfKeyword {
+            let Some(subject) = self.narrowing_subject(binary.left) else {
+                return result;
+            };
+            let Some(name) = self.property_name(binary.right) else {
+                return result;
+            };
+            let Some(target_symbol) = self.resolve_identifier(binary.right, &name) else {
+                return result;
+            };
+            let Some(target) = self.result.symbol_types.get(&target_symbol).copied() else {
+                return result;
+            };
+            let narrowed = self.narrow_by_assignability(subject, target, truthy);
+            result.insert(subject, narrowed);
+            return result;
+        }
         let equality = matches!(
             operator,
             SyntaxKind::EqualsEqualsToken | SyntaxKind::EqualsEqualsEqualsToken
@@ -1325,6 +1624,18 @@ impl<'a> Checker<'a> {
             return result;
         }
         let include_match = if inequality { !truthy } else { truthy };
+        if let Some((subject, property)) = self.property_narrowing_subject(binary.left) {
+            let comparison = self.type_of_expression(binary.right);
+            let narrowed = self.narrow_discriminant(subject, &property, comparison, include_match);
+            result.insert(subject, narrowed);
+            return result;
+        }
+        if let Some((subject, property)) = self.property_narrowing_subject(binary.right) {
+            let comparison = self.type_of_expression(binary.left);
+            let narrowed = self.narrow_discriminant(subject, &property, comparison, include_match);
+            result.insert(subject, narrowed);
+            return result;
+        }
         let (subject, comparison) = match (
             self.narrowing_subject(binary.left),
             self.narrowing_comparison(binary.right),
@@ -1338,9 +1649,7 @@ impl<'a> Checker<'a> {
                 _ => return result,
             },
         };
-        let Some(original) = self.result.symbol_types.get(&subject).copied() else {
-            return result;
-        };
+        let original = self.current_symbol_type(subject);
         let loose_null = matches!(
             operator,
             SyntaxKind::EqualsEqualsToken | SyntaxKind::ExclamationEqualsToken
@@ -1357,6 +1666,117 @@ impl<'a> Checker<'a> {
         });
         result.insert(subject, narrowed);
         result
+    }
+
+    fn current_symbol_type(&self, symbol: SymbolId) -> TypeId {
+        self.flow_types
+            .get(&symbol)
+            .or_else(|| self.result.symbol_types.get(&symbol))
+            .copied()
+            .unwrap_or_else(|| self.result.types.any())
+    }
+
+    fn is_truthy_type(kind: &TypeKind) -> bool {
+        match kind {
+            TypeKind::Undefined | TypeKind::Null | TypeKind::BooleanLiteral(false) => false,
+            TypeKind::NumberLiteral(value) => value != "0",
+            TypeKind::StringLiteral(value) => !value.is_empty(),
+            _ => true,
+        }
+    }
+
+    fn narrow_truthiness(&mut self, original: TypeId, truthy: bool) -> TypeId {
+        let mut filtered = Vec::new();
+        for member in self.union_members(original) {
+            match self.result.types.get(member).unwrap().kind.clone() {
+                TypeKind::Boolean => {
+                    filtered.push(self.result.types.alloc(TypeKind::BooleanLiteral(truthy)));
+                }
+                TypeKind::Number | TypeKind::String | TypeKind::BigInt => filtered.push(member),
+                kind if Self::is_truthy_type(&kind) == truthy => filtered.push(member),
+                _ => {}
+            }
+        }
+        self.result.types.union(filtered)
+    }
+
+    fn property_narrowing_subject(&self, node: NodeId) -> Option<(SymbolId, String)> {
+        let NodeData::PropertyAccessExpression(access) = &self.arena.get(node)?.data else {
+            return None;
+        };
+        let subject = self.narrowing_subject(access.expression)?;
+        Some((subject, self.property_name(access.name)?))
+    }
+
+    fn literal_expression_name(&self, node: NodeId) -> Option<String> {
+        match &self.arena.get(node)?.data {
+            NodeData::StringLiteral(value) => Some(value.text.clone()),
+            NodeData::NumericLiteral(value) => Some(value.text.clone()),
+            _ => None,
+        }
+    }
+
+    fn narrow_discriminant(
+        &mut self,
+        subject: SymbolId,
+        property: &str,
+        comparison: TypeId,
+        include_match: bool,
+    ) -> TypeId {
+        let original = self.current_symbol_type(subject);
+        let members = self.union_members(original);
+        let filtered = members
+            .into_iter()
+            .filter(|member| {
+                let matches =
+                    self.lookup_property_type(*member, property)
+                        .is_some_and(|property_type| {
+                            self.is_assignable(property_type, comparison)
+                                && self.is_assignable(comparison, property_type)
+                        });
+                matches == include_match
+            })
+            .collect::<Vec<_>>();
+        self.result.types.union(filtered)
+    }
+
+    fn narrow_by_property(
+        &mut self,
+        subject: SymbolId,
+        property: &str,
+        include_match: bool,
+    ) -> TypeId {
+        let original = self.current_symbol_type(subject);
+        let members = self.union_members(original);
+        let filtered = members
+            .into_iter()
+            .filter(|member| {
+                self.lookup_property_type(*member, property).is_some() == include_match
+            })
+            .collect::<Vec<_>>();
+        self.result.types.union(filtered)
+    }
+
+    fn narrow_by_assignability(
+        &mut self,
+        subject: SymbolId,
+        target: TypeId,
+        include_match: bool,
+    ) -> TypeId {
+        let original = self.current_symbol_type(subject);
+        let filtered = self
+            .union_members(original)
+            .into_iter()
+            .filter(|member| self.is_assignable(*member, target) == include_match)
+            .collect::<Vec<_>>();
+        self.result.types.union(filtered)
+    }
+
+    fn union_members(&self, type_id: TypeId) -> Vec<TypeId> {
+        match &self.result.types.get(type_id).unwrap().kind {
+            TypeKind::Union(members) => members.clone(),
+            _ => vec![type_id],
+        }
     }
 
     fn narrowing_subject(&self, node: NodeId) -> Option<SymbolId> {
@@ -1467,7 +1887,23 @@ impl<'a> Checker<'a> {
                     .arena
                     .get(data.operator_token)
                     .map_or(SyntaxKind::Unknown, |node| node.kind);
-                self.check_binary(node_id, operator, left, right)
+                if operator == SyntaxKind::EqualsToken
+                    && let Some(symbol) = self.narrowing_subject(data.left)
+                {
+                    let declared = self
+                        .result
+                        .symbol_types
+                        .get(&symbol)
+                        .copied()
+                        .unwrap_or(left);
+                    if !self.is_assignable(right, declared) {
+                        self.assignability_error(node_id, right, declared);
+                    }
+                    self.flow_types.insert(symbol, right);
+                    right
+                } else {
+                    self.check_binary(node_id, operator, left, right)
+                }
             }
             NodeData::ObjectLiteralExpression(data) => {
                 let contextual_properties = contextual_type.and_then(|type_id| {
@@ -1595,17 +2031,23 @@ impl<'a> Checker<'a> {
         if name == "undefined" {
             return self.result.types.undefined();
         }
-        for scope in self.local_scopes.iter().rev() {
-            if let Some(type_id) = scope.get(name) {
-                return *type_id;
-            }
-        }
-        if let Some(symbol) = self.resolve_identifier(node, name) {
+        let symbol = self.resolve_identifier(node, name);
+        if let Some(symbol) = symbol {
             for narrowing in self.narrowings.iter().rev() {
                 if let Some(type_id) = narrowing.get(&symbol) {
                     return *type_id;
                 }
             }
+            if let Some(type_id) = self.flow_types.get(&symbol) {
+                return *type_id;
+            }
+        }
+        for scope in self.local_scopes.iter().rev() {
+            if let Some(type_id) = scope.get(name) {
+                return *type_id;
+            }
+        }
+        if let Some(symbol) = symbol {
             return self
                 .result
                 .symbol_types
@@ -2057,7 +2499,9 @@ impl<'a> Checker<'a> {
             SyntaxKind::EqualsEqualsToken
             | SyntaxKind::EqualsEqualsEqualsToken
             | SyntaxKind::ExclamationEqualsToken
-            | SyntaxKind::ExclamationEqualsEqualsToken => self.result.types.boolean(),
+            | SyntaxKind::ExclamationEqualsEqualsToken
+            | SyntaxKind::InKeyword
+            | SyntaxKind::InstanceOfKeyword => self.result.types.boolean(),
             SyntaxKind::AmpersandAmpersandToken
             | SyntaxKind::BarBarToken
             | SyntaxKind::QuestionQuestionToken => self.result.types.union([left, right]),
@@ -4218,6 +4662,113 @@ mod tests {
                 .map(|diagnostic| diagnostic.diagnostic.code())
                 .collect::<Vec<_>>(),
             [2322, 2345]
+        );
+    }
+
+    #[test]
+    fn narrows_truthiness_discriminants_in_and_instanceof() {
+        let parsed = parse_source_file(
+            r#"
+                type Shape =
+                    { kind: "circle"; radius: number } |
+                    { kind: "square"; side: number };
+                function area(shape: Shape): number {
+                    if (shape.kind === "circle") { return shape.radius; }
+                    return shape.side;
+                }
+
+                type TextOrCount = { text: string } | { count: number };
+                function inspect(value: TextOrCount): void {
+                    if ("text" in value) {
+                        const text: string = value.text;
+                    } else {
+                        const count: number = value.count;
+                    }
+                }
+
+                class Dog { bark: string; }
+                class Cat { meow: string; }
+                function pet(value: Dog | Cat): void {
+                    if (value instanceof Dog) {
+                        value.bark;
+                        value.meow;
+                    } else {
+                        value.meow;
+                    }
+                }
+
+                function truthy(value: string | null): void {
+                    if (value) {
+                        const text: string = value;
+                    } else {
+                        const bad: number = value;
+                    }
+                }
+            "#,
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2339, 2322],
+            "{:?}",
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.render().unwrap())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn joins_assignments_and_checks_switch_returns_and_unreachable_code() {
+        let parsed = parse_source_file(
+            r#"
+                function assign(flag: boolean): void {
+                    let value: string | number = "start";
+                    value = 1;
+                    const numberValue: number = value;
+                    if (flag) { value = "next"; } else { value = 2; }
+                    const joined: string | number = value;
+                    const bad: boolean = value;
+                    while (flag) { value = 3; }
+                    const loopJoined: string | number = value;
+                }
+
+                type Token = { kind: "a"; a: number } | { kind: "b"; b: string };
+                function exhaustive(token: Token): string | number {
+                    switch (token.kind) {
+                        case "a": return token.a;
+                        case "b": return token.b;
+                    }
+                }
+                function incomplete(token: Token): string | number {
+                    switch (token.kind) {
+                        case "a": return token.a;
+                    }
+                }
+                function unreachable(): number {
+                    return 1;
+                    const after = 2;
+                }
+                function thrown(): number { throw "done"; }
+            "#,
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2322, 2355, 7027]
         );
     }
 }
