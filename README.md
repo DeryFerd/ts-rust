@@ -42,7 +42,7 @@ Or run the complete local gate, including generated-source checks:
 ./scripts/verify.sh
 ```
 
-Development-only `tsgo --tokenize file.ts`, `tsgo --parse file.ts`, and
-`tsgo --compile-dev file.ts` commands expose the scanner/parser and current
-end-to-end compiler pipeline. Standard compilation still exits explicitly as
-not implemented until option/default-library/diagnostic parity is sufficient.
+`tsgo file.ts` and `tsgo --project tsconfig.json` run the standard compilation
+pipeline, including default libraries, checking, JavaScript/declaration emit,
+and source maps. `tsgo --lsp` runs the editor protocol server. Development-only
+`--tokenize`, `--parse`, and `--compile-dev` modes expose individual layers.

@@ -1060,6 +1060,7 @@ impl Printer<'_> {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn emit_statement(&mut self, id: NodeId) -> Result<(), EmitError> {
         let node = self.node(id)?.clone();
         match &node.data {
@@ -1076,7 +1077,14 @@ impl Printer<'_> {
                 self.writer.write(";");
             }
             NodeData::FunctionDeclaration(data) => {
-                self.writer.write("function ");
+                if self.has_modifier(data.modifiers.as_ref(), SyntaxKind::AsyncKeyword) {
+                    self.writer.write("async ");
+                }
+                self.writer.write("function");
+                if data.asterisk_token.is_some() {
+                    self.writer.write("*");
+                }
+                self.writer.write(" ");
                 if let Some(name) = data.name {
                     self.emit_expression(name, 0)?;
                 }
@@ -1130,6 +1138,30 @@ impl Printer<'_> {
                 if let Some(incrementor) = data.incrementor {
                     self.emit_expression(incrementor, 0)?;
                 }
+                self.writer.write(") ");
+                self.emit_embedded(data.statement)?;
+            }
+            NodeData::ForInOrOfStatement(data) => {
+                self.writer.write("for");
+                if data.await_modifier.is_some() {
+                    self.writer.write(" await");
+                }
+                self.writer.write(" (");
+                if matches!(
+                    &self.node(data.initializer)?.data,
+                    NodeData::VariableDeclarationList(_)
+                ) {
+                    self.emit_variable_list(data.initializer)?;
+                } else {
+                    self.emit_expression(data.initializer, 0)?;
+                }
+                self.writer
+                    .write(if node.kind == SyntaxKind::ForInStatement {
+                        " in "
+                    } else {
+                        " of "
+                    });
+                self.emit_expression(data.expression, 0)?;
                 self.writer.write(") ");
                 self.emit_embedded(data.statement)?;
             }
@@ -1267,6 +1299,15 @@ impl Printer<'_> {
             let node = self.node(*member)?.clone();
             match &node.data {
                 NodeData::MethodDeclaration(method) if method.body.is_some() => {
+                    if self.has_modifier(method.modifiers.as_ref(), SyntaxKind::StaticKeyword) {
+                        self.writer.write("static ");
+                    }
+                    if self.has_modifier(method.modifiers.as_ref(), SyntaxKind::AsyncKeyword) {
+                        self.writer.write("async ");
+                    }
+                    if method.asterisk_token.is_some() {
+                        self.writer.write("*");
+                    }
                     self.emit_expression(method.name, 0)?;
                     self.emit_parameters(&method.parameters)?;
                     self.writer.write(" ");
@@ -1275,12 +1316,42 @@ impl Printer<'_> {
                 }
                 NodeData::MethodDeclaration(_) => {}
                 NodeData::PropertyDeclaration(property) => {
+                    if self.has_modifier(property.modifiers.as_ref(), SyntaxKind::StaticKeyword) {
+                        self.writer.write("static ");
+                    }
                     self.emit_expression(property.name, 0)?;
                     if let Some(initializer) = property.initializer {
                         self.writer.write(" = ");
                         self.emit_expression(initializer, 1)?;
                     }
                     self.writer.write(";");
+                    self.writer.newline();
+                }
+                NodeData::GetAccessorDeclaration(accessor) if accessor.body.is_some() => {
+                    if self.has_modifier(accessor.modifiers.as_ref(), SyntaxKind::StaticKeyword) {
+                        self.writer.write("static ");
+                    }
+                    self.writer.write("get ");
+                    self.emit_expression(accessor.name, 0)?;
+                    self.emit_parameters(&accessor.parameters)?;
+                    self.writer.write(" ");
+                    self.emit_block(accessor.body.expect("body checked above"))?;
+                    self.writer.newline();
+                }
+                NodeData::SetAccessorDeclaration(accessor) if accessor.body.is_some() => {
+                    if self.has_modifier(accessor.modifiers.as_ref(), SyntaxKind::StaticKeyword) {
+                        self.writer.write("static ");
+                    }
+                    self.writer.write("set ");
+                    self.emit_expression(accessor.name, 0)?;
+                    self.emit_parameters(&accessor.parameters)?;
+                    self.writer.write(" ");
+                    self.emit_block(accessor.body.expect("body checked above"))?;
+                    self.writer.newline();
+                }
+                NodeData::ClassStaticBlockDeclaration(block) => {
+                    self.writer.write("static ");
+                    self.emit_block(block.body)?;
                     self.writer.newline();
                 }
                 _ => return Err(Self::unsupported(*member, node.kind)),
@@ -1376,7 +1447,37 @@ impl Printer<'_> {
             self.writer.write(" from ");
         }
         self.emit_expression(data.module_specifier, 0)?;
+        if let Some(attributes) = data.attributes {
+            self.emit_import_attributes(attributes)?;
+        }
         self.writer.write(";");
+        Ok(())
+    }
+
+    fn emit_import_attributes(&mut self, id: NodeId) -> Result<(), EmitError> {
+        let node = self.node(id)?.clone();
+        let NodeData::ImportAttributes(data) = &node.data else {
+            return Err(Self::unsupported(id, node.kind));
+        };
+        self.writer
+            .write(if data.token == SyntaxKind::AssertKeyword {
+                " assert { "
+            } else {
+                " with { "
+            });
+        for (index, attribute) in data.attributes.nodes.iter().enumerate() {
+            if index != 0 {
+                self.writer.write(", ");
+            }
+            let node = self.node(*attribute)?.clone();
+            let NodeData::ImportAttribute(attribute) = &node.data else {
+                return Err(Self::unsupported(*attribute, node.kind));
+            };
+            self.emit_expression(attribute.name, 0)?;
+            self.writer.write(": ");
+            self.emit_expression(attribute.value, 0)?;
+        }
+        self.writer.write(" }");
         Ok(())
     }
 
@@ -1495,6 +1596,9 @@ impl Printer<'_> {
             self.writer.write(" from ");
             self.emit_expression(module, 0)?;
         }
+        if let Some(attributes) = data.attributes {
+            self.emit_import_attributes(attributes)?;
+        }
         self.writer.write(";");
         Ok(())
     }
@@ -1547,11 +1651,22 @@ impl Printer<'_> {
         }
     }
 
+    fn has_modifier(&self, modifiers: Option<&ts_ast::ModifierList>, kind: SyntaxKind) -> bool {
+        modifiers.is_some_and(|modifiers| {
+            modifiers.list.nodes.iter().any(|modifier| {
+                self.arena
+                    .get(*modifier)
+                    .is_some_and(|node| node.kind == kind)
+            })
+        })
+    }
+
     #[allow(clippy::too_many_lines)]
     fn emit_expression(&mut self, id: NodeId, parent_precedence: u8) -> Result<(), EmitError> {
         let node = self.node(id)?.clone();
         match &node.data {
             NodeData::Identifier(data) => self.writer.write(&data.text),
+            NodeData::PrivateIdentifier(data) => self.writer.write(&data.text),
             NodeData::NumericLiteral(data) => self.writer.write(&data.text),
             NodeData::BigIntLiteral(data) => self.writer.write(&data.text),
             NodeData::StringLiteral(data) => write_quoted(&mut self.writer, &data.text),
@@ -1559,8 +1674,46 @@ impl Printer<'_> {
                 SyntaxKind::NullKeyword => "null",
                 SyntaxKind::TrueKeyword => "true",
                 SyntaxKind::FalseKeyword => "false",
+                SyntaxKind::ThisKeyword => "this",
+                SyntaxKind::SuperKeyword => "super",
                 _ => return Err(Self::unsupported(id, node.kind)),
             }),
+            NodeData::BindingPattern(data) => {
+                self.writer
+                    .write(if node.kind == SyntaxKind::ArrayBindingPattern {
+                        "["
+                    } else {
+                        "{"
+                    });
+                self.emit_expression_list(&data.elements)?;
+                self.writer
+                    .write(if node.kind == SyntaxKind::ArrayBindingPattern {
+                        "]"
+                    } else {
+                        "}"
+                    });
+            }
+            NodeData::BindingElement(data) => {
+                if data.dot_dot_dot_token.is_some() {
+                    self.writer.write("...");
+                }
+                if let Some(property_name) = data.property_name {
+                    self.emit_expression(property_name, 0)?;
+                    self.writer.write(": ");
+                }
+                if let Some(name) = data.name {
+                    self.emit_expression(name, 0)?;
+                }
+                if let Some(initializer) = data.initializer {
+                    self.writer.write(" = ");
+                    self.emit_expression(initializer, 1)?;
+                }
+            }
+            NodeData::ComputedPropertyName(data) => {
+                self.writer.write("[");
+                self.emit_expression(data.expression, 0)?;
+                self.writer.write("]");
+            }
             NodeData::ParenthesizedExpression(data) => {
                 self.writer.write("(");
                 self.emit_expression(data.expression, 0)?;
@@ -1617,6 +1770,24 @@ impl Printer<'_> {
                     self.emit_expression(data.name, 18)?;
                 }
             }
+            NodeData::ElementAccessExpression(data) => {
+                if data.question_dot_token.is_some() && self.settings.target < ScriptTarget::Es2020
+                {
+                    self.emit_downlevel_optional_element(
+                        data.expression,
+                        data.argument_expression,
+                        parent_precedence,
+                    )?;
+                } else {
+                    self.emit_expression(data.expression, 18)?;
+                    if data.question_dot_token.is_some() {
+                        self.writer.write("?.");
+                    }
+                    self.writer.write("[");
+                    self.emit_expression(data.argument_expression, 0)?;
+                    self.writer.write("]");
+                }
+            }
             NodeData::CallExpression(data) => {
                 if data.question_dot_token.is_some() && self.settings.target < ScriptTarget::Es2020
                 {
@@ -1636,28 +1807,137 @@ impl Printer<'_> {
                 }
             }
             NodeData::ArrayLiteralExpression(data) => {
+                if self.settings.target < ScriptTarget::Es2015
+                    && data.elements.nodes.iter().any(|element| {
+                        self.arena
+                            .get(*element)
+                            .is_some_and(|node| matches!(node.data, NodeData::SpreadElement(_)))
+                    })
+                {
+                    self.emit_downlevel_array_spread(data)?;
+                    return Ok(());
+                }
                 self.writer.write("[");
                 self.emit_expression_list(&data.elements)?;
                 self.writer.write("]");
             }
+            NodeData::SpreadElement(data) => {
+                self.writer.write("...");
+                self.emit_expression(data.expression, 1)?;
+            }
+            NodeData::AwaitExpression(data) => {
+                self.writer.write("await ");
+                self.emit_expression(data.expression, 2)?;
+            }
+            NodeData::YieldExpression(data) => {
+                self.writer.write("yield");
+                if data.asterisk_token.is_some() {
+                    self.writer.write("*");
+                }
+                if let Some(expression) = data.expression {
+                    self.writer.write(" ");
+                    self.emit_expression(expression, 2)?;
+                }
+            }
+            NodeData::NonNullExpression(data) => {
+                self.emit_expression(data.expression, parent_precedence)?;
+            }
+            NodeData::AsExpression(data) => {
+                self.emit_expression(data.expression, parent_precedence)?;
+            }
+            NodeData::SatisfiesExpression(data) => {
+                self.emit_expression(data.expression, parent_precedence)?;
+            }
+            NodeData::TypeAssertion(data) => {
+                self.emit_expression(data.expression, parent_precedence)?;
+            }
+            NodeData::NewExpression(data) => {
+                self.writer.write("new ");
+                self.emit_expression(data.expression, 18)?;
+                if let Some(arguments) = &data.arguments {
+                    self.writer.write("(");
+                    self.emit_expression_list(arguments)?;
+                    self.writer.write(")");
+                }
+            }
+            NodeData::ConditionalExpression(data) => {
+                let wrap = parent_precedence > 2;
+                if wrap {
+                    self.writer.write("(");
+                }
+                self.emit_expression(data.condition, 3)?;
+                self.writer.write(" ? ");
+                self.emit_expression(data.when_true, 2)?;
+                self.writer.write(" : ");
+                self.emit_expression(data.when_false, 2)?;
+                if wrap {
+                    self.writer.write(")");
+                }
+            }
+            NodeData::PrefixUnaryExpression(data) => {
+                self.writer.write(
+                    operator_text(data.operator).ok_or_else(|| Self::unsupported(id, node.kind))?,
+                );
+                self.emit_expression(data.operand, 16)?;
+            }
+            NodeData::PostfixUnaryExpression(data) => {
+                self.emit_expression(data.operand, 17)?;
+                self.writer.write(
+                    operator_text(data.operator).ok_or_else(|| Self::unsupported(id, node.kind))?,
+                );
+            }
             NodeData::ObjectLiteralExpression(data) => {
+                if self.settings.target < ScriptTarget::Es2018
+                    && data.properties.nodes.iter().any(|property| {
+                        self.arena
+                            .get(*property)
+                            .is_some_and(|node| matches!(node.data, NodeData::SpreadAssignment(_)))
+                    })
+                {
+                    self.emit_downlevel_object_spread(data)?;
+                    return Ok(());
+                }
                 self.writer.write("{ ");
                 for (index, property) in data.properties.nodes.iter().enumerate() {
                     if index != 0 {
                         self.writer.write(", ");
                     }
                     let node = self.node(*property)?.clone();
-                    let NodeData::PropertyAssignment(property) = &node.data else {
-                        return Err(Self::unsupported(*property, node.kind));
-                    };
-                    self.emit_expression(property.name, 0)?;
-                    self.writer.write(": ");
-                    self.emit_expression(property.initializer, 1)?;
+                    match &node.data {
+                        NodeData::PropertyAssignment(property) => {
+                            self.emit_expression(property.name, 0)?;
+                            self.writer.write(": ");
+                            self.emit_expression(property.initializer, 1)?;
+                        }
+                        NodeData::ShorthandPropertyAssignment(property) => {
+                            self.emit_expression(property.name, 0)?;
+                        }
+                        NodeData::SpreadAssignment(property) => {
+                            self.writer.write("...");
+                            self.emit_expression(property.expression, 1)?;
+                        }
+                        NodeData::MethodDeclaration(method) if method.body.is_some() => {
+                            if self
+                                .has_modifier(method.modifiers.as_ref(), SyntaxKind::AsyncKeyword)
+                            {
+                                self.writer.write("async ");
+                            }
+                            if method.asterisk_token.is_some() {
+                                self.writer.write("*");
+                            }
+                            self.emit_expression(method.name, 0)?;
+                            self.emit_parameters(&method.parameters)?;
+                            self.writer.write(" ");
+                            self.emit_block(method.body.expect("body checked above"))?;
+                        }
+                        _ => return Err(Self::unsupported(*property, node.kind)),
+                    }
                 }
                 self.writer.write(" }");
             }
             NodeData::ArrowFunction(data) => {
-                if self.settings.target < ScriptTarget::Es2015 {
+                let is_async = self.has_modifier(data.modifiers.as_ref(), SyntaxKind::AsyncKeyword);
+                if self.settings.target < ScriptTarget::Es2015 && !is_async {
                     let wrap = parent_precedence > 1;
                     if wrap {
                         self.writer.write("(");
@@ -1680,6 +1960,9 @@ impl Printer<'_> {
                 let wrap = parent_precedence > 1;
                 if wrap {
                     self.writer.write("(");
+                }
+                if is_async {
+                    self.writer.write("async ");
                 }
                 self.emit_parameters(&data.parameters)?;
                 self.writer.write(" => ");
@@ -1779,6 +2062,130 @@ impl Printer<'_> {
         self.writer.write(")");
         if wrap {
             self.writer.write(")");
+        }
+        Ok(())
+    }
+
+    fn emit_downlevel_optional_element(
+        &mut self,
+        expression: NodeId,
+        argument: NodeId,
+        parent_precedence: u8,
+    ) -> Result<(), EmitError> {
+        let wrap = parent_precedence > 2;
+        if wrap {
+            self.writer.write("(");
+        }
+        self.emit_expression(expression, 10)?;
+        self.writer.write(" === null || ");
+        self.emit_expression(expression, 10)?;
+        self.writer.write(" === void 0 ? void 0 : ");
+        self.emit_expression(expression, 18)?;
+        self.writer.write("[");
+        self.emit_expression(argument, 0)?;
+        self.writer.write("]");
+        if wrap {
+            self.writer.write(")");
+        }
+        Ok(())
+    }
+
+    fn emit_downlevel_object_spread(
+        &mut self,
+        data: &ts_ast::ObjectLiteralExpressionData,
+    ) -> Result<(), EmitError> {
+        self.writer.write("Object.assign({}");
+        let mut object_open = false;
+        let mut properties_in_object = 0_usize;
+        for property in &data.properties.nodes {
+            let node = self.node(*property)?.clone();
+            if let NodeData::SpreadAssignment(spread) = &node.data {
+                if object_open {
+                    self.writer.write(" }");
+                    object_open = false;
+                }
+                self.writer.write(", ");
+                self.emit_expression(spread.expression, 1)?;
+                continue;
+            }
+            if !object_open {
+                self.writer.write(", ");
+                self.writer.write("{ ");
+                object_open = true;
+                properties_in_object = 0;
+            }
+            if properties_in_object != 0 {
+                self.writer.write(", ");
+            }
+            self.emit_object_property(*property, &node)?;
+            properties_in_object += 1;
+        }
+        if object_open {
+            self.writer.write(" }");
+        }
+        self.writer.write(")");
+        Ok(())
+    }
+
+    fn emit_downlevel_array_spread(
+        &mut self,
+        data: &ts_ast::ArrayLiteralExpressionData,
+    ) -> Result<(), EmitError> {
+        self.writer.write("[].concat([]");
+        let mut array_open = false;
+        let mut elements_in_array = 0_usize;
+        for element in &data.elements.nodes {
+            let node = self.node(*element)?.clone();
+            if let NodeData::SpreadElement(spread) = &node.data {
+                if array_open {
+                    self.writer.write("]");
+                    array_open = false;
+                }
+                self.writer.write(", ");
+                self.emit_expression(spread.expression, 1)?;
+                continue;
+            }
+            if !array_open {
+                self.writer.write(", [");
+                array_open = true;
+                elements_in_array = 0;
+            }
+            if elements_in_array != 0 {
+                self.writer.write(", ");
+            }
+            self.emit_expression(*element, 0)?;
+            elements_in_array += 1;
+        }
+        if array_open {
+            self.writer.write("]");
+        }
+        self.writer.write(")");
+        Ok(())
+    }
+
+    fn emit_object_property(&mut self, id: NodeId, node: &Node) -> Result<(), EmitError> {
+        match &node.data {
+            NodeData::PropertyAssignment(property) => {
+                self.emit_expression(property.name, 0)?;
+                self.writer.write(": ");
+                self.emit_expression(property.initializer, 1)?;
+            }
+            NodeData::ShorthandPropertyAssignment(property) => {
+                self.emit_expression(property.name, 0)?;
+            }
+            NodeData::MethodDeclaration(method) if method.body.is_some() => {
+                if self.has_modifier(method.modifiers.as_ref(), SyntaxKind::AsyncKeyword) {
+                    self.writer.write("async ");
+                }
+                if method.asterisk_token.is_some() {
+                    self.writer.write("*");
+                }
+                self.emit_expression(method.name, 0)?;
+                self.emit_parameters(&method.parameters)?;
+                self.writer.write(" ");
+                self.emit_block(method.body.expect("body checked above"))?;
+            }
+            _ => return Err(Self::unsupported(id, node.kind)),
         }
         Ok(())
     }
@@ -1914,6 +2321,13 @@ fn operator_text(kind: SyntaxKind) -> Option<&'static str> {
         SyntaxKind::QuestionQuestionEqualsToken => "??=",
         SyntaxKind::PlusToken => "+",
         SyntaxKind::MinusToken => "-",
+        SyntaxKind::PlusPlusToken => "++",
+        SyntaxKind::MinusMinusToken => "--",
+        SyntaxKind::ExclamationToken => "!",
+        SyntaxKind::TildeToken => "~",
+        SyntaxKind::TypeOfKeyword => "typeof ",
+        SyntaxKind::VoidKeyword => "void ",
+        SyntaxKind::DeleteKeyword => "delete ",
         SyntaxKind::AsteriskToken => "*",
         SyntaxKind::AsteriskAsteriskToken => "**",
         SyntaxKind::SlashToken => "/",
@@ -2075,6 +2489,29 @@ mod tests {
         assert_eq!(
             result.code,
             "var greet = function (name) { return \"hi \" + name + \"\"; };\nvar result = value !== null && value !== void 0 ? value : fallback;\n"
+        );
+    }
+
+    #[test]
+    fn preserves_parsed_modern_syntax_for_esnext() {
+        assert_eq!(
+            emit(
+                "async function* stream(source) { await source?.next?.(); yield* source?.[0]!; } class Box { #value = 1; static count = 0; *values() { yield this.#value; } async read() { return await this.#value; } static { this.count++; } } for await (const item of items) { item; } const { first, ...rest } = input; const [head, ...tail] = items; const copy = { first, ...rest, async run() { await task; }, *iter() { yield 1; } }; const values = [0, ...items]; const typed = (value as number)! satisfies number; const run = async (value) => await value; import data from 'pkg' with { type: 'json' }; export { data } from 'pkg' with { type: 'json' };"
+            ),
+            "async function* stream(source) {\n  await source?.next?.();\n  yield* source?.[0];\n}\nclass Box {\n  #value = 1;\n  static count = 0;\n  *values() {\n    yield this.#value;\n  }\n  async read() {\n    return await this.#value;\n  }\n  static {\n    this.count++;\n  }\n}\nfor await (const item of items) {\n  item;\n}\nconst {first, ...rest} = input;\nconst [head, ...tail] = items;\nconst copy = { first, ...rest, async run() {\n  await task;\n}, *iter() {\n  yield 1;\n} };\nconst values = [0, ...items];\nconst typed = (value);\nconst run = async (value) => await value;\nimport data from \"pkg\" with { type: \"json\" };\nexport { data } from \"pkg\" with { type: \"json\" };\n"
+        );
+    }
+
+    #[test]
+    fn downlevels_optional_element_and_spread_for_es5() {
+        let result = emit_with(
+            "const value = source?.[key]; const merged = { a: 1, ...extra, b: 2 }; const list = [0, ...items, 3];",
+            ScriptTarget::Es5,
+            ModuleKind::EsNext,
+        );
+        assert_eq!(
+            result.code,
+            "var value = source === null || source === void 0 ? void 0 : source[key];\nvar merged = Object.assign({}, { a: 1 }, extra, { b: 2 });\nvar list = [].concat([], [0], items, [3]);\n"
         );
     }
 

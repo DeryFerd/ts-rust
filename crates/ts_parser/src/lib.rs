@@ -28,14 +28,14 @@ use ts_ast::{
     PrivateIdentifierData, PropertyAccessExpressionData, PropertyAssignmentData,
     PropertyDeclarationData, QualifiedNameData, RestTypeNodeData, ReturnStatementData,
     SatisfiesExpressionData, SetAccessorDeclarationData, ShorthandPropertyAssignmentData,
-    SourceFileData, SpreadAssignmentData, StringLiteralData, SwitchStatementData, SymbolTable,
-    SyntaxKind, TemplateExpressionData, TemplateHeadData, TemplateLiteralTypeNodeData,
-    TemplateLiteralTypeSpanData, TemplateMiddleData, TemplateSpanData, TemplateTailData,
-    ThisTypeNodeData, ThrowStatementData, TokenData, TokenFlags, TryStatementData,
-    TupleTypeNodeData, TypeAliasDeclarationData, TypeAssertionData, TypeLiteralNodeData,
-    TypeOperatorNodeData, TypeParameterDeclarationData, TypePredicateNodeData, TypeQueryNodeData,
-    TypeReferenceNodeData, UnionTypeNodeData, VariableDeclarationData, VariableDeclarationListData,
-    VariableStatementData, WhileStatementData, YieldExpressionData,
+    SourceFileData, SpreadAssignmentData, SpreadElementData, StringLiteralData,
+    SwitchStatementData, SymbolTable, SyntaxKind, TemplateExpressionData, TemplateHeadData,
+    TemplateLiteralTypeNodeData, TemplateLiteralTypeSpanData, TemplateMiddleData, TemplateSpanData,
+    TemplateTailData, ThisTypeNodeData, ThrowStatementData, TokenData, TokenFlags,
+    TryStatementData, TupleTypeNodeData, TypeAliasDeclarationData, TypeAssertionData,
+    TypeLiteralNodeData, TypeOperatorNodeData, TypeParameterDeclarationData, TypePredicateNodeData,
+    TypeQueryNodeData, TypeReferenceNodeData, UnionTypeNodeData, VariableDeclarationData,
+    VariableDeclarationListData, VariableStatementData, WhileStatementData, YieldExpressionData,
 };
 use ts_core::{Diagnostic, DiagnosticCategory, TextPos, TextRange};
 use ts_diagnostics::{Category, message_by_code};
@@ -396,7 +396,7 @@ impl<'a> Parser<'a> {
 
     fn parse_variable_declaration(&mut self) -> NodeId {
         let start = self.current.range.start;
-        let name = self.parse_identifier("Expected a variable name.");
+        let name = self.parse_binding_name("Expected a variable name.");
         let type_node = if self.current.kind == SyntaxKind::ColonToken {
             self.bump();
             Some(self.parse_type())
@@ -536,11 +536,7 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        let name = if self.current.kind == SyntaxKind::OpenBracketToken {
-            self.parse_array_binding_pattern()
-        } else {
-            self.parse_identifier_name("Expected a parameter name.")
-        };
+        let name = self.parse_binding_name("Expected a parameter name.");
         let question_token = if self.current.kind == SyntaxKind::QuestionToken {
             Some(self.consume_token_node())
         } else {
@@ -597,16 +593,24 @@ impl<'a> Parser<'a> {
             } else {
                 None
             };
-            let name = self.parse_identifier_name("Expected a binding name.");
+            let name = self.parse_binding_name("Expected a binding name.");
+            let initializer = if self.current.kind == SyntaxKind::EqualsToken {
+                self.bump();
+                Some(self.parse_binary_expression(2))
+            } else {
+                None
+            };
             let mut children = vec![name];
             children.extend(dot_dot_dot_token);
+            children.extend(initializer);
+            let end = initializer.map_or_else(|| self.node_end(name), |id| self.node_end(id));
             elements.push(self.alloc_node(
                 SyntaxKind::BindingElement,
-                TextRange::new(element_start, self.node_end(name)),
+                TextRange::new(element_start, end),
                 NodeData::BindingElement(Box::new(BindingElementData {
                     dot_dot_dot_token,
                     flow_node: None,
-                    initializer: None,
+                    initializer,
                     local_symbol: None,
                     property_name: None,
                     symbol: None,
@@ -631,6 +635,90 @@ impl<'a> Parser<'a> {
         };
         self.alloc_node(
             SyntaxKind::ArrayBindingPattern,
+            TextRange::new(start, end),
+            NodeData::BindingPattern(Box::new(BindingPatternData {
+                elements: NodeList {
+                    range: TextRange::new(start, end),
+                    nodes: elements.clone(),
+                    has_trailing_comma: false,
+                },
+                facts: 0,
+            })),
+            &elements,
+        )
+    }
+
+    fn parse_binding_name(&mut self, message: &str) -> NodeId {
+        match self.current.kind {
+            SyntaxKind::OpenBracketToken => self.parse_array_binding_pattern(),
+            SyntaxKind::OpenBraceToken => self.parse_object_binding_pattern(),
+            _ => self.parse_identifier_name(message),
+        }
+    }
+
+    fn parse_object_binding_pattern(&mut self) -> NodeId {
+        let start = self.consume().range.start;
+        let mut elements = Vec::new();
+        while !matches!(
+            self.current.kind,
+            SyntaxKind::CloseBraceToken | SyntaxKind::EndOfFile
+        ) {
+            let element_start = self.current.range.start;
+            let dot_dot_dot_token = if self.current.kind == SyntaxKind::DotDotDotToken {
+                Some(self.consume_token_node())
+            } else {
+                None
+            };
+            let first_name = self.parse_identifier_name("Expected a binding name.");
+            let (property_name, name) = if self.current.kind == SyntaxKind::ColonToken {
+                self.bump();
+                (
+                    Some(first_name),
+                    self.parse_binding_name("Expected a binding name."),
+                )
+            } else {
+                (None, first_name)
+            };
+            let initializer = if self.current.kind == SyntaxKind::EqualsToken {
+                self.bump();
+                Some(self.parse_binary_expression(2))
+            } else {
+                None
+            };
+            let end = initializer.map_or_else(|| self.node_end(name), |id| self.node_end(id));
+            let mut children = Vec::new();
+            children.extend(dot_dot_dot_token);
+            children.extend(property_name);
+            children.push(name);
+            children.extend(initializer);
+            elements.push(self.alloc_node(
+                SyntaxKind::BindingElement,
+                TextRange::new(element_start, end),
+                NodeData::BindingElement(Box::new(BindingElementData {
+                    dot_dot_dot_token,
+                    flow_node: None,
+                    initializer,
+                    local_symbol: None,
+                    property_name,
+                    symbol: None,
+                    facts: 0,
+                    name: Some(name),
+                })),
+                &children,
+            ));
+            if self.current.kind != SyntaxKind::CommaToken {
+                break;
+            }
+            self.bump();
+        }
+        let end = if self.current.kind == SyntaxKind::CloseBraceToken {
+            self.consume().range.end
+        } else {
+            self.error_current("Expected '}'.");
+            elements.last().map_or(start, |node| self.node_end(*node))
+        };
+        self.alloc_node(
+            SyntaxKind::ObjectBindingPattern,
             TextRange::new(start, end),
             NodeData::BindingPattern(Box::new(BindingPatternData {
                 elements: NodeList {
@@ -2990,7 +3078,7 @@ impl<'a> Parser<'a> {
         while self.current.kind != SyntaxKind::CloseParenToken
             && self.current.kind != SyntaxKind::EndOfFile
         {
-            arguments.push(self.parse_binary_expression(2));
+            arguments.push(self.parse_spread_element_or_expression());
             if self.current.kind != SyntaxKind::CommaToken {
                 break;
             }
@@ -3008,6 +3096,20 @@ impl<'a> Parser<'a> {
             nodes: arguments,
             has_trailing_comma: trailing,
         }
+    }
+
+    fn parse_spread_element_or_expression(&mut self) -> NodeId {
+        if self.current.kind != SyntaxKind::DotDotDotToken {
+            return self.parse_binary_expression(2);
+        }
+        let start = self.consume().range.start;
+        let expression = self.parse_binary_expression(2);
+        self.alloc_node(
+            SyntaxKind::SpreadElement,
+            TextRange::new(start, self.node_end(expression)),
+            NodeData::SpreadElement(Box::new(SpreadElementData { expression })),
+            &[expression],
+        )
     }
 
     fn is_parenthesized_arrow(&mut self) -> bool {
@@ -3202,7 +3304,7 @@ impl<'a> Parser<'a> {
         while self.current.kind != SyntaxKind::CloseBracketToken
             && self.current.kind != SyntaxKind::EndOfFile
         {
-            elements.push(self.parse_binary_expression(2));
+            elements.push(self.parse_spread_element_or_expression());
             if self.current.kind != SyntaxKind::CommaToken {
                 break;
             }
@@ -5595,11 +5697,11 @@ mod tests {
     }
 
     #[test]
-    fn complex_binding_patterns_always_make_progress() {
+    fn parses_complex_binding_patterns() {
         let result = parse_source_file(
             "function f([value = 1, { nested }, [tail]]: unknown): void; const done = 1;",
         );
-        assert!(!result.diagnostics.is_empty());
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
         assert!(result.arena.len() < 200, "unexpected AST growth");
         assert!(source_statements(&result).iter().any(|statement| {
             result.arena.get(*statement).unwrap().kind == SyntaxKind::VariableStatement
