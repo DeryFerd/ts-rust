@@ -1070,6 +1070,15 @@ fn enum_values_for_emit(
 fn declaration_node_types_for_emit(source: &SourceFile) -> BTreeMap<NodeId, ts_checker::TypeId> {
     let mut node_types = source.checking.node_types.clone();
     for (id, node) in source.parse.arena.iter() {
+        if let NodeData::Identifier(identifier) = &node.data
+            && !node_types.contains_key(&id)
+            && let Some(type_id) = source
+                .binding
+                .resolve_name_at(id, &identifier.text)
+                .and_then(|symbol| source.checking.type_of_symbol(symbol))
+        {
+            node_types.insert(id, type_id);
+        }
         if !matches!(node.data, NodeData::FunctionDeclaration(_)) || node_types.contains_key(&id) {
             continue;
         }

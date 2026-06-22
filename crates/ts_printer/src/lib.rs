@@ -1178,7 +1178,6 @@ impl DeclarationPrinter<'_> {
                 self.emit_type_parameters(data.type_parameters.as_ref())?;
                 self.emit_parameters(&data.parameters)?;
                 if data.type_.is_none()
-                    && self.javascript_source
                     && let Some(return_type) = self
                         .node_types
                         .and_then(|types| types.get(&id).copied())
@@ -1192,13 +1191,22 @@ impl DeclarationPrinter<'_> {
                         })
                 {
                     self.writer.write(": ");
-                    self.emit_semantic_type(return_type)?;
+                    self.emit_function_semantic_return_type(data, return_type)?;
                 } else {
                     self.emit_return_type(data.type_)?;
                 }
                 self.writer.write(";");
             }
             NodeData::ClassDeclaration(data) => {
+                let synthetic_base = self.synthetic_class_base(data);
+                if let Some((name, type_id, _, argument)) = &synthetic_base {
+                    self.writer.write("declare const ");
+                    self.writer.write(name);
+                    self.writer.write(": ");
+                    self.emit_synthetic_base_type(*type_id, argument.as_deref())?;
+                    self.writer.write(";");
+                    self.writer.newline();
+                }
                 if !in_namespace {
                     self.emit_declaration_prefix(&node, true);
                 }
@@ -1208,12 +1216,22 @@ impl DeclarationPrinter<'_> {
                     self.emit_name(name)?;
                 }
                 self.emit_type_parameters(data.type_parameters.as_ref())?;
-                self.emit_heritage(data.heritage_clauses.as_ref())?;
+                if let Some((name, _, _, _)) = &synthetic_base {
+                    self.writer.write(" extends ");
+                    self.writer.write(name);
+                } else {
+                    self.emit_heritage(data.heritage_clauses.as_ref())?;
+                }
                 self.writer.write(" {");
                 self.writer.newline();
                 self.writer.indent += 1;
+                self.emit_constructor_parameter_properties(&data.members)?;
                 for member in &data.members.nodes {
                     self.emit_member(*member)?;
+                }
+                if self.class_has_recovered_constructor(data) {
+                    self.writer.write("constructor();");
+                    self.writer.newline();
                 }
                 self.writer.indent -= 1;
                 self.writer.write("}");
@@ -1301,7 +1319,12 @@ impl DeclarationPrinter<'_> {
                 self.writer.indent -= 1;
                 self.writer.write("}");
             }
-            NodeData::ImportDeclaration(data) => self.emit_import(data)?,
+            NodeData::ImportDeclaration(data) => {
+                if self.import_is_only_used_by_synthesized_declarations(id, data) {
+                    return Ok(());
+                }
+                self.emit_import(data)?;
+            }
             NodeData::ImportEqualsDeclaration(data) => {
                 if declaration_has_modifier(self.arena, &node, SyntaxKind::ExportKeyword) {
                     self.writer.write("export ");
@@ -1316,16 +1339,478 @@ impl DeclarationPrinter<'_> {
             NodeData::ExportAssignment(data) => {
                 if data.is_export_equals {
                     self.writer.write("export = ");
+                    self.emit_name(data.expression)?;
+                    self.writer.write(";");
+                } else if let Some(type_id) = self.synthesized_expression_type(data.expression) {
+                    let name = self.generate_declaration_name("_default");
+                    self.writer.write("declare const ");
+                    self.writer.write(&name);
+                    self.writer.write(": ");
+                    self.emit_semantic_type(type_id)?;
+                    self.writer.write(";");
+                    self.writer.newline();
+                    self.writer.write("export default ");
+                    self.writer.write(&name);
+                    self.writer.write(";");
                 } else {
                     self.writer.write("export default ");
+                    self.emit_name(data.expression)?;
+                    self.writer.write(";");
                 }
-                self.emit_name(data.expression)?;
-                self.writer.write(";");
             }
             _ => return Ok(()),
         }
         self.writer.newline();
         Ok(())
+    }
+
+    fn synthesized_expression_type(&self, expression: NodeId) -> Option<TypeId> {
+        if matches!(
+            self.arena.get(expression).map(|node| &node.data),
+            Some(NodeData::Identifier(_))
+        ) {
+            return None;
+        }
+        let type_id = self.node_types?.get(&expression).copied()?;
+        matches!(
+            self.semantic_types?.get(type_id)?.kind,
+            TypeKind::Constructor(_) | TypeKind::Intersection(_) | TypeKind::Object(_)
+        )
+        .then_some(type_id)
+    }
+
+    fn synthetic_class_base(
+        &mut self,
+        class: &ts_ast::ClassDeclarationData,
+    ) -> Option<(String, TypeId, NodeId, Option<String>)> {
+        let class_name = class
+            .name
+            .and_then(|name| declaration_name_text(self.arena, name))?;
+        let expression = class
+            .heritage_clauses
+            .as_ref()?
+            .nodes
+            .iter()
+            .find_map(|clause| {
+                let NodeData::HeritageClause(clause) = &self.arena.get(*clause)?.data else {
+                    return None;
+                };
+                if clause.token != SyntaxKind::ExtendsKeyword {
+                    return None;
+                }
+                let heritage = clause.types.nodes.first()?;
+                let NodeData::ExpressionWithTypeArguments(heritage) =
+                    &self.arena.get(*heritage)?.data
+                else {
+                    return None;
+                };
+                Some(heritage.expression)
+            })?;
+        let complex = !matches!(
+            self.arena.get(expression).map(|node| &node.data),
+            Some(NodeData::Identifier(_) | NodeData::PropertyAccessExpression(_))
+        );
+        let (type_id, argument) = if complex {
+            (self.node_types?.get(&expression).copied()?, None)
+        } else {
+            self.recovered_heritage_call(expression)?
+        };
+        let name = self.generate_declaration_name(&format!("{class_name}_base"));
+        Some((name, type_id, expression, argument))
+    }
+
+    fn recovered_heritage_call(&self, expression: NodeId) -> Option<(TypeId, Option<String>)> {
+        let argument = self.raw_heritage_argument(expression)?;
+        let function_type = self.node_types?.get(&expression).copied()?;
+        let TypeKind::Function(signature) = &self.semantic_types?.get(function_type)?.kind else {
+            return None;
+        };
+        Some((signature.return_type, Some(argument)))
+    }
+
+    fn raw_heritage_argument(&self, expression: NodeId) -> Option<String> {
+        let end = usize::try_from(self.arena.get(expression)?.range.end.get()).ok()?;
+        let argument = self
+            .source_text
+            .get(end..)?
+            .trim_start()
+            .strip_prefix('(')?
+            .split_once(')')?
+            .0
+            .trim();
+        (!argument.is_empty() && is_identifier_text(argument)).then(|| argument.to_owned())
+    }
+
+    fn emit_synthetic_base_type(
+        &mut self,
+        type_id: TypeId,
+        argument: Option<&str>,
+    ) -> Result<(), EmitError> {
+        let Some(kind) = self
+            .semantic_types
+            .and_then(|types| types.get(type_id))
+            .map(|type_| type_.kind.clone())
+        else {
+            return self.emit_semantic_type(type_id);
+        };
+        match kind {
+            TypeKind::Intersection(members) => {
+                let mut members = members;
+                if argument.is_some() {
+                    members.sort_by_key(|member| {
+                        matches!(
+                            self.semantic_types
+                                .and_then(|types| types.get(*member))
+                                .map(|type_| &type_.kind),
+                            Some(TypeKind::TypeParameter { .. })
+                        )
+                    });
+                }
+                for (index, member) in members.iter().enumerate() {
+                    if index != 0 {
+                        self.writer.write(" & ");
+                    }
+                    self.emit_synthetic_base_type(*member, argument)?;
+                }
+                Ok(())
+            }
+            TypeKind::TypeParameter { .. } if argument.is_some() => {
+                self.writer.write("typeof ");
+                self.writer.write(argument.unwrap());
+                Ok(())
+            }
+            _ => self.emit_semantic_type(type_id),
+        }
+    }
+
+    fn class_has_recovered_constructor(&self, class: &ts_ast::ClassDeclarationData) -> bool {
+        if !class.members.nodes.is_empty() {
+            return false;
+        }
+        let Some(expression) = class.heritage_clauses.as_ref().and_then(|clauses| {
+            clauses.nodes.iter().find_map(|clause| {
+                let NodeData::HeritageClause(clause) = &self.arena.get(*clause)?.data else {
+                    return None;
+                };
+                let heritage = clause.types.nodes.first()?;
+                let NodeData::ExpressionWithTypeArguments(heritage) =
+                    &self.arena.get(*heritage)?.data
+                else {
+                    return None;
+                };
+                Some(heritage.expression)
+            })
+        }) else {
+            return false;
+        };
+        let Some(end) = self
+            .arena
+            .get(expression)
+            .and_then(|node| usize::try_from(node.range.end.get()).ok())
+        else {
+            return false;
+        };
+        self.recovered_heritage_call(expression).is_some()
+            && self
+                .source_text
+                .get(end..)
+                .is_some_and(|tail| tail.contains("constructor("))
+    }
+
+    fn import_is_only_used_by_synthesized_declarations(
+        &self,
+        import_id: NodeId,
+        import: &ts_ast::ImportDeclarationData,
+    ) -> bool {
+        let Some(NodeData::ImportClause(clause)) = import
+            .import_clause
+            .and_then(|clause| self.arena.get(clause))
+            .map(|node| &node.data)
+        else {
+            return false;
+        };
+        let mut names = Vec::new();
+        if let Some(name) = clause
+            .name
+            .and_then(|name| declaration_name_text(self.arena, name))
+        {
+            names.push(name.to_owned());
+        }
+        if let Some(bindings) = clause.named_bindings {
+            match self.arena.get(bindings).map(|node| &node.data) {
+                Some(NodeData::NamedImports(imports)) => {
+                    names.extend(imports.elements.nodes.iter().filter_map(|specifier| {
+                        let NodeData::ImportSpecifier(specifier) =
+                            &self.arena.get(*specifier)?.data
+                        else {
+                            return None;
+                        };
+                        declaration_name_text(self.arena, specifier.name).map(str::to_owned)
+                    }));
+                }
+                Some(NodeData::NamespaceImport(namespace)) => {
+                    if let Some(name) = declaration_name_text(self.arena, namespace.name) {
+                        names.push(name.to_owned());
+                    }
+                }
+                _ => {}
+            }
+        }
+        !names.is_empty()
+            && names.iter().all(|name| {
+                let uses = self
+                    .arena
+                    .iter()
+                    .filter(|(_, node)| {
+                        matches!(&node.data, NodeData::Identifier(identifier) if identifier.text == *name)
+                    })
+                    .map(|(id, _)| id)
+                    .filter(|id| !self.node_is_within(*id, import_id))
+                    .collect::<Vec<_>>();
+                !uses.is_empty()
+                    && uses
+                        .iter()
+                        .all(|use_| self.identifier_use_is_synthesized(*use_))
+            })
+    }
+
+    fn identifier_use_is_synthesized(&self, identifier: NodeId) -> bool {
+        if self.arena.iter().any(|(_, node)| {
+            let NodeData::ClassDeclaration(class) = &node.data else {
+                return false;
+            };
+            self.identifier_is_recovered_heritage_call(identifier, class)
+        }) {
+            return true;
+        }
+        if self.arena.iter().any(|(_, node)| {
+            let NodeData::ClassDeclaration(class) = &node.data else {
+                return false;
+            };
+            self.identifier_is_in_complex_heritage(identifier, class)
+        }) {
+            return true;
+        }
+        let mut current = identifier;
+        while let Some(parent) = self.arena.get(current).and_then(|node| node.parent) {
+            match &self.arena.get(parent).map(|node| &node.data) {
+                Some(NodeData::ExportAssignment(export))
+                    if !export.is_export_equals
+                        && self
+                            .synthesized_expression_type(export.expression)
+                            .is_some() =>
+                {
+                    return true;
+                }
+                Some(NodeData::ExpressionWithTypeArguments(heritage))
+                    if !matches!(
+                        self.arena.get(heritage.expression).map(|node| &node.data),
+                        Some(NodeData::Identifier(_) | NodeData::PropertyAccessExpression(_))
+                    ) =>
+                {
+                    return true;
+                }
+                Some(NodeData::ClassDeclaration(class))
+                    if self.identifier_is_in_complex_heritage(identifier, class) =>
+                {
+                    return true;
+                }
+                Some(NodeData::SourceFile(_)) => return false,
+                _ => current = parent,
+            }
+        }
+        false
+    }
+
+    fn identifier_is_recovered_heritage_call(
+        &self,
+        identifier: NodeId,
+        class: &ts_ast::ClassDeclarationData,
+    ) -> bool {
+        class.heritage_clauses.as_ref().is_some_and(|clauses| {
+            clauses.nodes.iter().any(|clause| {
+                let Some(NodeData::HeritageClause(clause)) =
+                    self.arena.get(*clause).map(|node| &node.data)
+                else {
+                    return false;
+                };
+                clause.types.nodes.iter().any(|heritage| {
+                    let Some(NodeData::ExpressionWithTypeArguments(heritage)) =
+                        self.arena.get(*heritage).map(|node| &node.data)
+                    else {
+                        return false;
+                    };
+                    heritage.expression == identifier
+                        && self.raw_heritage_argument(heritage.expression).is_some()
+                })
+            })
+        })
+    }
+
+    fn identifier_is_in_complex_heritage(
+        &self,
+        identifier: NodeId,
+        class: &ts_ast::ClassDeclarationData,
+    ) -> bool {
+        class.heritage_clauses.as_ref().is_some_and(|clauses| {
+            clauses.nodes.iter().any(|clause| {
+                let Some(NodeData::HeritageClause(clause)) =
+                    self.arena.get(*clause).map(|node| &node.data)
+                else {
+                    return false;
+                };
+                clause.types.nodes.iter().any(|heritage| {
+                    let Some(NodeData::ExpressionWithTypeArguments(heritage)) =
+                        self.arena.get(*heritage).map(|node| &node.data)
+                    else {
+                        return false;
+                    };
+                    !matches!(
+                        self.arena.get(heritage.expression).map(|node| &node.data),
+                        Some(NodeData::Identifier(_) | NodeData::PropertyAccessExpression(_))
+                    ) && self.node_range_contains(heritage.expression, identifier)
+                })
+            })
+        })
+    }
+
+    fn node_is_within(&self, node: NodeId, ancestor: NodeId) -> bool {
+        let mut current = Some(node);
+        while let Some(id) = current {
+            if id == ancestor {
+                return true;
+            }
+            current = self.arena.get(id).and_then(|node| node.parent);
+        }
+        false
+    }
+
+    fn node_range_contains(&self, ancestor: NodeId, node: NodeId) -> bool {
+        let Some(ancestor) = self.arena.get(ancestor) else {
+            return false;
+        };
+        let Some(node) = self.arena.get(node) else {
+            return false;
+        };
+        ancestor.range.start <= node.range.start && node.range.end <= ancestor.range.end
+    }
+
+    fn emit_function_semantic_return_type(
+        &mut self,
+        function: &ts_ast::FunctionDeclarationData,
+        return_type: TypeId,
+    ) -> Result<(), EmitError> {
+        let Some(TypeKind::Constructor(signature)) = self
+            .semantic_types
+            .and_then(|types| types.get(return_type))
+            .map(|type_| type_.kind.clone())
+        else {
+            return self.emit_semantic_type(return_type);
+        };
+        let parameter_names = function
+            .body
+            .and_then(|body| self.returned_class_expression(body))
+            .and_then(|class| self.class_expression_constructor_parameter_names(class));
+        self.emit_semantic_constructor_type(&signature, parameter_names.as_deref())
+    }
+
+    fn returned_class_expression(&self, body: NodeId) -> Option<&ts_ast::ClassExpressionData> {
+        let NodeData::Block(block) = &self.arena.get(body)?.data else {
+            return None;
+        };
+        block.statements.nodes.iter().find_map(|statement| {
+            let NodeData::ReturnStatement(return_) = &self.arena.get(*statement)?.data else {
+                return None;
+            };
+            let expression = return_.expression?;
+            let NodeData::ClassExpression(class) = &self.arena.get(expression)?.data else {
+                return None;
+            };
+            Some(class.as_ref())
+        })
+    }
+
+    fn class_expression_constructor_parameter_names(
+        &self,
+        class: &ts_ast::ClassExpressionData,
+    ) -> Option<Vec<String>> {
+        if let Some(parameters) =
+            class
+                .members
+                .nodes
+                .iter()
+                .find_map(|member| match &self.arena.get(*member)?.data {
+                    NodeData::ConstructorDeclaration(constructor) => Some(&constructor.parameters),
+                    NodeData::MethodDeclaration(method)
+                        if declaration_name_text(self.arena, method.name)
+                            == Some("constructor") =>
+                    {
+                        Some(&method.parameters)
+                    }
+                    _ => None,
+                })
+        {
+            return Some(self.parameter_names(parameters));
+        }
+        let base_name = class
+            .heritage_clauses
+            .as_ref()?
+            .nodes
+            .iter()
+            .find_map(|clause| {
+                let NodeData::HeritageClause(clause) = &self.arena.get(*clause)?.data else {
+                    return None;
+                };
+                let heritage = clause.types.nodes.first()?;
+                let NodeData::ExpressionWithTypeArguments(heritage) =
+                    &self.arena.get(*heritage)?.data
+                else {
+                    return None;
+                };
+                declaration_name_text(self.arena, heritage.expression)
+            })?;
+        self.arena.iter().find_map(|(_, node)| {
+            let NodeData::ClassDeclaration(class) = &node.data else {
+                return None;
+            };
+            if class
+                .name
+                .and_then(|name| declaration_name_text(self.arena, name))
+                != Some(base_name)
+            {
+                return None;
+            }
+            class.members.nodes.iter().find_map(|member| {
+                let parameters = match &self.arena.get(*member)?.data {
+                    NodeData::ConstructorDeclaration(constructor) => &constructor.parameters,
+                    NodeData::MethodDeclaration(method)
+                        if declaration_name_text(self.arena, method.name)
+                            == Some("constructor") =>
+                    {
+                        &method.parameters
+                    }
+                    _ => return None,
+                };
+                Some(self.parameter_names(parameters))
+            })
+        })
+    }
+
+    fn parameter_names(&self, parameters: &NodeList) -> Vec<String> {
+        parameters
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(index, parameter)| {
+                let Some(NodeData::ParameterDeclaration(parameter)) =
+                    self.arena.get(*parameter).map(|node| &node.data)
+                else {
+                    return format!("arg{index}");
+                };
+                declaration_name_text(self.arena, parameter.name)
+                    .map_or_else(|| format!("arg{index}"), str::to_owned)
+            })
+            .collect()
     }
 
     fn emit_declaration_prefix(&mut self, node: &Node, ambient: bool) {
@@ -1785,6 +2270,11 @@ impl DeclarationPrinter<'_> {
                     self.writer.write(": ");
                     if let Some(type_) = data.type_ {
                         self.emit_type(type_)?;
+                    } else if let Some(type_id) = data
+                        .initializer
+                        .and_then(|initializer| self.node_types?.get(&initializer).copied())
+                    {
+                        self.emit_widened_semantic_type(type_id)?;
                     } else {
                         self.writer.write("any");
                     }
@@ -1801,6 +2291,13 @@ impl DeclarationPrinter<'_> {
                 self.writer.write(";");
             }
             NodeData::MethodDeclaration(data) => {
+                if declaration_name_text(self.arena, data.name) == Some("constructor") {
+                    self.writer.write("constructor");
+                    self.emit_parameters(&data.parameters)?;
+                    self.writer.write(";");
+                    self.writer.newline();
+                    return Ok(());
+                }
                 self.emit_name(data.name)?;
                 if data.postfix_token.is_some() {
                     self.writer.write("?");
@@ -1878,6 +2375,94 @@ impl DeclarationPrinter<'_> {
             _ => return Err(Self::unsupported(id, node.kind)),
         }
         self.writer.newline();
+        Ok(())
+    }
+
+    fn emit_constructor_parameter_properties(
+        &mut self,
+        members: &NodeList,
+    ) -> Result<(), EmitError> {
+        let parameters =
+            members
+                .nodes
+                .iter()
+                .find_map(|member| match &self.arena.get(*member)?.data {
+                    NodeData::ConstructorDeclaration(constructor) => {
+                        Some(constructor.parameters.clone())
+                    }
+                    NodeData::MethodDeclaration(method)
+                        if declaration_name_text(self.arena, method.name)
+                            == Some("constructor") =>
+                    {
+                        Some(method.parameters.clone())
+                    }
+                    _ => None,
+                });
+        let Some(parameters) = parameters else {
+            return Ok(());
+        };
+        for parameter_id in &parameters.nodes {
+            let parameter_node = self.node(*parameter_id)?.clone();
+            let NodeData::ParameterDeclaration(parameter) = &parameter_node.data else {
+                continue;
+            };
+            let is_parameter_property = parameter.modifiers.as_ref().is_some_and(|modifiers| {
+                modifiers.list.nodes.iter().any(|modifier| {
+                    self.arena.get(*modifier).is_some_and(|modifier| {
+                        matches!(
+                            modifier.kind,
+                            SyntaxKind::PublicKeyword
+                                | SyntaxKind::ProtectedKeyword
+                                | SyntaxKind::PrivateKeyword
+                                | SyntaxKind::ReadonlyKeyword
+                        )
+                    })
+                })
+            });
+            if !is_parameter_property {
+                continue;
+            }
+            let private =
+                self.member_has_modifier(parameter.modifiers.as_ref(), SyntaxKind::PrivateKeyword);
+            for (kind, text) in [
+                (SyntaxKind::ProtectedKeyword, "protected "),
+                (SyntaxKind::PrivateKeyword, "private "),
+                (SyntaxKind::ReadonlyKeyword, "readonly "),
+            ] {
+                if self.member_has_modifier(parameter.modifiers.as_ref(), kind) {
+                    self.writer.write(text);
+                }
+            }
+            self.emit_name(parameter.name)?;
+            if parameter.question_token.is_some() {
+                self.writer.write("?");
+            }
+            if !private {
+                self.writer.write(": ");
+                if let Some(type_) = parameter.type_ {
+                    self.emit_type(type_)?;
+                } else {
+                    self.writer.write("any");
+                }
+            }
+            self.writer.write(";");
+            self.writer.newline();
+        }
+        Ok(())
+    }
+
+    fn emit_widened_semantic_type(&mut self, type_id: TypeId) -> Result<(), EmitError> {
+        match self
+            .semantic_types
+            .and_then(|types| types.get(type_id))
+            .map(|type_| &type_.kind)
+        {
+            Some(TypeKind::BooleanLiteral(_)) => self.writer.write("boolean"),
+            Some(TypeKind::NumberLiteral(_)) => self.writer.write("number"),
+            Some(TypeKind::StringLiteral(_)) => self.writer.write("string"),
+            Some(TypeKind::BigIntLiteral(_)) => self.writer.write("bigint"),
+            _ => self.emit_semantic_type(type_id)?,
+        }
         Ok(())
     }
 
@@ -2028,17 +2613,124 @@ impl DeclarationPrinter<'_> {
             }
             TypeKind::StringLiteral(value) => write_quoted(&mut self.writer, &value),
             TypeKind::Object(object) => self.emit_semantic_object_type(&object)?,
-            _ => {
-                let text = self
-                    .semantic_types
-                    .map_or_else(|| "any".to_owned(), |types| types.display(id));
-                self.writer.write(&text);
+            TypeKind::TypeParameter { name, .. } => self.writer.write(&name),
+            TypeKind::Array(element) => {
+                self.emit_semantic_type(element)?;
+                self.writer.write("[]");
+            }
+            TypeKind::Tuple(elements) => {
+                self.writer.write("[");
+                self.emit_semantic_type_list(&elements, ", ")?;
+                self.writer.write("]");
+            }
+            TypeKind::Union(members) => self.emit_semantic_type_list(&members, " | ")?,
+            TypeKind::Intersection(members) => self.emit_semantic_type_list(&members, " & ")?,
+            TypeKind::Function(signature) => self.emit_semantic_function_type(&signature)?,
+            TypeKind::Constructor(signature) => {
+                self.emit_semantic_constructor_type(&signature, None)?;
+            }
+            TypeKind::Overload(signatures) => {
+                for (index, signature) in signatures.iter().enumerate() {
+                    if index != 0 {
+                        self.writer.write(" | ");
+                    }
+                    self.emit_semantic_function_type(signature)?;
+                }
             }
         }
         Ok(())
     }
 
+    fn emit_semantic_type_list(
+        &mut self,
+        types: &[TypeId],
+        separator: &str,
+    ) -> Result<(), EmitError> {
+        for (index, type_id) in types.iter().enumerate() {
+            if index != 0 {
+                self.writer.write(separator);
+            }
+            self.emit_semantic_type(*type_id)?;
+        }
+        Ok(())
+    }
+
+    fn emit_semantic_function_type(&mut self, signature: &FunctionType) -> Result<(), EmitError> {
+        self.writer.write("(");
+        self.emit_semantic_parameters(signature, None)?;
+        self.writer.write(") => ");
+        self.emit_semantic_type(signature.return_type)
+    }
+
+    fn emit_semantic_constructor_type(
+        &mut self,
+        signature: &FunctionType,
+        parameter_names: Option<&[String]>,
+    ) -> Result<(), EmitError> {
+        self.writer.write("{");
+        self.writer.newline();
+        self.writer.indent += 1;
+        self.writer.write("new (");
+        self.emit_semantic_parameters(signature, parameter_names)?;
+        self.writer.write("): ");
+        if let Some(TypeKind::Object(object)) = self
+            .semantic_types
+            .and_then(|types| types.get(signature.return_type))
+            .map(|type_| type_.kind.clone())
+        {
+            self.emit_semantic_object_type_with_methods(&object, true)?;
+        } else {
+            self.emit_semantic_type(signature.return_type)?;
+        }
+        self.writer.write(";");
+        self.writer.newline();
+        self.writer.indent -= 1;
+        self.writer.write("}");
+        Ok(())
+    }
+
+    fn emit_semantic_parameters(
+        &mut self,
+        signature: &FunctionType,
+        parameter_names: Option<&[String]>,
+    ) -> Result<(), EmitError> {
+        for (index, parameter) in signature.parameters.iter().enumerate() {
+            if index != 0 {
+                self.writer.write(", ");
+            }
+            let rest = signature.parameters.len() == 1
+                && matches!(
+                    self.semantic_types
+                        .and_then(|types| types.get(*parameter))
+                        .map(|type_| &type_.kind),
+                    Some(TypeKind::Array(_))
+                );
+            if rest {
+                self.writer.write("...");
+            }
+            if let Some(name) = parameter_names.and_then(|names| names.get(index)) {
+                self.writer.write(name);
+            } else if rest {
+                self.writer.write("args");
+            } else {
+                self.writer.write("arg");
+                self.writer.write(&index.to_string());
+            }
+            self.writer.write(": ");
+            self.emit_semantic_type(*parameter)?;
+        }
+        Ok(())
+    }
+
     fn emit_semantic_object_type(&mut self, object: &ObjectType) -> Result<(), EmitError> {
+        self.emit_semantic_object_type_with_methods(object, false)
+    }
+
+    fn emit_semantic_object_type_with_methods(
+        &mut self,
+        object: &ObjectType,
+        methods: bool,
+    ) -> Result<(), EmitError> {
         self.writer.write("{");
         if !object.properties.is_empty() {
             self.writer.newline();
@@ -2051,8 +2743,22 @@ impl DeclarationPrinter<'_> {
                 if object.optional_properties.contains(name) {
                     self.writer.write("?");
                 }
-                self.writer.write(": ");
-                self.emit_semantic_type(*type_id)?;
+                let function = self
+                    .semantic_types
+                    .and_then(|types| types.get(*type_id))
+                    .and_then(|type_| match &type_.kind {
+                        TypeKind::Function(signature) if methods => Some(signature.clone()),
+                        _ => None,
+                    });
+                if let Some(signature) = function {
+                    self.writer.write("(");
+                    self.emit_semantic_parameters(&signature, None)?;
+                    self.writer.write("): ");
+                    self.emit_semantic_type(signature.return_type)?;
+                } else {
+                    self.writer.write(": ");
+                    self.emit_semantic_type(*type_id)?;
+                }
                 self.writer.write(";");
                 self.writer.newline();
             }
