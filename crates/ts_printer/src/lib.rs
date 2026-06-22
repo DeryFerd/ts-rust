@@ -1,6 +1,6 @@
 //! Deterministic modern-JavaScript emission from the generated TypeScript AST.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 
@@ -706,6 +706,29 @@ pub fn emit_declaration_file(
     source_text: &str,
     declaration_map: bool,
 ) -> Result<EmitResult, EmitError> {
+    emit_declaration_file_with_reachability(
+        arena,
+        source_file,
+        source_name,
+        source_text,
+        declaration_map,
+        None,
+    )
+}
+
+/// Emits one source file as declarations, retaining the statements selected by checking.
+///
+/// # Errors
+///
+/// Returns an error when a declaration contains an unsupported or missing node.
+pub fn emit_declaration_file_with_reachability(
+    arena: &NodeArena,
+    source_file: NodeId,
+    source_name: &str,
+    source_text: &str,
+    declaration_map: bool,
+    declaration_reachability: Option<&BTreeMap<NodeId, BTreeSet<NodeId>>>,
+) -> Result<EmitResult, EmitError> {
     let mut printer = DeclarationPrinter {
         arena,
         writer: Writer::default(),
@@ -714,6 +737,7 @@ pub fn emit_declaration_file(
         source_line_starts: declaration_map.then(|| line_starts(source_text)),
         module_file: false,
         overload_names: HashSet::new(),
+        declaration_reachability,
     };
     let node = printer.node(source_file)?.clone();
     let NodeData::SourceFile(data) = &node.data else {
@@ -725,7 +749,11 @@ pub fn emit_declaration_file(
             .is_ok_and(|node| declaration_is_module_indicator(printer.arena, node))
     });
     for statement in &data.statements.nodes {
-        printer.emit_statement(*statement, false)?;
+        printer.emit_statement(*statement, false, source_file)?;
+    }
+    if printer.scope_needs_seal(source_file) {
+        printer.writer.write("export {};");
+        printer.writer.newline();
     }
     let source_map = printer
         .source_map
@@ -744,6 +772,7 @@ struct DeclarationPrinter<'a> {
     source_line_starts: Option<Vec<usize>>,
     module_file: bool,
     overload_names: HashSet<String>,
+    declaration_reachability: Option<&'a BTreeMap<NodeId, BTreeSet<NodeId>>>,
 }
 
 impl DeclarationPrinter<'_> {
@@ -771,8 +800,20 @@ impl DeclarationPrinter<'_> {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn emit_statement(&mut self, id: NodeId, in_namespace: bool) -> Result<(), EmitError> {
+    fn emit_statement(
+        &mut self,
+        id: NodeId,
+        in_namespace: bool,
+        scope: NodeId,
+    ) -> Result<(), EmitError> {
         let node = self.node(id)?.clone();
+        if let Some(retained) = self
+            .declaration_reachability
+            .and_then(|reachability| reachability.get(&scope))
+            && !retained.contains(&id)
+        {
+            return Ok(());
+        }
         if let NodeData::FunctionDeclaration(function) = &node.data
             && let Some(name) = function.name
             && let Some(name) = declaration_name_text(self.arena, name)
@@ -784,7 +825,8 @@ impl DeclarationPrinter<'_> {
             }
         }
         let exported = declaration_has_modifier(self.arena, &node, SyntaxKind::ExportKeyword);
-        if self.module_file
+        if self.declaration_reachability.is_none()
+            && self.module_file
             && !in_namespace
             && !exported
             && !matches!(
@@ -800,12 +842,12 @@ impl DeclarationPrinter<'_> {
         self.record_mapping(&node);
         match &node.data {
             NodeData::VariableStatement(data) => {
-                self.emit_declaration_prefix(&node, true);
+                self.emit_declaration_prefix(&node, !in_namespace);
                 self.emit_variable_declarations(data.declaration_list)?;
                 self.writer.write(";");
             }
             NodeData::FunctionDeclaration(data) => {
-                self.emit_declaration_prefix(&node, true);
+                self.emit_declaration_prefix(&node, !in_namespace);
                 self.writer.write("function ");
                 if let Some(name) = data.name {
                     self.emit_name(name)?;
@@ -816,7 +858,7 @@ impl DeclarationPrinter<'_> {
                 self.writer.write(";");
             }
             NodeData::ClassDeclaration(data) => {
-                self.emit_declaration_prefix(&node, true);
+                self.emit_declaration_prefix(&node, !in_namespace);
                 self.writer.write("class");
                 if let Some(name) = data.name {
                     self.writer.write(" ");
@@ -858,7 +900,7 @@ impl DeclarationPrinter<'_> {
                 self.writer.write(";");
             }
             NodeData::EnumDeclaration(data) => {
-                self.emit_declaration_prefix(&node, true);
+                self.emit_declaration_prefix(&node, !in_namespace);
                 self.writer.write("enum ");
                 self.emit_name(data.name)?;
                 self.writer.write(" {");
@@ -881,7 +923,7 @@ impl DeclarationPrinter<'_> {
                 self.writer.write("}");
             }
             NodeData::ModuleDeclaration(data) => {
-                self.emit_declaration_prefix(&node, true);
+                self.emit_declaration_prefix(&node, !in_namespace);
                 self.writer.write("namespace ");
                 self.emit_name(data.name)?;
                 self.writer.write(" {");
@@ -895,6 +937,9 @@ impl DeclarationPrinter<'_> {
             }
             NodeData::ImportDeclaration(data) => self.emit_import(data)?,
             NodeData::ImportEqualsDeclaration(data) => {
+                if declaration_has_modifier(self.arena, &node, SyntaxKind::ExportKeyword) {
+                    self.writer.write("export ");
+                }
                 self.writer.write("import ");
                 self.emit_name(data.name)?;
                 self.writer.write(" = ");
@@ -1374,13 +1419,52 @@ impl DeclarationPrinter<'_> {
         match &node.data {
             NodeData::ModuleBlock(data) => {
                 for statement in &data.statements.nodes {
-                    self.emit_statement(*statement, true)?;
+                    self.emit_statement(*statement, true, id)?;
+                }
+                if self.scope_needs_seal(id) {
+                    self.writer.write("export {};");
+                    self.writer.newline();
                 }
             }
-            NodeData::ModuleDeclaration(_) => self.emit_statement(id, true)?,
+            NodeData::ModuleDeclaration(_) => self.emit_statement(id, true, id)?,
             _ => return Err(Self::unsupported(id, node.kind)),
         }
         Ok(())
+    }
+
+    fn scope_needs_seal(&self, scope: NodeId) -> bool {
+        let Some(retained) = self
+            .declaration_reachability
+            .and_then(|reachability| reachability.get(&scope))
+        else {
+            return false;
+        };
+        let has_export = retained.iter().any(|statement| {
+            self.arena.get(*statement).is_some_and(|node| {
+                declaration_has_modifier(self.arena, node, SyntaxKind::ExportKeyword)
+                    || matches!(
+                        node.data,
+                        NodeData::ExportDeclaration(_) | NodeData::ExportAssignment(_)
+                    )
+            })
+        });
+        let has_private_declaration = retained.iter().any(|statement| {
+            self.arena.get(*statement).is_some_and(|node| {
+                !declaration_has_modifier(self.arena, node, SyntaxKind::ExportKeyword)
+                    && matches!(
+                        node.data,
+                        NodeData::VariableStatement(_)
+                            | NodeData::FunctionDeclaration(_)
+                            | NodeData::ClassDeclaration(_)
+                            | NodeData::InterfaceDeclaration(_)
+                            | NodeData::TypeAliasDeclaration(_)
+                            | NodeData::EnumDeclaration(_)
+                            | NodeData::ModuleDeclaration(_)
+                            | NodeData::ImportEqualsDeclaration(_)
+                    )
+            })
+        });
+        has_export && has_private_declaration
     }
 
     fn emit_import(&mut self, data: &ts_ast::ImportDeclarationData) -> Result<(), EmitError> {
@@ -6046,13 +6130,17 @@ fn binary_precedence(kind: SyntaxKind) -> Option<(u8, bool)> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use ts_ast::NodeData;
     use ts_binder::bind_source_file;
     use ts_options::{JsxEmit, ModuleKind, PrinterSettings, ScriptTarget};
     use ts_parser::{parse_jsx_source_file, parse_source_file};
 
     use super::{
-        AmdDependency, EmitContext, emit_declaration_file, emit_source_file,
-        emit_source_file_with_context, emit_source_file_with_settings, original_position,
+        AmdDependency, EmitContext, emit_declaration_file, emit_declaration_file_with_reachability,
+        emit_source_file, emit_source_file_with_context, emit_source_file_with_settings,
+        original_position,
     };
 
     fn emit(source: &str) -> String {
@@ -7153,8 +7241,44 @@ class Board {
                 .unwrap();
         assert_eq!(
             result.code,
-            "import { Input } from \"./types\";\nexport declare const version: number;\nexport declare function identity<T>(value: T): T;\nexport declare function parse(value: string): string;\nexport declare class Store<T> {\n    value: T;\n    read(input: T): T;\n}\nexport interface Box<T> {\n    value: T;\n}\nexport type Maybe<T> = T | undefined;\nexport declare enum Color {\n    Red,\n    Blue = 2,\n}\nexport declare namespace Helpers {\n    export declare function read(value: string): string;\n}\nexport { Input };\n"
+            "import { Input } from \"./types\";\nexport declare const version: number;\nexport declare function identity<T>(value: T): T;\nexport declare function parse(value: string): string;\nexport declare class Store<T> {\n    value: T;\n    read(input: T): T;\n}\nexport interface Box<T> {\n    value: T;\n}\nexport type Maybe<T> = T | undefined;\nexport declare enum Color {\n    Red,\n    Blue = 2,\n}\nexport declare namespace Helpers {\n    export function read(value: string): string;\n}\nexport { Input };\n"
         );
         assert!(result.source_map.is_some());
+    }
+
+    #[test]
+    fn emits_only_reachable_private_declarations_and_a_scope_seal() {
+        let source = concat!(
+            "type T = { x: number };\n",
+            "type Unused = { hidden: string };\n",
+            "export interface I { f: T; }\n",
+        );
+        let parsed = parse_source_file(source);
+        let NodeData::SourceFile(file) = &parsed.arena.get(parsed.source_file).unwrap().data else {
+            panic!("expected source file");
+        };
+        let retained = BTreeSet::from([file.statements.nodes[0], file.statements.nodes[2]]);
+        let reachability = BTreeMap::from([(parsed.source_file, retained)]);
+        let result = emit_declaration_file_with_reachability(
+            &parsed.arena,
+            parsed.source_file,
+            "input.ts",
+            source,
+            false,
+            Some(&reachability),
+        )
+        .unwrap();
+        assert_eq!(
+            result.code,
+            concat!(
+                "type T = {\n",
+                "    x: number;\n",
+                "};\n",
+                "export interface I {\n",
+                "    f: T;\n",
+                "}\n",
+                "export {};\n",
+            )
+        );
     }
 }

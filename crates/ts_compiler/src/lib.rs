@@ -17,7 +17,7 @@ use ts_options::{CompilerOptions, PrinterSettings, parse_project_options};
 use ts_parser::{ParseResult, parse_jsx_source_file, parse_source_file};
 use ts_path::{CaseSensitivity, canonicalize, directory_path, is_absolute, resolve_path};
 use ts_printer::{
-    AmdDependency as PrinterAmdDependency, EmitContext, emit_declaration_file,
+    AmdDependency as PrinterAmdDependency, EmitContext, emit_declaration_file_with_reachability,
     emit_source_file_with_context,
 };
 use ts_sourcemap::{SourceMap, SourceMapBuilder};
@@ -462,12 +462,13 @@ impl Program {
                 }
             }
             if settings.emit_declarations {
-                match emit_declaration_file(
+                match emit_declaration_file_with_reachability(
                     &source_file.parse.arena,
                     source_file.parse.source_file,
                     &source_file.file_name,
                     &source_file.source_text,
                     self.options.declaration_map,
+                    Some(&source_file.checking.declaration_reachability),
                 ) {
                     Ok(mut emitted) => {
                         let Some(file_name) = paths.declaration.clone() else {
@@ -603,12 +604,13 @@ impl Program {
                 let generated_line =
                     u32::try_from(code.bytes().filter(|byte| *byte == b'\n').count())
                         .unwrap_or(u32::MAX);
-                match emit_declaration_file(
+                match emit_declaration_file_with_reachability(
                     &source.parse.arena,
                     source.parse.source_file,
                     &source.file_name,
                     &source.source_text,
                     false,
+                    Some(&source.checking.declaration_reachability),
                 ) {
                     Ok(emitted) => {
                         if !emitted.code.is_empty() {
@@ -2476,6 +2478,97 @@ mod tests {
                 .iter()
                 .any(|file| file.file_name == "/project/dist/api.mjs")
         );
+    }
+
+    #[test]
+    fn declaration_emit_consumes_reachable_private_declarations() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/main.ts",
+            "type T = { x: number }; export interface I { f: T; }",
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["main.ts".to_owned()],
+            CompilerOptions {
+                declaration: true,
+                module: ModuleKind::CommonJs,
+                target: ScriptTarget::Es2015,
+                no_emit_on_error: true,
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        let emitted = program.emit();
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        let declaration = emitted
+            .files
+            .iter()
+            .find(|file| file.file_name == "/project/main.d.ts")
+            .unwrap();
+        assert_eq!(
+            declaration.text,
+            concat!(
+                "type T = {\n",
+                "    x: number;\n",
+                "};\n",
+                "export interface I {\n",
+                "    f: T;\n",
+                "}\n",
+                "export {};\n",
+            )
+        );
+
+        for (source, expected) in [
+            (
+                "namespace M { namespace N {} export import X = N; }",
+                concat!(
+                    "declare namespace M {\n",
+                    "    namespace N {\n",
+                    "    }\n",
+                    "    export import X = N;\n",
+                    "    export {};\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "namespace M { namespace N { class C {} } import R = N; export import X = R; }",
+                concat!(
+                    "declare namespace M {\n",
+                    "    namespace N {\n",
+                    "    }\n",
+                    "    import R = N;\n",
+                    "    export import X = R;\n",
+                    "    export {};\n",
+                    "}\n",
+                ),
+            ),
+        ] {
+            let fs = MemoryFileSystem::new(true);
+            fs.write_file("/project/alias.ts", source).unwrap();
+            let program = Program::new_with_options(
+                &fs,
+                "/project",
+                &["alias.ts".to_owned()],
+                CompilerOptions {
+                    declaration: true,
+                    module: ModuleKind::None,
+                    target: ScriptTarget::Es2015,
+                    no_lib: true,
+                    ..CompilerOptions::default()
+                },
+            );
+            let emitted = program.emit();
+            assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+            let declaration = emitted
+                .files
+                .iter()
+                .find(|file| file.file_name == "/project/alias.d.ts")
+                .unwrap();
+            assert_eq!(declaration.text, expected);
+        }
     }
 
     #[test]
