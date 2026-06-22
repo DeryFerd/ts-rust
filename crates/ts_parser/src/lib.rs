@@ -2854,7 +2854,7 @@ impl<'a> Parser<'a> {
             && self.current.kind != SyntaxKind::EndOfFile
         {
             let specifier_start = self.current.range.start;
-            let first = self.parse_identifier_name("Expected an import name.");
+            let first = self.parse_module_export_name("Expected an import name.");
             let (property_name, name) = if self.current.kind == SyntaxKind::AsKeyword {
                 self.bump();
                 (
@@ -3059,12 +3059,12 @@ impl<'a> Parser<'a> {
             && self.current.kind != SyntaxKind::EndOfFile
         {
             let specifier_start = self.current.range.start;
-            let first = self.parse_identifier("Expected an export name.");
+            let first = self.parse_module_export_name("Expected an export name.");
             let (property_name, name) = if self.current.kind == SyntaxKind::AsKeyword {
                 self.bump();
                 (
                     Some(first),
-                    self.parse_identifier("Expected an exported name."),
+                    self.parse_module_export_name("Expected an exported name."),
                 )
             } else {
                 (None, first)
@@ -4462,6 +4462,14 @@ impl<'a> Parser<'a> {
             })),
             &[],
         )
+    }
+
+    fn parse_module_export_name(&mut self, message: &str) -> NodeId {
+        if self.current.kind == SyntaxKind::StringLiteral {
+            self.parse_string_literal()
+        } else {
+            self.parse_identifier_name(message)
+        }
     }
 
     fn parse_property_name(&mut self, message: &str) -> NodeId {
@@ -6502,6 +6510,143 @@ mod tests {
             panic!("expected imported identifier name");
         };
         assert_eq!(property.text, "default");
+    }
+
+    #[test]
+    fn parses_identifier_name_and_string_literal_import_names() {
+        let result = parse_source_file(
+            r#"import { default as DefaultThing, "source-name" as sourceName, class as classValue } from "./mod";"#,
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let statements = source_statements(&result);
+        assert_eq!(statements.len(), 1);
+
+        let NodeData::ImportDeclaration(import) = &result.arena.get(statements[0]).unwrap().data
+        else {
+            panic!("expected import declaration");
+        };
+        let NodeData::ImportClause(clause) = &result
+            .arena
+            .get(import.import_clause.unwrap())
+            .unwrap()
+            .data
+        else {
+            panic!("expected import clause");
+        };
+        let NodeData::NamedImports(imports) = &result
+            .arena
+            .get(clause.named_bindings.unwrap())
+            .unwrap()
+            .data
+        else {
+            panic!("expected named imports");
+        };
+        let imported_names = imports
+            .elements
+            .nodes
+            .iter()
+            .map(|specifier| {
+                let NodeData::ImportSpecifier(specifier) =
+                    &result.arena.get(*specifier).unwrap().data
+                else {
+                    panic!("expected import specifier");
+                };
+                (
+                    result
+                        .arena
+                        .get(specifier.property_name.unwrap())
+                        .unwrap()
+                        .kind,
+                    result.arena.get(specifier.name).unwrap().kind,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            imported_names,
+            [
+                (SyntaxKind::Identifier, SyntaxKind::Identifier),
+                (SyntaxKind::StringLiteral, SyntaxKind::Identifier),
+                (SyntaxKind::Identifier, SyntaxKind::Identifier),
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_identifier_name_and_string_literal_export_names() {
+        let result = parse_source_file(
+            r#"
+                export { zzz as default };
+                export { default as zzz, zzz as "public-name", "source-name" as class } from "./mod";
+            "#,
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let statements = source_statements(&result);
+        assert_eq!(statements.len(), 2);
+
+        let NodeData::ExportDeclaration(export) = &result.arena.get(statements[0]).unwrap().data
+        else {
+            panic!("expected export declaration");
+        };
+        let NodeData::NamedExports(exports) = &result
+            .arena
+            .get(export.export_clause.unwrap())
+            .unwrap()
+            .data
+        else {
+            panic!("expected named exports");
+        };
+        let NodeData::ExportSpecifier(default_export) =
+            &result.arena.get(exports.elements.nodes[0]).unwrap().data
+        else {
+            panic!("expected export specifier");
+        };
+        let NodeData::Identifier(exported_name) =
+            &result.arena.get(default_export.name).unwrap().data
+        else {
+            panic!("expected exported identifier name");
+        };
+        assert_eq!(exported_name.text, "default");
+
+        let NodeData::ExportDeclaration(export) = &result.arena.get(statements[1]).unwrap().data
+        else {
+            panic!("expected export declaration");
+        };
+        let NodeData::NamedExports(exports) = &result
+            .arena
+            .get(export.export_clause.unwrap())
+            .unwrap()
+            .data
+        else {
+            panic!("expected named exports");
+        };
+        let export_name_kinds = exports
+            .elements
+            .nodes
+            .iter()
+            .map(|specifier| {
+                let NodeData::ExportSpecifier(specifier) =
+                    &result.arena.get(*specifier).unwrap().data
+                else {
+                    panic!("expected export specifier");
+                };
+                (
+                    result
+                        .arena
+                        .get(specifier.property_name.unwrap())
+                        .unwrap()
+                        .kind,
+                    result.arena.get(specifier.name).unwrap().kind,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            export_name_kinds,
+            [
+                (SyntaxKind::Identifier, SyntaxKind::Identifier),
+                (SyntaxKind::Identifier, SyntaxKind::StringLiteral),
+                (SyntaxKind::StringLiteral, SyntaxKind::Identifier),
+            ]
+        );
     }
 
     #[test]
