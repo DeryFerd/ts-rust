@@ -30,12 +30,48 @@ pub struct AmdDependency<'a> {
     pub comment_end: u32,
 }
 
+/// A checker-evaluated enum constant supplied for emission.
+#[derive(Clone, Debug, PartialEq)]
+pub enum EmitConstantValue {
+    Number(f64),
+    String(String),
+}
+
 /// Semantic and source-file metadata used while emitting one file.
 #[derive(Debug)]
 pub struct EmitContext<'a> {
     pub bindings: &'a BindResult,
     pub amd_module_name: Option<&'a str>,
     pub amd_dependencies: &'a [AmdDependency<'a>],
+    pub enum_member_values: &'a BTreeMap<NodeId, EmitConstantValue>,
+    pub enum_access_values: &'a BTreeMap<NodeId, EmitConstantValue>,
+    pub preserve_const_enums: bool,
+    pub inline_const_enums: bool,
+}
+
+#[derive(Clone, Copy)]
+enum ConstEnumEmitMode {
+    EraseAndInline,
+    PreserveAndInline,
+    PreserveRuntime,
+}
+
+impl ConstEnumEmitMode {
+    const fn new(preserve: bool, inline: bool) -> Self {
+        match (preserve, inline) {
+            (false, _) => Self::EraseAndInline,
+            (true, true) => Self::PreserveAndInline,
+            (true, false) => Self::PreserveRuntime,
+        }
+    }
+
+    const fn preserves_declarations(self) -> bool {
+        !matches!(self, Self::EraseAndInline)
+    }
+
+    const fn inlines_accesses(self) -> bool {
+        !matches!(self, Self::PreserveRuntime)
+    }
 }
 
 impl fmt::Display for EmitError {
@@ -113,6 +149,7 @@ pub fn emit_source_file_with_settings_and_bindings(
     settings: PrinterSettings,
     bindings: &BindResult,
 ) -> Result<EmitResult, EmitError> {
+    let empty_enum_values = BTreeMap::new();
     emit_source_file_with_context(
         arena,
         source_file,
@@ -123,6 +160,10 @@ pub fn emit_source_file_with_settings_and_bindings(
             bindings,
             amd_module_name: None,
             amd_dependencies: &[],
+            enum_member_values: &empty_enum_values,
+            enum_access_values: &empty_enum_values,
+            preserve_const_enums: true,
+            inline_const_enums: false,
         },
     )
 }
@@ -145,6 +186,12 @@ pub fn emit_source_file_with_context(
         return Ok(EmitResult::default());
     }
     let automatic_jsx = AutomaticJsxUsage::analyze(arena, settings.jsx);
+    let enum_access_fallbacks = const_enum_access_fallbacks(
+        arena,
+        context.bindings,
+        context.enum_member_values,
+        context.enum_access_values,
+    );
     let mut printer = Printer {
         arena,
         writer: Writer::default(),
@@ -164,6 +211,13 @@ pub fn emit_source_file_with_context(
         identifier_rewrites: HashMap::new(),
         system_predeclared_names: HashSet::new(),
         commonjs_module_transform: settings.module == ModuleKind::CommonJs,
+        enum_member_values: context.enum_member_values,
+        enum_access_values: context.enum_access_values,
+        const_enum_emit_mode: ConstEnumEmitMode::new(
+            context.preserve_const_enums,
+            context.inline_const_enums,
+        ),
+        enum_access_fallbacks,
     };
     let node = printer.node(source_file)?.clone();
     let NodeData::SourceFile(data) = &node.data else {
@@ -230,7 +284,11 @@ pub fn emit_source_file_with_context(
                 .write("Object.defineProperty(exports, \"__esModule\", { value: true });");
             printer.writer.newline();
         }
-        let preinitialized_exports = commonjs_preinitialized_export_names(arena, &data.statements);
+        let preinitialized_exports = commonjs_preinitialized_export_names(
+            arena,
+            &data.statements,
+            context.preserve_const_enums,
+        );
         if !preinitialized_exports.is_empty() {
             for name in preinitialized_exports.iter().rev() {
                 printer.writer.write("exports.");
@@ -444,7 +502,11 @@ fn commonjs_module_temp_base(arena: &NodeArena, module_specifier: NodeId) -> Str
     }
 }
 
-fn commonjs_preinitialized_export_names(arena: &NodeArena, statements: &NodeList) -> Vec<String> {
+fn commonjs_preinitialized_export_names(
+    arena: &NodeArena,
+    statements: &NodeList,
+    preserve_const_enums: bool,
+) -> Vec<String> {
     let mut names = Vec::new();
     let mut seen = HashSet::new();
     for statement in &statements.nodes {
@@ -452,6 +514,9 @@ fn commonjs_preinitialized_export_names(arena: &NodeArena, statements: &NodeList
             continue;
         };
         if !declaration_has_modifier(arena, node, SyntaxKind::ExportKeyword) {
+            continue;
+        }
+        if is_const_enum_declaration(arena, node) && !preserve_const_enums {
             continue;
         }
         let default_export = declaration_has_modifier(arena, node, SyntaxKind::DefaultKeyword);
@@ -713,6 +778,7 @@ pub fn emit_declaration_file(
         source_text,
         declaration_map,
         None,
+        None,
     )
 }
 
@@ -728,6 +794,7 @@ pub fn emit_declaration_file_with_reachability(
     source_text: &str,
     declaration_map: bool,
     declaration_reachability: Option<&BTreeMap<NodeId, BTreeSet<NodeId>>>,
+    enum_member_values: Option<&BTreeMap<NodeId, EmitConstantValue>>,
 ) -> Result<EmitResult, EmitError> {
     let mut printer = DeclarationPrinter {
         arena,
@@ -738,6 +805,7 @@ pub fn emit_declaration_file_with_reachability(
         module_file: false,
         overload_names: HashSet::new(),
         declaration_reachability,
+        enum_member_values,
     };
     let node = printer.node(source_file)?.clone();
     let NodeData::SourceFile(data) = &node.data else {
@@ -773,6 +841,7 @@ struct DeclarationPrinter<'a> {
     module_file: bool,
     overload_names: HashSet<String>,
     declaration_reachability: Option<&'a BTreeMap<NodeId, BTreeSet<NodeId>>>,
+    enum_member_values: Option<&'a BTreeMap<NodeId, EmitConstantValue>>,
 }
 
 impl DeclarationPrinter<'_> {
@@ -901,22 +970,39 @@ impl DeclarationPrinter<'_> {
             }
             NodeData::EnumDeclaration(data) => {
                 self.emit_declaration_prefix(&node, !in_namespace);
+                let is_const =
+                    declaration_has_modifier(self.arena, &node, SyntaxKind::ConstKeyword);
+                if is_const {
+                    self.writer.write("const ");
+                }
                 self.writer.write("enum ");
                 self.emit_name(data.name)?;
                 self.writer.write(" {");
                 self.writer.newline();
                 self.writer.indent += 1;
-                for member in &data.members.nodes {
+                for (index, member) in data.members.nodes.iter().enumerate() {
+                    let member_id = *member;
                     let member_node = self.node(*member)?.clone();
                     let NodeData::EnumMember(member) = &member_node.data else {
                         return Err(Self::unsupported(*member, member_node.kind));
                     };
                     self.emit_name(member.name)?;
-                    if let Some(initializer) = member.initializer {
+                    if let Some(value) = is_const
+                        .then(|| {
+                            self.enum_member_values
+                                .and_then(|values| values.get(&member_id))
+                        })
+                        .flatten()
+                    {
+                        self.writer.write(" = ");
+                        write_enum_constant(&mut self.writer, value);
+                    } else if let Some(initializer) = member.initializer {
                         self.writer.write(" = ");
                         self.emit_literal_expression(initializer)?;
                     }
-                    self.writer.write(",");
+                    if !is_const || index + 1 != data.members.nodes.len() {
+                        self.writer.write(",");
+                    }
                     self.writer.newline();
                 }
                 self.writer.indent -= 1;
@@ -1595,6 +1681,83 @@ fn declaration_has_modifier(arena: &NodeArena, node: &Node, kind: SyntaxKind) ->
     })
 }
 
+fn is_const_enum_declaration(arena: &NodeArena, node: &Node) -> bool {
+    matches!(node.data, NodeData::EnumDeclaration(_))
+        && declaration_has_modifier(arena, node, SyntaxKind::ConstKeyword)
+}
+
+fn write_enum_constant(writer: &mut Writer, value: &EmitConstantValue) {
+    match value {
+        EmitConstantValue::Number(value) => writer.write(&value.to_string()),
+        EmitConstantValue::String(value) => write_quoted(writer, value),
+    }
+}
+
+fn const_enum_access_fallbacks(
+    arena: &NodeArena,
+    bindings: &BindResult,
+    member_values: &BTreeMap<NodeId, EmitConstantValue>,
+    access_values: &BTreeMap<NodeId, EmitConstantValue>,
+) -> HashMap<NodeId, EmitConstantValue> {
+    let mut members = HashMap::new();
+    for (_, declaration) in arena.iter() {
+        let NodeData::EnumDeclaration(enumeration) = &declaration.data else {
+            continue;
+        };
+        if !is_const_enum_declaration(arena, declaration) {
+            continue;
+        }
+        let Some(enum_name) = declaration_name_text(arena, enumeration.name) else {
+            continue;
+        };
+        for member_id in &enumeration.members.nodes {
+            let Some(value) = member_values.get(member_id) else {
+                continue;
+            };
+            let Some(NodeData::EnumMember(member)) = arena.get(*member_id).map(|node| &node.data)
+            else {
+                continue;
+            };
+            let Some(name) = declaration_name_text(arena, member.name) else {
+                continue;
+            };
+            members.insert((enum_name.to_owned(), name.to_owned()), value.clone());
+        }
+    }
+    let mut fallbacks = HashMap::new();
+    for (id, node) in arena.iter() {
+        if access_values.contains_key(&id) {
+            continue;
+        }
+        let (receiver, member) = match &node.data {
+            NodeData::PropertyAccessExpression(access) => {
+                let Some(member) = declaration_name_text(arena, access.name) else {
+                    continue;
+                };
+                (access.expression, member)
+            }
+            NodeData::ElementAccessExpression(access) => {
+                let Some(member) = string_literal_text(arena, access.argument_expression) else {
+                    continue;
+                };
+                (access.expression, member)
+            }
+            _ => continue,
+        };
+        let Some(receiver_name) = declaration_name_text(arena, receiver) else {
+            continue;
+        };
+        let resolved_name = bindings
+            .resolve_name_at(receiver, receiver_name)
+            .and_then(|symbol| bindings.symbols.get(symbol))
+            .map_or(receiver_name, |symbol| symbol.name.as_str());
+        if let Some(value) = members.get(&(resolved_name.to_owned(), member.to_owned())) {
+            fallbacks.insert(id, value.clone());
+        }
+    }
+    fallbacks
+}
+
 fn declaration_modifiers(node: &Node) -> Option<&ts_ast::ModifierList> {
     match &node.data {
         NodeData::VariableStatement(data) => data.modifiers.as_ref(),
@@ -2057,6 +2220,10 @@ struct Printer<'a> {
     identifier_rewrites: HashMap<ts_ast::SymbolId, String>,
     system_predeclared_names: HashSet<String>,
     commonjs_module_transform: bool,
+    enum_member_values: &'a BTreeMap<NodeId, EmitConstantValue>,
+    enum_access_values: &'a BTreeMap<NodeId, EmitConstantValue>,
+    const_enum_emit_mode: ConstEnumEmitMode,
+    enum_access_fallbacks: HashMap<NodeId, EmitConstantValue>,
 }
 
 impl Printer<'_> {
@@ -2630,6 +2797,11 @@ impl Printer<'_> {
     fn emit_statement(&mut self, id: NodeId) -> Result<(), EmitError> {
         let node = self.node(id)?.clone();
         if declaration_has_modifier(self.arena, &node, SyntaxKind::DeclareKeyword) {
+            return Ok(());
+        }
+        if is_const_enum_declaration(self.arena, &node)
+            && !self.const_enum_emit_mode.preserves_declarations()
+        {
             return Ok(());
         }
         if matches!(
@@ -3970,31 +4142,43 @@ impl Printer<'_> {
         self.writer.indent += 1;
         let mut next_number = 0_i64;
         for member in &data.members.nodes {
+            let member_id = *member;
             let node = self.node(*member)?.clone();
             let NodeData::EnumMember(member) = &node.data else {
                 return Err(Self::unsupported(*member, node.kind));
             };
             let member_name = self.identifier_text(member.name)?.to_owned();
+            let constant = self.enum_member_values.get(&member_id);
             self.writer.write(&name);
             self.writer.write("[");
-            let is_string_member = if let Some(initializer) = member.initializer {
-                matches!(
-                    &self.node(initializer)?.data,
-                    NodeData::StringLiteral(_) | NodeData::NoSubstitutionTemplateLiteral(_)
-                )
-            } else {
-                false
-            };
+            let is_string_member = matches!(constant, Some(EmitConstantValue::String(_)))
+                || member.initializer.is_some_and(|initializer| {
+                    matches!(
+                        self.arena.get(initializer).map(|node| &node.data),
+                        Some(
+                            NodeData::StringLiteral(_) | NodeData::NoSubstitutionTemplateLiteral(_)
+                        )
+                    )
+                });
             if is_string_member {
                 write_quoted(&mut self.writer, &member_name);
                 self.writer.write("] = ");
-                self.emit_expression(member.initializer.expect("initializer checked above"), 1)?;
+                if let Some(constant) = constant {
+                    write_enum_constant(&mut self.writer, constant);
+                } else {
+                    self.emit_expression(
+                        member.initializer.expect("initializer checked above"),
+                        1,
+                    )?;
+                }
             } else {
                 self.writer.write(&name);
                 self.writer.write("[");
                 write_quoted(&mut self.writer, &member_name);
                 self.writer.write("] = ");
-                if let Some(initializer) = member.initializer {
+                if let Some(constant) = constant {
+                    write_enum_constant(&mut self.writer, constant);
+                } else if let Some(initializer) = member.initializer {
                     self.emit_expression(initializer, 1)?;
                     if let NodeData::NumericLiteral(literal) = &self.node(initializer)?.data
                         && let Ok(value) = literal.text.parse::<i64>()
@@ -4616,6 +4800,30 @@ impl Printer<'_> {
     #[allow(clippy::too_many_lines)]
     fn emit_expression(&mut self, id: NodeId, parent_precedence: u8) -> Result<(), EmitError> {
         let node = self.node(id)?.clone();
+        if self.const_enum_emit_mode.inlines_accesses()
+            && let Some(value) = self
+                .enum_access_values
+                .get(&id)
+                .or_else(|| self.enum_access_fallbacks.get(&id))
+        {
+            let wrap = matches!(value, EmitConstantValue::Number(value) if value.is_sign_negative())
+                && parent_precedence > 15;
+            if wrap {
+                self.writer.write("(");
+            }
+            write_enum_constant(&mut self.writer, value);
+            let start = usize::try_from(node.range.start.get()).unwrap_or(usize::MAX);
+            let end = usize::try_from(node.range.end.get()).unwrap_or(usize::MAX);
+            if let Some(text) = self.source_text.get(start..end) {
+                self.writer.write(" /* ");
+                self.writer.write(&text.replace("*/", "*_/"));
+                self.writer.write(" */");
+            }
+            if wrap {
+                self.writer.write(")");
+            }
+            return Ok(());
+        }
         match &node.data {
             NodeData::Identifier(data) => {
                 if let Some(rewrite) = self
@@ -6238,9 +6446,9 @@ mod tests {
     use ts_parser::{parse_jsx_source_file, parse_source_file};
 
     use super::{
-        AmdDependency, EmitContext, emit_declaration_file, emit_declaration_file_with_reachability,
-        emit_source_file, emit_source_file_with_context, emit_source_file_with_settings,
-        original_position,
+        AmdDependency, EmitConstantValue, EmitContext, emit_declaration_file,
+        emit_declaration_file_with_reachability, emit_source_file, emit_source_file_with_context,
+        emit_source_file_with_settings, original_position,
     };
 
     fn emit(source: &str) -> String {
@@ -6286,6 +6494,7 @@ mod tests {
                 comment_end: dependency.range.end.get(),
             })
             .collect::<Vec<_>>();
+        let enum_values = BTreeMap::new();
         emit_source_file_with_context(
             &parsed.arena,
             parsed.source_file,
@@ -6305,6 +6514,10 @@ mod tests {
                 bindings: &bindings,
                 amd_module_name: parsed.amd_module_name.as_deref(),
                 amd_dependencies: &dependencies,
+                enum_member_values: &enum_values,
+                enum_access_values: &enum_values,
+                preserve_const_enums: true,
+                inline_const_enums: false,
             },
         )
         .unwrap()
@@ -6541,6 +6754,62 @@ mod tests {
         assert_eq!(
             emit("enum Color { Red, Green = 4, Blue, Label = 'blue' }"),
             "var Color;\n(function (Color) {\n    Color[Color[\"Red\"] = 0] = \"Red\";\n    Color[Color[\"Green\"] = 4] = \"Green\";\n    Color[Color[\"Blue\"] = 5] = \"Blue\";\n    Color[\"Label\"] = \"blue\";\n})(Color || (Color = {}));\n"
+        );
+    }
+
+    #[test]
+    fn inlines_negative_const_enum_values_with_expression_precedence() {
+        let source = concat!(
+            "const enum E { A = -1 }\n",
+            "const product = E.A * 2;\n",
+            "const text = E.A.toString();\n",
+        );
+        let parsed = parse_source_file(source);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let accesses = parsed
+            .arena
+            .iter()
+            .filter_map(|(id, node)| {
+                let NodeData::PropertyAccessExpression(access) = &node.data else {
+                    return None;
+                };
+                (super::declaration_name_text(&parsed.arena, access.name) == Some("A"))
+                    .then_some((id, EmitConstantValue::Number(-1.0)))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let member_values = BTreeMap::new();
+        let emitted = emit_source_file_with_context(
+            &parsed.arena,
+            parsed.source_file,
+            "input.ts",
+            source,
+            PrinterSettings {
+                always_strict: false,
+                target: ScriptTarget::Es2015,
+                module: ModuleKind::EsNext,
+                jsx: JsxEmit::Preserve,
+                emit_javascript: true,
+                emit_declarations: false,
+                source_map: false,
+                inline_source_map: false,
+            },
+            &EmitContext {
+                bindings: &bindings,
+                amd_module_name: None,
+                amd_dependencies: &[],
+                enum_member_values: &member_values,
+                enum_access_values: &accesses,
+                preserve_const_enums: false,
+                inline_const_enums: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            emitted.code,
+            concat!(
+                "const product = -1 /* E.A */ * 2;\n",
+                "const text = (-1 /* E.A */).toString();\n",
+            )
         );
     }
 
@@ -7379,6 +7648,7 @@ class Board {
             source,
             false,
             Some(&reachability),
+            None,
         )
         .unwrap();
         assert_eq!(

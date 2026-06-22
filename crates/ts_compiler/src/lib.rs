@@ -7,7 +7,10 @@ use std::{
 
 use ts_ast::{NodeData, NodeId};
 use ts_binder::{BindResult, bind_source_file};
-use ts_checker::{CheckResult, CheckerOptions, ProgramSource, check_program, empty_check_result};
+use ts_checker::{
+    CheckResult, CheckerOptions, EnumConstantValue as CheckerConstantValue, ProgramSource,
+    check_program, empty_check_result,
+};
 use ts_config::{ConfigDiagnostic, resolve_config_file};
 use ts_core::TextRange;
 use ts_diagnostics::message_by_code;
@@ -17,8 +20,8 @@ use ts_options::{CompilerOptions, PrinterSettings, parse_project_options};
 use ts_parser::{ParseResult, parse_jsx_source_file, parse_source_file};
 use ts_path::{CaseSensitivity, canonicalize, directory_path, is_absolute, resolve_path};
 use ts_printer::{
-    AmdDependency as PrinterAmdDependency, EmitContext, emit_declaration_file_with_reachability,
-    emit_source_file_with_context,
+    AmdDependency as PrinterAmdDependency, EmitConstantValue, EmitContext,
+    emit_declaration_file_with_reachability, emit_source_file_with_context,
 };
 use ts_sourcemap::{SourceMap, SourceMapBuilder};
 use ts_vfs::FileSystem;
@@ -401,6 +404,8 @@ impl Program {
                 &common_source_directory,
                 self.case_sensitivity,
             );
+            let enum_member_values = enum_values_for_emit(&source_file.checking.enum_member_values);
+            let enum_access_values = enum_values_for_emit(&source_file.checking.enum_access_values);
             if settings.emit_javascript {
                 let amd_dependencies = source_file
                     .parse
@@ -417,6 +422,12 @@ impl Program {
                     bindings: &source_file.binding,
                     amd_module_name: source_file.parse.amd_module_name.as_deref(),
                     amd_dependencies: &amd_dependencies,
+                    enum_member_values: &enum_member_values,
+                    enum_access_values: &enum_access_values,
+                    preserve_const_enums: self.options.preserve_const_enums
+                        || self.options.isolated_modules
+                        || self.options.verbatim_module_syntax,
+                    inline_const_enums: !self.options.isolated_modules,
                 };
                 match emit_source_file_with_context(
                     &source_file.parse.arena,
@@ -469,6 +480,7 @@ impl Program {
                     &source_file.source_text,
                     self.options.declaration_map,
                     Some(&source_file.checking.declaration_reachability),
+                    Some(&enum_member_values),
                 ) {
                     Ok(mut emitted) => {
                         let Some(file_name) = paths.declaration.clone() else {
@@ -530,6 +542,8 @@ impl Program {
                 source_settings.source_map = false;
                 source_settings.inline_source_map = false;
                 source_settings.always_strict = settings.always_strict && code.is_empty();
+                let enum_member_values = enum_values_for_emit(&source.checking.enum_member_values);
+                let enum_access_values = enum_values_for_emit(&source.checking.enum_access_values);
                 let amd_dependencies = source
                     .parse
                     .amd_dependencies
@@ -545,6 +559,12 @@ impl Program {
                     bindings: &source.binding,
                     amd_module_name: source.parse.amd_module_name.as_deref(),
                     amd_dependencies: &amd_dependencies,
+                    enum_member_values: &enum_member_values,
+                    enum_access_values: &enum_access_values,
+                    preserve_const_enums: self.options.preserve_const_enums
+                        || self.options.isolated_modules
+                        || self.options.verbatim_module_syntax,
+                    inline_const_enums: !self.options.isolated_modules,
                 };
                 match emit_source_file_with_context(
                     &source.parse.arena,
@@ -604,6 +624,7 @@ impl Program {
                 let generated_line =
                     u32::try_from(code.bytes().filter(|byte| *byte == b'\n').count())
                         .unwrap_or(u32::MAX);
+                let enum_member_values = enum_values_for_emit(&source.checking.enum_member_values);
                 match emit_declaration_file_with_reachability(
                     &source.parse.arena,
                     source.parse.source_file,
@@ -611,6 +632,7 @@ impl Program {
                     &source.source_text,
                     false,
                     Some(&source.checking.declaration_reachability),
+                    Some(&enum_member_values),
                 ) {
                     Ok(emitted) => {
                         if !emitted.code.is_empty() {
@@ -656,9 +678,6 @@ impl Program {
     }
 
     fn check_program(&mut self) {
-        if self.options.no_check {
-            return;
-        }
         let module_maps = self
             .source_files
             .iter()
@@ -691,8 +710,9 @@ impl Program {
                     bindings: &source_file.binding,
                     resolved_modules,
                     is_default_library: source_file.is_default_library,
-                    skip_diagnostics: self.options.skip_lib_check
-                        && ts_path::is_declaration_file(&source_file.file_name),
+                    skip_diagnostics: self.options.no_check
+                        || (self.options.skip_lib_check
+                            && ts_path::is_declaration_file(&source_file.file_name)),
                     checker_options: CheckerOptions {
                         allow_unreachable_code: self.options.allow_unreachable_code,
                         exact_optional_property_types: self.options.exact_optional_property_types,
@@ -713,7 +733,10 @@ impl Program {
                 .collect::<Vec<_>>();
             check_program(&inputs)
         };
-        for (source_file, checking) in self.source_files.iter_mut().zip(checked.files) {
+        for (source_file, mut checking) in self.source_files.iter_mut().zip(checked.files) {
+            if self.options.no_check {
+                checking.diagnostics.clear();
+            }
             for diagnostic in &checking.diagnostics {
                 let range = source_file
                     .parse
@@ -1017,6 +1040,21 @@ fn emit_diagnostic(source_file: &SourceFile, error: &ts_printer::EmitError) -> P
         code: None,
         message: error.to_string(),
     }
+}
+
+fn enum_values_for_emit(
+    values: &BTreeMap<NodeId, CheckerConstantValue>,
+) -> BTreeMap<NodeId, EmitConstantValue> {
+    values
+        .iter()
+        .map(|(node, value)| {
+            let value = match value {
+                CheckerConstantValue::Number(value) => EmitConstantValue::Number(*value),
+                CheckerConstantValue::String(value) => EmitConstantValue::String(value.clone()),
+            };
+            (*node, value)
+        })
+        .collect()
 }
 
 fn base64_encode(bytes: &[u8]) -> String {
@@ -2230,6 +2268,162 @@ mod tests {
     }
 
     #[test]
+    fn emits_const_enum_accesses_as_commented_constants() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/const-enum.ts",
+            concat!(
+                "const enum TestType { foo, bar }\n",
+                "type TestTypeStr = keyof typeof TestType;\n",
+                "function f1(f: TestType) { }\n",
+                "function f2(f: TestTypeStr) { }\n",
+                "f1(TestType.foo)\n",
+                "f1(TestType.bar)\n",
+                "f2('foo')\n",
+                "f2('bar')\n",
+            ),
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/",
+            &["const-enum.ts".to_owned()],
+            CompilerOptions {
+                target: ScriptTarget::Es2015,
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        let emitted = program.emit();
+        assert_eq!(
+            emitted.files[0].text,
+            concat!(
+                "\"use strict\";\n",
+                "function f1(f) { }\n",
+                "function f2(f) { }\n",
+                "f1(0 /* TestType.foo */);\n",
+                "f1(1 /* TestType.bar */);\n",
+                "f2('foo');\n",
+                "f2('bar');\n",
+            )
+        );
+    }
+
+    #[test]
+    fn const_enum_emit_respects_preserve_isolated_and_no_check() {
+        let source = "const enum E { Value = 1, Value2 = Value } E.Value2;";
+        for (options, expected_access) in [
+            (
+                CompilerOptions {
+                    preserve_const_enums: true,
+                    target: ScriptTarget::Es2015,
+                    no_lib: true,
+                    ..CompilerOptions::default()
+                },
+                "1 /* E.Value2 */;",
+            ),
+            (
+                CompilerOptions {
+                    isolated_modules: true,
+                    target: ScriptTarget::Es2015,
+                    no_lib: true,
+                    ..CompilerOptions::default()
+                },
+                "E.Value2;",
+            ),
+            (
+                CompilerOptions {
+                    no_check: true,
+                    target: ScriptTarget::Es2015,
+                    no_lib: true,
+                    ..CompilerOptions::default()
+                },
+                "1 /* E.Value2 */;",
+            ),
+        ] {
+            let fs = MemoryFileSystem::new(true);
+            fs.write_file("/mode.ts", source).unwrap();
+            let program = Program::new_with_options(&fs, "/", &["mode.ts".to_owned()], options);
+            assert!(
+                program.diagnostics().is_empty(),
+                "{:?}",
+                program.diagnostics()
+            );
+            let javascript = &program.emit().files[0].text;
+            if javascript.contains("var E;") {
+                assert!(javascript.contains("E[E[\"Value2\"] = 1] = \"Value2\";"));
+            }
+            assert!(javascript.contains(expected_access), "{javascript}");
+        }
+    }
+
+    #[test]
+    fn const_enum_property_accesses_inline_in_computed_names() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/property.ts",
+            concat!(
+                "const enum G { A = 1, B = 2, C = A + B, D = A * 2 }\n",
+                "var o: { [idx: number]: boolean } = { 1: true };\n",
+                "var a = G.A; var a1 = G[\"A\"]; var g = o[G.A];\n",
+                "class C { [G.A]() { } get [G.B]() { return true; } set [G.B](x: number) { } }\n",
+            ),
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/",
+            &["property.ts".to_owned()],
+            CompilerOptions {
+                target: ScriptTarget::Es2015,
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        let javascript = &program.emit().files[0].text;
+        assert!(!javascript.contains("var G;"), "{javascript}");
+        for expected in [
+            "1 /* G.A */",
+            "1 /* G[\"A\"] */",
+            "o[1 /* G.A */]",
+            "[1 /* G.A */]()",
+            "get [2 /* G.B */]()",
+            "set [2 /* G.B */](x)",
+        ] {
+            assert!(
+                javascript.contains(expected),
+                "missing {expected}: {javascript}"
+            );
+        }
+    }
+
+    #[test]
+    fn erased_exported_const_enum_has_no_commonjs_export() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/exported.ts",
+            "export const enum E { A = 1 } export const value = E.A;",
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/",
+            &["exported.ts".to_owned()],
+            CompilerOptions {
+                target: ScriptTarget::Es2015,
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        let javascript = &program.emit().files[0].text;
+        assert!(!javascript.contains("exports.E"), "{javascript}");
+        assert!(
+            javascript.contains("const value = 1 /* E.A */;"),
+            "{javascript}"
+        );
+    }
+
+    #[test]
     fn no_emit_on_error_suppresses_all_outputs() {
         let fs = MemoryFileSystem::new(true);
         fs.write_file("/type-error.ts", "const value: string = 1;")
@@ -2569,6 +2763,59 @@ mod tests {
                 .unwrap();
             assert_eq!(declaration.text, expected);
         }
+    }
+
+    #[test]
+    fn declaration_emit_uses_evaluated_const_enum_values() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/enum.ts",
+            concat!(
+                "const enum E {\n",
+                "    a = 10, b = a, c = (a + 1), e, d = ~e,\n",
+                "    f = a << 2 >> 1, g = a << 2 >>> 1, h = a | b\n",
+                "}\n",
+            ),
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["enum.ts".to_owned()],
+            CompilerOptions {
+                declaration: true,
+                target: ScriptTarget::Es2015,
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        let emitted = program.emit();
+        let javascript = emitted
+            .files
+            .iter()
+            .find(|file| file.file_name == "/project/enum.js")
+            .unwrap();
+        assert_eq!(javascript.text, "\"use strict\";\n");
+        let declaration = emitted
+            .files
+            .iter()
+            .find(|file| file.file_name == "/project/enum.d.ts")
+            .unwrap();
+        assert_eq!(
+            declaration.text,
+            concat!(
+                "declare const enum E {\n",
+                "    a = 10,\n",
+                "    b = 10,\n",
+                "    c = 11,\n",
+                "    e = 12,\n",
+                "    d = -13,\n",
+                "    f = 20,\n",
+                "    g = 20,\n",
+                "    h = 10\n",
+                "}\n",
+            )
+        );
     }
 
     #[test]
