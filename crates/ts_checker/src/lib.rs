@@ -53,6 +53,7 @@ pub struct ObjectType {
     pub optional_properties: BTreeSet<String>,
     pub readonly_properties: BTreeSet<String>,
     pub getter_properties: BTreeSet<String>,
+    pub setter_properties: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -866,6 +867,7 @@ struct Checker<'a> {
     const_enum_types: BTreeSet<TypeId>,
     checked_overload_symbols: HashSet<SymbolId>,
     reported_unresolved_type_names: HashSet<NodeId>,
+    this_types: Vec<TypeId>,
 }
 
 enum DeclaredObject {
@@ -910,6 +912,7 @@ impl<'a> Checker<'a> {
             const_enum_types: BTreeSet::new(),
             checked_overload_symbols: HashSet::new(),
             reported_unresolved_type_names: HashSet::new(),
+            this_types: Vec::new(),
         }
     }
 
@@ -1242,6 +1245,7 @@ impl<'a> Checker<'a> {
             optional_properties: BTreeSet::new(),
             readonly_properties: properties.keys().cloned().collect(),
             getter_properties: BTreeSet::new(),
+            setter_properties: BTreeSet::new(),
         }));
         for member_type in properties.values() {
             self.enum_member_owners.insert(*member_type, enum_type);
@@ -1953,6 +1957,7 @@ impl<'a> Checker<'a> {
         let mut optional_properties = BTreeSet::new();
         let mut readonly_properties = BTreeSet::new();
         let mut getter_properties = BTreeSet::new();
+        let mut setter_properties = BTreeSet::new();
         for member in members {
             let Some(node) = self.arena.get(*member) else {
                 continue;
@@ -2057,9 +2062,11 @@ impl<'a> Checker<'a> {
                     }
                 }
                 NodeData::SetAccessorDeclaration(data) => {
-                    if let Some(name) = self.property_name(data.name)
-                        && !getter_properties.contains(&name)
-                    {
+                    if let Some(name) = self.property_name(data.name) {
+                        setter_properties.insert(name.clone());
+                        if getter_properties.contains(&name) {
+                            continue;
+                        }
                         let type_node = data
                             .parameters
                             .nodes
@@ -2085,6 +2092,7 @@ impl<'a> Checker<'a> {
             optional_properties,
             readonly_properties,
             getter_properties,
+            setter_properties,
         }))
     }
 
@@ -2217,6 +2225,7 @@ impl<'a> Checker<'a> {
         let mut optional_properties = BTreeSet::new();
         let mut readonly_properties = BTreeSet::new();
         let mut getter_properties = BTreeSet::new();
+        let mut setter_properties = BTreeSet::new();
         if let Some(clauses) = heritage_clauses {
             for clause in &clauses.nodes {
                 let Some(NodeData::HeritageClause(clause)) =
@@ -2257,6 +2266,7 @@ impl<'a> Checker<'a> {
                         optional_properties.extend(base.optional_properties);
                         readonly_properties.extend(base.readonly_properties);
                         getter_properties.extend(base.getter_properties);
+                        setter_properties.extend(base.setter_properties);
                     }
                 }
             }
@@ -2267,12 +2277,14 @@ impl<'a> Checker<'a> {
             optional_properties.extend(own.optional_properties);
             readonly_properties.extend(own.readonly_properties);
             getter_properties.extend(own.getter_properties);
+            setter_properties.extend(own.setter_properties);
         }
         let result = self.result.types.alloc(TypeKind::Object(ObjectType {
             properties,
             optional_properties,
             readonly_properties,
             getter_properties,
+            setter_properties,
         }));
         self.type_parameter_scopes.pop();
         result
@@ -2352,6 +2364,235 @@ impl<'a> Checker<'a> {
             })
             .collect::<Vec<_>>();
         self.result.types.union(types)
+    }
+
+    fn object_literal_type(
+        &mut self,
+        object: &ts_ast::ObjectLiteralExpressionData,
+        contextual_type: Option<TypeId>,
+    ) -> TypeId {
+        let object_type = self.collect_object_literal_properties(object, contextual_type);
+        let mut properties = object_type.properties.clone();
+        let readonly_properties = object_type.readonly_properties.clone();
+        let getter_properties = object_type.getter_properties.clone();
+        let setter_properties = object_type.setter_properties.clone();
+        let type_id = self.result.types.alloc(TypeKind::Object(object_type));
+        self.this_types.push(type_id);
+        for property in &object.properties.nodes {
+            let Some(node) = self.arena.get(*property).cloned() else {
+                continue;
+            };
+            match &node.data {
+                NodeData::GetAccessorDeclaration(data) => {
+                    self.check_object_literal_getter(data, &mut properties);
+                }
+                NodeData::SetAccessorDeclaration(data) => {
+                    let local_scope = self.parameter_scope(&data.parameters.nodes);
+                    self.local_scopes.push(local_scope);
+                    let mut saw_return = false;
+                    if let Some(body) = data.body {
+                        self.check_node(body, None, &mut saw_return);
+                    }
+                    self.local_scopes.pop();
+                }
+                _ => {}
+            }
+        }
+        self.this_types.pop();
+        self.result.types.types[type_id.index()].kind = TypeKind::Object(ObjectType {
+            properties,
+            readonly_properties,
+            getter_properties,
+            setter_properties,
+            ..ObjectType::default()
+        });
+        type_id
+    }
+
+    fn collect_object_literal_properties(
+        &mut self,
+        object: &ts_ast::ObjectLiteralExpressionData,
+        contextual_type: Option<TypeId>,
+    ) -> ObjectType {
+        let contextual_object =
+            contextual_type.and_then(|type_id| match &self.result.types.get(type_id)?.kind {
+                TypeKind::Object(object) => Some(object.clone()),
+                _ => None,
+            });
+        let mut properties = BTreeMap::new();
+        let mut getter_properties = BTreeSet::new();
+        let mut setter_properties = BTreeSet::new();
+        for property in &object.properties.nodes {
+            let Some(node) = self.arena.get(*property).cloned() else {
+                continue;
+            };
+            match &node.data {
+                NodeData::PropertyAssignment(data) => {
+                    let Some(name) = self.property_name(data.name) else {
+                        continue;
+                    };
+                    let expected = contextual_object
+                        .as_ref()
+                        .and_then(|object| object.properties.get(&name))
+                        .copied();
+                    if expected.is_none() && contextual_object.is_some() {
+                        self.error(
+                            *property,
+                            2353,
+                            [
+                                name.clone(),
+                                self.result.types.display(
+                                    contextual_type.expect("contextual object has a type"),
+                                ),
+                            ],
+                        );
+                    }
+                    let actual = self.type_of_expression_context(data.initializer, expected);
+                    if let Some(expected) = expected
+                        && !self.is_assignable(actual, expected)
+                        && !(self.options.exact_optional_property_types
+                            && contextual_object.as_ref().is_some_and(|object| {
+                                object.optional_properties.contains(&name)
+                                    && self.type_includes_undefined(actual)
+                            }))
+                    {
+                        self.assignability_error(*property, actual, expected);
+                    }
+                    properties.insert(name, actual);
+                }
+                NodeData::GetAccessorDeclaration(data) => {
+                    let Some(name) = self.property_name(data.name) else {
+                        continue;
+                    };
+                    let type_id = match data.type_ {
+                        Some(annotation) => self.type_from_type_node(annotation),
+                        None => self.result.types.any(),
+                    };
+                    properties.insert(name.clone(), type_id);
+                    getter_properties.insert(name);
+                }
+                NodeData::SetAccessorDeclaration(data) => {
+                    let Some(name) = self.property_name(data.name) else {
+                        continue;
+                    };
+                    let annotation = data
+                        .parameters
+                        .nodes
+                        .first()
+                        .and_then(|parameter| self.arena.get(*parameter))
+                        .and_then(|parameter| match &parameter.data {
+                            NodeData::ParameterDeclaration(parameter) => parameter.type_,
+                            _ => None,
+                        });
+                    let type_id = match annotation {
+                        Some(annotation) => self.type_from_type_node(annotation),
+                        None => self.result.types.any(),
+                    };
+                    properties.entry(name.clone()).or_insert(type_id);
+                    setter_properties.insert(name);
+                }
+                _ => {}
+            }
+        }
+        ObjectType {
+            properties,
+            readonly_properties: getter_properties
+                .difference(&setter_properties)
+                .cloned()
+                .collect(),
+            getter_properties,
+            setter_properties,
+            ..ObjectType::default()
+        }
+    }
+
+    fn check_object_literal_getter(
+        &mut self,
+        getter: &ts_ast::GetAccessorDeclarationData,
+        properties: &mut BTreeMap<String, TypeId>,
+    ) {
+        let Some(name) = self.property_name(getter.name) else {
+            return;
+        };
+        let expected = match getter.type_ {
+            Some(annotation) => self.type_from_type_node(annotation),
+            None => self.result.types.any(),
+        };
+        let local_scope = self.parameter_scope(&getter.parameters.nodes);
+        self.local_scopes.push(local_scope);
+        let diagnostics_start = self.result.diagnostics.len();
+        let mut saw_return = false;
+        if let Some(body) = getter.body {
+            self.check_node(body, Some(expected), &mut saw_return);
+        }
+        self.local_scopes.pop();
+        if getter.type_.is_some() {
+            properties.insert(name, expected);
+            return;
+        }
+        let returns = getter
+            .body
+            .into_iter()
+            .flat_map(|body| self.getter_return_expressions(body))
+            .collect::<Vec<_>>();
+        let inferred = if returns.is_empty() {
+            self.result.types.any()
+        } else {
+            let types = returns
+                .into_iter()
+                .map(|expression| {
+                    let type_id = self.type_of_expression(expression);
+                    self.widen_literal(type_id)
+                })
+                .collect::<Vec<_>>();
+            self.result.types.union(types)
+        };
+        if self.options.no_implicit_any
+            && inferred == self.result.types.any()
+            && getter
+                .body
+                .is_some_and(|body| self.subtree_contains_kind(body, SyntaxKind::ThisKeyword))
+        {
+            let message = message_by_code(7023).expect("checker diagnostic is in catalog");
+            self.result.diagnostics.insert(
+                diagnostics_start,
+                CheckDiagnostic {
+                    node: getter.name,
+                    diagnostic: Diagnostic::with_arguments(message, [name.clone()]),
+                },
+            );
+        }
+        properties.insert(name, inferred);
+    }
+
+    fn getter_return_expressions(&self, body: NodeId) -> Vec<NodeId> {
+        let Some(NodeData::Block(block)) = self.arena.get(body).map(|node| &node.data) else {
+            return Vec::new();
+        };
+        block
+            .statements
+            .nodes
+            .iter()
+            .filter_map(|statement| {
+                let NodeData::ReturnStatement(statement) = &self.arena.get(*statement)?.data else {
+                    return None;
+                };
+                statement.expression
+            })
+            .collect()
+    }
+
+    fn subtree_contains_kind(&self, root: NodeId, kind: SyntaxKind) -> bool {
+        let mut pending = vec![root];
+        while let Some(node) = pending.pop() {
+            if self.arena.get(node).is_some_and(|node| node.kind == kind) {
+                return true;
+            }
+            if let Some(children) = self.children.get(&node) {
+                pending.extend(children.iter().copied());
+            }
+        }
+        false
     }
 
     fn check_class_abstract_members(&mut self, class: &ts_ast::ClassDeclarationData) {
@@ -3086,6 +3327,11 @@ impl<'a> Checker<'a> {
                 }
                 SyntaxKind::NullKeyword => self.result.types.null(),
                 SyntaxKind::UndefinedKeyword => self.result.types.undefined(),
+                SyntaxKind::ThisKeyword => self
+                    .this_types
+                    .last()
+                    .copied()
+                    .unwrap_or_else(|| self.result.types.unknown()),
                 _ => self.result.types.unknown(),
             },
             NodeData::Identifier(identifier) => {
@@ -3143,53 +3389,7 @@ impl<'a> Checker<'a> {
                 }
             }
             NodeData::ObjectLiteralExpression(data) => {
-                let contextual_object = contextual_type.and_then(|type_id| {
-                    match &self.result.types.get(type_id)?.kind {
-                        TypeKind::Object(object) => Some(object.clone()),
-                        _ => None,
-                    }
-                });
-                let mut properties = BTreeMap::new();
-                for property in &data.properties.nodes {
-                    if let Some(NodeData::PropertyAssignment(property_data)) =
-                        self.arena.get(*property).map(|node| &node.data)
-                        && let Some(name) = self.property_name(property_data.name)
-                    {
-                        let expected = contextual_object
-                            .as_ref()
-                            .and_then(|object| object.properties.get(&name))
-                            .copied();
-                        if expected.is_none() && contextual_object.is_some() {
-                            self.error(
-                                *property,
-                                2353,
-                                [
-                                    name.clone(),
-                                    self.result.types.display(
-                                        contextual_type.expect("contextual object has a type"),
-                                    ),
-                                ],
-                            );
-                        }
-                        let actual =
-                            self.type_of_expression_context(property_data.initializer, expected);
-                        if let Some(expected) = expected
-                            && !self.is_assignable(actual, expected)
-                            && !(self.options.exact_optional_property_types
-                                && contextual_object.as_ref().is_some_and(|object| {
-                                    object.optional_properties.contains(&name)
-                                        && self.type_includes_undefined(actual)
-                                }))
-                        {
-                            self.assignability_error(*property, actual, expected);
-                        }
-                        properties.insert(name, actual);
-                    }
-                }
-                self.result.types.alloc(TypeKind::Object(ObjectType {
-                    properties,
-                    ..ObjectType::default()
-                }))
+                self.object_literal_type(data, contextual_type)
             }
             NodeData::ArrayLiteralExpression(data) => {
                 let expected_tuple = contextual_type.and_then(|type_id| {
@@ -3681,10 +3881,37 @@ impl<'a> Checker<'a> {
             self.error(
                 node,
                 2339,
-                [name.to_owned(), self.result.types.display(receiver)],
+                [name.to_owned(), self.property_receiver_display(receiver)],
             );
             self.result.types.any()
         }
+    }
+
+    fn property_receiver_display(&self, receiver: TypeId) -> String {
+        let Some(TypeKind::Object(object)) =
+            self.result.types.get(receiver).map(|type_| &type_.kind)
+        else {
+            return self.result.types.display(receiver);
+        };
+        if object.getter_properties.is_empty() {
+            return self.result.types.display(receiver);
+        }
+        format!(
+            "{{ {} }}",
+            object
+                .properties
+                .iter()
+                .map(|(name, value)| {
+                    let readonly = if object.readonly_properties.contains(name) {
+                        "readonly "
+                    } else {
+                        ""
+                    };
+                    format!("{readonly}{name}: {}", self.result.types.display(*value))
+                })
+                .collect::<Vec<_>>()
+                .join("; ")
+        )
     }
 
     fn lookup_property_type(&mut self, receiver: TypeId, name: &str) -> Option<TypeId> {
@@ -4140,6 +4367,7 @@ impl<'a> Checker<'a> {
                     optional_properties: object.optional_properties,
                     readonly_properties: object.readonly_properties,
                     getter_properties: object.getter_properties,
+                    setter_properties: object.setter_properties,
                 }))
             }
             _ => type_id,
@@ -4813,6 +5041,7 @@ impl<'a> Checker<'a> {
             optional_properties,
             readonly_properties,
             getter_properties: BTreeSet::new(),
+            setter_properties: BTreeSet::new(),
         }))
     }
 
@@ -5170,6 +5399,7 @@ impl<'a> Checker<'a> {
                     optional_properties: optional_properties.clone(),
                     readonly_properties: readonly_properties.clone(),
                     getter_properties: getter_properties.clone(),
+                    setter_properties: BTreeSet::new(),
                 }))
             }
             TypeDescriptor::Function {
@@ -5268,6 +5498,7 @@ impl<'a> Checker<'a> {
                 let optional_properties = object.optional_properties;
                 let readonly_properties = object.readonly_properties;
                 let getter_properties = object.getter_properties;
+                let setter_properties = object.setter_properties;
                 let properties = object
                     .properties
                     .into_iter()
@@ -5278,6 +5509,7 @@ impl<'a> Checker<'a> {
                     optional_properties,
                     readonly_properties,
                     getter_properties,
+                    setter_properties,
                 }))
             }
             _ => type_id,
@@ -6295,7 +6527,7 @@ fn property_name_text(arena: &NodeArena, node: NodeId) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use ts_ast::{
         ArrayLiteralExpressionData, BlockData, ElementAccessExpressionData,
@@ -7912,6 +8144,114 @@ mod tests {
                 .collect::<Vec<_>>(),
             [2654, 1253, 2540, 2416, 2416, 2416, 2676, 2676, 2676, 2676]
         );
+    }
+
+    #[test]
+    fn checks_contextual_this_in_object_literal_getter_inference() {
+        let parsed = parse_source_file(
+            r"
+                export var basePrototype = {
+                    get primaryPath() {
+                        var self = this;
+                        return self.collection.schema.primaryPath;
+                    },
+                };
+            ",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file_with_options(
+            &parsed.arena,
+            parsed.source_file,
+            &bindings,
+            CheckerOptions {
+                no_implicit_any: true,
+                ..CheckerOptions::default()
+            },
+        );
+
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [7023, 2339]
+        );
+        assert_eq!(
+            result.diagnostics[1].diagnostic.render().unwrap(),
+            "Property 'collection' does not exist on type '{ readonly primaryPath: any }'."
+        );
+        let symbol = bindings
+            .root_scope()
+            .unwrap()
+            .symbols
+            .get("basePrototype")
+            .unwrap();
+        let type_id = result.type_of_symbol(symbol).unwrap();
+        let TypeKind::Object(object) = &result.types.get(type_id).unwrap().kind else {
+            panic!("expected object type");
+        };
+        assert!(object.getter_properties.contains("primaryPath"));
+        assert!(object.readonly_properties.contains("primaryPath"));
+        assert!(!object.setter_properties.contains("primaryPath"));
+        assert_eq!(object.properties["primaryPath"], result.types.any());
+    }
+
+    #[test]
+    fn describes_object_literal_getter_and_setter_properties() {
+        let parsed = parse_source_file(
+            r#"
+                const value = {
+                    get readonlyValue() { return "read"; },
+                    set writeOnly(input: number) {},
+                    get paired() { return "paired"; },
+                    set paired(input: string) {},
+                };
+            "#,
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let symbol = bindings.root_scope().unwrap().symbols.get("value").unwrap();
+        let type_id = result.type_of_symbol(symbol).unwrap();
+        let TypeKind::Object(object) = &result.types.get(type_id).unwrap().kind else {
+            panic!("expected object type");
+        };
+
+        assert_eq!(
+            object.getter_properties,
+            BTreeSet::from(["paired".into(), "readonlyValue".into()])
+        );
+        assert_eq!(
+            object.setter_properties,
+            BTreeSet::from(["paired".into(), "writeOnly".into()])
+        );
+        assert_eq!(
+            object.readonly_properties,
+            BTreeSet::from(["readonlyValue".into()])
+        );
+        assert!(matches!(
+            result
+                .types
+                .get(object.properties["readonlyValue"])
+                .unwrap()
+                .kind,
+            TypeKind::String
+        ));
+        assert!(matches!(
+            result
+                .types
+                .get(object.properties["writeOnly"])
+                .unwrap()
+                .kind,
+            TypeKind::Number
+        ));
+        assert!(matches!(
+            result.types.get(object.properties["paired"]).unwrap().kind,
+            TypeKind::String
+        ));
     }
 
     #[test]
