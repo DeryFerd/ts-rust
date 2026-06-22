@@ -71,18 +71,22 @@ pub fn emit_source_file_with_settings(
     if !settings.emit_javascript {
         return Ok(EmitResult::default());
     }
+    let automatic_jsx = AutomaticJsxUsage::analyze(arena, settings.jsx);
     let mut printer = Printer {
         arena,
         writer: Writer::default(),
         settings,
         source_map: settings.source_map.then(SourceMapBuilder::new),
         source_text,
+        source_name,
         source_line_starts: settings.source_map.then(|| line_starts(source_text)),
+        automatic_jsx,
     };
     let node = printer.node(source_file)?.clone();
     let NodeData::SourceFile(data) = &node.data else {
         return Err(Printer::unsupported(source_file, node.kind));
     };
+    printer.emit_automatic_jsx_prelude();
     for statement in &data.statements.nodes {
         printer.emit_statement(*statement)?;
     }
@@ -1022,16 +1026,112 @@ fn original_position(source: &str, line_starts: &[usize], byte_offset: u32) -> (
     )
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct AutomaticJsxUsage {
+    jsx: bool,
+    jsxs: bool,
+    fragment: bool,
+}
+
+impl AutomaticJsxUsage {
+    fn analyze(arena: &NodeArena, mode: JsxEmit) -> Self {
+        if !matches!(mode, JsxEmit::ReactJsx | JsxEmit::ReactJsxDev) {
+            return Self::default();
+        }
+        let mut usage = Self::default();
+        for (_, node) in arena.iter() {
+            let children = match &node.data {
+                NodeData::JsxElement(element) => {
+                    arena
+                        .get(element.opening_element)
+                        .and_then(|opening| match &opening.data {
+                            NodeData::JsxOpeningElement(_) => Some(&element.children),
+                            _ => None,
+                        })
+                }
+                NodeData::JsxSelfClosingElement(_) => None,
+                NodeData::JsxFragment(fragment) => {
+                    usage.fragment = true;
+                    Some(&fragment.children)
+                }
+                _ => continue,
+            };
+            let child_count =
+                children.map_or(0, |children| semantic_jsx_children(arena, children).len());
+            if child_count > 1 {
+                usage.jsxs = true;
+            } else {
+                usage.jsx = true;
+            }
+        }
+        usage
+    }
+
+    const fn any(self) -> bool {
+        self.jsx || self.jsxs || self.fragment
+    }
+}
+
 struct Printer<'a> {
     arena: &'a NodeArena,
     writer: Writer,
     settings: PrinterSettings,
     source_map: Option<SourceMapBuilder>,
     source_text: &'a str,
+    source_name: &'a str,
     source_line_starts: Option<Vec<usize>>,
+    automatic_jsx: AutomaticJsxUsage,
 }
 
 impl Printer<'_> {
+    fn emit_automatic_jsx_prelude(&mut self) {
+        if !self.automatic_jsx.any() {
+            return;
+        }
+        let development = self.settings.jsx == JsxEmit::ReactJsxDev;
+        let runtime = if development {
+            "react/jsx-dev-runtime"
+        } else {
+            "react/jsx-runtime"
+        };
+        if self.settings.module == ModuleKind::CommonJs {
+            self.writer.write("const jsx_runtime_1 = require(");
+            write_quoted(&mut self.writer, runtime);
+            self.writer.write(");");
+            self.writer.newline();
+        } else {
+            self.writer.write("import { ");
+            let mut first = true;
+            for (used, imported, local) in [
+                (development, "jsxDEV", "_jsxDEV"),
+                (!development && self.automatic_jsx.jsx, "jsx", "_jsx"),
+                (!development && self.automatic_jsx.jsxs, "jsxs", "_jsxs"),
+                (self.automatic_jsx.fragment, "Fragment", "_Fragment"),
+            ] {
+                if !used {
+                    continue;
+                }
+                if !first {
+                    self.writer.write(", ");
+                }
+                first = false;
+                self.writer.write(imported);
+                self.writer.write(" as ");
+                self.writer.write(local);
+            }
+            self.writer.write(" } from ");
+            write_quoted(&mut self.writer, runtime);
+            self.writer.write(";");
+            self.writer.newline();
+        }
+        if development {
+            self.writer.write("const _jsxFileName = ");
+            write_quoted(&mut self.writer, self.source_name);
+            self.writer.write(";");
+            self.writer.newline();
+        }
+    }
+
     fn node(&self, id: NodeId) -> Result<&Node, EmitError> {
         self.arena.get(id).ok_or(EmitError {
             node: id,
@@ -2202,7 +2302,20 @@ impl Printer<'_> {
             self.writer.write(">");
             return Ok(());
         }
-        self.emit_react_create_element(opening.tag_name, opening.attributes, Some(&data.children))
+        if self.settings.jsx == JsxEmit::React {
+            self.emit_react_create_element(
+                opening.tag_name,
+                opening.attributes,
+                Some(&data.children),
+            )
+        } else {
+            self.emit_automatic_jsx(
+                opening.tag_name,
+                opening.attributes,
+                Some(&data.children),
+                self.node(data.opening_element)?.range.start.get(),
+            )
+        }
     }
 
     fn emit_jsx_self_closing(
@@ -2216,7 +2329,20 @@ impl Printer<'_> {
             self.writer.write(" />");
             return Ok(());
         }
-        self.emit_react_create_element(data.tag_name, data.attributes, None)
+        if self.settings.jsx == JsxEmit::React {
+            self.emit_react_create_element(data.tag_name, data.attributes, None)
+        } else {
+            self.emit_automatic_jsx(
+                data.tag_name,
+                data.attributes,
+                None,
+                self.node(data.tag_name)?
+                    .range
+                    .start
+                    .get()
+                    .saturating_sub(1),
+            )
+        }
     }
 
     fn emit_jsx_fragment(&mut self, data: &ts_ast::JsxFragmentData) -> Result<(), EmitError> {
@@ -2228,14 +2354,20 @@ impl Printer<'_> {
             self.writer.write("</>");
             return Ok(());
         }
-        self.writer
-            .write("React.createElement(React.Fragment, null");
-        for child in &data.children.nodes {
-            self.writer.write(", ");
-            self.emit_jsx_child(*child, false)?;
+        if self.settings.jsx == JsxEmit::React {
+            self.writer
+                .write("React.createElement(React.Fragment, null");
+            for child in &data.children.nodes {
+                self.writer.write(", ");
+                self.emit_jsx_child(*child, false)?;
+            }
+            self.writer.write(")");
+            return Ok(());
         }
-        self.writer.write(")");
-        Ok(())
+        self.emit_automatic_fragment(
+            &data.children,
+            self.node(data.opening_fragment)?.range.start.get(),
+        )
     }
 
     fn emit_react_create_element(
@@ -2266,6 +2398,254 @@ impl Printer<'_> {
             }
         }
         self.writer.write(")");
+        Ok(())
+    }
+
+    fn emit_automatic_jsx(
+        &mut self,
+        tag_name: NodeId,
+        attributes: NodeId,
+        children: Option<&NodeList>,
+        location: u32,
+    ) -> Result<(), EmitError> {
+        let children = children
+            .map(|children| semantic_jsx_children(self.arena, children))
+            .unwrap_or_default();
+        self.emit_automatic_helper(children.len() > 1);
+        self.writer.write("(");
+        self.emit_jsx_tag(tag_name)?;
+        self.writer.write(", ");
+        let key = self.emit_automatic_props(attributes, &children)?;
+        self.emit_automatic_tail(key, children.len() > 1, location)?;
+        self.writer.write(")");
+        Ok(())
+    }
+
+    fn emit_automatic_fragment(
+        &mut self,
+        children: &NodeList,
+        location: u32,
+    ) -> Result<(), EmitError> {
+        let children = semantic_jsx_children(self.arena, children);
+        self.emit_automatic_helper(children.len() > 1);
+        self.writer.write("(");
+        self.emit_automatic_fragment_reference();
+        self.writer.write(", {");
+        if !children.is_empty() {
+            self.writer.write(" children: ");
+            self.emit_automatic_children(&children)?;
+            self.writer.write(" ");
+        }
+        self.writer.write("}");
+        self.emit_automatic_tail(None, children.len() > 1, location)?;
+        self.writer.write(")");
+        Ok(())
+    }
+
+    fn emit_automatic_helper(&mut self, static_children: bool) {
+        if self.settings.module == ModuleKind::CommonJs {
+            self.writer.write("(0, jsx_runtime_1.");
+            self.writer
+                .write(if self.settings.jsx == JsxEmit::ReactJsxDev {
+                    "jsxDEV"
+                } else if static_children {
+                    "jsxs"
+                } else {
+                    "jsx"
+                });
+            self.writer.write(")");
+        } else if self.settings.jsx == JsxEmit::ReactJsxDev {
+            self.writer.write("_jsxDEV");
+        } else if static_children {
+            self.writer.write("_jsxs");
+        } else {
+            self.writer.write("_jsx");
+        }
+    }
+
+    fn emit_automatic_fragment_reference(&mut self) {
+        if self.settings.module == ModuleKind::CommonJs {
+            self.writer.write("jsx_runtime_1.Fragment");
+        } else {
+            self.writer.write("_Fragment");
+        }
+    }
+
+    fn emit_jsx_tag(&mut self, tag_name: NodeId) -> Result<(), EmitError> {
+        let tag = self.node(tag_name)?.clone();
+        if let NodeData::Identifier(identifier) = &tag.data
+            && identifier
+                .text
+                .chars()
+                .next()
+                .is_some_and(char::is_lowercase)
+        {
+            write_quoted(&mut self.writer, &identifier.text);
+        } else {
+            self.emit_expression(tag_name, 0)?;
+        }
+        Ok(())
+    }
+
+    fn emit_automatic_props(
+        &mut self,
+        attributes: NodeId,
+        children: &[NodeId],
+    ) -> Result<Option<NodeId>, EmitError> {
+        let node = self.node(attributes)?.clone();
+        let NodeData::JsxAttributes(attributes) = &node.data else {
+            return Err(Self::unsupported(attributes, node.kind));
+        };
+        let key = attributes.properties.nodes.iter().find_map(|attribute| {
+            let node = self.arena.get(*attribute)?;
+            let NodeData::JsxAttribute(attribute) = &node.data else {
+                return None;
+            };
+            (self.identifier_text(attribute.name).ok() == Some("key"))
+                .then_some(attribute.initializer)
+                .flatten()
+        });
+        let has_properties = !children.is_empty()
+            || attributes.properties.nodes.iter().any(|attribute| {
+                self.arena
+                    .get(*attribute)
+                    .is_some_and(|node| match &node.data {
+                        NodeData::JsxSpreadAttribute(_) => true,
+                        NodeData::JsxAttribute(attribute) => {
+                            self.identifier_text(attribute.name).ok() != Some("key")
+                        }
+                        _ => false,
+                    })
+            });
+        self.writer.write("{");
+        if has_properties {
+            self.writer.write(" ");
+        }
+        let mut wrote = false;
+        for attribute in &attributes.properties.nodes {
+            let node = self.node(*attribute)?.clone();
+            match &node.data {
+                NodeData::JsxSpreadAttribute(attribute) => {
+                    if wrote {
+                        self.writer.write(", ");
+                    }
+                    wrote = true;
+                    self.writer.write("...");
+                    self.emit_expression(attribute.expression, 0)?;
+                }
+                NodeData::JsxAttribute(attribute) => {
+                    if self.identifier_text(attribute.name).ok() == Some("key") {
+                        continue;
+                    }
+                    if wrote {
+                        self.writer.write(", ");
+                    }
+                    wrote = true;
+                    self.emit_expression(attribute.name, 0)?;
+                    self.writer.write(": ");
+                    self.emit_jsx_attribute_initializer(attribute.initializer)?;
+                }
+                _ => return Err(Self::unsupported(*attribute, node.kind)),
+            }
+        }
+        if !children.is_empty() {
+            if wrote {
+                self.writer.write(", ");
+            }
+            self.writer.write("children: ");
+            self.emit_automatic_children(children)?;
+        }
+        if has_properties {
+            self.writer.write(" ");
+        }
+        self.writer.write("}");
+        Ok(key)
+    }
+
+    fn emit_jsx_attribute_initializer(
+        &mut self,
+        initializer: Option<NodeId>,
+    ) -> Result<(), EmitError> {
+        let Some(initializer) = initializer else {
+            self.writer.write("true");
+            return Ok(());
+        };
+        let node = self.node(initializer)?.clone();
+        match &node.data {
+            NodeData::StringLiteral(value) => write_quoted(&mut self.writer, &value.text),
+            NodeData::JsxExpression(value) => {
+                if let Some(expression) = value.expression {
+                    self.emit_expression(expression, 0)?;
+                } else {
+                    self.writer.write("true");
+                }
+            }
+            _ => return Err(Self::unsupported(initializer, node.kind)),
+        }
+        Ok(())
+    }
+
+    fn emit_automatic_children(&mut self, children: &[NodeId]) -> Result<(), EmitError> {
+        if children.len() == 1 {
+            return self.emit_automatic_child(children[0]);
+        }
+        self.writer.write("[");
+        for (index, child) in children.iter().enumerate() {
+            if index != 0 {
+                self.writer.write(", ");
+            }
+            self.emit_automatic_child(*child)?;
+        }
+        self.writer.write("]");
+        Ok(())
+    }
+
+    fn emit_automatic_child(&mut self, child: NodeId) -> Result<(), EmitError> {
+        let node = self.node(child)?.clone();
+        match &node.data {
+            NodeData::JsxText(text) => {
+                write_quoted(&mut self.writer, &normalize_jsx_text(&text.text));
+            }
+            NodeData::JsxExpression(expression) => {
+                if let Some(expression) = expression.expression {
+                    self.emit_expression(expression, 0)?;
+                }
+            }
+            NodeData::JsxElement(element) => self.emit_jsx_element(element)?,
+            NodeData::JsxSelfClosingElement(element) => self.emit_jsx_self_closing(element)?,
+            NodeData::JsxFragment(fragment) => self.emit_jsx_fragment(fragment)?,
+            _ => return Err(Self::unsupported(child, node.kind)),
+        }
+        Ok(())
+    }
+
+    fn emit_automatic_tail(
+        &mut self,
+        key: Option<NodeId>,
+        static_children: bool,
+        location: u32,
+    ) -> Result<(), EmitError> {
+        if let Some(key) = key {
+            self.writer.write(", ");
+            self.emit_jsx_attribute_initializer(Some(key))?;
+        }
+        if self.settings.jsx != JsxEmit::ReactJsxDev {
+            return Ok(());
+        }
+        if key.is_none() {
+            self.writer.write(", void 0");
+        }
+        self.writer.write(if static_children {
+            ", true, { fileName: _jsxFileName, lineNumber: "
+        } else {
+            ", false, { fileName: _jsxFileName, lineNumber: "
+        });
+        let starts = line_starts(self.source_text);
+        let (line, column) = original_position(self.source_text, &starts, location);
+        self.writer.write(&(line + 1).to_string());
+        self.writer.write(", columnNumber: ");
+        self.writer.write(&(column + 1).to_string());
+        self.writer.write(" }, this");
         Ok(())
     }
 
@@ -2660,6 +3040,44 @@ impl Printer<'_> {
     }
 }
 
+fn semantic_jsx_children(arena: &NodeArena, children: &NodeList) -> Vec<NodeId> {
+    children
+        .nodes
+        .iter()
+        .copied()
+        .filter(|child| match arena.get(*child).map(|node| &node.data) {
+            Some(NodeData::JsxExpression(expression)) => expression.expression.is_some(),
+            Some(NodeData::JsxText(text)) => !text.contains_only_trivia_white_spaces,
+            Some(_) => true,
+            None => false,
+        })
+        .collect()
+}
+
+fn normalize_jsx_text(text: &str) -> String {
+    if !text.contains(['\n', '\r']) {
+        return text.to_owned();
+    }
+    let lines = text.split('\n').collect::<Vec<_>>();
+    let last = lines.len().saturating_sub(1);
+    lines
+        .into_iter()
+        .enumerate()
+        .map(|(index, line)| {
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            if index == 0 {
+                line.trim_end()
+            } else if index == last {
+                line.trim_start()
+            } else {
+                line.trim()
+            }
+        })
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn write_quoted(writer: &mut Writer, text: &str) {
     writer.write("\"");
     for ch in text.chars() {
@@ -2908,6 +3326,28 @@ mod tests {
         assert_eq!(
             emit_jsx(fragment, JsxEmit::React),
             "const view = React.createElement(React.Fragment, null, React.createElement(\"span\", null), value);\n"
+        );
+    }
+
+    #[test]
+    fn emits_automatic_jsx_runtime_calls() {
+        let source = "const view = <><div id='root'>hello <Widget /></div><UI.Button>{value}</UI.Button></>;";
+        assert_eq!(
+            emit_jsx(source, JsxEmit::ReactJsx),
+            "import { jsx as _jsx, jsxs as _jsxs, Fragment as _Fragment } from \"react/jsx-runtime\";\nconst view = _jsxs(_Fragment, { children: [_jsxs(\"div\", { id: \"root\", children: [\"hello \", _jsx(Widget, {})] }), _jsx(UI.Button, { children: value })] });\n"
+        );
+        assert_eq!(
+            emit_jsx(source, JsxEmit::ReactJsxDev),
+            "import { jsxDEV as _jsxDEV, Fragment as _Fragment } from \"react/jsx-dev-runtime\";\nconst _jsxFileName = \"input.tsx\";\nconst view = _jsxDEV(_Fragment, { children: [_jsxDEV(\"div\", { id: \"root\", children: [\"hello \", _jsxDEV(Widget, {}, void 0, false, { fileName: _jsxFileName, lineNumber: 1, columnNumber: 37 }, this)] }, void 0, true, { fileName: _jsxFileName, lineNumber: 1, columnNumber: 16 }, this), _jsxDEV(UI.Button, { children: value }, void 0, false, { fileName: _jsxFileName, lineNumber: 1, columnNumber: 53 }, this)] }, void 0, true, { fileName: _jsxFileName, lineNumber: 1, columnNumber: 14 }, this);\n"
+        );
+    }
+
+    #[test]
+    fn automatic_jsx_extracts_key_and_uses_single_child_props() {
+        let source = "const item = <Component key='item' value={count}>text</Component>;";
+        assert_eq!(
+            emit_jsx(source, JsxEmit::ReactJsx),
+            "import { jsx as _jsx } from \"react/jsx-runtime\";\nconst item = _jsx(Component, { value: count, children: \"text\" }, \"item\");\n"
         );
     }
 

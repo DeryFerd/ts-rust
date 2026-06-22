@@ -3584,7 +3584,7 @@ impl<'a> Parser<'a> {
         if self.current.kind == SyntaxKind::GreaterThanToken {
             return self.parse_jsx_fragment(start, resume_jsx);
         }
-        let tag_name = self.parse_identifier("Expected a JSX tag name.");
+        let tag_name = self.parse_jsx_tag_name("Expected a JSX tag name.");
         let attributes = self.parse_jsx_attributes();
         if self.current.kind == SyntaxKind::SlashToken {
             self.bump();
@@ -3620,7 +3620,7 @@ impl<'a> Parser<'a> {
         } else {
             self.error_current("Expected a JSX closing tag.");
         }
-        let closing_name = self.parse_identifier("Expected a JSX closing tag name.");
+        let closing_name = self.parse_jsx_tag_name("Expected a JSX closing tag name.");
         let end = self.finish_jsx_tag(resume_jsx);
         let closing = self.alloc_node(
             SyntaxKind::JsxClosingElement,
@@ -3777,6 +3777,7 @@ impl<'a> Parser<'a> {
                 ));
                 continue;
             }
+            self.current = self.scanner.scan_jsx_identifier();
             let name = self.parse_identifier("Expected a JSX attribute name.");
             let initializer = if self.current.kind == SyntaxKind::EqualsToken {
                 self.bump();
@@ -3852,6 +3853,29 @@ impl<'a> Parser<'a> {
             self.scanner.scan()
         };
         end
+    }
+
+    fn parse_jsx_tag_name(&mut self, message: &str) -> NodeId {
+        self.current = self.scanner.scan_jsx_identifier();
+        let mut expression = self.parse_identifier(message);
+        while self.current.kind == SyntaxKind::DotToken {
+            self.bump();
+            self.current = self.scanner.scan_jsx_identifier();
+            let name = self.parse_identifier(message);
+            expression = self.alloc_node(
+                SyntaxKind::PropertyAccessExpression,
+                TextRange::new(self.node_start(expression), self.node_end(name)),
+                NodeData::PropertyAccessExpression(Box::new(PropertyAccessExpressionData {
+                    expression,
+                    flow_node: None,
+                    question_dot_token: None,
+                    facts: 0,
+                    name,
+                })),
+                &[expression, name],
+            );
+        }
+        expression
     }
 
     fn parse_identifier(&mut self, message: &str) -> NodeId {
@@ -5717,6 +5741,47 @@ mod tests {
             result.arena.get(element.children.nodes[2]).unwrap().kind,
             SyntaxKind::JsxSelfClosingElement
         );
+    }
+
+    #[test]
+    fn parses_dotted_jsx_member_tag_names() {
+        let result = parse_jsx_source_file("const view = <UI.Controls.Button />;");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let identifier = |node| match &result.arena.get(node).unwrap().data {
+            NodeData::Identifier(identifier) => identifier.text.as_str(),
+            _ => panic!("expected identifier"),
+        };
+        let (list, _) = variable_list(&result, source_statements(&result)[0]);
+        let declaration = declaration_nodes(&result, list)[0];
+        let NodeData::VariableDeclaration(declaration) =
+            &result.arena.get(declaration).unwrap().data
+        else {
+            panic!("expected declaration");
+        };
+        let NodeData::JsxSelfClosingElement(element) = &result
+            .arena
+            .get(declaration.initializer.unwrap())
+            .unwrap()
+            .data
+        else {
+            panic!("expected self-closing JSX element");
+        };
+        let NodeData::PropertyAccessExpression(button) =
+            &result.arena.get(element.tag_name).unwrap().data
+        else {
+            panic!("expected member tag name");
+        };
+        assert_eq!(identifier(button.name), "Button");
+        let NodeData::PropertyAccessExpression(controls) =
+            &result.arena.get(button.expression).unwrap().data
+        else {
+            panic!("expected nested member tag name");
+        };
+        assert_eq!(identifier(controls.name), "Controls");
+        assert_eq!(identifier(controls.expression), "UI");
+
+        let custom = parse_jsx_source_file("const view = <my-widget data-id='x' />;");
+        assert!(custom.diagnostics.is_empty(), "{:?}", custom.diagnostics);
     }
 
     #[test]
