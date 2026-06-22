@@ -1429,6 +1429,7 @@ impl Printer<'_> {
                 self.emit_embedded(data.statement)?;
             }
             NodeData::ImportDeclaration(data) => self.emit_import(data)?,
+            NodeData::ImportEqualsDeclaration(data) => self.emit_import_equals(data)?,
             NodeData::ExportAssignment(data) => {
                 if self.settings.module == ModuleKind::CommonJs {
                     self.writer.write("exports.default = ");
@@ -1632,10 +1633,7 @@ impl Printer<'_> {
             else {
                 return false;
             };
-            method.body.is_some()
-                && self
-                    .identifier_text(method.name)
-                    .is_ok_and(|name| name == "constructor")
+            method.body.is_some() && self.is_constructor_name(method.name)
         });
         if lower_fields && self.has_instance_field_initializers(data) && !has_constructor {
             self.emit_synthesized_native_constructor(data, has_base)?;
@@ -1644,7 +1642,7 @@ impl Printer<'_> {
             let node = self.node(*member)?.clone();
             match &node.data {
                 NodeData::MethodDeclaration(method) if method.body.is_some() => {
-                    if lower_fields && self.identifier_text(method.name)? == "constructor" {
+                    if lower_fields && self.is_constructor_name(method.name) {
                         self.emit_native_constructor(method, data, has_base)?;
                         continue;
                     }
@@ -1833,7 +1831,7 @@ impl Printer<'_> {
             let NodeData::MethodDeclaration(method) = &self.arena.get(*member)?.data else {
                 return None;
             };
-            (method.body.is_some() && self.identifier_text(method.name).ok()? == "constructor")
+            (method.body.is_some() && self.is_constructor_name(method.name))
                 .then_some(method.as_ref())
         });
         self.writer.write("function ");
@@ -1916,7 +1914,7 @@ impl Printer<'_> {
             let NodeData::MethodDeclaration(method) = &node.data else {
                 continue;
             };
-            if method.body.is_none() || self.identifier_text(method.name)? == "constructor" {
+            if method.body.is_none() || self.is_constructor_name(method.name) {
                 continue;
             }
             self.writer.write(&name);
@@ -2190,6 +2188,45 @@ impl Printer<'_> {
         Ok(())
     }
 
+    fn emit_import_equals(
+        &mut self,
+        data: &ts_ast::ImportEqualsDeclarationData,
+    ) -> Result<(), EmitError> {
+        if data.is_type_only {
+            return Ok(());
+        }
+        self.writer.write(self.variable_keyword());
+        self.writer.write(" ");
+        self.emit_expression(data.name, 0)?;
+        self.writer.write(" = ");
+        let reference = self.node(data.module_reference)?.clone();
+        match &reference.data {
+            NodeData::ExternalModuleReference(reference) => {
+                self.writer.write("require(");
+                self.emit_expression(reference.expression, 0)?;
+                self.writer.write(")");
+            }
+            NodeData::Identifier(_) => self.emit_expression(data.module_reference, 0)?,
+            NodeData::QualifiedName(reference) => {
+                self.emit_qualified_name(reference)?;
+            }
+            _ => return Err(Self::unsupported(data.module_reference, reference.kind)),
+        }
+        self.writer.write(";");
+        Ok(())
+    }
+
+    fn emit_qualified_name(&mut self, data: &ts_ast::QualifiedNameData) -> Result<(), EmitError> {
+        let left = self.node(data.left)?.clone();
+        match &left.data {
+            NodeData::Identifier(_) => self.emit_expression(data.left, 0)?,
+            NodeData::QualifiedName(left) => self.emit_qualified_name(left)?,
+            _ => return Err(Self::unsupported(data.left, left.kind)),
+        }
+        self.writer.write(".");
+        self.emit_expression(data.right, 0)
+    }
+
     fn emit_import_attributes(&mut self, id: NodeId) -> Result<(), EmitError> {
         let node = self.node(id)?.clone();
         let NodeData::ImportAttributes(data) = &node.data else {
@@ -2243,10 +2280,17 @@ impl Printer<'_> {
             }
         }
         if let Some(bindings) = clause.named_bindings {
+            let bindings_node = self.node(bindings)?.clone();
             self.writer.write(self.variable_keyword());
-            self.writer.write(" { ");
-            self.emit_commonjs_named_imports(bindings)?;
-            self.writer.write(" } = require(");
+            self.writer.write(" ");
+            if let NodeData::NamespaceImport(namespace) = &bindings_node.data {
+                self.emit_expression(namespace.name, 0)?;
+                self.writer.write(" = require(");
+            } else {
+                self.writer.write("{ ");
+                self.emit_commonjs_named_imports(bindings)?;
+                self.writer.write(" } = require(");
+            }
             self.emit_expression(data.module_specifier, 0)?;
             self.writer.write(");");
         }
@@ -2277,6 +2321,10 @@ impl Printer<'_> {
 
     fn emit_named_imports(&mut self, id: NodeId) -> Result<(), EmitError> {
         let node = self.node(id)?.clone();
+        if let NodeData::NamespaceImport(data) = &node.data {
+            self.writer.write("* as ");
+            return self.emit_expression(data.name, 0);
+        }
         let NodeData::NamedImports(data) = &node.data else {
             return Err(Self::unsupported(id, node.kind));
         };
@@ -3570,6 +3618,12 @@ impl Printer<'_> {
             Err(Self::unsupported(id, node.kind))
         }
     }
+
+    fn is_constructor_name(&self, id: NodeId) -> bool {
+        self.arena.get(id).is_some_and(
+            |node| matches!(&node.data, NodeData::Identifier(data) if data.text == "constructor"),
+        )
+    }
 }
 
 fn semantic_jsx_children(arena: &NodeArena, children: &NodeList) -> Vec<NodeId> {
@@ -4094,6 +4148,65 @@ class Board {
         assert_eq!(
             result.code,
             "\"use strict\";\nconst main = require(\"pkg\").default;\nconst { read: load, write } = require(\"pkg\");\nrequire(\"side\");\nexports.result = load;\nObject.assign(exports, require(\"other\"));\nexports.default = main;\n"
+        );
+    }
+
+    #[test]
+    fn emits_runtime_import_equals_for_commonjs() {
+        let commonjs = emit_with(
+            "import ts = require('typescript'); ts.version;",
+            ScriptTarget::Es2015,
+            ModuleKind::CommonJs,
+        );
+        assert_eq!(
+            commonjs.code,
+            "\"use strict\";\nconst ts = require(\"typescript\");\nts.version;\n"
+        );
+
+        let es_module = emit_with(
+            "import ts = require('typescript'); ts.version;",
+            ScriptTarget::Es2015,
+            ModuleKind::EsNext,
+        );
+        assert_eq!(
+            es_module.code,
+            "const ts = require(\"typescript\");\nts.version;\n"
+        );
+    }
+
+    #[test]
+    fn emits_namespace_imports_for_es_modules_and_commonjs() {
+        let es_module = emit_with(
+            "import * as ts from 'typescript'; ts.version;",
+            ScriptTarget::Es2015,
+            ModuleKind::EsNext,
+        );
+        assert_eq!(
+            es_module.code,
+            "import * as ts from \"typescript\";\nts.version;\n"
+        );
+
+        let commonjs = emit_with(
+            "import * as ts from 'typescript'; ts.version;",
+            ScriptTarget::Es2015,
+            ModuleKind::CommonJs,
+        );
+        assert_eq!(
+            commonjs.code,
+            "\"use strict\";\nconst ts = require(\"typescript\");\nts.version;\n"
+        );
+    }
+
+    #[test]
+    fn emits_numeric_and_string_named_class_method_overloads() {
+        let result = emit_with(
+            "class Numeric { 0(); 1() { } } class StringNamed { 'foo'(); 'bar'() { } }",
+            ScriptTarget::Es2015,
+            ModuleKind::EsNext,
+        );
+        assert_eq!(
+            result.code,
+            "class Numeric {\n  1() {\n  }\n}\nclass StringNamed {\n  \"bar\"() {\n  }\n}\n"
         );
     }
 
