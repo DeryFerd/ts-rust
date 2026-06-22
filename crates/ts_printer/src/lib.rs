@@ -1,6 +1,6 @@
 //! Deterministic modern-JavaScript emission from the generated TypeScript AST.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 
@@ -87,6 +87,7 @@ pub fn emit_source_file_with_settings(
         namespace_containers: Vec::new(),
         namespace_declarations: vec![HashSet::new()],
         runtime_identifier_uses: HashSet::new(),
+        commonjs_default_imports: HashMap::new(),
         has_runtime_export_equals: false,
     };
     let node = printer.node(source_file)?.clone();
@@ -94,6 +95,10 @@ pub fn emit_source_file_with_settings(
         return Err(Printer::unsupported(source_file, node.kind));
     };
     printer.runtime_identifier_uses = runtime_identifier_uses(arena, source_file);
+    if settings.module == ModuleKind::CommonJs {
+        printer.commonjs_default_imports =
+            commonjs_default_imports(arena, &data.statements, &printer.runtime_identifier_uses);
+    }
     let is_external_module = data.statements.nodes.iter().any(|statement| {
         arena
             .get(*statement)
@@ -134,6 +139,9 @@ pub fn emit_source_file_with_settings(
             &printer.runtime_identifier_uses,
         ) {
             printer.emit_import_star_helper();
+        }
+        if !printer.commonjs_default_imports.is_empty() {
+            printer.emit_import_default_helper();
         }
         if export_equals_expression.is_none() {
             printer
@@ -256,6 +264,103 @@ fn source_needs_import_star_helper(
                     .is_some_and(|name| runtime_identifier_uses.contains(name))
             })
     })
+}
+
+fn commonjs_default_imports(
+    arena: &NodeArena,
+    statements: &NodeList,
+    runtime_identifier_uses: &HashSet<String>,
+) -> HashMap<String, String> {
+    let mut imports = HashMap::new();
+    let mut module_name_counts = HashMap::<String, usize>::new();
+    for statement in &statements.nodes {
+        let Some(NodeData::ImportDeclaration(import)) =
+            arena.get(*statement).map(|node| &node.data)
+        else {
+            continue;
+        };
+        let Some(NodeData::ImportClause(clause)) = import
+            .import_clause
+            .and_then(|clause| arena.get(clause))
+            .map(|node| &node.data)
+        else {
+            continue;
+        };
+        if clause.phase_modifier == Some(SyntaxKind::TypeKeyword) {
+            continue;
+        }
+        let mut local_names = Vec::new();
+        if let Some(name) = clause.name
+            && let Some(name) = declaration_name_text(arena, name)
+            && runtime_identifier_uses.contains(name)
+        {
+            local_names.push(name.to_owned());
+        }
+        if let Some(NodeData::NamedImports(bindings)) = clause
+            .named_bindings
+            .and_then(|bindings| arena.get(bindings))
+            .map(|node| &node.data)
+        {
+            for element in &bindings.elements.nodes {
+                let Some(NodeData::ImportSpecifier(specifier)) =
+                    arena.get(*element).map(|node| &node.data)
+                else {
+                    continue;
+                };
+                if specifier.is_type_only
+                    || !specifier.property_name.is_some_and(|property| {
+                        declaration_name_text(arena, property) == Some("default")
+                    })
+                {
+                    continue;
+                }
+                if let Some(name) = declaration_name_text(arena, specifier.name)
+                    && runtime_identifier_uses.contains(name)
+                {
+                    local_names.push(name.to_owned());
+                }
+            }
+        }
+        if local_names.is_empty() {
+            continue;
+        }
+        let base = commonjs_module_temp_base(arena, import.module_specifier);
+        let count = module_name_counts.entry(base.clone()).or_default();
+        *count += 1;
+        let temp = format!("{base}_{count}");
+        for local_name in local_names {
+            imports.insert(local_name, temp.clone());
+        }
+    }
+    imports
+}
+
+fn commonjs_module_temp_base(arena: &NodeArena, module_specifier: NodeId) -> String {
+    let text = match arena.get(module_specifier).map(|node| &node.data) {
+        Some(NodeData::StringLiteral(literal)) => literal.text.as_str(),
+        _ => "module",
+    };
+    let segment = text
+        .rsplit('/')
+        .find(|segment| !segment.is_empty())
+        .unwrap_or("module");
+    let stem = segment.split('.').next().unwrap_or(segment);
+    let mut base = String::new();
+    for (index, character) in stem.chars().enumerate() {
+        if character == '_' || character == '$' || character.is_ascii_alphanumeric() {
+            if index == 0 && character.is_ascii_digit() {
+                base.push('_');
+            }
+            base.push(character);
+        } else if !base.ends_with('_') {
+            base.push('_');
+        }
+    }
+    if base.is_empty() {
+        "module".to_owned()
+    } else {
+        base
+    }
 }
 
 fn commonjs_preinitialized_export_names(arena: &NodeArena, statements: &NodeList) -> Vec<String> {
@@ -1515,6 +1620,7 @@ struct Printer<'a> {
     namespace_containers: Vec<String>,
     namespace_declarations: Vec<HashSet<String>>,
     runtime_identifier_uses: HashSet<String>,
+    commonjs_default_imports: HashMap<String, String>,
     has_runtime_export_equals: bool,
 }
 
@@ -1627,6 +1733,17 @@ impl Printer<'_> {
             "        return result;",
             "    };",
             "})();",
+        ] {
+            self.writer.write(line);
+            self.writer.newline();
+        }
+    }
+
+    fn emit_import_default_helper(&mut self) {
+        for line in [
+            "var __importDefault = (this && this.__importDefault) || function (mod) {",
+            "    return (mod && mod.__esModule) ? mod : { \"default\": mod };",
+            "};",
         ] {
             self.writer.write(line);
             self.writer.newline();
@@ -1803,11 +1920,13 @@ impl Printer<'_> {
             NodeData::Block(_) => self.emit_block(id)?,
             NodeData::EmptyStatement(_) => self.writer.write(";"),
             NodeData::VariableStatement(data) => {
-                self.emit_runtime_declaration_modifiers(data.modifiers.as_ref());
-                self.emit_variable_list(data.declaration_list)?;
-                self.writer.write(";");
-                let names = self.variable_declaration_names(data.declaration_list)?;
-                self.emit_commonjs_declaration_exports(data.modifiers.as_ref(), &names);
+                if !self.emit_commonjs_default_import_export_variable(data)? {
+                    self.emit_runtime_declaration_modifiers(data.modifiers.as_ref());
+                    self.emit_variable_list(data.declaration_list)?;
+                    self.writer.write(";");
+                    let names = self.variable_declaration_names(data.declaration_list)?;
+                    self.emit_commonjs_declaration_exports(data.modifiers.as_ref(), &names);
+                }
             }
             NodeData::FunctionDeclaration(data) => {
                 self.emit_runtime_declaration_modifiers(data.modifiers.as_ref());
@@ -3194,20 +3313,33 @@ impl Printer<'_> {
         let NodeData::ImportClause(clause) = &clause_node.data else {
             return Err(Self::unsupported(clause_id, clause_node.kind));
         };
-        if let Some(name) = clause.name {
+        let default_local = clause
+            .name
+            .and_then(|name| self.identifier_text(name).ok())
+            .map(str::to_owned)
+            .or_else(|| self.commonjs_named_default_local(clause.named_bindings));
+        let default_temp = default_local
+            .as_ref()
+            .and_then(|name| self.commonjs_default_imports.get(name))
+            .cloned();
+        if let Some(temp) = default_temp.as_deref() {
             self.writer.write(self.variable_keyword());
             self.writer.write(" ");
-            self.emit_expression(name, 0)?;
-            self.writer.write(" = require(");
+            self.writer.write(temp);
+            self.writer.write(" = __importDefault(require(");
             self.emit_expression(data.module_specifier, 0)?;
-            self.writer.write(").default;");
-            if clause.named_bindings.is_some() {
+            self.writer.write("));");
+            if self.commonjs_has_non_default_bindings(clause.named_bindings) {
                 self.writer.newline();
             }
         }
         if let Some(bindings) = clause.named_bindings {
             let bindings_node = self.node(bindings)?.clone();
             let is_namespace_import = matches!(bindings_node.data, NodeData::NamespaceImport(_));
+            if matches!(&bindings_node.data, NodeData::NamedImports(imports) if imports.elements.nodes.iter().all(|element| self.commonjs_import_specifier_is_default(*element)))
+            {
+                return Ok(());
+            }
             self.writer.write(self.variable_keyword());
             self.writer.write(" ");
             if let NodeData::NamespaceImport(namespace) = &bindings_node.data {
@@ -3225,13 +3357,57 @@ impl Printer<'_> {
         Ok(())
     }
 
+    fn commonjs_named_default_local(&self, bindings: Option<NodeId>) -> Option<String> {
+        let NodeData::NamedImports(imports) = &self.arena.get(bindings?)?.data else {
+            return None;
+        };
+        imports.elements.nodes.iter().find_map(|element| {
+            let NodeData::ImportSpecifier(specifier) = &self.arena.get(*element)?.data else {
+                return None;
+            };
+            (self.commonjs_import_specifier_is_default(*element) && !specifier.is_type_only)
+                .then(|| declaration_name_text(self.arena, specifier.name).map(str::to_owned))
+                .flatten()
+        })
+    }
+
+    fn commonjs_import_specifier_is_default(&self, specifier: NodeId) -> bool {
+        let Some(NodeData::ImportSpecifier(specifier)) =
+            self.arena.get(specifier).map(|node| &node.data)
+        else {
+            return false;
+        };
+        specifier
+            .property_name
+            .is_some_and(|property| declaration_name_text(self.arena, property) == Some("default"))
+    }
+
+    fn commonjs_has_non_default_bindings(&self, bindings: Option<NodeId>) -> bool {
+        let Some(bindings) = bindings.and_then(|bindings| self.arena.get(bindings)) else {
+            return false;
+        };
+        match &bindings.data {
+            NodeData::NamespaceImport(_) => true,
+            NodeData::NamedImports(imports) => imports
+                .elements
+                .nodes
+                .iter()
+                .any(|element| !self.commonjs_import_specifier_is_default(*element)),
+            _ => false,
+        }
+    }
+
     fn emit_commonjs_named_imports(&mut self, id: NodeId) -> Result<(), EmitError> {
         let node = self.node(id)?.clone();
         let NodeData::NamedImports(data) = &node.data else {
             return Err(Self::unsupported(id, node.kind));
         };
-        for (index, specifier) in data.elements.nodes.iter().enumerate() {
-            if index != 0 {
+        let mut emitted = false;
+        for specifier in &data.elements.nodes {
+            if self.commonjs_import_specifier_is_default(*specifier) {
+                continue;
+            }
+            if emitted {
                 self.writer.write(", ");
             }
             let node = self.node(*specifier)?.clone();
@@ -3243,6 +3419,7 @@ impl Printer<'_> {
                 self.writer.write(": ");
             }
             self.emit_expression(specifier.name, 0)?;
+            emitted = true;
         }
         Ok(())
     }
@@ -3422,6 +3599,63 @@ impl Printer<'_> {
             })
     }
 
+    fn emit_commonjs_default_import_export_variable(
+        &mut self,
+        statement: &ts_ast::VariableStatementData,
+    ) -> Result<bool, EmitError> {
+        if self.settings.module != ModuleKind::CommonJs
+            || self.commonjs_default_imports.is_empty()
+            || !self.has_modifier(statement.modifiers.as_ref(), SyntaxKind::ExportKeyword)
+        {
+            return Ok(false);
+        }
+        let list_node = self.node(statement.declaration_list)?.clone();
+        let NodeData::VariableDeclarationList(list) = &list_node.data else {
+            return Ok(false);
+        };
+        let [declaration] = list.declarations.nodes.as_slice() else {
+            return Ok(false);
+        };
+        let declaration_node = self.node(*declaration)?.clone();
+        let NodeData::VariableDeclaration(declaration) = &declaration_node.data else {
+            return Ok(false);
+        };
+        let Some(initializer) = declaration.initializer else {
+            return Ok(false);
+        };
+        let Some(name) = declaration_name_text(self.arena, declaration.name) else {
+            return Ok(false);
+        };
+        if !self.expression_uses_commonjs_default_import(initializer) {
+            return Ok(false);
+        }
+        self.writer.write("exports.");
+        self.writer.write(name);
+        self.writer.write(" = ");
+        self.emit_expression(initializer, 1)?;
+        self.writer.write(";");
+        Ok(true)
+    }
+
+    fn expression_uses_commonjs_default_import(&self, expression: NodeId) -> bool {
+        self.arena.iter().any(|(id, node)| {
+            let NodeData::Identifier(identifier) = &node.data else {
+                return false;
+            };
+            if !self.commonjs_default_imports.contains_key(&identifier.text) {
+                return false;
+            }
+            let mut current = id;
+            while let Some(parent) = self.arena.get(current).and_then(|node| node.parent) {
+                if parent == expression {
+                    return true;
+                }
+                current = parent;
+            }
+            false
+        })
+    }
+
     fn import_binding_is_used(&self, name: NodeId) -> bool {
         self.identifier_text(name)
             .is_ok_and(|name| self.runtime_identifier_uses.contains(name))
@@ -3517,7 +3751,14 @@ impl Printer<'_> {
     fn emit_expression(&mut self, id: NodeId, parent_precedence: u8) -> Result<(), EmitError> {
         let node = self.node(id)?.clone();
         match &node.data {
-            NodeData::Identifier(data) => self.writer.write(&data.text),
+            NodeData::Identifier(data) => {
+                if let Some(temp) = self.commonjs_default_imports.get(&data.text) {
+                    self.writer.write(temp);
+                    self.writer.write(".default");
+                } else {
+                    self.writer.write(&data.text);
+                }
+            }
             NodeData::QualifiedName(data) => self.emit_qualified_name(data)?,
             NodeData::PrivateIdentifier(data) => self.writer.write(&data.text),
             NodeData::NumericLiteral(data) => self.writer.write(&data.text),
@@ -5610,7 +5851,59 @@ class Board {
         );
         assert_eq!(
             result.code,
-            "\"use strict\";\nObject.defineProperty(exports, \"__esModule\", { value: true });\nconst main = require('pkg').default;\nconst { read: load, write } = require('pkg');\nrequire('side');\nexports.result = load;\nObject.assign(exports, require('other'));\nexports.default = main;\n"
+            "\"use strict\";\nvar __importDefault = (this && this.__importDefault) || function (mod) {\n    return (mod && mod.__esModule) ? mod : { \"default\": mod };\n};\nObject.defineProperty(exports, \"__esModule\", { value: true });\nconst pkg_1 = __importDefault(require('pkg'));\nconst { read: load, write } = require('pkg');\nrequire('side');\nexports.result = load;\nObject.assign(exports, require('other'));\nexports.default = pkg_1.default;\n"
+        );
+    }
+
+    #[test]
+    fn wraps_commonjs_default_imports_with_import_default() {
+        let result = emit_with(
+            "import Foo from \"./b\"; new Foo();",
+            ScriptTarget::Es2015,
+            ModuleKind::CommonJs,
+        );
+        assert_eq!(
+            result.code,
+            "\"use strict\";\nvar __importDefault = (this && this.__importDefault) || function (mod) {\n    return (mod && mod.__esModule) ? mod : { \"default\": mod };\n};\nObject.defineProperty(exports, \"__esModule\", { value: true });\nconst b_1 = __importDefault(require(\"./b\"));\nnew b_1.default();\n"
+        );
+    }
+
+    #[test]
+    fn emits_default_import_initializers_directly_to_commonjs_exports() {
+        let result = emit_with(
+            "import Namespace from \"./b\"; export var x = new Namespace.Foo();",
+            ScriptTarget::Es2015,
+            ModuleKind::CommonJs,
+        );
+        assert_eq!(
+            result.code,
+            "\"use strict\";\nvar __importDefault = (this && this.__importDefault) || function (mod) {\n    return (mod && mod.__esModule) ? mod : { \"default\": mod };\n};\nObject.defineProperty(exports, \"__esModule\", { value: true });\nexports.x = void 0;\nconst b_1 = __importDefault(require(\"./b\"));\nexports.x = new b_1.default.Foo();\n"
+        );
+    }
+
+    #[test]
+    fn treats_named_default_imports_as_commonjs_default_imports() {
+        let result = emit_with(
+            "import { default as Foo } from \"./b\"; Foo.bar(); Foo.foo();",
+            ScriptTarget::Es2015,
+            ModuleKind::CommonJs,
+        );
+        assert_eq!(
+            result.code,
+            "\"use strict\";\nvar __importDefault = (this && this.__importDefault) || function (mod) {\n    return (mod && mod.__esModule) ? mod : { \"default\": mod };\n};\nObject.defineProperty(exports, \"__esModule\", { value: true });\nconst b_1 = __importDefault(require(\"./b\"));\nb_1.default.bar();\nb_1.default.foo();\n"
+        );
+    }
+
+    #[test]
+    fn does_not_emit_import_default_for_type_only_default_usage() {
+        let result = emit_with(
+            "import Foo from \"./b\"; let value: Foo;",
+            ScriptTarget::Es2015,
+            ModuleKind::CommonJs,
+        );
+        assert_eq!(
+            result.code,
+            "\"use strict\";\nObject.defineProperty(exports, \"__esModule\", { value: true });\nlet value;\n"
         );
     }
 

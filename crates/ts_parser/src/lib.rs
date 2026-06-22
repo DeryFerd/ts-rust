@@ -2696,7 +2696,7 @@ impl<'a> Parser<'a> {
             && self.current.kind != SyntaxKind::EndOfFile
         {
             let specifier_start = self.current.range.start;
-            let first = self.parse_identifier("Expected an import name.");
+            let first = self.parse_identifier_name("Expected an import name.");
             let (property_name, name) = if self.current.kind == SyntaxKind::AsKeyword {
                 self.bump();
                 (
@@ -6034,6 +6034,50 @@ mod tests {
                 .parent,
             Some(source_statements(&result)[0])
         );
+    }
+
+    #[test]
+    fn parses_keyword_named_import_specifiers() {
+        let result = parse_source_file("import { default as Foo } from \"./b\";");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let NodeData::ImportDeclaration(import) = &result
+            .arena
+            .get(source_statements(&result)[0])
+            .unwrap()
+            .data
+        else {
+            panic!("expected import declaration");
+        };
+        let NodeData::ImportClause(clause) = &result
+            .arena
+            .get(import.import_clause.unwrap())
+            .unwrap()
+            .data
+        else {
+            panic!("expected import clause");
+        };
+        let NodeData::NamedImports(imports) = &result
+            .arena
+            .get(clause.named_bindings.unwrap())
+            .unwrap()
+            .data
+        else {
+            panic!("expected named imports");
+        };
+        let NodeData::ImportSpecifier(specifier) =
+            &result.arena.get(imports.elements.nodes[0]).unwrap().data
+        else {
+            panic!("expected import specifier");
+        };
+        let NodeData::Identifier(property) = &result
+            .arena
+            .get(specifier.property_name.unwrap())
+            .unwrap()
+            .data
+        else {
+            panic!("expected imported identifier name");
+        };
+        assert_eq!(property.text, "default");
     }
 
     #[test]
