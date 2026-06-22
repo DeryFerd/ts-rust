@@ -44,6 +44,7 @@ pub enum TypeKind {
     Intersection(Vec<TypeId>),
     Object(ObjectType),
     Function(FunctionType),
+    Constructor(FunctionType),
     Overload(Vec<FunctionType>),
 }
 
@@ -290,6 +291,17 @@ impl TypeArena {
                     .join(", "),
                 self.display(function.return_type)
             ),
+            TypeKind::Constructor(constructor) => format!(
+                "new ({}) => {}",
+                constructor
+                    .parameters
+                    .iter()
+                    .enumerate()
+                    .map(|(index, value)| format!("arg{index}: {}", self.display(*value)))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                self.display(constructor.return_type)
+            ),
             TypeKind::Overload(signatures) => signatures
                 .iter()
                 .map(|signature| {
@@ -477,6 +489,11 @@ enum TypeDescriptor {
         getter_properties: BTreeSet<String>,
     },
     Function {
+        parameters: Vec<Self>,
+        return_type: Box<Self>,
+        parameters_optional: bool,
+    },
+    Constructor {
         parameters: Vec<Self>,
         return_type: Box<Self>,
         parameters_optional: bool,
@@ -1457,8 +1474,20 @@ impl<'a> Checker<'a> {
                 self.check_function(node_id, data);
             }
             NodeData::ClassDeclaration(data) => {
+                let instance_type = self
+                    .bindings
+                    .node_symbols
+                    .get(&node_id)
+                    .and_then(|symbol| self.result.symbol_types.get(symbol))
+                    .copied();
+                if let Some(instance_type) = instance_type {
+                    self.this_types.push(instance_type);
+                }
                 self.check_class_members(&data.members.nodes);
                 self.check_class_abstract_members(data);
+                if instance_type.is_some() {
+                    self.this_types.pop();
+                }
             }
             NodeData::IfStatement(data) => {
                 self.type_of_expression(data.expression);
@@ -2020,6 +2049,7 @@ impl<'a> Checker<'a> {
                                 &mut optional_properties,
                                 &mut readonly_properties,
                             );
+                            continue;
                         }
                         let method_type = self.signature_type(
                             &data.parameters.nodes,
@@ -2037,6 +2067,14 @@ impl<'a> Checker<'a> {
                             properties.insert(name, self.result.types.union([method, undefined]));
                         }
                     }
+                }
+                NodeData::ConstructorDeclaration(data) => {
+                    self.add_parameter_properties(
+                        &data.parameters.nodes,
+                        &mut properties,
+                        &mut optional_properties,
+                        &mut readonly_properties,
+                    );
                 }
                 NodeData::MethodSignatureDeclaration(data) => {
                     if let Some(name) = self.property_name(data.name) {
@@ -2581,6 +2619,64 @@ impl<'a> Checker<'a> {
         }
     }
 
+    fn class_expression_type(&mut self, class: &ts_ast::ClassExpressionData) -> TypeId {
+        let instance_type = self.declared_object_type(
+            class.type_parameters.as_ref(),
+            class.heritage_clauses.as_ref(),
+            &class.members.nodes,
+            &[],
+        );
+        self.this_types.push(instance_type);
+        self.check_class_members(&class.members.nodes);
+        self.this_types.pop();
+        let signature = self.class_constructor_signature(&class.members.nodes, instance_type);
+        let constructor_type = self.result.types.alloc(TypeKind::Constructor(signature));
+        if let Some(symbol) = class.symbol.or(class.local_symbol) {
+            self.result.symbol_types.insert(symbol, constructor_type);
+        }
+        constructor_type
+    }
+
+    fn class_constructor_signature(
+        &mut self,
+        members: &[NodeId],
+        instance_type: TypeId,
+    ) -> FunctionType {
+        for member in members {
+            let Some(node) = self.arena.get(*member).cloned() else {
+                continue;
+            };
+            let parameters = match &node.data {
+                NodeData::ConstructorDeclaration(constructor) => Some(&constructor.parameters),
+                NodeData::MethodDeclaration(method)
+                    if self.property_name(method.name).as_deref() == Some("constructor") =>
+                {
+                    Some(&method.parameters)
+                }
+                _ => None,
+            };
+            let Some(parameters) = parameters else {
+                continue;
+            };
+            let signature_type = self.signature_type(&parameters.nodes, None, None);
+            let Some(TypeKind::Function(mut signature)) = self
+                .result
+                .types
+                .get(signature_type)
+                .map(|type_| type_.kind.clone())
+            else {
+                continue;
+            };
+            signature.return_type = instance_type;
+            return signature;
+        }
+        FunctionType {
+            parameters: Vec::new(),
+            return_type: instance_type,
+            parameters_optional: false,
+        }
+    }
+
     fn getter_return_expressions(&self, body: NodeId) -> Vec<NodeId> {
         let Some(NodeData::Block(block)) = self.arena.get(body).map(|node| &node.data) else {
             return Vec::new();
@@ -2943,6 +3039,18 @@ impl<'a> Checker<'a> {
                     let mut saw_return = false;
                     if let Some(body) = data.body {
                         self.check_node(body, Some(return_type), &mut saw_return);
+                    }
+                    self.local_scopes.pop();
+                }
+                NodeData::ConstructorDeclaration(data) => {
+                    for parameter in &data.parameters.nodes {
+                        self.check_parameter(*parameter);
+                    }
+                    let local_scope = self.parameter_scope(&data.parameters.nodes);
+                    self.local_scopes.push(local_scope);
+                    let mut saw_return = false;
+                    if let Some(body) = data.body {
+                        self.check_node(body, None, &mut saw_return);
                     }
                     self.local_scopes.pop();
                 }
@@ -3407,6 +3515,7 @@ impl<'a> Checker<'a> {
             NodeData::ObjectLiteralExpression(data) => {
                 self.object_literal_type(data, contextual_type)
             }
+            NodeData::ClassExpression(data) => self.class_expression_type(data),
             NodeData::ArrayLiteralExpression(data) => {
                 let expected_tuple = contextual_type.and_then(|type_id| {
                     match &self.result.types.get(type_id)?.kind {
@@ -4179,7 +4288,15 @@ impl<'a> Checker<'a> {
             }
             return self.result.types.any();
         }
-        let Some(signatures) = self.callable_signatures(callee_kind) else {
+        let signatures = if construct {
+            match callee_kind {
+                TypeKind::Constructor(signature) => Some(vec![signature]),
+                other => self.callable_signatures(other),
+            }
+        } else {
+            self.callable_signatures(callee_kind)
+        };
+        let Some(signatures) = signatures else {
             self.error(
                 node,
                 if construct { 2351 } else { 2349 },
@@ -5434,6 +5551,22 @@ impl<'a> Checker<'a> {
                     parameters_optional: *parameters_optional,
                 }))
             }
+            TypeDescriptor::Constructor {
+                parameters,
+                return_type,
+                parameters_optional,
+            } => {
+                let parameters = parameters
+                    .iter()
+                    .map(|parameter| self.import_type(parameter))
+                    .collect();
+                let return_type = self.import_type(return_type);
+                self.result.types.alloc(TypeKind::Constructor(FunctionType {
+                    parameters,
+                    return_type,
+                    parameters_optional: *parameters_optional,
+                }))
+            }
             TypeDescriptor::Overload(signatures) => {
                 let signatures = signatures
                     .iter()
@@ -6211,6 +6344,15 @@ fn describe_type(types: &TypeArena, type_id: TypeId) -> TypeDescriptor {
             return_type: Box::new(describe_type(types, function.return_type)),
             parameters_optional: function.parameters_optional,
         },
+        TypeKind::Constructor(constructor) => TypeDescriptor::Constructor {
+            parameters: constructor
+                .parameters
+                .iter()
+                .map(|parameter| describe_type(types, *parameter))
+                .collect(),
+            return_type: Box::new(describe_type(types, constructor.return_type)),
+            parameters_optional: constructor.parameters_optional,
+        },
         TypeKind::Overload(signatures) => TypeDescriptor::Overload(
             signatures
                 .iter()
@@ -6282,6 +6424,18 @@ fn substitute_descriptor(
             return_type,
             parameters_optional,
         } => TypeDescriptor::Function {
+            parameters: parameters
+                .iter()
+                .map(|parameter| substitute_descriptor(parameter, substitutions))
+                .collect(),
+            return_type: Box::new(substitute_descriptor(return_type, substitutions)),
+            parameters_optional: *parameters_optional,
+        },
+        TypeDescriptor::Constructor {
+            parameters,
+            return_type,
+            parameters_optional,
+        } => TypeDescriptor::Constructor {
             parameters: parameters
                 .iter()
                 .map(|parameter| substitute_descriptor(parameter, substitutions))
@@ -7472,6 +7626,112 @@ mod tests {
                 .map(|diagnostic| diagnostic.diagnostic.code())
                 .collect::<Vec<_>>(),
             [2345, 2322]
+        );
+    }
+
+    #[test]
+    fn infers_class_expression_constructor_and_instance_types() {
+        let parsed = parse_source_file(
+            r#"
+                const Box = class NamedBox {
+                    constructor(public readonly value: string) {}
+                    method(): string { return this.value; }
+                };
+                const Empty = class {};
+                const box = new Box("ok");
+                const text: string = box.value;
+                box.value = "changed";
+                new Box(1);
+                Box();
+            "#,
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        assert!(
+            bindings.diagnostics.is_empty(),
+            "{:?}",
+            bindings.diagnostics
+        );
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2540, 2345, 2349]
+        );
+
+        let box_symbol = bindings.root_scope().unwrap().symbols.get("Box").unwrap();
+        let constructor_type = result.type_of_symbol(box_symbol).unwrap();
+        let TypeKind::Constructor(constructor) = &result.types.get(constructor_type).unwrap().kind
+        else {
+            panic!("expected constructor type");
+        };
+        assert_eq!(constructor.parameters, [result.types.string()]);
+        let TypeKind::Object(instance) = &result.types.get(constructor.return_type).unwrap().kind
+        else {
+            panic!("expected instance type");
+        };
+        assert!(instance.properties.contains_key("value"));
+        assert!(instance.properties.contains_key("method"));
+        assert!(instance.readonly_properties.contains("value"));
+        let empty_symbol = bindings.root_scope().unwrap().symbols.get("Empty").unwrap();
+        let empty_type = result.type_of_symbol(empty_symbol).unwrap();
+        let TypeKind::Constructor(empty_constructor) = &result.types.get(empty_type).unwrap().kind
+        else {
+            panic!("expected anonymous class constructor type");
+        };
+        assert!(empty_constructor.parameters.is_empty());
+        assert!(matches!(
+            result
+                .types
+                .get(empty_constructor.return_type)
+                .unwrap()
+                .kind,
+            TypeKind::Object(_)
+        ));
+
+        let declaration = bindings.symbols.get(box_symbol).unwrap().declarations[0];
+        assert_eq!(result.type_of_node(declaration), Some(constructor_type));
+        let NodeData::VariableDeclaration(variable) = &parsed.arena.get(declaration).unwrap().data
+        else {
+            panic!("expected variable declaration");
+        };
+        assert_eq!(
+            result.type_of_node(variable.initializer.unwrap()),
+            Some(constructor_type)
+        );
+    }
+
+    #[test]
+    fn checks_contextual_this_for_classes_in_nested_control_flow() {
+        let parsed = parse_source_file(
+            r#"
+                while (0) {
+                    class A { methodA() { this; } }
+                    class B {
+                        methodB() {
+                            this.methodA;
+                            this.methodB;
+                        }
+                    }
+                }
+                function f() {
+                    return typeof class {} === "function";
+                }
+            "#,
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2339]
         );
     }
 
