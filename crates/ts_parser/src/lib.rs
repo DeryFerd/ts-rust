@@ -714,12 +714,52 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        let initializer = if self.current.kind == SyntaxKind::EqualsToken {
+        let mut shift_recovery = false;
+        let mut initializer = if self.current.kind == SyntaxKind::EqualsToken {
             self.bump();
+            shift_recovery = self.current.kind == SyntaxKind::LessThanLessThanToken;
             Some(self.parse_binary_expression(2))
         } else {
             None
         };
+        if shift_recovery
+            && self.current.kind == SyntaxKind::EqualsGreaterThanToken
+            && let Some(left) = initializer
+        {
+            self.error_current("Expected ','.");
+            let arrow = self.consume();
+            if self.current.kind == SyntaxKind::Identifier {
+                let right = self.alloc_node(
+                    SyntaxKind::Identifier,
+                    self.current.range,
+                    NodeData::Identifier(Box::new(IdentifierData {
+                        flow_node: None,
+                        text: token_value(&self.current),
+                    })),
+                    &[],
+                );
+                let comma = self.alloc_node(
+                    SyntaxKind::CommaToken,
+                    arrow.range,
+                    NodeData::Token(Box::new(TokenData)),
+                    &[],
+                );
+                initializer = Some(self.alloc_node(
+                    SyntaxKind::BinaryExpression,
+                    TextRange::new(self.node_start(left), self.node_end(right)),
+                    NodeData::BinaryExpression(Box::new(BinaryExpressionData {
+                        left,
+                        operator_token: comma,
+                        right,
+                        symbol: None,
+                        type_: None,
+                        facts: 0,
+                        modifiers: None,
+                    })),
+                    &[left, comma, right],
+                ));
+            }
+        }
         let end = initializer
             .or(type_node)
             .and_then(|id| self.arena.get(id))
@@ -3127,20 +3167,28 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_binary_expression(&mut self, minimum_precedence: u8) -> NodeId {
-        if self.current.kind == SyntaxKind::AsyncKeyword && self.is_async_arrow_function() {
+        if minimum_precedence <= 2
+            && self.current.kind == SyntaxKind::AsyncKeyword
+            && self.is_async_arrow_function()
+        {
             return self.parse_async_arrow_function();
         }
-        if self.current.kind == SyntaxKind::LessThanToken
+        if minimum_precedence <= 2
+            && self.current.kind == SyntaxKind::LessThanToken
             && self.language_variant != LanguageVariant::Jsx
             && self.is_generic_arrow_function()
         {
             return self.parse_generic_arrow_function();
         }
-        if self.current.kind == SyntaxKind::OpenParenToken && self.is_parenthesized_arrow() {
+        if minimum_precedence <= 2
+            && self.current.kind == SyntaxKind::OpenParenToken
+            && self.is_parenthesized_arrow()
+        {
             return self.parse_parenthesized_arrow_function();
         }
         let mut left = self.parse_postfix_expression();
-        if self.current.kind == SyntaxKind::EqualsGreaterThanToken
+        if minimum_precedence <= 2
+            && self.current.kind == SyntaxKind::EqualsGreaterThanToken
             && self.arena.get(left).unwrap().kind == SyntaxKind::Identifier
         {
             return self.parse_single_parameter_arrow_function(left);
@@ -3907,7 +3955,9 @@ impl<'a> Parser<'a> {
             _ => {
                 let position = self.current.range.start;
                 self.error_current("Expected an expression.");
-                if !is_expression_terminator(self.current.kind) {
+                if binary_precedence(self.current.kind).is_none()
+                    && !is_expression_terminator(self.current.kind)
+                {
                     self.bump();
                 }
                 self.missing_identifier(position)
@@ -3936,6 +3986,15 @@ impl<'a> Parser<'a> {
         let expression = self.parse_binary_expression(0);
         let end = if self.current.kind == SyntaxKind::CloseParenToken {
             self.consume().range.end
+        } else if self.current.kind == SyntaxKind::ColonToken {
+            self.error_current("Expected ')'.");
+            self.bump();
+            self.parse_type();
+            if self.current.kind == SyntaxKind::CloseParenToken {
+                self.consume().range.end
+            } else {
+                self.node_end(expression)
+            }
         } else {
             self.error_current("Expected ')'.");
             self.node_end(expression)
@@ -6334,7 +6393,7 @@ mod tests {
                 .iter()
                 .filter_map(|diagnostic| diagnostic.code)
                 .collect::<Vec<_>>(),
-            [1109, 1005]
+            [1109, 1005, 1005, 1005]
         );
         assert_eq!(
             result.diagnostics[0].range.start.get(),
@@ -6348,14 +6407,27 @@ mod tests {
         else {
             panic!("expected recovered variable declaration");
         };
-        assert_ne!(
-            result
-                .arena
-                .get(declaration.initializer.unwrap())
-                .unwrap()
-                .kind,
-            SyntaxKind::ArrowFunction
+        let initializer = declaration.initializer.unwrap();
+        let NodeData::BinaryExpression(comma) = &result.arena.get(initializer).unwrap().data else {
+            panic!("expected recovered comma expression");
+        };
+        assert_eq!(
+            result.arena.get(comma.operator_token).unwrap().kind,
+            SyntaxKind::CommaToken
         );
+        assert_eq!(
+            result.arena.get(comma.right).unwrap().kind,
+            SyntaxKind::Identifier
+        );
+        let NodeData::BinaryExpression(greater_than) = &result.arena.get(comma.left).unwrap().data
+        else {
+            panic!("expected recovered shift comparison");
+        };
+        assert_eq!(
+            result.arena.get(greater_than.operator_token).unwrap().kind,
+            SyntaxKind::GreaterThanToken
+        );
+        assert_eq!(statements.len(), 2);
     }
 
     #[test]

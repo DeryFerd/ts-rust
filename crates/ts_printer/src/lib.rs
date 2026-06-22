@@ -1204,12 +1204,9 @@ impl DeclarationPrinter<'_> {
                         return Err(Self::unsupported(*member, member_node.kind));
                     };
                     self.emit_name(member.name)?;
-                    if let Some(value) = is_const
-                        .then(|| {
-                            self.enum_member_values
-                                .and_then(|values| values.get(&member_id))
-                        })
-                        .flatten()
+                    if let Some(value) = self
+                        .enum_member_values
+                        .and_then(|values| values.get(&member_id))
                     {
                         self.writer.write(" = ");
                         write_enum_constant(&mut self.writer, value);
@@ -1217,7 +1214,7 @@ impl DeclarationPrinter<'_> {
                         self.writer.write(" = ");
                         self.emit_literal_expression(initializer)?;
                     }
-                    if !is_const || index + 1 != data.members.nodes.len() {
+                    if index + 1 != data.members.nodes.len() {
                         self.writer.write(",");
                     }
                     self.writer.newline();
@@ -1942,6 +1939,11 @@ impl DeclarationPrinter<'_> {
             NodeData::PrivateIdentifier(data) => self.writer.write(&data.text),
             NodeData::StringLiteral(data) => write_quoted(&mut self.writer, &data.text),
             NodeData::NumericLiteral(data) => self.writer.write(&data.text),
+            NodeData::ComputedPropertyName(data) => {
+                self.writer.write("[");
+                self.emit_literal_expression(data.expression)?;
+                self.writer.write("]");
+            }
             NodeData::QualifiedName(data) => {
                 self.emit_name(data.left)?;
                 self.writer.write(".");
@@ -2279,6 +2281,11 @@ fn declaration_modifiers(node: &Node) -> Option<&ts_ast::ModifierList> {
 fn declaration_name_text(arena: &NodeArena, id: NodeId) -> Option<&str> {
     match &arena.get(id)?.data {
         NodeData::Identifier(identifier) => Some(&identifier.text),
+        NodeData::StringLiteral(literal) => Some(&literal.text),
+        NodeData::NumericLiteral(literal) => Some(&literal.text),
+        NodeData::ComputedPropertyName(computed) => {
+            declaration_name_text(arena, computed.expression)
+        }
         _ => None,
     }
 }
@@ -5609,7 +5616,7 @@ impl Printer<'_> {
             let NodeData::EnumMember(member) = &node.data else {
                 return Err(Self::unsupported(*member, node.kind));
             };
-            let member_name = self.identifier_text(member.name)?.to_owned();
+            let (member_name, numeric_name) = self.enum_member_name_text(member.name)?;
             let constant = self.enum_member_values.get(&member_id);
             self.writer.write(&name);
             self.writer.write("[");
@@ -5623,7 +5630,11 @@ impl Printer<'_> {
                     )
                 });
             if is_string_member {
-                write_quoted(&mut self.writer, &member_name);
+                if numeric_name {
+                    self.writer.write(&member_name);
+                } else {
+                    write_quoted(&mut self.writer, &member_name);
+                }
                 self.writer.write("] = ");
                 if let Some(constant) = constant {
                     write_enum_constant(&mut self.writer, constant);
@@ -5636,7 +5647,11 @@ impl Printer<'_> {
             } else {
                 self.writer.write(&name);
                 self.writer.write("[");
-                write_quoted(&mut self.writer, &member_name);
+                if numeric_name {
+                    self.writer.write(&member_name);
+                } else {
+                    write_quoted(&mut self.writer, &member_name);
+                }
                 self.writer.write("] = ");
                 if let Some(constant) = constant {
                     write_enum_constant(&mut self.writer, constant);
@@ -5652,7 +5667,11 @@ impl Printer<'_> {
                     next_number = next_number.saturating_add(1);
                 }
                 self.writer.write("] = ");
-                write_quoted(&mut self.writer, &member_name);
+                if numeric_name {
+                    self.writer.write(&member_name);
+                } else {
+                    write_quoted(&mut self.writer, &member_name);
+                }
             }
             self.writer.write(";");
             self.writer.newline();
@@ -6590,7 +6609,9 @@ impl Printer<'_> {
                     self.writer.write("(");
                 }
                 self.emit_expression(data.left, precedence)?;
-                self.writer.write(" ");
+                if operator != SyntaxKind::CommaToken {
+                    self.writer.write(" ");
+                }
                 self.writer.write(
                     operator_text(operator)
                         .ok_or_else(|| Self::unsupported(data.operator_token, operator))?,
@@ -8020,6 +8041,17 @@ impl Printer<'_> {
         }
     }
 
+    fn enum_member_name_text(&self, id: NodeId) -> Result<(String, bool), EmitError> {
+        let node = self.node(id)?;
+        match &node.data {
+            NodeData::Identifier(data) => Ok((data.text.clone(), false)),
+            NodeData::StringLiteral(data) => Ok((data.text.clone(), false)),
+            NodeData::NumericLiteral(data) => Ok((data.text.clone(), true)),
+            NodeData::ComputedPropertyName(data) => self.enum_member_name_text(data.expression),
+            _ => Err(Self::unsupported(id, node.kind)),
+        }
+    }
+
     fn is_constructor_name(&self, id: NodeId) -> bool {
         self.arena.get(id).is_some_and(
             |node| matches!(&node.data, NodeData::Identifier(data) if data.text == "constructor"),
@@ -8604,6 +8636,24 @@ mod tests {
         assert_eq!(
             emit("enum Color { Red, Green = 4, Blue, Label = 'blue' }"),
             "var Color;\n(function (Color) {\n    Color[Color[\"Red\"] = 0] = \"Red\";\n    Color[Color[\"Green\"] = 4] = \"Green\";\n    Color[Color[\"Blue\"] = 5] = \"Blue\";\n    Color[\"Label\"] = \"blue\";\n})(Color || (Color = {}));\n"
+        );
+    }
+
+    #[test]
+    fn emits_literal_and_computed_literal_enum_member_names() {
+        let source = "enum Keys { \"string\", 1, [\"computed\"], [3] }";
+        assert_eq!(
+            emit(source),
+            "var Keys;\n(function (Keys) {\n    Keys[Keys[\"string\"] = 0] = \"string\";\n    Keys[Keys[1] = 1] = 1;\n    Keys[Keys[\"computed\"] = 2] = \"computed\";\n    Keys[Keys[3] = 3] = 3;\n})(Keys || (Keys = {}));\n"
+        );
+
+        let parsed = parse_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        assert_eq!(
+            emit_declaration_file(&parsed.arena, parsed.source_file, "input.ts", source, false)
+                .unwrap()
+                .code,
+            "declare enum Keys {\n    \"string\",\n    1,\n    [\"computed\"],\n    [3]\n}\n"
         );
     }
 
@@ -10089,7 +10139,7 @@ class Board {
                 .unwrap();
         assert_eq!(
             result.code,
-            "import { Input } from \"./types\";\nexport declare const version: number;\nexport declare function identity<T>(value: T): T;\nexport declare function parse(value: string): string;\nexport declare class Store<T> {\n    value: T;\n    read(input: T): T;\n}\nexport interface Box<T> {\n    value: T;\n}\nexport type Maybe<T> = T | undefined;\nexport declare enum Color {\n    Red,\n    Blue = 2,\n}\nexport declare namespace Helpers {\n    export function read(value: string): string;\n}\nexport { Input };\n"
+            "import { Input } from \"./types\";\nexport declare const version: number;\nexport declare function identity<T>(value: T): T;\nexport declare function parse(value: string): string;\nexport declare class Store<T> {\n    value: T;\n    read(input: T): T;\n}\nexport interface Box<T> {\n    value: T;\n}\nexport type Maybe<T> = T | undefined;\nexport declare enum Color {\n    Red,\n    Blue = 2\n}\nexport declare namespace Helpers {\n    export function read(value: string): string;\n}\nexport { Input };\n"
         );
         assert!(result.source_map.is_some());
     }
