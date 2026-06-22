@@ -2305,6 +2305,9 @@ impl<'a> Checker<'a> {
                 }
             }
             NodeData::ArrowFunction(data) => self.arrow_type(data, contextual_type),
+            NodeData::FunctionExpression(data) => {
+                self.function_expression_type(data, contextual_type)
+            }
             NodeData::PropertyAccessExpression(data) => {
                 let receiver = self.type_of_expression(data.expression);
                 if matches!(
@@ -2497,6 +2500,69 @@ impl<'a> Checker<'a> {
                 expected_return.unwrap_or_else(|| self.widen_literal(actual))
             }
         };
+        self.local_scopes.pop();
+        self.result.types.alloc(TypeKind::Function(FunctionType {
+            parameters,
+            return_type,
+        }))
+    }
+
+    fn function_expression_type(
+        &mut self,
+        data: &ts_ast::FunctionExpressionData,
+        contextual_type: Option<TypeId>,
+    ) -> TypeId {
+        let contextual_signature =
+            contextual_type.and_then(|type_id| match &self.result.types.get(type_id)?.kind {
+                TypeKind::Function(signature) => Some(signature.clone()),
+                TypeKind::Overload(signatures) => signatures.first().cloned(),
+                _ => None,
+            });
+        let mut parameters = Vec::with_capacity(data.parameters.nodes.len());
+        let mut local_scope = HashMap::new();
+        for (index, parameter) in data.parameters.nodes.iter().enumerate() {
+            let Some(NodeData::ParameterDeclaration(parameter_data)) =
+                self.arena.get(*parameter).map(|node| &node.data)
+            else {
+                parameters.push(self.result.types.any());
+                continue;
+            };
+            if self.options.no_implicit_any
+                && parameter_data.type_.is_none()
+                && contextual_signature.is_none()
+            {
+                let name = self
+                    .property_name(parameter_data.name)
+                    .unwrap_or_else(|| "parameter".into());
+                self.error(*parameter, 7006, [name, "any".into()]);
+            }
+            let parameter_type = parameter_data
+                .type_
+                .map(|node| self.type_from_type_node(node))
+                .or_else(|| {
+                    contextual_signature
+                        .as_ref()
+                        .and_then(|signature| signature.parameters.get(index))
+                        .copied()
+                })
+                .unwrap_or_else(|| self.result.types.any());
+            if let Some(name) = self.property_name(parameter_data.name) {
+                local_scope.insert(name, parameter_type);
+            }
+            parameters.push(parameter_type);
+        }
+        self.local_scopes.push(local_scope);
+        let return_type = data
+            .type_
+            .map(|node| self.type_from_type_node(node))
+            .or_else(|| {
+                contextual_signature
+                    .as_ref()
+                    .map(|signature| signature.return_type)
+            })
+            .unwrap_or_else(|| self.result.types.any());
+        let mut saw_return = false;
+        self.check_node(data.body, Some(return_type), &mut saw_return);
         self.local_scopes.pop();
         self.result.types.alloc(TypeKind::Function(FunctionType {
             parameters,

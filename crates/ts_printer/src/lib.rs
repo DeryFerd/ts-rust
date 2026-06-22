@@ -2850,6 +2850,34 @@ impl Printer<'_> {
                     self.writer.write(")");
                 }
             }
+            NodeData::FunctionExpression(data) => {
+                let wrap = parent_precedence > 1;
+                if wrap {
+                    self.writer.write("(");
+                }
+                self.writer.write("function");
+                if data.asterisk_token.is_some() {
+                    self.writer.write("*");
+                }
+                if let Some(name) = data.name {
+                    self.writer.write(" ");
+                    self.emit_expression(name, 0)?;
+                } else {
+                    self.writer.write(" ");
+                }
+                self.emit_parameters(&data.parameters)?;
+                self.writer.write(" ");
+                if let Some(expression) = self.single_line_return_expression(data.body)? {
+                    self.writer.write("{ return ");
+                    self.emit_expression(expression, 0)?;
+                    self.writer.write("; }");
+                } else {
+                    self.emit_block(data.body)?;
+                }
+                if wrap {
+                    self.writer.write(")");
+                }
+            }
             NodeData::NoSubstitutionTemplateLiteral(data) => {
                 if self.settings.target < ScriptTarget::Es2015 {
                     write_quoted(&mut self.writer, &data.text);
@@ -3624,6 +3652,30 @@ impl Printer<'_> {
         Ok(())
     }
 
+    fn single_line_return_expression(&self, block: NodeId) -> Result<Option<NodeId>, EmitError> {
+        let node = self.node(block)?;
+        let NodeData::Block(data) = &node.data else {
+            return Err(Self::unsupported(block, node.kind));
+        };
+        let [statement] = data.statements.nodes.as_slice() else {
+            return Ok(None);
+        };
+        if !self.source_text.is_empty() {
+            let start = usize::try_from(node.range.start.get()).unwrap_or(usize::MAX);
+            let end = usize::try_from(node.range.end.get()).unwrap_or(usize::MAX);
+            let Some(text) = self.source_text.get(start..end) else {
+                return Ok(None);
+            };
+            if text.contains('\n') || text.contains('\r') {
+                return Ok(None);
+            }
+        }
+        Ok(match &self.node(*statement)?.data {
+            NodeData::ReturnStatement(data) => data.expression,
+            _ => None,
+        })
+    }
+
     fn identifier_text(&self, id: NodeId) -> Result<&str, EmitError> {
         let node = self.node(id)?;
         if let NodeData::Identifier(data) = &node.data {
@@ -3966,6 +4018,16 @@ mod tests {
         assert_eq!(
             emit("const first = /a[b\\/]c+/giu; const second = /=foo/;"),
             "const first = /a[b\\/]c+/giu;\nconst second = /=foo/;\n"
+        );
+    }
+
+    #[test]
+    fn preserves_function_expressions_and_erases_their_types() {
+        assert_eq!(
+            emit(
+                "const callback = function (value: number): number { return value; }; const result = (function* named() { yield 1; })();"
+            ),
+            "const callback = function (value) { return value; };\nconst result = (function* named() {\n    yield 1;\n})();\n"
         );
     }
 

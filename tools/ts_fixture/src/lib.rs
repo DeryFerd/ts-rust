@@ -376,12 +376,12 @@ pub fn compare_emitted_output_sections(
     let expected = parse_baseline_sections(baseline)
         .into_iter()
         .filter(|(name, _)| is_emitted_section(name))
-        .map(|(name, text)| (normalize_section_name(&name), text))
+        .map(|(name, text)| (normalize_section_name(&name), normalize_newlines(&text)))
         .collect::<BTreeMap<_, _>>();
     let actual = outputs
         .iter()
         .filter(|(name, _)| is_emitted_section(name))
-        .map(|(name, text)| (normalize_section_name(name), text.clone()))
+        .map(|(name, text)| (normalize_section_name(name), normalize_newlines(text)))
         .collect::<BTreeMap<_, _>>();
     let names = expected
         .keys()
@@ -840,6 +840,10 @@ fn normalize_section_name(name: &str) -> String {
         .to_owned()
 }
 
+fn normalize_newlines(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
 /// One virtual source file declared by a fixture.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Unit {
@@ -1180,6 +1184,20 @@ mod tests {
             comparison.differences[2].kind,
             OutputDifferenceKind::Unexpected { .. }
         ));
+    }
+
+    #[test]
+    fn compares_emitted_sections_independent_of_line_endings() {
+        let outputs = BTreeMap::from([(
+            "/case/input.js".into(),
+            "const value = 1;\nconsole.log(value);\n".into(),
+        )]);
+        let baseline = concat!(
+            "//// [input.js] ////\r\n",
+            "const value = 1;\r\n",
+            "console.log(value);\r\n",
+        );
+        assert!(compare_emitted_output_sections(&outputs, baseline).is_match());
     }
 
     #[test]

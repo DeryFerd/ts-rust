@@ -11,10 +11,10 @@ use ts_ast::{
     DoStatementData, ElementAccessExpressionData, EmptyStatementData, EnumDeclarationData,
     EnumMemberData, ExportAssignmentData, ExportDeclarationData, ExportSpecifierData,
     ExpressionStatementData, ExpressionWithTypeArgumentsData, ExternalModuleReferenceData,
-    ForInOrOfStatementData, ForStatementData, FunctionDeclarationData, FunctionTypeNodeData,
-    GetAccessorDeclarationData, HeritageClauseData, IdentifierData, IfStatementData,
-    ImportAttributeData, ImportAttributesData, ImportClauseData, ImportDeclarationData,
-    ImportEqualsDeclarationData, ImportSpecifierData, ImportTypeNodeData,
+    ForInOrOfStatementData, ForStatementData, FunctionDeclarationData, FunctionExpressionData,
+    FunctionTypeNodeData, GetAccessorDeclarationData, HeritageClauseData, IdentifierData,
+    IfStatementData, ImportAttributeData, ImportAttributesData, ImportClauseData,
+    ImportDeclarationData, ImportEqualsDeclarationData, ImportSpecifierData, ImportTypeNodeData,
     IndexSignatureDeclarationData, IndexedAccessTypeNodeData, InferTypeNodeData,
     InterfaceDeclarationData, IntersectionTypeNodeData, JsDocData, JsDocTextData,
     JsDocUnknownTagData, JsxAttributeData, JsxAttributesData, JsxClosingElementData,
@@ -3336,6 +3336,7 @@ impl<'a> Parser<'a> {
             SyntaxKind::SlashToken | SyntaxKind::SlashEqualsToken => {
                 self.parse_regular_expression_literal()
             }
+            SyntaxKind::FunctionKeyword => self.parse_function_expression(),
             SyntaxKind::NoSubstitutionTemplateLiteral => self.parse_template_literal(),
             SyntaxKind::NullKeyword
             | SyntaxKind::TrueKeyword
@@ -4121,6 +4122,47 @@ impl<'a> Parser<'a> {
                 token_flags: TokenFlags::default(),
             })),
             &[],
+        )
+    }
+
+    fn parse_function_expression(&mut self) -> NodeId {
+        let start = self.consume().range.start;
+        let asterisk_token =
+            (self.current.kind == SyntaxKind::AsteriskToken).then(|| self.consume_token_node());
+        let name = (self.current.kind == SyntaxKind::Identifier || self.current.kind.is_keyword())
+            .then(|| self.parse_identifier_name("Expected a function name."));
+        let type_parameters = self.parse_type_parameters();
+        let parameters = self.parse_parameter_list();
+        let return_type = self.parse_optional_type_annotation();
+        let body = self.parse_block();
+        let mut children = Vec::new();
+        children.extend(asterisk_token);
+        children.extend(name);
+        extend_list_children(&mut children, type_parameters.as_ref());
+        children.extend(parameters.nodes.iter().copied());
+        children.extend(return_type);
+        children.push(body);
+        self.alloc_node(
+            SyntaxKind::FunctionExpression,
+            TextRange::new(start, self.node_end(body)),
+            NodeData::FunctionExpression(Box::new(FunctionExpressionData {
+                asterisk_token,
+                body,
+                end_flow_node: None,
+                flow_node: None,
+                full_signature: None,
+                locals: SymbolTable,
+                next_container: None,
+                parameters,
+                return_flow_node: None,
+                symbol: None,
+                type_: return_type,
+                type_parameters,
+                facts: 0,
+                modifiers: None,
+                name,
+            })),
+            &children,
         )
     }
 
@@ -5969,6 +6011,32 @@ mod tests {
     }
 
     #[test]
+    fn parses_named_generator_and_anonymous_function_expressions() {
+        let result = parse_source_file(
+            "const callback = function (value: number): number { return value; }; const generator = function* named() { yield 1; };",
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let statements = source_statements(&result);
+        for statement in statements {
+            let (list, _) = variable_list(&result, *statement);
+            let declaration = declaration_nodes(&result, list)[0];
+            let NodeData::VariableDeclaration(declaration) =
+                &result.arena.get(declaration).unwrap().data
+            else {
+                panic!("expected variable declaration");
+            };
+            assert_eq!(
+                result
+                    .arena
+                    .get(declaration.initializer.unwrap())
+                    .unwrap()
+                    .kind,
+                SyntaxKind::FunctionExpression
+            );
+        }
+    }
+
+    #[test]
     fn parses_jsx_elements_attributes_children_and_expressions() {
         let result = parse_jsx_source_file(
             "const view = <div id=\"x\">hello {name}<span value={1} /></div>;",
@@ -6076,11 +6144,11 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_case_statements_always_make_progress() {
+    fn function_expressions_in_case_statements_make_progress() {
         let result = parse_source_file(
             "switch (x) { case 1: (function() { return x }); break; } const done = 1;",
         );
-        assert!(!result.diagnostics.is_empty());
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
         assert!(result.arena.len() < 100, "unexpected AST growth");
         let statements = source_statements(&result);
         assert_eq!(statements.len(), 2);

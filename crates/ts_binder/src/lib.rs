@@ -579,6 +579,16 @@ impl<'a> Binder<'a> {
                     Some(data.body),
                 );
             }
+            NodeData::FunctionExpression(data) => {
+                self.bind_function_like(
+                    node_id,
+                    scope,
+                    parent_symbol,
+                    data.type_parameters.as_ref(),
+                    &data.parameters.nodes,
+                    Some(data.body),
+                );
+            }
             NodeData::TypeParameterDeclaration(data) => {
                 self.declare_named(
                     scope,
