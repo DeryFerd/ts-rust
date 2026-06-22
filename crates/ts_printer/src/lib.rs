@@ -9266,7 +9266,8 @@ impl Printer<'_> {
         &mut self,
         data: &ts_ast::ObjectLiteralExpressionData,
     ) -> Result<(), EmitError> {
-        self.writer.write("Object.assign({}");
+        self.writer.write("Object.assign(");
+        let mut emitted_argument = false;
         let mut object_open = false;
         let mut properties_in_object = 0_usize;
         for property in &data.properties.nodes {
@@ -9276,14 +9277,21 @@ impl Printer<'_> {
                     self.writer.write(" }");
                     object_open = false;
                 }
+                if !emitted_argument {
+                    self.writer.write("{}");
+                    emitted_argument = true;
+                }
                 self.writer.write(", ");
                 self.emit_expression(spread.expression, 1)?;
                 continue;
             }
             if !object_open {
-                self.writer.write(", ");
+                if emitted_argument {
+                    self.writer.write(", ");
+                }
                 self.writer.write("{ ");
                 object_open = true;
+                emitted_argument = true;
                 properties_in_object = 0;
             }
             if properties_in_object != 0 {
@@ -11026,8 +11034,38 @@ mod tests {
         );
         assert_eq!(
             result.code,
-            "var value = source === null || source === void 0 ? void 0 : source[key];\nvar merged = Object.assign({}, { a: 1 }, extra, { b: 2 });\nvar list = [].concat([], [0], items, [3]);\n"
+            "var value = source === null || source === void 0 ? void 0 : source[key];\nvar merged = Object.assign({ a: 1 }, extra, { b: 2 });\nvar list = [].concat([], [0], items, [3]);\n"
         );
+    }
+
+    #[test]
+    fn downlevel_object_spread_groups_properties_in_source_order() {
+        let source = concat!(
+            "const leading = { before: one(), [computed()]: two(), ...spread(), after: three() };",
+            "const spreadFirst = { ...first, [key()]: value(), plain: after(), ...second(), tail: end() };",
+        );
+        let output = emit_with(source, ScriptTarget::Es2015, ModuleKind::EsNext).code;
+        assert_eq!(
+            output,
+            concat!(
+                "const leading = Object.assign({ before: one(), [computed()]: two() }, spread(), { after: three() });\n",
+                "const spreadFirst = Object.assign({}, first, { [key()]: value(), plain: after() }, second(), { tail: end() });\n",
+            )
+        );
+        for call in [
+            "one()",
+            "computed()",
+            "two()",
+            "spread()",
+            "three()",
+            "key()",
+            "value()",
+            "after()",
+            "second()",
+            "end()",
+        ] {
+            assert_eq!(output.matches(call).count(), 1, "{call}: {output}");
+        }
     }
 
     #[test]
