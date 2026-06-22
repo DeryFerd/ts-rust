@@ -363,6 +363,61 @@ pub fn common_path_prefix(paths: &[&str], case_sensitivity: CaseSensitivity) -> 
 }
 
 #[must_use]
+pub fn directory_path(path: &str) -> String {
+    let path = normalize_slashes(path);
+    let root_len = root_length(&path);
+    let end = path[root_len..]
+        .trim_end_matches('/')
+        .rfind('/')
+        .map_or(root_len, |index| root_len + index);
+    if end == 0 {
+        String::new()
+    } else {
+        path[..end.max(root_len)].to_owned()
+    }
+}
+
+#[must_use]
+pub fn base_file_name(path: &str) -> &str {
+    path.rsplit(['/', '\\']).next().unwrap_or(path)
+}
+
+#[must_use]
+pub fn ensure_trailing_directory_separator(path: &str) -> String {
+    let mut path = normalize_slashes(path);
+    if !path.is_empty() && !path.ends_with('/') {
+        path.push('/');
+    }
+    path
+}
+
+#[must_use]
+pub fn remove_file_extension(path: &str) -> &str {
+    if let Some(extension) = extension_from_path(path) {
+        return &path[..path.len() - extension.as_str().len()];
+    }
+    let file_start = path.rfind(['/', '\\']).map_or(0, |separator| separator + 1);
+    path[file_start..]
+        .rfind('.')
+        .filter(|dot| *dot != 0)
+        .map_or(path, |dot| &path[..file_start + dot])
+}
+
+#[must_use]
+pub fn change_extension(path: &str, extension: &str) -> String {
+    format!("{}{}", remove_file_extension(path), extension)
+}
+
+#[must_use]
+pub fn declaration_emit_extension(path: &str) -> &'static str {
+    match extension_from_path(path) {
+        Some(FileExtension::Mts | FileExtension::Mjs | FileExtension::Dmts) => ".d.mts",
+        Some(FileExtension::Cts | FileExtension::Cjs | FileExtension::Dcts) => ".d.cts",
+        _ => ".d.ts",
+    }
+}
+
+#[must_use]
 pub fn extension_from_path(path: &str) -> Option<FileExtension> {
     EXTENSIONS_LONGEST_FIRST.into_iter().find(|extension| {
         path.len() > extension.as_str().len() && path.ends_with(extension.as_str())
@@ -484,6 +539,22 @@ mod tests {
         assert_eq!(script_kind_from_path("component.TSX"), ScriptKind::Tsx);
         assert_eq!(script_kind_from_path("package.json"), ScriptKind::Json);
         assert_eq!(SUPPORTED_TS_EXTENSIONS.len(), 7);
+    }
+
+    #[test]
+    fn derives_directory_base_and_emit_extensions() {
+        assert_eq!(directory_path("/src/nested/file.ts"), "/src/nested");
+        assert_eq!(directory_path("C:/file.ts"), "C:/");
+        assert_eq!(directory_path("file.ts"), "");
+        assert_eq!(base_file_name(r"C:\src\file.ts"), "file.ts");
+        assert_eq!(ensure_trailing_directory_separator("/src"), "/src/");
+        assert_eq!(remove_file_extension("/src/file.d.mts"), "/src/file");
+        assert_eq!(remove_file_extension("/src/file.custom"), "/src/file");
+        assert_eq!(remove_file_extension("/src/.config"), "/src/.config");
+        assert_eq!(change_extension("/src/file.ts", ".js"), "/src/file.js");
+        assert_eq!(declaration_emit_extension("entry.mts"), ".d.mts");
+        assert_eq!(declaration_emit_extension("entry.cjs"), ".d.cts");
+        assert_eq!(declaration_emit_extension("entry.tsx"), ".d.ts");
     }
 
     #[test]
