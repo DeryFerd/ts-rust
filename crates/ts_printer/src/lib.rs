@@ -1138,6 +1138,13 @@ impl Printer<'_> {
                 self.writer.write(") ");
                 self.emit_embedded(data.statement)?;
             }
+            NodeData::DoStatement(data) => {
+                self.writer.write("do ");
+                self.emit_embedded(data.statement)?;
+                self.writer.write(" while (");
+                self.emit_expression(data.expression, 0)?;
+                self.writer.write(");");
+            }
             NodeData::ForStatement(data) => {
                 self.writer.write("for (");
                 if let Some(initializer) = data.initializer {
@@ -1185,6 +1192,29 @@ impl Printer<'_> {
                 self.writer.write(") ");
                 self.emit_embedded(data.statement)?;
             }
+            NodeData::SwitchStatement(data) => self.emit_switch(data)?,
+            NodeData::TryStatement(data) => self.emit_try(data)?,
+            NodeData::ThrowStatement(data) => {
+                self.writer.write("throw ");
+                self.emit_expression(data.expression, 0)?;
+                self.writer.write(";");
+            }
+            NodeData::BreakStatement(data) => {
+                self.writer.write("break");
+                if let Some(label) = data.label {
+                    self.writer.write(" ");
+                    self.emit_expression(label, 0)?;
+                }
+                self.writer.write(";");
+            }
+            NodeData::ContinueStatement(data) => {
+                self.writer.write("continue");
+                if let Some(label) = data.label {
+                    self.writer.write(" ");
+                    self.emit_expression(label, 0)?;
+                }
+                self.writer.write(";");
+            }
             NodeData::ImportDeclaration(data) => self.emit_import(data)?,
             NodeData::ExportAssignment(data) => {
                 if self.settings.module == ModuleKind::CommonJs {
@@ -1203,6 +1233,68 @@ impl Printer<'_> {
             _ => return Err(Self::unsupported(id, node.kind)),
         }
         self.writer.newline();
+        Ok(())
+    }
+
+    fn emit_switch(&mut self, data: &ts_ast::SwitchStatementData) -> Result<(), EmitError> {
+        self.writer.write("switch (");
+        self.emit_expression(data.expression, 0)?;
+        self.writer.write(") {");
+        self.writer.newline();
+        let block = self.node(data.case_block)?.clone();
+        let NodeData::CaseBlock(block) = &block.data else {
+            return Err(Self::unsupported(data.case_block, block.kind));
+        };
+        self.writer.indent += 1;
+        for clause_id in &block.clauses.nodes {
+            let clause_node = self.node(*clause_id)?.clone();
+            let NodeData::CaseOrDefaultClause(clause) = &clause_node.data else {
+                return Err(Self::unsupported(*clause_id, clause_node.kind));
+            };
+            if clause_node.kind == SyntaxKind::DefaultClause {
+                self.writer.write("default:");
+            } else {
+                self.writer.write("case ");
+                self.emit_expression(clause.expression, 0)?;
+                self.writer.write(":");
+            }
+            self.writer.newline();
+            self.writer.indent += 1;
+            for statement in &clause.statements.nodes {
+                self.emit_statement(*statement)?;
+            }
+            self.writer.indent -= 1;
+        }
+        self.writer.indent -= 1;
+        self.writer.write("}");
+        Ok(())
+    }
+
+    fn emit_try(&mut self, data: &ts_ast::TryStatementData) -> Result<(), EmitError> {
+        self.writer.write("try ");
+        self.emit_block(data.try_block)?;
+        if let Some(catch_id) = data.catch_clause {
+            let catch_node = self.node(catch_id)?.clone();
+            let NodeData::CatchClause(catch) = &catch_node.data else {
+                return Err(Self::unsupported(catch_id, catch_node.kind));
+            };
+            self.writer.write(" catch");
+            if let Some(variable_id) = catch.variable_declaration {
+                let variable_node = self.node(variable_id)?.clone();
+                let NodeData::VariableDeclaration(variable) = &variable_node.data else {
+                    return Err(Self::unsupported(variable_id, variable_node.kind));
+                };
+                self.writer.write(" (");
+                self.emit_expression(variable.name, 0)?;
+                self.writer.write(")");
+            }
+            self.writer.write(" ");
+            self.emit_block(catch.block)?;
+        }
+        if let Some(finally_block) = data.finally_block {
+            self.writer.write(" finally ");
+            self.emit_block(finally_block)?;
+        }
         Ok(())
     }
 
@@ -2547,6 +2639,16 @@ mod tests {
                 "class Counter extends Base implements Shape { value: number = 0; inc(step: number) { value = value + step; } } let i: number = 0; while (i < 2) { i = i + 1; } for (let j: number = 0; j < 2; j = j + 1) { i = i + j; }"
             ),
             "class Counter extends Base {\n  value = 0;\n  inc(step) {\n    value = value + step;\n  }\n}\nlet i = 0;\nwhile (i < 2) {\n  i = i + 1;\n}\nfor (let j = 0; j < 2; j = j + 1) {\n  i = i + j;\n}\n"
+        );
+    }
+
+    #[test]
+    fn prints_switch_try_and_loop_control_statements() {
+        assert_eq!(
+            emit(
+                "let i = 0; do { i++; if (i === 1) continue; } while (i < 2); switch (i) { case 2: i = 3; break; default: i = 4; } try { throw i; } catch (error: unknown) { i = 5; } finally { i = 6; }"
+            ),
+            "let i = 0;\ndo {\n  i++;\n  if (i === 1) {\n    continue;\n  }\n} while (i < 2);\nswitch (i) {\n  case 2:\n    i = 3;\n    break;\n  default:\n    i = 4;\n}\ntry {\n  throw i;\n} catch (error) {\n  i = 5;\n} finally {\n  i = 6;\n}\n"
         );
     }
 
