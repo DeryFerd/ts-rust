@@ -300,8 +300,14 @@ pub fn emit_source_file_with_context(
     if let Some(start) = first_statement_start {
         if settings.module == ModuleKind::CommonJs && is_external_module {
             printer.emit_leading_pinned_source_comments(start);
-        } else {
+        } else if data.statements.nodes.first().is_some_and(|statement| {
+            arena
+                .get(*statement)
+                .is_some_and(|node| printer.statement_emits_runtime(*statement, node))
+        }) {
             printer.emit_leading_source_comments(start);
+        } else {
+            printer.emit_leading_pinned_source_comments(start);
         }
     }
     if settings.target < ScriptTarget::Es2015 && source_needs_extends_helper(arena) {
@@ -3050,7 +3056,9 @@ impl Printer<'_> {
                 if statement_emits_javascript(self.arena, node) {
                     self.emit_source_comments_between(previous_end, node.range.start.get());
                 }
-                if self.statement_emits_runtime(*statement, node) {
+                if self.statement_emits_runtime(*statement, node)
+                    && !self.import_runtime_meanings.contains_key(statement)
+                {
                     self.emit_reference_directives_between(
                         reference_owner_start,
                         node.range.start.get(),
@@ -3438,7 +3446,9 @@ impl Printer<'_> {
                     .map_or(bytes.len(), |offset| index + offset);
                 let comment = &prefix[index..comment_end];
                 let comment_range = (index, comment_end);
-                let pinned = comment.starts_with("//!") || comment.contains("@license");
+                let pinned = comment.starts_with("//!")
+                    || comment.contains("@license")
+                    || is_amd_dependency_directive(comment);
                 if (!pinned_only || pinned)
                     && !is_reference_directive(comment)
                     && !excluded.iter().any(|(start, end)| {
@@ -8284,6 +8294,18 @@ fn is_reference_directive(comment: &str) -> bool {
         .is_some_and(|character| character.is_whitespace() || matches!(character, '/' | '>'))
 }
 
+fn is_amd_dependency_directive(comment: &str) -> bool {
+    let Some(directive) = comment.strip_prefix("///") else {
+        return false;
+    };
+    let Some(rest) = directive.trim_start().strip_prefix("<amd-dependency") else {
+        return false;
+    };
+    rest.chars()
+        .next()
+        .is_some_and(|character| character.is_whitespace() || matches!(character, '/' | '>'))
+}
+
 fn write_quoted(writer: &mut Writer, text: &str) {
     write_quoted_with(writer, text, '"');
 }
@@ -9100,6 +9122,69 @@ mod tests {
                 "    runtime.run();\n",
                 "});\n",
             )
+        );
+    }
+
+    #[test]
+    fn drops_compiler_resolved_reference_directives_from_amd_output() {
+        let source =
+            "///<reference path='ambient.ts' />\nimport A = require('M');\nvar c = new A();";
+        let parsed = parse_source_file(source);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let NodeData::SourceFile(file) = &parsed.arena.get(parsed.source_file).unwrap().data else {
+            panic!("expected source file");
+        };
+        let import_meanings = BTreeMap::from([(file.statements.nodes[0], true)]);
+        let enum_values = BTreeMap::new();
+        assert_eq!(
+            emit_source_file_with_context(
+                &parsed.arena,
+                parsed.source_file,
+                "input.ts",
+                source,
+                PrinterSettings {
+                    always_strict: false,
+                    target: ScriptTarget::Es2015,
+                    module: ModuleKind::Amd,
+                    jsx: JsxEmit::Preserve,
+                    emit_javascript: true,
+                    emit_declarations: false,
+                    source_map: false,
+                    inline_source_map: false,
+                },
+                &EmitContext {
+                    bindings: &bindings,
+                    amd_module_name: None,
+                    amd_dependencies: &[],
+                    enum_member_values: &enum_values,
+                    enum_access_values: &enum_values,
+                    import_runtime_meanings: &import_meanings,
+                    preserve_const_enums: false,
+                    inline_const_enums: false,
+                },
+            )
+            .unwrap()
+            .code,
+            "define([\"require\", \"exports\", \"M\"], function (require, exports, A) {\n    \"use strict\";\n    Object.defineProperty(exports, \"__esModule\", { value: true });\n    var c = new A();\n});\n"
+        );
+    }
+
+    #[test]
+    fn routes_commonjs_amd_dependency_before_the_generated_prologue() {
+        let source =
+            "///<amd-dependency path='bar' name='b'/>\nimport m1 = require(\"m2\");\nm1.f();";
+        assert_eq!(
+            emit_with(source, ScriptTarget::Es2015, ModuleKind::CommonJs).code,
+            "\"use strict\";\n///<amd-dependency path='bar' name='b'/>\nObject.defineProperty(exports, \"__esModule\", { value: true });\nconst m1 = require(\"m2\");\nm1.f();\n"
+        );
+    }
+
+    #[test]
+    fn drops_an_ordinary_leading_comment_owned_by_an_erased_statement() {
+        let source = "// target: es5\ntype Hidden = { value: string };\nfunction visible() { }";
+        assert_eq!(
+            emit_always_strict(source, ScriptTarget::Es2015, ModuleKind::None).code,
+            "\"use strict\";\nfunction visible() { }\n"
         );
     }
 
