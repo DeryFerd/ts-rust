@@ -8,12 +8,12 @@ use ts_ast::{
     ClassDeclarationData, ClassStaticBlockDeclarationData, ComputedPropertyNameData,
     ConditionalExpressionData, ConditionalTypeNodeData, ConstructSignatureDeclarationData,
     ConstructorTypeNodeData, ContinueStatementData, DebuggerStatementData, DecoratorData,
-    DoStatementData, ElementAccessExpressionData, EmptyStatementData, EnumDeclarationData,
-    EnumMemberData, ExportAssignmentData, ExportDeclarationData, ExportSpecifierData,
-    ExpressionStatementData, ExpressionWithTypeArgumentsData, ExternalModuleReferenceData,
-    ForInOrOfStatementData, ForStatementData, FunctionDeclarationData, FunctionExpressionData,
-    FunctionTypeNodeData, GetAccessorDeclarationData, HeritageClauseData, IdentifierData,
-    IfStatementData, ImportAttributeData, ImportAttributesData, ImportClauseData,
+    DeleteExpressionData, DoStatementData, ElementAccessExpressionData, EmptyStatementData,
+    EnumDeclarationData, EnumMemberData, ExportAssignmentData, ExportDeclarationData,
+    ExportSpecifierData, ExpressionStatementData, ExpressionWithTypeArgumentsData,
+    ExternalModuleReferenceData, ForInOrOfStatementData, ForStatementData, FunctionDeclarationData,
+    FunctionExpressionData, FunctionTypeNodeData, GetAccessorDeclarationData, HeritageClauseData,
+    IdentifierData, IfStatementData, ImportAttributeData, ImportAttributesData, ImportClauseData,
     ImportDeclarationData, ImportEqualsDeclarationData, ImportSpecifierData, ImportTypeNodeData,
     IndexSignatureDeclarationData, IndexedAccessTypeNodeData, InferTypeNodeData,
     InterfaceDeclarationData, IntersectionTypeNodeData, JsDocData, JsDocTextData,
@@ -2899,6 +2899,16 @@ impl<'a> Parser<'a> {
         if self.current.kind == SyntaxKind::YieldKeyword {
             return self.parse_yield_expression();
         }
+        if self.current.kind == SyntaxKind::DeleteKeyword {
+            let start = self.consume().range.start;
+            let expression = self.parse_postfix_expression();
+            return self.alloc_node(
+                SyntaxKind::DeleteExpression,
+                TextRange::new(start, self.node_end(expression)),
+                NodeData::DeleteExpression(Box::new(DeleteExpressionData { expression })),
+                &[expression],
+            );
+        }
         if is_prefix_operator(self.current.kind) {
             let operator_token = self.consume();
             let operator = operator_token.kind;
@@ -3344,7 +3354,9 @@ impl<'a> Parser<'a> {
             | SyntaxKind::UndefinedKeyword
             | SyntaxKind::ThisKeyword
             | SyntaxKind::SuperKeyword => self.parse_keyword_expression(),
-            kind if kind.is_keyword_type() => self.parse_identifier_name("Expected an expression."),
+            kind if is_contextual_keyword(kind) => {
+                self.parse_identifier_name("Expected an expression.")
+            }
             SyntaxKind::OpenParenToken => self.parse_parenthesized_expression(),
             SyntaxKind::OpenBracketToken => self.parse_array_literal(),
             SyntaxKind::OpenBraceToken => self.parse_object_literal(),
@@ -5141,6 +5153,11 @@ fn is_expression_terminator(kind: SyntaxKind) -> bool {
     )
 }
 
+fn is_contextual_keyword(kind: SyntaxKind) -> bool {
+    (kind as u16) >= (SyntaxKind::AbstractKeyword as u16)
+        && (kind as u16) <= (SyntaxKind::DeferKeyword as u16)
+}
+
 fn is_prefix_operator(kind: SyntaxKind) -> bool {
     matches!(
         kind,
@@ -6041,9 +6058,9 @@ mod tests {
     }
 
     #[test]
-    fn parses_keyword_type_spelling_as_a_value_identifier() {
+    fn parses_contextual_keyword_spellings_as_value_identifiers() {
         let result = parse_source_file(
-            "function read(symbol: symbol) { if (!symbol) return; return symbol; }",
+            "function read(symbol: symbol, type: string) { if (!symbol) return; if (!type) return; return symbol; }",
         );
         assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
         let statements = source_statements(&result);
@@ -6069,6 +6086,27 @@ mod tests {
             result.arena.get(condition.operand).unwrap().kind,
             SyntaxKind::Identifier
         );
+    }
+
+    #[test]
+    fn parses_delete_expressions() {
+        let result = parse_source_file("delete value.optional; delete value['indexed'];");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let delete_expressions = result
+            .arena
+            .iter()
+            .filter(|(_, node)| node.kind == SyntaxKind::DeleteExpression)
+            .collect::<Vec<_>>();
+        assert_eq!(delete_expressions.len(), 2);
+        for (_, node) in delete_expressions {
+            let NodeData::DeleteExpression(delete) = &node.data else {
+                panic!("expected delete expression");
+            };
+            assert!(matches!(
+                result.arena.get(delete.expression).unwrap().kind,
+                SyntaxKind::PropertyAccessExpression | SyntaxKind::ElementAccessExpression
+            ));
+        }
     }
 
     #[test]
