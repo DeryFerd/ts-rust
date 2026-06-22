@@ -983,6 +983,15 @@ fn module_specifiers(parse: &ParseResult) -> Vec<(String, TextRange)> {
             NodeData::ImportDeclaration(data) => {
                 string_literal(&parse.arena, data.module_specifier)
             }
+            NodeData::ImportEqualsDeclaration(data) => parse
+                .arena
+                .get(data.module_reference)
+                .and_then(|reference| match &reference.data {
+                    NodeData::ExternalModuleReference(reference) => {
+                        string_literal(&parse.arena, reference.expression)
+                    }
+                    _ => None,
+                }),
             NodeData::ExportDeclaration(data) => data
                 .module_specifier
                 .and_then(|specifier| string_literal(&parse.arena, specifier)),
@@ -1490,6 +1499,39 @@ mod tests {
                 .diagnostics()
                 .iter()
                 .any(|diagnostic| diagnostic.code == Some(2307))
+        );
+    }
+
+    #[test]
+    fn resolves_external_import_equals_module_references() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/main.ts",
+            concat!(
+                "import present = require('./dep');\n",
+                "import nested = present.value;\n",
+                "import missing = require('./missing');\n",
+                "present.value; nested; missing;\n",
+            ),
+        )
+        .unwrap();
+        fs.write_file("/project/dep.ts", "export const value = 1;")
+            .unwrap();
+
+        let program = Program::new_with_module_resolution(
+            &fs,
+            "/project",
+            &["main.ts".to_owned()],
+            ts_module::ResolutionOptions::default(),
+        );
+        assert!(program.source_file("/project/dep.ts").is_some());
+        assert_eq!(
+            program
+                .diagnostics()
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Some(2307))
+                .count(),
+            1
         );
     }
 

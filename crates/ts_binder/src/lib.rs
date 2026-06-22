@@ -226,6 +226,33 @@ impl BindResult {
     pub fn scope(&self, id: ScopeId) -> Option<&Scope> {
         self.scopes.get(id.index())
     }
+
+    /// Resolves a name using the lexical scope containing `node`.
+    #[must_use]
+    pub fn resolve_name_at(&self, node: NodeId, name: &str) -> Option<SymbolId> {
+        if let Some(symbol) = self.node_symbols.get(&node).copied()
+            && self
+                .symbols
+                .get(symbol)
+                .is_some_and(|symbol| symbol.name == name)
+        {
+            return Some(symbol);
+        }
+        let container = self.containers.get(&node).copied().unwrap_or(node);
+        let mut scope = self.node_scopes.get(&container).copied().or_else(|| {
+            self.scopes
+                .iter()
+                .find(|scope| scope.owner == container)
+                .map(|scope| scope.id)
+        })?;
+        loop {
+            let current = self.scope(scope)?;
+            if let Some(symbol) = current.symbols.get(name) {
+                return Some(symbol);
+            }
+            scope = current.parent?;
+        }
+    }
 }
 
 /// Binds declarations reachable from one source-file node.
@@ -621,7 +648,14 @@ impl<'a> Binder<'a> {
                 self.bind_node(data.module_specifier, scope, container, parent_symbol);
             }
             NodeData::ImportEqualsDeclaration(data) => {
-                self.declare_named(scope, node_id, data.name, SymbolFlags::ALIAS, parent_symbol);
+                self.declare_and_export(
+                    scope,
+                    node_id,
+                    data.name,
+                    SymbolFlags::ALIAS,
+                    parent_symbol,
+                );
+                self.bind_node(data.module_reference, scope, container, parent_symbol);
             }
             NodeData::ExportDeclaration(data) => {
                 if let Some(clause) = data.export_clause {
@@ -1106,6 +1140,7 @@ impl<'a> Binder<'a> {
             Some(NodeData::InterfaceDeclaration(data)) => data.modifiers.as_ref(),
             Some(NodeData::TypeAliasDeclaration(data)) => data.modifiers.as_ref(),
             Some(NodeData::EnumDeclaration(data)) => data.modifiers.as_ref(),
+            Some(NodeData::ImportEqualsDeclaration(data)) => data.modifiers.as_ref(),
             Some(NodeData::ModuleDeclaration(data)) => data.modifiers.as_ref(),
             Some(NodeData::VariableStatement(data)) => data.modifiers.as_ref(),
             _ => None,
@@ -1870,6 +1905,95 @@ mod tests {
             .unwrap();
         assert!(ordinary.flags.contains(SymbolFlags::REGULAR_ENUM));
         assert!(!ordinary.flags.contains(SymbolFlags::CONST_ENUM));
+    }
+
+    #[test]
+    fn exports_import_equals_and_resolves_qualified_references() {
+        let parsed = parse_source_file(
+            r#"
+                import { alias } from "foo";
+                export import cls2 = alias.Class;
+                namespace M {
+                    export import cls = alias.Class;
+                    let value = cls;
+                }
+            "#,
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let result = bind_source_file(&parsed.arena, parsed.source_file);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let root = result.root_scope().unwrap();
+        let alias = root.symbols.get("alias").unwrap();
+        let cls2 = root.symbols.get("cls2").unwrap();
+        assert_eq!(result.exports.get("cls2"), Some(cls2));
+
+        let NodeData::SourceFile(source) = &parsed.arena.get(parsed.source_file).unwrap().data
+        else {
+            panic!("expected source file");
+        };
+        let NodeData::ImportEqualsDeclaration(top_alias) =
+            &parsed.arena.get(source.statements.nodes[1]).unwrap().data
+        else {
+            panic!("expected top-level import-equals declaration");
+        };
+        let NodeData::QualifiedName(top_reference) =
+            &parsed.arena.get(top_alias.module_reference).unwrap().data
+        else {
+            panic!("expected qualified module reference");
+        };
+        assert_eq!(
+            result.resolve_name_at(top_reference.left, "alias"),
+            Some(alias)
+        );
+
+        let NodeData::ModuleDeclaration(module) =
+            &parsed.arena.get(source.statements.nodes[2]).unwrap().data
+        else {
+            panic!("expected namespace");
+        };
+        let module_symbol = result.symbols.get(root.symbols.get("M").unwrap()).unwrap();
+        let namespace_alias = module_symbol.members.get("cls").unwrap();
+        let NodeData::ModuleBlock(block) = &parsed.arena.get(module.body.unwrap()).unwrap().data
+        else {
+            panic!("expected namespace block");
+        };
+        let NodeData::ImportEqualsDeclaration(nested_alias) =
+            &parsed.arena.get(block.statements.nodes[0]).unwrap().data
+        else {
+            panic!("expected namespace import-equals declaration");
+        };
+        let NodeData::QualifiedName(nested_reference) = &parsed
+            .arena
+            .get(nested_alias.module_reference)
+            .unwrap()
+            .data
+        else {
+            panic!("expected qualified namespace module reference");
+        };
+        assert_eq!(
+            result.resolve_name_at(nested_reference.left, "alias"),
+            Some(alias)
+        );
+        let NodeData::VariableStatement(statement) =
+            &parsed.arena.get(block.statements.nodes[1]).unwrap().data
+        else {
+            panic!("expected namespace variable");
+        };
+        let NodeData::VariableDeclarationList(list) =
+            &parsed.arena.get(statement.declaration_list).unwrap().data
+        else {
+            panic!("expected declaration list");
+        };
+        let NodeData::VariableDeclaration(variable) =
+            &parsed.arena.get(list.declarations.nodes[0]).unwrap().data
+        else {
+            panic!("expected variable declaration");
+        };
+        let initializer = variable.initializer.unwrap();
+        assert_eq!(
+            result.resolve_name_at(initializer, "cls"),
+            Some(namespace_alias)
+        );
     }
 
     #[test]

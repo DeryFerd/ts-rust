@@ -2255,6 +2255,7 @@ impl<'a> Parser<'a> {
                 NodeData::InterfaceDeclaration(data) => data.modifiers.clone(),
                 NodeData::TypeAliasDeclaration(data) => data.modifiers.clone(),
                 NodeData::EnumDeclaration(data) => data.modifiers.clone(),
+                NodeData::ImportEqualsDeclaration(data) => data.modifiers.clone(),
                 NodeData::VariableStatement(data) => data.modifiers.clone(),
                 NodeData::ModuleDeclaration(data) => data.modifiers.clone(),
                 _ => None,
@@ -2277,6 +2278,9 @@ impl<'a> Parser<'a> {
                 NodeData::InterfaceDeclaration(data) => data.modifiers = Some(modifiers.clone()),
                 NodeData::TypeAliasDeclaration(data) => data.modifiers = Some(modifiers.clone()),
                 NodeData::EnumDeclaration(data) => data.modifiers = Some(modifiers.clone()),
+                NodeData::ImportEqualsDeclaration(data) => {
+                    data.modifiers = Some(modifiers.clone());
+                }
                 NodeData::VariableStatement(data) => data.modifiers = Some(modifiers.clone()),
                 NodeData::ModuleDeclaration(data) => data.modifiers = Some(modifiers.clone()),
                 _ => self.diagnostics.push(parser_diagnostic(
@@ -2597,6 +2601,7 @@ impl<'a> Parser<'a> {
                 | SyntaxKind::VarKeyword
                 | SyntaxKind::LetKeyword
                 | SyntaxKind::ConstKeyword
+                | SyntaxKind::ImportKeyword
                 | SyntaxKind::DeclareKeyword
                 | SyntaxKind::AbstractKeyword
                 | SyntaxKind::AsyncKeyword
@@ -6186,6 +6191,52 @@ mod tests {
             };
             assert!(has_export);
         }
+    }
+
+    #[test]
+    fn parses_exported_import_equals_declarations() {
+        let result = parse_source_file(
+            r#"
+                import alias = require("foo");
+                export import cls2 = alias.Class;
+                namespace M { export import cls = alias.Class; }
+            "#,
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let statements = source_statements(&result);
+
+        let assert_exported_alias = |declaration: NodeId| {
+            let NodeData::ImportEqualsDeclaration(data) =
+                &result.arena.get(declaration).unwrap().data
+            else {
+                panic!("expected import-equals declaration");
+            };
+            let modifiers = data.modifiers.as_ref().unwrap();
+            assert_eq!(modifiers.list.nodes.len(), 1);
+            assert_eq!(
+                result.arena.get(modifiers.list.nodes[0]).unwrap().kind,
+                SyntaxKind::ExportKeyword
+            );
+            assert_eq!(
+                result.arena.get(modifiers.list.nodes[0]).unwrap().parent,
+                Some(declaration)
+            );
+            assert_eq!(
+                result.arena.get(data.module_reference).unwrap().kind,
+                SyntaxKind::QualifiedName
+            );
+        };
+
+        assert_exported_alias(statements[1]);
+        let NodeData::ModuleDeclaration(module) = &result.arena.get(statements[2]).unwrap().data
+        else {
+            panic!("expected namespace declaration");
+        };
+        let NodeData::ModuleBlock(block) = &result.arena.get(module.body.unwrap()).unwrap().data
+        else {
+            panic!("expected namespace block");
+        };
+        assert_exported_alias(block.statements.nodes[0]);
     }
 
     #[test]
