@@ -633,21 +633,16 @@ impl<'a> ProgramChecker<'a> {
                 if clause.phase_modifier == Some(SyntaxKind::TypeKeyword) {
                     return Some(false);
                 }
-                let target_source = self.sources.get(target)?;
                 let mut has_value = clause.name.is_some_and(|_| {
                     exports.get("default").is_some_and(|symbol| {
-                        Self::symbol_has_runtime_value(target_source, *symbol, &mut HashSet::new())
+                        self.symbol_has_runtime_value(target, *symbol, &mut HashSet::new())
                     })
                 });
                 if let Some(bindings) = clause.named_bindings {
                     match &source.arena.get(bindings)?.data {
                         NodeData::NamespaceImport(_) => {
                             has_value |= exports.values().any(|symbol| {
-                                Self::symbol_has_runtime_value(
-                                    target_source,
-                                    *symbol,
-                                    &mut HashSet::new(),
-                                )
+                                self.symbol_has_runtime_value(target, *symbol, &mut HashSet::new())
                             });
                         }
                         NodeData::NamedImports(imports) => {
@@ -665,8 +660,8 @@ impl<'a> ProgramChecker<'a> {
                                     return false;
                                 };
                                 exports.get(name).is_some_and(|symbol| {
-                                    Self::symbol_has_runtime_value(
-                                        target_source,
+                                    self.symbol_has_runtime_value(
+                                        target,
                                         *symbol,
                                         &mut HashSet::new(),
                                     )
@@ -687,25 +682,14 @@ impl<'a> ProgramChecker<'a> {
                 {
                     let target = source.resolved_modules.get(specifier).copied()?;
                     let exports = self.resolved_module_export_symbols(target, specifier);
-                    let target_source = self.sources.get(target)?;
                     let symbol = exports.get("export=").copied();
                     return Some(symbol.map_or_else(
                         || {
                             exports.values().any(|symbol| {
-                                Self::symbol_has_runtime_value(
-                                    target_source,
-                                    *symbol,
-                                    &mut HashSet::new(),
-                                )
+                                self.symbol_has_runtime_value(target, *symbol, &mut HashSet::new())
                             })
                         },
-                        |symbol| {
-                            Self::symbol_has_runtime_value(
-                                target_source,
-                                symbol,
-                                &mut HashSet::new(),
-                            )
-                        },
+                        |symbol| self.symbol_has_runtime_value(target, symbol, &mut HashSet::new()),
                     ));
                 }
                 None
@@ -733,15 +717,19 @@ impl<'a> ProgramChecker<'a> {
     }
 
     fn symbol_has_runtime_value(
-        source: &ProgramSource<'_>,
+        &self,
+        source_index: usize,
         symbol: SymbolId,
-        visited: &mut HashSet<SymbolId>,
+        visited: &mut HashSet<(usize, SymbolId)>,
     ) -> bool {
+        let Some(source) = self.sources.get(source_index) else {
+            return true;
+        };
         let Some(symbol) = source.bindings.symbols.get(symbol) else {
             return true;
         };
         let target = symbol.target.unwrap_or(symbol.id);
-        if !visited.insert(target) {
+        if !visited.insert((source_index, target)) {
             return false;
         }
         let Some(symbol) = source.bindings.symbols.get(target) else {
@@ -764,23 +752,98 @@ impl<'a> ProgramChecker<'a> {
             return true;
         }
         for declaration in &symbol.declarations {
+            if let Some(has_value) =
+                self.imported_alias_has_runtime_value(source_index, *declaration, visited)
+                && has_value
+            {
+                return true;
+            }
+        }
+        for declaration in &symbol.declarations {
             let Some(NodeData::ExportAssignment(assignment)) =
                 source.arena.get(*declaration).map(|node| &node.data)
             else {
                 continue;
             };
             if let Some(target) = Self::resolve_entity_symbol(source, assignment.expression) {
-                if Self::symbol_has_runtime_value(source, target, visited) {
+                if self.symbol_has_runtime_value(source_index, target, visited) {
                     return true;
                 }
             } else {
                 return true;
             }
         }
-        symbol
-            .members
-            .iter()
-            .any(|(_, member)| Self::symbol_has_runtime_value(source, member, &mut visited.clone()))
+        symbol.members.iter().any(|(_, member)| {
+            self.symbol_has_runtime_value(source_index, member, &mut visited.clone())
+        })
+    }
+
+    fn imported_alias_has_runtime_value(
+        &self,
+        source_index: usize,
+        declaration: NodeId,
+        visited: &mut HashSet<(usize, SymbolId)>,
+    ) -> Option<bool> {
+        let source = self.sources.get(source_index)?;
+        let (imported_name, namespace, explicitly_type_only) =
+            match &source.arena.get(declaration)?.data {
+                NodeData::ImportClause(clause) => (
+                    Some("default".to_owned()),
+                    false,
+                    clause.phase_modifier == Some(SyntaxKind::TypeKeyword),
+                ),
+                NodeData::ImportSpecifier(specifier) => {
+                    let imported = specifier.property_name.unwrap_or(specifier.name);
+                    (
+                        identifier_text(source.arena, imported).map(str::to_owned),
+                        false,
+                        specifier.is_type_only,
+                    )
+                }
+                NodeData::NamespaceImport(_) => (None, true, false),
+                _ => return None,
+            };
+        if explicitly_type_only {
+            return Some(false);
+        }
+        let import_declaration = Self::containing_import_declaration(source.arena, declaration)?;
+        let NodeData::ImportDeclaration(import) = &source.arena.get(import_declaration)?.data
+        else {
+            return None;
+        };
+        if import.import_clause.is_some_and(|clause| {
+            matches!(
+                source.arena.get(clause).map(|node| &node.data),
+                Some(NodeData::ImportClause(clause))
+                    if clause.phase_modifier == Some(SyntaxKind::TypeKeyword)
+            )
+        }) {
+            return Some(false);
+        }
+        let specifier = string_literal_text(source.arena, import.module_specifier)?;
+        let target = source.resolved_modules.get(specifier).copied()?;
+        let exports = self.resolved_module_export_symbols(target, specifier);
+        if namespace {
+            return Some(exports.values().any(|symbol| {
+                self.symbol_has_runtime_value(target, *symbol, &mut visited.clone())
+            }));
+        }
+        let symbol = exports.get(imported_name.as_deref()?)?;
+        Some(self.symbol_has_runtime_value(target, *symbol, visited))
+    }
+
+    fn containing_import_declaration(arena: &NodeArena, node: NodeId) -> Option<NodeId> {
+        let mut current = node;
+        while let Some(parent) = arena.get(current).and_then(|node| node.parent) {
+            if matches!(
+                arena.get(parent).map(|node| &node.data),
+                Some(NodeData::ImportDeclaration(_))
+            ) {
+                return Some(parent);
+            }
+            current = parent;
+        }
+        None
     }
 
     fn has_modifier(
@@ -9262,6 +9325,133 @@ mod tests {
         assert_eq!(meanings.get(&source.statements.nodes[1]), Some(&true));
         assert!(!meanings.contains_key(&source.statements.nodes[2]));
         assert_eq!(meanings.get(&source.statements.nodes[3]), Some(&true));
+    }
+
+    #[test]
+    fn follows_runtime_meaning_through_merged_default_reexports() {
+        let b = parse_source_file(
+            "export const zzz = 123; export default zzz; export interface TypeOnly {}",
+        );
+        let a = parse_source_file(
+            r#"
+                export default interface zzz { x: string; }
+                import zzz from "./b";
+                const x: zzz = { x: "" };
+                zzz;
+                export default zzz;
+            "#,
+        );
+        let index = parse_source_file(
+            r#"
+                import zzz from "./a";
+                import originalZZZ from "./b";
+                import { TypeOnly } from "./b";
+                zzz;
+                originalZZZ;
+            "#,
+        );
+        assert!(b.diagnostics.is_empty(), "{:?}", b.diagnostics);
+        assert!(a.diagnostics.is_empty(), "{:?}", a.diagnostics);
+        assert!(index.diagnostics.is_empty(), "{:?}", index.diagnostics);
+        let b_bindings = bind_source_file(&b.arena, b.source_file);
+        let a_bindings = bind_source_file(&a.arena, a.source_file);
+        let index_bindings = bind_source_file(&index.arena, index.source_file);
+        let no_modules = BTreeMap::new();
+        let a_modules = BTreeMap::from([("./b".into(), 0)]);
+        let index_modules = BTreeMap::from([("./a".into(), 1), ("./b".into(), 0)]);
+        let checked = check_program(&[
+            ProgramSource {
+                arena: &b.arena,
+                source_file: b.source_file,
+                bindings: &b_bindings,
+                resolved_modules: &no_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+            ProgramSource {
+                arena: &a.arena,
+                source_file: a.source_file,
+                bindings: &a_bindings,
+                resolved_modules: &a_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+            ProgramSource {
+                arena: &index.arena,
+                source_file: index.source_file,
+                bindings: &index_bindings,
+                resolved_modules: &index_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+        ]);
+        let NodeData::SourceFile(a_source) = &a.arena.get(a.source_file).unwrap().data else {
+            panic!("expected source file");
+        };
+        assert_eq!(
+            checked.files[1]
+                .import_runtime_meanings
+                .get(&a_source.statements.nodes[1]),
+            Some(&true)
+        );
+        let NodeData::SourceFile(index_source) = &index.arena.get(index.source_file).unwrap().data
+        else {
+            panic!("expected source file");
+        };
+        let meanings = &checked.files[2].import_runtime_meanings;
+        assert_eq!(meanings.get(&index_source.statements.nodes[0]), Some(&true));
+        assert_eq!(meanings.get(&index_source.statements.nodes[1]), Some(&true));
+        assert_eq!(
+            meanings.get(&index_source.statements.nodes[2]),
+            Some(&false)
+        );
+    }
+
+    #[test]
+    fn resolves_cyclic_default_reexports_without_runtime_value() {
+        let a = parse_source_file("import value from './b'; export default value; value;");
+        let b = parse_source_file("import value from './a'; export default value; value;");
+        assert!(a.diagnostics.is_empty(), "{:?}", a.diagnostics);
+        assert!(b.diagnostics.is_empty(), "{:?}", b.diagnostics);
+        let a_bindings = bind_source_file(&a.arena, a.source_file);
+        let b_bindings = bind_source_file(&b.arena, b.source_file);
+        let a_modules = BTreeMap::from([("./b".into(), 1)]);
+        let b_modules = BTreeMap::from([("./a".into(), 0)]);
+        let checked = check_program(&[
+            ProgramSource {
+                arena: &a.arena,
+                source_file: a.source_file,
+                bindings: &a_bindings,
+                resolved_modules: &a_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+            ProgramSource {
+                arena: &b.arena,
+                source_file: b.source_file,
+                bindings: &b_bindings,
+                resolved_modules: &b_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+        ]);
+        for (source, result) in [&a, &b].into_iter().zip(&checked.files) {
+            let NodeData::SourceFile(file) = &source.arena.get(source.source_file).unwrap().data
+            else {
+                panic!("expected source file");
+            };
+            assert_eq!(
+                result
+                    .import_runtime_meanings
+                    .get(&file.statements.nodes[0]),
+                Some(&false)
+            );
+        }
     }
 
     #[test]
