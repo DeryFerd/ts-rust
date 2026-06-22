@@ -321,11 +321,22 @@ pub fn check_source_file(
     Checker::new(arena, bindings).check(source_file)
 }
 
+#[must_use]
+pub fn empty_check_result() -> CheckResult {
+    CheckResult {
+        types: TypeArena::new(),
+        symbol_types: HashMap::new(),
+        node_types: BTreeMap::new(),
+        diagnostics: Vec::new(),
+    }
+}
+
 pub struct ProgramSource<'a> {
     pub arena: &'a NodeArena,
     pub source_file: NodeId,
     pub bindings: &'a BindResult,
     pub resolved_modules: &'a BTreeMap<String, usize>,
+    pub is_default_library: bool,
 }
 
 #[derive(Debug)]
@@ -338,7 +349,7 @@ pub fn check_program(sources: &[ProgramSource<'_>]) -> ProgramCheckResult {
     ProgramChecker::new(sources).check()
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 enum TypeDescriptor {
     Any,
     Unknown,
@@ -386,7 +397,13 @@ impl<'a> ProgramChecker<'a> {
         let preliminary = self
             .sources
             .iter()
-            .map(|source| check_source_file(source.arena, source.source_file, source.bindings))
+            .map(|source| {
+                if source.is_default_library {
+                    empty_check_result()
+                } else {
+                    check_source_file(source.arena, source.source_file, source.bindings)
+                }
+            })
             .collect::<Vec<_>>();
         let exports = self
             .sources
@@ -396,11 +413,18 @@ impl<'a> ProgramChecker<'a> {
             .collect::<Vec<_>>();
         let (globals, duplicate_globals) = self.globals(&preliminary);
         let mut files = Vec::with_capacity(self.sources.len());
-        for source in self.sources {
+        for (file_index, source) in self.sources.iter().enumerate() {
             let (external_symbols, mut import_diagnostics) = Self::imports(source, &exports);
-            let mut result = Checker::new(source.arena, source.bindings)
-                .with_environment(external_symbols, globals.clone())
-                .check(source.source_file);
+            let mut result = if source.is_default_library {
+                preliminary[file_index].clone()
+            } else {
+                Checker::new(source.arena, source.bindings)
+                    .with_environment(external_symbols, globals.clone())
+                    .check(source.source_file)
+            };
+            if source.is_default_library {
+                result.diagnostics.clear();
+            }
             result.diagnostics.append(&mut import_diagnostics);
             files.push(result);
         }
@@ -444,8 +468,12 @@ impl<'a> ProgramChecker<'a> {
                 let Some(symbol) = source.bindings.symbols.get(symbol_id) else {
                     continue;
                 };
-                if let Some((_, existing_flags)) = declarations.get(name) {
-                    if !global_declarations_merge(*existing_flags, symbol.flags) {
+                if let Some((existing_file, existing_flags)) = declarations.get(name) {
+                    let both_default_libraries = source.is_default_library
+                        && self.sources[*existing_file].is_default_library;
+                    if !both_default_libraries
+                        && !global_declarations_merge(*existing_flags, symbol.flags)
+                    {
                         let code = if existing_flags
                             .intersects(ts_binder::SymbolFlags::BLOCK_SCOPED_VARIABLE)
                             || symbol
@@ -460,9 +488,22 @@ impl<'a> ProgramChecker<'a> {
                             duplicates.push((file_index, *declaration, code, name.to_owned()));
                         }
                     }
+                    if !source.is_default_library
+                        && existing_flags.contains(ts_binder::SymbolFlags::INTERFACE)
+                        && symbol.flags.contains(ts_binder::SymbolFlags::INTERFACE)
+                        && let Some(descriptor) = Self::describe_symbol(source, result, symbol_id)
+                        && let Some(existing) = globals.get_mut(name)
+                    {
+                        merge_global_descriptor(existing, descriptor);
+                    }
                     continue;
                 }
-                if let Some(descriptor) = Self::describe_symbol(source, result, symbol_id) {
+                let descriptor = if source.is_default_library {
+                    Some(TypeDescriptor::Any)
+                } else {
+                    Self::describe_symbol(source, result, symbol_id)
+                };
+                if let Some(descriptor) = descriptor {
                     globals.insert(name.to_owned(), descriptor);
                     declarations.insert(name.to_owned(), (file_index, symbol.flags));
                 }
@@ -2426,6 +2467,12 @@ fn global_declarations_merge(
         || (existing == ts_binder::SymbolFlags::FUNCTION && new == ts_binder::SymbolFlags::FUNCTION)
         || (existing == ts_binder::SymbolFlags::FUNCTION_SCOPED_VARIABLE
             && new == ts_binder::SymbolFlags::FUNCTION_SCOPED_VARIABLE)
+}
+
+fn merge_global_descriptor(existing: &mut TypeDescriptor, new: TypeDescriptor) {
+    if let (TypeDescriptor::Object(existing), TypeDescriptor::Object(new)) = (existing, new) {
+        existing.extend(new);
+    }
 }
 
 fn string_literal_text(arena: &NodeArena, node: NodeId) -> Option<&str> {

@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use ts_ast::{NodeData, NodeId};
 use ts_binder::{BindResult, bind_source_file};
-use ts_checker::{CheckResult, ProgramSource, check_program, check_source_file};
+use ts_checker::{CheckResult, ProgramSource, check_program, empty_check_result};
 use ts_config::{ConfigDiagnostic, resolve_config_file};
 use ts_core::TextRange;
 use ts_diagnostics::message_by_code;
@@ -25,6 +25,7 @@ pub struct SourceFile {
     pub parse: ParseResult,
     pub binding: BindResult,
     pub checking: CheckResult,
+    pub is_default_library: bool,
 }
 
 /// A diagnostic produced while constructing or parsing a Program.
@@ -34,6 +35,14 @@ pub struct ProgramDiagnostic {
     pub range: Option<TextRange>,
     pub code: Option<u32>,
     pub message: String,
+}
+
+/// Command-line overrides applied after loading a project configuration.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ProgramOptionsOverride {
+    pub no_check: Option<bool>,
+    pub no_emit: Option<bool>,
+    pub no_lib: Option<bool>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -110,30 +119,43 @@ impl Program {
         resolution_options: ResolutionOptions,
     ) -> Self {
         let mut program = Self::new_unchecked(file_system, current_directory, root_names);
+        program.load_module_graph(file_system, resolution_options);
+        program.check_program();
+        program
+    }
+
+    fn load_module_graph(
+        &mut self,
+        file_system: &dyn FileSystem,
+        resolution_options: ResolutionOptions,
+    ) {
         let resolver = Resolver::new(file_system, resolution_options);
         let mut file_index = 0;
-        while file_index < program.source_files.len() {
-            let containing_file = program.source_files[file_index].file_name.clone();
-            let specifiers = module_specifiers(&program.source_files[file_index].parse);
+        while file_index < self.source_files.len() {
+            if self.source_files[file_index].is_default_library {
+                file_index += 1;
+                continue;
+            }
+            let containing_file = self.source_files[file_index].file_name.clone();
+            let specifiers = module_specifiers(&self.source_files[file_index].parse);
             for (specifier, range) in specifiers {
                 let result = resolver.resolve(&specifier, &containing_file);
                 if let Some(resolved) = result.resolved {
                     let containing = canonicalize(
                         &containing_file,
-                        &program.current_directory,
-                        program.case_sensitivity,
+                        &self.current_directory,
+                        self.case_sensitivity,
                     );
                     let target = canonicalize(
                         &resolved.resolved_file_name,
-                        &program.current_directory,
-                        program.case_sensitivity,
+                        &self.current_directory,
+                        self.case_sensitivity,
                     );
-                    program
-                        .resolved_modules
+                    self.resolved_modules
                         .insert((containing, specifier.clone()), target);
-                    program.load_file(file_system, &resolved.resolved_file_name, false);
-                } else {
-                    program.diagnostics.push(module_not_found_diagnostic(
+                    self.load_file(file_system, &resolved.resolved_file_name, false);
+                } else if !self.options.no_check {
+                    self.diagnostics.push(module_not_found_diagnostic(
                         &containing_file,
                         range,
                         &specifier,
@@ -142,6 +164,21 @@ impl Program {
             }
             file_index += 1;
         }
+    }
+
+    /// Creates a Program using fully normalized compiler options, including
+    /// module resolution and bundled default-library selection.
+    #[must_use]
+    pub fn new_with_options(
+        file_system: &dyn FileSystem,
+        current_directory: &str,
+        root_names: &[String],
+        options: CompilerOptions,
+    ) -> Self {
+        let mut program = Self::new_unchecked(file_system, current_directory, root_names);
+        program.options = options;
+        program.load_default_libraries();
+        program.load_module_graph(file_system, program.options.module_resolution_options());
         program.check_program();
         program
     }
@@ -150,6 +187,16 @@ impl Program {
     /// Include/exclude glob expansion is added by the file-loader layer.
     #[must_use]
     pub fn from_config(file_system: &dyn FileSystem, config_path: &str) -> Self {
+        Self::from_config_with_options(file_system, config_path, ProgramOptionsOverride::default())
+    }
+
+    /// Creates a Program from a tsconfig and applies command-line overrides.
+    #[must_use]
+    pub fn from_config_with_options(
+        file_system: &dyn FileSystem,
+        config_path: &str,
+        overrides: ProgramOptionsOverride,
+    ) -> Self {
         let parsed = resolve_config_file(file_system, config_path);
         let mut config_diagnostics: Vec<_> =
             parsed.diagnostics.iter().map(config_diagnostic).collect();
@@ -163,7 +210,7 @@ impl Program {
             .path
             .rsplit_once('/')
             .map_or(".", |(directory, _)| directory);
-        let options_result = parse_project_options(&config);
+        let mut options_result = parse_project_options(&config);
         config_diagnostics.extend(options_result.diagnostics.iter().map(|diagnostic| {
             ProgramDiagnostic {
                 file_name: Some(config.path.clone()),
@@ -174,6 +221,18 @@ impl Program {
                     .unwrap_or_else(|error| error.to_string()),
             }
         }));
+        if let Some(value) = overrides.no_check {
+            options_result.options.no_check = value;
+        }
+        if let Some(value) = overrides.no_emit {
+            options_result.options.no_emit = value;
+        }
+        if let Some(value) = overrides.no_lib {
+            options_result.options.no_lib = value;
+            if value {
+                options_result.options.lib = None;
+            }
+        }
         let mut discovery = DiscoveryOptions::new(config_directory);
         discovery.files = config.files.unwrap_or_default();
         discovery.include = config.include.unwrap_or_else(|| {
@@ -193,13 +252,12 @@ impl Program {
             });
             discovery.files.clone()
         });
-        let mut program = Self::new_with_module_resolution(
+        let mut program = Self::new_with_options(
             file_system,
             config_directory,
             &roots,
-            options_result.options.module_resolution_options(),
+            options_result.options,
         );
-        program.options = options_result.options;
         config_diagnostics.append(&mut program.diagnostics);
         program.diagnostics = config_diagnostics;
         program
@@ -241,7 +299,10 @@ impl Program {
         let source_names = self
             .source_files
             .iter()
-            .filter(|source_file| !ts_path::is_declaration_file(&source_file.file_name))
+            .filter(|source_file| {
+                !source_file.is_default_library
+                    && !ts_path::is_declaration_file(&source_file.file_name)
+            })
             .map(|source_file| source_file.file_name.clone())
             .collect::<Vec<_>>();
         let common_source_directory = ts_outputpaths::common_source_directory(
@@ -250,7 +311,9 @@ impl Program {
             self.case_sensitivity,
         );
         for source_file in &self.source_files {
-            if ts_path::is_declaration_file(&source_file.file_name) {
+            if source_file.is_default_library
+                || ts_path::is_declaration_file(&source_file.file_name)
+            {
                 continue;
             }
             let paths = ts_outputpaths::output_paths(
@@ -344,6 +407,9 @@ impl Program {
     }
 
     fn check_program(&mut self) {
+        if self.options.no_check {
+            return;
+        }
         let module_maps = self
             .source_files
             .iter()
@@ -375,6 +441,7 @@ impl Program {
                     source_file: source_file.parse.source_file,
                     bindings: &source_file.binding,
                     resolved_modules,
+                    is_default_library: source_file.is_default_library,
                 })
                 .collect::<Vec<_>>();
             check_program(&inputs)
@@ -416,7 +483,7 @@ impl Program {
             self.diagnostics.push(ProgramDiagnostic {
                 file_name: Some(file_name.to_owned()),
                 range: Some(diagnostic.range),
-                code: None,
+                code: diagnostic.code,
                 message: diagnostic.message.clone(),
             });
         }
@@ -433,7 +500,7 @@ impl Program {
                     .unwrap_or_else(|error| error.to_string()),
             });
         }
-        let checking = check_source_file(&parse.arena, parse.source_file, &binding);
+        let checking = empty_check_result();
         let index = self.source_files.len();
         self.file_index.insert(canonical, index);
         self.source_files.push(SourceFile {
@@ -442,7 +509,60 @@ impl Program {
             parse,
             binding,
             checking,
+            is_default_library: false,
         });
+    }
+
+    fn load_default_libraries(&mut self) {
+        if self.options.no_lib {
+            return;
+        }
+        let roots = match &self.options.lib {
+            None => vec![ts_bundled::default_library_name(self.options.target).to_owned()],
+            Some(libraries) => libraries
+                .iter()
+                .map(|name| bundled_library_name(name))
+                .collect(),
+        };
+        for root in roots {
+            for library_name in ts_bundled::library_closure(&root) {
+                self.load_bundled_library(library_name);
+            }
+        }
+    }
+
+    fn load_bundled_library(&mut self, library_name: &str) {
+        let file_name = format!("/__typescript/lib/{library_name}");
+        let canonical = canonicalize(&file_name, &self.current_directory, self.case_sensitivity);
+        if self.file_index.contains_key(&canonical) {
+            return;
+        }
+        let Some(source) = ts_bundled::library(library_name) else {
+            return;
+        };
+        let source_text = source.to_owned();
+        let parse = parse_source_file(&source_text);
+        let binding = bind_source_file(&parse.arena, parse.source_file);
+        let checking = empty_check_result();
+        let index = self.source_files.len();
+        self.file_index.insert(canonical, index);
+        self.source_files.push(SourceFile {
+            file_name,
+            source_text,
+            parse,
+            binding,
+            checking,
+            is_default_library: true,
+        });
+    }
+}
+
+fn bundled_library_name(name: &str) -> String {
+    let name = name.to_ascii_lowercase();
+    if name.starts_with("lib.") && name.ends_with(".d.ts") {
+        name
+    } else {
+        format!("lib.{name}.d.ts")
     }
 }
 
@@ -570,6 +690,7 @@ fn config_diagnostic(diagnostic: &ConfigDiagnostic) -> ProgramDiagnostic {
 
 #[cfg(test)]
 mod tests {
+    use ts_options::CompilerOptions;
     use ts_vfs::{FileSystem, MemoryFileSystem};
 
     use super::Program;
@@ -609,17 +730,42 @@ mod tests {
     }
 
     #[test]
+    fn propagates_parser_diagnostic_codes() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/main.ts", "function () { const value = ;")
+            .unwrap();
+        let program = Program::new(&fs, "/project", &["main.ts".to_owned()]);
+        for code in [1003, 1109, 1005] {
+            assert!(
+                program
+                    .diagnostics()
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == Some(code)),
+                "missing TS{code}: {:?}",
+                program.diagnostics()
+            );
+        }
+    }
+
+    #[test]
     fn constructs_roots_from_config_files() {
         let fs = MemoryFileSystem::new(true);
         fs.write_file(
             "/project/tsconfig.json",
-            "{ \"files\": [\"src/a.ts\", \"src/b.ts\"] }",
+            "{ \"files\": [\"src/a.ts\", \"src/b.ts\"], \"compilerOptions\": { \"noLib\": true } }",
         )
         .unwrap();
         fs.write_file("/project/src/a.ts", "let a = 1;").unwrap();
         fs.write_file("/project/src/b.ts", "let b = 2;").unwrap();
         let program = Program::from_config(&fs, "/project/tsconfig.json");
-        assert_eq!(program.source_files().len(), 2);
+        assert_eq!(
+            program
+                .source_files()
+                .iter()
+                .filter(|file| !file.is_default_library)
+                .count(),
+            2
+        );
         assert!(program.diagnostics().is_empty());
     }
 
@@ -628,7 +774,7 @@ mod tests {
         let fs = MemoryFileSystem::new(true);
         fs.write_file(
             "/project/tsconfig.json",
-            "{ \"include\": [\"src/**/*.ts\"], \"exclude\": [\"src/generated\"] }",
+            "{ \"include\": [\"src/**/*.ts\"], \"exclude\": [\"src/generated\"], \"compilerOptions\": { \"noLib\": true } }",
         )
         .unwrap();
         fs.write_file("/project/src/a.ts", "let a = 1;").unwrap();
@@ -637,7 +783,14 @@ mod tests {
         fs.write_file("/project/src/generated/c.ts", "let c = 3;")
             .unwrap();
         let program = Program::from_config(&fs, "/project/tsconfig.json");
-        assert_eq!(program.source_files().len(), 2);
+        assert_eq!(
+            program
+                .source_files()
+                .iter()
+                .filter(|file| !file.is_default_library)
+                .count(),
+            2
+        );
         assert!(program.diagnostics().is_empty());
     }
 
@@ -649,7 +802,7 @@ mod tests {
             r#"{
                 "include": ["src/**/*.ts"],
                 "exclude": ["src/generated"],
-                "compilerOptions": { "target": "es2015" }
+                "compilerOptions": { "target": "es2015", "noLib": true }
             }"#,
         )
         .unwrap();
@@ -674,7 +827,14 @@ mod tests {
             program.diagnostics()
         );
         assert_eq!(program.options().target, ts_options::ScriptTarget::Es2015);
-        assert_eq!(program.source_files().len(), 2);
+        assert_eq!(
+            program
+                .source_files()
+                .iter()
+                .filter(|file| !file.is_default_library)
+                .count(),
+            2
+        );
         assert!(program.source_file("/repo/base/src/a.ts").is_some());
         assert!(program.source_file("/repo/base/src/nested/b.ts").is_some());
         assert!(
@@ -865,8 +1025,11 @@ mod tests {
     #[test]
     fn checks_annotated_variable_assignability() {
         let fs = MemoryFileSystem::new(true);
-        fs.write_file("/type-error.ts", "const value: string = 1;")
-            .unwrap();
+        fs.write_file(
+            "/type-error.ts",
+            "import { missing } from './absent'; const value: string = 1;",
+        )
+        .unwrap();
         let program = Program::new(&fs, "/", &["type-error.ts".to_owned()]);
         assert!(
             program
@@ -877,11 +1040,35 @@ mod tests {
     }
 
     #[test]
+    fn no_check_skips_semantic_diagnostics() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/type-error.ts", "const value: string = 1;")
+            .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/",
+            &["type-error.ts".to_owned()],
+            CompilerOptions {
+                no_check: true,
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        assert!(
+            !program
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| matches!(diagnostic.code, Some(2307 | 2322)))
+        );
+        assert_eq!(program.emit().files.len(), 1);
+    }
+
+    #[test]
     fn config_options_control_emit_and_resolution() {
         let fs = MemoryFileSystem::new(true);
         fs.write_file(
             "/project/tsconfig.json",
-            "{ \"files\": [\"main.ts\"], \"compilerOptions\": { \"noEmit\": true, \"module\": \"esnext\" } }",
+            "{ \"files\": [\"main.ts\"], \"compilerOptions\": { \"noEmit\": true, \"module\": \"esnext\", \"noLib\": true } }",
         )
         .unwrap();
         fs.write_file("/project/main.ts", "const value = 1;")
@@ -897,7 +1084,7 @@ mod tests {
         let fs = MemoryFileSystem::new(true);
         fs.write_file(
             "/project/tsconfig.json",
-            "{ \"files\": [\"main.ts\"], \"compilerOptions\": { \"target\": \"es2015\", \"module\": \"commonjs\", \"sourceMap\": true } }",
+            "{ \"files\": [\"main.ts\"], \"compilerOptions\": { \"target\": \"es2015\", \"module\": \"commonjs\", \"sourceMap\": true, \"noLib\": true } }",
         )
         .unwrap();
         fs.write_file(
@@ -942,7 +1129,8 @@ mod tests {
                 "compilerOptions": {
                     "outDir": "build",
                     "rootDir": "src",
-                    "sourceMap": true
+                    "sourceMap": true,
+                    "noLib": true
                 }
             }"#,
         )
@@ -971,7 +1159,7 @@ mod tests {
             "/project/tsconfig.json",
             r#"{
                 "files": ["src/main.ts"],
-                "compilerOptions": { "outDir": "build", "inlineSourceMap": true }
+                "compilerOptions": { "outDir": "build", "inlineSourceMap": true, "noLib": true }
             }"#,
         )
         .unwrap();
@@ -1000,7 +1188,8 @@ mod tests {
                     "rootDir": "src",
                     "declaration": true,
                     "declarationMap": true,
-                    "declarationDir": "types"
+                    "declarationDir": "types",
+                    "noLib": true
                 }
             }"#,
         )
@@ -1054,7 +1243,7 @@ mod tests {
             "/project/tsconfig.json",
             r#"{
                 "files": ["src/index.ts"],
-                "compilerOptions": { "outDir": "types", "emitDeclarationOnly": true }
+                "compilerOptions": { "outDir": "types", "emitDeclarationOnly": true, "noLib": true }
             }"#,
         )
         .unwrap();
@@ -1070,6 +1259,137 @@ mod tests {
         assert_eq!(
             emitted.files[0].text,
             "export declare const value: string;\n"
+        );
+    }
+
+    #[test]
+    fn config_loads_target_default_libraries_without_emitting_them() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/tsconfig.json",
+            r#"{
+                "files": ["main.ts"],
+                "compilerOptions": { "target": "es2015" }
+            }"#,
+        )
+        .unwrap();
+        fs.write_file("/project/main.ts", "Array; Promise;")
+            .unwrap();
+        let program = Program::from_config(&fs, "/project/tsconfig.json");
+        assert!(
+            !program
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code == Some(2304))
+        );
+        assert!(
+            program.source_files().iter().any(|file| {
+                file.is_default_library && file.file_name.ends_with("/lib.es6.d.ts")
+            })
+        );
+        let emitted = program.emit();
+        assert!(
+            emitted
+                .files
+                .iter()
+                .all(|file| !file.file_name.contains("/__typescript/lib/"))
+        );
+    }
+
+    #[test]
+    fn no_lib_removes_default_library_globals() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/tsconfig.json",
+            r#"{
+                "files": ["main.ts"],
+                "compilerOptions": { "noLib": true }
+            }"#,
+        )
+        .unwrap();
+        fs.write_file("/project/main.ts", "Array; Promise;")
+            .unwrap();
+        let program = Program::from_config(&fs, "/project/tsconfig.json");
+        assert_eq!(
+            program
+                .diagnostics()
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Some(2304))
+                .count(),
+            2
+        );
+        assert!(
+            !program
+                .source_files()
+                .iter()
+                .any(|file| file.is_default_library)
+        );
+    }
+
+    #[test]
+    fn explicit_lib_overrides_target_default_selection() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/tsconfig.json",
+            r#"{
+                "files": ["main.ts"],
+                "compilerOptions": {
+                    "target": "es5",
+                    "lib": ["es5", "es2015.promise"]
+                }
+            }"#,
+        )
+        .unwrap();
+        fs.write_file("/project/main.ts", "Array; Promise;")
+            .unwrap();
+        let program = Program::from_config(&fs, "/project/tsconfig.json");
+        assert!(
+            !program
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code == Some(2304))
+        );
+        assert!(program.source_files().iter().any(|file| {
+            file.is_default_library && file.file_name.ends_with("/lib.es2015.promise.d.ts")
+        }));
+        assert!(
+            !program.source_files().iter().any(|file| {
+                file.is_default_library && file.file_name.ends_with("/lib.dom.d.ts")
+            })
+        );
+    }
+
+    #[test]
+    fn target_selects_distinct_default_library_roots() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/main.ts", "Array;").unwrap();
+        let es5 = Program::new_with_options(
+            &fs,
+            "/project",
+            &["main.ts".to_owned()],
+            CompilerOptions {
+                target: ts_options::ScriptTarget::Es5,
+                ..CompilerOptions::default()
+            },
+        );
+        let es2015 = Program::new_with_options(
+            &fs,
+            "/project",
+            &["main.ts".to_owned()],
+            CompilerOptions {
+                target: ts_options::ScriptTarget::Es2015,
+                ..CompilerOptions::default()
+            },
+        );
+        assert!(
+            es5.source_files()
+                .iter()
+                .any(|file| { file.is_default_library && file.file_name.ends_with("/lib.d.ts") })
+        );
+        assert!(
+            es2015.source_files().iter().any(|file| {
+                file.is_default_library && file.file_name.ends_with("/lib.es6.d.ts")
+            })
         );
     }
 }

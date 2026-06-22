@@ -12,12 +12,12 @@ pub enum ExitStatus {
     DiagnosticsPresentOutputsGenerated = 2,
     InvalidProjectOutputsSkipped = 3,
     ProjectReferenceCycleOutputsSkipped = 4,
-    NotImplemented = 5,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Command {
     Help,
+    Lsp,
     Version,
     Compile(CompilerOptions),
 }
@@ -73,12 +73,21 @@ fn parse_expanded(args: &[String]) -> Result<Command, CommandLineError> {
         let lower = argument.to_ascii_lowercase();
         match lower.as_str() {
             "--help" | "-h" | "-?" => return Ok(Command::Help),
+            "--lsp" => return Ok(Command::Lsp),
             "--version" | "-v" => return Ok(Command::Version),
             "--nocheck" => options.no_check = true,
             "--noemit" => options.no_emit = true,
             "--nolib" => options.no_lib = true,
             "--ignoreconfig" => options.ignore_config = true,
-            "--pretty" => options.pretty = Some(true),
+            "--pretty" => {
+                let explicit_value = args
+                    .get(index + 1)
+                    .and_then(|value| parse_bool_value(value));
+                options.pretty = Some(explicit_value.unwrap_or(true));
+                if explicit_value.is_some() {
+                    index += 1;
+                }
+            }
             "--project" | "-p" => {
                 index += 1;
                 options.project = Some(required_option_value(args, index, argument)?);
@@ -121,6 +130,16 @@ fn parse_bool_option(argument: &str, name: &str) -> Result<bool, CommandLineErro
             code: 5024,
             message: format!("Compiler option '{name}' requires a value of type boolean."),
         }),
+    }
+}
+
+fn parse_bool_value(value: &str) -> Option<bool> {
+    if value.eq_ignore_ascii_case("true") {
+        Some(true)
+    } else if value.eq_ignore_ascii_case("false") {
+        Some(false)
+    } else {
+        None
     }
 }
 
@@ -228,6 +247,28 @@ mod tests {
             "error TS5023: Unknown compiler option '--wat'."
         );
         assert_eq!(parse(&["--project"]).unwrap_err().code, 6044);
+    }
+
+    #[test]
+    fn parses_lsp_without_changing_compiler_arguments() {
+        assert_eq!(parse(&["--LSP"]), Ok(Command::Lsp));
+        assert_eq!(
+            parse(&["--noEmit", "src/main.ts"]),
+            Ok(Command::Compile(CompilerOptions {
+                files: vec!["src/main.ts".to_owned()],
+                no_emit: true,
+                ..CompilerOptions::default()
+            }))
+        );
+    }
+
+    #[test]
+    fn parses_separated_pretty_value() {
+        let Command::Compile(options) = parse(&["--pretty", "false", "main.ts"]).unwrap() else {
+            panic!("expected compile command");
+        };
+        assert_eq!(options.pretty, Some(false));
+        assert_eq!(options.files, ["main.ts"]);
     }
 
     #[test]

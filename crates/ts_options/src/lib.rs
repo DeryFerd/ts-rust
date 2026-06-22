@@ -77,7 +77,10 @@ pub struct CompilerOptions {
     pub declaration: bool,
     pub declaration_map: bool,
     pub emit_declaration_only: bool,
+    pub no_check: bool,
     pub no_emit: bool,
+    pub no_lib: bool,
+    pub lib: Option<Vec<String>>,
     pub module: ModuleKind,
     pub module_resolution: ModuleResolutionKind,
     pub target: ScriptTarget,
@@ -102,7 +105,10 @@ impl Default for CompilerOptions {
             declaration: false,
             declaration_map: false,
             emit_declaration_only: false,
+            no_check: false,
             no_emit: false,
+            no_lib: false,
+            lib: None,
             module: ModuleKind::CommonJs,
             module_resolution: ModuleResolutionKind::Node10,
             target: ScriptTarget::Es5,
@@ -247,7 +253,10 @@ pub fn parse_compiler_options_map(options: &BTreeMap<String, JsonValue>) -> Pars
             "emitdeclarationonly" => {
                 parsed.emit_declaration_only = boolean(original_name, value, &mut diagnostics);
             }
+            "nocheck" => parsed.no_check = boolean(original_name, value, &mut diagnostics),
             "noemit" => parsed.no_emit = boolean(original_name, value, &mut diagnostics),
+            "nolib" => parsed.no_lib = boolean(original_name, value, &mut diagnostics),
+            "lib" => parsed.lib = string_array(original_name, value, &mut diagnostics),
             "resolvejsonmodule" => {
                 parsed.resolve_json_module = boolean(original_name, value, &mut diagnostics);
             }
@@ -290,7 +299,10 @@ struct PartialOptions {
     declaration: Option<bool>,
     declaration_map: Option<bool>,
     emit_declaration_only: Option<bool>,
+    no_check: Option<bool>,
     no_emit: Option<bool>,
+    no_lib: Option<bool>,
+    lib: Option<Vec<String>>,
     module: Option<ModuleKind>,
     module_resolution: Option<ModuleResolutionKind>,
     target: Option<ScriptTarget>,
@@ -318,7 +330,10 @@ impl PartialOptions {
             declaration: self.declaration.unwrap_or(emit_declaration_only),
             declaration_map: self.declaration_map.unwrap_or(false),
             emit_declaration_only,
+            no_check: self.no_check.unwrap_or(false),
             no_emit: self.no_emit.unwrap_or(false),
+            no_lib: self.no_lib.unwrap_or(false),
+            lib: self.lib,
             module,
             module_resolution: self
                 .module_resolution
@@ -356,6 +371,9 @@ fn validate_options(options: &PartialOptions, diagnostics: &mut Vec<Diagnostic>)
     }
     if options.source_map == Some(true) && options.inline_source_map == Some(true) {
         diagnostics.push(diagnostic(5053, ["sourceMap", "inlineSourceMap"]));
+    }
+    if options.no_lib == Some(true) && options.lib.is_some() {
+        diagnostics.push(diagnostic(5053, ["lib", "noLib"]));
     }
 
     let (Some(module), Some(resolution)) = (options.module, options.module_resolution) else {
@@ -620,9 +638,11 @@ mod tests {
         let result = parse_compiler_options(&object([
             ("checkJs", JsonValue::Bool(true)),
             ("emitDeclarationOnly", JsonValue::Bool(true)),
+            ("noCheck", JsonValue::Bool(true)),
         ]));
         assert!(result.options.allow_js);
         assert!(result.options.declaration);
+        assert!(result.options.no_check);
         let settings = result.options.printer_settings();
         assert!(!settings.emit_javascript);
         assert!(settings.emit_declarations);
@@ -739,5 +759,29 @@ mod tests {
         ]));
         assert_eq!(result.diagnostics.len(), 1);
         assert_eq!(result.diagnostics[0].code(), 5053);
+    }
+
+    #[test]
+    fn parses_default_library_controls() {
+        let result = parse_compiler_options(&object([(
+            "lib",
+            JsonValue::Array(vec![
+                JsonValue::String("ES2015".into()),
+                JsonValue::String("DOM".into()),
+            ]),
+        )]));
+        assert_eq!(
+            result.options.lib,
+            Some(vec!["ES2015".into(), "DOM".into()])
+        );
+        let conflict = parse_compiler_options(&object([
+            ("noLib", JsonValue::Bool(true)),
+            (
+                "lib",
+                JsonValue::Array(vec![JsonValue::String("ES5".into())]),
+            ),
+        ]));
+        assert_eq!(conflict.diagnostics.len(), 1);
+        assert_eq!(conflict.diagnostics[0].code(), 5053);
     }
 }

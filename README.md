@@ -19,10 +19,12 @@ against the upstream TypeScript fixtures independently:
 - `ts_jsnum`: JavaScript number operations, formatting, and pseudo-bigints
 - `ts_evaluator`: compile-time expression and constant evaluation
 - `ts_jsonrpc`: typed JSON-RPC messages and LSP protocol framing
+- `ts_lsp`: document synchronization, diagnostics, navigation, and editor protocol handling
 - `ts_compiler`: Program graph, diagnostics, checking, and emit orchestration
 - `ts_printer` / `ts_sourcemap`: target-aware JavaScript and source-map emission
 - `ts_bundled`: the pinned TypeScript default-library declarations
 - `ts_diagnostics`: generated TypeScript diagnostic catalog
+- `ts_diagnostic_writer`: plain and contextual diagnostic formatting
 - `ts_config`: JSONC and `tsconfig.json` parsing
 - `ts_path` / `ts_vfs`: compiler path and filesystem abstractions
 - `ts_cli`: the `tsgo` executable

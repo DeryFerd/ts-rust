@@ -198,7 +198,10 @@ version = "7.0.0-dev"
 dependencies = [
  "ts_ast",
  "ts_compiler",
+ "ts_diagnostic_writer",
+ "ts_lsp",
  "ts_module",
+ "ts_options",
  "ts_parser",
  "ts_scanner",
  "ts_vfs",
@@ -216,6 +219,7 @@ dependencies = [
  "serde_json",
  "ts_ast",
  "ts_binder",
+ "ts_bundled",
  "ts_checker",
  "ts_config",
  "ts_core",
@@ -242,6 +246,13 @@ dependencies = [
 [[package]]
 name = "ts_core"
 version = "7.0.0-dev"
+
+[[package]]
+name = "ts_diagnostic_writer"
+version = "7.0.0-dev"
+dependencies = [
+ "ts_core",
+]
 
 [[package]]
 name = "ts_diagnostics"
@@ -298,6 +309,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "ts_lsp"
+version = "7.0.0-dev"
+dependencies = [
+ "serde",
+ "serde_json",
+ "ts_ast",
+ "ts_binder",
+ "ts_compiler",
+ "ts_jsonrpc",
+ "ts_module",
+ "ts_options",
+ "ts_parser",
+ "ts_vfs",
+]
+
+[[package]]
 name = "ts_module"
 version = "7.0.0-dev"
 dependencies = [
@@ -331,6 +358,7 @@ version = "7.0.0-dev"
 dependencies = [
  "ts_ast",
  "ts_core",
+ "ts_diagnostics",
  "ts_scanner",
 ]
 
@@ -354,6 +382,7 @@ version = "7.0.0-dev"
 dependencies = [
  "ts_ast",
  "ts_core",
+ "ts_diagnostics",
 ]
 
 [[package]]
