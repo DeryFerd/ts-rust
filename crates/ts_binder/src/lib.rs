@@ -1055,18 +1055,29 @@ impl<'a> Binder<'a> {
         let id = if let Some(existing) = existing {
             let existing_flags = self.result.symbols.get(existing)?.flags;
             if !can_merge(existing_flags, flags) {
-                let code = if existing_flags.intersects(SymbolFlags::BLOCK_SCOPED_VARIABLE)
-                    || flags.intersects(SymbolFlags::BLOCK_SCOPED_VARIABLE)
+                if existing_flags.intersects(SymbolFlags::ENUM)
+                    || flags.intersects(SymbolFlags::ENUM)
                 {
-                    2451
+                    let prior_declarations =
+                        self.result.symbols.get(existing)?.declarations.clone();
+                    for prior in prior_declarations {
+                        self.report_enum_merge_error(prior);
+                    }
+                    self.report_enum_merge_error(declaration);
                 } else {
-                    2300
-                };
-                let message = message_by_code(code).expect("binder diagnostic is in catalog");
-                self.result.diagnostics.push(BindDiagnostic {
-                    node: declaration,
-                    diagnostic: Diagnostic::with_arguments(message, [name.clone()]),
-                });
+                    let code = if existing_flags.intersects(SymbolFlags::BLOCK_SCOPED_VARIABLE)
+                        || flags.intersects(SymbolFlags::BLOCK_SCOPED_VARIABLE)
+                    {
+                        2451
+                    } else {
+                        2300
+                    };
+                    let message = message_by_code(code).expect("binder diagnostic is in catalog");
+                    self.result.diagnostics.push(BindDiagnostic {
+                        node: declaration,
+                        diagnostic: Diagnostic::with_arguments(message, [name.clone()]),
+                    });
+                }
             }
             let symbol = self.result.symbols.get_mut(existing)?;
             symbol.flags |= flags;
@@ -1094,6 +1105,19 @@ impl<'a> Binder<'a> {
             id
         };
         Some(id)
+    }
+
+    fn report_enum_merge_error(&mut self, declaration: NodeId) {
+        if self.result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.node == declaration && diagnostic.diagnostic.code() == 2567
+        }) {
+            return;
+        }
+        let message = message_by_code(2567).expect("binder diagnostic is in catalog");
+        self.result.diagnostics.push(BindDiagnostic {
+            node: declaration,
+            diagnostic: Diagnostic::new(message),
+        });
     }
 
     fn declare_export_alias(
@@ -2001,8 +2025,53 @@ mod tests {
         let parsed = parse_source_file("enum Mixed { A } const enum Mixed { B }");
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         let result = bind_source_file(&parsed.arena, parsed.source_file);
-        assert_eq!(result.diagnostics.len(), 1);
-        assert_eq!(result.diagnostics[0].diagnostic.code(), 2300);
+        assert_eq!(result.diagnostics.len(), 2);
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.diagnostic.code() == 2567)
+        );
+        assert_eq!(
+            result.diagnostics[0].diagnostic.render().unwrap(),
+            "Enum declarations can only merge with namespace or other enum declarations."
+        );
+    }
+
+    #[test]
+    fn reports_enum_merge_diagnostics_for_each_incompatible_declaration() {
+        let parsed = parse_source_file(
+            r"
+                const enum ConstFirst { A }
+                class ConstFirst {}
+                class ClassFirst {}
+                const enum ClassFirst { A }
+                const enum MixedFirst { A }
+                enum MixedFirst { B }
+                enum RegularFirst { A }
+                const enum RegularFirst { B }
+                declare const enum Legal { A }
+                declare const enum Legal { B }
+                declare namespace Legal { const label: string; }
+            ",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let result = bind_source_file(&parsed.arena, parsed.source_file);
+        assert_eq!(result.diagnostics.len(), 8, "{:?}", result.diagnostics);
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.diagnostic.code() == 2567)
+        );
+        let root = result.root_scope().unwrap();
+        let legal = result
+            .symbols
+            .get(root.symbols.get("Legal").unwrap())
+            .unwrap();
+        assert!(legal.flags.contains(SymbolFlags::CONST_ENUM));
+        assert!(legal.flags.contains(SymbolFlags::NAMESPACE_MODULE));
+        assert_eq!(legal.declarations.len(), 3);
     }
 
     #[test]
