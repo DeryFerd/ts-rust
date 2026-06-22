@@ -167,6 +167,7 @@ pub enum OutputDifferenceKind {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RunnerOptions {
     pub filter: Option<String>,
+    pub skip: usize,
     pub limit: Option<usize>,
 }
 
@@ -228,6 +229,7 @@ pub fn run_upstream_baselines(
                 .as_ref()
                 .is_none_or(|filter| path.to_string_lossy().to_ascii_lowercase().contains(filter))
         })
+        .skip(options.skip)
         .take(options.limit.unwrap_or(usize::MAX));
 
     let mut summary = RunnerSummary::default();
