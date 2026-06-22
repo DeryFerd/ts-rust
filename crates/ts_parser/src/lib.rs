@@ -3130,6 +3130,12 @@ impl<'a> Parser<'a> {
         if self.current.kind == SyntaxKind::AsyncKeyword && self.is_async_arrow_function() {
             return self.parse_async_arrow_function();
         }
+        if self.current.kind == SyntaxKind::LessThanToken
+            && self.language_variant != LanguageVariant::Jsx
+            && self.is_generic_arrow_function()
+        {
+            return self.parse_generic_arrow_function();
+        }
         if self.current.kind == SyntaxKind::OpenParenToken && self.is_parenthesized_arrow() {
             return self.parse_parenthesized_arrow_function();
         }
@@ -3224,6 +3230,119 @@ impl<'a> Parser<'a> {
         };
         self.scanner.rewind(checkpoint);
         result
+    }
+
+    fn is_generic_arrow_function(&mut self) -> bool {
+        let checkpoint = self.scanner.mark();
+        let mut token = self.scanner.scan();
+        if token.kind != SyntaxKind::Identifier {
+            self.scanner.rewind(checkpoint);
+            return false;
+        }
+
+        let mut angle_depth = 1_u32;
+        while token.kind != SyntaxKind::EndOfFile {
+            token = self.scanner.scan();
+            match token.kind {
+                SyntaxKind::LessThanToken => angle_depth += 1,
+                SyntaxKind::GreaterThanToken => {
+                    angle_depth -= 1;
+                    if angle_depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if angle_depth != 0 || self.scanner.scan().kind != SyntaxKind::OpenParenToken {
+            self.scanner.rewind(checkpoint);
+            return false;
+        }
+
+        let mut parenthesis_depth = 1_u32;
+        token = self.scanner.scan();
+        while token.kind != SyntaxKind::EndOfFile && parenthesis_depth != 0 {
+            match token.kind {
+                SyntaxKind::OpenParenToken => parenthesis_depth += 1,
+                SyntaxKind::CloseParenToken => parenthesis_depth -= 1,
+                _ => {}
+            }
+            if parenthesis_depth != 0 {
+                token = self.scanner.scan();
+            }
+        }
+        if parenthesis_depth != 0 {
+            self.scanner.rewind(checkpoint);
+            return false;
+        }
+
+        token = self.scanner.scan();
+        let result = if token.kind == SyntaxKind::EqualsGreaterThanToken {
+            true
+        } else if token.kind == SyntaxKind::ColonToken {
+            let mut delimiter_depth = 0_i32;
+            loop {
+                token = self.scanner.scan();
+                match token.kind {
+                    SyntaxKind::OpenParenToken
+                    | SyntaxKind::OpenBracketToken
+                    | SyntaxKind::OpenBraceToken
+                    | SyntaxKind::LessThanToken => delimiter_depth += 1,
+                    SyntaxKind::CloseParenToken
+                    | SyntaxKind::CloseBracketToken
+                    | SyntaxKind::CloseBraceToken
+                    | SyntaxKind::GreaterThanToken => delimiter_depth -= 1,
+                    SyntaxKind::EqualsGreaterThanToken if delimiter_depth == 0 => break true,
+                    SyntaxKind::EndOfFile | SyntaxKind::SemicolonToken => break false,
+                    _ => {}
+                }
+            }
+        } else {
+            false
+        };
+        self.scanner.rewind(checkpoint);
+        result
+    }
+
+    fn parse_generic_arrow_function(&mut self) -> NodeId {
+        let start = self.current.range.start;
+        let type_parameters = self.parse_type_parameters();
+        let parameters = self.parse_parameter_list();
+        let return_type = self.parse_optional_type_annotation();
+        let arrow =
+            self.parse_expected_token_node(SyntaxKind::EqualsGreaterThanToken, "Expected '=>'.");
+        let body = if self.current.kind == SyntaxKind::OpenBraceToken {
+            self.parse_block()
+        } else {
+            self.parse_binary_expression(2)
+        };
+        let mut children = Vec::new();
+        extend_list_children(&mut children, type_parameters.as_ref());
+        children.extend(parameters.nodes.iter().copied());
+        children.extend(return_type);
+        children.push(arrow);
+        children.push(body);
+        self.alloc_node(
+            SyntaxKind::ArrowFunction,
+            TextRange::new(start, self.node_end(body)),
+            NodeData::ArrowFunction(Box::new(ArrowFunctionData {
+                asterisk_token: None,
+                body,
+                end_flow_node: None,
+                equals_greater_than_token: arrow,
+                flow_node: None,
+                full_signature: None,
+                locals: SymbolTable,
+                next_container: None,
+                parameters,
+                symbol: None,
+                type_: return_type,
+                type_parameters,
+                facts: 0,
+                modifiers: None,
+            })),
+            &children,
+        )
     }
 
     fn parse_async_arrow_function(&mut self) -> NodeId {
@@ -6146,6 +6265,97 @@ mod tests {
         for span in &template_data.template_spans.nodes {
             assert_eq!(result.arena.get(*span).unwrap().parent, Some(template));
         }
+    }
+
+    #[test]
+    fn distinguishes_generic_arrows_from_generic_function_type_assertions() {
+        let source = "var r = <T>(x: T) => x;\nvar r2 = < <T>(x: T) => T>f;";
+        let result = parse_source_file(source);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let statements = source_statements(&result);
+
+        let (list, _) = variable_list(&result, statements[0]);
+        let declaration = declaration_nodes(&result, list)[0];
+        let NodeData::VariableDeclaration(declaration) =
+            &result.arena.get(declaration).unwrap().data
+        else {
+            panic!("expected variable declaration");
+        };
+        let arrow_id = declaration.initializer.unwrap();
+        let NodeData::ArrowFunction(arrow) = &result.arena.get(arrow_id).unwrap().data else {
+            panic!("expected generic arrow function");
+        };
+        let type_parameters = arrow.type_parameters.as_ref().unwrap();
+        assert_eq!(type_parameters.nodes.len(), 1);
+        assert_eq!(arrow.parameters.nodes.len(), 1);
+        assert_eq!(
+            result.arena.get(arrow.body).unwrap().kind,
+            SyntaxKind::Identifier
+        );
+        assert_eq!(
+            result.arena.get(type_parameters.nodes[0]).unwrap().parent,
+            Some(arrow_id)
+        );
+
+        let (list, _) = variable_list(&result, statements[1]);
+        let declaration = declaration_nodes(&result, list)[0];
+        let NodeData::VariableDeclaration(declaration) =
+            &result.arena.get(declaration).unwrap().data
+        else {
+            panic!("expected variable declaration");
+        };
+        let assertion_id = declaration.initializer.unwrap();
+        let NodeData::TypeAssertion(assertion) = &result.arena.get(assertion_id).unwrap().data
+        else {
+            panic!("expected type assertion");
+        };
+        let NodeData::FunctionTypeNode(function_type) =
+            &result.arena.get(assertion.type_).unwrap().data
+        else {
+            panic!("expected generic function type");
+        };
+        assert_eq!(
+            function_type.type_parameters.as_ref().unwrap().nodes.len(),
+            1
+        );
+        assert_eq!(
+            result.arena.get(assertion.expression).unwrap().kind,
+            SyntaxKind::Identifier
+        );
+    }
+
+    #[test]
+    fn keeps_double_less_than_on_the_shift_recovery_path() {
+        let source = "var r3 = <<T>(x: T) => T>f;";
+        let result = parse_source_file(source);
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .filter_map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [1109, 1005]
+        );
+        assert_eq!(
+            result.diagnostics[0].range.start.get(),
+            u32::try_from(source.find("<<").unwrap()).unwrap()
+        );
+        let statements = source_statements(&result);
+        let (list, _) = variable_list(&result, statements[0]);
+        let declaration = declaration_nodes(&result, list)[0];
+        let NodeData::VariableDeclaration(declaration) =
+            &result.arena.get(declaration).unwrap().data
+        else {
+            panic!("expected recovered variable declaration");
+        };
+        assert_ne!(
+            result
+                .arena
+                .get(declaration.initializer.unwrap())
+                .unwrap()
+                .kind,
+            SyntaxKind::ArrowFunction
+        );
     }
 
     #[test]
