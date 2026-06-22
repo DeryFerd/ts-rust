@@ -15,6 +15,42 @@ pub struct OutputPaths {
     pub declaration_map: Option<String>,
 }
 
+/// Computes the single output paths selected by `outFile`.
+#[must_use]
+pub fn bundle_output_paths(
+    options: &CompilerOptions,
+    current_directory: &str,
+) -> Option<OutputPaths> {
+    let out_file = options.out_file.as_deref()?;
+    let out_file = if ts_path::is_absolute(out_file) {
+        normalize_path(out_file)
+    } else {
+        resolve_path(current_directory, &[out_file])
+    };
+    let javascript = options
+        .printer_settings()
+        .emit_javascript
+        .then(|| out_file.clone());
+    let source_map = javascript
+        .as_ref()
+        .filter(|_| options.source_map && !options.inline_source_map)
+        .map(|javascript| format!("{javascript}.map"));
+    let declaration = options
+        .printer_settings()
+        .emit_declarations
+        .then(|| change_extension(&out_file, ".d.ts"));
+    let declaration_map = declaration
+        .as_ref()
+        .filter(|_| options.declaration_map)
+        .map(|declaration| format!("{declaration}.map"));
+    Some(OutputPaths {
+        javascript,
+        source_map,
+        declaration,
+        declaration_map,
+    })
+}
+
 #[must_use]
 pub fn output_extension(file_name: &str, jsx: JsxEmit) -> &'static str {
     match extension_from_path(file_name) {
@@ -172,8 +208,8 @@ mod tests {
     use ts_path::CaseSensitivity;
 
     use super::{
-        build_info_path, common_source_directory, declaration_extension, output_extension,
-        output_paths, source_file_path_in_new_directory,
+        build_info_path, bundle_output_paths, common_source_directory, declaration_extension,
+        output_extension, output_paths, source_file_path_in_new_directory,
     };
 
     #[test]
@@ -278,5 +314,30 @@ mod tests {
         );
         assert_eq!(paths.javascript.as_deref(), Some("/project/dist/main.js"));
         assert!(paths.source_map.is_none());
+    }
+
+    #[test]
+    fn computes_single_out_file_paths() {
+        let options = CompilerOptions {
+            out_file: Some("dist/bundle.js".into()),
+            declaration: true,
+            declaration_map: true,
+            source_map: true,
+            ..CompilerOptions::default()
+        };
+        let paths = bundle_output_paths(&options, "/project").unwrap();
+        assert_eq!(paths.javascript.as_deref(), Some("/project/dist/bundle.js"));
+        assert_eq!(
+            paths.source_map.as_deref(),
+            Some("/project/dist/bundle.js.map")
+        );
+        assert_eq!(
+            paths.declaration.as_deref(),
+            Some("/project/dist/bundle.d.ts")
+        );
+        assert_eq!(
+            paths.declaration_map.as_deref(),
+            Some("/project/dist/bundle.d.ts.map")
+        );
     }
 }

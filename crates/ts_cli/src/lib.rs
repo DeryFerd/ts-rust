@@ -200,6 +200,7 @@ fn compiler_string_name(argument: &str) -> Option<&'static str> {
         "--module" => "module",
         "--moduledetection" => "moduledetection",
         "--moduleresolution" => "moduleresolution",
+        "--outfile" => "outfile",
         "--outdir" => "outdir",
         "--rootdir" => "rootdir",
         "--target" => "target",
@@ -457,6 +458,19 @@ mod tests {
         assert!(options.compiler_options.allow_js);
         assert!(options.compiler_options.strict);
         assert!(options.compiler_options.no_implicit_any);
+    }
+
+    #[test]
+    fn parses_out_file() {
+        let Command::Compile(options) =
+            parse(&["--module", "amd", "--outFile", "bundle.js", "main.ts"]).unwrap()
+        else {
+            panic!("expected compile command");
+        };
+        assert_eq!(
+            options.compiler_options.out_file.as_deref(),
+            Some("bundle.js")
+        );
     }
 
     #[test]

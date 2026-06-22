@@ -13,11 +13,11 @@ use ts_core::TextRange;
 use ts_diagnostics::message_by_code;
 use ts_glob::{DiscoveryOptions, discover_files};
 use ts_module::{ResolutionOptions, Resolver, automatic_type_directive_names};
-use ts_options::{CompilerOptions, parse_project_options};
+use ts_options::{CompilerOptions, PrinterSettings, parse_project_options};
 use ts_parser::{ParseResult, parse_jsx_source_file, parse_source_file};
 use ts_path::{CaseSensitivity, canonicalize, directory_path, is_absolute, resolve_path};
 use ts_printer::{emit_declaration_file, emit_source_file_with_settings};
-use ts_sourcemap::SourceMap;
+use ts_sourcemap::{SourceMap, SourceMapBuilder};
 use ts_vfs::FileSystem;
 
 /// One parsed source file owned by a Program.
@@ -342,6 +342,9 @@ impl Program {
         if !settings.emit_javascript && !settings.emit_declarations {
             return output;
         }
+        if self.options.out_file.is_some() {
+            return self.emit_bundle(settings);
+        }
         let source_names = self
             .source_files
             .iter()
@@ -449,6 +452,138 @@ impl Program {
                 }
             }
         }
+        if self.options.no_emit_on_error && !output.diagnostics.is_empty() {
+            output.files.clear();
+        }
+        output
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn emit_bundle(&self, settings: PrinterSettings) -> EmitOutput {
+        let mut output = EmitOutput::default();
+        let paths = ts_outputpaths::bundle_output_paths(&self.options, &self.current_directory)
+            .expect("outFile was checked before bundle emission");
+        let sources = self
+            .source_files
+            .iter()
+            .filter(|source| {
+                !source.is_default_library && !ts_path::is_declaration_file(&source.file_name)
+            })
+            .collect::<Vec<_>>();
+
+        if settings.emit_javascript {
+            let mut code = String::new();
+            let mut map_builder = settings.source_map.then(SourceMapBuilder::new);
+            let mut map_sources = Vec::new();
+            for source in &sources {
+                let generated_line =
+                    u32::try_from(code.bytes().filter(|byte| *byte == b'\n').count())
+                        .unwrap_or(u32::MAX);
+                let mut source_settings = settings;
+                source_settings.source_map = false;
+                source_settings.inline_source_map = false;
+                source_settings.always_strict = settings.always_strict && code.is_empty();
+                match emit_source_file_with_settings(
+                    &source.parse.arena,
+                    source.parse.source_file,
+                    &source.file_name,
+                    &source.source_text,
+                    source_settings,
+                ) {
+                    Ok(emitted) => {
+                        if !emitted.code.is_empty() {
+                            if let Some(builder) = &mut map_builder {
+                                let source_index =
+                                    u32::try_from(map_sources.len()).unwrap_or(u32::MAX);
+                                let _ = builder.add_mapping(generated_line, 0, source_index, 0, 0);
+                            }
+                            map_sources.push(source.file_name.clone());
+                            code.push_str(&emitted.code);
+                        }
+                    }
+                    Err(error) => output.diagnostics.push(emit_diagnostic(source, &error)),
+                }
+            }
+            if let Some(mut map) = map_builder.map(|builder| builder.finish(None, map_sources)) {
+                let Some(file_name) = paths.javascript.as_ref() else {
+                    return output;
+                };
+                map.file = file_name.rsplit('/').next().map(str::to_owned);
+                let serialized = serialize_source_map(&map);
+                if settings.inline_source_map {
+                    code.push_str("//# sourceMappingURL=data:application/json;base64,");
+                    code.push_str(&base64_encode(serialized.as_bytes()));
+                    code.push('\n');
+                } else if let Some(map_file_name) = paths.source_map.clone() {
+                    code.push_str("//# sourceMappingURL=");
+                    code.push_str(map_file_name.rsplit('/').next().unwrap_or(&map_file_name));
+                    code.push('\n');
+                    output.files.push(OutputFile {
+                        file_name: map_file_name,
+                        text: serialized,
+                    });
+                }
+            }
+            if let Some(file_name) = paths.javascript.clone() {
+                output.files.push(OutputFile {
+                    file_name,
+                    text: code,
+                });
+            }
+        }
+
+        if settings.emit_declarations {
+            let mut code = String::new();
+            let mut map_builder = self.options.declaration_map.then(SourceMapBuilder::new);
+            let mut map_sources = Vec::new();
+            for source in &sources {
+                let generated_line =
+                    u32::try_from(code.bytes().filter(|byte| *byte == b'\n').count())
+                        .unwrap_or(u32::MAX);
+                match emit_declaration_file(
+                    &source.parse.arena,
+                    source.parse.source_file,
+                    &source.file_name,
+                    &source.source_text,
+                    false,
+                ) {
+                    Ok(emitted) => {
+                        if !emitted.code.is_empty() {
+                            if let Some(builder) = &mut map_builder {
+                                let source_index =
+                                    u32::try_from(map_sources.len()).unwrap_or(u32::MAX);
+                                let _ = builder.add_mapping(generated_line, 0, source_index, 0, 0);
+                            }
+                            map_sources.push(source.file_name.clone());
+                            code.push_str(&emitted.code);
+                        }
+                    }
+                    Err(error) => output.diagnostics.push(emit_diagnostic(source, &error)),
+                }
+            }
+            if let Some(mut map) = map_builder.map(|builder| builder.finish(None, map_sources)) {
+                let Some(file_name) = paths.declaration.as_ref() else {
+                    return output;
+                };
+                map.file = file_name.rsplit('/').next().map(str::to_owned);
+                if let Some(map_file_name) = paths.declaration_map.clone() {
+                    code.push_str("//# sourceMappingURL=");
+                    code.push_str(map_file_name.rsplit('/').next().unwrap_or(&map_file_name));
+                    code.push('\n');
+                    output.files.push(OutputFile {
+                        file_name: map_file_name,
+                        text: serialize_source_map(&map),
+                    });
+                }
+            }
+            if let Some(file_name) = paths.declaration.clone() {
+                output.files.push(OutputFile {
+                    file_name,
+                    text: code,
+                });
+            }
+        }
+
         if self.options.no_emit_on_error && !output.diagnostics.is_empty() {
             output.files.clear();
         }
@@ -916,7 +1051,7 @@ fn config_diagnostic(diagnostic: &ConfigDiagnostic) -> ProgramDiagnostic {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use ts_options::CompilerOptions;
+    use ts_options::{CompilerOptions, ModuleKind, ScriptTarget};
     use ts_vfs::{FileSystem, MemoryFileSystem};
 
     use super::Program;
@@ -1523,6 +1658,49 @@ mod tests {
             },
         );
         assert_eq!(ordinary.emit().files.len(), 1);
+    }
+
+    #[test]
+    fn out_file_concatenates_sources_once_in_root_order() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/first.ts", "const first = 1;")
+            .unwrap();
+        fs.write_file("/project/second.ts", "const second = 2;")
+            .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["second.ts".to_owned(), "first.ts".to_owned()],
+            CompilerOptions {
+                out_file: Some("dist/out.js".into()),
+                module: ModuleKind::Amd,
+                target: ScriptTarget::Es2015,
+                source_map: true,
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        let emitted = program.emit();
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        assert_eq!(emitted.files.len(), 2);
+        let javascript = emitted
+            .files
+            .iter()
+            .find(|file| file.file_name == "/project/dist/out.js")
+            .unwrap();
+        assert_eq!(
+            javascript.text,
+            "\"use strict\";\nconst second = 2;\nconst first = 1;\n//# sourceMappingURL=out.js.map\n"
+        );
+        let map = emitted
+            .files
+            .iter()
+            .find(|file| file.file_name == "/project/dist/out.js.map")
+            .unwrap();
+        assert!(
+            map.text
+                .contains("\"sources\":[\"/project/second.ts\",\"/project/first.ts\"]")
+        );
     }
 
     #[test]
@@ -2206,6 +2384,44 @@ mod tests {
             skipped.diagnostics().is_empty(),
             "{:?}",
             skipped.diagnostics()
+        );
+    }
+
+    #[test]
+    fn reports_accidental_get_accessor_calls_across_files() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/model.ts",
+            "export class Model { get value(): number { return 1; } set label(value: string) {} }",
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/main.ts",
+            r"
+                import { Model } from './model';
+                declare const model: Model;
+                const value: number = model.value;
+                const label: string = model.label;
+                model.value();
+            ",
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/tsconfig.json",
+            r#"{
+                "files": ["main.ts"],
+                "compilerOptions": { "noLib": true, "noEmit": true }
+            }"#,
+        )
+        .unwrap();
+        let program = Program::from_config(&fs, "/project/tsconfig.json");
+        assert_eq!(
+            program
+                .diagnostics()
+                .iter()
+                .filter_map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [6234]
         );
     }
 

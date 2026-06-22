@@ -117,6 +117,7 @@ pub struct CompilerOptions {
     pub source_map: bool,
     pub inline_source_map: bool,
     pub incremental: bool,
+    pub out_file: Option<String>,
     pub out_dir: Option<String>,
     pub root_dir: Option<String>,
     pub declaration_dir: Option<String>,
@@ -168,6 +169,7 @@ impl Default for CompilerOptions {
             source_map: false,
             inline_source_map: false,
             incremental: false,
+            out_file: None,
             out_dir: None,
             root_dir: None,
             declaration_dir: None,
@@ -264,6 +266,7 @@ impl CompilerOptions {
                 }
                 "nounusedlocals" => self.no_unused_locals = overrides.no_unused_locals,
                 "nounusedparameters" => self.no_unused_parameters = overrides.no_unused_parameters,
+                "outfile" => self.out_file.clone_from(&overrides.out_file),
                 "outdir" => self.out_dir.clone_from(&overrides.out_dir),
                 "rootdir" => self.root_dir.clone_from(&overrides.root_dir),
                 "skiplibcheck" => self.skip_lib_check = overrides.skip_lib_check,
@@ -369,6 +372,7 @@ pub fn parse_project_options(config: &ProjectConfig) -> ParseOptionsResult {
         }
     }
     for path in [
+        &mut result.options.out_file,
         &mut result.options.out_dir,
         &mut result.options.root_dir,
         &mut result.options.declaration_dir,
@@ -477,6 +481,7 @@ pub fn parse_compiler_options_map(options: &BTreeMap<String, JsonValue>) -> Pars
                 parsed.inline_source_map = boolean(original_name, value, &mut diagnostics);
             }
             "incremental" => parsed.incremental = boolean(original_name, value, &mut diagnostics),
+            "outfile" => parsed.out_file = string(original_name, value, &mut diagnostics),
             "outdir" => parsed.out_dir = string(original_name, value, &mut diagnostics),
             "rootdir" => parsed.root_dir = string(original_name, value, &mut diagnostics),
             "declarationdir" => {
@@ -548,6 +553,7 @@ struct PartialOptions {
     source_map: Option<bool>,
     inline_source_map: Option<bool>,
     incremental: Option<bool>,
+    out_file: Option<String>,
     out_dir: Option<String>,
     root_dir: Option<String>,
     declaration_dir: Option<String>,
@@ -564,7 +570,11 @@ impl PartialOptions {
         let check_js = self.check_js.unwrap_or(false);
         let strict = self.strict.unwrap_or(false);
         let emit_declaration_only = self.emit_declaration_only.unwrap_or(false);
-        let module = self.module.unwrap_or_default();
+        let module = self.module.unwrap_or(if self.out_file.is_some() {
+            ModuleKind::None
+        } else {
+            ModuleKind::default()
+        });
         let module_resolution = self
             .module_resolution
             .unwrap_or_else(|| default_module_resolution(module));
@@ -613,6 +623,7 @@ impl PartialOptions {
             source_map: self.source_map.unwrap_or(false),
             inline_source_map: self.inline_source_map.unwrap_or(false),
             incremental: self.incremental.unwrap_or(false),
+            out_file: self.out_file,
             out_dir: self.out_dir,
             root_dir: self.root_dir,
             declaration_dir: self.declaration_dir,
@@ -656,6 +667,16 @@ fn validate_options(options: &PartialOptions, diagnostics: &mut Vec<Diagnostic>)
             5052,
             ["exactOptionalPropertyTypes", "strictNullChecks"],
         ));
+    }
+    if options.out_file.is_some()
+        && options.module.is_some_and(|module| {
+            !matches!(
+                module,
+                ModuleKind::None | ModuleKind::Amd | ModuleKind::System
+            )
+        })
+    {
+        diagnostics.push(diagnostic(6082, ["outFile"]));
     }
 
     let (Some(module), Some(resolution)) = (options.module, options.module_resolution) else {
@@ -1145,6 +1166,41 @@ mod tests {
             Some("/repo/.cache/project.tsbuildinfo")
         );
         assert!(result.options.printer_settings().source_map);
+    }
+
+    #[test]
+    fn parses_and_resolves_out_file() {
+        let config = parse_config_text(
+            "/repo/tsconfig.json",
+            r#"{
+                "compilerOptions": {
+                    "module": "amd",
+                    "outFile": "dist/bundle.js"
+                }
+            }"#,
+        )
+        .value
+        .unwrap();
+        let result = parse_project_options(&config);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert_eq!(
+            result.options.out_file.as_deref(),
+            Some("/repo/dist/bundle.js")
+        );
+        assert_eq!(result.options.module, ModuleKind::Amd);
+
+        let invalid = parse_compiler_options(&object([
+            ("module", JsonValue::String("commonjs".into())),
+            ("outFile", JsonValue::String("bundle.js".into())),
+        ]));
+        assert_eq!(
+            invalid
+                .diagnostics
+                .iter()
+                .map(ts_diagnostics::Diagnostic::code)
+                .collect::<Vec<_>>(),
+            [6082]
+        );
     }
 
     #[test]

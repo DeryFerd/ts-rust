@@ -5,7 +5,7 @@
 //! as name/value metadata for the compiler harness.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt, fs,
     io::{self, Write},
     ops::Range,
@@ -274,7 +274,8 @@ pub fn run_upstream_baselines(
                 }
                 baseline.push_str(&text);
             }
-            let comparison = compare_emitted_output_sections(&compilation.outputs, &baseline);
+            let comparison =
+                compare_case_emitted_output_sections(&compilation.outputs, &baseline, &case);
             if comparison.is_match() {
                 summary.matched += 1;
             } else {
@@ -375,10 +376,35 @@ pub fn compare_emitted_output_sections(
     outputs: &BTreeMap<String, String>,
     baseline: &str,
 ) -> BaselineComparison {
+    compare_emitted_output_sections_excluding(outputs, baseline, &BTreeSet::new())
+}
+
+fn compare_case_emitted_output_sections(
+    outputs: &BTreeMap<String, String>,
+    baseline: &str,
+    case: &Case,
+) -> BaselineComparison {
+    let declaration_inputs = case
+        .units
+        .iter()
+        .filter_map(|unit| {
+            let path = unit.path.to_string_lossy().replace('\\', "/");
+            ts_path::is_declaration_file(&path).then(|| normalize_section_name(&path))
+        })
+        .collect::<BTreeSet<_>>();
+    compare_emitted_output_sections_excluding(outputs, baseline, &declaration_inputs)
+}
+
+fn compare_emitted_output_sections_excluding(
+    outputs: &BTreeMap<String, String>,
+    baseline: &str,
+    excluded_expected: &BTreeSet<String>,
+) -> BaselineComparison {
     let expected = parse_baseline_sections(baseline)
         .into_iter()
         .filter(|(name, _)| is_emitted_section(name))
         .map(|(name, text)| (normalize_section_name(&name), normalize_newlines(&text)))
+        .filter(|(name, _)| !excluded_expected.contains(name))
         .collect::<BTreeMap<_, _>>();
     let actual = outputs
         .iter()
@@ -454,7 +480,8 @@ pub fn run_case_against_baseline(case: &Case, baseline: &str) -> std::io::Result
     compile_case_matrix(case)?
         .into_iter()
         .map(|(variant, compilation)| {
-            let comparison = compare_emitted_output_sections(&compilation.outputs, baseline);
+            let comparison =
+                compare_case_emitted_output_sections(&compilation.outputs, baseline, case);
             Ok(BaselineRun {
                 variant,
                 compilation,
@@ -591,6 +618,7 @@ const SCALAR_OPTION_NAMES: &[&str] = &[
     "noLib",
     "noUnusedLocals",
     "noUnusedParameters",
+    "outFile",
     "outDir",
     "resolveJsonModule",
     "rootDir",
@@ -1124,6 +1152,37 @@ mod tests {
         assert_eq!(sections.len(), 2);
         assert_eq!(sections["input.ts"], "const value: number = 1;\n");
         assert_eq!(sections["input.js"], "const value = 1;\n");
+    }
+
+    #[test]
+    fn compiles_out_file_directives_to_one_output() {
+        let case = Case::parse(
+            "bundle.ts",
+            concat!(
+                "// @module: amd\n",
+                "// @target: es2015\n",
+                "// @outFile: out.js\n",
+                "// @noLib: true\n",
+                "// @filename: first.ts\n",
+                "const first = 1;\n",
+                "// @filename: types.d.ts\n",
+                "declare const ambient: string;\n",
+                "// @filename: second.ts\n",
+                "const second = 2;\n",
+            ),
+        )
+        .unwrap();
+        let compilation = compile_case(&case).unwrap();
+        assert!(
+            compilation.diagnostics.is_empty(),
+            "{:?}",
+            compilation.diagnostics
+        );
+        assert_eq!(compilation.outputs.len(), 1);
+        assert_eq!(
+            compilation.outputs["/case/out.js"],
+            "\"use strict\";\nconst first = 1;\nconst second = 2;\n"
+        );
     }
 
     #[test]
