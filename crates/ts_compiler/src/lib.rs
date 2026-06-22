@@ -1425,6 +1425,47 @@ mod tests {
     }
 
     #[test]
+    fn reports_enum_and_advanced_type_operator_diagnostics() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/advanced-types.ts",
+            r#"
+                enum State { Ready, Running = 3, Finished }
+                type Record = { id: number; label: string };
+                type Keys = keyof Record;
+                type Values = Record[Keys];
+                type Element<T> = T extends readonly (infer U)[] ? U : never;
+                type Labels<T> = {
+                    [K in keyof T as K extends "id" ? never : K]: T[K]
+                };
+                const state: State = "Ready";
+                const key: Keys = "missing";
+                const value: Values = false;
+                const element: Element<string[]> = 1;
+                const labels: Labels<Record> = { label: "ok", id: 1 };
+            "#,
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/",
+            &["advanced-types.ts".to_owned()],
+            CompilerOptions {
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        assert_eq!(
+            program
+                .diagnostics()
+                .iter()
+                .filter_map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [2322, 2322, 2322, 2322, 2353]
+        );
+    }
+
+    #[test]
     fn no_check_skips_semantic_diagnostics() {
         let fs = MemoryFileSystem::new(true);
         fs.write_file("/type-error.ts", "const value: string = 1;")
@@ -1640,7 +1681,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             declaration.text,
-            "export declare const version: number;\nexport declare function identity<T>(value: T): T;\nexport interface Box<T> {\n  value: T;\n}\nexport type Maybe<T> = T | undefined;\nexport declare enum Color {\n  Red,\n  Blue = 2,\n}\n//# sourceMappingURL=api.d.mts.map\n"
+            "export declare const version: number;\nexport declare function identity<T>(value: T): T;\nexport interface Box<T> {\n    value: T;\n}\nexport type Maybe<T> = T | undefined;\nexport declare enum Color {\n    Red,\n    Blue = 2,\n}\n//# sourceMappingURL=api.d.mts.map\n"
         );
         assert!(
             emitted

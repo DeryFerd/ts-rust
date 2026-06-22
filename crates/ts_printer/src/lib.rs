@@ -791,6 +791,7 @@ impl DeclarationPrinter<'_> {
             NodeData::NumericLiteral(data) => self.writer.write(&data.text),
             NodeData::BigIntLiteral(data) => self.writer.write(&data.text),
             NodeData::StringLiteral(data) => write_quoted(&mut self.writer, &data.text),
+            NodeData::RegularExpressionLiteral(data) => self.writer.write(&data.text),
             NodeData::NoSubstitutionTemplateLiteral(data) => {
                 self.writer.write("`");
                 self.writer.write(&data.raw_text);
@@ -1005,8 +1006,8 @@ impl Writer {
     fn write(&mut self, text: &str) {
         if self.line_start {
             for _ in 0..self.indent {
-                self.output.push_str("  ");
-                self.column += 2;
+                self.output.push_str("    ");
+                self.column += 4;
             }
             self.line_start = false;
         }
@@ -1038,7 +1039,7 @@ impl Writer {
         let column = if self.line_start {
             u32::try_from(self.indent)
                 .unwrap_or(u32::MAX)
-                .saturating_mul(2)
+                .saturating_mul(4)
         } else {
             self.column
         };
@@ -1517,6 +1518,10 @@ impl Printer<'_> {
         let NodeData::Block(data) = &node.data else {
             return Err(Self::unsupported(id, node.kind));
         };
+        if data.statements.nodes.is_empty() && !data.multi_line {
+            self.writer.write("{ }");
+            return Ok(());
+        }
         self.writer.write("{");
         self.writer.newline();
         self.writer.indent += 1;
@@ -1742,16 +1747,24 @@ impl Printer<'_> {
         data: &ts_ast::ClassDeclarationData,
         has_base: bool,
     ) -> Result<(), EmitError> {
-        self.writer.write("constructor");
-        self.emit_parameters(&method.parameters)?;
-        self.writer.write(" {");
-        self.writer.newline();
-        self.writer.indent += 1;
         let body_id = method.body.expect("constructor body checked");
         let body = self.node(body_id)?.clone();
         let NodeData::Block(body) = &body.data else {
             return Err(Self::unsupported(body_id, body.kind));
         };
+        self.writer.write("constructor");
+        self.emit_parameters(&method.parameters)?;
+        if body.statements.nodes.is_empty()
+            && !body.multi_line
+            && !self.has_instance_field_initializers(data)
+        {
+            self.writer.write(" { }");
+            self.writer.newline();
+            return Ok(());
+        }
+        self.writer.write(" {");
+        self.writer.newline();
+        self.writer.indent += 1;
         if !has_base {
             self.emit_instance_fields(data, "this")?;
         }
@@ -2523,6 +2536,7 @@ impl Printer<'_> {
             NodeData::NumericLiteral(data) => self.writer.write(&data.text),
             NodeData::BigIntLiteral(data) => self.writer.write(&data.text),
             NodeData::StringLiteral(data) => write_quoted(&mut self.writer, &data.text),
+            NodeData::RegularExpressionLiteral(data) => self.writer.write(&data.text),
             NodeData::KeywordExpression(_) => {
                 if node.kind == SyntaxKind::ThisKeyword
                     && let Some(alias) = self.this_alias
@@ -3861,7 +3875,7 @@ mod tests {
             emit(
                 "interface Shape { area(): number; } type Id<T> = T; const answer: number = 42; function add<T>(a: number, b?: number): number { return a + b; }"
             ),
-            "const answer = 42;\nfunction add(a, b) {\n  return a + b;\n}\n"
+            "const answer = 42;\nfunction add(a, b) {\n    return a + b;\n}\n"
         );
     }
 
@@ -3871,7 +3885,7 @@ mod tests {
             emit(
                 "class Counter extends Base implements Shape { value: number = 0; inc(step: number) { value = value + step; } } let i: number = 0; while (i < 2) { i = i + 1; } for (let j: number = 0; j < 2; j = j + 1) { i = i + j; }"
             ),
-            "class Counter extends Base {\n  value = 0;\n  inc(step) {\n    value = value + step;\n  }\n}\nlet i = 0;\nwhile (i < 2) {\n  i = i + 1;\n}\nfor (let j = 0; j < 2; j = j + 1) {\n  i = i + j;\n}\n"
+            "class Counter extends Base {\n    value = 0;\n    inc(step) {\n        value = value + step;\n    }\n}\nlet i = 0;\nwhile (i < 2) {\n    i = i + 1;\n}\nfor (let j = 0; j < 2; j = j + 1) {\n    i = i + j;\n}\n"
         );
     }
 
@@ -3881,7 +3895,7 @@ mod tests {
             emit(
                 "let i = 0; do { i++; if (i === 1) continue; } while (i < 2); switch (i) { case 2: i = 3; break; default: i = 4; } try { throw i; } catch (error: unknown) { i = 5; } finally { i = 6; }"
             ),
-            "let i = 0;\ndo {\n  i++;\n  if (i === 1) {\n    continue;\n  }\n} while (i < 2);\nswitch (i) {\n  case 2:\n    i = 3;\n    break;\n  default:\n    i = 4;\n}\ntry {\n  throw i;\n} catch (error) {\n  i = 5;\n} finally {\n  i = 6;\n}\n"
+            "let i = 0;\ndo {\n    i++;\n    if (i === 1) {\n        continue;\n    }\n} while (i < 2);\nswitch (i) {\n    case 2:\n        i = 3;\n        break;\n    default:\n        i = 4;\n}\ntry {\n    throw i;\n} catch (error) {\n    i = 5;\n} finally {\n    i = 6;\n}\n"
         );
     }
 
@@ -3889,7 +3903,7 @@ mod tests {
     fn prints_labeled_debugger_and_with_statements() {
         assert_eq!(
             emit("outer: while (value) { debugger; break outer; } with (obj) value;"),
-            "outer: while (value) {\n  debugger;\n  break outer;\n}\nwith (obj) {\n  value;\n}\n"
+            "outer: while (value) {\n    debugger;\n    break outer;\n}\nwith (obj) {\n    value;\n}\n"
         );
     }
 
@@ -3948,10 +3962,18 @@ mod tests {
     }
 
     #[test]
+    fn preserves_regular_expression_literals() {
+        assert_eq!(
+            emit("const first = /a[b\\/]c+/giu; const second = /=foo/;"),
+            "const first = /a[b\\/]c+/giu;\nconst second = /=foo/;\n"
+        );
+    }
+
+    #[test]
     fn emits_enums_deterministically() {
         assert_eq!(
             emit("enum Color { Red, Green = 4, Blue, Label = 'blue' }"),
-            "var Color;\n(function (Color) {\n  Color[Color[\"Red\"] = 0] = \"Red\";\n  Color[Color[\"Green\"] = 4] = \"Green\";\n  Color[Color[\"Blue\"] = 5] = \"Blue\";\n  Color[\"Label\"] = \"blue\";\n})(Color || (Color = {}));\n"
+            "var Color;\n(function (Color) {\n    Color[Color[\"Red\"] = 0] = \"Red\";\n    Color[Color[\"Green\"] = 4] = \"Green\";\n    Color[Color[\"Blue\"] = 5] = \"Blue\";\n    Color[\"Label\"] = \"blue\";\n})(Color || (Color = {}));\n"
         );
     }
 
@@ -3974,7 +3996,7 @@ mod tests {
             emit(
                 "async function* stream(source) { await source?.next?.(); yield* source?.[0]!; } class Box { #value = 1; static count = 0; *values() { yield this.#value; } async read() { return await this.#value; } static { this.count++; } } for await (const item of items) { item; } const { first, ...rest } = input; const [head, ...tail] = items; const copy = { first, ...rest, async run() { await task; }, *iter() { yield 1; } }; const values = [0, ...items]; const typed = (value as number)! satisfies number; const run = async (value) => await value; import data from 'pkg' with { type: 'json' }; export { data } from 'pkg' with { type: 'json' };"
             ),
-            "async function* stream(source) {\n  await source?.next?.();\n  yield* source?.[0];\n}\nclass Box {\n  #value = 1;\n  static count = 0;\n  *values() {\n    yield this.#value;\n  }\n  async read() {\n    return await this.#value;\n  }\n  static {\n    this.count++;\n  }\n}\nfor await (const item of items) {\n  item;\n}\nconst {first, ...rest} = input;\nconst [head, ...tail] = items;\nconst copy = { first, ...rest, async run() {\n  await task;\n}, *iter() {\n  yield 1;\n} };\nconst values = [0, ...items];\nconst typed = (value);\nconst run = async (value) => await value;\nimport data from \"pkg\" with { type: \"json\" };\nexport { data } from \"pkg\" with { type: \"json\" };\n"
+            "async function* stream(source) {\n    await source?.next?.();\n    yield* source?.[0];\n}\nclass Box {\n    #value = 1;\n    static count = 0;\n    *values() {\n        yield this.#value;\n    }\n    async read() {\n        return await this.#value;\n    }\n    static {\n        this.count++;\n    }\n}\nfor await (const item of items) {\n    item;\n}\nconst {first, ...rest} = input;\nconst [head, ...tail] = items;\nconst copy = { first, ...rest, async run() {\n    await task;\n}, *iter() {\n    yield 1;\n} };\nconst values = [0, ...items];\nconst typed = (value);\nconst run = async (value) => await value;\nimport data from \"pkg\" with { type: \"json\" };\nexport { data } from \"pkg\" with { type: \"json\" };\n"
         );
     }
 
@@ -4000,7 +4022,7 @@ mod tests {
         );
         assert_eq!(
             result.code,
-            "var __extends = (this && this.__extends) || (function () {\n  var extendStatics = function (d, b) {\n    extendStatics = Object.setPrototypeOf ||\n      ({ __proto__: [] } instanceof Array && function (d, b) { d.__proto__ = b; }) ||\n      function (d, b) { for (var p in b) if (Object.prototype.hasOwnProperty.call(b, p)) d[p] = b[p]; };\n    return extendStatics(d, b);\n  };\n  return function (d, b) {\n    if (typeof b !== \"function\" && b !== null)\n      throw new TypeError(\"Class extends value \" + String(b) + \" is not a constructor or null\");\n    extendStatics(d, b);\n    function __() { this.constructor = d; }\n    d.prototype = b === null ? Object.create(b) : (__.prototype = b.prototype, new __());\n  };\n})();\nvar Point = /** @class */ (function () {\n  function Point(y) {\n    this.x = 1;\n    this.y = y;\n  }\n  Point.prototype.move = function (d) {\n    this.x = this.x + d;\n  };\n  Point.make = function () {\n    return new Point(0);\n  };\n  Point.origin = 0;\n  return Point;\n}());\nvar ColoredPoint = /** @class */ (function (_super) {\n  __extends(ColoredPoint, _super);\n  function ColoredPoint(y) {\n    var _this = _super.call(this, y) || this;\n    _this.color = \"red\";\n    _this.color = \"blue\";\n    return _this;\n  }\n  ColoredPoint.prototype.paint = function () {\n    return this.color;\n  };\n  return ColoredPoint;\n}(Point));\n"
+            "var __extends = (this && this.__extends) || (function () {\n    var extendStatics = function (d, b) {\n        extendStatics = Object.setPrototypeOf ||\n            ({ __proto__: [] } instanceof Array && function (d, b) { d.__proto__ = b; }) ||\n            function (d, b) { for (var p in b) if (Object.prototype.hasOwnProperty.call(b, p)) d[p] = b[p]; };\n        return extendStatics(d, b);\n    };\n    return function (d, b) {\n        if (typeof b !== \"function\" && b !== null)\n            throw new TypeError(\"Class extends value \" + String(b) + \" is not a constructor or null\");\n        extendStatics(d, b);\n        function __() { this.constructor = d; }\n        d.prototype = b === null ? Object.create(b) : (__.prototype = b.prototype, new __());\n    };\n})();\nvar Point = /** @class */ (function () {\n    function Point(y) {\n        this.x = 1;\n        this.y = y;\n    }\n    Point.prototype.move = function (d) {\n        this.x = this.x + d;\n    };\n    Point.make = function () {\n        return new Point(0);\n    };\n    Point.origin = 0;\n    return Point;\n}());\nvar ColoredPoint = /** @class */ (function (_super) {\n    __extends(ColoredPoint, _super);\n    function ColoredPoint(y) {\n        var _this = _super.call(this, y) || this;\n        _this.color = \"red\";\n        _this.color = \"blue\";\n        return _this;\n    }\n    ColoredPoint.prototype.paint = function () {\n        return this.color;\n    };\n    return ColoredPoint;\n}(Point));\n"
         );
     }
 
@@ -4013,7 +4035,7 @@ mod tests {
         );
         assert_eq!(
             result.code,
-            "class Box {\n  constructor() {\n    this.value = 1;\n  }\n  read() {\n    return this.value;\n  }\n}\n"
+            "class Box {\n    constructor() {\n        this.value = 1;\n    }\n    read() {\n        return this.value;\n    }\n}\n"
         );
     }
 
@@ -4026,7 +4048,7 @@ mod tests {
         );
         assert_eq!(
             result.code,
-            "class Box extends Base {\n  constructor(name) {\n    super(name);\n    this.value = 1;\n    this.ready = true;\n  }\n}\nBox.count = 2;\n"
+            "class Box extends Base {\n    constructor(name) {\n        super(name);\n        this.value = 1;\n        this.ready = true;\n    }\n}\nBox.count = 2;\n"
         );
     }
 
@@ -4039,7 +4061,7 @@ mod tests {
         );
         assert_eq!(
             result.code,
-            "class Box {\n  value = 1;\n  static count = 2;\n}\n"
+            "class Box {\n    value = 1;\n    static count = 2;\n}\n"
         );
     }
 
@@ -4073,7 +4095,7 @@ class Board {
         .unwrap();
         assert_eq!(
             result.code,
-            "\"use strict\";\nclass Cell {\n}\nclass Ship {\n  constructor() {\n    this.isSunk = false;\n  }\n}\nclass Board {\n  constructor() {\n    this.ships = [];\n    this.cells = [];\n  }\n}\n"
+            "\"use strict\";\nclass Cell {\n}\nclass Ship {\n    constructor() {\n        this.isSunk = false;\n    }\n}\nclass Board {\n    constructor() {\n        this.ships = [];\n        this.cells = [];\n    }\n}\n"
         );
     }
 
@@ -4134,7 +4156,7 @@ class Board {
         );
         assert_eq!(
             result.code,
-            "export const value = 1;\nexport default function read() {\n  return value;\n}\n"
+            "export const value = 1;\nexport default function read() {\n    return value;\n}\n"
         );
     }
 
@@ -4206,7 +4228,7 @@ class Board {
         );
         assert_eq!(
             result.code,
-            "class Numeric {\n  1() {\n  }\n}\nclass StringNamed {\n  \"bar\"() {\n  }\n}\n"
+            "class Numeric {\n    1() { }\n}\nclass StringNamed {\n    \"bar\"() { }\n}\n"
         );
     }
 
@@ -4280,7 +4302,7 @@ class Board {
                 .unwrap();
         assert_eq!(
             result.code,
-            "import { Input } from \"./types\";\nexport declare const version: number;\nexport declare function identity<T>(value: T): T;\nexport declare function parse(value: string): string;\nexport declare class Store<T> {\n  value: T;\n  read(input: T): T;\n}\nexport interface Box<T> {\n  value: T;\n}\nexport type Maybe<T> = T | undefined;\nexport declare enum Color {\n  Red,\n  Blue = 2,\n}\nexport declare namespace Helpers {\n  export declare function read(value: string): string;\n}\nexport { Input };\n"
+            "import { Input } from \"./types\";\nexport declare const version: number;\nexport declare function identity<T>(value: T): T;\nexport declare function parse(value: string): string;\nexport declare class Store<T> {\n    value: T;\n    read(input: T): T;\n}\nexport interface Box<T> {\n    value: T;\n}\nexport type Maybe<T> = T | undefined;\nexport declare enum Color {\n    Red,\n    Blue = 2,\n}\nexport declare namespace Helpers {\n    export declare function read(value: string): string;\n}\nexport { Input };\n"
         );
         assert!(result.source_map.is_some());
     }
