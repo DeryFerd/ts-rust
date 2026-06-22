@@ -290,6 +290,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ts_jsonrpc"
+version = "7.0.0-dev"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ts_module"
 version = "7.0.0-dev"
 dependencies = [

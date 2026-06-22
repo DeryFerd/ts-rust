@@ -10,6 +10,7 @@ members = [
     "crates/ts_module",
     "crates/ts_glob",
     "crates/ts_jsnum",
+    "crates/ts_jsonrpc",
     "crates/ts_options",
     "crates/ts_outputpaths",
     "crates/ts_printer",

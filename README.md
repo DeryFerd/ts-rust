@@ -18,6 +18,7 @@ against the upstream TypeScript fixtures independently:
 - `ts_semver`: npm-style semantic versions and package range matching
 - `ts_jsnum`: JavaScript number operations, formatting, and pseudo-bigints
 - `ts_evaluator`: compile-time expression and constant evaluation
+- `ts_jsonrpc`: typed JSON-RPC messages and LSP protocol framing
 - `ts_compiler`: Program graph, diagnostics, checking, and emit orchestration
 - `ts_printer` / `ts_sourcemap`: target-aware JavaScript and source-map emission
 - `ts_bundled`: the pinned TypeScript default-library declarations
