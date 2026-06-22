@@ -175,6 +175,10 @@ pub struct RunnerSummary {
     pub matched: usize,
     pub mismatched: usize,
     pub missing: usize,
+    pub content_differences: usize,
+    pub missing_sections: usize,
+    pub unexpected_sections: usize,
+    pub diagnostic_failures: usize,
 }
 
 impl RunnerSummary {
@@ -273,19 +277,21 @@ pub fn run_upstream_baselines(
                 summary.matched += 1;
             } else {
                 summary.mismatched += 1;
-                let difference = &comparison.differences[0];
-                writeln!(
-                    writer,
-                    "MISMATCH {display_path}{label}: {}",
-                    describe_difference(difference)
-                )?;
+                let description = record_mismatch(&mut summary, &comparison, &compilation);
+                writeln!(writer, "MISMATCH {display_path}{label}: {description}")?;
             }
         }
     }
     writeln!(
         writer,
-        "summary: matched={} mismatched={} missing={}",
-        summary.matched, summary.mismatched, summary.missing
+        "summary: matched={} mismatched={} missing={} content={} missing_sections={} unexpected_sections={} diagnostics={}",
+        summary.matched,
+        summary.mismatched,
+        summary.missing,
+        summary.content_differences,
+        summary.missing_sections,
+        summary.unexpected_sections,
+        summary.diagnostic_failures,
     )?;
     Ok(summary)
 }
@@ -462,7 +468,9 @@ fn compile_case_variant(case: &Case, variant: &OptionVariant) -> std::io::Result
     for (index, unit) in case.units.iter().enumerate() {
         let path = virtual_unit_path(case, unit, index);
         file_system.write_file(&path, unit.source_text.as_scannable_str())?;
-        roots.push(path);
+        if is_compilation_unit(&path) {
+            roots.push(path);
+        }
     }
 
     let mut compiler_options = fixture_compiler_options(variant);
@@ -475,10 +483,10 @@ fn compile_case_variant(case: &Case, variant: &OptionVariant) -> std::io::Result
     let program =
         ts_compiler::Program::new_with_options(&file_system, "/case", &roots, compiler_options);
     let emit = program.emit();
-    let diagnostics = program
-        .diagnostics()
+    let diagnostics = emit
+        .diagnostics
         .iter()
-        .chain(&emit.diagnostics)
+        .chain(program.diagnostics())
         .map(|diagnostic| CompilationDiagnostic {
             file_name: diagnostic.file_name.clone(),
             code: diagnostic.code,
@@ -510,6 +518,13 @@ fn virtual_unit_path(case: &Case, unit: &Unit, index: usize) -> String {
         return ts_path::normalize_path(&path);
     }
     ts_path::resolve_path("/case", &[&path])
+}
+
+fn is_compilation_unit(path: &str) -> bool {
+    let path = path.to_ascii_lowercase();
+    [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"]
+        .iter()
+        .any(|extension| path.ends_with(extension))
 }
 
 fn fixture_compiler_options(variant: &OptionVariant) -> ts_options::CompilerOptions {
@@ -548,6 +563,7 @@ fn directive_json_value(name: &str, value: &str) -> ts_config::JsonValue {
 }
 
 const SCALAR_OPTION_NAMES: &[&str] = &[
+    "alwaysStrict",
     "allowJs",
     "allowSyntheticDefaultImports",
     "checkJs",
@@ -754,6 +770,45 @@ fn describe_difference(difference: &OutputDifference) -> String {
             )
         }
     }
+}
+
+fn describe_compilation_diagnostic(diagnostic: &CompilationDiagnostic) -> String {
+    let code = diagnostic
+        .code
+        .map_or_else(|| "no code".to_owned(), |code| format!("TS{code}"));
+    let file = diagnostic.file_name.as_deref().unwrap_or("<global>");
+    format!("diagnostic {code} {file}: {}", diagnostic.message)
+}
+
+fn record_mismatch(
+    summary: &mut RunnerSummary,
+    comparison: &BaselineComparison,
+    compilation: &Compilation,
+) -> String {
+    let has_missing_section = comparison
+        .differences
+        .iter()
+        .any(|difference| matches!(&difference.kind, OutputDifferenceKind::Missing { .. }));
+    let diagnostic = has_missing_section
+        .then(|| compilation.diagnostics.first())
+        .flatten();
+    if diagnostic.is_some() {
+        summary.diagnostic_failures += 1;
+    }
+    for difference in &comparison.differences {
+        match &difference.kind {
+            OutputDifferenceKind::Content { .. } => summary.content_differences += 1,
+            OutputDifferenceKind::Missing { .. } if diagnostic.is_none() => {
+                summary.missing_sections += 1;
+            }
+            OutputDifferenceKind::Unexpected { .. } => summary.unexpected_sections += 1,
+            OutputDifferenceKind::Missing { .. } => {}
+        }
+    }
+    diagnostic.map_or_else(
+        || describe_difference(&comparison.differences[0]),
+        describe_compilation_diagnostic,
+    )
 }
 
 fn first_different_line<'a>(expected: &'a str, actual: &'a str) -> (usize, &'a str, &'a str) {
@@ -1028,7 +1083,7 @@ mod tests {
         assert_eq!(compilation.outputs.len(), 2);
         assert_eq!(
             compilation.outputs["/case/a.js"],
-            "export const value = 1;\n"
+            "\"use strict\";\nexport const value = 1;\n"
         );
         assert!(compilation.outputs["/case/b.js"].contains("result = value + 1"));
     }
@@ -1134,8 +1189,11 @@ mod tests {
             "// @target: esnext\n// @noLib: true\nconst value: number = 1;\n",
         )
         .unwrap();
-        let runs =
-            run_case_against_baseline(&case, "//// [simple.js] ////\nconst value = 1;\n").unwrap();
+        let runs = run_case_against_baseline(
+            &case,
+            "//// [simple.js] ////\n\"use strict\";\nconst value = 1;\n",
+        )
+        .unwrap();
         assert_eq!(runs.len(), 1);
         assert!(runs[0].comparison.is_match());
     }

@@ -67,15 +67,15 @@ fn filters_limits_and_reports_matches() {
     let repository = TestRepository::new();
     repository.write_case(
         "matching",
-        "// @target: esnext\n// @noLib: true\nconst value: number = 1;\n",
-        Some("//// [matching.js] ////\nconst value = 1;\n"),
+        "// @target: esnext\n// @module: esnext\n// @noLib: true\nconst value: number = 1;\n",
+        Some("//// [matching.js] ////\n\"use strict\";\nconst value = 1;\n"),
     );
     repository.write_case("ignored", "// @noLib: true\nconst ignored = 1;\n", None);
     let output = run(&repository.0, &["--filter", "matching", "--limit", "1"]);
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        "summary: matched=1 mismatched=0 missing=0\n"
+        "summary: matched=1 mismatched=0 missing=0 content=0 missing_sections=0 unexpected_sections=0 diagnostics=0\n"
     );
 }
 
@@ -84,17 +84,19 @@ fn reports_the_first_actionable_mismatch() {
     let repository = TestRepository::new();
     repository.write_case(
         "mismatch",
-        "// @target: esnext\n// @noLib: true\nconst value: number = 1;\n",
-        Some("//// [mismatch.js] ////\nconst value = 2;\n"),
+        "// @target: esnext\n// @module: esnext\n// @noLib: true\nconst value: number = 1;\n",
+        Some("//// [mismatch.js] ////\n\"use strict\";\nconst value = 2;\n"),
     );
     let output = run(&repository.0, &[]);
     assert_eq!(output.status.code(), Some(1));
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("MISMATCH tests/cases/compiler/mismatch.ts"));
-    assert!(stdout.contains("differs at line 1"));
+    assert!(stdout.contains("differs at line 2"));
     assert!(stdout.contains("expected \"const value = 2;\""));
     assert!(stdout.contains("actual \"const value = 1;\""));
-    assert!(stdout.contains("summary: matched=0 mismatched=1 missing=0"));
+    assert!(stdout.contains(
+        "summary: matched=0 mismatched=1 missing=0 content=1 missing_sections=0 unexpected_sections=0 diagnostics=0"
+    ));
 }
 
 #[test]
@@ -105,7 +107,9 @@ fn reports_missing_baselines() {
     assert_eq!(output.status.code(), Some(1));
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("MISSING tests/cases/compiler/missing.ts"));
-    assert!(stdout.contains("summary: matched=0 mismatched=0 missing=1"));
+    assert!(stdout.contains(
+        "summary: matched=0 mismatched=0 missing=1 content=0 missing_sections=0 unexpected_sections=0 diagnostics=0"
+    ));
 }
 
 #[test]
@@ -113,16 +117,16 @@ fn compiles_and_matches_option_variants() {
     let repository = TestRepository::new();
     repository.write_case(
         "matrix",
-        "// @target: es5, esnext\n// @noLib: true\nconst value = 1;\n",
+        "// @target: es5, esnext\n// @module: esnext\n// @noLib: true\nconst value = 1;\n",
         None,
     );
     repository.write_baseline(
         "matrix(target=es5).js",
-        "//// [matrix.js] ////\nvar value = 1;\n",
+        "//// [matrix.js] ////\n\"use strict\";\nvar value = 1;\n",
     );
     repository.write_baseline(
         "matrix(target=esnext).js",
-        "//// [matrix.js] ////\nconst value = 1;\n",
+        "//// [matrix.js] ////\n\"use strict\";\nconst value = 1;\n",
     );
     let output = run(&repository.0, &[]);
     assert!(
@@ -132,6 +136,75 @@ fn compiles_and_matches_option_variants() {
     );
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        "summary: matched=2 mismatched=0 missing=0\n"
+        "summary: matched=2 mismatched=0 missing=0 content=0 missing_sections=0 unexpected_sections=0 diagnostics=0\n"
+    );
+}
+
+#[test]
+fn reports_compilation_diagnostic_for_missing_emitted_section() {
+    let repository = TestRepository::new();
+    repository.write_case(
+        "diagnostic",
+        concat!(
+            "// @noLib: true\n",
+            "// @noEmitOnError: true\n",
+            "const value: string = 1;\n",
+        ),
+        Some("//// [diagnostic.js] ////\nvar value = 1;\n"),
+    );
+    let output = run(&repository.0, &[]);
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("MISMATCH tests/cases/compiler/diagnostic.ts: diagnostic TS2322"));
+    assert!(stdout.contains("/case/diagnostic.ts"));
+    assert!(stdout.contains("Type '1' is not assignable to type 'string'."));
+    assert!(stdout.contains(
+        "summary: matched=0 mismatched=1 missing=0 content=0 missing_sections=0 unexpected_sections=0 diagnostics=1"
+    ));
+}
+
+#[test]
+fn prioritizes_emit_diagnostic_for_unsupported_output() {
+    let repository = TestRepository::new();
+    repository.write_case(
+        "unsupported",
+        "// @noLib: true\nimport ts = require('typescript');\n",
+        Some("//// [unsupported.js] ////\nvar ts = require('typescript');\n"),
+    );
+    let output = run(&repository.0, &[]);
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("diagnostic no code /case/unsupported.ts"));
+    assert!(stdout.contains("unsupported ImportEqualsDeclaration node"));
+    assert!(stdout.contains("diagnostics=1"));
+}
+
+#[test]
+fn counts_missing_and_unexpected_output_sections() {
+    let repository = TestRepository::new();
+    repository.write_case(
+        "missingSection",
+        "// @noEmit: true\nconst value = 1;\n",
+        Some("//// [missingSection.js] ////\nvar value = 1;\n"),
+    );
+    let missing = run(&repository.0, &["--filter", "missingSection"]);
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(
+        String::from_utf8(missing.stdout)
+            .unwrap()
+            .contains("content=0 missing_sections=1 unexpected_sections=0 diagnostics=0")
+    );
+
+    repository.write_case(
+        "unexpectedSection",
+        "// @declaration: true\nconst value = 1;\n",
+        Some("//// [unexpectedSection.js] ////\n\"use strict\";\nvar value = 1;\n"),
+    );
+    let unexpected = run(&repository.0, &["--filter", "unexpectedSection"]);
+    assert_eq!(unexpected.status.code(), Some(1));
+    assert!(
+        String::from_utf8(unexpected.stdout)
+            .unwrap()
+            .contains("content=0 missing_sections=0 unexpected_sections=1 diagnostics=0")
     );
 }
