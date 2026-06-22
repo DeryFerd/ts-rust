@@ -1608,6 +1608,70 @@ mod tests {
     }
 
     #[test]
+    fn ambient_external_modules_do_not_conflict_with_global_block_variables() {
+        for module in [ModuleKind::CommonJs, ModuleKind::Preserve] {
+            let fs = MemoryFileSystem::new(true);
+            fs.write_file(
+                "/project/node.d.ts",
+                r#"
+                    declare function require(moduleName: string): any;
+                    declare module "fs" {
+                        export function readFileSync(path: string): string;
+                    }
+                "#,
+            )
+            .unwrap();
+            fs.write_file(
+                "/project/app.js",
+                r#"const fs = require("fs"); fs.readFileSync("/a/b/c");"#,
+            )
+            .unwrap();
+            let program = Program::new_with_options(
+                &fs,
+                "/project",
+                &["node.d.ts".to_owned(), "app.js".to_owned()],
+                CompilerOptions {
+                    allow_js: true,
+                    module,
+                    no_lib: true,
+                    ..CompilerOptions::default()
+                },
+            );
+            assert!(
+                !program
+                    .diagnostics()
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == Some(2451)),
+                "{module:?}: {:?}",
+                program.diagnostics()
+            );
+        }
+
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/first.ts", "const collision = 1;")
+            .unwrap();
+        fs.write_file("/project/second.ts", "const collision = 2;")
+            .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["first.ts".to_owned(), "second.ts".to_owned()],
+            CompilerOptions {
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        assert!(
+            program
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code == Some(2451)),
+            "{:?}",
+            program.diagnostics()
+        );
+    }
+
+    #[test]
     fn follows_relative_imports_and_reports_unresolved_modules() {
         let fs = MemoryFileSystem::new(true);
         fs.write_file(
