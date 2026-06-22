@@ -2,16 +2,17 @@
 
 use ts_ast::{
     ArrayLiteralExpressionData, ArrayTypeNodeData, ArrowFunctionData, AsExpressionData,
-    BigIntLiteralData, BinaryExpressionData, BlockData, BreakStatementData, CallExpressionData,
-    CallSignatureDeclarationData, CaseBlockData, CaseOrDefaultClauseData, CatchClauseData,
-    ClassDeclarationData, ConditionalExpressionData, ConditionalTypeNodeData,
-    ConstructSignatureDeclarationData, ConstructorTypeNodeData, ContinueStatementData,
-    DecoratorData, DoStatementData, ElementAccessExpressionData, EmptyStatementData,
-    EnumDeclarationData, EnumMemberData, ExportAssignmentData, ExportDeclarationData,
-    ExportSpecifierData, ExpressionStatementData, ExpressionWithTypeArgumentsData,
-    ExternalModuleReferenceData, ForInOrOfStatementData, ForStatementData, FunctionDeclarationData,
-    FunctionTypeNodeData, HeritageClauseData, IdentifierData, IfStatementData, ImportClauseData,
-    ImportDeclarationData, ImportEqualsDeclarationData, ImportSpecifierData, ImportTypeNodeData,
+    BigIntLiteralData, BinaryExpressionData, BindingElementData, BindingPatternData, BlockData,
+    BreakStatementData, CallExpressionData, CallSignatureDeclarationData, CaseBlockData,
+    CaseOrDefaultClauseData, CatchClauseData, ClassDeclarationData, ComputedPropertyNameData,
+    ConditionalExpressionData, ConditionalTypeNodeData, ConstructSignatureDeclarationData,
+    ConstructorTypeNodeData, ContinueStatementData, DecoratorData, DoStatementData,
+    ElementAccessExpressionData, EmptyStatementData, EnumDeclarationData, EnumMemberData,
+    ExportAssignmentData, ExportDeclarationData, ExportSpecifierData, ExpressionStatementData,
+    ExpressionWithTypeArgumentsData, ExternalModuleReferenceData, ForInOrOfStatementData,
+    ForStatementData, FunctionDeclarationData, FunctionTypeNodeData, GetAccessorDeclarationData,
+    HeritageClauseData, IdentifierData, IfStatementData, ImportClauseData, ImportDeclarationData,
+    ImportEqualsDeclarationData, ImportSpecifierData, ImportTypeNodeData,
     IndexSignatureDeclarationData, IndexedAccessTypeNodeData, InferTypeNodeData,
     InterfaceDeclarationData, IntersectionTypeNodeData, JsDocData, JsDocTextData,
     JsDocUnknownTagData, JsxAttributeData, JsxAttributesData, JsxClosingElementData,
@@ -25,14 +26,15 @@ use ts_ast::{
     ParenthesizedTypeNodeData, PostfixUnaryExpressionData, PrefixUnaryExpressionData,
     PropertyAccessExpressionData, PropertyAssignmentData, PropertyDeclarationData,
     QualifiedNameData, RestTypeNodeData, ReturnStatementData, SatisfiesExpressionData,
-    ShorthandPropertyAssignmentData, SourceFileData, SpreadAssignmentData, StringLiteralData,
-    SwitchStatementData, SymbolTable, SyntaxKind, TemplateExpressionData, TemplateHeadData,
-    TemplateMiddleData, TemplateSpanData, TemplateTailData, ThisTypeNodeData, ThrowStatementData,
-    TokenData, TokenFlags, TryStatementData, TupleTypeNodeData, TypeAliasDeclarationData,
-    TypeAssertionData, TypeLiteralNodeData, TypeOperatorNodeData, TypeParameterDeclarationData,
-    TypePredicateNodeData, TypeQueryNodeData, TypeReferenceNodeData, UnionTypeNodeData,
-    VariableDeclarationData, VariableDeclarationListData, VariableStatementData,
-    WhileStatementData,
+    SetAccessorDeclarationData, ShorthandPropertyAssignmentData, SourceFileData,
+    SpreadAssignmentData, StringLiteralData, SwitchStatementData, SymbolTable, SyntaxKind,
+    TemplateExpressionData, TemplateHeadData, TemplateLiteralTypeNodeData,
+    TemplateLiteralTypeSpanData, TemplateMiddleData, TemplateSpanData, TemplateTailData,
+    ThisTypeNodeData, ThrowStatementData, TokenData, TokenFlags, TryStatementData,
+    TupleTypeNodeData, TypeAliasDeclarationData, TypeAssertionData, TypeLiteralNodeData,
+    TypeOperatorNodeData, TypeParameterDeclarationData, TypePredicateNodeData, TypeQueryNodeData,
+    TypeReferenceNodeData, UnionTypeNodeData, VariableDeclarationData, VariableDeclarationListData,
+    VariableStatementData, WhileStatementData,
 };
 use ts_core::{Diagnostic, TextPos, TextRange};
 use ts_scanner::{LanguageVariant, Scanner, Token, TokenFlags as ScannerTokenFlags};
@@ -259,9 +261,9 @@ impl<'a> Parser<'a> {
             SyntaxKind::BreakKeyword | SyntaxKind::ContinueKeyword => {
                 self.parse_break_or_continue_statement()
             }
-            SyntaxKind::NamespaceKeyword | SyntaxKind::ModuleKeyword => {
-                self.parse_module_declaration()
-            }
+            SyntaxKind::NamespaceKeyword
+            | SyntaxKind::ModuleKeyword
+            | SyntaxKind::GlobalKeyword => self.parse_module_declaration(),
             SyntaxKind::AtToken => self.parse_decorated_statement(),
             SyntaxKind::DeclareKeyword | SyntaxKind::AbstractKeyword | SyntaxKind::AsyncKeyword => {
                 self.parse_modified_statement()
@@ -397,8 +399,9 @@ impl<'a> Parser<'a> {
 
     fn parse_function_declaration(&mut self) -> NodeId {
         let start = self.consume().range.start;
-        let name = if self.current.kind == SyntaxKind::Identifier {
-            Some(self.parse_identifier("Expected a function name."))
+        let name = if self.current.kind == SyntaxKind::Identifier || self.current.kind.is_keyword()
+        {
+            Some(self.parse_identifier_name("Expected a function name."))
         } else {
             self.error_current("Expected a function name.");
             None
@@ -492,7 +495,11 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        let name = self.parse_identifier_name("Expected a parameter name.");
+        let name = if self.current.kind == SyntaxKind::OpenBracketToken {
+            self.parse_array_binding_pattern()
+        } else {
+            self.parse_identifier_name("Expected a parameter name.")
+        };
         let question_token = if self.current.kind == SyntaxKind::QuestionToken {
             Some(self.consume_token_node())
         } else {
@@ -528,6 +535,71 @@ impl<'a> Parser<'a> {
                 name,
             })),
             &children,
+        )
+    }
+
+    fn parse_array_binding_pattern(&mut self) -> NodeId {
+        let start = self.consume().range.start;
+        let mut elements = Vec::new();
+        while !matches!(
+            self.current.kind,
+            SyntaxKind::CloseBracketToken | SyntaxKind::EndOfFile
+        ) {
+            if self.current.kind == SyntaxKind::CommaToken {
+                self.bump();
+                continue;
+            }
+            let before = (self.current.kind, self.current.range);
+            let element_start = self.current.range.start;
+            let dot_dot_dot_token = if self.current.kind == SyntaxKind::DotDotDotToken {
+                Some(self.consume_token_node())
+            } else {
+                None
+            };
+            let name = self.parse_identifier_name("Expected a binding name.");
+            let mut children = vec![name];
+            children.extend(dot_dot_dot_token);
+            elements.push(self.alloc_node(
+                SyntaxKind::BindingElement,
+                TextRange::new(element_start, self.node_end(name)),
+                NodeData::BindingElement(Box::new(BindingElementData {
+                    dot_dot_dot_token,
+                    flow_node: None,
+                    initializer: None,
+                    local_symbol: None,
+                    property_name: None,
+                    symbol: None,
+                    facts: 0,
+                    name: Some(name),
+                })),
+                &children,
+            ));
+            if self.current.kind == SyntaxKind::CommaToken {
+                self.bump();
+            }
+            if before == (self.current.kind, self.current.range) {
+                self.error_current("Parser made no progress while parsing a binding element.");
+                self.bump();
+            }
+        }
+        let end = if self.current.kind == SyntaxKind::CloseBracketToken {
+            self.consume().range.end
+        } else {
+            self.error_current("Expected ']'.");
+            elements.last().map_or(start, |node| self.node_end(*node))
+        };
+        self.alloc_node(
+            SyntaxKind::ArrayBindingPattern,
+            TextRange::new(start, end),
+            NodeData::BindingPattern(Box::new(BindingPatternData {
+                elements: NodeList {
+                    range: TextRange::new(start, end),
+                    nodes: elements.clone(),
+                    has_trailing_comma: false,
+                },
+                facts: 0,
+            })),
+            &elements,
         )
     }
 
@@ -681,7 +753,7 @@ impl<'a> Parser<'a> {
             let keyword = self.consume();
             let mut types = Vec::new();
             loop {
-                let expression = self.parse_identifier("Expected a base type.");
+                let expression = self.parse_entity_name();
                 let type_arguments = self.parse_type_arguments();
                 let end = type_arguments
                     .as_ref()
@@ -776,6 +848,18 @@ impl<'a> Parser<'a> {
 
     fn parse_class_member(&mut self, signature_only: bool) -> NodeId {
         let start = self.current.range.start;
+        let mut modifier_nodes = Vec::new();
+        while self.current.kind.is_modifier() {
+            modifier_nodes.push(self.consume_token_node());
+        }
+        let modifiers = (!modifier_nodes.is_empty()).then(|| ModifierList {
+            list: NodeList {
+                range: TextRange::new(start, self.current.range.start),
+                nodes: modifier_nodes.clone(),
+                has_trailing_comma: false,
+            },
+            flags: ts_ast::ModifierFlags::default(),
+        });
         let name = self.parse_property_name("Expected a member name.");
         if self.current.kind == SyntaxKind::OpenParenToken {
             let parameters = self.parse_parameter_list();
@@ -789,7 +873,8 @@ impl<'a> Parser<'a> {
             let end = body
                 .or(return_type)
                 .map_or(parameters.range.end, |id| self.node_end(id));
-            let mut children = vec![name];
+            let mut children = modifier_nodes.clone();
+            children.push(name);
             children.extend(parameters.nodes.iter().copied());
             children.extend(return_type);
             children.extend(body);
@@ -810,7 +895,7 @@ impl<'a> Parser<'a> {
                     type_: return_type,
                     type_parameters: None,
                     facts: 0,
-                    modifiers: None,
+                    modifiers: modifiers.clone(),
                     name,
                 })),
                 &children,
@@ -825,7 +910,8 @@ impl<'a> Parser<'a> {
             };
             let fallback = type_node.map_or_else(|| self.node_end(name), |id| self.node_end(id));
             let end = self.parse_semicolon(initializer.map_or(fallback, |id| self.node_end(id)));
-            let mut children = vec![name];
+            let mut children = modifier_nodes;
+            children.push(name);
             children.extend(type_node);
             children.extend(initializer);
             self.alloc_node(
@@ -837,7 +923,7 @@ impl<'a> Parser<'a> {
                     symbol: None,
                     type_: type_node,
                     facts: 0,
-                    modifiers: None,
+                    modifiers,
                     name,
                 })),
                 &children,
@@ -859,6 +945,12 @@ impl<'a> Parser<'a> {
             },
             flags: ts_ast::ModifierFlags::default(),
         });
+        let index_signature =
+            self.current.kind == SyntaxKind::OpenBracketToken && self.is_index_signature();
+        let accessor_signature = matches!(
+            self.current.kind,
+            SyntaxKind::GetKeyword | SyntaxKind::SetKeyword
+        ) && self.is_accessor_signature();
 
         let member = match self.current.kind {
             SyntaxKind::OpenParenToken | SyntaxKind::LessThanToken => {
@@ -868,13 +960,40 @@ impl<'a> Parser<'a> {
                 self.bump();
                 self.parse_signature_member(start, SyntaxKind::ConstructSignature)
             }
-            SyntaxKind::OpenBracketToken => self.parse_index_signature(start, modifiers),
+            SyntaxKind::OpenBracketToken if index_signature => {
+                self.parse_index_signature(start, modifiers)
+            }
+            SyntaxKind::GetKeyword | SyntaxKind::SetKeyword if accessor_signature => {
+                self.parse_accessor_signature(start, modifiers)
+            }
             _ => self.parse_named_type_member(start, modifiers),
         };
         for modifier in modifier_nodes {
             self.arena.get_mut(modifier).unwrap().parent = Some(member);
         }
         member
+    }
+
+    fn is_index_signature(&mut self) -> bool {
+        let checkpoint = self.scanner.mark();
+        let name = self.scanner.scan();
+        let colon = self.scanner.scan();
+        self.scanner.rewind(checkpoint);
+        (name.kind == SyntaxKind::Identifier || name.kind.is_keyword())
+            && colon.kind == SyntaxKind::ColonToken
+    }
+
+    fn is_accessor_signature(&mut self) -> bool {
+        let checkpoint = self.scanner.mark();
+        let name = self.scanner.scan();
+        self.scanner.rewind(checkpoint);
+        matches!(
+            name.kind,
+            SyntaxKind::Identifier
+                | SyntaxKind::StringLiteral
+                | SyntaxKind::NumericLiteral
+                | SyntaxKind::OpenBracketToken
+        ) || name.kind.is_keyword()
     }
 
     fn parse_signature_member(&mut self, start: TextPos, kind: SyntaxKind) -> NodeId {
@@ -909,6 +1028,69 @@ impl<'a> Parser<'a> {
             }))
         };
         self.alloc_node(kind, TextRange::new(start, end), data, &children)
+    }
+
+    fn parse_accessor_signature(
+        &mut self,
+        start: TextPos,
+        modifiers: Option<ModifierList>,
+    ) -> NodeId {
+        let kind = self.consume().kind;
+        let name = self.parse_property_name("Expected an accessor name.");
+        let parameters = self.parse_parameter_list();
+        let return_type = self.parse_optional_type_annotation();
+        let fallback = return_type.map_or(parameters.range.end, |node| self.node_end(node));
+        let end = self.parse_semicolon(fallback);
+        let mut children = vec![name];
+        children.extend(parameters.nodes.iter().copied());
+        children.extend(return_type);
+        let data = if kind == SyntaxKind::GetKeyword {
+            NodeData::GetAccessorDeclaration(Box::new(GetAccessorDeclarationData {
+                asterisk_token: None,
+                body: None,
+                end_flow_node: None,
+                flow_node: None,
+                full_signature: None,
+                locals: SymbolTable,
+                next_container: None,
+                parameters,
+                postfix_token: None,
+                symbol: None,
+                type_: return_type,
+                type_parameters: None,
+                facts: 0,
+                modifiers,
+                name,
+            }))
+        } else {
+            NodeData::SetAccessorDeclaration(Box::new(SetAccessorDeclarationData {
+                asterisk_token: None,
+                body: None,
+                end_flow_node: None,
+                flow_node: None,
+                full_signature: None,
+                locals: SymbolTable,
+                next_container: None,
+                parameters,
+                postfix_token: None,
+                symbol: None,
+                type_: return_type,
+                type_parameters: None,
+                facts: 0,
+                modifiers,
+                name,
+            }))
+        };
+        self.alloc_node(
+            if kind == SyntaxKind::GetKeyword {
+                SyntaxKind::GetAccessor
+            } else {
+                SyntaxKind::SetAccessor
+            },
+            TextRange::new(start, end),
+            data,
+            &children,
+        )
     }
 
     fn parse_index_signature(&mut self, start: TextPos, modifiers: Option<ModifierList>) -> NodeId {
@@ -1557,7 +1739,17 @@ impl<'a> Parser<'a> {
 
     fn parse_module_declaration(&mut self) -> NodeId {
         let keyword = self.consume();
-        let name = if self.current.kind == SyntaxKind::StringLiteral {
+        let name = if keyword.kind == SyntaxKind::GlobalKeyword {
+            self.alloc_node(
+                SyntaxKind::Identifier,
+                keyword.range,
+                NodeData::Identifier(Box::new(IdentifierData {
+                    flow_node: None,
+                    text: token_value(&keyword),
+                })),
+                &[],
+            )
+        } else if self.current.kind == SyntaxKind::StringLiteral {
             self.parse_string_literal()
         } else {
             self.parse_identifier("Expected a module name.")
@@ -3035,6 +3227,25 @@ impl<'a> Parser<'a> {
         match self.current.kind {
             SyntaxKind::StringLiteral => self.parse_string_literal(),
             SyntaxKind::NumericLiteral => self.parse_numeric_literal(),
+            SyntaxKind::OpenBracketToken => {
+                let start = self.consume().range.start;
+                let expression = self.parse_binary_expression(0);
+                let end = if self.current.kind == SyntaxKind::CloseBracketToken {
+                    self.consume().range.end
+                } else {
+                    self.error_current("Expected ']'.");
+                    self.node_end(expression)
+                };
+                self.alloc_node(
+                    SyntaxKind::ComputedPropertyName,
+                    TextRange::new(start, end),
+                    NodeData::ComputedPropertyName(Box::new(ComputedPropertyNameData {
+                        expression,
+                        facts: 0,
+                    })),
+                    &[expression],
+                )
+            }
             _ => self.parse_identifier_name(message),
         }
     }
@@ -3372,9 +3583,12 @@ impl<'a> Parser<'a> {
                 )
             }
             SyntaxKind::OpenBracketToken => self.parse_tuple_type(),
+            SyntaxKind::TemplateHead => self.parse_template_literal_type(),
+            SyntaxKind::MinusToken => self.parse_negative_literal_type(),
             SyntaxKind::StringLiteral
             | SyntaxKind::NumericLiteral
             | SyntaxKind::BigIntLiteral
+            | SyntaxKind::NoSubstitutionTemplateLiteral
             | SyntaxKind::TrueKeyword
             | SyntaxKind::FalseKeyword
             | SyntaxKind::NullKeyword => self.parse_literal_type(),
@@ -3543,6 +3757,7 @@ impl<'a> Parser<'a> {
             SyntaxKind::StringLiteral => self.parse_string_literal(),
             SyntaxKind::NumericLiteral => self.parse_numeric_literal(),
             SyntaxKind::BigIntLiteral => self.parse_bigint_literal(),
+            SyntaxKind::NoSubstitutionTemplateLiteral => self.parse_template_literal(),
             _ => self.parse_keyword_expression(),
         };
         self.alloc_node(
@@ -3550,6 +3765,114 @@ impl<'a> Parser<'a> {
             self.arena.get(literal).unwrap().range,
             NodeData::LiteralTypeNode(Box::new(LiteralTypeNodeData { literal })),
             &[literal],
+        )
+    }
+
+    fn parse_negative_literal_type(&mut self) -> NodeId {
+        let operator = self.consume();
+        let operand = if self.current.kind == SyntaxKind::BigIntLiteral {
+            self.parse_bigint_literal()
+        } else {
+            self.parse_numeric_literal()
+        };
+        let literal = self.alloc_node(
+            SyntaxKind::PrefixUnaryExpression,
+            TextRange::new(operator.range.start, self.node_end(operand)),
+            NodeData::PrefixUnaryExpression(Box::new(PrefixUnaryExpressionData {
+                operand,
+                operator: operator.kind,
+            })),
+            &[operand],
+        );
+        self.alloc_node(
+            SyntaxKind::LiteralType,
+            TextRange::new(operator.range.start, self.node_end(literal)),
+            NodeData::LiteralTypeNode(Box::new(LiteralTypeNodeData { literal })),
+            &[literal],
+        )
+    }
+
+    fn parse_template_literal_type(&mut self) -> NodeId {
+        let head_token = self.consume();
+        let start = head_token.range.start;
+        let head = self.alloc_node(
+            SyntaxKind::TemplateHead,
+            head_token.range,
+            NodeData::TemplateHead(Box::new(TemplateHeadData {
+                raw_text: head_token.text.to_owned(),
+                template_flags: TokenFlags::default(),
+                text: token_value(&head_token),
+                token_flags: TokenFlags::default(),
+            })),
+            &[],
+        );
+        let mut spans = Vec::new();
+        loop {
+            let type_node = self.parse_type();
+            if self.current.kind != SyntaxKind::CloseBraceToken {
+                self.error_current("Expected '}'.");
+                break;
+            }
+            self.current = self.scanner.rescan_template_token();
+            let literal_token = self.consume();
+            let literal = match literal_token.kind {
+                SyntaxKind::TemplateMiddle => self.alloc_node(
+                    SyntaxKind::TemplateMiddle,
+                    literal_token.range,
+                    NodeData::TemplateMiddle(Box::new(TemplateMiddleData {
+                        raw_text: literal_token.text.to_owned(),
+                        template_flags: TokenFlags::default(),
+                        text: token_value(&literal_token),
+                        token_flags: TokenFlags::default(),
+                    })),
+                    &[],
+                ),
+                SyntaxKind::TemplateTail => self.alloc_node(
+                    SyntaxKind::TemplateTail,
+                    literal_token.range,
+                    NodeData::TemplateTail(Box::new(TemplateTailData {
+                        raw_text: literal_token.text.to_owned(),
+                        template_flags: TokenFlags::default(),
+                        text: token_value(&literal_token),
+                        token_flags: TokenFlags::default(),
+                    })),
+                    &[],
+                ),
+                _ => {
+                    self.error_current("Expected a template continuation.");
+                    self.missing_identifier(literal_token.range.start)
+                }
+            };
+            spans.push(self.alloc_node(
+                SyntaxKind::TemplateLiteralTypeSpan,
+                TextRange::new(self.node_start(type_node), self.node_end(literal)),
+                NodeData::TemplateLiteralTypeSpan(Box::new(TemplateLiteralTypeSpanData {
+                    literal,
+                    type_: type_node,
+                })),
+                &[type_node, literal],
+            ));
+            if literal_token.kind == SyntaxKind::TemplateTail {
+                break;
+            }
+        }
+        let end = spans
+            .last()
+            .map_or(self.node_end(head), |node| self.node_end(*node));
+        let mut children = vec![head];
+        children.extend(spans.iter().copied());
+        self.alloc_node(
+            SyntaxKind::TemplateLiteralType,
+            TextRange::new(start, end),
+            NodeData::TemplateLiteralTypeNode(Box::new(TemplateLiteralTypeNodeData {
+                head,
+                template_spans: NodeList {
+                    range: TextRange::new(self.node_end(head), end),
+                    nodes: spans,
+                    has_trailing_comma: false,
+                },
+            })),
+            &children,
         )
     }
 
@@ -4462,6 +4785,39 @@ mod tests {
     }
 
     #[test]
+    fn parses_bundled_library_declaration_forms() {
+        let result = parse_source_file(
+            r"
+                declare global {
+                    interface IterableValue {
+                        get value(): string;
+                        set value(next: string);
+                        [Symbol.iterator](): IterableValue;
+                    }
+                    type Key = `${string}-${number}` | -1;
+                    function consume(...[value]: [string]): void;
+                }
+                declare abstract class Base {
+                    private constructor();
+                    abstract next(): void;
+                }
+            ",
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let kinds: Vec<_> = result.arena.iter().map(|(_, node)| node.kind).collect();
+        for expected in [
+            SyntaxKind::ModuleDeclaration,
+            SyntaxKind::GetAccessor,
+            SyntaxKind::SetAccessor,
+            SyntaxKind::ComputedPropertyName,
+            SyntaxKind::TemplateLiteralType,
+            SyntaxKind::ArrayBindingPattern,
+        ] {
+            assert!(kinds.contains(&expected), "missing {expected:?}");
+        }
+    }
+
+    #[test]
     fn parses_namespace_imports_import_equals_exports_and_type_assertions() {
         let result = parse_source_file(
             r#"
@@ -4610,6 +4966,18 @@ mod tests {
             result.arena.get(statements[1]).unwrap().kind,
             SyntaxKind::VariableStatement
         );
+    }
+
+    #[test]
+    fn complex_binding_patterns_always_make_progress() {
+        let result = parse_source_file(
+            "function f([value = 1, { nested }, [tail]]: unknown): void; const done = 1;",
+        );
+        assert!(!result.diagnostics.is_empty());
+        assert!(result.arena.len() < 200, "unexpected AST growth");
+        assert!(source_statements(&result).iter().any(|statement| {
+            result.arena.get(*statement).unwrap().kind == SyntaxKind::VariableStatement
+        }));
     }
 
     #[test]
