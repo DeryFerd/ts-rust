@@ -6199,6 +6199,22 @@ impl<'a> Checker<'a> {
             NodeData::Identifier(data) => Some(data.text.clone()),
             NodeData::StringLiteral(data) => Some(data.text.clone()),
             NodeData::NumericLiteral(data) => Some(data.text.clone()),
+            NodeData::NoSubstitutionTemplateLiteral(data) => Some(data.text.clone()),
+            NodeData::ComputedPropertyName(computed) => {
+                self.computed_property_name(computed.expression)
+            }
+            _ => None,
+        }
+    }
+
+    fn computed_property_name(&self, node: NodeId) -> Option<String> {
+        match &self.arena.get(node)?.data {
+            NodeData::StringLiteral(data) => Some(data.text.clone()),
+            NodeData::NumericLiteral(data) => Some(data.text.clone()),
+            NodeData::NoSubstitutionTemplateLiteral(data) => Some(data.text.clone()),
+            NodeData::ParenthesizedExpression(parenthesized) => {
+                self.computed_property_name(parenthesized.expression)
+            }
             _ => None,
         }
     }
@@ -7155,7 +7171,23 @@ fn property_name_text(arena: &NodeArena, node: NodeId) -> Option<String> {
     match &arena.get(node)?.data {
         NodeData::Identifier(identifier) => Some(identifier.text.clone()),
         NodeData::StringLiteral(literal) => Some(literal.text.clone()),
+        NodeData::NumericLiteral(literal) => Some(literal.text.clone()),
         NodeData::NoSubstitutionTemplateLiteral(literal) => Some(literal.text.clone()),
+        NodeData::ComputedPropertyName(computed) => {
+            computed_property_name_text(arena, computed.expression)
+        }
+        _ => None,
+    }
+}
+
+fn computed_property_name_text(arena: &NodeArena, node: NodeId) -> Option<String> {
+    match &arena.get(node)?.data {
+        NodeData::StringLiteral(literal) => Some(literal.text.clone()),
+        NodeData::NumericLiteral(literal) => Some(literal.text.clone()),
+        NodeData::NoSubstitutionTemplateLiteral(literal) => Some(literal.text.clone()),
+        NodeData::ParenthesizedExpression(parenthesized) => {
+            computed_property_name_text(arena, parenthesized.expression)
+        }
         _ => None,
     }
 }
@@ -7891,6 +7923,58 @@ mod tests {
                 EnumConstantValue::String("ok".into()),
             ]
         );
+    }
+
+    #[test]
+    fn evaluates_literal_and_computed_enum_names_and_element_accesses() {
+        let parsed = parse_source_file(
+            r#"
+                const enum Named {
+                    Identifier = 0,
+                    "quoted" = 1,
+                    2 = 2,
+                    ["computed"] = 3,
+                    [4] = 4,
+                    FromQuoted = Named["quoted"],
+                    FromNumeric = Named["2"],
+                    FromComputed = Named["computed"],
+                    FromComputedNumeric = Named["4"],
+                }
+                const quoted: 1 = Named["quoted"];
+                const numeric: 2 = Named["2"];
+                const computed: 3 = Named["computed"];
+                const computedNumeric: 4 = Named["4"];
+            "#,
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        assert!(
+            bindings.diagnostics.is_empty(),
+            "{:?}",
+            bindings.diagnostics
+        );
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert_eq!(
+            result
+                .enum_member_values
+                .values()
+                .cloned()
+                .collect::<Vec<_>>(),
+            [
+                EnumConstantValue::Number(0.0),
+                EnumConstantValue::Number(1.0),
+                EnumConstantValue::Number(2.0),
+                EnumConstantValue::Number(3.0),
+                EnumConstantValue::Number(4.0),
+                EnumConstantValue::Number(1.0),
+                EnumConstantValue::Number(2.0),
+                EnumConstantValue::Number(3.0),
+                EnumConstantValue::Number(4.0),
+            ]
+        );
+        assert_eq!(result.enum_access_values.len(), 4);
     }
 
     #[test]

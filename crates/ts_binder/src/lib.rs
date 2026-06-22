@@ -990,12 +990,24 @@ impl<'a> Binder<'a> {
         flags: SymbolFlags,
         parent_symbol: Option<SymbolId>,
     ) -> Option<SymbolId> {
-        let name = self.declaration_name_text(name_node)?.to_owned();
+        let name = self.declaration_name_text(name_node)?;
         let id = self.declare_name(scope, declaration, name, flags, parent_symbol)?;
         self.result.node_symbols.insert(declaration, id);
         self.result.node_symbols.insert(name_node, id);
+        if let Some(NodeData::ComputedPropertyName(computed)) =
+            self.arena.get(name_node).map(|node| &node.data)
+        {
+            self.result.node_symbols.insert(computed.expression, id);
+        }
         if let Some(container) = self.result.containers.get(&declaration).copied() {
             self.result.containers.insert(name_node, container);
+            if let Some(NodeData::ComputedPropertyName(computed)) =
+                self.arena.get(name_node).map(|node| &node.data)
+            {
+                self.result
+                    .containers
+                    .insert(computed.expression, container);
+            }
         }
         Some(id)
     }
@@ -1239,12 +1251,28 @@ impl<'a> Binder<'a> {
         }
     }
 
-    fn declaration_name_text(&self, node: NodeId) -> Option<&str> {
+    fn declaration_name_text(&self, node: NodeId) -> Option<String> {
         match &self.arena.get(node)?.data {
-            NodeData::Identifier(identifier) => Some(&identifier.text),
-            NodeData::PrivateIdentifier(identifier) => Some(&identifier.text),
-            NodeData::StringLiteral(literal) => Some(&literal.text),
-            NodeData::NumericLiteral(literal) => Some(&literal.text),
+            NodeData::Identifier(identifier) => Some(identifier.text.clone()),
+            NodeData::PrivateIdentifier(identifier) => Some(identifier.text.clone()),
+            NodeData::StringLiteral(literal) => Some(literal.text.clone()),
+            NodeData::NumericLiteral(literal) => Some(literal.text.clone()),
+            NodeData::NoSubstitutionTemplateLiteral(literal) => Some(literal.text.clone()),
+            NodeData::ComputedPropertyName(computed) => {
+                self.computed_property_name_text(computed.expression)
+            }
+            _ => None,
+        }
+    }
+
+    fn computed_property_name_text(&self, node: NodeId) -> Option<String> {
+        match &self.arena.get(node)?.data {
+            NodeData::StringLiteral(literal) => Some(literal.text.clone()),
+            NodeData::NumericLiteral(literal) => Some(literal.text.clone()),
+            NodeData::NoSubstitutionTemplateLiteral(literal) => Some(literal.text.clone()),
+            NodeData::ParenthesizedExpression(parenthesized) => {
+                self.computed_property_name_text(parenthesized.expression)
+            }
             _ => None,
         }
     }
@@ -1693,6 +1721,56 @@ mod tests {
             result.symbols.get(local_id).unwrap().parent,
             Some(root.symbols.get("run").unwrap())
         );
+    }
+
+    #[test]
+    fn binds_literal_and_computed_enum_member_names() {
+        let parsed = parse_source_file(
+            r#"enum Names { Identifier, "quoted", 2, ["computed"] = 3, [4] = 4 }"#,
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let result = bind_source_file(&parsed.arena, parsed.source_file);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+
+        let root = result.root_scope().unwrap();
+        let names = result
+            .symbols
+            .get(root.symbols.get("Names").unwrap())
+            .unwrap();
+        assert_eq!(
+            names
+                .members
+                .iter()
+                .map(|(name, _)| name)
+                .collect::<Vec<_>>(),
+            ["2", "4", "Identifier", "computed", "quoted"]
+        );
+
+        let NodeData::SourceFile(source) = &parsed.arena.get(parsed.source_file).unwrap().data
+        else {
+            panic!("expected source file");
+        };
+        let NodeData::EnumDeclaration(enumeration) =
+            &parsed.arena.get(source.statements.nodes[0]).unwrap().data
+        else {
+            panic!("expected enum declaration");
+        };
+        for member in &enumeration.members.nodes {
+            let NodeData::EnumMember(member_data) = &parsed.arena.get(*member).unwrap().data else {
+                panic!("expected enum member");
+            };
+            assert!(result.node_symbols.contains_key(member));
+            assert!(result.node_symbols.contains_key(&member_data.name));
+            if let NodeData::ComputedPropertyName(computed) =
+                &parsed.arena.get(member_data.name).unwrap().data
+            {
+                assert!(result.node_symbols.contains_key(&computed.expression));
+                assert_eq!(
+                    result.containers.get(&computed.expression),
+                    result.containers.get(member)
+                );
+            }
+        }
     }
 
     #[test]
