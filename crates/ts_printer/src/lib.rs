@@ -269,7 +269,18 @@ pub fn emit_source_file_with_context(
             Some(NodeData::StringLiteral(literal)) if literal.text == "use strict"
         )
     });
+    let preserves_external_module_syntax = is_external_module
+        && matches!(
+            settings.module,
+            ModuleKind::None
+                | ModuleKind::Es2015
+                | ModuleKind::Es2020
+                | ModuleKind::Es2022
+                | ModuleKind::EsNext
+                | ModuleKind::Preserve
+        );
     if !has_use_strict
+        && !preserves_external_module_syntax
         && (settings.always_strict
             || (settings.module == ModuleKind::CommonJs && is_external_module))
     {
@@ -8619,6 +8630,60 @@ class Board {
                 always_strict: true,
                 target: ScriptTarget::Es2015,
                 module: ModuleKind::EsNext,
+                jsx: JsxEmit::Preserve,
+                emit_javascript: true,
+                emit_declarations: false,
+                source_map: false,
+                inline_source_map: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(result.code, "\"use strict\";\nconst value = 1;\n");
+    }
+
+    #[test]
+    fn does_not_synthesize_use_strict_for_preserved_external_modules() {
+        let source = "export const value: number = 1;";
+        for module in [
+            ModuleKind::None,
+            ModuleKind::Es2015,
+            ModuleKind::Es2020,
+            ModuleKind::Es2022,
+            ModuleKind::EsNext,
+            ModuleKind::Preserve,
+        ] {
+            let parsed = parse_source_file(source);
+            let result = emit_source_file_with_settings(
+                &parsed.arena,
+                parsed.source_file,
+                "input.ts",
+                source,
+                PrinterSettings {
+                    always_strict: true,
+                    target: ScriptTarget::Es2015,
+                    module,
+                    jsx: JsxEmit::Preserve,
+                    emit_javascript: true,
+                    emit_declarations: false,
+                    source_map: false,
+                    inline_source_map: false,
+                },
+            )
+            .unwrap();
+            assert_eq!(result.code, "export const value = 1;\n", "{module:?}");
+        }
+
+        let script = "const value: number = 1;";
+        let parsed = parse_source_file(script);
+        let result = emit_source_file_with_settings(
+            &parsed.arena,
+            parsed.source_file,
+            "input.ts",
+            script,
+            PrinterSettings {
+                always_strict: true,
+                target: ScriptTarget::Es2015,
+                module: ModuleKind::None,
                 jsx: JsxEmit::Preserve,
                 emit_javascript: true,
                 emit_declarations: false,

@@ -266,16 +266,13 @@ pub fn run_upstream_baselines(
                 }
                 continue;
             }
-            let mut baseline = String::new();
-            for path in selected {
-                let text = fs::read_to_string(path)?;
-                if !baseline.is_empty() && !baseline.ends_with('\n') {
-                    baseline.push('\n');
-                }
-                baseline.push_str(&text);
-            }
-            let comparison =
-                compare_case_emitted_output_sections(&compilation.outputs, &baseline, &case);
+            let baseline = read_baseline_files(&selected)?;
+            let comparison = compare_case_emitted_output_sections(
+                &compilation.outputs,
+                &baseline,
+                &case,
+                &variant,
+            );
             if comparison.is_match() {
                 summary.matched += 1;
             } else {
@@ -297,6 +294,18 @@ pub fn run_upstream_baselines(
         summary.diagnostic_failures,
     )?;
     Ok(summary)
+}
+
+fn read_baseline_files(paths: &[&PathBuf]) -> io::Result<String> {
+    let mut baseline = String::new();
+    for path in paths {
+        let text = fs::read_to_string(path)?;
+        if !baseline.is_empty() && !baseline.ends_with('\n') {
+            baseline.push('\n');
+        }
+        baseline.push_str(&text);
+    }
+    Ok(baseline)
 }
 
 /// Parses TypeScript's `//// [file]` baseline sections, preserving section
@@ -383,8 +392,9 @@ fn compare_case_emitted_output_sections(
     outputs: &BTreeMap<String, String>,
     baseline: &str,
     case: &Case,
+    variant: &OptionVariant,
 ) -> BaselineComparison {
-    let declaration_inputs = case
+    let mut excluded_expected = case
         .units
         .iter()
         .filter_map(|unit| {
@@ -392,7 +402,18 @@ fn compare_case_emitted_output_sections(
             ts_path::is_declaration_file(&path).then(|| normalize_section_name(&path))
         })
         .collect::<BTreeSet<_>>();
-    compare_emitted_output_sections_excluding(outputs, baseline, &declaration_inputs)
+    let emit_declaration_only = variant.values.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("emitDeclarationOnly") && value.eq_ignore_ascii_case("true")
+    });
+    if emit_declaration_only {
+        excluded_expected.extend(
+            parse_baseline_sections(baseline)
+                .into_keys()
+                .map(|name| normalize_section_name(&name))
+                .filter(|name| is_javascript_output_section(name)),
+        );
+    }
+    compare_emitted_output_sections_excluding(outputs, baseline, &excluded_expected)
 }
 
 fn compare_emitted_output_sections_excluding(
@@ -490,8 +511,12 @@ pub fn run_case_against_baseline(case: &Case, baseline: &str) -> std::io::Result
     compile_case_matrix(case)?
         .into_iter()
         .map(|(variant, compilation)| {
-            let comparison =
-                compare_case_emitted_output_sections(&compilation.outputs, baseline, case);
+            let comparison = compare_case_emitted_output_sections(
+                &compilation.outputs,
+                baseline,
+                case,
+                &variant,
+            );
             Ok(BaselineRun {
                 variant,
                 compilation,
@@ -875,6 +900,13 @@ fn is_emitted_section(name: &str) -> bool {
         .any(|extension| name.ends_with(extension))
 }
 
+fn is_javascript_output_section(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    [".js", ".jsx", ".mjs", ".cjs"]
+        .iter()
+        .any(|extension| name.ends_with(extension))
+}
+
 fn normalize_section_name(name: &str) -> String {
     let name = name.replace('\\', "/");
     name.strip_prefix("/case/")
@@ -1014,7 +1046,8 @@ mod tests {
     use std::{collections::BTreeMap, path::Path};
 
     use super::{
-        Case, OutputDifferenceKind, ParseError, compare_emitted_output_sections, compile_case,
+        Case, OptionVariant, OutputDifferenceKind, ParseError,
+        compare_case_emitted_output_sections, compare_emitted_output_sections, compile_case,
         compile_case_matrix, expand_option_matrix, first_different_line, parse_baseline_sections,
         run_case_against_baseline,
     };
@@ -1158,7 +1191,7 @@ mod tests {
         assert_eq!(compilation.outputs.len(), 2);
         assert_eq!(
             compilation.outputs["/case/a.js"],
-            "\"use strict\";\nexport const value = 1;\n"
+            "export const value = 1;\n"
         );
         assert!(compilation.outputs["/case/b.js"].contains("result = value + 1"));
     }
@@ -1380,6 +1413,42 @@ mod tests {
             "declare const value = 1;\n",
         );
         assert!(compare_emitted_output_sections(&outputs, baseline).is_match());
+    }
+
+    #[test]
+    fn declaration_only_variants_do_not_expect_javascript_sections() {
+        let case = Case::parse(
+            "declarationOnly.ts",
+            "// @emitDeclarationOnly: true\nexport const value = 1;\n",
+        )
+        .unwrap();
+        let outputs = BTreeMap::from([(
+            "/case/declarationOnly.d.ts".into(),
+            "export declare const value = 1;\n".into(),
+        )]);
+        let baseline = concat!(
+            "//// [declarationOnly.js] ////\n",
+            "export const value = 1;\n",
+            "//// [declarationOnly.d.ts] ////\n",
+            "export declare const value = 1;\n",
+        );
+        let declaration_only = OptionVariant {
+            values: BTreeMap::from([("emitDeclarationOnly".into(), "true".into())]),
+        };
+        assert!(
+            compare_case_emitted_output_sections(&outputs, baseline, &case, &declaration_only,)
+                .is_match()
+        );
+
+        assert!(
+            !compare_case_emitted_output_sections(
+                &outputs,
+                baseline,
+                &case,
+                &OptionVariant::default(),
+            )
+            .is_match()
+        );
     }
 
     #[test]
