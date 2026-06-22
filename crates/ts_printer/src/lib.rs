@@ -365,10 +365,12 @@ pub fn emit_source_file_with_context(
 
 fn source_needs_extends_helper(arena: &NodeArena) -> bool {
     arena.iter().any(|(_, node)| {
-        let NodeData::ClassDeclaration(class) = &node.data else {
-            return false;
+        let heritage_clauses = match &node.data {
+            NodeData::ClassDeclaration(class) => class.heritage_clauses.as_ref(),
+            NodeData::ClassExpression(class) => class.heritage_clauses.as_ref(),
+            _ => None,
         };
-        class.heritage_clauses.as_ref().is_some_and(|clauses| {
+        heritage_clauses.is_some_and(|clauses| {
             clauses.nodes.iter().any(|clause| {
                 matches!(
                     arena.get(*clause).map(|node| &node.data),
@@ -756,6 +758,7 @@ fn identifier_is_declaration_name(child: NodeId, parent: &Node) -> bool {
         NodeData::FunctionDeclaration(declaration) => declaration.name == Some(child),
         NodeData::FunctionExpression(declaration) => declaration.name == Some(child),
         NodeData::ClassDeclaration(declaration) => declaration.name == Some(child),
+        NodeData::ClassExpression(declaration) => declaration.name == Some(child),
         NodeData::EnumDeclaration(declaration) => declaration.name == child,
         NodeData::EnumMember(declaration) => declaration.name == child,
         NodeData::ModuleDeclaration(declaration) => declaration.name == child,
@@ -3434,6 +3437,59 @@ impl Printer<'_> {
         Ok(())
     }
 
+    fn emit_class_expression(
+        &mut self,
+        id: NodeId,
+        data: &ts_ast::ClassExpressionData,
+    ) -> Result<(), EmitError> {
+        let declaration = ts_ast::ClassDeclarationData {
+            flow_node: None,
+            heritage_clauses: data.heritage_clauses.clone(),
+            local_symbol: data.local_symbol,
+            locals: data.locals.clone(),
+            members: data.members.clone(),
+            next_container: data.next_container,
+            symbol: data.symbol,
+            type_parameters: data.type_parameters.clone(),
+            facts: data.facts,
+            modifiers: data.modifiers.clone(),
+            name: data.name,
+        };
+        if self.settings.target < ScriptTarget::Es2015 {
+            let name = declaration
+                .name
+                .and_then(|name| self.identifier_text(name).ok())
+                .unwrap_or("_class")
+                .to_owned();
+            return self.emit_downlevel_class_value(&declaration, &name);
+        }
+        if self.settings.target < ScriptTarget::Es2022
+            && self.class_expression_requires_post_class_lowering(&declaration)
+        {
+            return Err(Self::unsupported(id, SyntaxKind::ClassExpression));
+        }
+        self.emit_class(&declaration)
+    }
+
+    fn class_expression_requires_post_class_lowering(
+        &self,
+        data: &ts_ast::ClassDeclarationData,
+    ) -> bool {
+        data.members.nodes.iter().any(|member| {
+            let Some(node) = self.arena.get(*member) else {
+                return false;
+            };
+            match &node.data {
+                NodeData::PropertyDeclaration(property) => {
+                    property.initializer.is_some()
+                        && self.has_modifier(property.modifiers.as_ref(), SyntaxKind::StaticKeyword)
+                }
+                NodeData::ClassStaticBlockDeclaration(_) => true,
+                _ => false,
+            }
+        })
+    }
+
     fn emit_synthesized_native_constructor(
         &mut self,
         data: &ts_ast::ClassDeclarationData,
@@ -3606,10 +3662,22 @@ impl Printer<'_> {
             .and_then(|name| self.identifier_text(name).ok())
             .unwrap_or("_class")
             .to_owned();
-        let base = self.class_base_expression(data)?;
         self.writer.write("var ");
         self.writer.write(&name);
-        self.writer.write(" = /** @class */ (function (");
+        self.writer.write(" = ");
+        self.emit_downlevel_class_value(data, &name)?;
+        self.writer.write(";");
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn emit_downlevel_class_value(
+        &mut self,
+        data: &ts_ast::ClassDeclarationData,
+        name: &str,
+    ) -> Result<(), EmitError> {
+        let base = self.class_base_expression(data)?;
+        self.writer.write("/** @class */ (function (");
         if base.is_some() {
             self.writer.write("_super");
         }
@@ -3618,7 +3686,7 @@ impl Printer<'_> {
         self.writer.indent += 1;
         if base.is_some() {
             self.writer.write("__extends(");
-            self.writer.write(&name);
+            self.writer.write(name);
             self.writer.write(", _super);");
             self.writer.newline();
         }
@@ -3634,7 +3702,7 @@ impl Printer<'_> {
             .then_some(method.as_ref())
         });
         self.writer.write("function ");
-        self.writer.write(&name);
+        self.writer.write(name);
         if let Some(constructor) = constructor {
             self.emit_parameters(&constructor.parameters)?;
             self.writer.write(" {");
@@ -3755,7 +3823,7 @@ impl Printer<'_> {
                     NodeData::MethodDeclaration(method)
                         if method.body.is_some() && !self.is_constructor_name(method.name) =>
                     {
-                        self.writer.write(&name);
+                        self.writer.write(name);
                         if !self.has_modifier(method.modifiers.as_ref(), SyntaxKind::StaticKeyword)
                         {
                             self.writer.write(".prototype");
@@ -3777,7 +3845,7 @@ impl Printer<'_> {
                         self.writer.newline();
                     }
                     NodeData::GetAccessorDeclaration(_) | NodeData::SetAccessorDeclaration(_) => {
-                        self.emit_downlevel_accessor(data, &name, index)?;
+                        self.emit_downlevel_accessor(data, name, index)?;
                     }
                     _ => {}
                 }
@@ -3791,9 +3859,9 @@ impl Printer<'_> {
         if previous_emitted {
             self.emit_class_empty_elements_between(previous_end, data.members.range.end.get());
         }
-        self.emit_static_fields(data, &name)?;
+        self.emit_static_fields(data, name)?;
         self.writer.write("return ");
-        self.writer.write(&name);
+        self.writer.write(name);
         self.writer.write(";");
         self.writer.newline();
         self.writer.indent -= 1;
@@ -3801,7 +3869,7 @@ impl Printer<'_> {
         if let Some(base) = base {
             self.emit_expression(base, 0)?;
         }
-        self.writer.write("));");
+        self.writer.write("))");
         Ok(())
     }
 
@@ -5156,6 +5224,10 @@ impl Printer<'_> {
                 self.writer.write("await ");
                 self.emit_expression(data.expression, 2)?;
             }
+            NodeData::TypeOfExpression(data) => {
+                self.writer.write("typeof ");
+                self.emit_expression(data.expression, 16)?;
+            }
             NodeData::YieldExpression(data) => {
                 self.writer.write("yield");
                 if data.asterisk_token.is_some() {
@@ -5400,6 +5472,7 @@ impl Printer<'_> {
                     self.writer.write(")");
                 }
             }
+            NodeData::ClassExpression(data) => self.emit_class_expression(id, data)?,
             NodeData::NoSubstitutionTemplateLiteral(data) => {
                 if self.settings.target < ScriptTarget::Es2015 {
                     write_quoted(&mut self.writer, &data.text);
@@ -6548,7 +6621,7 @@ fn binary_precedence(kind: SyntaxKind) -> Option<(u8, bool)> {
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
-    use ts_ast::NodeData;
+    use ts_ast::{NodeData, SyntaxKind};
     use ts_binder::bind_source_file;
     use ts_options::{JsxEmit, ModuleKind, PrinterSettings, ScriptTarget};
     use ts_parser::{parse_jsx_source_file, parse_source_file};
@@ -7268,6 +7341,108 @@ mod tests {
         assert_eq!(
             result.code,
             "var __extends = (this && this.__extends) || (function () {\n    var extendStatics = function (d, b) {\n        extendStatics = Object.setPrototypeOf ||\n            ({ __proto__: [] } instanceof Array && function (d, b) { d.__proto__ = b; }) ||\n            function (d, b) { for (var p in b) if (Object.prototype.hasOwnProperty.call(b, p)) d[p] = b[p]; };\n        return extendStatics(d, b);\n    };\n    return function (d, b) {\n        if (typeof b !== \"function\" && b !== null)\n            throw new TypeError(\"Class extends value \" + String(b) + \" is not a constructor or null\");\n        extendStatics(d, b);\n        function __() { this.constructor = d; }\n        d.prototype = b === null ? Object.create(b) : (__.prototype = b.prototype, new __());\n    };\n})();\nvar Point = /** @class */ (function () {\n    function Point(y) {\n        this.x = 1;\n        this.y = y;\n    }\n    Point.prototype.move = function (d) {\n        this.x = this.x + d;\n    };\n    Point.make = function () {\n        return new Point(0);\n    };\n    Point.origin = 0;\n    return Point;\n}());\nvar ColoredPoint = /** @class */ (function (_super) {\n    __extends(ColoredPoint, _super);\n    function ColoredPoint(y) {\n        var _this = _super.call(this, y) || this;\n        _this.color = 'red';\n        _this.color = 'blue';\n        return _this;\n    }\n    ColoredPoint.prototype.paint = function () {\n        return this.color;\n    };\n    return ColoredPoint;\n}(Point));\n"
+        );
+    }
+
+    #[test]
+    fn emits_anonymous_class_expression_under_typeof_for_es2015_and_es5() {
+        let source = "function f() { return typeof class {} === \"function\"; }";
+        assert_eq!(
+            emit_with(source, ScriptTarget::Es2015, ModuleKind::EsNext).code,
+            concat!(
+                "function f() {\n",
+                "    return typeof class {\n",
+                "    } === \"function\";\n",
+                "}\n",
+            )
+        );
+        assert_eq!(
+            emit_with(source, ScriptTarget::Es5, ModuleKind::EsNext).code,
+            concat!(
+                "function f() {\n",
+                "    return typeof /** @class */ (function () {\n",
+                "        function _class() {\n",
+                "        }\n",
+                "        return _class;\n",
+                "    }()) === \"function\";\n",
+                "}\n",
+            )
+        );
+    }
+
+    #[test]
+    fn emits_named_and_inherited_class_expression_values() {
+        let named = "const Value = class Inner { method() { return 1; } };";
+        assert_eq!(
+            emit_with(named, ScriptTarget::Es2015, ModuleKind::EsNext).code,
+            concat!(
+                "const Value = class Inner {\n",
+                "    method() {\n",
+                "        return 1;\n",
+                "    }\n",
+                "};\n",
+            )
+        );
+        assert_eq!(
+            emit_with(named, ScriptTarget::Es5, ModuleKind::EsNext).code,
+            concat!(
+                "var Value = /** @class */ (function () {\n",
+                "    function Inner() {\n",
+                "    }\n",
+                "    Inner.prototype.method = function () {\n",
+                "        return 1;\n",
+                "    };\n",
+                "    return Inner;\n",
+                "}());\n",
+            )
+        );
+
+        let inherited = emit_with(
+            "function make() { return class extends Base { method() { return 1; } }; }",
+            ScriptTarget::Es5,
+            ModuleKind::EsNext,
+        )
+        .code;
+        assert!(inherited.starts_with("var __extends = "), "{inherited}");
+        assert!(
+            inherited.contains("return /** @class */ (function (_super) {"),
+            "{inherited}"
+        );
+        assert!(
+            inherited.contains("__extends(_class, _super);"),
+            "{inherited}"
+        );
+        assert!(inherited.ends_with("}(Base));\n}\n"), "{inherited}");
+        assert!(!inherited.contains("return var"), "{inherited}");
+    }
+
+    #[test]
+    fn rejects_native_class_expression_static_lowering_without_a_scoped_temp() {
+        let source = "const Value = class Inner { static value = 1; };";
+        let parsed = parse_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let error = emit_source_file_with_settings(
+            &parsed.arena,
+            parsed.source_file,
+            "input.ts",
+            source,
+            PrinterSettings {
+                always_strict: false,
+                target: ScriptTarget::Es2015,
+                module: ModuleKind::EsNext,
+                jsx: JsxEmit::Preserve,
+                emit_javascript: true,
+                emit_declarations: false,
+                source_map: false,
+                inline_source_map: false,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.kind, SyntaxKind::ClassExpression);
+
+        assert_eq!(
+            emit_with(source, ScriptTarget::Es2022, ModuleKind::EsNext).code,
+            "const Value = class Inner {\n    static value = 1;\n};\n"
         );
     }
 
