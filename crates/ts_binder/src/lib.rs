@@ -709,6 +709,24 @@ impl<'a> Binder<'a> {
             let name = data.name;
             let type_ = data.type_;
             let initializer = data.initializer;
+            let property_name = data
+                .modifiers
+                .as_ref()
+                .filter(|modifiers| {
+                    modifiers.list.nodes.iter().any(|modifier| {
+                        self.arena.get(*modifier).is_some_and(|modifier| {
+                            matches!(
+                                modifier.kind,
+                                SyntaxKind::OverrideKeyword
+                                    | SyntaxKind::PrivateKeyword
+                                    | SyntaxKind::ProtectedKeyword
+                                    | SyntaxKind::PublicKeyword
+                                    | SyntaxKind::ReadonlyKeyword
+                            )
+                        })
+                    })
+                })
+                .and_then(|_| self.identifier_text(name).map(str::to_owned));
             self.declare_binding_name(
                 scope,
                 parameter,
@@ -716,12 +734,38 @@ impl<'a> Binder<'a> {
                 SymbolFlags::FUNCTION_SCOPED_VARIABLE,
                 parent_symbol,
             );
+            if let Some(property_name) = property_name
+                && self.is_constructor_like(container)
+                && let Some(class_scope) = self.result.scopes[scope.index()].parent
+                && self.result.scopes[class_scope.index()].kind == ScopeKind::Class
+                && let Some(class_symbol) = parent_symbol
+                    .and_then(|symbol| self.result.symbols.get(symbol))
+                    .and_then(|symbol| symbol.parent)
+            {
+                self.declare_name(
+                    class_scope,
+                    parameter,
+                    property_name,
+                    SymbolFlags::PROPERTY,
+                    Some(class_symbol),
+                );
+            }
             if let Some(type_) = type_ {
                 self.bind_node(type_, scope, container, parent_symbol);
             }
             if let Some(initializer) = initializer {
                 self.bind_node(initializer, scope, container, parent_symbol);
             }
+        }
+    }
+
+    fn is_constructor_like(&self, node: NodeId) -> bool {
+        match self.arena.get(node).map(|node| &node.data) {
+            Some(NodeData::ConstructorDeclaration(_)) => true,
+            Some(NodeData::MethodDeclaration(method)) => {
+                self.identifier_text(method.name) == Some("constructor")
+            }
+            _ => false,
         }
     }
 
@@ -1673,5 +1717,37 @@ mod tests {
                 .iter()
                 .any(|scope| scope.kind == ScopeKind::Module)
         );
+    }
+
+    #[test]
+    fn binds_modified_arrow_parameters_and_constructor_parameter_properties() {
+        let parsed = parse_source_file(
+            r"
+                var v = (public x: string) => x;
+                class C { constructor(public readonly value: string) { value; } }
+                class any {}
+            ",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let result = bind_source_file(&parsed.arena, parsed.source_file);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+
+        let root = result.root_scope().unwrap();
+        assert!(root.symbols.get("v").is_some());
+        assert!(root.symbols.get("any").is_some());
+        let class = result.symbols.get(root.symbols.get("C").unwrap()).unwrap();
+        assert!(
+            result
+                .symbols
+                .get(class.members.get("value").unwrap())
+                .unwrap()
+                .flags
+                .contains(SymbolFlags::PROPERTY)
+        );
+        for parameter in ["x", "value"] {
+            assert!(result.scopes.iter().any(|scope| {
+                scope.kind == ScopeKind::Function && scope.symbols.get(parameter).is_some()
+            }));
+        }
     }
 }

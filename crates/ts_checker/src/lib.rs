@@ -1407,6 +1407,7 @@ impl<'a> Checker<'a> {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn object_type_from_members(&mut self, members: &[NodeId]) -> TypeId {
         let mut properties = BTreeMap::new();
         let mut optional_properties = BTreeSet::new();
@@ -1459,6 +1460,14 @@ impl<'a> Checker<'a> {
                         self.check_parameter(*parameter);
                     }
                     if let Some(name) = self.property_name(data.name) {
+                        if name == "constructor" {
+                            self.add_parameter_properties(
+                                &data.parameters.nodes,
+                                &mut properties,
+                                &mut optional_properties,
+                                &mut readonly_properties,
+                            );
+                        }
                         let method_type = self.signature_type(
                             &data.parameters.nodes,
                             data.type_,
@@ -1503,6 +1512,56 @@ impl<'a> Checker<'a> {
             optional_properties,
             readonly_properties,
         }))
+    }
+
+    fn add_parameter_properties(
+        &mut self,
+        parameters: &[NodeId],
+        properties: &mut BTreeMap<String, TypeId>,
+        optional_properties: &mut BTreeSet<String>,
+        readonly_properties: &mut BTreeSet<String>,
+    ) {
+        for parameter in parameters {
+            let Some(NodeData::ParameterDeclaration(data)) =
+                self.arena.get(*parameter).map(|node| &node.data)
+            else {
+                continue;
+            };
+            let is_property = data.modifiers.as_ref().is_some_and(|modifiers| {
+                modifiers.list.nodes.iter().any(|modifier| {
+                    self.arena.get(*modifier).is_some_and(|modifier| {
+                        matches!(
+                            modifier.kind,
+                            SyntaxKind::OverrideKeyword
+                                | SyntaxKind::PrivateKeyword
+                                | SyntaxKind::ProtectedKeyword
+                                | SyntaxKind::PublicKeyword
+                                | SyntaxKind::ReadonlyKeyword
+                        )
+                    })
+                })
+            });
+            let Some(name) = is_property.then(|| self.property_name(data.name)).flatten() else {
+                continue;
+            };
+            let mut property_type = data
+                .type_
+                .map(|type_node| self.type_from_type_node(type_node))
+                .or_else(|| {
+                    data.initializer
+                        .map(|initializer| self.type_of_expression(initializer))
+                })
+                .unwrap_or_else(|| self.result.types.any());
+            if self.is_question_token(data.question_token) {
+                optional_properties.insert(name.clone());
+                let undefined = self.result.types.undefined();
+                property_type = self.result.types.union([property_type, undefined]);
+            }
+            if self.has_ast_modifier(data.modifiers.as_ref(), SyntaxKind::ReadonlyKeyword) {
+                readonly_properties.insert(name.clone());
+            }
+            properties.insert(name, property_type);
+        }
     }
 
     fn is_question_token(&self, token: Option<NodeId>) -> bool {
@@ -4931,6 +4990,36 @@ mod tests {
         assert_eq!(
             result.diagnostics[2].diagnostic.render().unwrap(),
             "Argument of type '\"x\"' is not assignable to parameter of type 'number'."
+        );
+    }
+
+    #[test]
+    fn checks_modified_arrow_parameters_and_constructor_parameter_properties() {
+        let parsed = parse_source_file(
+            r"
+                const v = (public x: string) => x;
+                v(1);
+                class C { constructor(public readonly value: string) {} }
+                declare const c: C;
+                const text: string = c.value;
+                const bad: number = c.value;
+            ",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        assert!(
+            bindings.diagnostics.is_empty(),
+            "{:?}",
+            bindings.diagnostics
+        );
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2345, 2322]
         );
     }
 

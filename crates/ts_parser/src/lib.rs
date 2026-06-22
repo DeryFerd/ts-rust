@@ -584,6 +584,18 @@ impl<'a> Parser<'a> {
 
     fn parse_parameter(&mut self) -> NodeId {
         let start = self.current.range.start;
+        let mut modifier_nodes = Vec::new();
+        while self.current_token_is_parameter_modifier() {
+            modifier_nodes.push(self.consume_token_node());
+        }
+        let modifiers = (!modifier_nodes.is_empty()).then(|| ModifierList {
+            list: NodeList {
+                range: TextRange::new(start, self.current.range.start),
+                nodes: modifier_nodes.clone(),
+                has_trailing_comma: false,
+            },
+            flags: ts_ast::ModifierFlags::default(),
+        });
         let dot_dot_dot_token = if self.current.kind == SyntaxKind::DotDotDotToken {
             Some(self.consume_token_node())
         } else {
@@ -606,8 +618,9 @@ impl<'a> Parser<'a> {
             .or(type_node)
             .and_then(|id| self.arena.get(id))
             .map_or_else(|| self.node_end(name), |node| node.range.end);
-        let mut children = vec![name];
+        let mut children = modifier_nodes;
         children.extend(dot_dot_dot_token);
+        children.push(name);
         children.extend(question_token);
         children.extend(type_node);
         children.extend(initializer);
@@ -621,11 +634,37 @@ impl<'a> Parser<'a> {
                 symbol: None,
                 type_: type_node,
                 facts: 0,
-                modifiers: None,
+                modifiers,
                 name,
             })),
             &children,
         )
+    }
+
+    fn current_token_is_parameter_modifier(&mut self) -> bool {
+        if !matches!(
+            self.current.kind,
+            SyntaxKind::OverrideKeyword
+                | SyntaxKind::PrivateKeyword
+                | SyntaxKind::ProtectedKeyword
+                | SyntaxKind::PublicKeyword
+                | SyntaxKind::ReadonlyKeyword
+        ) {
+            return false;
+        }
+        let next = self.next_token_kind();
+        matches!(
+            next,
+            SyntaxKind::DotDotDotToken
+                | SyntaxKind::Identifier
+                | SyntaxKind::OpenBraceToken
+                | SyntaxKind::OpenBracketToken
+                | SyntaxKind::OverrideKeyword
+                | SyntaxKind::PrivateKeyword
+                | SyntaxKind::ProtectedKeyword
+                | SyntaxKind::PublicKeyword
+                | SyntaxKind::ReadonlyKeyword
+        ) || next.is_keyword()
     }
 
     fn parse_array_binding_pattern(&mut self) -> NodeId {
@@ -856,8 +895,9 @@ impl<'a> Parser<'a> {
 
     fn parse_class_declaration(&mut self) -> NodeId {
         let start = self.consume().range.start;
-        let name = if self.current.kind == SyntaxKind::Identifier {
-            Some(self.parse_identifier("Expected a class name."))
+        let name = if self.current.kind == SyntaxKind::Identifier || self.current.kind.is_keyword()
+        {
+            Some(self.parse_identifier_name("Expected a class name."))
         } else {
             self.error_current("Expected a class name.");
             None
@@ -5383,6 +5423,99 @@ mod tests {
         for span in &template_data.template_spans.nodes {
             assert_eq!(result.arena.get(*span).unwrap().parent, Some(template));
         }
+    }
+
+    #[test]
+    fn parses_parameter_modifiers_and_keyword_class_names() {
+        let source = r"
+            var v = (public x: string) => x;
+            class C { constructor(public readonly value: string) {} }
+            class any {}
+        ";
+        let result = parse_source_file(source);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let statements = source_statements(&result);
+
+        let (list, _) = variable_list(&result, statements[0]);
+        let declaration = declaration_nodes(&result, list)[0];
+        let NodeData::VariableDeclaration(declaration) =
+            &result.arena.get(declaration).unwrap().data
+        else {
+            panic!("expected variable declaration");
+        };
+        let NodeData::ArrowFunction(arrow) = &result
+            .arena
+            .get(declaration.initializer.unwrap())
+            .unwrap()
+            .data
+        else {
+            panic!("expected arrow function");
+        };
+        let NodeData::ParameterDeclaration(parameter) =
+            &result.arena.get(arrow.parameters.nodes[0]).unwrap().data
+        else {
+            panic!("expected arrow parameter");
+        };
+        let NodeData::Identifier(name) = &result.arena.get(parameter.name).unwrap().data else {
+            panic!("expected parameter identifier");
+        };
+        assert_eq!(name.text, "x");
+        assert_eq!(parameter.modifiers.as_ref().unwrap().list.nodes.len(), 1);
+        assert_eq!(
+            result
+                .arena
+                .get(parameter.modifiers.as_ref().unwrap().list.nodes[0])
+                .unwrap()
+                .kind,
+            SyntaxKind::PublicKeyword
+        );
+
+        let NodeData::ClassDeclaration(class) = &result.arena.get(statements[1]).unwrap().data
+        else {
+            panic!("expected class declaration");
+        };
+        let NodeData::MethodDeclaration(constructor) =
+            &result.arena.get(class.members.nodes[0]).unwrap().data
+        else {
+            panic!("expected constructor method");
+        };
+        let NodeData::ParameterDeclaration(parameter) = &result
+            .arena
+            .get(constructor.parameters.nodes[0])
+            .unwrap()
+            .data
+        else {
+            panic!("expected constructor parameter");
+        };
+        let modifier_kinds = parameter
+            .modifiers
+            .as_ref()
+            .unwrap()
+            .list
+            .nodes
+            .iter()
+            .map(|modifier| result.arena.get(*modifier).unwrap().kind)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            modifier_kinds,
+            [SyntaxKind::PublicKeyword, SyntaxKind::ReadonlyKeyword]
+        );
+        let NodeData::Identifier(name) = &result.arena.get(parameter.name).unwrap().data else {
+            panic!("expected parameter identifier");
+        };
+        assert_eq!(name.text, "value");
+
+        let NodeData::ClassDeclaration(keyword_named) =
+            &result.arena.get(statements[2]).unwrap().data
+        else {
+            panic!("expected keyword-named class declaration");
+        };
+        let NodeData::Identifier(name) =
+            &result.arena.get(keyword_named.name.unwrap()).unwrap().data
+        else {
+            panic!("expected class name");
+        };
+        assert_eq!(name.text, "any");
     }
 
     #[test]
