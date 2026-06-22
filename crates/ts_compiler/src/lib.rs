@@ -690,6 +690,8 @@ fn config_diagnostic(diagnostic: &ConfigDiagnostic) -> ProgramDiagnostic {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use ts_options::CompilerOptions;
     use ts_vfs::{FileSystem, MemoryFileSystem};
 
@@ -1390,6 +1392,71 @@ mod tests {
             es2015.source_files().iter().any(|file| {
                 file.is_default_library && file.file_name.ends_with("/lib.es6.d.ts")
             })
+        );
+    }
+
+    #[test]
+    fn checks_core_default_library_array_and_promise_generics() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/tsconfig.json",
+            r#"{
+                "files": ["main.ts"],
+                "compilerOptions": { "target": "es2015", "lib": ["es5"] }
+            }"#,
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/main.ts",
+            r#"
+                const values: Array<number> = [1, 2];
+                const wrongElement: string = values[0];
+                values.push("wrong");
+                const wrongMap: Array<string> = values.map(value => value + 1);
+
+                let promise: PromiseLike<number>;
+                promise.then((value: string) => value);
+            "#,
+        )
+        .unwrap();
+        let program = Program::from_config(&fs, "/project/tsconfig.json");
+        assert_eq!(
+            program
+                .diagnostics()
+                .iter()
+                .filter_map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [2322, 2345, 2322, 2345]
+        );
+    }
+
+    #[test]
+    fn checks_core_default_library_within_debug_budget() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/tsconfig.json",
+            r#"{
+                "files": ["main.ts"],
+                "compilerOptions": { "target": "es5", "lib": ["es5"] }
+            }"#,
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/main.ts",
+            "const values: Array<number> = [1, 2, 3]; values.map(value => value + 1);",
+        )
+        .unwrap();
+        let started = Instant::now();
+        let program = Program::from_config(&fs, "/project/tsconfig.json");
+        let elapsed = started.elapsed();
+        assert!(
+            program.diagnostics().is_empty(),
+            "{:?}",
+            program.diagnostics()
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "cold debug default-library check took {elapsed:?}"
         );
     }
 }

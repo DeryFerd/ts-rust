@@ -509,10 +509,13 @@ impl<'a> ProgramChecker<'a> {
                             duplicates.push((file_index, *declaration, code, name.to_owned()));
                         }
                     }
-                    if !source.is_default_library
-                        && existing_flags.contains(ts_binder::SymbolFlags::INTERFACE)
+                    if existing_flags.contains(ts_binder::SymbolFlags::INTERFACE)
                         && symbol.flags.contains(ts_binder::SymbolFlags::INTERFACE)
-                        && let Some(descriptor) = Self::describe_symbol(source, result, symbol_id)
+                        && let Some(descriptor) = if source.is_default_library {
+                            Self::describe_default_library_symbol(source, symbol_id)
+                        } else {
+                            Self::describe_symbol(source, result, symbol_id)
+                        }
                         && let Some(existing) = globals.get_mut(name)
                     {
                         merge_global_descriptor(existing, descriptor);
@@ -520,7 +523,7 @@ impl<'a> ProgramChecker<'a> {
                     continue;
                 }
                 let descriptor = if source.is_default_library {
-                    Some(TypeDescriptor::Any)
+                    Self::describe_default_library_symbol(source, symbol_id)
                 } else {
                     Self::describe_symbol(source, result, symbol_id)
                 };
@@ -531,6 +534,30 @@ impl<'a> ProgramChecker<'a> {
             }
         }
         (globals, duplicates)
+    }
+
+    fn describe_default_library_symbol(
+        source: &ProgramSource<'_>,
+        symbol_id: SymbolId,
+    ) -> Option<TypeDescriptor> {
+        let symbol = source.bindings.symbols.get(symbol_id)?;
+        let core_name = is_core_library_name(&symbol.name);
+        let preserve = symbol.declarations.iter().any(|declaration| {
+            match source.arena.get(*declaration).map(|node| &node.data) {
+                Some(NodeData::TypeAliasDeclaration(_)) => core_name,
+                Some(NodeData::InterfaceDeclaration(_) | NodeData::ClassDeclaration(_)) => {
+                    core_name
+                }
+                Some(NodeData::FunctionDeclaration(_)) => {
+                    core_name && symbol.declarations.len() > 1
+                }
+                _ => false,
+            }
+        });
+        if !preserve {
+            return Some(TypeDescriptor::Any);
+        }
+        describe_declaration_symbol(source, symbol_id).or(Some(TypeDescriptor::Any))
     }
 
     fn imports(
@@ -644,20 +671,18 @@ impl<'a> ProgramChecker<'a> {
         result: &CheckResult,
         symbol_id: SymbolId,
     ) -> Option<TypeDescriptor> {
+        if let Some(descriptor) = describe_declaration_symbol(source, symbol_id) {
+            return Some(descriptor);
+        }
         let symbol = source.bindings.symbols.get(symbol_id)?;
         let target = symbol.target.unwrap_or(symbol_id);
         let target_symbol = source.bindings.symbols.get(target)?;
         for declaration in &target_symbol.declarations {
-            match source.arena.get(*declaration).map(|node| &node.data) {
-                Some(NodeData::TypeAliasDeclaration(alias)) => {
-                    return Some(describe_alias(source, alias));
-                }
-                Some(NodeData::ExportAssignment(assignment)) => {
-                    if let Some(type_id) = result.type_of_node(assignment.expression) {
-                        return Some(describe_type(&result.types, type_id));
-                    }
-                }
-                _ => {}
+            if let Some(NodeData::ExportAssignment(assignment)) =
+                source.arena.get(*declaration).map(|node| &node.data)
+                && let Some(type_id) = result.type_of_node(assignment.expression)
+            {
+                return Some(describe_type(&result.types, type_id));
             }
         }
         result
@@ -678,6 +703,7 @@ struct Checker<'a> {
     external_symbols: HashMap<SymbolId, TypeDescriptor>,
     external_names: BTreeMap<String, TypeDescriptor>,
     external_aliases: HashMap<SymbolId, TypeDescriptor>,
+    imported_type_parameters: HashMap<String, TypeId>,
 }
 
 enum DeclaredObject {
@@ -710,6 +736,7 @@ impl<'a> Checker<'a> {
             external_symbols: HashMap::new(),
             external_names: BTreeMap::new(),
             external_aliases: HashMap::new(),
+            imported_type_parameters: HashMap::new(),
         }
     }
 
@@ -1645,13 +1672,28 @@ impl<'a> Checker<'a> {
             self.check_node(data.body, expected_return, &mut saw_return);
             expected_return.unwrap_or_else(|| self.result.types.any())
         } else {
-            let actual = self.type_of_expression_context(data.body, expected_return);
+            let return_context = expected_return.filter(|expected| {
+                !matches!(
+                    self.result.types.get(*expected).map(|type_| &type_.kind),
+                    Some(TypeKind::TypeParameter { .. })
+                )
+            });
+            let actual = self.type_of_expression_context(data.body, return_context);
             if let Some(expected) = expected_return
                 && !self.is_assignable(actual, expected)
             {
                 self.assignability_error(data.body, actual, expected);
             }
-            expected_return.unwrap_or_else(|| self.widen_literal(actual))
+            if expected_return.is_some_and(|expected| {
+                matches!(
+                    self.result.types.get(expected).map(|type_| &type_.kind),
+                    Some(TypeKind::TypeParameter { .. })
+                )
+            }) {
+                self.widen_literal(actual)
+            } else {
+                expected_return.unwrap_or_else(|| self.widen_literal(actual))
+            }
         };
         self.local_scopes.pop();
         self.result.types.alloc(TypeKind::Function(FunctionType {
@@ -1678,6 +1720,14 @@ impl<'a> Checker<'a> {
             TypeKind::Any => Some(self.result.types.any()),
             TypeKind::Object(object) => object.properties.get(name).copied(),
             TypeKind::Array(_) if name == "length" => Some(self.result.types.number()),
+            TypeKind::Array(element) => {
+                let descriptor = self.external_names.get("Array")?.clone();
+                let array = self.import_alias(&descriptor, &[element]);
+                match self.result.types.get(array)?.kind.clone() {
+                    TypeKind::Object(object) => object.properties.get(name).copied(),
+                    _ => None,
+                }
+            }
             TypeKind::Tuple(elements) if name == "length" => Some(
                 self.result
                     .types
@@ -1821,25 +1871,29 @@ impl<'a> Checker<'a> {
                 return self.result.types.any();
             }
         };
-        let actuals = arguments
-            .iter()
-            .map(|argument| self.type_of_expression(*argument))
-            .collect::<Vec<_>>();
-        if let Some((signature, inference)) = signatures.iter().find_map(|signature| {
-            if signature.parameters.len() != actuals.len() {
-                return None;
-            }
-            let mut inference = HashMap::new();
-            for (actual, parameter) in actuals.iter().zip(&signature.parameters) {
-                self.infer_type_parameters(*parameter, *actual, &mut inference);
-                let expected = self.substitute_type(*parameter, &inference);
-                if !self.is_assignable(*actual, expected) {
+        if signatures.len() > 1 {
+            let actuals = arguments
+                .iter()
+                .map(|argument| self.type_of_expression(*argument))
+                .collect::<Vec<_>>();
+            if let Some((signature, inference)) = signatures.iter().find_map(|signature| {
+                if actuals.len() < self.minimum_parameter_count(signature)
+                    || actuals.len() > signature.parameters.len()
+                {
                     return None;
                 }
+                let mut inference = HashMap::new();
+                for (actual, parameter) in actuals.iter().zip(&signature.parameters) {
+                    self.infer_type_parameters(*parameter, *actual, &mut inference);
+                    let expected = self.substitute_type(*parameter, &inference);
+                    if !self.is_assignable(*actual, expected) {
+                        return None;
+                    }
+                }
+                Some((signature, inference))
+            }) {
+                return self.substitute_type(signature.return_type, &inference);
             }
-            Some((signature, inference))
-        }) {
-            return self.substitute_type(signature.return_type, &inference);
         }
         let Some(signature) = signatures.first() else {
             self.error(
@@ -1849,14 +1903,12 @@ impl<'a> Checker<'a> {
             );
             return self.result.types.any();
         };
-        if signature.parameters.len() != arguments.len() {
+        let minimum_parameters = self.minimum_parameter_count(signature);
+        if arguments.len() < minimum_parameters || arguments.len() > signature.parameters.len() {
             self.error(
                 node,
                 2554,
-                [
-                    signature.parameters.len().to_string(),
-                    arguments.len().to_string(),
-                ],
+                [minimum_parameters.to_string(), arguments.len().to_string()],
             );
         }
         let mut inference = HashMap::new();
@@ -1876,6 +1928,24 @@ impl<'a> Checker<'a> {
             }
         }
         self.substitute_type(signature.return_type, &inference)
+    }
+
+    fn minimum_parameter_count(&self, signature: &FunctionType) -> usize {
+        signature
+            .parameters
+            .iter()
+            .rposition(|parameter| !self.type_includes_undefined(*parameter))
+            .map_or(0, |index| index + 1)
+    }
+
+    fn type_includes_undefined(&self, type_id: TypeId) -> bool {
+        if type_id == self.result.types.undefined() {
+            return true;
+        }
+        matches!(
+            &self.result.types.get(type_id).unwrap().kind,
+            TypeKind::Union(members) if members.iter().any(|member| self.type_includes_undefined(*member))
+        )
     }
 
     fn infer_type_parameters(
@@ -1899,6 +1969,24 @@ impl<'a> Checker<'a> {
                     self.infer_type_parameters(parameter_element, actual_element, inference);
                 }
             }
+            TypeKind::Function(parameter_signature) => {
+                if let TypeKind::Function(actual_signature) =
+                    self.result.types.get(actual).unwrap().kind.clone()
+                {
+                    for (parameter, actual) in parameter_signature
+                        .parameters
+                        .iter()
+                        .zip(&actual_signature.parameters)
+                    {
+                        self.infer_type_parameters(*parameter, *actual, inference);
+                    }
+                    self.infer_type_parameters(
+                        parameter_signature.return_type,
+                        actual_signature.return_type,
+                        inference,
+                    );
+                }
+            }
             _ => {}
         }
     }
@@ -1918,6 +2006,18 @@ impl<'a> Checker<'a> {
                     .map(|member| self.substitute_type(member, inference))
                     .collect::<Vec<_>>();
                 self.result.types.union(substituted)
+            }
+            TypeKind::Function(signature) => {
+                let parameters = signature
+                    .parameters
+                    .into_iter()
+                    .map(|parameter| self.substitute_type(parameter, inference))
+                    .collect();
+                let return_type = self.substitute_type(signature.return_type, inference);
+                self.result.types.alloc(TypeKind::Function(FunctionType {
+                    parameters,
+                    return_type,
+                }))
             }
             _ => type_id,
         }
@@ -2046,7 +2146,13 @@ impl<'a> Checker<'a> {
                     };
                     if data.question_token.is_some() {
                         let undefined = self.result.types.undefined();
-                        self.result.types.union([base, undefined])
+                        if base == self.result.types.any() {
+                            self.result
+                                .types
+                                .alloc(TypeKind::Union(vec![base, undefined]))
+                        } else {
+                            self.result.types.union([base, undefined])
+                        }
                     } else {
                         base
                     }
@@ -2199,6 +2305,16 @@ impl<'a> Checker<'a> {
                 self.result.types.alloc(TypeKind::Tuple(elements))
             }
             NodeData::TypeLiteralNode(data) => self.object_type_from_members(&data.members.nodes),
+            NodeData::FunctionTypeNode(data) => self.signature_type(
+                &data.parameters.nodes,
+                data.type_,
+                data.type_parameters.as_ref(),
+            ),
+            NodeData::ConstructorTypeNode(data) => self.signature_type(
+                &data.parameters.nodes,
+                data.type_,
+                data.type_parameters.as_ref(),
+            ),
             NodeData::IndexedAccessTypeNode(data) => {
                 let object = self.type_from_type_node(data.object_type);
                 let index = self.type_from_type_node(data.index_type);
@@ -2460,7 +2576,7 @@ impl<'a> Checker<'a> {
                 constraint.is_none_or(|constraint| self.is_assignable(source, constraint))
             }
             (TypeKind::Function(source), TypeKind::Function(target)) => {
-                source.parameters.len() == target.parameters.len()
+                source.parameters.len() <= target.parameters.len()
                     && source
                         .parameters
                         .iter()
@@ -2521,9 +2637,22 @@ impl<'a> Checker<'a> {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn import_type(&mut self, descriptor: &TypeDescriptor) -> TypeId {
         match descriptor {
-            TypeDescriptor::Any | TypeDescriptor::TypeParameter(_) => self.result.types.any(),
+            TypeDescriptor::Any => self.result.types.any(),
+            TypeDescriptor::TypeParameter(name) => {
+                if let Some(type_id) = self.imported_type_parameters.get(name) {
+                    *type_id
+                } else {
+                    let type_id = self.result.types.alloc(TypeKind::TypeParameter {
+                        name: name.clone(),
+                        constraint: None,
+                    });
+                    self.imported_type_parameters.insert(name.clone(), type_id);
+                    type_id
+                }
+            }
             TypeDescriptor::Unknown => self.result.types.unknown(),
             TypeDescriptor::Never => self.result.types.never(),
             TypeDescriptor::Void => self.result.types.void(),
@@ -2565,7 +2694,13 @@ impl<'a> Checker<'a> {
                     .iter()
                     .map(|member| self.import_type(member))
                     .collect::<Vec<_>>();
-                self.result.types.union(members)
+                if members.contains(&self.result.types.any())
+                    && members.contains(&self.result.types.undefined())
+                {
+                    self.result.types.alloc(TypeKind::Union(members))
+                } else {
+                    self.result.types.union(members)
+                }
             }
             TypeDescriptor::Intersection(members) => {
                 let members = members
@@ -2825,6 +2960,171 @@ fn describe_alias(
     }
 }
 
+fn describe_declaration_symbol(
+    source: &ProgramSource<'_>,
+    symbol_id: SymbolId,
+) -> Option<TypeDescriptor> {
+    let symbol = source.bindings.symbols.get(symbol_id)?;
+    let declarations = symbol
+        .declarations
+        .iter()
+        .filter_map(|declaration| source.arena.get(*declaration))
+        .collect::<Vec<_>>();
+    if let Some(NodeData::TypeAliasDeclaration(alias)) = declarations.iter().find_map(|node| {
+        matches!(&node.data, NodeData::TypeAliasDeclaration(_)).then_some(&node.data)
+    }) {
+        return Some(describe_alias(source, alias));
+    }
+    let function_declarations = declarations
+        .iter()
+        .filter_map(|node| {
+            let NodeData::FunctionDeclaration(data) = &node.data else {
+                return None;
+            };
+            Some(data.as_ref())
+        })
+        .collect::<Vec<_>>();
+    if !function_declarations.is_empty() {
+        let mut checker = Checker::new(source.arena, source.bindings);
+        let signatures = function_declarations
+            .iter()
+            .filter(|declaration| function_declarations.len() == 1 || declaration.body.is_none())
+            .map(|declaration| {
+                let type_id = checker.function_type(declaration);
+                describe_type(&checker.result.types, type_id)
+            })
+            .collect::<Vec<_>>();
+        return if signatures.len() == 1 {
+            signatures.into_iter().next()
+        } else {
+            Some(TypeDescriptor::Overload(signatures))
+        };
+    }
+    let first_interface = declarations.iter().find_map(|node| {
+        let NodeData::InterfaceDeclaration(data) = &node.data else {
+            return None;
+        };
+        Some(data.as_ref())
+    });
+    if let Some(first) = first_interface {
+        let mut checker = Checker::new(source.arena, source.bindings);
+        let (parameters, arguments) =
+            descriptor_parameters(&mut checker, first.type_parameters.as_ref());
+        let mut properties = BTreeMap::new();
+        for declaration in declarations {
+            let NodeData::InterfaceDeclaration(data) = &declaration.data else {
+                continue;
+            };
+            let object = checker.declared_object_type(
+                data.type_parameters.as_ref(),
+                data.heritage_clauses.as_ref(),
+                &data.members.nodes,
+                &arguments,
+            );
+            if let TypeKind::Object(object) = checker.result.types.get(object)?.kind.clone() {
+                properties.extend(object.properties);
+            }
+        }
+        let body = checker
+            .result
+            .types
+            .alloc(TypeKind::Object(ObjectType { properties }));
+        let body = describe_type(&checker.result.types, body);
+        return Some(if parameters.is_empty() {
+            body
+        } else {
+            TypeDescriptor::Alias {
+                parameters,
+                body: Box::new(body),
+            }
+        });
+    }
+    let class = declarations.iter().find_map(|node| {
+        let NodeData::ClassDeclaration(data) = &node.data else {
+            return None;
+        };
+        Some(data.as_ref())
+    })?;
+    let mut checker = Checker::new(source.arena, source.bindings);
+    let (parameters, arguments) =
+        descriptor_parameters(&mut checker, class.type_parameters.as_ref());
+    let object = checker.declared_object_type(
+        class.type_parameters.as_ref(),
+        class.heritage_clauses.as_ref(),
+        &class.members.nodes,
+        &arguments,
+    );
+    let body = describe_type(&checker.result.types, object);
+    Some(if parameters.is_empty() {
+        body
+    } else {
+        TypeDescriptor::Alias {
+            parameters,
+            body: Box::new(body),
+        }
+    })
+}
+
+fn descriptor_parameters(
+    checker: &mut Checker<'_>,
+    type_parameters: Option<&ts_ast::NodeList>,
+) -> (Vec<String>, Vec<TypeId>) {
+    let mut names = Vec::new();
+    let mut types = Vec::new();
+    if let Some(parameters) = type_parameters {
+        for parameter in &parameters.nodes {
+            let Some(NodeData::TypeParameterDeclaration(parameter)) =
+                checker.arena.get(*parameter).map(|node| &node.data)
+            else {
+                continue;
+            };
+            let Some(name) = checker.property_name(parameter.name) else {
+                continue;
+            };
+            types.push(checker.result.types.alloc(TypeKind::TypeParameter {
+                name: name.clone(),
+                constraint: None,
+            }));
+            names.push(name);
+        }
+    }
+    (names, types)
+}
+
+fn is_core_library_name(name: &str) -> bool {
+    matches!(
+        name,
+        "Array"
+            | "ReadonlyArray"
+            | "Promise"
+            | "PromiseLike"
+            | "PromiseConstructor"
+            | "String"
+            | "StringConstructor"
+            | "ArrayConstructor"
+            | "Object"
+            | "Function"
+            | "CallableFunction"
+            | "NewableFunction"
+            | "IArguments"
+            | "RegExp"
+            | "Awaited"
+            | "Partial"
+            | "Required"
+            | "Readonly"
+            | "Pick"
+            | "Record"
+            | "Exclude"
+            | "Extract"
+            | "Omit"
+            | "NonNullable"
+            | "Parameters"
+            | "ConstructorParameters"
+            | "ReturnType"
+            | "InstanceType"
+    )
+}
+
 fn describe_type(types: &TypeArena, type_id: TypeId) -> TypeDescriptor {
     match &types
         .get(type_id)
@@ -2904,7 +3204,7 @@ fn substitute_descriptor(
         TypeDescriptor::TypeParameter(name) => substitutions
             .get(name)
             .cloned()
-            .unwrap_or(TypeDescriptor::Any),
+            .unwrap_or_else(|| descriptor.clone()),
         TypeDescriptor::Array(element) => {
             TypeDescriptor::Array(Box::new(substitute_descriptor(element, substitutions)))
         }
@@ -2986,8 +3286,27 @@ fn global_declarations_merge(
 }
 
 fn merge_global_descriptor(existing: &mut TypeDescriptor, new: TypeDescriptor) {
-    if let (TypeDescriptor::Object(existing), TypeDescriptor::Object(new)) = (existing, new) {
-        existing.extend(new);
+    match (existing, new) {
+        (TypeDescriptor::Object(existing), TypeDescriptor::Object(new)) => {
+            existing.extend(new);
+        }
+        (
+            TypeDescriptor::Alias {
+                parameters: existing_parameters,
+                body: existing_body,
+            },
+            TypeDescriptor::Alias {
+                parameters: new_parameters,
+                body: new_body,
+            },
+        ) if *existing_parameters == new_parameters => {
+            if let (TypeDescriptor::Object(existing), TypeDescriptor::Object(new)) =
+                (existing_body.as_mut(), *new_body)
+            {
+                existing.extend(new);
+            }
+        }
+        _ => {}
     }
 }
 
