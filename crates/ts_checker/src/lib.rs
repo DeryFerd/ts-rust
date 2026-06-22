@@ -1,6 +1,6 @@
 //! Initial semantic type checking over the arena-backed TypeScript AST.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use ts_ast::{NodeArena, NodeData, NodeId, SymbolId, SyntaxKind};
 use ts_binder::BindResult;
@@ -48,6 +48,8 @@ pub enum TypeKind {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ObjectType {
     pub properties: BTreeMap<String, TypeId>,
+    pub optional_properties: BTreeSet<String>,
+    pub readonly_properties: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -428,7 +430,11 @@ enum TypeDescriptor {
     Tuple(Vec<Self>),
     Union(Vec<Self>),
     Intersection(Vec<Self>),
-    Object(BTreeMap<String, Self>),
+    Object {
+        properties: BTreeMap<String, Self>,
+        optional_properties: BTreeSet<String>,
+        readonly_properties: BTreeSet<String>,
+    },
     Function {
         parameters: Vec<Self>,
         return_type: Box<Self>,
@@ -1348,6 +1354,8 @@ impl<'a> Checker<'a> {
 
     fn object_type_from_members(&mut self, members: &[NodeId]) -> TypeId {
         let mut properties = BTreeMap::new();
+        let mut optional_properties = BTreeSet::new();
+        let mut readonly_properties = BTreeSet::new();
         for member in members {
             let Some(node) = self.arena.get(*member) else {
                 continue;
@@ -1355,19 +1363,39 @@ impl<'a> Checker<'a> {
             match &node.data {
                 NodeData::PropertyDeclaration(data) => {
                     if let Some(name) = self.property_name(data.name) {
-                        let property_type = data
+                        let mut property_type = data
                             .type_
                             .map(|type_node| self.type_from_type_node(type_node))
                             .or_else(|| {
                                 data.initializer.map(|value| self.type_of_expression(value))
                             })
                             .unwrap_or_else(|| self.result.types.any());
+                        if self.is_question_token(data.postfix_token) {
+                            optional_properties.insert(name.clone());
+                            let undefined = self.result.types.undefined();
+                            property_type = self.result.types.union([property_type, undefined]);
+                        }
+                        if self
+                            .has_ast_modifier(data.modifiers.as_ref(), SyntaxKind::ReadonlyKeyword)
+                        {
+                            readonly_properties.insert(name.clone());
+                        }
                         properties.insert(name, property_type);
                     }
                 }
                 NodeData::PropertySignatureDeclaration(data) => {
                     if let Some(name) = self.property_name(data.name) {
-                        let property_type = self.type_from_type_node(data.type_);
+                        let mut property_type = self.type_from_type_node(data.type_);
+                        if self.is_question_token(data.postfix_token) {
+                            optional_properties.insert(name.clone());
+                            let undefined = self.result.types.undefined();
+                            property_type = self.result.types.union([property_type, undefined]);
+                        }
+                        if self
+                            .has_ast_modifier(data.modifiers.as_ref(), SyntaxKind::ReadonlyKeyword)
+                        {
+                            readonly_properties.insert(name.clone());
+                        }
                         properties.insert(name, property_type);
                     }
                 }
@@ -1381,7 +1409,16 @@ impl<'a> Checker<'a> {
                             data.type_,
                             data.type_parameters.as_ref(),
                         );
-                        self.insert_callable_property(&mut properties, name, method_type);
+                        let optional = self.is_question_token(data.postfix_token);
+                        if optional {
+                            optional_properties.insert(name.clone());
+                        }
+                        self.insert_callable_property(&mut properties, name.clone(), method_type);
+                        if optional {
+                            let method = properties[&name];
+                            let undefined = self.result.types.undefined();
+                            properties.insert(name, self.result.types.union([method, undefined]));
+                        }
                     }
                 }
                 NodeData::MethodSignatureDeclaration(data) => {
@@ -1391,15 +1428,42 @@ impl<'a> Checker<'a> {
                             data.type_,
                             data.type_parameters.as_ref(),
                         );
-                        self.insert_callable_property(&mut properties, name, method_type);
+                        let optional = self.is_question_token(data.postfix_token);
+                        if optional {
+                            optional_properties.insert(name.clone());
+                        }
+                        self.insert_callable_property(&mut properties, name.clone(), method_type);
+                        if optional {
+                            let method = properties[&name];
+                            let undefined = self.result.types.undefined();
+                            properties.insert(name, self.result.types.union([method, undefined]));
+                        }
                     }
                 }
                 _ => {}
             }
         }
-        self.result
-            .types
-            .alloc(TypeKind::Object(ObjectType { properties }))
+        self.result.types.alloc(TypeKind::Object(ObjectType {
+            properties,
+            optional_properties,
+            readonly_properties,
+        }))
+    }
+
+    fn is_question_token(&self, token: Option<NodeId>) -> bool {
+        token
+            .and_then(|token| self.arena.get(token))
+            .is_some_and(|token| token.kind == SyntaxKind::QuestionToken)
+    }
+
+    fn has_ast_modifier(&self, modifiers: Option<&ts_ast::ModifierList>, kind: SyntaxKind) -> bool {
+        modifiers.is_some_and(|modifiers| {
+            modifiers.list.nodes.iter().any(|modifier| {
+                self.arena
+                    .get(*modifier)
+                    .is_some_and(|modifier| modifier.kind == kind)
+            })
+        })
     }
 
     fn insert_callable_property(
@@ -1460,6 +1524,8 @@ impl<'a> Checker<'a> {
         }
         self.type_parameter_scopes.push(scope);
         let mut properties = BTreeMap::new();
+        let mut optional_properties = BTreeSet::new();
+        let mut readonly_properties = BTreeSet::new();
         if let Some(clauses) = heritage_clauses {
             for clause in &clauses.nodes {
                 let Some(NodeData::HeritageClause(clause)) =
@@ -1497,6 +1563,8 @@ impl<'a> Checker<'a> {
                         self.result.types.get(base).unwrap().kind.clone()
                     {
                         properties.extend(base.properties);
+                        optional_properties.extend(base.optional_properties);
+                        readonly_properties.extend(base.readonly_properties);
                     }
                 }
             }
@@ -1504,11 +1572,14 @@ impl<'a> Checker<'a> {
         let own = self.object_type_from_members(members);
         if let TypeKind::Object(own) = self.result.types.get(own).unwrap().kind.clone() {
             properties.extend(own.properties);
+            optional_properties.extend(own.optional_properties);
+            readonly_properties.extend(own.readonly_properties);
         }
-        let result = self
-            .result
-            .types
-            .alloc(TypeKind::Object(ObjectType { properties }));
+        let result = self.result.types.alloc(TypeKind::Object(ObjectType {
+            properties,
+            optional_properties,
+            readonly_properties,
+        }));
         self.type_parameter_scopes.pop();
         result
     }
@@ -1960,14 +2031,22 @@ impl<'a> Checker<'a> {
                     }
                     self.flow_types.insert(symbol, right);
                     right
+                } else if operator == SyntaxKind::EqualsToken
+                    && let Some(name) = self.readonly_assignment_name(data.left)
+                {
+                    self.error(node_id, 2540, [name]);
+                    if !self.is_assignable(right, left) {
+                        self.assignability_error(node_id, right, left);
+                    }
+                    right
                 } else {
                     self.check_binary(node_id, operator, left, right)
                 }
             }
             NodeData::ObjectLiteralExpression(data) => {
-                let contextual_properties = contextual_type.and_then(|type_id| {
+                let contextual_object = contextual_type.and_then(|type_id| {
                     match &self.result.types.get(type_id)?.kind {
-                        TypeKind::Object(object) => Some(object.properties.clone()),
+                        TypeKind::Object(object) => Some(object.clone()),
                         _ => None,
                     }
                 });
@@ -1977,10 +2056,22 @@ impl<'a> Checker<'a> {
                         self.arena.get(*property).map(|node| &node.data)
                         && let Some(name) = self.property_name(property_data.name)
                     {
-                        let expected = contextual_properties
+                        let expected = contextual_object
                             .as_ref()
-                            .and_then(|properties| properties.get(&name))
+                            .and_then(|object| object.properties.get(&name))
                             .copied();
+                        if expected.is_none() && contextual_object.is_some() {
+                            self.error(
+                                *property,
+                                2353,
+                                [
+                                    name.clone(),
+                                    self.result.types.display(
+                                        contextual_type.expect("contextual object has a type"),
+                                    ),
+                                ],
+                            );
+                        }
                         let actual =
                             self.type_of_expression_context(property_data.initializer, expected);
                         if let Some(expected) = expected
@@ -1991,9 +2082,10 @@ impl<'a> Checker<'a> {
                         properties.insert(name, actual);
                     }
                 }
-                self.result
-                    .types
-                    .alloc(TypeKind::Object(ObjectType { properties }))
+                self.result.types.alloc(TypeKind::Object(ObjectType {
+                    properties,
+                    ..ObjectType::default()
+                }))
             }
             NodeData::ArrayLiteralExpression(data) => {
                 let expected_tuple = contextual_type.and_then(|type_id| {
@@ -2120,6 +2212,23 @@ impl<'a> Checker<'a> {
         }
         self.error(node, 2304, [name.to_owned()]);
         self.result.types.any()
+    }
+
+    fn readonly_assignment_name(&mut self, left: NodeId) -> Option<String> {
+        let NodeData::PropertyAccessExpression(access) =
+            self.arena.get(left).map(|node| node.data.clone())?
+        else {
+            return None;
+        };
+        let name = self.property_name(access.name)?;
+        let receiver = self.type_of_expression(access.expression);
+        let readonly = self.union_members(receiver).iter().any(|member| {
+            matches!(
+                &self.result.types.get(*member).unwrap().kind,
+                TypeKind::Object(object) if object.readonly_properties.contains(&name)
+            )
+        });
+        readonly.then_some(name)
     }
 
     fn arrow_type(
@@ -2480,6 +2589,26 @@ impl<'a> Checker<'a> {
                     self.infer_type_parameters(parameter_element, actual_element, inference);
                 }
             }
+            TypeKind::Tuple(parameter_elements) => {
+                if let TypeKind::Tuple(actual_elements) =
+                    self.result.types.get(actual).unwrap().kind.clone()
+                {
+                    for (parameter, actual) in parameter_elements.iter().zip(&actual_elements) {
+                        self.infer_type_parameters(*parameter, *actual, inference);
+                    }
+                }
+            }
+            TypeKind::Object(parameter_object) => {
+                if let TypeKind::Object(actual_object) =
+                    self.result.types.get(actual).unwrap().kind.clone()
+                {
+                    for (name, parameter) in parameter_object.properties {
+                        if let Some(actual) = actual_object.properties.get(&name) {
+                            self.infer_type_parameters(parameter, *actual, inference);
+                        }
+                    }
+                }
+            }
             TypeKind::Function(parameter_signature) => {
                 if let TypeKind::Function(actual_signature) =
                     self.result.types.get(actual).unwrap().kind.clone()
@@ -2528,6 +2657,25 @@ impl<'a> Checker<'a> {
                 self.result.types.alloc(TypeKind::Function(FunctionType {
                     parameters,
                     return_type,
+                }))
+            }
+            TypeKind::Tuple(elements) => {
+                let elements = elements
+                    .into_iter()
+                    .map(|element| self.substitute_type(element, inference))
+                    .collect();
+                self.result.types.alloc(TypeKind::Tuple(elements))
+            }
+            TypeKind::Object(object) => {
+                let properties = object
+                    .properties
+                    .into_iter()
+                    .map(|(name, property)| (name, self.substitute_type(property, inference)))
+                    .collect();
+                self.result.types.alloc(TypeKind::Object(ObjectType {
+                    properties,
+                    optional_properties: object.optional_properties,
+                    readonly_properties: object.readonly_properties,
                 }))
             }
             _ => type_id,
@@ -2945,6 +3093,8 @@ impl<'a> Checker<'a> {
         let constraint = self.type_from_type_node(constraint);
         let keys = self.literal_keys(constraint);
         let mut properties = BTreeMap::new();
+        let mut optional_properties = BTreeSet::new();
+        let mut readonly_properties = BTreeSet::new();
         for (property_name, key_type) in keys {
             self.type_parameter_scopes
                 .push(HashMap::from([(name.clone(), key_type)]));
@@ -2960,15 +3110,21 @@ impl<'a> Checker<'a> {
                 None => self.result.types.any(),
             };
             if data.question_token.is_some() {
+                optional_properties.insert(output_name.clone());
                 let undefined = self.result.types.undefined();
                 property_type = self.result.types.union([property_type, undefined]);
+            }
+            if data.readonly_token.is_some() {
+                readonly_properties.insert(output_name.clone());
             }
             self.type_parameter_scopes.pop();
             properties.insert(output_name, property_type);
         }
-        self.result
-            .types
-            .alloc(TypeKind::Object(ObjectType { properties }))
+        self.result.types.alloc(TypeKind::Object(ObjectType {
+            properties,
+            optional_properties,
+            readonly_properties,
+        }))
     }
 
     fn literal_keys(&self, type_id: TypeId) -> Vec<(String, TypeId)> {
@@ -3068,9 +3224,11 @@ impl<'a> Checker<'a> {
         }
         if let TypeKind::Object(target_object) = target_kind {
             return target_object.properties.iter().all(|(name, target_type)| {
-                self.property_types(source, name)
-                    .into_iter()
-                    .any(|source_type| self.is_assignable(source_type, *target_type))
+                let source_types = self.property_types(source, name);
+                (source_types.is_empty() && target_object.optional_properties.contains(name))
+                    || source_types
+                        .into_iter()
+                        .any(|source_type| self.is_assignable(source_type, *target_type))
             });
         }
         match (source_kind, target_kind) {
@@ -3252,14 +3410,20 @@ impl<'a> Checker<'a> {
                     .collect::<Vec<_>>();
                 self.result.types.intersection(members)
             }
-            TypeDescriptor::Object(properties) => {
+            TypeDescriptor::Object {
+                properties,
+                optional_properties,
+                readonly_properties,
+            } => {
                 let properties = properties
                     .iter()
                     .map(|(name, property)| (name.clone(), self.import_type(property)))
                     .collect();
-                self.result
-                    .types
-                    .alloc(TypeKind::Object(ObjectType { properties }))
+                self.result.types.alloc(TypeKind::Object(ObjectType {
+                    properties,
+                    optional_properties: optional_properties.clone(),
+                    readonly_properties: readonly_properties.clone(),
+                }))
             }
             TypeDescriptor::Function {
                 parameters,
@@ -3350,14 +3514,18 @@ impl<'a> Checker<'a> {
                 self.result.types.intersection(members)
             }
             Some(TypeKind::Object(object)) => {
+                let optional_properties = object.optional_properties;
+                let readonly_properties = object.readonly_properties;
                 let properties = object
                     .properties
                     .into_iter()
                     .map(|(name, property)| (name, self.widen_literal(property)))
                     .collect();
-                self.result
-                    .types
-                    .alloc(TypeKind::Object(ObjectType { properties }))
+                self.result.types.alloc(TypeKind::Object(ObjectType {
+                    properties,
+                    optional_properties,
+                    readonly_properties,
+                }))
             }
             _ => type_id,
         }
@@ -3625,10 +3793,10 @@ fn describe_declaration_symbol(
                 properties.extend(object.properties);
             }
         }
-        let body = checker
-            .result
-            .types
-            .alloc(TypeKind::Object(ObjectType { properties }));
+        let body = checker.result.types.alloc(TypeKind::Object(ObjectType {
+            properties,
+            ..ObjectType::default()
+        }));
         let body = describe_type(&checker.result.types, body);
         return Some(if parameters.is_empty() {
             body
@@ -3765,13 +3933,15 @@ fn describe_type(types: &TypeArena, type_id: TypeId) -> TypeDescriptor {
                 .map(|member| describe_type(types, *member))
                 .collect(),
         ),
-        TypeKind::Object(object) => TypeDescriptor::Object(
-            object
+        TypeKind::Object(object) => TypeDescriptor::Object {
+            properties: object
                 .properties
                 .iter()
                 .map(|(name, property)| (name.clone(), describe_type(types, *property)))
                 .collect(),
-        ),
+            optional_properties: object.optional_properties.clone(),
+            readonly_properties: object.readonly_properties.clone(),
+        },
         TypeKind::Function(function) => TypeDescriptor::Function {
             parameters: function
                 .parameters
@@ -3826,14 +3996,20 @@ fn substitute_descriptor(
                 .map(|member| substitute_descriptor(member, substitutions))
                 .collect(),
         ),
-        TypeDescriptor::Object(properties) => TypeDescriptor::Object(
-            properties
+        TypeDescriptor::Object {
+            properties,
+            optional_properties,
+            readonly_properties,
+        } => TypeDescriptor::Object {
+            properties: properties
                 .iter()
                 .map(|(name, property)| {
                     (name.clone(), substitute_descriptor(property, substitutions))
                 })
                 .collect(),
-        ),
+            optional_properties: optional_properties.clone(),
+            readonly_properties: readonly_properties.clone(),
+        },
         TypeDescriptor::Function {
             parameters,
             return_type,
@@ -3887,8 +4063,21 @@ fn global_declarations_merge(
 
 fn merge_global_descriptor(existing: &mut TypeDescriptor, new: TypeDescriptor) {
     match (existing, new) {
-        (TypeDescriptor::Object(existing), TypeDescriptor::Object(new)) => {
+        (
+            TypeDescriptor::Object {
+                properties: existing,
+                optional_properties: existing_optional,
+                readonly_properties: existing_readonly,
+            },
+            TypeDescriptor::Object {
+                properties: new,
+                optional_properties: new_optional,
+                readonly_properties: new_readonly,
+            },
+        ) => {
             existing.extend(new);
+            existing_optional.extend(new_optional);
+            existing_readonly.extend(new_readonly);
         }
         (
             TypeDescriptor::Alias {
@@ -3900,10 +4089,22 @@ fn merge_global_descriptor(existing: &mut TypeDescriptor, new: TypeDescriptor) {
                 body: new_body,
             },
         ) if *existing_parameters == new_parameters => {
-            if let (TypeDescriptor::Object(existing), TypeDescriptor::Object(new)) =
-                (existing_body.as_mut(), *new_body)
+            if let (
+                TypeDescriptor::Object {
+                    properties: existing,
+                    optional_properties: existing_optional,
+                    readonly_properties: existing_readonly,
+                },
+                TypeDescriptor::Object {
+                    properties: new,
+                    optional_properties: new_optional,
+                    readonly_properties: new_readonly,
+                },
+            ) = (existing_body.as_mut(), *new_body)
             {
                 existing.extend(new);
+                existing_optional.extend(new_optional);
+                existing_readonly.extend(new_readonly);
             }
         }
         _ => {}
@@ -4589,13 +4790,16 @@ mod tests {
         let number = checker.result.types.number();
         let left = checker.result.types.alloc(TypeKind::Object(ObjectType {
             properties: BTreeMap::from([("left".into(), string)]),
+            ..ObjectType::default()
         }));
         let right = checker.result.types.alloc(TypeKind::Object(ObjectType {
             properties: BTreeMap::from([("right".into(), number)]),
+            ..ObjectType::default()
         }));
         let intersection = checker.result.types.intersection([left, right]);
         let target = checker.result.types.alloc(TypeKind::Object(ObjectType {
             properties: BTreeMap::from([("left".into(), string), ("right".into(), number)]),
+            ..ObjectType::default()
         }));
         assert!(checker.is_assignable(intersection, target));
         assert_eq!(
@@ -4925,6 +5129,39 @@ mod tests {
                 .map(|diagnostic| diagnostic.diagnostic.code())
                 .collect::<Vec<_>>(),
             [2322, 2355, 7027]
+        );
+    }
+
+    #[test]
+    fn checks_structural_optional_readonly_excess_and_generic_inference() {
+        let parsed = parse_source_file(
+            r#"
+                interface Base { readonly id: number; label?: string; }
+                interface Child extends Base { value: string; }
+                const good: Child = { id: 1, value: "ok" };
+                const missing: Child = { id: 1 };
+                const excess: Child = { id: 1, value: "ok", extra: true };
+                good.id = 2;
+
+                function unwrap<T>(box: { value: T }): T { return box.value; }
+                const inferred: number = unwrap({ value: 1 });
+                const wrong: string = unwrap({ value: 1 });
+            "#,
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2322, 2353, 2540, 2322]
+        );
+        assert_eq!(
+            result.diagnostics[1].diagnostic.render().unwrap(),
+            "Object literal may only specify known properties, and 'extra' does not exist in type '{ id: number; label: undefined | string; value: string }'."
         );
     }
 }
