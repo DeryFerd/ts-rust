@@ -9,7 +9,8 @@ use ts_compiler::{EmitOutput, Program, ProgramOptionsOverride};
 use ts_config::resolve_config_file;
 use ts_core::TextRange;
 use ts_diagnostics::message_by_code;
-use ts_path::{is_absolute, normalize_path, resolve_path};
+use ts_incremental::{BuildDecision, BuildInfo};
+use ts_path::{change_extension, is_absolute, normalize_path, resolve_path};
 use ts_vfs::FileSystem;
 
 /// A diagnostic produced while loading a project graph.
@@ -25,6 +26,7 @@ pub struct ProjectDiagnostic {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ProjectGraph {
     pub projects: Vec<String>,
+    pub references: BTreeMap<String, Vec<String>>,
     pub diagnostics: Vec<ProjectDiagnostic>,
     pub has_cycle: bool,
 }
@@ -35,6 +37,13 @@ pub struct CompiledProject {
     pub config_path: String,
     pub program: Program,
     pub emit: EmitOutput,
+    pub build_info: Option<IncrementalOutput>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IncrementalOutput {
+    pub file_name: String,
+    pub text: String,
 }
 
 /// Result of loading and compiling a project graph.
@@ -42,6 +51,7 @@ pub struct CompiledProject {
 pub struct BuildResult {
     pub graph: ProjectGraph,
     pub projects: Vec<CompiledProject>,
+    pub skipped: Vec<String>,
 }
 
 /// Loads project references recursively and returns dependency-first order.
@@ -66,28 +76,110 @@ pub fn build_projects(
     current_directory: &str,
     roots: &[String],
     overrides: ProgramOptionsOverride,
+    incremental: bool,
 ) -> BuildResult {
     let graph = load_project_graph(file_system, current_directory, roots);
     if !graph.diagnostics.is_empty() {
         return BuildResult {
             graph,
             projects: Vec::new(),
+            skipped: Vec::new(),
         };
     }
-    let projects = graph
-        .projects
-        .iter()
-        .map(|config_path| {
-            let program = Program::from_config_with_options(file_system, config_path, overrides);
-            let emit = program.emit();
-            CompiledProject {
-                config_path: config_path.clone(),
-                program,
-                emit,
-            }
-        })
-        .collect();
-    BuildResult { graph, projects }
+    let mut projects = Vec::new();
+    let mut skipped = Vec::new();
+    let mut signatures: BTreeMap<String, String> = BTreeMap::new();
+    for config_path in &graph.projects {
+        let program = Program::from_config_with_options(file_system, config_path, overrides);
+        let enabled = incremental || program.options().incremental || program.options().composite;
+        let dependencies = graph
+            .references
+            .get(config_path)
+            .into_iter()
+            .flatten()
+            .filter_map(|path| {
+                signatures
+                    .get(path)
+                    .map(|signature| (path.clone(), signature.clone()))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let build_info_path = ts_outputpaths::build_info_path(program.options())
+            .unwrap_or_else(|| change_extension(config_path, ".tsbuildinfo"));
+        let previous = enabled
+            .then(|| {
+                file_system
+                    .read_file(&build_info_path)
+                    .ok()
+                    .and_then(|source| {
+                        BuildInfo::from_json(&source, env!("CARGO_PKG_VERSION")).ok()
+                    })
+            })
+            .flatten();
+        let preliminary = project_build_info(
+            &program,
+            dependencies.clone(),
+            previous
+                .as_ref()
+                .map_or_else(Vec::new, |info| info.outputs.clone()),
+        );
+        if enabled
+            && BuildInfo::decision(previous.as_ref(), &preliminary, |path| {
+                file_system.file_exists(path)
+            }) == BuildDecision::UpToDate
+        {
+            signatures.insert(config_path.clone(), preliminary.project_signature());
+            skipped.push(config_path.clone());
+            continue;
+        }
+        let emit = program.emit();
+        let current = project_build_info(
+            &program,
+            dependencies,
+            emit.files
+                .iter()
+                .map(|output| output.file_name.clone())
+                .collect(),
+        );
+        signatures.insert(config_path.clone(), current.project_signature());
+        let build_info =
+            (enabled && program.diagnostics().is_empty() && emit.diagnostics.is_empty())
+                .then(|| {
+                    current.to_json().ok().map(|text| IncrementalOutput {
+                        file_name: build_info_path,
+                        text,
+                    })
+                })
+                .flatten();
+        projects.push(CompiledProject {
+            config_path: config_path.clone(),
+            program,
+            emit,
+            build_info,
+        });
+    }
+    BuildResult {
+        graph,
+        projects,
+        skipped,
+    }
+}
+
+fn project_build_info(
+    program: &Program,
+    dependencies: BTreeMap<String, String>,
+    outputs: Vec<String>,
+) -> BuildInfo {
+    BuildInfo::new(
+        env!("CARGO_PKG_VERSION"),
+        &format!("{:?}", program.options()),
+        program
+            .source_files()
+            .iter()
+            .filter(|source| !source.is_default_library)
+            .map(|source| (source.file_name.clone(), source.source_text.clone())),
+        dependencies,
+        outputs,
+    )
 }
 
 struct GraphLoader<'a> {
@@ -141,8 +233,15 @@ impl<'a> GraphLoader<'a> {
                     }),
             );
         if let Some(config) = parsed.value {
-            for reference in config.resolved_references(self.file_system) {
-                let reference_path = resolve_config_path(self.file_system, "/", &reference.path);
+            let references = config
+                .resolved_references(self.file_system)
+                .into_iter()
+                .map(|reference| resolve_config_path(self.file_system, "/", &reference.path))
+                .collect::<Vec<_>>();
+            self.graph
+                .references
+                .insert(config_path.clone(), references.clone());
+            for reference_path in references {
                 self.visit(&reference_path);
             }
             self.graph.projects.push(config_path.clone());

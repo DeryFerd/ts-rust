@@ -86,6 +86,44 @@ fn project_no_emit_matches_oracle() {
 }
 
 #[test]
+fn common_compiler_options_match_oracle() {
+    let directory = TestDirectory::new("common-options");
+    fs::create_dir_all(directory.0.join("src")).unwrap();
+    fs::write(
+        directory.0.join("src/main.ts"),
+        "export const answer: number = 42;\n",
+    )
+    .unwrap();
+    assert_matches_oracle(
+        &directory.0,
+        &[
+            "src/main.ts",
+            "--ignoreConfig",
+            "--noEmit",
+            "--target",
+            "es2022",
+            "--module",
+            "esnext",
+            "--moduleResolution",
+            "bundler",
+            "--jsx",
+            "react-jsx",
+            "--outDir",
+            "dist",
+            "--rootDir",
+            "src",
+            "--declaration",
+            "--sourceMap",
+            "--allowJs",
+            "--checkJs",
+            "--strict",
+            "--pretty",
+            "false",
+        ],
+    );
+}
+
+#[test]
 fn project_and_files_conflict_matches_oracle() {
     let directory = TestDirectory::new("project-conflict");
     fs::write(directory.0.join("main.ts"), "const value = 1;\n").unwrap();
@@ -143,6 +181,47 @@ fn creates_project_output_directory() {
         String::from_utf8_lossy(&output.stdout)
     );
     assert!(directory.0.join("dist/main.js").is_file());
+}
+
+#[test]
+fn command_line_options_override_project_options() {
+    let directory = TestDirectory::new("project-overrides");
+    fs::write(directory.0.join("main.ts"), "export const answer = 42;\n").unwrap();
+    fs::write(
+        directory.0.join("tsconfig.json"),
+        r#"{"files":["main.ts"],"compilerOptions":{"target":"es5","outDir":"original"}}"#,
+    )
+    .unwrap();
+    let output = run(
+        env!("CARGO_BIN_EXE_tsgo"),
+        &directory.0,
+        &[
+            "--project",
+            "tsconfig.json",
+            "--target",
+            "es2022",
+            "--module",
+            "esnext",
+            "--moduleResolution",
+            "node10",
+            "--outDir",
+            "override",
+            "--declaration",
+            "--sourceMap",
+            "--pretty",
+            "false",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let javascript = fs::read_to_string(directory.0.join("override/main.js")).unwrap();
+    assert!(javascript.contains("const answer"));
+    assert!(directory.0.join("override/main.js.map").is_file());
+    assert!(directory.0.join("override/main.d.ts").is_file());
+    assert!(!directory.0.join("original/main.js").exists());
 }
 
 #[test]

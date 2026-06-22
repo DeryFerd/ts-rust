@@ -10,10 +10,13 @@ use ts_cli::{
 use ts_compiler::{Program, ProgramDiagnostic, ProgramOptionsOverride};
 use ts_diagnostic_writer::{Diagnostic, DiagnosticCategory, FormattingOptions, format_diagnostics};
 use ts_module::ResolutionOptions;
-use ts_options::CompilerOptions;
 use ts_project::{CompiledProject, ProjectDiagnostic, build_projects};
 use ts_scanner::Scanner;
 use ts_vfs::OsFileSystem;
+use ts_watch::{
+    CompileCycle, Coordinator, FsEventSource, WatchCompiler, WatchError, WatchMode, WatchPath,
+    watch_paths_for_program,
+};
 
 fn main() -> ExitCode {
     let args: Vec<_> = env::args().skip(1).collect();
@@ -37,6 +40,7 @@ fn main() -> ExitCode {
             println!("Version {VERSION}");
             ExitCode::SUCCESS
         }
+        Ok(Command::Build(options)) if options.watch => watch_build(options),
         Ok(Command::Build(options)) => build(&options),
         Ok(Command::Help) => {
             print_help();
@@ -47,6 +51,7 @@ fn main() -> ExitCode {
             }
         }
         Ok(Command::Lsp) => run_lsp(),
+        Ok(Command::Compile(options)) if options.watch => watch_compile(*options),
         Ok(Command::Compile(options)) => compile(&options),
         Err(error) => {
             println!("{}", error.render());
@@ -75,6 +80,7 @@ fn build(options: &BuildOptions) -> ExitCode {
             no_emit: options.no_emit.then_some(true),
             ..ProgramOptionsOverride::default()
         },
+        options.incremental,
     );
     let pretty = options.pretty.unwrap_or(false);
     print_project_diagnostics(&result.graph.diagnostics, &current_directory_text, pretty);
@@ -89,7 +95,12 @@ fn build(options: &BuildOptions) -> ExitCode {
     let mut had_diagnostics = false;
     let mut generated_output = false;
     for project in result.projects {
-        let CompiledProject { program, emit, .. } = project;
+        let CompiledProject {
+            program,
+            emit,
+            build_info,
+            ..
+        } = project;
         print_diagnostics(
             &program,
             program.diagnostics(),
@@ -104,6 +115,12 @@ fn build(options: &BuildOptions) -> ExitCode {
                 return exit(ExitStatus::DiagnosticsPresentOutputsSkipped);
             }
             generated_output = true;
+        }
+        if let Some(build_info) = build_info
+            && let Err(error) = write_output(&build_info.file_name, build_info.text)
+        {
+            eprintln!("{error}");
+            return exit(ExitStatus::DiagnosticsPresentOutputsSkipped);
         }
     }
     diagnostic_exit(had_diagnostics, generated_output)
@@ -156,18 +173,19 @@ fn compile(options: &CliOptions) -> ExitCode {
 
     let current_directory_text = current_directory.to_string_lossy();
     let program = if let Some(config_path) = project_path {
-        Program::from_config_with_options(&file_system, &config_path.to_string_lossy(), overrides)
+        Program::from_config_with_command_line_options(
+            &file_system,
+            &config_path.to_string_lossy(),
+            overrides,
+            &options.compiler_options,
+            &options.specified_options,
+        )
     } else {
         Program::new_with_options(
             &file_system,
             &current_directory_text,
             &options.files,
-            CompilerOptions {
-                no_check: options.no_check,
-                no_emit: options.no_emit,
-                no_lib: options.no_lib,
-                ..CompilerOptions::default()
-            },
+            options.compiler_options.clone(),
         )
     };
 
@@ -194,6 +212,191 @@ fn compile(options: &CliOptions) -> ExitCode {
         generated_output = true;
     }
     diagnostic_exit(had_diagnostics, generated_output)
+}
+
+struct FileWatchCompiler {
+    options: CliOptions,
+    current_directory: PathBuf,
+    project_path: Option<PathBuf>,
+}
+
+impl WatchCompiler for FileWatchCompiler {
+    fn compile(&mut self) -> Result<CompileCycle, WatchError> {
+        let file_system = OsFileSystem::default();
+        let current_directory = self.current_directory.to_string_lossy();
+        let overrides = ProgramOptionsOverride {
+            no_check: self.options.no_check.then_some(true),
+            no_emit: self.options.no_emit.then_some(true),
+            no_lib: self.options.no_lib.then_some(true),
+        };
+        let program = if let Some(config_path) = &self.project_path {
+            Program::from_config_with_command_line_options(
+                &file_system,
+                &config_path.to_string_lossy(),
+                overrides,
+                &self.options.compiler_options,
+                &self.options.specified_options,
+            )
+        } else {
+            Program::new_with_options(
+                &file_system,
+                &current_directory,
+                &self.options.files,
+                self.options.compiler_options.clone(),
+            )
+        };
+        let pretty = self.options.pretty.unwrap_or(false);
+        print_diagnostics(&program, program.diagnostics(), &current_directory, pretty);
+        let emitted = program.emit();
+        print_diagnostics(&program, &emitted.diagnostics, &current_directory, pretty);
+        let error_count = program.diagnostics().len() + emitted.diagnostics.len();
+        for output in emitted.files {
+            write_output(&output.file_name, output.text).map_err(WatchError::Compile)?;
+        }
+        Ok(CompileCycle {
+            error_count,
+            watch_paths: watch_paths_for_program(
+                &program,
+                &self.current_directory,
+                self.project_path.as_deref(),
+                &self.options.files,
+            ),
+        })
+    }
+}
+
+fn watch_compile(options: CliOptions) -> ExitCode {
+    let Ok(current_directory) = env::current_dir() else {
+        eprintln!("error: could not determine the current directory");
+        return exit(ExitStatus::DiagnosticsPresentOutputsSkipped);
+    };
+    if options.project.is_some() && !options.files.is_empty() {
+        print_command_line_diagnostic(
+            5042,
+            "Option 'project' cannot be mixed with source files on a command line.",
+            &current_directory,
+            options.pretty.unwrap_or(false),
+        );
+        return exit(ExitStatus::DiagnosticsPresentOutputsSkipped);
+    }
+    let discovered_config = (!options.ignore_config)
+        .then(|| find_config_file(&current_directory))
+        .flatten();
+    if !options.files.is_empty() && options.project.is_none() && discovered_config.is_some() {
+        print_command_line_diagnostic(
+            5112,
+            "tsconfig.json is present but will not be loaded if files are specified on commandline. Use '--ignoreConfig' to skip this error.",
+            &current_directory,
+            options.pretty.unwrap_or(false),
+        );
+        return exit(ExitStatus::DiagnosticsPresentOutputsSkipped);
+    }
+    let project_path = options
+        .project
+        .as_deref()
+        .map(|path| resolve_project_path(&current_directory, path))
+        .or(discovered_config);
+    if options.files.is_empty() && project_path.is_none() {
+        print_help();
+        return exit(ExitStatus::DiagnosticsPresentOutputsSkipped);
+    }
+    let compiler = FileWatchCompiler {
+        options,
+        current_directory,
+        project_path,
+    };
+    run_watch(compiler)
+}
+
+struct BuildWatchCompiler {
+    options: BuildOptions,
+    current_directory: PathBuf,
+    roots: Vec<String>,
+}
+
+impl WatchCompiler for BuildWatchCompiler {
+    fn compile(&mut self) -> Result<CompileCycle, WatchError> {
+        let file_system = OsFileSystem::default();
+        let current_directory = self.current_directory.to_string_lossy();
+        let result = build_projects(
+            &file_system,
+            &current_directory,
+            &self.roots,
+            ProgramOptionsOverride {
+                no_emit: self.options.no_emit.then_some(true),
+                ..ProgramOptionsOverride::default()
+            },
+            self.options.incremental,
+        );
+        let pretty = self.options.pretty.unwrap_or(false);
+        print_project_diagnostics(&result.graph.diagnostics, &current_directory, pretty);
+        let mut error_count = result.graph.diagnostics.len();
+        let mut watch_paths = vec![WatchPath::new(
+            self.current_directory.clone(),
+            WatchMode::NonRecursive,
+        )];
+        for CompiledProject {
+            config_path,
+            program,
+            emit,
+            build_info,
+            ..
+        } in result.projects
+        {
+            print_diagnostics(&program, program.diagnostics(), &current_directory, pretty);
+            print_diagnostics(&program, &emit.diagnostics, &current_directory, pretty);
+            error_count += program.diagnostics().len() + emit.diagnostics.len();
+            watch_paths.extend(watch_paths_for_program(
+                &program,
+                &self.current_directory,
+                Some(Path::new(&config_path)),
+                &[],
+            ));
+            for output in emit.files {
+                write_output(&output.file_name, output.text).map_err(WatchError::Compile)?;
+            }
+            if let Some(build_info) = build_info {
+                write_output(&build_info.file_name, build_info.text)
+                    .map_err(WatchError::Compile)?;
+            }
+        }
+        watch_paths.sort_by(|left, right| left.directory.cmp(&right.directory));
+        watch_paths.dedup_by(|left, right| left.directory == right.directory);
+        Ok(CompileCycle {
+            error_count,
+            watch_paths,
+        })
+    }
+}
+
+fn watch_build(options: BuildOptions) -> ExitCode {
+    let Ok(current_directory) = env::current_dir() else {
+        eprintln!("error: could not determine the current directory");
+        return exit(ExitStatus::DiagnosticsPresentOutputsSkipped);
+    };
+    let roots = if options.projects.is_empty() {
+        vec!["tsconfig.json".to_owned()]
+    } else {
+        options.projects.clone()
+    };
+    run_watch(BuildWatchCompiler {
+        options,
+        current_directory,
+        roots,
+    })
+}
+
+fn run_watch(compiler: impl WatchCompiler) -> ExitCode {
+    let reporter = |status: ts_watch::WatchStatus| println!("{}", status.message());
+    let mut coordinator = Coordinator::new(compiler, FsEventSource::default(), reporter);
+    match coordinator.run() {
+        Ok(summary) if summary.last_error_count == 0 => ExitCode::SUCCESS,
+        Ok(_) => exit(ExitStatus::DiagnosticsPresentOutputsSkipped),
+        Err(error) => {
+            eprintln!("error: {error}");
+            exit(ExitStatus::DiagnosticsPresentOutputsSkipped)
+        }
+    }
 }
 
 fn diagnostic_exit(had_diagnostics: bool, generated_output: bool) -> ExitCode {
@@ -476,10 +679,22 @@ fn print_help() {
     println!("  -v, --version      Print the compiler version");
     println!("  -p, --project PATH Compile the project at PATH");
     println!("  -b, --build PATH   Build a project and its references");
+    println!("  -w, --watch        Watch input files and rebuild on changes");
+    println!("      --incremental  Reuse project build information");
     println!("      --ignoreConfig Ignore tsconfig.json when compiling files");
     println!("      --noCheck      Skip semantic type checking");
     println!("      --noEmit       Do not write output files");
     println!("      --noLib        Do not include the default library");
+    println!("      --target NAME  Select the ECMAScript target");
+    println!("      --module NAME  Select the module format");
+    println!("      --moduleResolution NAME  Select module resolution");
+    println!("      --jsx NAME     Select JSX emission");
+    println!("      --outDir PATH  Redirect emitted files");
+    println!("      --rootDir PATH Set the source root");
+    println!("      --declaration  Emit declaration files");
+    println!("      --sourceMap    Emit source maps");
+    println!("      --allowJs      Include JavaScript files");
+    println!("      --checkJs      Check JavaScript files");
     println!("      --pretty BOOL  Enable or disable formatted diagnostics");
     println!("      --lsp          Run the language server over stdin/stdout");
     println!("      --parse        Parse one source file (development)");

@@ -132,3 +132,65 @@ fn build_reports_missing_referenced_config() {
     assert!(stdout.contains("error TS6053:"));
     assert!(stdout.contains("missing/tsconfig.json"));
 }
+
+#[test]
+fn incremental_build_skips_unchanged_and_invalidates_consumers() {
+    let directory = TestDirectory::new("incremental");
+    write_project(&directory.0);
+    let arguments = ["--build", "--incremental", "--pretty", "false"];
+    let first = run(&directory.0, &arguments);
+    assert!(first.status.success());
+    let library_output = directory.0.join("packages/lib/dist/index.js");
+    let application_output = directory.0.join("packages/app/dist/index.js");
+    let library_info = directory.0.join("packages/lib/tsconfig.tsbuildinfo");
+    let application_info = directory.0.join("packages/app/tsconfig.tsbuildinfo");
+    assert!(library_info.is_file());
+    assert!(application_info.is_file());
+
+    fs::write(&library_output, "unchanged sentinel").unwrap();
+    fs::write(&application_output, "unchanged sentinel").unwrap();
+    let second = run(&directory.0, &arguments);
+    assert!(second.status.success());
+    assert_eq!(
+        fs::read_to_string(&library_output).unwrap(),
+        "unchanged sentinel"
+    );
+    assert_eq!(
+        fs::read_to_string(&application_output).unwrap(),
+        "unchanged sentinel"
+    );
+
+    fs::write(
+        directory.0.join("packages/lib/index.ts"),
+        "export const libraryValue = 3;\n",
+    )
+    .unwrap();
+    let third = run(&directory.0, &arguments);
+    assert!(third.status.success());
+    assert_ne!(
+        fs::read_to_string(&library_output).unwrap(),
+        "unchanged sentinel"
+    );
+    assert_ne!(
+        fs::read_to_string(&application_output).unwrap(),
+        "unchanged sentinel"
+    );
+}
+
+#[test]
+fn composite_project_uses_configured_build_info_path() {
+    let directory = TestDirectory::new("composite");
+    fs::write(
+        directory.0.join("tsconfig.json"),
+        r#"{"files":["main.ts"],"compilerOptions":{"composite":true,"noLib":true,"outDir":"dist","tsBuildInfoFile":"cache/state.tsbuildinfo"}}"#,
+    )
+    .unwrap();
+    fs::write(directory.0.join("main.ts"), "export const value = 1;\n").unwrap();
+    let arguments = ["--build", "--pretty", "false"];
+    assert!(run(&directory.0, &arguments).status.success());
+    let output = directory.0.join("dist/main.js");
+    assert!(directory.0.join("cache/state.tsbuildinfo").is_file());
+    fs::write(&output, "composite sentinel").unwrap();
+    assert!(run(&directory.0, &arguments).status.success());
+    assert_eq!(fs::read_to_string(output).unwrap(), "composite sentinel");
+}

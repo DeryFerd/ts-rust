@@ -1,6 +1,12 @@
 //! TypeScript-compatible command-line parsing and exit statuses.
 
-use std::{collections::HashSet, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashSet},
+    path::Path,
+};
+
+use ts_config::JsonValue;
+use ts_options::{CompilerOptions as NormalizedCompilerOptions, parse_compiler_options_map};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -20,19 +26,23 @@ pub enum Command {
     Help,
     Lsp,
     Version,
-    Compile(CompilerOptions),
+    Compile(Box<CompilerOptions>),
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct BuildOptions {
     pub projects: Vec<String>,
+    pub incremental: bool,
     pub no_emit: bool,
     pub pretty: Option<bool>,
+    pub watch: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 #[allow(clippy::struct_excessive_bools)] // Compiler switches are independently composable.
 pub struct CompilerOptions {
+    pub compiler_options: NormalizedCompilerOptions,
+    pub specified_options: BTreeSet<String>,
     pub files: Vec<String>,
     pub no_check: bool,
     pub no_emit: bool,
@@ -40,6 +50,7 @@ pub struct CompilerOptions {
     pub ignore_config: bool,
     pub project: Option<String>,
     pub pretty: Option<bool>,
+    pub watch: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -78,6 +89,7 @@ fn parse_expanded(args: &[String]) -> Result<Command, CommandLineError> {
         return parse_build_options(&args[1..]).map(Command::Build);
     }
     let mut options = CompilerOptions::default();
+    let mut compiler_options = BTreeMap::new();
     let mut index = 0;
     while index < args.len() {
         let argument = &args[index];
@@ -86,9 +98,7 @@ fn parse_expanded(args: &[String]) -> Result<Command, CommandLineError> {
             "--help" | "-h" | "-?" => return Ok(Command::Help),
             "--lsp" => return Ok(Command::Lsp),
             "--version" | "-v" => return Ok(Command::Version),
-            "--nocheck" => options.no_check = true,
-            "--noemit" => options.no_emit = true,
-            "--nolib" => options.no_lib = true,
+            "--watch" | "-w" => options.watch = true,
             "--ignoreconfig" => options.ignore_config = true,
             "--pretty" => {
                 let explicit_value = args
@@ -106,6 +116,27 @@ fn parse_expanded(args: &[String]) -> Result<Command, CommandLineError> {
             _ if lower.starts_with("--pretty=") => {
                 options.pretty = Some(parse_bool_option(argument, "pretty")?);
             }
+            _ if compiler_boolean_name(&lower).is_some() => {
+                let name = compiler_boolean_name(&lower).expect("guard checked option name");
+                let explicit_value = args
+                    .get(index + 1)
+                    .and_then(|value| parse_bool_value(value));
+                compiler_options.insert(
+                    name.to_owned(),
+                    JsonValue::Bool(explicit_value.unwrap_or(true)),
+                );
+                if explicit_value.is_some() {
+                    index += 1;
+                }
+            }
+            _ if compiler_string_name(&lower).is_some() => {
+                let name = compiler_string_name(&lower).expect("guard checked option name");
+                index += 1;
+                compiler_options.insert(
+                    name.to_owned(),
+                    JsonValue::String(required_option_value(args, index, argument)?),
+                );
+            }
             _ if argument.starts_with('-') => {
                 return Err(CommandLineError {
                     code: 5023,
@@ -116,7 +147,58 @@ fn parse_expanded(args: &[String]) -> Result<Command, CommandLineError> {
         }
         index += 1;
     }
-    Ok(Command::Compile(options))
+    let parsed = parse_compiler_options_map(&compiler_options);
+    if let Some(diagnostic) = parsed.diagnostics.first() {
+        return Err(CommandLineError {
+            code: u16::try_from(diagnostic.code()).unwrap_or(u16::MAX),
+            message: diagnostic
+                .render()
+                .unwrap_or_else(|error| error.to_string()),
+        });
+    }
+    options.no_check = parsed.options.no_check;
+    options.no_emit = parsed.options.no_emit;
+    options.no_lib = parsed.options.no_lib;
+    options.specified_options = compiler_options.keys().cloned().collect();
+    options.compiler_options = parsed.options;
+    Ok(Command::Compile(Box::new(options)))
+}
+
+fn compiler_boolean_name(argument: &str) -> Option<&'static str> {
+    Some(match argument {
+        "--allowjs" => "allowjs",
+        "--allowsyntheticdefaultimports" => "allowsyntheticdefaultimports",
+        "--checkjs" => "checkjs",
+        "--declaration" => "declaration",
+        "--esmoduleinterop" => "esmoduleinterop",
+        "--forceconsistentcasinginfilenames" => "forceconsistentcasinginfilenames",
+        "--isolatedmodules" => "isolatedmodules",
+        "--nocheck" => "nocheck",
+        "--noemit" => "noemit",
+        "--noimplicitany" => "noimplicitany",
+        "--nolib" => "nolib",
+        "--nounusedlocals" => "nounusedlocals",
+        "--nounusedparameters" => "nounusedparameters",
+        "--skiplibcheck" => "skiplibcheck",
+        "--sourcemap" => "sourcemap",
+        "--strict" => "strict",
+        "--strictnullchecks" => "strictnullchecks",
+        "--verbatimmodulesyntax" => "verbatimmodulesyntax",
+        _ => return None,
+    })
+}
+
+fn compiler_string_name(argument: &str) -> Option<&'static str> {
+    Some(match argument {
+        "--jsx" => "jsx",
+        "--module" => "module",
+        "--moduledetection" => "moduledetection",
+        "--moduleresolution" => "moduleresolution",
+        "--outdir" => "outdir",
+        "--rootdir" => "rootdir",
+        "--target" => "target",
+        _ => return None,
+    })
 }
 
 fn parse_build_options(args: &[String]) -> Result<BuildOptions, CommandLineError> {
@@ -126,7 +208,9 @@ fn parse_build_options(args: &[String]) -> Result<BuildOptions, CommandLineError
         let argument = &args[index];
         let lower = argument.to_ascii_lowercase();
         match lower.as_str() {
+            "--incremental" => options.incremental = true,
             "--noemit" => options.no_emit = true,
+            "--watch" | "-w" => options.watch = true,
             "--pretty" => {
                 let explicit_value = args
                     .get(index + 1)
@@ -251,7 +335,7 @@ fn tokenize_response_file(source: &str) -> Result<Vec<String>, CommandLineError>
 mod tests {
     use std::{io, path::Path};
 
-    use super::{BuildOptions, Command, CompilerOptions, parse_command_line};
+    use super::{BuildOptions, Command, parse_command_line};
 
     fn parse(args: &[&str]) -> Result<Command, super::CommandLineError> {
         parse_command_line(
@@ -262,24 +346,21 @@ mod tests {
 
     #[test]
     fn parses_syntax_only_compilation_case_insensitively() {
-        assert_eq!(
-            parse(&[
-                "--NOCHECK",
-                "--noEmit",
-                "--noLib",
-                "--ignoreConfig",
-                "source.ts"
-            ]),
-            Ok(Command::Compile(CompilerOptions {
-                files: vec!["source.ts".to_owned()],
-                no_check: true,
-                no_emit: true,
-                no_lib: true,
-                ignore_config: true,
-                project: None,
-                pretty: None,
-            }))
-        );
+        let Command::Compile(options) = parse(&[
+            "--NOCHECK",
+            "--noEmit",
+            "--noLib",
+            "--ignoreConfig",
+            "source.ts",
+        ])
+        .unwrap() else {
+            panic!("expected compile command");
+        };
+        assert!(options.no_check);
+        assert!(options.no_emit);
+        assert!(options.no_lib);
+        assert!(options.ignore_config);
+        assert_eq!(options.files, ["source.ts"]);
     }
 
     #[test]
@@ -291,19 +372,17 @@ mod tests {
             "error TS5023: Unknown compiler option '--wat'."
         );
         assert_eq!(parse(&["--project"]).unwrap_err().code, 6044);
+        assert_eq!(parse(&["--target", "future"]).unwrap_err().code, 6046);
     }
 
     #[test]
     fn parses_lsp_without_changing_compiler_arguments() {
         assert_eq!(parse(&["--LSP"]), Ok(Command::Lsp));
-        assert_eq!(
-            parse(&["--noEmit", "src/main.ts"]),
-            Ok(Command::Compile(CompilerOptions {
-                files: vec!["src/main.ts".to_owned()],
-                no_emit: true,
-                ..CompilerOptions::default()
-            }))
-        );
+        let Command::Compile(options) = parse(&["--noEmit", "src/main.ts"]).unwrap() else {
+            panic!("expected compile command");
+        };
+        assert!(options.no_emit);
+        assert_eq!(options.files, ["src/main.ts"]);
     }
 
     #[test]
@@ -316,22 +395,84 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_common_compiler_options() {
+        let Command::Compile(options) = parse(&[
+            "--target",
+            "es2022",
+            "--module",
+            "nodenext",
+            "--moduleResolution",
+            "nodenext",
+            "--jsx",
+            "react-jsx",
+            "--outDir",
+            "dist",
+            "--rootDir",
+            "src",
+            "--declaration",
+            "--sourceMap",
+            "--checkJs",
+            "--strict",
+            "main.ts",
+        ])
+        .unwrap() else {
+            panic!("expected compile command");
+        };
+        assert_eq!(
+            options.compiler_options.target,
+            ts_options::ScriptTarget::Es2022
+        );
+        assert_eq!(
+            options.compiler_options.module,
+            ts_options::ModuleKind::NodeNext
+        );
+        assert_eq!(
+            options.compiler_options.module_resolution,
+            ts_options::ModuleResolutionKind::NodeNext
+        );
+        assert_eq!(options.compiler_options.jsx, ts_options::JsxEmit::ReactJsx);
+        assert_eq!(options.compiler_options.out_dir.as_deref(), Some("dist"));
+        assert_eq!(options.compiler_options.root_dir.as_deref(), Some("src"));
+        assert!(options.compiler_options.declaration);
+        assert!(options.compiler_options.source_map);
+        assert!(options.compiler_options.check_js);
+        assert!(options.compiler_options.allow_js);
+        assert!(options.compiler_options.strict);
+        assert!(options.compiler_options.no_implicit_any);
+    }
+
+    #[test]
     fn parses_build_projects_and_options() {
         assert_eq!(
             parse(&[
                 "-b",
                 "packages/a",
                 "packages/b",
+                "--incremental",
                 "--noEmit",
                 "--pretty",
                 "false"
             ]),
             Ok(Command::Build(BuildOptions {
                 projects: vec!["packages/a".into(), "packages/b".into()],
+                incremental: true,
                 no_emit: true,
                 pretty: Some(false),
+                watch: false,
             }))
         );
+    }
+
+    #[test]
+    fn parses_watch_for_files_and_builds() {
+        let Command::Compile(options) = parse(&["--watch", "main.ts"]).unwrap() else {
+            panic!("expected compile command");
+        };
+        assert!(options.watch);
+        let Command::Build(options) = parse(&["--build", "--watch", "project"]).unwrap() else {
+            panic!("expected build command");
+        };
+        assert!(options.watch);
     }
 
     #[test]

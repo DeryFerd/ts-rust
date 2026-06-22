@@ -313,6 +313,7 @@ version = "7.0.0-dev"
 dependencies = [
  "ts_ast",
  "ts_compiler",
+ "ts_config",
  "ts_diagnostic_writer",
  "ts_lsp",
  "ts_module",
@@ -321,6 +322,7 @@ dependencies = [
  "ts_project",
  "ts_scanner",
  "ts_vfs",
+ "ts_watch",
 ]
 
 [[package]]
@@ -395,8 +397,13 @@ dependencies = [
 name = "ts_fixture"
 version = "7.0.0-dev"
 dependencies = [
+ "ts_compiler",
+ "ts_config",
  "ts_core",
+ "ts_options",
  "ts_parser",
+ "ts_path",
+ "ts_vfs",
 ]
 
 [[package]]
@@ -412,6 +419,14 @@ version = "7.0.0-dev"
 dependencies = [
  "ts_path",
  "ts_vfs",
+]
+
+[[package]]
+name = "ts_incremental"
+version = "7.0.0-dev"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -507,6 +522,8 @@ dependencies = [
  "ts_config",
  "ts_core",
  "ts_diagnostics",
+ "ts_incremental",
+ "ts_outputpaths",
  "ts_path",
  "ts_vfs",
 ]
@@ -531,6 +548,16 @@ version = "7.0.0-dev"
 [[package]]
 name = "ts_vfs"
 version = "7.0.0-dev"
+
+[[package]]
+name = "ts_watch"
+version = "7.0.0-dev"
+dependencies = [
+ "ts_compiler",
+ "ts_fswatch",
+ "ts_module",
+ "ts_vfs",
+]
 
 [[package]]
 name = "unicode-ident"
