@@ -21,7 +21,7 @@ use ts_parser::{ParseResult, parse_jsx_source_file, parse_source_file};
 use ts_path::{CaseSensitivity, canonicalize, directory_path, is_absolute, resolve_path};
 use ts_printer::{
     AmdDependency as PrinterAmdDependency, EmitConstantValue, EmitContext,
-    emit_declaration_file_with_reachability, emit_source_file_with_context,
+    emit_declaration_file_with_semantics, emit_source_file_with_context,
 };
 use ts_sourcemap::{SourceMap, SourceMapBuilder};
 use ts_vfs::FileSystem;
@@ -474,7 +474,7 @@ impl Program {
                 }
             }
             if settings.emit_declarations {
-                match emit_declaration_file_with_reachability(
+                match emit_declaration_file_with_semantics(
                     &source_file.parse.arena,
                     source_file.parse.source_file,
                     &source_file.file_name,
@@ -482,6 +482,8 @@ impl Program {
                     self.options.declaration_map,
                     Some(&source_file.checking.declaration_reachability),
                     Some(&enum_member_values),
+                    Some(&source_file.checking.types),
+                    Some(&source_file.checking.node_types),
                 ) {
                     Ok(mut emitted) => {
                         let Some(file_name) = paths.declaration.clone() else {
@@ -627,7 +629,7 @@ impl Program {
                     u32::try_from(code.bytes().filter(|byte| *byte == b'\n').count())
                         .unwrap_or(u32::MAX);
                 let enum_member_values = enum_values_for_emit(&source.checking.enum_member_values);
-                match emit_declaration_file_with_reachability(
+                match emit_declaration_file_with_semantics(
                     &source.parse.arena,
                     source.parse.source_file,
                     &source.file_name,
@@ -635,6 +637,8 @@ impl Program {
                     false,
                     Some(&source.checking.declaration_reachability),
                     Some(&enum_member_values),
+                    Some(&source.checking.types),
+                    Some(&source.checking.node_types),
                 ) {
                     Ok(emitted) => {
                         if !emitted.code.is_empty() {
@@ -3539,5 +3543,118 @@ mod tests {
                 .collect::<Vec<_>>(),
             [2322, 2353, 2540, 2322]
         );
+    }
+
+    #[test]
+    fn declaration_emit_uses_inferred_readonly_object_types() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/main.ts",
+            "export var basePrototype = { get primaryPath() { return this.collection; } };",
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["main.ts".to_owned()],
+            CompilerOptions {
+                declaration: true,
+                no_lib: true,
+                module: ModuleKind::CommonJs,
+                target: ScriptTarget::Es2015,
+                ..CompilerOptions::default()
+            },
+        );
+        let emitted = program.emit();
+        let declaration = emitted
+            .files
+            .iter()
+            .find(|file| file.file_name == "/project/main.d.ts")
+            .unwrap();
+        assert_eq!(
+            declaration.text,
+            "export declare var basePrototype: {\n    readonly primaryPath: any;\n};\n"
+        );
+    }
+
+    #[test]
+    fn javascript_declaration_emit_synthesizes_accessor_namespaces() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/a.js",
+            concat!(
+                "export const t1 = { p: 'value', get getter() { return 'value'; } };\n",
+                "export const t2 = { v: 'value', set setter(v) {} };\n",
+                "export const t3 = { p: 'value', get value() { return 'value'; }, set value(v) {} };\n",
+            ),
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["a.js".to_owned()],
+            CompilerOptions {
+                allow_js: true,
+                check_js: true,
+                declaration: true,
+                emit_declaration_only: true,
+                no_lib: true,
+                target: ScriptTarget::Es2015,
+                ..CompilerOptions::default()
+            },
+        );
+        let emitted = program.emit();
+        let declaration = emitted
+            .files
+            .iter()
+            .find(|file| file.file_name == "/project/a.d.ts")
+            .unwrap();
+        assert_eq!(
+            declaration.text,
+            concat!(
+                "export namespace t1 {\n    let p: string;\n    const getter: string;\n}\n",
+                "export namespace t2 {\n    let v: string;\n    let setter: any;\n}\n",
+                "export namespace t3 {\n    let p_1: string;\n    export { p_1 as p };\n    export let value: string;\n}\n",
+            )
+        );
+    }
+
+    #[test]
+    fn declaration_emit_preserves_ambient_auto_accessors() {
+        let source = concat!(
+            "declare class AmbientClass { accessor prop1: string; static accessor prop2: number; private accessor prop3: boolean; private static accessor prop4: symbol; }\n",
+            "declare namespace AmbientNamespace { class C { accessor prop: string; } }\n",
+            "declare module \"some-module\" { export class ExportedClass { accessor value: any; } }\n",
+            "class RegularClass { accessor shouldError: string; }\n",
+        );
+        let expected = concat!(
+            "declare class AmbientClass {\n    accessor prop1: string;\n    static accessor prop2: number;\n    private accessor prop3;\n    private static accessor prop4;\n}\n",
+            "declare namespace AmbientNamespace {\n    class C {\n        accessor prop: string;\n    }\n}\n",
+            "declare module \"some-module\" {\n    class ExportedClass {\n        accessor value: any;\n    }\n}\n",
+            "declare class RegularClass {\n    accessor shouldError: string;\n}\n",
+        );
+        for target in [ScriptTarget::Es5, ScriptTarget::Es2015] {
+            let fs = MemoryFileSystem::new(true);
+            fs.write_file("/project/main.ts", source).unwrap();
+            let program = Program::new_with_options(
+                &fs,
+                "/project",
+                &["main.ts".to_owned()],
+                CompilerOptions {
+                    declaration: true,
+                    no_lib: true,
+                    module: ModuleKind::None,
+                    target,
+                    ..CompilerOptions::default()
+                },
+            );
+            let emitted = program.emit();
+            let declaration = emitted
+                .files
+                .iter()
+                .find(|file| file.file_name == "/project/main.d.ts")
+                .unwrap();
+            assert_eq!(declaration.text, expected);
+        }
     }
 }

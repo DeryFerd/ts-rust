@@ -512,6 +512,7 @@ version = "7.0.0-dev"
 dependencies = [
  "ts_ast",
  "ts_binder",
+ "ts_checker",
  "ts_options",
  "ts_parser",
  "ts_sourcemap",
