@@ -1926,7 +1926,7 @@ impl<'a> Parser<'a> {
             && self.current.kind != SyntaxKind::EndOfFile
         {
             let entry_start = self.current.range.start;
-            let member_name = self.parse_identifier("Expected an enum member name.");
+            let member_name = self.parse_enum_member_name();
             let initializer = if self.current.kind == SyntaxKind::EqualsToken {
                 self.bump();
                 Some(self.parse_binary_expression(2))
@@ -1981,6 +1981,17 @@ impl<'a> Parser<'a> {
             })),
             &children,
         )
+    }
+
+    fn parse_enum_member_name(&mut self) -> NodeId {
+        if matches!(
+            self.current.kind,
+            SyntaxKind::StringLiteral | SyntaxKind::NumericLiteral | SyntaxKind::OpenBracketToken
+        ) {
+            self.parse_property_name("Expected an enum member name.")
+        } else {
+            self.parse_identifier_name("Expected an enum member name.")
+        }
     }
 
     fn parse_return_statement(&mut self) -> NodeId {
@@ -5641,8 +5652,8 @@ mod tests {
     use ts_core::DiagnosticCategory;
 
     use super::{
-        NODE_FLAG_AWAIT_USING, NODE_FLAG_USING, ParseResult, parse_jsdoc_comment,
-        parse_jsx_source_file, parse_source_file,
+        NODE_FLAG_AWAIT_USING, NODE_FLAG_HAS_ERROR, NODE_FLAG_USING, ParseResult,
+        parse_jsdoc_comment, parse_jsx_source_file, parse_source_file,
     };
 
     #[test]
@@ -5906,6 +5917,111 @@ mod tests {
                 Some(source_statements(&result)[1])
             );
         }
+    }
+
+    #[test]
+    fn parses_enum_property_names_initializers_and_ranges() {
+        let source = concat!(
+            "enum E { ",
+            "A, ",
+            "\"non identifier\", ",
+            "1 = seed, ",
+            "[key] = seed + 1, ",
+            "[ns.value]",
+            " }",
+        );
+        let result = parse_source_file(source);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let statements = source_statements(&result);
+        assert_eq!(statements.len(), 1);
+        let NodeData::EnumDeclaration(declaration) = &result.arena.get(statements[0]).unwrap().data
+        else {
+            panic!("expected enum declaration");
+        };
+        assert_eq!(declaration.members.nodes.len(), 5);
+
+        for ((member, expected_kind), expected_text) in declaration
+            .members
+            .nodes
+            .iter()
+            .zip([
+                SyntaxKind::Identifier,
+                SyntaxKind::StringLiteral,
+                SyntaxKind::NumericLiteral,
+                SyntaxKind::ComputedPropertyName,
+                SyntaxKind::ComputedPropertyName,
+            ])
+            .zip([
+                "A",
+                "\"non identifier\"",
+                "1 = seed",
+                "[key] = seed + 1",
+                "[ns.value]",
+            ])
+        {
+            let member_node = result.arena.get(*member).unwrap();
+            let NodeData::EnumMember(member_data) = &member_node.data else {
+                panic!("expected enum member");
+            };
+            assert_eq!(
+                result.arena.get(member_data.name).unwrap().kind,
+                expected_kind
+            );
+            assert_eq!(
+                result.arena.get(member_data.name).unwrap().parent,
+                Some(*member)
+            );
+            assert_eq!(
+                &source
+                    [member_node.range.start.get() as usize..member_node.range.end.get() as usize],
+                expected_text
+            );
+            if let Some(initializer) = member_data.initializer {
+                assert_eq!(result.arena.get(initializer).unwrap().parent, Some(*member));
+            }
+            if let NodeData::ComputedPropertyName(computed) =
+                &result.arena.get(member_data.name).unwrap().data
+            {
+                assert_eq!(
+                    result.arena.get(computed.expression).unwrap().parent,
+                    Some(member_data.name)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn enum_member_name_recovery_preserves_later_members_and_statements() {
+        let result = parse_source_file("enum E { A, , \"quoted\" = 1 } const after = 1;");
+        assert_eq!(result.diagnostics.len(), 1, "{:?}", result.diagnostics);
+        let statements = source_statements(&result);
+        assert_eq!(statements.len(), 2);
+        let NodeData::EnumDeclaration(declaration) = &result.arena.get(statements[0]).unwrap().data
+        else {
+            panic!("expected enum declaration");
+        };
+        assert_eq!(declaration.members.nodes.len(), 3);
+        let missing_member = result.arena.get(declaration.members.nodes[1]).unwrap();
+        let NodeData::EnumMember(missing_member) = &missing_member.data else {
+            panic!("expected recovered enum member");
+        };
+        assert_eq!(
+            result.arena.get(missing_member.name).unwrap().flags,
+            NODE_FLAG_HAS_ERROR
+        );
+        let NodeData::EnumMember(quoted_member) =
+            &result.arena.get(declaration.members.nodes[2]).unwrap().data
+        else {
+            panic!("expected quoted enum member");
+        };
+        assert_eq!(
+            result.arena.get(quoted_member.name).unwrap().kind,
+            SyntaxKind::StringLiteral
+        );
+        assert_eq!(
+            result.arena.get(statements[1]).unwrap().kind,
+            SyntaxKind::VariableStatement
+        );
     }
 
     #[test]
