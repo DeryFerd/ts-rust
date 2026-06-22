@@ -114,7 +114,17 @@ pub struct ServerCapabilities {
     pub document_highlight_provider: bool,
     pub linked_editing_range_provider: bool,
     pub code_action_provider: bool,
+    pub document_formatting_provider: bool,
+    pub document_range_formatting_provider: bool,
+    pub document_on_type_formatting_provider: DocumentOnTypeFormattingOptions,
     pub completion_provider: CompletionOptions,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DocumentOnTypeFormattingOptions {
+    pub first_trigger_character: String,
+    pub more_trigger_character: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -411,6 +421,43 @@ pub struct CodeAction {
     pub is_preferred: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FormattingOptions {
+    pub tab_size: u32,
+    pub insert_spaces: bool,
+    #[serde(default)]
+    pub trim_trailing_whitespace: Option<bool>,
+    #[serde(default)]
+    pub insert_final_newline: Option<bool>,
+    #[serde(default)]
+    pub trim_final_newlines: Option<bool>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DocumentFormattingParams {
+    pub text_document: TextDocumentIdentifier,
+    pub options: FormattingOptions,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DocumentRangeFormattingParams {
+    pub text_document: TextDocumentIdentifier,
+    pub range: Range,
+    pub options: FormattingOptions,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DocumentOnTypeFormattingParams {
+    pub text_document: TextDocumentIdentifier,
+    pub position: Position,
+    pub ch: String,
+    pub options: FormattingOptions,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 struct CallHierarchyData {
     file_name: String,
@@ -610,6 +657,15 @@ impl Server {
         if method == "textDocument/codeAction" {
             return vec![self.code_action(id, message.params)];
         }
+        if method == "textDocument/formatting" {
+            return vec![self.formatting(id, message.params)];
+        }
+        if method == "textDocument/rangeFormatting" {
+            return vec![self.range_formatting(id, message.params)];
+        }
+        if method == "textDocument/onTypeFormatting" {
+            return vec![self.on_type_formatting(id, message.params)];
+        }
         vec![failure(id, CODE_METHOD_NOT_FOUND, "method not found")]
     }
 
@@ -658,6 +714,12 @@ impl Server {
                 document_highlight_provider: true,
                 linked_editing_range_provider: true,
                 code_action_provider: true,
+                document_formatting_provider: true,
+                document_range_formatting_provider: true,
+                document_on_type_formatting_provider: DocumentOnTypeFormattingOptions {
+                    first_trigger_character: "}".to_owned(),
+                    more_trigger_character: vec![";".to_owned(), "\n".to_owned()],
+                },
                 completion_provider: CompletionOptions {
                     resolve_provider: false,
                 },
@@ -1434,6 +1496,88 @@ impl Server {
         ))
     }
 
+    fn formatting(&self, id: Id, params: Option<Value>) -> OutgoingMessage {
+        let Ok(params) = deserialize_params::<DocumentFormattingParams>(params) else {
+            return failure(id, CODE_INVALID_PARAMS, "invalid formatting parameters");
+        };
+        let edits =
+            self.documents
+                .get(&params.text_document.uri)
+                .map_or_else(Vec::new, |document| {
+                    let formatted = format_typescript(&document.text, params.options, 0, true);
+                    if formatted == document.text {
+                        Vec::new()
+                    } else {
+                        vec![TextEdit {
+                            range: Range {
+                                start: Position::default(),
+                                end: position_at(
+                                    &document.text,
+                                    u32::try_from(document.text.len()).unwrap_or(u32::MAX),
+                                ),
+                            },
+                            new_text: formatted,
+                        }]
+                    }
+                });
+        OutgoingMessage::Response(Response::success(
+            id,
+            serde_json::to_value(edits).unwrap_or(Value::Null),
+        ))
+    }
+
+    fn range_formatting(&self, id: Id, params: Option<Value>) -> OutgoingMessage {
+        let Ok(params) = deserialize_params::<DocumentRangeFormattingParams>(params) else {
+            return failure(
+                id,
+                CODE_INVALID_PARAMS,
+                "invalid range formatting parameters",
+            );
+        };
+        let edits = self
+            .documents
+            .get(&params.text_document.uri)
+            .and_then(|document| format_line_edit(&document.text, params.range, params.options))
+            .into_iter()
+            .collect::<Vec<_>>();
+        OutgoingMessage::Response(Response::success(
+            id,
+            serde_json::to_value(edits).unwrap_or(Value::Null),
+        ))
+    }
+
+    fn on_type_formatting(&self, id: Id, params: Option<Value>) -> OutgoingMessage {
+        let Ok(params) = deserialize_params::<DocumentOnTypeFormattingParams>(params) else {
+            return failure(
+                id,
+                CODE_INVALID_PARAMS,
+                "invalid on-type formatting parameters",
+            );
+        };
+        let edits = if matches!(params.ch.as_str(), "}" | ";" | "\n") {
+            self.documents
+                .get(&params.text_document.uri)
+                .and_then(|document| {
+                    let range = Range {
+                        start: Position {
+                            line: params.position.line,
+                            character: 0,
+                        },
+                        end: params.position,
+                    };
+                    format_line_edit(&document.text, range, params.options)
+                })
+                .into_iter()
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        OutgoingMessage::Response(Response::success(
+            id,
+            serde_json::to_value(edits).unwrap_or(Value::Null),
+        ))
+    }
+
     fn call_hierarchy_item_for_symbol(
         &self,
         source: &SourceFile,
@@ -1878,6 +2022,334 @@ fn relative_module_specifier(from: &str, to: &str) -> Option<String> {
             format!("./{path}")
         }
     })
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct FormatLexState {
+    block_comment: bool,
+    template: bool,
+}
+
+fn format_typescript(
+    text: &str,
+    options: FormattingOptions,
+    initial_depth: usize,
+    full_document: bool,
+) -> String {
+    let indent_unit = if options.insert_spaces {
+        " ".repeat(usize::try_from(options.tab_size).unwrap_or(4))
+    } else {
+        "\t".to_owned()
+    };
+    let mut depth = isize::try_from(initial_depth).unwrap_or(isize::MAX);
+    let mut brace_state = FormatLexState::default();
+    let mut spacing_state = FormatLexState::default();
+    let mut lines = Vec::new();
+    for raw_line in text.split('\n') {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() {
+            lines.push(String::new());
+            continue;
+        }
+        let leading_closes = trimmed
+            .chars()
+            .take_while(|character| matches!(character, '}' | ']'))
+            .count();
+        let line_depth = depth
+            .saturating_sub(isize::try_from(leading_closes).unwrap_or(isize::MAX))
+            .max(0);
+        let content = normalize_format_line(trimmed, &mut spacing_state);
+        lines.push(format!(
+            "{}{}",
+            indent_unit.repeat(usize::try_from(line_depth).unwrap_or_default()),
+            content
+        ));
+        let (opens, closes) = structural_delimiters(trimmed, &mut brace_state);
+        depth = (depth + isize::try_from(opens).unwrap_or_default()
+            - isize::try_from(closes).unwrap_or_default())
+        .max(0);
+    }
+    let mut formatted = lines.join("\n");
+    if full_document {
+        if options.trim_final_newlines == Some(true) {
+            while formatted.ends_with('\n') {
+                formatted.pop();
+            }
+        }
+        if options.insert_final_newline == Some(true) && !formatted.ends_with('\n') {
+            formatted.push('\n');
+        }
+    }
+    formatted
+}
+
+fn format_line_edit(text: &str, range: Range, options: FormattingOptions) -> Option<TextEdit> {
+    let start_line = range.start.line;
+    let end_line = if range.end.character == 0 && range.end.line > start_line {
+        range.end.line - 1
+    } else {
+        range.end.line
+    };
+    let start = line_start_offset(text, start_line)?;
+    let end = line_end_offset(text, end_line)?;
+    let depth = formatting_depth(&text[..start]);
+    let original = text.get(start..end)?;
+    let formatted = format_typescript(original, options, depth, false);
+    (formatted != original).then(|| TextEdit {
+        range: Range {
+            start: position_at(text, u32::try_from(start).unwrap_or(u32::MAX)),
+            end: position_at(text, u32::try_from(end).unwrap_or(u32::MAX)),
+        },
+        new_text: formatted,
+    })
+}
+
+fn line_start_offset(text: &str, line: u32) -> Option<usize> {
+    if line == 0 {
+        return Some(0);
+    }
+    let mut current = 0;
+    for (index, byte) in text.bytes().enumerate() {
+        if byte == b'\n' {
+            current += 1;
+            if current == line {
+                return Some(index + 1);
+            }
+        }
+    }
+    None
+}
+
+fn line_end_offset(text: &str, line: u32) -> Option<usize> {
+    let start = line_start_offset(text, line)?;
+    Some(
+        text.get(start..)?
+            .find('\n')
+            .map_or(text.len(), |offset| start + offset + 1),
+    )
+}
+
+fn formatting_depth(prefix: &str) -> usize {
+    let mut state = FormatLexState::default();
+    let mut depth = 0_isize;
+    for line in prefix.split('\n') {
+        let (opens, closes) = structural_delimiters(line, &mut state);
+        depth = (depth + isize::try_from(opens).unwrap_or_default()
+            - isize::try_from(closes).unwrap_or_default())
+        .max(0);
+    }
+    usize::try_from(depth).unwrap_or_default()
+}
+
+fn structural_delimiters(line: &str, state: &mut FormatLexState) -> (usize, usize) {
+    let mut opens = 0;
+    let mut closes = 0;
+    let mut quote = None;
+    let mut escaped = false;
+    let characters = line.chars().collect::<Vec<_>>();
+    let mut index = 0;
+    while index < characters.len() {
+        let character = characters[index];
+        let next = characters.get(index + 1).copied();
+        if state.block_comment {
+            if character == '*' && next == Some('/') {
+                state.block_comment = false;
+                index += 2;
+                continue;
+            }
+            index += 1;
+            continue;
+        }
+        if state.template {
+            if !escaped && character == '`' {
+                state.template = false;
+            }
+            escaped = !escaped && character == '\\';
+            index += 1;
+            continue;
+        }
+        if let Some(delimiter) = quote {
+            if !escaped && character == delimiter {
+                quote = None;
+            }
+            escaped = !escaped && character == '\\';
+            index += 1;
+            continue;
+        }
+        if character == '/' && next == Some('/') {
+            break;
+        }
+        if character == '/' && next == Some('*') {
+            state.block_comment = true;
+            index += 2;
+            continue;
+        }
+        match character {
+            '\'' | '"' => quote = Some(character),
+            '`' => state.template = true,
+            '{' | '[' => opens += 1,
+            '}' | ']' => closes += 1,
+            _ => {}
+        }
+        escaped = false;
+        index += 1;
+    }
+    (opens, closes)
+}
+
+fn normalize_format_line(line: &str, state: &mut FormatLexState) -> String {
+    if state.block_comment
+        || state.template
+        || line.starts_with("//")
+        || line.starts_with("/*")
+        || line.starts_with('*')
+    {
+        let _ = structural_delimiters(line, state);
+        return line.trim_end().to_owned();
+    }
+    let mut result = String::with_capacity(line.len());
+    let mut quote = None;
+    let mut escaped = false;
+    let mut pending_space = false;
+    let characters = line.chars().collect::<Vec<_>>();
+    let mut index = 0;
+    while index < characters.len() {
+        let character = characters[index];
+        let next = characters.get(index + 1).copied();
+        if let Some(delimiter) = quote {
+            result.push(character);
+            if !escaped && character == delimiter {
+                quote = None;
+            }
+            escaped = !escaped && character == '\\';
+            index += 1;
+            continue;
+        }
+        if character == '/' && next == Some('/') {
+            trim_spaces(&mut result);
+            if !result.is_empty() {
+                result.push(' ');
+            }
+            result.extend(characters[index..].iter());
+            break;
+        }
+        if character == '/' && next == Some('*') {
+            trim_spaces(&mut result);
+            if !result.is_empty() {
+                result.push(' ');
+            }
+            result.extend(characters[index..].iter());
+            if !characters[index + 2..]
+                .windows(2)
+                .any(|pair| pair == ['*', '/'])
+            {
+                state.block_comment = true;
+            }
+            break;
+        }
+        if matches!(character, '\'' | '"' | '`') {
+            push_pending_space(&mut result, &mut pending_space);
+            result.push(character);
+            quote = Some(character);
+            index += 1;
+            continue;
+        }
+        if character.is_whitespace() {
+            pending_space = !result.is_empty();
+            index += 1;
+            continue;
+        }
+        match character {
+            ',' | ';' => {
+                trim_spaces(&mut result);
+                result.push(character);
+                pending_space = next.is_some();
+            }
+            ':' => {
+                trim_spaces(&mut result);
+                result.push(':');
+                pending_space = true;
+            }
+            ')' | ']' => {
+                trim_spaces(&mut result);
+                result.push(character);
+                pending_space = false;
+            }
+            '(' => {
+                trim_spaces(&mut result);
+                if matches!(
+                    last_word(&result),
+                    "if" | "for" | "while" | "switch" | "catch"
+                ) {
+                    result.push(' ');
+                }
+                result.push('(');
+                pending_space = false;
+            }
+            '{' => {
+                trim_spaces(&mut result);
+                if !result.is_empty() && !result.ends_with(['(', '[', '{', ' ']) {
+                    result.push(' ');
+                }
+                result.push('{');
+                pending_space = next.is_some_and(|next| next != '}');
+            }
+            '}' => {
+                trim_spaces(&mut result);
+                if !result.is_empty() && !result.ends_with(['{', ' ']) {
+                    result.push(' ');
+                }
+                result.push('}');
+                pending_space = next.is_some();
+            }
+            '=' => {
+                trim_spaces(&mut result);
+                if !result.is_empty() {
+                    result.push(' ');
+                }
+                result.push(character);
+                while characters.get(index + 1) == Some(&'=') {
+                    result.push('=');
+                    index += 1;
+                }
+                if characters.get(index + 1) == Some(&'>') {
+                    result.push('>');
+                    index += 1;
+                }
+                pending_space = true;
+            }
+            _ => {
+                push_pending_space(&mut result, &mut pending_space);
+                result.push(character);
+            }
+        }
+        index += 1;
+    }
+    if quote == Some('`') {
+        state.template = true;
+    }
+    trim_spaces(&mut result);
+    result
+}
+
+fn last_word(value: &str) -> &str {
+    value
+        .rsplit(|character: char| !character.is_alphanumeric() && character != '_')
+        .next()
+        .unwrap_or("")
+}
+
+fn push_pending_space(result: &mut String, pending: &mut bool) {
+    if *pending && !result.is_empty() && !result.ends_with([' ', '(', '[', '.']) {
+        result.push(' ');
+    }
+    *pending = false;
+}
+
+fn trim_spaces(result: &mut String) {
+    while result.ends_with(' ') {
+        result.pop();
+    }
 }
 
 fn document_symbols_for_node(source: &SourceFile, node: NodeId) -> Vec<DocumentSymbol> {
@@ -3314,6 +3786,12 @@ mod tests {
         assert_eq!(capabilities["documentHighlightProvider"], true);
         assert_eq!(capabilities["linkedEditingRangeProvider"], true);
         assert_eq!(capabilities["codeActionProvider"], true);
+        assert_eq!(capabilities["documentFormattingProvider"], true);
+        assert_eq!(capabilities["documentRangeFormattingProvider"], true);
+        assert_eq!(
+            capabilities["documentOnTypeFormattingProvider"]["firstTriggerCharacter"],
+            "}"
+        );
 
         let opened = reader.read_message::<Value>().unwrap().unwrap();
         assert_eq!(opened["method"], "textDocument/publishDiagnostics");
@@ -3888,5 +4366,94 @@ mod tests {
             actions[2]["edit"]["changes"][main_uri.0.as_str()][0]["newText"],
             "_unusedParam"
         );
+    }
+
+    #[test]
+    fn framed_session_formats_documents_ranges_and_utf16_on_type_positions() {
+        let uri = DocumentUri("file:///workspace/format.ts".to_owned());
+        let source = concat!(
+            "const smile=\"😀\";   \n",
+            "function greet(){\n",
+            "const value=1;\n",
+            "return value;\n",
+            "}\n"
+        );
+        let options = FormattingOptions {
+            tab_size: 2,
+            insert_spaces: true,
+            trim_trailing_whitespace: Some(true),
+            insert_final_newline: Some(true),
+            trim_final_newlines: Some(true),
+        };
+        let mut input = begin_framed_session();
+        write_open(&mut input, uri.clone(), source);
+        write(
+            &mut input,
+            &Request::new(
+                70_i64,
+                "textDocument/formatting",
+                Some(DocumentFormattingParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    options,
+                }),
+            ),
+        );
+        write(
+            &mut input,
+            &Request::new(
+                71_i64,
+                "textDocument/rangeFormatting",
+                Some(DocumentRangeFormattingParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    range: Range {
+                        start: Position {
+                            line: 2,
+                            character: 0,
+                        },
+                        end: Position {
+                            line: 3,
+                            character: 0,
+                        },
+                    },
+                    options,
+                }),
+            ),
+        );
+        write(
+            &mut input,
+            &Request::new(
+                72_i64,
+                "textDocument/onTypeFormatting",
+                Some(DocumentOnTypeFormattingParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    position: position_at(
+                        source,
+                        u32::try_from(source.find('\n').unwrap()).unwrap(),
+                    ),
+                    ch: ";".to_owned(),
+                    options,
+                }),
+            ),
+        );
+
+        let output = finish_framed_session(input);
+        let response = |id| output.iter().find(|message| message["id"] == id).unwrap();
+        assert_eq!(
+            response(70)["result"][0]["newText"],
+            concat!(
+                "const smile = \"😀\";\n",
+                "function greet() {\n",
+                "  const value = 1;\n",
+                "  return value;\n",
+                "}\n"
+            )
+        );
+        assert_eq!(response(71)["result"][0]["range"]["start"]["line"], 2);
+        assert_eq!(response(71)["result"][0]["range"]["end"]["line"], 3);
+        assert_eq!(response(71)["result"][0]["newText"], "  const value = 1;\n");
+        let on_type = &response(72)["result"][0];
+        assert_eq!(on_type["range"]["end"]["line"], 1);
+        assert_eq!(on_type["range"]["end"]["character"], 0);
+        assert_eq!(on_type["newText"], "const smile = \"😀\";\n");
     }
 }
