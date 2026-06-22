@@ -208,6 +208,7 @@ pub fn emit_source_file_with_context(
         this_alias: None,
         namespace_containers: Vec::new(),
         namespace_declarations: vec![HashSet::new()],
+        generated_names: GeneratedNames::new(arena),
         runtime_identifier_uses: HashSet::new(),
         commonjs_default_imports: HashMap::new(),
         commonjs_named_import_temps: HashMap::new(),
@@ -2767,6 +2768,49 @@ impl GeneratedNames {
             index += 1;
         }
     }
+
+    fn claim(&mut self, preferred: &str) -> Option<String> {
+        self.used
+            .insert(preferred.to_owned())
+            .then(|| preferred.to_owned())
+    }
+
+    fn generate_temp(&mut self) -> String {
+        let mut suffix = 0_u32;
+        loop {
+            for letter in b'a'..=b'z' {
+                let base = format!("_{}", char::from(letter));
+                let candidate = if suffix == 0 {
+                    base
+                } else {
+                    format!("{base}_{suffix}")
+                };
+                if self.used.insert(candidate.clone()) {
+                    return candidate;
+                }
+            }
+            suffix += 1;
+        }
+    }
+
+    fn generate_loop_variable(&mut self) -> String {
+        self.claim("_i").unwrap_or_else(|| self.generate_temp())
+    }
+}
+
+#[derive(Clone)]
+enum DownlevelBindingValue {
+    Node(NodeId),
+    Name(String),
+    Element(Box<Self>, DownlevelBindingIndex),
+    Slice(Box<Self>, usize),
+    VoidZero,
+}
+
+#[derive(Clone)]
+enum DownlevelBindingIndex {
+    Number(usize),
+    Name(String),
 }
 
 impl SystemModulePlan {
@@ -3041,6 +3085,7 @@ struct Printer<'a> {
     this_alias: Option<&'static str>,
     namespace_containers: Vec<String>,
     namespace_declarations: Vec<HashSet<String>>,
+    generated_names: GeneratedNames,
     runtime_identifier_uses: HashSet<String>,
     commonjs_default_imports: HashMap<String, String>,
     commonjs_named_import_temps: HashMap<NodeId, String>,
@@ -4522,6 +4567,14 @@ impl Printer<'_> {
                 self.emit_embedded(data.statement)?;
             }
             NodeData::ForInOrOfStatement(data) => {
+                if node.kind == SyntaxKind::ForOfStatement
+                    && data.await_modifier.is_none()
+                    && self.settings.target < ScriptTarget::Es2015
+                {
+                    self.emit_downlevel_for_of(data)?;
+                    self.writer.newline();
+                    return Ok(());
+                }
                 self.writer.write("for");
                 if data.await_modifier.is_some() {
                     self.writer.write(" await");
@@ -4665,6 +4718,275 @@ impl Printer<'_> {
         Ok(())
     }
 
+    fn emit_downlevel_for_of(
+        &mut self,
+        data: &ts_ast::ForInOrOfStatementData,
+    ) -> Result<(), EmitError> {
+        let counter = self.generated_names.generate_loop_variable();
+        let rhs = match self.node(data.expression)?.data.clone() {
+            NodeData::Identifier(identifier) => self.generated_names.generate(&identifier.text),
+            _ => self.generated_names.generate_temp(),
+        };
+        self.writer.write("for (var ");
+        self.writer.write(&counter);
+        self.writer.write(" = 0, ");
+        self.writer.write(&rhs);
+        self.writer.write(" = ");
+        self.emit_expression(data.expression, 1)?;
+        self.writer.write("; ");
+        self.writer.write(&counter);
+        self.writer.write(" < ");
+        self.writer.write(&rhs);
+        self.writer.write(".length; ");
+        self.writer.write(&counter);
+        self.writer.write("++) ");
+        let value = DownlevelBindingValue::Element(
+            Box::new(DownlevelBindingValue::Name(rhs)),
+            DownlevelBindingIndex::Name(counter),
+        );
+        self.emit_downlevel_for_of_body(data.statement, data.initializer, &value)
+    }
+
+    fn emit_downlevel_for_of_body(
+        &mut self,
+        body: NodeId,
+        initializer: NodeId,
+        value: &DownlevelBindingValue,
+    ) -> Result<(), EmitError> {
+        self.writer.write("{");
+        self.writer.newline();
+        self.writer.indent += 1;
+        self.emit_downlevel_for_of_binding(initializer, value)?;
+
+        let body_node = self.node(body)?.clone();
+        if let NodeData::Block(block) = &body_node.data {
+            let mut previous_end = body_node.range.start.get().saturating_add(1);
+            let mut previous_emitted = true;
+            for statement in &block.statements.nodes {
+                let statement_node = self.node(*statement)?.clone();
+                self.emit_source_comments_between_with_trailing(
+                    previous_end,
+                    statement_node.range.start.get(),
+                    previous_emitted,
+                );
+                self.emit_statement(*statement)?;
+                previous_end = statement_node.range.end.get();
+                previous_emitted = statement_emits_javascript(self.arena, &statement_node);
+            }
+            self.emit_source_comments_between_with_trailing(
+                previous_end,
+                body_node.range.end.get().saturating_sub(1),
+                previous_emitted,
+            );
+        } else {
+            self.emit_statement(body)?;
+        }
+        self.writer.indent -= 1;
+        self.writer.write("}");
+        Ok(())
+    }
+
+    fn emit_downlevel_for_of_binding(
+        &mut self,
+        initializer: NodeId,
+        value: &DownlevelBindingValue,
+    ) -> Result<(), EmitError> {
+        let initializer_node = self.node(initializer)?.clone();
+        if let NodeData::VariableDeclarationList(list) = &initializer_node.data {
+            self.writer.write("var ");
+            let mut emitted = false;
+            if let Some(declaration_id) = list.declarations.nodes.first() {
+                let declaration_node = self.node(*declaration_id)?.clone();
+                let NodeData::VariableDeclaration(declaration) = &declaration_node.data else {
+                    return Err(Self::unsupported(*declaration_id, declaration_node.kind));
+                };
+                let binding_value =
+                    if self.node(declaration.name)?.kind == SyntaxKind::ArrayBindingPattern {
+                        let temp = self.generated_names.generate_temp();
+                        self.emit_downlevel_declarator_start(&mut emitted);
+                        self.writer.write(&temp);
+                        self.writer.write(" = ");
+                        self.emit_downlevel_binding_value(value)?;
+                        DownlevelBindingValue::Name(temp)
+                    } else {
+                        (*value).clone()
+                    };
+                self.emit_downlevel_binding_declarators(
+                    declaration.name,
+                    binding_value,
+                    None,
+                    &mut emitted,
+                )?;
+            }
+            if !emitted {
+                let temp = self.generated_names.generate_temp();
+                self.emit_downlevel_declarator_start(&mut emitted);
+                self.writer.write(&temp);
+                self.writer.write(" = ");
+                self.emit_downlevel_binding_value(value)?;
+            }
+            self.writer.write(";");
+        } else {
+            self.emit_expression(initializer, 1)?;
+            self.writer.write(" = ");
+            self.emit_downlevel_binding_value(value)?;
+            self.writer.write(";");
+        }
+        self.writer.newline();
+        Ok(())
+    }
+
+    fn emit_downlevel_binding_declarators(
+        &mut self,
+        name: NodeId,
+        value: DownlevelBindingValue,
+        initializer: Option<NodeId>,
+        emitted: &mut bool,
+    ) -> Result<(), EmitError> {
+        let value = if let Some(initializer) = initializer {
+            let temp = self.generated_names.generate_temp();
+            self.emit_downlevel_declarator_start(emitted);
+            self.writer.write(&temp);
+            self.writer.write(" = ");
+            self.emit_downlevel_binding_value(&value)?;
+            let defaulted = self.generated_names.generate_temp();
+            self.emit_downlevel_declarator_start(emitted);
+            self.writer.write(&defaulted);
+            self.writer.write(" = ");
+            self.writer.write(&temp);
+            self.writer.write(" === void 0 ? ");
+            self.emit_expression(initializer, 2)?;
+            self.writer.write(" : ");
+            self.writer.write(&temp);
+            DownlevelBindingValue::Name(defaulted)
+        } else {
+            value
+        };
+
+        let name_node = self.node(name)?.clone();
+        match &name_node.data {
+            NodeData::Identifier(_) => {
+                self.emit_downlevel_declarator_start(emitted);
+                self.emit_expression(name, 0)?;
+                self.writer.write(" = ");
+                self.emit_downlevel_binding_value(&value)?;
+            }
+            NodeData::BindingPattern(pattern)
+                if name_node.kind == SyntaxKind::ArrayBindingPattern =>
+            {
+                let mut index = 0_usize;
+                let mut previous_end = name_node.range.start.get().saturating_add(1);
+                for element_id in &pattern.elements.nodes {
+                    let element_node = self.node(*element_id)?.clone();
+                    index += self
+                        .array_binding_comma_count(previous_end, element_node.range.start.get());
+                    if matches!(element_node.data, NodeData::OmittedExpression(_)) {
+                        previous_end = element_node.range.end.get();
+                        continue;
+                    }
+                    let NodeData::BindingElement(element) = &element_node.data else {
+                        return Err(Self::unsupported(*element_id, element_node.kind));
+                    };
+                    let Some(element_name) = element.name else {
+                        continue;
+                    };
+                    let mut element_value = if element.dot_dot_dot_token.is_some() {
+                        DownlevelBindingValue::Slice(Box::new(value.clone()), index)
+                    } else {
+                        DownlevelBindingValue::Element(
+                            Box::new(value.clone()),
+                            DownlevelBindingIndex::Number(index),
+                        )
+                    };
+                    if element.initializer.is_none()
+                        && self.node(element_name)?.kind == SyntaxKind::ArrayBindingPattern
+                    {
+                        let temp = self.generated_names.generate_temp();
+                        self.emit_downlevel_declarator_start(emitted);
+                        self.writer.write(&temp);
+                        self.writer.write(" = ");
+                        self.emit_downlevel_binding_value(&element_value)?;
+                        element_value = DownlevelBindingValue::Name(temp);
+                    }
+                    self.emit_downlevel_binding_declarators(
+                        element_name,
+                        element_value,
+                        element.initializer,
+                        emitted,
+                    )?;
+                    previous_end = element_node.range.end.get();
+                }
+            }
+            _ => return Err(Self::unsupported(name, name_node.kind)),
+        }
+        Ok(())
+    }
+
+    fn array_binding_comma_count(&self, start: u32, end: u32) -> usize {
+        let start = usize::try_from(start).unwrap_or(usize::MAX);
+        let end = usize::try_from(end).unwrap_or(usize::MAX);
+        let Some(text) = self.source_text.get(start..end) else {
+            return 0;
+        };
+        let bytes = text.as_bytes();
+        let mut index = 0;
+        let mut commas = 0;
+        while index < bytes.len() {
+            if bytes[index..].starts_with(b"//") {
+                index += 2;
+                while index < bytes.len() && !matches!(bytes[index], b'\n' | b'\r') {
+                    index += 1;
+                }
+            } else if bytes[index..].starts_with(b"/*") {
+                index += 2;
+                while index + 1 < bytes.len() && !bytes[index..].starts_with(b"*/") {
+                    index += 1;
+                }
+                index = (index + 2).min(bytes.len());
+            } else {
+                commas += usize::from(bytes[index] == b',');
+                index += 1;
+            }
+        }
+        commas
+    }
+
+    fn emit_downlevel_declarator_start(&mut self, emitted: &mut bool) {
+        if *emitted {
+            self.writer.write(", ");
+        }
+        *emitted = true;
+    }
+
+    fn emit_downlevel_binding_value(
+        &mut self,
+        value: &DownlevelBindingValue,
+    ) -> Result<(), EmitError> {
+        match value {
+            DownlevelBindingValue::Node(node) => self.emit_expression(*node, 18)?,
+            DownlevelBindingValue::Name(name) => self.writer.write(name),
+            DownlevelBindingValue::Element(value, index) => {
+                self.emit_downlevel_binding_value(value)?;
+                self.writer.write("[");
+                match index {
+                    DownlevelBindingIndex::Number(index) => {
+                        self.writer.write(&index.to_string());
+                    }
+                    DownlevelBindingIndex::Name(name) => self.writer.write(name),
+                }
+                self.writer.write("]");
+            }
+            DownlevelBindingValue::Slice(value, index) => {
+                self.emit_downlevel_binding_value(value)?;
+                self.writer.write(".slice(");
+                self.writer.write(&index.to_string());
+                self.writer.write(")");
+            }
+            DownlevelBindingValue::VoidZero => self.writer.write("void 0"),
+        }
+        Ok(())
+    }
+
     fn emit_block(&mut self, id: NodeId) -> Result<(), EmitError> {
         let node = self.node(id)?.clone();
         let NodeData::Block(data) = &node.data else {
@@ -4761,14 +5083,41 @@ impl Printer<'_> {
         };
         self.writer.write(keyword);
         self.writer.write(" ");
-        for (index, declaration) in data.declarations.nodes.iter().enumerate() {
-            if index != 0 {
-                self.writer.write(", ");
-            }
+        let mut emitted = false;
+        for declaration in &data.declarations.nodes {
             let declaration_node = self.node(*declaration)?.clone();
             let NodeData::VariableDeclaration(declaration) = &declaration_node.data else {
                 return Err(Self::unsupported(*declaration, declaration_node.kind));
             };
+            if self.settings.target < ScriptTarget::Es2015
+                && self.node(declaration.name)?.kind == SyntaxKind::ArrayBindingPattern
+            {
+                let value = if let Some(initializer) = declaration.initializer {
+                    if let NodeData::Identifier(identifier) = &self.node(initializer)?.data
+                        && !self
+                            .binding_name_contains_identifier(declaration.name, &identifier.text)?
+                    {
+                        DownlevelBindingValue::Node(initializer)
+                    } else {
+                        let temp = self.generated_names.generate_temp();
+                        self.emit_downlevel_declarator_start(&mut emitted);
+                        self.writer.write(&temp);
+                        self.writer.write(" = ");
+                        self.emit_expression(initializer, 1)?;
+                        DownlevelBindingValue::Name(temp)
+                    }
+                } else {
+                    DownlevelBindingValue::VoidZero
+                };
+                self.emit_downlevel_binding_declarators(
+                    declaration.name,
+                    value,
+                    None,
+                    &mut emitted,
+                )?;
+                continue;
+            }
+            self.emit_downlevel_declarator_start(&mut emitted);
             self.emit_expression(declaration.name, 0)?;
             if let Some(initializer) = declaration.initializer {
                 self.writer.write(" = ");
@@ -4776,6 +5125,30 @@ impl Printer<'_> {
             }
         }
         Ok(())
+    }
+
+    fn binding_name_contains_identifier(
+        &self,
+        name: NodeId,
+        identifier: &str,
+    ) -> Result<bool, EmitError> {
+        let node = self.node(name)?;
+        match &node.data {
+            NodeData::Identifier(data) => Ok(data.text == identifier),
+            NodeData::BindingPattern(pattern) => {
+                for element in &pattern.elements.nodes {
+                    let element_node = self.node(*element)?;
+                    if let NodeData::BindingElement(element) = &element_node.data
+                        && let Some(name) = element.name
+                        && self.binding_name_contains_identifier(name, identifier)?
+                    {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            _ => Ok(false),
+        }
     }
 
     fn emit_parameters(&mut self, parameters: &NodeList) -> Result<(), EmitError> {
@@ -8892,6 +9265,90 @@ mod tests {
                 "let i = 0; do { i++; if (i === 1) continue; } while (i < 2); switch (i) { case 2: i = 3; break; default: i = 4; } try { throw i; } catch (error: unknown) { i = 5; } finally { i = 6; }"
             ),
             "let i = 0;\ndo {\n    i++;\n    if (i === 1)\n        continue;\n} while (i < 2);\nswitch (i) {\n    case 2:\n        i = 3;\n        break;\n    default:\n        i = 4;\n}\ntry {\n    throw i;\n} catch (error) {\n    i = 5;\n} finally {\n    i = 6;\n}\n"
+        );
+    }
+
+    #[test]
+    fn lowers_for_of_and_array_bindings_for_es5() {
+        assert_eq!(
+            emit_with(
+                "function doubleAndReturnAsArray(x: number, y: number, z: number) { let result = []; for (let arg of arguments) { result.push(arg + arg); } return result; }",
+                ScriptTarget::Es5,
+                ModuleKind::EsNext,
+            )
+            .code,
+            "function doubleAndReturnAsArray(x, y, z) {\n    var result = [];\n    for (var _i = 0, arguments_1 = arguments; _i < arguments_1.length; _i++) {\n        var arg = arguments_1[_i];\n        result.push(arg + arg);\n    }\n    return result;\n}\n"
+        );
+        assert_eq!(
+            emit_with(
+                "function doubleAndReturnAsArray(x: number, y: number, z: number) { let blah = arguments[Symbol.iterator]; let result = []; for (let arg of blah()) { result.push(arg + arg); } return result; }",
+                ScriptTarget::Es5,
+                ModuleKind::EsNext,
+            )
+            .code,
+            "function doubleAndReturnAsArray(x, y, z) {\n    var blah = arguments[Symbol.iterator];\n    var result = [];\n    for (var _i = 0, _a = blah(); _i < _a.length; _i++) {\n        var arg = _a[_i];\n        result.push(arg + arg);\n    }\n    return result;\n}\n"
+        );
+        assert_eq!(
+            emit_with(
+                "function asReversedTuple(a: number, b: string, c: boolean) { let [x, y, z] = arguments; return [z, y, x]; }",
+                ScriptTarget::Es5,
+                ModuleKind::EsNext,
+            )
+            .code,
+            "function asReversedTuple(a, b, c) {\n    var x = arguments[0], y = arguments[1], z = arguments[2];\n    return [z, y, x];\n}\n"
+        );
+    }
+
+    #[test]
+    fn downlevel_for_of_temps_avoid_source_names_and_evaluate_rhs_once() {
+        let output = emit_with(
+            "function iterate(_i: number, _a: number, arguments_1: unknown) { for (let value of make()) { // keep\n use(value); } }",
+            ScriptTarget::Es5,
+            ModuleKind::EsNext,
+        )
+        .code;
+        assert_eq!(output.matches("make()").count(), 1, "{output}");
+        assert_eq!(
+            output,
+            "function iterate(_i, _a, arguments_1) {\n    for (var _b = 0, _c = make(); _b < _c.length; _b++) {\n        var value = _c[_b]; // keep\n        use(value);\n    }\n}\n"
+        );
+    }
+
+    #[test]
+    fn downlevel_array_bindings_handle_defaults_omissions_rest_and_nested_patterns() {
+        let output = emit_with(
+            "let [head = fallback(), , [nested], ...tail] = make();",
+            ScriptTarget::Es5,
+            ModuleKind::EsNext,
+        )
+        .code;
+        assert_eq!(output.matches("make()").count(), 1, "{output}");
+        assert_eq!(output.matches("fallback()").count(), 1, "{output}");
+        assert_eq!(
+            output,
+            "var _a = make(), _b = _a[0], _c = _b === void 0 ? fallback() : _b, head = _c, _d = _a[2], nested = _d[0], tail = _a.slice(3);\n"
+        );
+        assert_eq!(
+            emit_with(
+                "for (let [x, y] of rows()) { use(x, y); }",
+                ScriptTarget::Es5,
+                ModuleKind::EsNext,
+            )
+            .code,
+            "for (var _i = 0, _a = rows(); _i < _a.length; _i++) {\n    var _b = _a[_i], x = _b[0], y = _b[1];\n    use(x, y);\n}\n"
+        );
+    }
+
+    #[test]
+    fn preserves_for_of_and_array_bindings_at_es2015() {
+        assert_eq!(
+            emit_with(
+                "let [x, y] = arguments; for (let value of values) { use(value); }",
+                ScriptTarget::Es2015,
+                ModuleKind::EsNext,
+            )
+            .code,
+            "let [x, y] = arguments;\nfor (let value of values) {\n    use(value);\n}\n"
         );
     }
 
