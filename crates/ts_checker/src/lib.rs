@@ -325,19 +325,27 @@ pub struct CheckResult {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct CheckerOptions {
+    pub allow_unreachable_code: Option<bool>,
+    pub no_fallthrough_cases_in_switch: bool,
     pub strict_null_checks: bool,
     pub no_implicit_any: bool,
+    pub no_implicit_returns: bool,
     pub no_unused_locals: bool,
     pub no_unused_parameters: bool,
+    pub use_unknown_in_catch_variables: bool,
 }
 
 impl Default for CheckerOptions {
     fn default() -> Self {
         Self {
+            allow_unreachable_code: None,
+            no_fallthrough_cases_in_switch: false,
             strict_null_checks: true,
             no_implicit_any: false,
+            no_implicit_returns: false,
             no_unused_locals: false,
             no_unused_parameters: false,
+            use_unknown_in_catch_variables: false,
         }
     }
 }
@@ -923,7 +931,7 @@ impl<'a> Checker<'a> {
             NodeData::Block(data) => {
                 let mut terminated = false;
                 for statement in &data.statements.nodes {
-                    if terminated {
+                    if terminated && self.options.allow_unreachable_code == Some(false) {
                         self.error(*statement, 7027, std::iter::empty());
                     }
                     self.check_node(*statement, expected_return, saw_return);
@@ -975,6 +983,31 @@ impl<'a> Checker<'a> {
                         .unwrap_or_else(|| self.result.types.any());
                     self.result.symbol_types.insert(*symbol, inferred);
                 }
+            }
+            NodeData::CatchClause(data) => {
+                if let Some(variable) = data.variable_declaration
+                    && let Some(NodeData::VariableDeclaration(declaration)) =
+                        self.arena.get(variable).map(|node| &node.data)
+                {
+                    let symbol = self
+                        .bindings
+                        .node_symbols
+                        .get(&variable)
+                        .copied()
+                        .or(declaration.symbol)
+                        .or(declaration.local_symbol);
+                    if let Some(symbol) = symbol {
+                        let type_id = if let Some(annotation) = declaration.type_ {
+                            self.type_from_type_node(annotation)
+                        } else if self.options.use_unknown_in_catch_variables {
+                            self.result.types.unknown()
+                        } else {
+                            self.result.types.any()
+                        };
+                        self.result.symbol_types.insert(symbol, type_id);
+                    }
+                }
+                self.check_node(data.block, expected_return, saw_return);
             }
             NodeData::FunctionDeclaration(data) => {
                 self.check_function(node_id, data);
@@ -1201,7 +1234,8 @@ impl<'a> Checker<'a> {
         let mut exits = Vec::new();
         let mut case_types = Vec::new();
         let mut has_default = false;
-        for clause_id in block.clauses.nodes {
+        let clause_count = block.clauses.nodes.len();
+        for (clause_index, clause_id) in block.clauses.nodes.into_iter().enumerate() {
             let Some(clause_node) = self.arena.get(clause_id).cloned() else {
                 continue;
             };
@@ -1225,12 +1259,22 @@ impl<'a> Checker<'a> {
             }
             self.narrowings.push(narrowing);
             let mut terminated = false;
-            for statement in clause.statements.nodes {
-                if terminated {
-                    self.error(statement, 7027, std::iter::empty());
+            let statements = clause.statements.nodes;
+            for statement in &statements {
+                if terminated && self.options.allow_unreachable_code == Some(false) {
+                    self.error(*statement, 7027, std::iter::empty());
                 }
-                self.check_node(statement, expected_return, saw_return);
-                terminated |= self.statement_definitely_terminates(statement);
+                self.check_node(*statement, expected_return, saw_return);
+                terminated |= self.statement_definitely_terminates(*statement);
+            }
+            if self.options.no_fallthrough_cases_in_switch
+                && clause_index + 1 < clause_count
+                && !statements.is_empty()
+                && !statements
+                    .iter()
+                    .any(|statement| self.statement_prevents_fallthrough(*statement))
+            {
+                self.error(clause_id, 7029, std::iter::empty());
             }
             self.narrowings.pop();
             exits.push(self.flow_types.clone());
@@ -1248,6 +1292,16 @@ impl<'a> Checker<'a> {
             .into_iter()
             .reduce(|left, right| self.join_flow_types(&left, &right))
             .unwrap_or(before);
+    }
+
+    fn statement_prevents_fallthrough(&self, statement: NodeId) -> bool {
+        let Some(node) = self.arena.get(statement) else {
+            return false;
+        };
+        matches!(
+            node.kind,
+            SyntaxKind::BreakStatement | SyntaxKind::ContinueStatement
+        ) || self.statement_definitely_terminates(statement)
     }
 
     fn narrow_to_comparison(
@@ -1315,16 +1369,17 @@ impl<'a> Checker<'a> {
             self.check_node(body, Some(return_type), &mut saw_return);
         }
         self.local_scopes.pop();
-        if data.body.is_some()
-            && !data
-                .body
-                .is_some_and(|body| self.statement_definitely_terminates(body))
-            && !matches!(
-                self.result.types.get(return_type).map(|value| &value.kind),
-                Some(TypeKind::Any | TypeKind::Void | TypeKind::Undefined)
-            )
-        {
+        let has_implicit_return = data
+            .body
+            .is_some_and(|body| !self.statement_definitely_terminates(body));
+        let requires_value_return = !matches!(
+            self.result.types.get(return_type).map(|value| &value.kind),
+            Some(TypeKind::Any | TypeKind::Void | TypeKind::Undefined)
+        );
+        if has_implicit_return && requires_value_return {
             self.error(node_id, 2355, std::iter::empty());
+        } else if has_implicit_return && saw_return && self.options.no_implicit_returns {
+            self.error(data.name.unwrap_or(node_id), 7030, std::iter::empty());
         }
     }
 
@@ -2135,6 +2190,16 @@ impl<'a> Checker<'a> {
             NodeData::ArrowFunction(data) => self.arrow_type(data, contextual_type),
             NodeData::PropertyAccessExpression(data) => {
                 let receiver = self.type_of_expression(data.expression);
+                if matches!(
+                    self.result.types.get(receiver).map(|type_| &type_.kind),
+                    Some(TypeKind::Unknown)
+                ) {
+                    let name = self
+                        .property_name(data.expression)
+                        .unwrap_or_else(|| "value".into());
+                    self.error(data.expression, 18046, [name]);
+                    return self.result.types.any();
+                }
                 let name = self.property_name(data.name).unwrap_or_default();
                 self.property_access_type(node_id, receiver, &name)
             }
@@ -4197,7 +4262,10 @@ mod tests {
     use ts_core::TextRange;
     use ts_parser::parse_source_file;
 
-    use super::{Checker, ObjectType, TypeKind, check_source_file};
+    use super::{
+        Checker, CheckerOptions, ObjectType, TypeKind, check_source_file,
+        check_source_file_with_options,
+    };
 
     struct Builder {
         arena: NodeArena,
@@ -5128,7 +5196,56 @@ mod tests {
                 .iter()
                 .map(|diagnostic| diagnostic.diagnostic.code())
                 .collect::<Vec<_>>(),
-            [2322, 2355, 7027]
+            [2322, 2355]
+        );
+    }
+
+    #[test]
+    fn enforces_control_flow_compiler_options() {
+        let parsed = parse_source_file(
+            r"
+                function choose(value: boolean) { if (value) return 1; }
+                function cases(value: number) {
+                    switch (value) { case 1: value++; case 2: break; }
+                }
+                function unreachable() { return; const after = 1; }
+                try { throw 1; } catch (error) { error.toFixed(); }
+            ",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file_with_options(
+            &parsed.arena,
+            parsed.source_file,
+            &bindings,
+            CheckerOptions {
+                allow_unreachable_code: Some(false),
+                no_fallthrough_cases_in_switch: true,
+                no_implicit_returns: true,
+                use_unknown_in_catch_variables: true,
+                ..CheckerOptions::default()
+            },
+        );
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [7030, 7029, 7027, 18046]
+        );
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.render().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "Not all code paths return a value.",
+                "Fallthrough case in switch.",
+                "Unreachable code detected.",
+                "'error' is of type 'unknown'.",
+            ]
         );
     }
 

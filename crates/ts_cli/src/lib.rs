@@ -167,6 +167,7 @@ fn parse_expanded(args: &[String]) -> Result<Command, CommandLineError> {
 fn compiler_boolean_name(argument: &str) -> Option<&'static str> {
     Some(match argument {
         "--allowjs" => "allowjs",
+        "--allowunreachablecode" => "allowunreachablecode",
         "--allowsyntheticdefaultimports" => "allowsyntheticdefaultimports",
         "--checkjs" => "checkjs",
         "--declaration" => "declaration",
@@ -177,13 +178,16 @@ fn compiler_boolean_name(argument: &str) -> Option<&'static str> {
         "--noemit" => "noemit",
         "--noemitonerror" => "noemitonerror",
         "--noimplicitany" => "noimplicitany",
+        "--noimplicitreturns" => "noimplicitreturns",
         "--nolib" => "nolib",
+        "--nofallthroughcasesinswitch" => "nofallthroughcasesinswitch",
         "--nounusedlocals" => "nounusedlocals",
         "--nounusedparameters" => "nounusedparameters",
         "--skiplibcheck" => "skiplibcheck",
         "--sourcemap" => "sourcemap",
         "--strict" => "strict",
         "--strictnullchecks" => "strictnullchecks",
+        "--useunknownincatchvariables" => "useunknownincatchvariables",
         "--verbatimmodulesyntax" => "verbatimmodulesyntax",
         _ => return None,
     })

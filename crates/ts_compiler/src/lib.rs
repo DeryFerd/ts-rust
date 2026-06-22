@@ -12,7 +12,7 @@ use ts_config::{ConfigDiagnostic, resolve_config_file};
 use ts_core::TextRange;
 use ts_diagnostics::message_by_code;
 use ts_glob::{DiscoveryOptions, discover_files};
-use ts_module::{ResolutionOptions, Resolver};
+use ts_module::{ResolutionOptions, Resolver, automatic_type_directive_names};
 use ts_options::{CompilerOptions, parse_project_options};
 use ts_parser::{ParseResult, parse_jsx_source_file, parse_source_file};
 use ts_path::{CaseSensitivity, canonicalize, is_absolute, resolve_path};
@@ -181,7 +181,9 @@ impl Program {
         let mut program = Self::new_unchecked(file_system, current_directory, root_names);
         program.options = options;
         program.load_default_libraries();
-        program.load_module_graph(file_system, program.options.module_resolution_options());
+        let resolution_options = program.options.module_resolution_options();
+        program.load_automatic_type_directives(file_system, &resolution_options);
+        program.load_module_graph(file_system, resolution_options);
         program.check_program();
         program
     }
@@ -484,10 +486,14 @@ impl Program {
                     skip_diagnostics: self.options.skip_lib_check
                         && ts_path::is_declaration_file(&source_file.file_name),
                     checker_options: CheckerOptions {
+                        allow_unreachable_code: self.options.allow_unreachable_code,
+                        no_fallthrough_cases_in_switch: self.options.no_fallthrough_cases_in_switch,
                         strict_null_checks: self.options.strict_null_checks,
                         no_implicit_any: self.options.no_implicit_any,
+                        no_implicit_returns: self.options.no_implicit_returns,
                         no_unused_locals: self.options.no_unused_locals,
                         no_unused_parameters: self.options.no_unused_parameters,
+                        use_unknown_in_catch_variables: self.options.use_unknown_in_catch_variables,
                     },
                 })
                 .collect::<Vec<_>>();
@@ -581,6 +587,38 @@ impl Program {
         for root in roots {
             for library_name in ts_bundled::library_closure(&root) {
                 self.load_bundled_library(library_name);
+            }
+        }
+    }
+
+    fn load_automatic_type_directives(
+        &mut self,
+        file_system: &dyn FileSystem,
+        resolution_options: &ResolutionOptions,
+    ) {
+        let names = automatic_type_directive_names(
+            file_system,
+            resolution_options,
+            &self.current_directory,
+        );
+        if names.is_empty() {
+            return;
+        }
+        let resolver = Resolver::new(file_system, resolution_options.clone());
+        let containing_file =
+            resolve_path(&self.current_directory, &["__inferred type names__.ts"]);
+        for name in names {
+            if let Some(resolved) = resolver
+                .resolve_type_reference(&name, &containing_file)
+                .resolved
+            {
+                self.load_file(file_system, &resolved.resolved_file_name, false);
+            } else if resolution_options
+                .types
+                .as_ref()
+                .is_some_and(|types| types.iter().any(|entry| entry == &name))
+            {
+                self.diagnostics.push(type_definition_not_found(&name));
             }
         }
     }
@@ -733,6 +771,18 @@ fn module_not_found_diagnostic(
     }
 }
 
+fn type_definition_not_found(name: &str) -> ProgramDiagnostic {
+    let message = message_by_code(2688).expect("TS2688 must be in the generated catalog");
+    ProgramDiagnostic {
+        file_name: None,
+        range: None,
+        code: Some(message.code()),
+        message: message
+            .format(&[name.to_owned()])
+            .expect("TS2688 has one formatting argument"),
+    }
+}
+
 fn config_diagnostic(diagnostic: &ConfigDiagnostic) -> ProgramDiagnostic {
     ProgramDiagnostic {
         file_name: Some(diagnostic.file_name.clone()),
@@ -823,6 +873,66 @@ mod tests {
             2
         );
         assert!(program.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn loads_explicit_and_automatic_type_directives() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/main.ts", "ENV_GLOBAL; AUTO_GLOBAL;")
+            .unwrap();
+        fs.write_file(
+            "/project/types/env/index.d.ts",
+            "declare const ENV_GLOBAL: string;",
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/node_modules/@types/auto/index.d.ts",
+            "declare const AUTO_GLOBAL: number;",
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/tsconfig.json",
+            r#"{
+                "files": ["main.ts"],
+                "compilerOptions": {
+                    "noLib": true,
+                    "typeRoots": ["types", "node_modules/@types"],
+                    "types": ["env", "auto", "missing"]
+                }
+            }"#,
+        )
+        .unwrap();
+        let program = Program::from_config(&fs, "/project/tsconfig.json");
+        assert!(
+            program
+                .source_file("/project/types/env/index.d.ts")
+                .is_some()
+        );
+        assert!(
+            program
+                .source_file("/project/node_modules/@types/auto/index.d.ts")
+                .is_some()
+        );
+        assert_eq!(
+            program
+                .diagnostics()
+                .iter()
+                .filter_map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [2688]
+        );
+
+        fs.write_file(
+            "/project/automatic.json",
+            r#"{"files":["main.ts"],"compilerOptions":{"noLib":true}}"#,
+        )
+        .unwrap();
+        let automatic = Program::from_config(&fs, "/project/automatic.json");
+        assert!(
+            automatic
+                .source_file("/project/node_modules/@types/auto/index.d.ts")
+                .is_some()
+        );
     }
 
     #[test]

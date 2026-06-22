@@ -81,6 +81,7 @@ pub enum ModuleDetectionKind {
 #[allow(clippy::struct_excessive_bools)]
 pub struct CompilerOptions {
     pub allow_js: bool,
+    pub allow_unreachable_code: Option<bool>,
     pub allow_synthetic_default_imports: bool,
     pub check_js: bool,
     pub composite: bool,
@@ -95,12 +96,15 @@ pub struct CompilerOptions {
     pub no_emit: bool,
     pub no_emit_on_error: bool,
     pub no_implicit_any: bool,
+    pub no_implicit_returns: bool,
     pub no_lib: bool,
+    pub no_fallthrough_cases_in_switch: bool,
     pub no_unused_locals: bool,
     pub no_unused_parameters: bool,
     pub skip_lib_check: bool,
     pub strict: bool,
     pub strict_null_checks: bool,
+    pub use_unknown_in_catch_variables: bool,
     pub verbatim_module_syntax: bool,
     pub lib: Option<Vec<String>>,
     pub module: ModuleKind,
@@ -126,6 +130,7 @@ impl Default for CompilerOptions {
     fn default() -> Self {
         Self {
             allow_js: false,
+            allow_unreachable_code: None,
             allow_synthetic_default_imports: false,
             check_js: false,
             composite: false,
@@ -140,12 +145,15 @@ impl Default for CompilerOptions {
             no_emit: false,
             no_emit_on_error: false,
             no_implicit_any: false,
+            no_implicit_returns: false,
             no_lib: false,
+            no_fallthrough_cases_in_switch: false,
             no_unused_locals: false,
             no_unused_parameters: false,
             skip_lib_check: false,
             strict: false,
             strict_null_checks: false,
+            use_unknown_in_catch_variables: false,
             verbatim_module_syntax: false,
             lib: None,
             module: ModuleKind::CommonJs,
@@ -201,6 +209,9 @@ impl CompilerOptions {
         for name in names {
             match name.as_str() {
                 "allowjs" => self.allow_js = overrides.allow_js,
+                "allowunreachablecode" => {
+                    self.allow_unreachable_code = overrides.allow_unreachable_code;
+                }
                 "allowsyntheticdefaultimports" => {
                     self.allow_synthetic_default_imports =
                         overrides.allow_synthetic_default_imports;
@@ -237,7 +248,11 @@ impl CompilerOptions {
                 "noemit" => self.no_emit = overrides.no_emit,
                 "noemitonerror" => self.no_emit_on_error = overrides.no_emit_on_error,
                 "noimplicitany" => self.no_implicit_any = overrides.no_implicit_any,
+                "noimplicitreturns" => self.no_implicit_returns = overrides.no_implicit_returns,
                 "nolib" => self.no_lib = overrides.no_lib,
+                "nofallthroughcasesinswitch" => {
+                    self.no_fallthrough_cases_in_switch = overrides.no_fallthrough_cases_in_switch;
+                }
                 "nounusedlocals" => self.no_unused_locals = overrides.no_unused_locals,
                 "nounusedparameters" => self.no_unused_parameters = overrides.no_unused_parameters,
                 "outdir" => self.out_dir.clone_from(&overrides.out_dir),
@@ -252,9 +267,16 @@ impl CompilerOptions {
                     if !names.contains("strictnullchecks") {
                         self.strict_null_checks = overrides.strict_null_checks;
                     }
+                    if !names.contains("useunknownincatchvariables") {
+                        self.use_unknown_in_catch_variables =
+                            overrides.use_unknown_in_catch_variables;
+                    }
                 }
                 "strictnullchecks" => self.strict_null_checks = overrides.strict_null_checks,
                 "target" => self.target = overrides.target,
+                "useunknownincatchvariables" => {
+                    self.use_unknown_in_catch_variables = overrides.use_unknown_in_catch_variables;
+                }
                 "verbatimmodulesyntax" => {
                     self.verbatim_module_syntax = overrides.verbatim_module_syntax;
                 }
@@ -353,6 +375,7 @@ pub fn parse_project_options(config: &ProjectConfig) -> ParseOptionsResult {
 
 /// Parses and normalizes a map of compiler option values.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn parse_compiler_options_map(options: &BTreeMap<String, JsonValue>) -> ParseOptionsResult {
     let mut parsed = PartialOptions::default();
     let mut diagnostics = Vec::new();
@@ -360,6 +383,9 @@ pub fn parse_compiler_options_map(options: &BTreeMap<String, JsonValue>) -> Pars
         let name = original_name.to_ascii_lowercase();
         match name.as_str() {
             "allowjs" => parsed.allow_js = boolean(original_name, value, &mut diagnostics),
+            "allowunreachablecode" => {
+                parsed.allow_unreachable_code = boolean(original_name, value, &mut diagnostics);
+            }
             "allowsyntheticdefaultimports" => {
                 parsed.allow_synthetic_default_imports =
                     boolean(original_name, value, &mut diagnostics);
@@ -397,7 +423,14 @@ pub fn parse_compiler_options_map(options: &BTreeMap<String, JsonValue>) -> Pars
             "noimplicitany" => {
                 parsed.no_implicit_any = boolean(original_name, value, &mut diagnostics);
             }
+            "noimplicitreturns" => {
+                parsed.no_implicit_returns = boolean(original_name, value, &mut diagnostics);
+            }
             "nolib" => parsed.no_lib = boolean(original_name, value, &mut diagnostics),
+            "nofallthroughcasesinswitch" => {
+                parsed.no_fallthrough_cases_in_switch =
+                    boolean(original_name, value, &mut diagnostics);
+            }
             "nounusedlocals" => {
                 parsed.no_unused_locals = boolean(original_name, value, &mut diagnostics);
             }
@@ -413,6 +446,10 @@ pub fn parse_compiler_options_map(options: &BTreeMap<String, JsonValue>) -> Pars
             }
             "verbatimmodulesyntax" => {
                 parsed.verbatim_module_syntax = boolean(original_name, value, &mut diagnostics);
+            }
+            "useunknownincatchvariables" => {
+                parsed.use_unknown_in_catch_variables =
+                    boolean(original_name, value, &mut diagnostics);
             }
             "lib" => parsed.lib = string_array(original_name, value, &mut diagnostics),
             "resolvejsonmodule" => {
@@ -458,6 +495,7 @@ pub fn parse_compiler_options_map(options: &BTreeMap<String, JsonValue>) -> Pars
 #[derive(Default)]
 struct PartialOptions {
     allow_js: Option<bool>,
+    allow_unreachable_code: Option<bool>,
     allow_synthetic_default_imports: Option<bool>,
     check_js: Option<bool>,
     composite: Option<bool>,
@@ -472,12 +510,15 @@ struct PartialOptions {
     no_emit: Option<bool>,
     no_emit_on_error: Option<bool>,
     no_implicit_any: Option<bool>,
+    no_implicit_returns: Option<bool>,
     no_lib: Option<bool>,
+    no_fallthrough_cases_in_switch: Option<bool>,
     no_unused_locals: Option<bool>,
     no_unused_parameters: Option<bool>,
     skip_lib_check: Option<bool>,
     strict: Option<bool>,
     strict_null_checks: Option<bool>,
+    use_unknown_in_catch_variables: Option<bool>,
     verbatim_module_syntax: Option<bool>,
     lib: Option<Vec<String>>,
     module: Option<ModuleKind>,
@@ -511,6 +552,7 @@ impl PartialOptions {
         let es_module_interop = self.es_module_interop.unwrap_or(false);
         CompilerOptions {
             allow_js: self.allow_js.unwrap_or(check_js),
+            allow_unreachable_code: self.allow_unreachable_code,
             allow_synthetic_default_imports: self.allow_synthetic_default_imports.unwrap_or(
                 es_module_interop
                     || module == ModuleKind::System
@@ -531,12 +573,15 @@ impl PartialOptions {
             no_emit: self.no_emit.unwrap_or(false),
             no_emit_on_error: self.no_emit_on_error.unwrap_or(false),
             no_implicit_any: self.no_implicit_any.unwrap_or(strict),
+            no_implicit_returns: self.no_implicit_returns.unwrap_or(false),
             no_lib: self.no_lib.unwrap_or(false),
+            no_fallthrough_cases_in_switch: self.no_fallthrough_cases_in_switch.unwrap_or(false),
             no_unused_locals: self.no_unused_locals.unwrap_or(false),
             no_unused_parameters: self.no_unused_parameters.unwrap_or(false),
             skip_lib_check: self.skip_lib_check.unwrap_or(false),
             strict,
             strict_null_checks: self.strict_null_checks.unwrap_or(strict),
+            use_unknown_in_catch_variables: self.use_unknown_in_catch_variables.unwrap_or(strict),
             verbatim_module_syntax: self.verbatim_module_syntax.unwrap_or(false),
             lib: self.lib,
             module,
@@ -884,6 +929,9 @@ mod tests {
         let result = parse_compiler_options(&object([
             ("strict", JsonValue::Bool(true)),
             ("strictNullChecks", JsonValue::Bool(false)),
+            ("allowUnreachableCode", JsonValue::Bool(false)),
+            ("noImplicitReturns", JsonValue::Bool(true)),
+            ("noFallthroughCasesInSwitch", JsonValue::Bool(true)),
             ("esModuleInterop", JsonValue::Bool(true)),
             ("noUnusedLocals", JsonValue::Bool(true)),
             ("noUnusedParameters", JsonValue::Bool(true)),
@@ -897,6 +945,10 @@ mod tests {
         assert!(result.options.strict);
         assert!(result.options.no_implicit_any);
         assert!(!result.options.strict_null_checks);
+        assert_eq!(result.options.allow_unreachable_code, Some(false));
+        assert!(result.options.no_implicit_returns);
+        assert!(result.options.no_fallthrough_cases_in_switch);
+        assert!(result.options.use_unknown_in_catch_variables);
         assert!(result.options.es_module_interop);
         assert!(result.options.allow_synthetic_default_imports);
         assert!(result.options.no_unused_locals);

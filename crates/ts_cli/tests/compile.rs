@@ -144,6 +144,36 @@ fn common_compiler_options_match_oracle() {
 }
 
 #[test]
+fn control_flow_options_match_oracle() {
+    let directory = TestDirectory::new("control-flow-options");
+    fs::write(
+        directory.0.join("main.ts"),
+        concat!(
+            "function choose(value: boolean) { if (value) return 1; }\n",
+            "function cases(value: number) { switch (value) { case 1: value++; case 2: break; } }\n",
+            "function unreachable() { return; const after = 1; }\n",
+            "try { throw 1; } catch (caught) { caught.toFixed(); }\n",
+        ),
+    )
+    .unwrap();
+    assert_matches_oracle(
+        &directory.0,
+        &[
+            "main.ts",
+            "--ignoreConfig",
+            "--noEmit",
+            "--noImplicitReturns",
+            "--noFallthroughCasesInSwitch",
+            "--allowUnreachableCode",
+            "false",
+            "--useUnknownInCatchVariables",
+            "--pretty",
+            "false",
+        ],
+    );
+}
+
+#[test]
 fn project_and_files_conflict_matches_oracle() {
     let directory = TestDirectory::new("project-conflict");
     fs::write(directory.0.join("main.ts"), "const value = 1;\n").unwrap();

@@ -154,6 +154,35 @@ impl<'a, F: FileSystem + ?Sized> Resolver<'a, F> {
         result
     }
 
+    /// Resolves a `types` compiler-option entry or automatically discovered
+    /// package through type roots and ancestor `node_modules/@types` folders.
+    #[must_use]
+    pub fn resolve_type_reference(&self, name: &str, containing_file: &str) -> ResolutionResult {
+        let mut state = ResolutionState {
+            resolver: self,
+            failed_lookups: Vec::new(),
+        };
+        let containing_directory = directory_path(containing_file);
+        let type_root_name = name
+            .strip_prefix('@')
+            .and_then(|name| name.split_once('/'))
+            .map_or_else(
+                || name.to_owned(),
+                |(scope, package)| format!("{scope}__{package}"),
+            );
+        let resolved = state
+            .resolve_from_type_roots(&type_root_name, &containing_directory)
+            .or_else(|| {
+                types_package_name(name).and_then(|types_name| {
+                    state.resolve_node_modules_types(&types_name, &containing_directory)
+                })
+            });
+        ResolutionResult {
+            resolved,
+            failed_lookups: state.failed_lookups,
+        }
+    }
+
     pub fn clear_cache(&self) {
         self.cache
             .write()
