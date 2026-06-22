@@ -485,6 +485,15 @@ impl<'a> Parser<'a> {
             && self.next_token_kind() == SyntaxKind::ColonToken;
         let is_const_enum = self.current.kind == SyntaxKind::ConstKeyword
             && self.next_token_kind() == SyntaxKind::EnumKeyword;
+        let is_module_declaration = match self.current.kind {
+            SyntaxKind::GlobalKeyword => self.next_token_kind() == SyntaxKind::OpenBraceToken,
+            SyntaxKind::NamespaceKeyword => self.next_token_kind() == SyntaxKind::Identifier,
+            SyntaxKind::ModuleKeyword => matches!(
+                self.next_token_kind(),
+                SyntaxKind::Identifier | SyntaxKind::StringLiteral
+            ),
+            _ => false,
+        };
         match self.current.kind {
             SyntaxKind::OpenBraceToken => self.parse_block(),
             SyntaxKind::ConstKeyword if is_const_enum => self.parse_const_enum_declaration(),
@@ -513,7 +522,11 @@ impl<'a> Parser<'a> {
             SyntaxKind::WithKeyword => self.parse_with_statement(),
             SyntaxKind::NamespaceKeyword
             | SyntaxKind::ModuleKeyword
-            | SyntaxKind::GlobalKeyword => self.parse_module_declaration(),
+            | SyntaxKind::GlobalKeyword
+                if is_module_declaration =>
+            {
+                self.parse_module_declaration()
+            }
             SyntaxKind::AtToken => self.parse_decorated_statement(),
             SyntaxKind::DeclareKeyword | SyntaxKind::AbstractKeyword | SyntaxKind::AsyncKeyword => {
                 self.parse_modified_statement()
@@ -1362,13 +1375,14 @@ impl<'a> Parser<'a> {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn parse_class_member(&mut self, signature_only: bool) -> NodeId {
         let start = self.current.range.start;
         if self.current.kind == SyntaxKind::StaticKeyword && self.next_token_is_open_brace() {
             return self.parse_class_static_block(start);
         }
         let mut modifier_nodes = Vec::new();
-        while self.current.kind.is_modifier() {
+        while self.current.kind.is_modifier() && !self.current_modifier_is_member_name() {
             modifier_nodes.push(self.consume_token_node());
         }
         self.recover_invalid_class_var_modifier(&mut modifier_nodes);
@@ -1393,7 +1407,8 @@ impl<'a> Parser<'a> {
             None
         };
         let name = self.parse_property_name("Expected a member name.");
-        if self.current.kind == SyntaxKind::OpenParenToken {
+        let type_parameters = self.parse_type_parameters();
+        if type_parameters.is_some() || self.current.kind == SyntaxKind::OpenParenToken {
             let parameters = self.parse_parameter_list();
             let return_type = self.parse_optional_type_annotation();
             let body = if !signature_only && self.current.kind == SyntaxKind::OpenBraceToken {
@@ -1408,6 +1423,7 @@ impl<'a> Parser<'a> {
             let mut children = modifier_nodes.clone();
             children.extend(asterisk_token);
             children.push(name);
+            extend_list_children(&mut children, type_parameters.as_ref());
             children.extend(parameters.nodes.iter().copied());
             children.extend(return_type);
             children.extend(body);
@@ -1426,7 +1442,7 @@ impl<'a> Parser<'a> {
                     postfix_token: None,
                     symbol: None,
                     type_: return_type,
-                    type_parameters: None,
+                    type_parameters,
                     facts: 0,
                     modifiers: modifiers.clone(),
                     name,
@@ -1470,9 +1486,26 @@ impl<'a> Parser<'a> {
         }
         self.error_code_at(self.current.range, 1440, std::iter::empty::<String>());
         self.bump();
-        while self.current.kind.is_modifier() {
+        while self.current.kind.is_modifier() && !self.current_modifier_is_member_name() {
             modifier_nodes.push(self.consume_token_node());
         }
+    }
+
+    fn current_modifier_is_member_name(&mut self) -> bool {
+        if !self.current.kind.is_modifier() {
+            return false;
+        }
+        matches!(
+            self.next_token_kind(),
+            SyntaxKind::LessThanToken
+                | SyntaxKind::OpenParenToken
+                | SyntaxKind::QuestionToken
+                | SyntaxKind::ColonToken
+                | SyntaxKind::EqualsToken
+                | SyntaxKind::SemicolonToken
+                | SyntaxKind::CloseBraceToken
+                | SyntaxKind::EndOfFile
+        )
     }
 
     fn parse_class_accessor(
@@ -1591,7 +1624,9 @@ impl<'a> Parser<'a> {
     fn parse_type_member(&mut self) -> NodeId {
         let start = self.current.range.start;
         let mut modifier_nodes = Vec::new();
-        while self.current.kind == SyntaxKind::ReadonlyKeyword {
+        while self.current.kind == SyntaxKind::ReadonlyKeyword
+            && !self.current_modifier_is_member_name()
+        {
             modifier_nodes.push(self.consume_token_node());
         }
         let modifiers = (!modifier_nodes.is_empty()).then(|| ModifierList {
@@ -6641,6 +6676,201 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn parses_class_and_type_member_property_names() {
+        let source = r#"
+            declare class BaseClass {
+                static extends<A>(a: A): new () => A & BaseClass;
+                static<T>(): T;
+                async(): void;
+                "quoted"<T>(value: T): T;
+                0(): void;
+                [computed]<T>(value: T): T;
+                get value(): string;
+                set value(next: string);
+                get(): void;
+            }
+            interface Members {
+                readonly(): void;
+                readonly: string;
+                "quoted"<T>(value: T): T;
+                1: number;
+                [computed]<T>(value: T): T;
+                get value(): string;
+                set value(next: string);
+                get(): void;
+            }
+        "#;
+        let result = parse_source_file(source);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let statements = source_statements(&result);
+
+        let NodeData::ClassDeclaration(class) = &result.arena.get(statements[0]).unwrap().data
+        else {
+            panic!("expected class declaration");
+        };
+        assert_eq!(class.members.nodes.len(), 9);
+        let NodeData::MethodDeclaration(extends_method) =
+            &result.arena.get(class.members.nodes[0]).unwrap().data
+        else {
+            panic!("expected static generic method");
+        };
+        let NodeData::Identifier(extends_name) =
+            &result.arena.get(extends_method.name).unwrap().data
+        else {
+            panic!("expected keyword method name to be an identifier");
+        };
+        assert_eq!(extends_name.text, "extends");
+        assert_eq!(
+            extends_method
+                .modifiers
+                .as_ref()
+                .unwrap()
+                .list
+                .nodes
+                .iter()
+                .map(|modifier| result.arena.get(*modifier).unwrap().kind)
+                .collect::<Vec<_>>(),
+            [SyntaxKind::StaticKeyword]
+        );
+        let type_parameters = extends_method.type_parameters.as_ref().unwrap();
+        assert_eq!(type_parameters.nodes.len(), 1);
+        assert_eq!(
+            result.arena.get(type_parameters.nodes[0]).unwrap().parent,
+            Some(class.members.nodes[0])
+        );
+
+        let class_name_kinds = class.members.nodes[..6]
+            .iter()
+            .map(|member| match &result.arena.get(*member).unwrap().data {
+                NodeData::MethodDeclaration(method) => result.arena.get(method.name).unwrap().kind,
+                _ => panic!("expected method declaration"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            class_name_kinds,
+            [
+                SyntaxKind::Identifier,
+                SyntaxKind::Identifier,
+                SyntaxKind::Identifier,
+                SyntaxKind::StringLiteral,
+                SyntaxKind::NumericLiteral,
+                SyntaxKind::ComputedPropertyName,
+            ]
+        );
+        let NodeData::MethodDeclaration(static_name) =
+            &result.arena.get(class.members.nodes[1]).unwrap().data
+        else {
+            panic!("expected static-named method");
+        };
+        assert!(static_name.modifiers.is_none());
+        let NodeData::Identifier(static_name) = &result.arena.get(static_name.name).unwrap().data
+        else {
+            panic!("expected identifier name");
+        };
+        assert_eq!(static_name.text, "static");
+        assert!(matches!(
+            result.arena.get(class.members.nodes[6]).unwrap().data,
+            NodeData::GetAccessorDeclaration(_)
+        ));
+        assert!(matches!(
+            result.arena.get(class.members.nodes[7]).unwrap().data,
+            NodeData::SetAccessorDeclaration(_)
+        ));
+        let NodeData::MethodDeclaration(get_method) =
+            &result.arena.get(class.members.nodes[8]).unwrap().data
+        else {
+            panic!("expected get-named method");
+        };
+        assert_eq!(
+            result.arena.get(get_method.name).unwrap().kind,
+            SyntaxKind::Identifier
+        );
+
+        let NodeData::InterfaceDeclaration(interface) =
+            &result.arena.get(statements[1]).unwrap().data
+        else {
+            panic!("expected interface declaration");
+        };
+        assert_eq!(interface.members.nodes.len(), 8);
+        let NodeData::MethodSignatureDeclaration(readonly_method) =
+            &result.arena.get(interface.members.nodes[0]).unwrap().data
+        else {
+            panic!("expected readonly-named method");
+        };
+        assert!(readonly_method.modifiers.is_none());
+        let NodeData::PropertyDeclaration(readonly_property) =
+            &result.arena.get(interface.members.nodes[1]).unwrap().data
+        else {
+            panic!("expected readonly-named property");
+        };
+        assert!(readonly_property.modifiers.is_none());
+        assert_eq!(
+            interface.members.nodes[2..5]
+                .iter()
+                .map(|member| match &result.arena.get(*member).unwrap().data {
+                    NodeData::MethodSignatureDeclaration(method) => {
+                        result.arena.get(method.name).unwrap().kind
+                    }
+                    NodeData::PropertyDeclaration(property) => {
+                        result.arena.get(property.name).unwrap().kind
+                    }
+                    _ => panic!("expected named type member"),
+                })
+                .collect::<Vec<_>>(),
+            [
+                SyntaxKind::StringLiteral,
+                SyntaxKind::NumericLiteral,
+                SyntaxKind::ComputedPropertyName,
+            ]
+        );
+        assert!(matches!(
+            result.arena.get(interface.members.nodes[5]).unwrap().data,
+            NodeData::GetAccessorDeclaration(_)
+        ));
+        assert!(matches!(
+            result.arena.get(interface.members.nodes[6]).unwrap().data,
+            NodeData::SetAccessorDeclaration(_)
+        ));
+        assert!(matches!(
+            result.arena.get(interface.members.nodes[7]).unwrap().data,
+            NodeData::MethodSignatureDeclaration(_)
+        ));
+
+        let value_access = parse_source_file(
+            "const ExtendedClass = BaseClass.extends({ f: function() { return 'ok'; } }); const module = {}; module.exports = ExtendedClass;",
+        );
+        assert!(
+            value_access.diagnostics.is_empty(),
+            "{:?}",
+            value_access.diagnostics
+        );
+    }
+
+    #[test]
+    fn recovers_after_a_generic_class_method_missing_parameters() {
+        let result =
+            parse_source_file("class Broken { static extends<T>; \"after\"() {} } const done = 1;");
+        assert_eq!(result.diagnostics.len(), 1, "{:?}", result.diagnostics);
+        assert_eq!(result.diagnostics[0].code, Some(1005));
+        let statements = source_statements(&result);
+        assert_eq!(statements.len(), 2);
+        let NodeData::ClassDeclaration(class) = &result.arena.get(statements[0]).unwrap().data
+        else {
+            panic!("expected class declaration");
+        };
+        assert_eq!(class.members.nodes.len(), 2);
+        assert_eq!(
+            result.arena.get(class.members.nodes[1]).unwrap().kind,
+            SyntaxKind::MethodDeclaration
+        );
+        assert_eq!(
+            result.arena.get(statements[1]).unwrap().kind,
+            SyntaxKind::VariableStatement
+        );
     }
 
     #[test]
