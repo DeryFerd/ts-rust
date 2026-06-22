@@ -1,6 +1,6 @@
 //! Typed compiler option parsing and normalization.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ts_config::{JsonValue, ProjectConfig};
 use ts_diagnostics::{Diagnostic, message_by_code};
@@ -68,18 +68,39 @@ pub enum JsxEmit {
     ReactJsxDev,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ModuleDetectionKind {
+    Legacy,
+    #[default]
+    Auto,
+    Force,
+}
+
 /// Normalized compiler options consumed by compiler subsystems.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct CompilerOptions {
     pub allow_js: bool,
+    pub allow_synthetic_default_imports: bool,
     pub check_js: bool,
+    pub composite: bool,
     pub declaration: bool,
     pub declaration_map: bool,
     pub emit_declaration_only: bool,
+    pub es_module_interop: bool,
+    pub force_consistent_casing_in_file_names: bool,
+    pub isolated_modules: bool,
+    pub module_detection: ModuleDetectionKind,
     pub no_check: bool,
     pub no_emit: bool,
+    pub no_implicit_any: bool,
     pub no_lib: bool,
+    pub no_unused_locals: bool,
+    pub no_unused_parameters: bool,
+    pub skip_lib_check: bool,
+    pub strict: bool,
+    pub strict_null_checks: bool,
+    pub verbatim_module_syntax: bool,
     pub lib: Option<Vec<String>>,
     pub module: ModuleKind,
     pub module_resolution: ModuleResolutionKind,
@@ -88,6 +109,7 @@ pub struct CompilerOptions {
     pub resolve_json_module: bool,
     pub source_map: bool,
     pub inline_source_map: bool,
+    pub incremental: bool,
     pub out_dir: Option<String>,
     pub root_dir: Option<String>,
     pub declaration_dir: Option<String>,
@@ -95,19 +117,34 @@ pub struct CompilerOptions {
     pub base_url: Option<String>,
     pub paths: BTreeMap<String, Vec<String>>,
     pub root_dirs: Vec<String>,
+    pub type_roots: Option<Vec<String>>,
+    pub types: Option<Vec<String>>,
 }
 
 impl Default for CompilerOptions {
     fn default() -> Self {
         Self {
             allow_js: false,
+            allow_synthetic_default_imports: false,
             check_js: false,
+            composite: false,
             declaration: false,
             declaration_map: false,
             emit_declaration_only: false,
+            es_module_interop: false,
+            force_consistent_casing_in_file_names: false,
+            isolated_modules: false,
+            module_detection: ModuleDetectionKind::Auto,
             no_check: false,
             no_emit: false,
+            no_implicit_any: false,
             no_lib: false,
+            no_unused_locals: false,
+            no_unused_parameters: false,
+            skip_lib_check: false,
+            strict: false,
+            strict_null_checks: false,
+            verbatim_module_syntax: false,
             lib: None,
             module: ModuleKind::CommonJs,
             module_resolution: ModuleResolutionKind::Node10,
@@ -116,6 +153,7 @@ impl Default for CompilerOptions {
             resolve_json_module: false,
             source_map: false,
             inline_source_map: false,
+            incremental: false,
             out_dir: None,
             root_dir: None,
             declaration_dir: None,
@@ -123,6 +161,8 @@ impl Default for CompilerOptions {
             base_url: None,
             paths: BTreeMap::new(),
             root_dirs: Vec::new(),
+            type_roots: None,
+            types: None,
         }
     }
 }
@@ -155,6 +195,71 @@ impl ParseOptionsResult {
 }
 
 impl CompilerOptions {
+    pub fn apply_overrides(&mut self, overrides: &Self, names: &BTreeSet<String>) {
+        for name in names {
+            match name.as_str() {
+                "allowjs" => self.allow_js = overrides.allow_js,
+                "allowsyntheticdefaultimports" => {
+                    self.allow_synthetic_default_imports =
+                        overrides.allow_synthetic_default_imports;
+                }
+                "checkjs" => {
+                    self.check_js = overrides.check_js;
+                    if !names.contains("allowjs") {
+                        self.allow_js = overrides.allow_js;
+                    }
+                }
+                "declaration" => self.declaration = overrides.declaration,
+                "esmoduleinterop" => {
+                    self.es_module_interop = overrides.es_module_interop;
+                    if !names.contains("allowsyntheticdefaultimports") {
+                        self.allow_synthetic_default_imports =
+                            overrides.allow_synthetic_default_imports;
+                    }
+                }
+                "forceconsistentcasinginfilenames" => {
+                    self.force_consistent_casing_in_file_names =
+                        overrides.force_consistent_casing_in_file_names;
+                }
+                "isolatedmodules" => self.isolated_modules = overrides.isolated_modules,
+                "jsx" => self.jsx = overrides.jsx,
+                "module" => {
+                    self.module = overrides.module;
+                    if !names.contains("moduleresolution") {
+                        self.module_resolution = overrides.module_resolution;
+                    }
+                }
+                "moduledetection" => self.module_detection = overrides.module_detection,
+                "moduleresolution" => self.module_resolution = overrides.module_resolution,
+                "nocheck" => self.no_check = overrides.no_check,
+                "noemit" => self.no_emit = overrides.no_emit,
+                "noimplicitany" => self.no_implicit_any = overrides.no_implicit_any,
+                "nolib" => self.no_lib = overrides.no_lib,
+                "nounusedlocals" => self.no_unused_locals = overrides.no_unused_locals,
+                "nounusedparameters" => self.no_unused_parameters = overrides.no_unused_parameters,
+                "outdir" => self.out_dir.clone_from(&overrides.out_dir),
+                "rootdir" => self.root_dir.clone_from(&overrides.root_dir),
+                "skiplibcheck" => self.skip_lib_check = overrides.skip_lib_check,
+                "sourcemap" => self.source_map = overrides.source_map,
+                "strict" => {
+                    self.strict = overrides.strict;
+                    if !names.contains("noimplicitany") {
+                        self.no_implicit_any = overrides.no_implicit_any;
+                    }
+                    if !names.contains("strictnullchecks") {
+                        self.strict_null_checks = overrides.strict_null_checks;
+                    }
+                }
+                "strictnullchecks" => self.strict_null_checks = overrides.strict_null_checks,
+                "target" => self.target = overrides.target,
+                "verbatimmodulesyntax" => {
+                    self.verbatim_module_syntax = overrides.verbatim_module_syntax;
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Converts these options to the module resolver's settings.
     #[must_use]
     pub fn module_resolution_options(&self) -> ResolutionOptions {
@@ -172,6 +277,8 @@ impl CompilerOptions {
             base_url: self.base_url.clone(),
             paths: self.paths.clone(),
             root_dirs: self.root_dirs.clone(),
+            type_roots: self.type_roots.clone(),
+            types: self.types.clone(),
         }
     }
 
@@ -219,6 +326,13 @@ pub fn parse_project_options(config: &ProjectConfig) -> ParseOptionsResult {
             *root_dir = ts_path::resolve_path(directory, &[root_dir]);
         }
     }
+    if let Some(type_roots) = &mut result.options.type_roots {
+        for type_root in type_roots {
+            if !ts_path::is_absolute(type_root) {
+                *type_root = ts_path::resolve_path(directory, &[type_root]);
+            }
+        }
+    }
     for path in [
         &mut result.options.out_dir,
         &mut result.options.root_dir,
@@ -243,7 +357,12 @@ pub fn parse_compiler_options_map(options: &BTreeMap<String, JsonValue>) -> Pars
         let name = original_name.to_ascii_lowercase();
         match name.as_str() {
             "allowjs" => parsed.allow_js = boolean(original_name, value, &mut diagnostics),
+            "allowsyntheticdefaultimports" => {
+                parsed.allow_synthetic_default_imports =
+                    boolean(original_name, value, &mut diagnostics);
+            }
             "checkjs" => parsed.check_js = boolean(original_name, value, &mut diagnostics),
+            "composite" => parsed.composite = boolean(original_name, value, &mut diagnostics),
             "declaration" => {
                 parsed.declaration = boolean(original_name, value, &mut diagnostics);
             }
@@ -253,9 +372,42 @@ pub fn parse_compiler_options_map(options: &BTreeMap<String, JsonValue>) -> Pars
             "emitdeclarationonly" => {
                 parsed.emit_declaration_only = boolean(original_name, value, &mut diagnostics);
             }
+            "esmoduleinterop" => {
+                parsed.es_module_interop = boolean(original_name, value, &mut diagnostics);
+            }
+            "forceconsistentcasinginfilenames" => {
+                parsed.force_consistent_casing_in_file_names =
+                    boolean(original_name, value, &mut diagnostics);
+            }
+            "isolatedmodules" => {
+                parsed.isolated_modules = boolean(original_name, value, &mut diagnostics);
+            }
+            "moduledetection" => {
+                parsed.module_detection =
+                    enum_value(original_name, value, &mut diagnostics, module_detection);
+            }
             "nocheck" => parsed.no_check = boolean(original_name, value, &mut diagnostics),
             "noemit" => parsed.no_emit = boolean(original_name, value, &mut diagnostics),
+            "noimplicitany" => {
+                parsed.no_implicit_any = boolean(original_name, value, &mut diagnostics);
+            }
             "nolib" => parsed.no_lib = boolean(original_name, value, &mut diagnostics),
+            "nounusedlocals" => {
+                parsed.no_unused_locals = boolean(original_name, value, &mut diagnostics);
+            }
+            "nounusedparameters" => {
+                parsed.no_unused_parameters = boolean(original_name, value, &mut diagnostics);
+            }
+            "skiplibcheck" => {
+                parsed.skip_lib_check = boolean(original_name, value, &mut diagnostics);
+            }
+            "strict" => parsed.strict = boolean(original_name, value, &mut diagnostics),
+            "strictnullchecks" => {
+                parsed.strict_null_checks = boolean(original_name, value, &mut diagnostics);
+            }
+            "verbatimmodulesyntax" => {
+                parsed.verbatim_module_syntax = boolean(original_name, value, &mut diagnostics);
+            }
             "lib" => parsed.lib = string_array(original_name, value, &mut diagnostics),
             "resolvejsonmodule" => {
                 parsed.resolve_json_module = boolean(original_name, value, &mut diagnostics);
@@ -264,6 +416,7 @@ pub fn parse_compiler_options_map(options: &BTreeMap<String, JsonValue>) -> Pars
             "inlinesourcemap" => {
                 parsed.inline_source_map = boolean(original_name, value, &mut diagnostics);
             }
+            "incremental" => parsed.incremental = boolean(original_name, value, &mut diagnostics),
             "outdir" => parsed.out_dir = string(original_name, value, &mut diagnostics),
             "rootdir" => parsed.root_dir = string(original_name, value, &mut diagnostics),
             "declarationdir" => {
@@ -275,6 +428,10 @@ pub fn parse_compiler_options_map(options: &BTreeMap<String, JsonValue>) -> Pars
             "baseurl" => parsed.base_url = string(original_name, value, &mut diagnostics),
             "paths" => parsed.paths = paths(original_name, value, &mut diagnostics),
             "rootdirs" => parsed.root_dirs = string_array(original_name, value, &mut diagnostics),
+            "typeroots" => {
+                parsed.type_roots = string_array(original_name, value, &mut diagnostics);
+            }
+            "types" => parsed.types = string_array(original_name, value, &mut diagnostics),
             "module" => parsed.module = enum_value(original_name, value, &mut diagnostics, module),
             "moduleresolution" => {
                 parsed.module_resolution =
@@ -295,13 +452,26 @@ pub fn parse_compiler_options_map(options: &BTreeMap<String, JsonValue>) -> Pars
 #[derive(Default)]
 struct PartialOptions {
     allow_js: Option<bool>,
+    allow_synthetic_default_imports: Option<bool>,
     check_js: Option<bool>,
+    composite: Option<bool>,
     declaration: Option<bool>,
     declaration_map: Option<bool>,
     emit_declaration_only: Option<bool>,
+    es_module_interop: Option<bool>,
+    force_consistent_casing_in_file_names: Option<bool>,
+    isolated_modules: Option<bool>,
+    module_detection: Option<ModuleDetectionKind>,
     no_check: Option<bool>,
     no_emit: Option<bool>,
+    no_implicit_any: Option<bool>,
     no_lib: Option<bool>,
+    no_unused_locals: Option<bool>,
+    no_unused_parameters: Option<bool>,
+    skip_lib_check: Option<bool>,
+    strict: Option<bool>,
+    strict_null_checks: Option<bool>,
+    verbatim_module_syntax: Option<bool>,
     lib: Option<Vec<String>>,
     module: Option<ModuleKind>,
     module_resolution: Option<ModuleResolutionKind>,
@@ -310,6 +480,7 @@ struct PartialOptions {
     resolve_json_module: Option<bool>,
     source_map: Option<bool>,
     inline_source_map: Option<bool>,
+    incremental: Option<bool>,
     out_dir: Option<String>,
     root_dir: Option<String>,
     declaration_dir: Option<String>,
@@ -317,32 +488,57 @@ struct PartialOptions {
     base_url: Option<String>,
     paths: Option<BTreeMap<String, Vec<String>>>,
     root_dirs: Option<Vec<String>>,
+    type_roots: Option<Vec<String>>,
+    types: Option<Vec<String>>,
 }
 
 impl PartialOptions {
     fn normalize(self) -> CompilerOptions {
         let check_js = self.check_js.unwrap_or(false);
+        let strict = self.strict.unwrap_or(false);
         let emit_declaration_only = self.emit_declaration_only.unwrap_or(false);
         let module = self.module.unwrap_or_default();
+        let module_resolution = self
+            .module_resolution
+            .unwrap_or_else(|| default_module_resolution(module));
+        let es_module_interop = self.es_module_interop.unwrap_or(false);
         CompilerOptions {
             allow_js: self.allow_js.unwrap_or(check_js),
+            allow_synthetic_default_imports: self.allow_synthetic_default_imports.unwrap_or(
+                es_module_interop
+                    || module == ModuleKind::System
+                    || module_resolution == ModuleResolutionKind::Bundler,
+            ),
             check_js,
+            composite: self.composite.unwrap_or(false),
             declaration: self.declaration.unwrap_or(emit_declaration_only),
             declaration_map: self.declaration_map.unwrap_or(false),
             emit_declaration_only,
+            es_module_interop,
+            force_consistent_casing_in_file_names: self
+                .force_consistent_casing_in_file_names
+                .unwrap_or(false),
+            isolated_modules: self.isolated_modules.unwrap_or(false),
+            module_detection: self.module_detection.unwrap_or_default(),
             no_check: self.no_check.unwrap_or(false),
             no_emit: self.no_emit.unwrap_or(false),
+            no_implicit_any: self.no_implicit_any.unwrap_or(strict),
             no_lib: self.no_lib.unwrap_or(false),
+            no_unused_locals: self.no_unused_locals.unwrap_or(false),
+            no_unused_parameters: self.no_unused_parameters.unwrap_or(false),
+            skip_lib_check: self.skip_lib_check.unwrap_or(false),
+            strict,
+            strict_null_checks: self.strict_null_checks.unwrap_or(strict),
+            verbatim_module_syntax: self.verbatim_module_syntax.unwrap_or(false),
             lib: self.lib,
             module,
-            module_resolution: self
-                .module_resolution
-                .unwrap_or_else(|| default_module_resolution(module)),
+            module_resolution,
             target: self.target.unwrap_or_default(),
             jsx: self.jsx.unwrap_or_default(),
             resolve_json_module: self.resolve_json_module.unwrap_or(false),
             source_map: self.source_map.unwrap_or(false),
             inline_source_map: self.inline_source_map.unwrap_or(false),
+            incremental: self.incremental.unwrap_or(false),
             out_dir: self.out_dir,
             root_dir: self.root_dir,
             declaration_dir: self.declaration_dir,
@@ -350,6 +546,8 @@ impl PartialOptions {
             base_url: self.base_url,
             paths: self.paths.unwrap_or_default(),
             root_dirs: self.root_dirs.unwrap_or_default(),
+            type_roots: self.type_roots,
+            types: self.types,
         }
     }
 }
@@ -545,6 +743,15 @@ fn module_resolution(value: &str) -> Option<ModuleResolutionKind> {
     })
 }
 
+fn module_detection(value: &str) -> Option<ModuleDetectionKind> {
+    Some(match value.to_ascii_lowercase().as_str() {
+        "legacy" => ModuleDetectionKind::Legacy,
+        "auto" => ModuleDetectionKind::Auto,
+        "force" => ModuleDetectionKind::Force,
+        _ => return None,
+    })
+}
+
 fn target(value: &str) -> Option<ScriptTarget> {
     Some(match value.to_ascii_lowercase().as_str() {
         "es3" => ScriptTarget::Es3,
@@ -582,6 +789,7 @@ fn allowed_values(name: &str) -> &'static str {
             "'none', 'commonjs', 'amd', 'umd', 'system', 'es2015', 'es2020', 'es2022', 'esnext', 'node16', 'node18', 'node20', 'nodenext', 'preserve'"
         }
         "moduleresolution" => "'classic', 'node10', 'node16', 'nodenext', 'bundler'",
+        "moduledetection" => "'legacy', 'auto', 'force'",
         "target" => {
             "'es3', 'es5', 'es2015', 'es2016', 'es2017', 'es2018', 'es2019', 'es2020', 'es2021', 'es2022', 'es2023', 'es2024', 'esnext'"
         }
@@ -603,8 +811,8 @@ mod tests {
     use ts_module::{ResolutionMode, ResolutionOptions};
 
     use super::{
-        CompilerOptions, JsxEmit, ModuleKind, ModuleResolutionKind, ScriptTarget,
-        parse_compiler_options, parse_project_options,
+        CompilerOptions, JsxEmit, ModuleDetectionKind, ModuleKind, ModuleResolutionKind,
+        ScriptTarget, parse_compiler_options, parse_project_options,
     };
 
     fn object(entries: impl IntoIterator<Item = (&'static str, JsonValue)>) -> JsonValue {
@@ -637,11 +845,15 @@ mod tests {
     fn applies_boolean_implications_and_emission_settings() {
         let result = parse_compiler_options(&object([
             ("checkJs", JsonValue::Bool(true)),
+            ("composite", JsonValue::Bool(true)),
             ("emitDeclarationOnly", JsonValue::Bool(true)),
+            ("incremental", JsonValue::Bool(true)),
             ("noCheck", JsonValue::Bool(true)),
         ]));
         assert!(result.options.allow_js);
         assert!(result.options.declaration);
+        assert!(result.options.composite);
+        assert!(result.options.incremental);
         assert!(result.options.no_check);
         let settings = result.options.printer_settings();
         assert!(!settings.emit_javascript);
@@ -655,6 +867,35 @@ mod tests {
         .printer_settings();
         assert!(!no_emit.emit_javascript);
         assert!(!no_emit.emit_declarations);
+    }
+
+    #[test]
+    fn normalizes_strict_and_interoperability_options() {
+        let result = parse_compiler_options(&object([
+            ("strict", JsonValue::Bool(true)),
+            ("strictNullChecks", JsonValue::Bool(false)),
+            ("esModuleInterop", JsonValue::Bool(true)),
+            ("noUnusedLocals", JsonValue::Bool(true)),
+            ("noUnusedParameters", JsonValue::Bool(true)),
+            ("skipLibCheck", JsonValue::Bool(true)),
+            ("verbatimModuleSyntax", JsonValue::Bool(true)),
+            ("isolatedModules", JsonValue::Bool(true)),
+            ("forceConsistentCasingInFileNames", JsonValue::Bool(true)),
+            ("moduleDetection", JsonValue::String("force".into())),
+        ]));
+        assert!(result.is_ok());
+        assert!(result.options.strict);
+        assert!(result.options.no_implicit_any);
+        assert!(!result.options.strict_null_checks);
+        assert!(result.options.es_module_interop);
+        assert!(result.options.allow_synthetic_default_imports);
+        assert!(result.options.no_unused_locals);
+        assert!(result.options.no_unused_parameters);
+        assert!(result.options.skip_lib_check);
+        assert!(result.options.verbatim_module_syntax);
+        assert!(result.options.isolated_modules);
+        assert!(result.options.force_consistent_casing_in_file_names);
+        assert_eq!(result.options.module_detection, ModuleDetectionKind::Force);
     }
 
     #[test]
@@ -680,7 +921,7 @@ mod tests {
     fn parses_project_config_and_converts_resolution_settings() {
         let config = parse_config_text(
             "/repo/tsconfig.json",
-            r#"{"compilerOptions":{"allowJs":true,"resolveJsonModule":true,"moduleResolution":"Bundler","baseUrl":".","paths":{"@app/*":["src/*"]},"rootDirs":["src","generated"]}}"#,
+            r#"{"compilerOptions":{"allowJs":true,"resolveJsonModule":true,"moduleResolution":"Bundler","baseUrl":".","paths":{"@app/*":["src/*"]},"rootDirs":["src","generated"],"typeRoots":["types","/shared/types"],"types":["node","jest"]}}"#,
         )
         .value
         .unwrap();
@@ -694,6 +935,8 @@ mod tests {
                 base_url: Some("/repo".into()),
                 paths: BTreeMap::from([("@app/*".into(), vec!["src/*".into()])]),
                 root_dirs: vec!["/repo/src".into(), "/repo/generated".into()],
+                type_roots: Some(vec!["/repo/types".into(), "/shared/types".into()]),
+                types: Some(vec!["node".into(), "jest".into()]),
                 ..ResolutionOptions::default()
             }
         );

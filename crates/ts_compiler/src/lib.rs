@@ -1,6 +1,6 @@
 //! Compiler Program and source-file graph foundations.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ts_ast::{NodeData, NodeId};
 use ts_binder::{BindResult, bind_source_file};
@@ -197,6 +197,31 @@ impl Program {
         config_path: &str,
         overrides: ProgramOptionsOverride,
     ) -> Self {
+        Self::from_config_with_overrides(file_system, config_path, overrides, None)
+    }
+
+    #[must_use]
+    pub fn from_config_with_command_line_options(
+        file_system: &dyn FileSystem,
+        config_path: &str,
+        overrides: ProgramOptionsOverride,
+        command_line_options: &CompilerOptions,
+        specified_options: &BTreeSet<String>,
+    ) -> Self {
+        Self::from_config_with_overrides(
+            file_system,
+            config_path,
+            overrides,
+            Some((command_line_options, specified_options)),
+        )
+    }
+
+    fn from_config_with_overrides(
+        file_system: &dyn FileSystem,
+        config_path: &str,
+        overrides: ProgramOptionsOverride,
+        command_line: Option<(&CompilerOptions, &BTreeSet<String>)>,
+    ) -> Self {
         let parsed = resolve_config_file(file_system, config_path);
         let mut config_diagnostics: Vec<_> =
             parsed.diagnostics.iter().map(config_diagnostic).collect();
@@ -232,6 +257,11 @@ impl Program {
             if value {
                 options_result.options.lib = None;
             }
+        }
+        if let Some((command_line_options, specified_options)) = command_line {
+            options_result
+                .options
+                .apply_overrides(command_line_options, specified_options);
         }
         let mut discovery = DiscoveryOptions::new(config_directory);
         discovery.files = config.files.unwrap_or_default();

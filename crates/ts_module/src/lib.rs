@@ -1,6 +1,9 @@
 //! Foundational TypeScript module resolution.
 
-use std::collections::BTreeMap;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{PoisonError, RwLock},
+};
 
 use serde_json::Value;
 use ts_path::{FileExtension, is_absolute, is_relative, normalize_path, resolve_path, root_length};
@@ -26,6 +29,8 @@ pub struct ResolutionOptions {
     pub base_url: Option<String>,
     pub paths: BTreeMap<String, Vec<String>>,
     pub root_dirs: Vec<String>,
+    pub type_roots: Option<Vec<String>>,
+    pub types: Option<Vec<String>>,
 }
 
 impl Default for ResolutionOptions {
@@ -38,6 +43,8 @@ impl Default for ResolutionOptions {
             base_url: None,
             paths: BTreeMap::new(),
             root_dirs: Vec::new(),
+            type_roots: None,
+            types: None,
         }
     }
 }
@@ -77,19 +84,23 @@ pub struct PackageJson {
     pub package_type: Option<String>,
     pub exports: Option<Value>,
     pub types_versions: Option<Value>,
+    pub name: Option<String>,
+    pub imports: Option<Value>,
 }
 
 pub struct Resolver<'a, F: FileSystem + ?Sized> {
     file_system: &'a F,
     options: ResolutionOptions,
+    cache: RwLock<BTreeMap<(String, String), ResolutionResult>>,
 }
 
 impl<'a, F: FileSystem + ?Sized> Resolver<'a, F> {
     #[must_use]
-    pub const fn new(file_system: &'a F, options: ResolutionOptions) -> Self {
+    pub fn new(file_system: &'a F, options: ResolutionOptions) -> Self {
         Self {
             file_system,
             options,
+            cache: RwLock::new(BTreeMap::new()),
         }
     }
 
@@ -100,6 +111,15 @@ impl<'a, F: FileSystem + ?Sized> Resolver<'a, F> {
 
     #[must_use]
     pub fn resolve(&self, specifier: &str, containing_file: &str) -> ResolutionResult {
+        let key = (specifier.to_owned(), normalize_path(containing_file));
+        if let Some(cached) = self
+            .cache
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&key)
+        {
+            return cached.clone();
+        }
         let mut state = ResolutionState {
             resolver: self,
             failed_lookups: Vec::new(),
@@ -119,12 +139,26 @@ impl<'a, F: FileSystem + ?Sized> Resolver<'a, F> {
         } else {
             state
                 .resolve_paths_or_base_url(specifier)
+                .or_else(|| state.resolve_package_imports_or_self(specifier, &containing_directory))
                 .or_else(|| state.resolve_node_modules(specifier, &containing_directory))
+                .or_else(|| state.resolve_from_type_roots(specifier, &containing_directory))
         };
-        ResolutionResult {
+        let result = ResolutionResult {
             resolved,
             failed_lookups: state.failed_lookups,
-        }
+        };
+        self.cache
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(key, result.clone());
+        result
+    }
+
+    pub fn clear_cache(&self) {
+        self.cache
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
     }
 }
 
@@ -192,6 +226,70 @@ impl<F: FileSystem + ?Sized> ResolutionState<'_, '_, F> {
         None
     }
 
+    fn resolve_package_imports_or_self(
+        &mut self,
+        specifier: &str,
+        containing_directory: &str,
+    ) -> Option<ResolvedModule> {
+        if !matches!(
+            self.resolver.options.mode,
+            ResolutionMode::Node16 | ResolutionMode::NodeNext | ResolutionMode::Bundler
+        ) {
+            return None;
+        }
+        if specifier == "#"
+            || (self.resolver.options.mode == ResolutionMode::Node16 && specifier.starts_with("#/"))
+        {
+            return None;
+        }
+        for ancestor in ancestors(containing_directory) {
+            let package_json_path = join(&ancestor, "package.json");
+            if !self.resolver.file_system.file_exists(&package_json_path) {
+                continue;
+            }
+            let package = self.read_package_json(&package_json_path)?;
+            let target = if specifier.starts_with('#') {
+                package.imports.as_ref().and_then(|imports| {
+                    package_map_target(imports, specifier, self.resolver.options.prefer_types)
+                })
+            } else {
+                let name = package.name.as_deref()?;
+                let rest = specifier
+                    .strip_prefix(name)
+                    .filter(|rest| rest.is_empty() || rest.starts_with('/'))?;
+                let key = if rest.is_empty() {
+                    ".".to_owned()
+                } else {
+                    format!(".{rest}")
+                };
+                package.exports.as_ref().and_then(|exports| {
+                    package_export_target(exports, &key, self.resolver.options.prefer_types)
+                })
+            }?;
+            if target.starts_with("./") {
+                let candidate = resolve_path(&ancestor, &[target.trim_start_matches("./")]);
+                return self.resolve_candidate_with_package(&candidate, &package_json_path);
+            }
+            return self.resolve_node_modules(&target, &ancestor);
+        }
+        None
+    }
+
+    fn resolve_from_type_roots(
+        &mut self,
+        specifier: &str,
+        containing_directory: &str,
+    ) -> Option<ResolvedModule> {
+        for root in effective_type_roots(&self.resolver.options, containing_directory) {
+            let candidate = resolve_path(&root, &[specifier]);
+            if let Some(mut resolved) = self.resolve_candidate(&candidate, true) {
+                resolved.is_external_library_import = true;
+                return Some(resolved);
+            }
+        }
+        None
+    }
+
     fn resolve_node_modules(
         &mut self,
         specifier: &str,
@@ -209,6 +307,33 @@ impl<F: FileSystem + ?Sized> ResolutionState<'_, '_, F> {
                 PackageMetadataResolution::Blocked => return None,
                 PackageMetadataResolution::NotApplicable => {}
             }
+            let candidate = if rest.is_empty() {
+                package_directory
+            } else {
+                join(&package_directory, rest)
+            };
+            if let Some(mut resolved) = self.resolve_candidate(&candidate, true) {
+                resolved.is_external_library_import = true;
+                return Some(resolved);
+            }
+        }
+        if let Some(types_name) = types_package_name(specifier) {
+            return self.resolve_node_modules_types(&types_name, containing_directory);
+        }
+        None
+    }
+
+    fn resolve_node_modules_types(
+        &mut self,
+        specifier: &str,
+        containing_directory: &str,
+    ) -> Option<ResolvedModule> {
+        let (package_name, rest) = parse_package_name(specifier)?;
+        for ancestor in ancestors(containing_directory) {
+            if ancestor.ends_with("/node_modules") {
+                continue;
+            }
+            let package_directory = join(&join(&ancestor, "node_modules"), package_name);
             let candidate = if rest.is_empty() {
                 package_directory
             } else {
@@ -428,6 +553,8 @@ pub fn parse_package_json(contents: &str) -> serde_json::Result<PackageJson> {
         package_type: string_field(&value, "type"),
         exports: value.get("exports").cloned(),
         types_versions: value.get("typesVersions").cloned(),
+        name: string_field(&value, "name"),
+        imports: value.get("imports").cloned(),
     })
 }
 
@@ -489,6 +616,92 @@ fn package_export_target(exports: &Value, key: &str, prefer_types: bool) -> Opti
         .map(str::to_owned)
 }
 
+fn package_map_target(map: &Value, key: &str, prefer_types: bool) -> Option<String> {
+    let object = map.as_object()?;
+    if let Some(value) = object.get(key) {
+        return select_export_condition(value, prefer_types).map(str::to_owned);
+    }
+    let (value, capture) = wildcard_export(object, key)?;
+    select_export_condition(value, prefer_types).map(|target| target.replace('*', &capture))
+}
+
+fn types_package_name(specifier: &str) -> Option<String> {
+    if specifier.starts_with("@types/") || specifier.starts_with('#') {
+        return None;
+    }
+    let (package, rest) = parse_package_name(specifier)?;
+    let package = package
+        .strip_prefix('@')
+        .map_or_else(|| package.to_owned(), |name| name.replace('/', "__"));
+    Some(if rest.is_empty() {
+        format!("@types/{package}")
+    } else {
+        format!("@types/{package}/{rest}")
+    })
+}
+
+/// Returns explicit type roots or ancestor `node_modules/@types` directories.
+#[must_use]
+pub fn effective_type_roots(options: &ResolutionOptions, current_directory: &str) -> Vec<String> {
+    options.type_roots.clone().unwrap_or_else(|| {
+        ancestors(current_directory)
+            .into_iter()
+            .map(|directory| join(&join(&directory, "node_modules"), "@types"))
+            .collect()
+    })
+}
+
+/// Lists automatic type directive package names in stable order.
+#[must_use]
+pub fn automatic_type_directive_names(
+    file_system: &dyn FileSystem,
+    options: &ResolutionOptions,
+    current_directory: &str,
+) -> Vec<String> {
+    if let Some(types) = &options.types
+        && !types.iter().any(|name| name == "*")
+    {
+        return types.clone();
+    }
+    let mut installed = Vec::new();
+    let mut seen = BTreeSet::new();
+    for root in effective_type_roots(options, current_directory) {
+        if let Ok(entries) = file_system.read_directory(&root) {
+            for name in entries.directories {
+                let package_json = join(&join(&root, &name), "package.json");
+                let is_not_needed = file_system
+                    .read_file(&package_json)
+                    .ok()
+                    .and_then(|contents| serde_json::from_str::<Value>(&contents).ok())
+                    .is_some_and(|package| package.get("typings").is_some_and(Value::is_null));
+                if !name.starts_with('.') && !is_not_needed && seen.insert(name.clone()) {
+                    installed.push(name);
+                }
+            }
+        }
+    }
+    let names = options.types.as_ref().map_or_else(
+        || installed.clone(),
+        |types| {
+            types
+                .iter()
+                .flat_map(|name| {
+                    if name == "*" {
+                        installed.clone()
+                    } else {
+                        vec![name.clone()]
+                    }
+                })
+                .collect()
+        },
+    );
+    let mut seen = BTreeSet::new();
+    names
+        .into_iter()
+        .filter(|name| seen.insert(name.clone()))
+        .collect()
+}
+
 fn wildcard_export<'a>(
     exports: &'a serde_json::Map<String, Value>,
     key: &str,
@@ -505,6 +718,11 @@ fn wildcard_export<'a>(
 fn select_export_condition(value: &Value, prefer_types: bool) -> Option<&str> {
     if let Some(target) = value.as_str() {
         return Some(target);
+    }
+    if let Some(targets) = value.as_array() {
+        return targets
+            .iter()
+            .find_map(|target| select_export_condition(target, prefer_types));
     }
     let object = value.as_object()?;
     let conditions: &[&str] = if prefer_types {
@@ -557,6 +775,9 @@ fn source_extension(path: &str) -> Option<&'static str> {
 }
 
 fn parse_package_name(specifier: &str) -> Option<(&str, &str)> {
+    if specifier.starts_with('#') {
+        return None;
+    }
     if let Some(scoped) = specifier.strip_prefix('@') {
         let first_slash = scoped.find('/')? + 1;
         let after_scope = &specifier[first_slash + 1..];
@@ -859,6 +1080,154 @@ mod tests {
         assert_eq!(
             resolved.package_json.as_deref(),
             Some("/app/node_modules/pkg/package.json")
+        );
+    }
+
+    #[test]
+    fn node16_resolves_package_imports_and_patterns() {
+        let fs = fs(&[
+            (
+                "/repo/package.json",
+                r##"{"imports":{"#core":{"types":"./types/core.d.ts"},"#features/*":"./types/features/*.d.ts"}}"##,
+            ),
+            ("/repo/types/core.d.ts", ""),
+            ("/repo/types/features/tool.d.ts", ""),
+        ]);
+        let resolver = Resolver::new(
+            &fs,
+            ResolutionOptions {
+                mode: ResolutionMode::Node16,
+                ..ResolutionOptions::default()
+            },
+        );
+        assert_eq!(
+            resolver
+                .resolve("#core", "/repo/src/main.ts")
+                .resolved
+                .unwrap()
+                .resolved_file_name,
+            "/repo/types/core.d.ts"
+        );
+        assert_eq!(
+            resolver
+                .resolve("#features/tool", "/repo/src/main.ts")
+                .resolved
+                .unwrap()
+                .resolved_file_name,
+            "/repo/types/features/tool.d.ts"
+        );
+    }
+
+    #[test]
+    fn nodenext_resolves_package_self_name_exports() {
+        let fs = fs(&[
+            (
+                "/repo/package.json",
+                r#"{"name":"workspace-pkg","exports":{".":{"types":"./types/index.d.ts"},"./feature":"./types/feature.d.ts"}}"#,
+            ),
+            ("/repo/types/index.d.ts", ""),
+            ("/repo/types/feature.d.ts", ""),
+        ]);
+        let resolver = Resolver::new(
+            &fs,
+            ResolutionOptions {
+                mode: ResolutionMode::NodeNext,
+                ..ResolutionOptions::default()
+            },
+        );
+        assert_eq!(
+            resolver
+                .resolve("workspace-pkg/feature", "/repo/src/main.ts")
+                .resolved
+                .unwrap()
+                .resolved_file_name,
+            "/repo/types/feature.d.ts"
+        );
+    }
+
+    #[test]
+    fn bundler_falls_back_to_at_types_and_custom_type_roots() {
+        let fs = fs(&[
+            (
+                "/app/node_modules/pkg/package.json",
+                r#"{"main":"index.js"}"#,
+            ),
+            ("/app/node_modules/pkg/index.js", ""),
+            ("/app/node_modules/@types/pkg/index.d.ts", ""),
+            ("/custom/types/ambient/index.d.ts", ""),
+        ]);
+        let resolver = Resolver::new(
+            &fs,
+            ResolutionOptions {
+                mode: ResolutionMode::Bundler,
+                allow_javascript: false,
+                type_roots: Some(vec!["/custom/types".into()]),
+                ..ResolutionOptions::default()
+            },
+        );
+        assert_eq!(
+            resolver
+                .resolve("pkg", "/app/src/main.ts")
+                .resolved
+                .unwrap()
+                .resolved_file_name,
+            "/app/node_modules/@types/pkg/index.d.ts"
+        );
+        assert_eq!(
+            resolver
+                .resolve("ambient", "/app/src/main.ts")
+                .resolved
+                .unwrap()
+                .resolved_file_name,
+            "/custom/types/ambient/index.d.ts"
+        );
+    }
+
+    #[test]
+    fn discovers_automatic_types_and_caches_resolution_results() {
+        let fs = fs(&[
+            ("/repo/node_modules/@types/node/index.d.ts", ""),
+            ("/repo/node_modules/@types/jest/index.d.ts", ""),
+            (
+                "/repo/node_modules/@types/obsolete/package.json",
+                r#"{"typings":null}"#,
+            ),
+        ]);
+        let options = ResolutionOptions::default();
+        assert_eq!(
+            automatic_type_directive_names(&fs, &options, "/repo/src"),
+            ["jest", "node"]
+        );
+        let selected = ResolutionOptions {
+            types: Some(vec!["custom".into(), "*".into(), "node".into()]),
+            ..ResolutionOptions::default()
+        };
+        assert_eq!(
+            automatic_type_directive_names(&fs, &selected, "/repo/src"),
+            ["custom", "jest", "node"]
+        );
+        let resolver = Resolver::new(&fs, options);
+        assert!(
+            resolver
+                .resolve("./later", "/repo/src/main.ts")
+                .resolved
+                .is_none()
+        );
+        fs.write_file("/repo/src/later.ts", "").unwrap();
+        assert!(
+            resolver
+                .resolve("./later", "/repo/src/main.ts")
+                .resolved
+                .is_none()
+        );
+        resolver.clear_cache();
+        assert_eq!(
+            resolver
+                .resolve("./later", "/repo/src/main.ts")
+                .resolved
+                .unwrap()
+                .resolved_file_name,
+            "/repo/src/later.ts"
         );
     }
 }
