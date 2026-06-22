@@ -1480,6 +1480,59 @@ mod tests {
     }
 
     #[test]
+    fn matches_allow_js_out_dir_outputs_across_module_variants() {
+        let case = Case::parse(
+            "ambientRequireFunction.ts",
+            concat!(
+                "// @target: es2015\n",
+                "// @module: commonjs, preserve\n",
+                "// @allowJs: true\n",
+                "// @outDir: ./out/\n",
+                "// @noLib: true\n",
+                "// @filename: node.d.ts\n",
+                "declare function require(moduleName: string): any;\n",
+                "declare module \"fs\" {\n",
+                "    export function readFileSync(s: string): string;\n",
+                "}\n",
+                "// @filename: app.js\n",
+                "/// <reference path=\"node.d.ts\"/>\n",
+                "const fs = require(\"fs\");\n",
+                "const text = fs.readFileSync(\"/a/b/c\");\n",
+            ),
+        )
+        .unwrap();
+        let baseline = concat!(
+            "//// [app.js] ////\n",
+            "\"use strict\";\n",
+            "/// <reference path=\"node.d.ts\"/>\n",
+            "const fs = require(\"fs\");\n",
+            "const text = fs.readFileSync(\"/a/b/c\");\n",
+        );
+        let runs = run_case_against_baseline(&case, baseline).unwrap();
+        assert_eq!(runs.len(), 2);
+        for run in runs {
+            assert!(
+                run.compilation.diagnostics.is_empty(),
+                "{:?}: {:?}",
+                run.variant,
+                run.compilation.diagnostics
+            );
+            assert!(
+                run.compilation.outputs.contains_key("/case/out/app.js"),
+                "{:?}: {:?}",
+                run.variant,
+                run.compilation.outputs.keys().collect::<Vec<_>>()
+            );
+            assert!(
+                run.comparison.is_match(),
+                "{:?}: {:?}",
+                run.variant,
+                run.comparison.differences
+            );
+        }
+    }
+
+    #[test]
     fn declaration_only_variants_do_not_expect_javascript_sections() {
         let case = Case::parse(
             "declarationOnly.ts",
