@@ -29,16 +29,17 @@ use ts_ast::{
     ParameterDeclarationData, ParenthesizedExpressionData, ParenthesizedTypeNodeData,
     PostfixUnaryExpressionData, PrefixUnaryExpressionData, PrivateIdentifierData,
     PropertyAccessExpressionData, PropertyAssignmentData, PropertyDeclarationData,
-    QualifiedNameData, RestTypeNodeData, ReturnStatementData, SatisfiesExpressionData,
-    SetAccessorDeclarationData, ShorthandPropertyAssignmentData, SourceFileData,
-    SpreadAssignmentData, SpreadElementData, StringLiteralData, SwitchStatementData, SymbolTable,
-    SyntaxKind, TemplateExpressionData, TemplateHeadData, TemplateLiteralTypeNodeData,
-    TemplateLiteralTypeSpanData, TemplateMiddleData, TemplateSpanData, TemplateTailData,
-    ThisTypeNodeData, ThrowStatementData, TokenData, TokenFlags, TryStatementData,
-    TupleTypeNodeData, TypeAliasDeclarationData, TypeAssertionData, TypeLiteralNodeData,
-    TypeOperatorNodeData, TypeParameterDeclarationData, TypePredicateNodeData, TypeQueryNodeData,
-    TypeReferenceNodeData, UnionTypeNodeData, VariableDeclarationData, VariableDeclarationListData,
-    VariableStatementData, WhileStatementData, WithStatementData, YieldExpressionData,
+    QualifiedNameData, RegularExpressionLiteralData, RestTypeNodeData, ReturnStatementData,
+    SatisfiesExpressionData, SetAccessorDeclarationData, ShorthandPropertyAssignmentData,
+    SourceFileData, SpreadAssignmentData, SpreadElementData, StringLiteralData,
+    SwitchStatementData, SymbolTable, SyntaxKind, TemplateExpressionData, TemplateHeadData,
+    TemplateLiteralTypeNodeData, TemplateLiteralTypeSpanData, TemplateMiddleData, TemplateSpanData,
+    TemplateTailData, ThisTypeNodeData, ThrowStatementData, TokenData, TokenFlags,
+    TryStatementData, TupleTypeNodeData, TypeAliasDeclarationData, TypeAssertionData,
+    TypeLiteralNodeData, TypeOperatorNodeData, TypeParameterDeclarationData, TypePredicateNodeData,
+    TypeQueryNodeData, TypeReferenceNodeData, UnionTypeNodeData, VariableDeclarationData,
+    VariableDeclarationListData, VariableStatementData, WhileStatementData, WithStatementData,
+    YieldExpressionData,
 };
 use ts_core::{Diagnostic, DiagnosticCategory, TextPos, TextRange};
 use ts_diagnostics::{Category, message_by_code};
@@ -3332,6 +3333,9 @@ impl<'a> Parser<'a> {
             SyntaxKind::NumericLiteral => self.parse_numeric_literal(),
             SyntaxKind::BigIntLiteral => self.parse_bigint_literal(),
             SyntaxKind::StringLiteral => self.parse_string_literal(),
+            SyntaxKind::SlashToken | SyntaxKind::SlashEqualsToken => {
+                self.parse_regular_expression_literal()
+            }
             SyntaxKind::NoSubstitutionTemplateLiteral => self.parse_template_literal(),
             SyntaxKind::NullKeyword
             | SyntaxKind::TrueKeyword
@@ -4100,6 +4104,20 @@ impl<'a> Parser<'a> {
             token.range,
             NodeData::StringLiteral(Box::new(StringLiteralData {
                 text,
+                token_flags: TokenFlags::default(),
+            })),
+            &[],
+        )
+    }
+
+    fn parse_regular_expression_literal(&mut self) -> NodeId {
+        let token = self.scanner.rescan_slash_token();
+        self.current = self.scanner.scan();
+        self.alloc_node(
+            SyntaxKind::RegularExpressionLiteral,
+            token.range,
+            NodeData::RegularExpressionLiteral(Box::new(RegularExpressionLiteralData {
+                text: token.text.to_owned(),
                 token_flags: TokenFlags::default(),
             })),
             &[],
@@ -5925,6 +5943,28 @@ mod tests {
                 _ => false,
             };
             assert!(has_export);
+        }
+    }
+
+    #[test]
+    fn rescans_regular_expression_literals_in_expression_contexts() {
+        let result = parse_source_file("const first = /a[b\\/]c+/giu; const second = /=foo/;");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let statements = source_statements(&result);
+        let expected = ["/a[b\\/]c+/giu", "/=foo/"];
+        for (statement, expected) in statements.iter().zip(expected) {
+            let (list, _) = variable_list(&result, *statement);
+            let declaration = declaration_nodes(&result, list)[0];
+            let NodeData::VariableDeclaration(declaration) =
+                &result.arena.get(declaration).unwrap().data
+            else {
+                panic!("expected variable declaration");
+            };
+            let initializer = result.arena.get(declaration.initializer.unwrap()).unwrap();
+            let NodeData::RegularExpressionLiteral(regex) = &initializer.data else {
+                panic!("expected regular expression literal");
+            };
+            assert_eq!(regex.text, expected);
         }
     }
 
