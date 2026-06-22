@@ -1880,6 +1880,7 @@ impl<'a> Checker<'a> {
                     .and_then(|symbol| self.result.symbol_types.get(symbol))
                     .copied();
                 if let Some(instance_type) = instance_type {
+                    self.result.node_types.insert(node_id, instance_type);
                     self.this_types.push(instance_type);
                 }
                 self.check_class_members(&data.members.nodes);
@@ -2218,6 +2219,7 @@ impl<'a> Checker<'a> {
         let return_type = signature
             .as_ref()
             .map_or_else(|| self.result.types.any(), |function| function.return_type);
+        self.result.node_types.insert(node_id, function_type);
         for parameter in &data.parameters.nodes {
             self.check_parameter(*parameter);
         }
@@ -2246,10 +2248,11 @@ impl<'a> Checker<'a> {
         let has_implicit_return = data
             .body
             .is_some_and(|body| !self.statement_definitely_terminates(body));
-        let requires_value_return = !matches!(
-            self.result.types.get(return_type).map(|value| &value.kind),
-            Some(TypeKind::Any | TypeKind::Void | TypeKind::Undefined)
-        );
+        let requires_value_return = data.type_.is_some()
+            && !matches!(
+                self.result.types.get(return_type).map(|value| &value.kind),
+                Some(TypeKind::Any | TypeKind::Void | TypeKind::Undefined)
+            );
         if has_implicit_return && requires_value_return {
             self.error(node_id, 2355, std::iter::empty());
         } else if has_implicit_return && saw_return && self.options.no_implicit_returns {
@@ -3028,12 +3031,73 @@ impl<'a> Checker<'a> {
         self.this_types.push(instance_type);
         self.check_class_members(&class.members.nodes);
         self.this_types.pop();
-        let signature = self.class_constructor_signature(&class.members.nodes, instance_type);
+        let base_type = self.class_expression_base_value_type(class);
+        let mut signature = self.class_constructor_signature(&class.members.nodes, instance_type);
+        let has_constructor = class.members.nodes.iter().any(|member| {
+            matches!(
+                self.arena.get(*member).map(|node| &node.data),
+                Some(NodeData::ConstructorDeclaration(_))
+            ) || matches!(
+                self.arena.get(*member).map(|node| &node.data),
+                Some(NodeData::MethodDeclaration(method))
+                    if self.property_name(method.name).as_deref() == Some("constructor")
+            )
+        });
+        if !has_constructor
+            && let Some(base_signature) = base_type.and_then(|base| self.construct_signature(base))
+        {
+            signature.parameters = base_signature.parameters;
+            signature.parameters_optional = base_signature.parameters_optional;
+        }
         let constructor_type = self.result.types.alloc(TypeKind::Constructor(signature));
         if let Some(symbol) = class.symbol.or(class.local_symbol) {
             self.result.symbol_types.insert(symbol, constructor_type);
         }
-        constructor_type
+        if base_type.is_some_and(|base| {
+            matches!(
+                self.result.types.get(base).map(|type_| &type_.kind),
+                Some(TypeKind::TypeParameter { .. } | TypeKind::Intersection(_))
+            )
+        }) {
+            self.result
+                .types
+                .intersection([constructor_type, base_type.unwrap()])
+        } else {
+            constructor_type
+        }
+    }
+
+    fn class_expression_base_value_type(
+        &mut self,
+        class: &ts_ast::ClassExpressionData,
+    ) -> Option<TypeId> {
+        let clauses = class.heritage_clauses.as_ref()?;
+        let clause = clauses.nodes.iter().find_map(|clause| {
+            let NodeData::HeritageClause(clause) = &self.arena.get(*clause)?.data else {
+                return None;
+            };
+            (clause.token == SyntaxKind::ExtendsKeyword).then_some(clause)
+        })?;
+        let heritage = clause.types.nodes.first()?;
+        let NodeData::ExpressionWithTypeArguments(heritage) = &self.arena.get(*heritage)?.data
+        else {
+            return None;
+        };
+        Some(self.type_of_expression(heritage.expression))
+    }
+
+    fn construct_signature(&self, type_id: TypeId) -> Option<FunctionType> {
+        match &self.result.types.get(type_id)?.kind {
+            TypeKind::Constructor(signature) => Some(signature.clone()),
+            TypeKind::TypeParameter {
+                constraint: Some(constraint),
+                ..
+            } => self.construct_signature(*constraint),
+            TypeKind::Intersection(members) => members
+                .iter()
+                .find_map(|member| self.construct_signature(*member)),
+            _ => None,
+        }
     }
 
     fn class_constructor_signature(
@@ -4264,12 +4328,25 @@ impl<'a> Checker<'a> {
             }
         }
         if let Some(symbol) = symbol {
-            return self
+            let type_id = self
                 .result
                 .symbol_types
                 .get(&symbol)
                 .copied()
                 .unwrap_or_else(|| self.result.types.any());
+            if let Some(class) = self.bindings.symbols.get(symbol).and_then(|symbol| {
+                symbol.declarations.iter().find_map(|declaration| {
+                    let NodeData::ClassDeclaration(class) = &self.arena.get(*declaration)?.data
+                    else {
+                        return None;
+                    };
+                    Some(class.as_ref().clone())
+                })
+            }) {
+                let signature = self.class_constructor_signature(&class.members.nodes, type_id);
+                return self.result.types.alloc(TypeKind::Constructor(signature));
+            }
+            return type_id;
         }
         if let Some(descriptor) = self.external_names.get(name).cloned() {
             return self.import_type(&descriptor);
@@ -4781,6 +4858,27 @@ impl<'a> Checker<'a> {
         }
     }
 
+    fn construct_signatures(&self, kind: TypeKind) -> Option<Vec<FunctionType>> {
+        match kind {
+            TypeKind::Constructor(signature) => Some(vec![signature]),
+            TypeKind::Intersection(members) => members.into_iter().find_map(|member| {
+                self.result
+                    .types
+                    .get(member)
+                    .and_then(|type_| self.construct_signatures(type_.kind.clone()))
+            }),
+            TypeKind::TypeParameter {
+                constraint: Some(constraint),
+                ..
+            } => self
+                .result
+                .types
+                .get(constraint)
+                .and_then(|type_| self.construct_signatures(type_.kind.clone())),
+            _ => None,
+        }
+    }
+
     fn call_expression_type(
         &mut self,
         node: NodeId,
@@ -4802,10 +4900,7 @@ impl<'a> Checker<'a> {
             return self.result.types.any();
         }
         let signatures = if construct {
-            match callee_kind {
-                TypeKind::Constructor(signature) => Some(vec![signature]),
-                other => self.callable_signatures(other),
-            }
+            self.construct_signatures(callee_kind)
         } else {
             self.callable_signatures(callee_kind)
         };
@@ -4975,6 +5070,24 @@ impl<'a> Checker<'a> {
                     );
                 }
             }
+            TypeKind::Constructor(parameter_signature) => {
+                if let TypeKind::Constructor(actual_signature) =
+                    self.result.types.get(actual).unwrap().kind.clone()
+                {
+                    for (parameter, actual) in parameter_signature
+                        .parameters
+                        .iter()
+                        .zip(&actual_signature.parameters)
+                    {
+                        self.infer_type_parameters(*parameter, *actual, inference);
+                    }
+                    self.infer_type_parameters(
+                        parameter_signature.return_type,
+                        actual_signature.return_type,
+                        inference,
+                    );
+                }
+            }
             _ => {}
         }
     }
@@ -4995,6 +5108,13 @@ impl<'a> Checker<'a> {
                     .collect::<Vec<_>>();
                 self.result.types.union(substituted)
             }
+            TypeKind::Intersection(members) => {
+                let substituted = members
+                    .into_iter()
+                    .map(|member| self.substitute_type(member, inference))
+                    .collect::<Vec<_>>();
+                self.result.types.intersection(substituted)
+            }
             TypeKind::Function(signature) => {
                 let parameters = signature
                     .parameters
@@ -5003,6 +5123,19 @@ impl<'a> Checker<'a> {
                     .collect();
                 let return_type = self.substitute_type(signature.return_type, inference);
                 self.result.types.alloc(TypeKind::Function(FunctionType {
+                    parameters,
+                    return_type,
+                    parameters_optional: signature.parameters_optional,
+                }))
+            }
+            TypeKind::Constructor(signature) => {
+                let parameters = signature
+                    .parameters
+                    .into_iter()
+                    .map(|parameter| self.substitute_type(parameter, inference))
+                    .collect();
+                let return_type = self.substitute_type(signature.return_type, inference);
+                self.result.types.alloc(TypeKind::Constructor(FunctionType {
                     parameters,
                     return_type,
                     parameters_optional: signature.parameters_optional,
@@ -5142,20 +5275,93 @@ impl<'a> Checker<'a> {
             data.type_,
             data.type_parameters.as_ref(),
         );
-        if self.options.is_javascript_file
-            && data.type_.is_none()
-            && data
-                .body
-                .is_some_and(|body| !self.function_body_has_return(body))
+        if data.type_.is_none()
+            && let Some(body) = data.body
         {
-            let void = self.result.types.void();
-            if let TypeKind::Function(signature) =
-                &mut self.result.types.types[function.index()].kind
+            let inferred = self
+                .infer_function_return_type(data, function, body)
+                .or_else(|| {
+                    (self.options.is_javascript_file && !self.function_body_has_return(body))
+                        .then(|| self.result.types.void())
+                });
+            if let Some(inferred) = inferred
+                && let TypeKind::Function(signature) =
+                    &mut self.result.types.types[function.index()].kind
             {
-                signature.return_type = void;
+                signature.return_type = inferred;
             }
         }
         function
+    }
+
+    fn infer_function_return_type(
+        &mut self,
+        data: &ts_ast::FunctionDeclarationData,
+        function: TypeId,
+        body: NodeId,
+    ) -> Option<TypeId> {
+        let TypeKind::Function(signature) = self.result.types.get(function)?.kind.clone() else {
+            return None;
+        };
+        let local_scope = data
+            .parameters
+            .nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, parameter)| {
+                let NodeData::ParameterDeclaration(parameter) = &self.arena.get(*parameter)?.data
+                else {
+                    return None;
+                };
+                Some((
+                    self.property_name(parameter.name)?,
+                    *signature.parameters.get(index)?,
+                ))
+            })
+            .collect();
+        self.local_scopes.push(local_scope);
+        let returns = self.function_return_expressions(body);
+        let return_types = returns
+            .into_iter()
+            .map(|expression| {
+                let type_id = self.type_of_expression(expression);
+                self.widen_literal(type_id)
+            })
+            .collect::<Vec<_>>();
+        self.local_scopes.pop();
+        (!return_types.is_empty()).then(|| self.result.types.union(return_types))
+    }
+
+    fn function_return_expressions(&self, body: NodeId) -> Vec<NodeId> {
+        let mut pending = vec![body];
+        let mut returns = Vec::new();
+        while let Some(node_id) = pending.pop() {
+            let Some(node) = self.arena.get(node_id) else {
+                continue;
+            };
+            if let NodeData::ReturnStatement(statement) = &node.data {
+                if let Some(expression) = statement.expression {
+                    returns.push(expression);
+                }
+                continue;
+            }
+            if node_id != body
+                && matches!(
+                    node.data,
+                    NodeData::FunctionDeclaration(_)
+                        | NodeData::FunctionExpression(_)
+                        | NodeData::ArrowFunction(_)
+                        | NodeData::ClassDeclaration(_)
+                        | NodeData::ClassExpression(_)
+                )
+            {
+                continue;
+            }
+            if let Some(children) = self.children.get(&node_id) {
+                pending.extend(children.iter().rev().copied());
+            }
+        }
+        returns
     }
 
     fn function_body_has_return(&self, body: NodeId) -> bool {
@@ -5911,6 +6117,13 @@ impl<'a> Checker<'a> {
             (_, TypeKind::Union(targets)) => targets
                 .iter()
                 .any(|target| self.is_assignable(source, *target)),
+            (TypeKind::Intersection(sources), TypeKind::Intersection(targets)) => {
+                targets.iter().all(|target| {
+                    sources
+                        .iter()
+                        .any(|source| self.is_assignable(*source, *target))
+                })
+            }
             (TypeKind::Intersection(sources), _) => sources
                 .iter()
                 .any(|source| self.is_assignable(*source, target)),
@@ -5937,6 +6150,15 @@ impl<'a> Checker<'a> {
                 constraint.is_none_or(|constraint| self.is_assignable(source, constraint))
             }
             (TypeKind::Function(source), TypeKind::Function(target)) => {
+                source.parameters.len() <= target.parameters.len()
+                    && source
+                        .parameters
+                        .iter()
+                        .zip(&target.parameters)
+                        .all(|(source, target)| self.is_assignable(*target, *source))
+                    && self.is_assignable(source.return_type, target.return_type)
+            }
+            (TypeKind::Constructor(source), TypeKind::Constructor(target)) => {
                 source.parameters.len() <= target.parameters.len()
                     && source
                         .parameters
@@ -8436,6 +8658,192 @@ mod tests {
         assert_eq!(
             result.type_of_node(variable.initializer.unwrap()),
             Some(constructor_type)
+        );
+    }
+
+    #[test]
+    fn infers_anonymous_class_function_returns_and_inherited_parameter_properties() {
+        let parsed = parse_source_file(
+            r"
+                export class X {
+                    constructor(readonly a: number) {}
+                }
+                export function y() {
+                    return class extends X {};
+                }
+            ",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+
+        let y = bindings.root_scope().unwrap().symbols.get("y").unwrap();
+        let y_declaration = bindings.symbols.get(y).unwrap().declarations[0];
+        let y_type = result.type_of_symbol(y).unwrap();
+        assert_eq!(result.type_of_node(y_declaration), Some(y_type));
+        let TypeKind::Function(y_signature) = &result.types.get(y_type).unwrap().kind else {
+            panic!("expected function type");
+        };
+        let TypeKind::Constructor(constructor) =
+            &result.types.get(y_signature.return_type).unwrap().kind
+        else {
+            panic!("expected anonymous class constructor return");
+        };
+        assert_eq!(constructor.parameters, [result.types.number()]);
+        let TypeKind::Object(instance) = &result.types.get(constructor.return_type).unwrap().kind
+        else {
+            panic!("expected anonymous class instance");
+        };
+        assert_eq!(instance.properties.get("a"), Some(&result.types.number()));
+        assert!(instance.readonly_properties.contains("a"));
+
+        let NodeData::FunctionDeclaration(y_function) =
+            &parsed.arena.get(y_declaration).unwrap().data
+        else {
+            panic!("expected function declaration");
+        };
+        let body = y_function.body.unwrap();
+        let NodeData::Block(body) = &parsed.arena.get(body).unwrap().data else {
+            panic!("expected function body");
+        };
+        let NodeData::ReturnStatement(return_statement) =
+            &parsed.arena.get(body.statements.nodes[0]).unwrap().data
+        else {
+            panic!("expected return statement");
+        };
+        assert_eq!(
+            result.type_of_node(return_statement.expression.unwrap()),
+            Some(y_signature.return_type)
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn preserves_imported_anonymous_constructor_types_through_generic_calls() {
+        let wrappers = parse_source_file(
+            r"
+                export type Constructor<T = {}> = new (...args: any[]) => T;
+                export function wrapClass(param: any) {
+                    return class Wrapped { foo() { return param; } };
+                }
+                export function Timestamped<TBase extends Constructor>(Base: TBase) {
+                    return class extends Base { timestamp = 1; };
+                }
+            ",
+        );
+        let consumer = parse_source_file(
+            r#"
+                import { wrapClass, Timestamped } from "./wrappers";
+                export default wrapClass(0);
+                class User { name = ""; }
+                export const Mixed = Timestamped(User);
+            "#,
+        );
+        assert!(
+            wrappers.diagnostics.is_empty(),
+            "{:?}",
+            wrappers.diagnostics
+        );
+        assert!(
+            consumer.diagnostics.is_empty(),
+            "{:?}",
+            consumer.diagnostics
+        );
+        let wrappers_bindings = bind_source_file(&wrappers.arena, wrappers.source_file);
+        let consumer_bindings = bind_source_file(&consumer.arena, consumer.source_file);
+        let no_modules = BTreeMap::new();
+        let consumer_modules = BTreeMap::from([("./wrappers".into(), 0)]);
+        let checked = check_program(&[
+            ProgramSource {
+                arena: &wrappers.arena,
+                source_file: wrappers.source_file,
+                bindings: &wrappers_bindings,
+                resolved_modules: &no_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+            ProgramSource {
+                arena: &consumer.arena,
+                source_file: consumer.source_file,
+                bindings: &consumer_bindings,
+                resolved_modules: &consumer_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+        ]);
+        assert!(
+            checked.files[0].diagnostics.is_empty(),
+            "{:?}",
+            checked.files[0].diagnostics
+        );
+        assert!(
+            checked.files[1].diagnostics.is_empty(),
+            "{:?}",
+            checked.files[1].diagnostics
+        );
+
+        let NodeData::SourceFile(source) = &consumer.arena.get(consumer.source_file).unwrap().data
+        else {
+            panic!("expected source file");
+        };
+        let NodeData::ExportAssignment(default_export) =
+            &consumer.arena.get(source.statements.nodes[1]).unwrap().data
+        else {
+            panic!("expected default export");
+        };
+        let default_type = checked.files[1]
+            .type_of_node(default_export.expression)
+            .unwrap();
+        assert!(matches!(
+            checked.files[1].types.get(default_type).unwrap().kind,
+            TypeKind::Constructor(_)
+        ));
+
+        let mixed = consumer_bindings
+            .root_scope()
+            .unwrap()
+            .symbols
+            .get("Mixed")
+            .unwrap();
+        let mixed_type = checked.files[1].type_of_symbol(mixed).unwrap();
+        let TypeKind::Intersection(members) = &checked.files[1].types.get(mixed_type).unwrap().kind
+        else {
+            panic!("expected generic mixin intersection");
+        };
+        let constructors = members
+            .iter()
+            .filter_map(|member| {
+                let TypeKind::Constructor(signature) = &checked.files[1].types.get(*member)?.kind
+                else {
+                    return None;
+                };
+                Some(signature)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(constructors.len(), 2);
+        let instance_properties = constructors
+            .iter()
+            .filter_map(|constructor| {
+                let TypeKind::Object(instance) =
+                    &checked.files[1].types.get(constructor.return_type)?.kind
+                else {
+                    return None;
+                };
+                Some(instance.properties.keys().cloned().collect::<BTreeSet<_>>())
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            instance_properties
+                .iter()
+                .any(|properties| properties.contains("timestamp"))
+        );
+        assert!(
+            instance_properties
+                .iter()
+                .any(|properties| properties.contains("name"))
         );
     }
 
