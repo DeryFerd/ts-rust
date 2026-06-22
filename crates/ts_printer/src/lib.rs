@@ -332,6 +332,7 @@ pub fn emit_source_file_with_context(
         .first()
         .and_then(|statement| arena.get(*statement))
         .map_or(0, |node| node.range.start.get());
+    let mut reference_owner_start = 0;
     let mut previous_emitted = false;
     for statement in &data.statements.nodes {
         if let Some(node) = arena.get(*statement) {
@@ -340,8 +341,15 @@ pub fn emit_source_file_with_context(
                 node.range.start.get(),
                 previous_emitted,
             );
-            previous_emitted = statement_emits_javascript(arena, node);
+            previous_emitted = printer.statement_emits_runtime(node);
+            if previous_emitted {
+                printer.emit_reference_directives_between(
+                    reference_owner_start,
+                    node.range.start.get(),
+                );
+            }
             previous_end = node.range.end.get();
+            reference_owner_start = node.range.end.get();
         }
         printer.emit_statement(*statement)?;
     }
@@ -2355,12 +2363,20 @@ impl Printer<'_> {
             .first()
             .and_then(|statement| self.arena.get(*statement))
             .map_or(0, |node| node.range.start.get());
+        let mut reference_owner_start = 0;
         for statement in &data.statements.nodes {
             if let Some(node) = self.arena.get(*statement) {
                 if statement_emits_javascript(self.arena, node) {
                     self.emit_source_comments_between(previous_end, node.range.start.get());
                 }
+                if self.statement_emits_runtime(node) {
+                    self.emit_reference_directives_between(
+                        reference_owner_start,
+                        node.range.start.get(),
+                    );
+                }
                 previous_end = node.range.end.get();
+                reference_owner_start = node.range.end.get();
             }
             if matches!(
                 self.arena.get(*statement).map(|node| &node.data),
@@ -2543,6 +2559,37 @@ impl Printer<'_> {
         self.emit_source_comments_between_with_trailing(start, end, true);
     }
 
+    fn emit_reference_directives_between(&mut self, start: u32, end: u32) {
+        let start = usize::try_from(start).unwrap_or(usize::MAX);
+        let end = usize::try_from(end).unwrap_or(usize::MAX);
+        let Some(trivia) = self.source_text.get(start..end) else {
+            return;
+        };
+        let bytes = trivia.as_bytes();
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index..].starts_with(b"//") {
+                let comment_end = bytes[index..]
+                    .iter()
+                    .position(|byte| *byte == b'\n' || *byte == b'\r')
+                    .map_or(bytes.len(), |offset| index + offset);
+                let comment = &trivia[index..comment_end];
+                if is_reference_directive(comment) {
+                    self.writer.write(comment);
+                    self.writer.newline();
+                }
+                index = comment_end;
+            } else if bytes[index..].starts_with(b"/*") {
+                index = bytes[index + 2..]
+                    .windows(2)
+                    .position(|window| window == b"*/")
+                    .map_or(bytes.len(), |offset| index + 2 + offset + 2);
+            } else {
+                index += 1;
+            }
+        }
+    }
+
     fn emit_source_comments_between_with_trailing(
         &mut self,
         start: u32,
@@ -2562,6 +2609,11 @@ impl Printer<'_> {
                     .iter()
                     .position(|byte| *byte == b'\n' || *byte == b'\r')
                     .map_or(bytes.len(), |offset| index + offset);
+                let comment = &trivia[index..comment_end];
+                if is_reference_directive(comment) {
+                    index = comment_end;
+                    continue;
+                }
                 let immediate_trailing = !trivia[..index].contains(['\n', '\r']);
                 if !immediate_trailing || preserve_immediate_trailing {
                     if immediate_trailing {
@@ -2616,10 +2668,14 @@ impl Printer<'_> {
                     .iter()
                     .position(|byte| *byte == b'\n' || *byte == b'\r')
                     .map_or(bytes.len(), |offset| index + offset);
-                if !excluded.iter().any(|(start, end)| {
-                    usize::try_from(*start) == Ok(index) && usize::try_from(*end) == Ok(comment_end)
-                }) {
-                    self.writer.write(&prefix[index..comment_end]);
+                let comment = &prefix[index..comment_end];
+                if !is_reference_directive(comment)
+                    && !excluded.iter().any(|(start, end)| {
+                        usize::try_from(*start) == Ok(index)
+                            && usize::try_from(*end) == Ok(comment_end)
+                    })
+                {
+                    self.writer.write(comment);
                     self.writer.newline();
                 }
                 index = comment_end;
@@ -2806,6 +2862,33 @@ impl Printer<'_> {
 
     const fn unsupported(id: NodeId, kind: SyntaxKind) -> EmitError {
         EmitError { node: id, kind }
+    }
+
+    fn statement_emits_runtime(&self, node: &Node) -> bool {
+        if declaration_has_modifier(self.arena, node, SyntaxKind::DeclareKeyword)
+            || (is_const_enum_declaration(self.arena, node)
+                && !self.const_enum_emit_mode.preserves_declarations())
+        {
+            return false;
+        }
+        match &node.data {
+            NodeData::ImportDeclaration(import) => self.import_has_runtime_use(import),
+            NodeData::ImportEqualsDeclaration(import) => {
+                !import.is_type_only
+                    && (self.has_modifier(import.modifiers.as_ref(), SyntaxKind::ExportKeyword)
+                        || self.import_binding_is_used(import.name))
+            }
+            NodeData::InterfaceDeclaration(_) | NodeData::TypeAliasDeclaration(_) => false,
+            NodeData::FunctionDeclaration(function) => function.body.is_some(),
+            NodeData::VariableStatement(statement)
+                if self.commonjs_module_transform
+                    && declaration_has_modifier(self.arena, node, SyntaxKind::ExportKeyword)
+                    && self.variable_list_is_uninitialized(statement.declaration_list) =>
+            {
+                false
+            }
+            _ => true,
+        }
     }
 
     fn record_mapping(&mut self, node: &Node) {
@@ -6481,6 +6564,18 @@ fn normalize_jsx_text(text: &str) -> String {
         .join(" ")
 }
 
+fn is_reference_directive(comment: &str) -> bool {
+    let Some(directive) = comment.strip_prefix("///") else {
+        return false;
+    };
+    let Some(rest) = directive.trim_start().strip_prefix("<reference") else {
+        return false;
+    };
+    rest.chars()
+        .next()
+        .is_some_and(|character| character.is_whitespace() || matches!(character, '/' | '>'))
+}
+
 fn write_quoted(writer: &mut Writer, text: &str) {
     write_quoted_with(writer, text, '"');
 }
@@ -7162,6 +7257,26 @@ mod tests {
     }
 
     #[test]
+    fn keeps_reference_directives_inside_amd_after_generated_prologues() {
+        let source = concat!(
+            "///<reference path='types.d.ts' />\n",
+            "import runtime = require(\"runtime\");\n",
+            "runtime.run();\n",
+        );
+        assert_eq!(
+            emit_amd(source).code,
+            concat!(
+                "define([\"require\", \"exports\", \"runtime\"], function (require, exports, runtime) {\n",
+                "    \"use strict\";\n",
+                "    Object.defineProperty(exports, \"__esModule\", { value: true });\n",
+                "    ///<reference path='types.d.ts' />\n",
+                "    runtime.run();\n",
+                "});\n",
+            )
+        );
+    }
+
+    #[test]
     fn emits_system_module_for_statements_with_omitted_clauses() {
         let source = r"
             export { };
@@ -7617,6 +7732,50 @@ class Board {
                 "y = moduleA; // should be error\n",
             )
         );
+    }
+
+    #[test]
+    fn defers_reference_directives_until_their_runtime_import_owner() {
+        let source = concat!(
+            "/*! license */\n",
+            "///<reference path='types.d.ts' />\n",
+            "import mod = require(\"./mod\");\n",
+            "export const value = mod.value;\n",
+        );
+        assert_eq!(
+            emit_with(source, ScriptTarget::Es2015, ModuleKind::CommonJs).code,
+            concat!(
+                "\"use strict\";\n",
+                "/*! license */\n",
+                "Object.defineProperty(exports, \"__esModule\", { value: true });\n",
+                "exports.value = void 0;\n",
+                "///<reference path='types.d.ts' />\n",
+                "const mod = require(\"./mod\");\n",
+                "const value = mod.value;\n",
+                "exports.value = value;\n",
+            )
+        );
+    }
+
+    #[test]
+    fn drops_reference_directives_owned_by_erased_statements() {
+        let source = concat!(
+            "///<reference path='types.d.ts' />\n",
+            "interface Shape { value: number; }\n",
+            "export const value: Shape | number = 1;\n",
+        );
+        let output = emit_with(source, ScriptTarget::Es2015, ModuleKind::CommonJs).code;
+        assert_eq!(
+            output,
+            concat!(
+                "\"use strict\";\n",
+                "Object.defineProperty(exports, \"__esModule\", { value: true });\n",
+                "exports.value = void 0;\n",
+                "const value = 1;\n",
+                "exports.value = value;\n",
+            )
+        );
+        assert!(!output.contains("<reference"));
     }
 
     #[test]
