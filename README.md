@@ -46,6 +46,14 @@ Or run the complete local gate, including generated-source checks:
 ./scripts/verify.sh
 ```
 
+With an upstream checkout available, compiler emit baselines can be sampled
+directly and filtered deterministically:
+
+```sh
+TS_GO_REPO=/path/to/typescript-go cargo run -p ts_fixture \
+  --bin ts_fixture_baseline -- --filter ClassDeclaration --limit 20
+```
+
 `tsgo file.ts` and `tsgo --project tsconfig.json` run the standard compilation
 pipeline, including default libraries, checking, JavaScript/declaration emit,
 and source maps. Project-reference builds support incremental `.tsbuildinfo`
