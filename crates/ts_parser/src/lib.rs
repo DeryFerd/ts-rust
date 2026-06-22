@@ -3344,6 +3344,7 @@ impl<'a> Parser<'a> {
             | SyntaxKind::UndefinedKeyword
             | SyntaxKind::ThisKeyword
             | SyntaxKind::SuperKeyword => self.parse_keyword_expression(),
+            kind if kind.is_keyword_type() => self.parse_identifier_name("Expected an expression."),
             SyntaxKind::OpenParenToken => self.parse_parenthesized_expression(),
             SyntaxKind::OpenBracketToken => self.parse_array_literal(),
             SyntaxKind::OpenBraceToken => self.parse_object_literal(),
@@ -6037,6 +6038,37 @@ mod tests {
                 SyntaxKind::FunctionExpression
             );
         }
+    }
+
+    #[test]
+    fn parses_keyword_type_spelling_as_a_value_identifier() {
+        let result = parse_source_file(
+            "function read(symbol: symbol) { if (!symbol) return; return symbol; }",
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let statements = source_statements(&result);
+        let NodeData::FunctionDeclaration(function) =
+            &result.arena.get(statements[0]).unwrap().data
+        else {
+            panic!("expected function declaration");
+        };
+        let NodeData::Block(body) = &result.arena.get(function.body.unwrap()).unwrap().data else {
+            panic!("expected function body");
+        };
+        let NodeData::IfStatement(if_statement) =
+            &result.arena.get(body.statements.nodes[0]).unwrap().data
+        else {
+            panic!("expected if statement");
+        };
+        let NodeData::PrefixUnaryExpression(condition) =
+            &result.arena.get(if_statement.expression).unwrap().data
+        else {
+            panic!("expected prefix condition");
+        };
+        assert_eq!(
+            result.arena.get(condition.operand).unwrap().kind,
+            SyntaxKind::Identifier
+        );
     }
 
     #[test]
