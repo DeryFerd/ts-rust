@@ -1,6 +1,10 @@
 //! Core Language Server Protocol types and a synchronous TypeScript session.
 
-use std::{collections::BTreeMap, error::Error, fmt, io};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fmt, io,
+};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -104,7 +108,25 @@ pub struct ServerCapabilities {
     pub workspace_symbol_provider: bool,
     pub call_hierarchy_provider: bool,
     pub signature_help_provider: SignatureHelpOptions,
+    pub semantic_tokens_provider: SemanticTokensOptions,
+    pub folding_range_provider: bool,
+    pub selection_range_provider: bool,
     pub completion_provider: CompletionOptions,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SemanticTokensOptions {
+    pub legend: SemanticTokensLegend,
+    pub full: bool,
+    pub range: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SemanticTokensLegend {
+    pub token_types: Vec<String>,
+    pub token_modifiers: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -313,6 +335,41 @@ pub struct SymbolInformation {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SemanticTokens {
+    pub data: Vec<u32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FoldingRangeParams {
+    pub text_document: TextDocumentIdentifier,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FoldingRange {
+    pub start_line: u32,
+    pub start_character: u32,
+    pub end_line: u32,
+    pub end_character: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SelectionRangeParams {
+    pub text_document: TextDocumentIdentifier,
+    pub positions: Vec<Position>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct SelectionRange {
+    pub range: Range,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent: Option<Box<SelectionRange>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 struct CallHierarchyData {
     file_name: String,
     declaration_start: u32,
@@ -493,6 +550,15 @@ impl Server {
         if method == "workspace/symbol" {
             return vec![self.workspace_symbol(id, message.params)];
         }
+        if method == "textDocument/semanticTokens/full" {
+            return vec![self.semantic_tokens_full(id, message.params)];
+        }
+        if method == "textDocument/foldingRange" {
+            return vec![self.folding_range(id, message.params)];
+        }
+        if method == "textDocument/selectionRange" {
+            return vec![self.selection_range(id, message.params)];
+        }
         vec![failure(id, CODE_METHOD_NOT_FOUND, "method not found")]
     }
 
@@ -525,6 +591,19 @@ impl Server {
                     trigger_characters: vec!["(".to_owned(), ",".to_owned()],
                     retrigger_characters: vec![")".to_owned()],
                 },
+                semantic_tokens_provider: SemanticTokensOptions {
+                    legend: SemanticTokensLegend {
+                        token_types: semantic_token_types()
+                            .iter()
+                            .map(|token| (*token).to_owned())
+                            .collect(),
+                        token_modifiers: Vec::new(),
+                    },
+                    full: true,
+                    range: false,
+                },
+                folding_range_provider: true,
+                selection_range_provider: true,
                 completion_provider: CompletionOptions {
                     resolve_provider: false,
                 },
@@ -1096,6 +1175,68 @@ impl Server {
         symbols
     }
 
+    fn semantic_tokens_full(&self, id: Id, params: Option<Value>) -> OutgoingMessage {
+        let Ok(params) = deserialize_params::<FoldingRangeParams>(params) else {
+            return failure(
+                id,
+                CODE_INVALID_PARAMS,
+                "invalid semantic tokens parameters",
+            );
+        };
+        let program = self.build_program();
+        let result = self
+            .documents
+            .get(&params.text_document.uri)
+            .and_then(|document| program.source_file(&document.file_name))
+            .map_or_else(|| SemanticTokens { data: Vec::new() }, semantic_tokens);
+        OutgoingMessage::Response(Response::success(
+            id,
+            serde_json::to_value(result).unwrap_or(Value::Null),
+        ))
+    }
+
+    fn folding_range(&self, id: Id, params: Option<Value>) -> OutgoingMessage {
+        let Ok(params) = deserialize_params::<FoldingRangeParams>(params) else {
+            return failure(id, CODE_INVALID_PARAMS, "invalid folding range parameters");
+        };
+        let program = self.build_program();
+        let result = self
+            .documents
+            .get(&params.text_document.uri)
+            .and_then(|document| program.source_file(&document.file_name))
+            .map_or_else(Vec::new, folding_ranges);
+        OutgoingMessage::Response(Response::success(
+            id,
+            serde_json::to_value(result).unwrap_or(Value::Null),
+        ))
+    }
+
+    fn selection_range(&self, id: Id, params: Option<Value>) -> OutgoingMessage {
+        let Ok(params) = deserialize_params::<SelectionRangeParams>(params) else {
+            return failure(
+                id,
+                CODE_INVALID_PARAMS,
+                "invalid selection range parameters",
+            );
+        };
+        let program = self.build_program();
+        let result = self
+            .documents
+            .get(&params.text_document.uri)
+            .and_then(|document| program.source_file(&document.file_name))
+            .map_or_else(Vec::new, |source| {
+                params
+                    .positions
+                    .iter()
+                    .filter_map(|position| selection_range_at(source, *position))
+                    .collect()
+            });
+        OutgoingMessage::Response(Response::success(
+            id,
+            serde_json::to_value(result).unwrap_or(Value::Null),
+        ))
+    }
+
     fn call_hierarchy_item_for_symbol(
         &self,
         source: &SourceFile,
@@ -1141,6 +1282,200 @@ fn lightweight_options() -> CompilerOptions {
         no_lib: true,
         ..CompilerOptions::default()
     }
+}
+
+const fn semantic_token_types() -> &'static [&'static str] {
+    &[
+        "namespace",
+        "type",
+        "class",
+        "enum",
+        "interface",
+        "struct",
+        "typeParameter",
+        "parameter",
+        "variable",
+        "property",
+        "enumMember",
+        "event",
+        "function",
+        "method",
+        "macro",
+        "keyword",
+        "modifier",
+        "comment",
+        "string",
+        "number",
+        "regexp",
+        "operator",
+        "decorator",
+    ]
+}
+
+fn semantic_tokens(source: &SourceFile) -> SemanticTokens {
+    let mut tokens = source
+        .parse
+        .arena
+        .iter()
+        .filter_map(|(node, value)| {
+            let token_type = semantic_token_type(source, node, &value.data, value.kind)?;
+            let start = position_at(&source.source_text, value.range.start.get());
+            let end = position_at(&source.source_text, value.range.end.get());
+            (start.line == end.line && end.character > start.character).then_some((
+                start.line,
+                start.character,
+                end.character - start.character,
+                token_type,
+            ))
+        })
+        .collect::<Vec<_>>();
+    tokens.sort_unstable();
+    tokens.dedup_by_key(|token| (token.0, token.1, token.2));
+    let mut data = Vec::with_capacity(tokens.len() * 5);
+    let mut previous_line = 0;
+    let mut previous_start = 0;
+    for (line, start, length, token_type) in tokens {
+        let delta_line = line - previous_line;
+        let delta_start = if delta_line == 0 {
+            start - previous_start
+        } else {
+            start
+        };
+        data.extend([delta_line, delta_start, length, token_type, 0]);
+        previous_line = line;
+        previous_start = start;
+    }
+    SemanticTokens { data }
+}
+
+fn semantic_token_type(
+    source: &SourceFile,
+    node: NodeId,
+    data: &NodeData,
+    kind: ts_ast::SyntaxKind,
+) -> Option<u32> {
+    match data {
+        NodeData::Identifier(identifier) => {
+            if is_parameter_name(source, node) {
+                return Some(7);
+            }
+            let symbol = resolve_symbol(source, node, &identifier.text)
+                .and_then(|symbol| source.binding.symbols.get(symbol));
+            Some(symbol.map_or(8, |symbol| semantic_symbol_type(symbol.flags)))
+        }
+        NodeData::StringLiteral(_) | NodeData::NoSubstitutionTemplateLiteral(_) => Some(18),
+        NodeData::NumericLiteral(_) | NodeData::BigIntLiteral(_) => Some(19),
+        NodeData::RegularExpressionLiteral(_) => Some(20),
+        _ if kind.is_keyword() => Some(15),
+        _ => None,
+    }
+}
+
+fn semantic_symbol_type(flags: SymbolFlags) -> u32 {
+    if flags.intersects(SymbolFlags::CLASS) {
+        2
+    } else if flags.intersects(SymbolFlags::ENUM) {
+        3
+    } else if flags.intersects(SymbolFlags::INTERFACE) {
+        4
+    } else if flags.intersects(SymbolFlags::TYPE_PARAMETER) {
+        6
+    } else if flags.intersects(SymbolFlags::PROPERTY) {
+        9
+    } else if flags.intersects(SymbolFlags::ENUM_MEMBER) {
+        10
+    } else if flags.intersects(SymbolFlags::FUNCTION) {
+        12
+    } else if flags.intersects(SymbolFlags::METHOD) {
+        13
+    } else if flags.intersects(SymbolFlags::MODULE) {
+        0
+    } else if flags.intersects(SymbolFlags::TYPE_ALIAS) {
+        1
+    } else {
+        8
+    }
+}
+
+fn is_parameter_name(source: &SourceFile, node: NodeId) -> bool {
+    let Some(parent) = source.parse.arena.get(node).and_then(|node| node.parent) else {
+        return false;
+    };
+    matches!(
+        source.parse.arena.get(parent).map(|node| &node.data),
+        Some(NodeData::ParameterDeclaration(parameter)) if parameter.name == node
+    )
+}
+
+fn folding_ranges(source: &SourceFile) -> Vec<FoldingRange> {
+    let mut ranges = BTreeSet::new();
+    for (_, node) in source.parse.arena.iter() {
+        if !is_foldable_node(&node.data) {
+            continue;
+        }
+        let start = position_at(&source.source_text, node.range.start.get());
+        let end = position_at(&source.source_text, node.range.end.get());
+        if end.line > start.line {
+            ranges.insert((start.line, start.character, end.line, end.character));
+        }
+    }
+    ranges
+        .into_iter()
+        .map(
+            |(start_line, start_character, end_line, end_character)| FoldingRange {
+                start_line,
+                start_character,
+                end_line,
+                end_character,
+            },
+        )
+        .collect()
+}
+
+fn is_foldable_node(data: &NodeData) -> bool {
+    matches!(
+        data,
+        NodeData::Block(_)
+            | NodeData::ClassDeclaration(_)
+            | NodeData::InterfaceDeclaration(_)
+            | NodeData::EnumDeclaration(_)
+            | NodeData::ModuleBlock(_)
+            | NodeData::ObjectLiteralExpression(_)
+            | NodeData::ArrayLiteralExpression(_)
+            | NodeData::SwitchStatement(_)
+            | NodeData::JsxElement(_)
+    )
+}
+
+fn selection_range_at(source: &SourceFile, position: Position) -> Option<SelectionRange> {
+    let offset = u32::try_from(byte_offset(&source.source_text, position).ok()?).ok()?;
+    let mut node = source
+        .parse
+        .arena
+        .iter()
+        .filter(|(_, node)| node.range.start.get() <= offset && offset <= node.range.end.get())
+        .min_by_key(|(_, node)| node.range.len())
+        .map(|(node, _)| node)?;
+    let mut ranges = Vec::new();
+    loop {
+        let current = source.parse.arena.get(node)?;
+        let range = node_range(source, node)?;
+        if ranges.last() != Some(&range) {
+            ranges.push(range);
+        }
+        let Some(parent) = current.parent else {
+            break;
+        };
+        node = parent;
+    }
+    let mut result = None;
+    for range in ranges.into_iter().rev() {
+        result = Some(SelectionRange {
+            range,
+            parent: result.map(Box::new),
+        });
+    }
+    result
 }
 
 fn document_symbols_for_node(source: &SourceFile, node: NodeId) -> Vec<DocumentSymbol> {
@@ -2570,6 +2905,10 @@ mod tests {
             initialize["result"]["capabilities"]["textDocumentSync"]["change"],
             2
         );
+        let capabilities = &initialize["result"]["capabilities"];
+        assert_eq!(capabilities["semanticTokensProvider"]["full"], true);
+        assert_eq!(capabilities["foldingRangeProvider"], true);
+        assert_eq!(capabilities["selectionRangeProvider"], true);
 
         let opened = reader.read_message::<Value>().unwrap().unwrap();
         assert_eq!(opened["method"], "textDocument/publishDiagnostics");
@@ -2959,5 +3298,92 @@ mod tests {
         );
         assert_eq!(response(44)["result"][0]["name"], "leaf");
         assert_eq!(response(44)["result"][0]["location"]["uri"], uri.0);
+    }
+
+    #[test]
+    fn framed_session_serves_semantic_folding_and_selection_ranges() {
+        let uri = DocumentUri("file:///workspace/ranges.ts".to_owned());
+        let source = concat!(
+            "function outer(name: string) {\n",
+            "  const emoji = \"😀\"; const after = emoji;\n",
+            "  if (name) {\n",
+            "    return after;\n",
+            "  }\n",
+            "}\n"
+        );
+        let after_offset = source.find("after").unwrap();
+        let reference_offset = source.rfind("after").unwrap();
+        let mut input = begin_framed_session();
+        write_open(&mut input, uri.clone(), source);
+        for (id, method) in [
+            (50_i64, "textDocument/semanticTokens/full"),
+            (51_i64, "textDocument/foldingRange"),
+        ] {
+            write(
+                &mut input,
+                &Request::new(
+                    id,
+                    method,
+                    Some(FoldingRangeParams {
+                        text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    }),
+                ),
+            );
+        }
+        write(
+            &mut input,
+            &Request::new(
+                52_i64,
+                "textDocument/selectionRange",
+                Some(SelectionRangeParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    positions: vec![position_at(
+                        source,
+                        u32::try_from(reference_offset + 2).unwrap(),
+                    )],
+                }),
+            ),
+        );
+
+        let output = finish_framed_session(input);
+        let response = |id| output.iter().find(|message| message["id"] == id).unwrap();
+        let data = response(50)["result"]["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| u32::try_from(value.as_u64().unwrap()).unwrap())
+            .collect::<Vec<_>>();
+        let mut line = 0;
+        let mut start = 0;
+        let mut tokens = Vec::new();
+        for token in data.chunks_exact(5) {
+            line += token[0];
+            start = if token[0] == 0 {
+                start + token[1]
+            } else {
+                token[1]
+            };
+            tokens.push((line, start, token[2], token[3]));
+        }
+        let after = position_at(source, u32::try_from(after_offset).unwrap());
+        assert!(tokens.contains(&(after.line, after.character, 5, 8)));
+        assert!(tokens.iter().any(|token| token.2 == 4 && token.3 == 18));
+
+        let folds = response(51)["result"].as_array().unwrap();
+        assert!(
+            folds
+                .iter()
+                .any(|range| range["startLine"] == 0 && range["endLine"] == 5)
+        );
+        assert!(
+            folds
+                .iter()
+                .any(|range| range["startLine"] == 2 && range["endLine"] == 4)
+        );
+
+        let selection = &response(52)["result"][0];
+        assert_eq!(selection["range"]["start"]["line"], 3);
+        assert_eq!(selection["range"]["start"]["character"], 11);
+        assert!(selection["parent"]["parent"].is_object());
     }
 }
