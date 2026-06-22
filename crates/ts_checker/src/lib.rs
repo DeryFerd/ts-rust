@@ -6450,6 +6450,9 @@ impl<'a> DeclarationReachability<'a> {
                     NodeData::ImportEqualsDeclaration(import) => {
                         self.retain_entity(import.module_reference);
                     }
+                    NodeData::ExportAssignment(assignment) => {
+                        self.retain_entity(assignment.expression);
+                    }
                     NodeData::Block(_) | NodeData::ModuleBlock(_) if node_id != declaration => {
                         continue;
                     }
@@ -9911,6 +9914,109 @@ mod tests {
         assert!(retained.contains(&source.statements.nodes[0]));
         assert!(!retained.contains(&source.statements.nodes[1]));
         assert!(retained.contains(&source.statements.nodes[2]));
+    }
+
+    #[test]
+    fn default_export_assignment_retains_private_alias_chain_across_modules() {
+        let color = parse_source_file(
+            r"
+                interface Color { c: string; }
+                type Paint = Color;
+                interface Unrelated { hidden: string; }
+                export default Paint;
+            ",
+        );
+        let file1 = parse_source_file(
+            r#"
+                import Paint from "./color";
+                export declare function styled(): Paint;
+            "#,
+        );
+        let file2 = parse_source_file(
+            r#"
+                import { styled } from "./file1";
+                export const value = styled();
+            "#,
+        );
+        assert!(color.diagnostics.is_empty(), "{:?}", color.diagnostics);
+        assert!(file1.diagnostics.is_empty(), "{:?}", file1.diagnostics);
+        assert!(file2.diagnostics.is_empty(), "{:?}", file2.diagnostics);
+        let color_bindings = bind_source_file(&color.arena, color.source_file);
+        let file1_bindings = bind_source_file(&file1.arena, file1.source_file);
+        let file2_bindings = bind_source_file(&file2.arena, file2.source_file);
+        let no_modules = BTreeMap::new();
+        let file1_modules = BTreeMap::from([("./color".into(), 0)]);
+        let file2_modules = BTreeMap::from([("./file1".into(), 1)]);
+        let checked = check_program(&[
+            ProgramSource {
+                arena: &color.arena,
+                source_file: color.source_file,
+                bindings: &color_bindings,
+                resolved_modules: &no_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+            ProgramSource {
+                arena: &file1.arena,
+                source_file: file1.source_file,
+                bindings: &file1_bindings,
+                resolved_modules: &file1_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+            ProgramSource {
+                arena: &file2.arena,
+                source_file: file2.source_file,
+                bindings: &file2_bindings,
+                resolved_modules: &file2_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+        ]);
+        let NodeData::SourceFile(source) = &color.arena.get(color.source_file).unwrap().data else {
+            panic!("expected source file");
+        };
+        let retained = checked.files[0]
+            .declarations_to_emit(color.source_file)
+            .unwrap();
+
+        assert_eq!(retained.len(), 3);
+        assert!(retained.contains(&source.statements.nodes[0]));
+        assert!(retained.contains(&source.statements.nodes[1]));
+        assert!(!retained.contains(&source.statements.nodes[2]));
+        assert!(retained.contains(&source.statements.nodes[3]));
+    }
+
+    #[test]
+    fn export_equals_assignment_retains_private_alias_chain() {
+        let parsed = parse_source_file(
+            r"
+                interface Color { c: string; }
+                type Paint = Color;
+                type PublicColor = Paint;
+                interface Unrelated { hidden: string; }
+                export = PublicColor;
+            ",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let NodeData::SourceFile(source) = &parsed.arena.get(parsed.source_file).unwrap().data
+        else {
+            panic!("expected source file");
+        };
+        let retained = result.declarations_to_emit(parsed.source_file).unwrap();
+
+        assert_eq!(retained.len(), 4);
+        assert!(retained.contains(&source.statements.nodes[0]));
+        assert!(retained.contains(&source.statements.nodes[1]));
+        assert!(retained.contains(&source.statements.nodes[2]));
+        assert!(!retained.contains(&source.statements.nodes[3]));
+        assert!(retained.contains(&source.statements.nodes[4]));
     }
 
     #[test]
