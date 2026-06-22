@@ -1073,10 +1073,14 @@ impl Printer<'_> {
             NodeData::Block(_) => self.emit_block(id)?,
             NodeData::EmptyStatement(_) => self.writer.write(";"),
             NodeData::VariableStatement(data) => {
+                self.emit_runtime_declaration_modifiers(data.modifiers.as_ref());
                 self.emit_variable_list(data.declaration_list)?;
                 self.writer.write(";");
+                let names = self.variable_declaration_names(data.declaration_list)?;
+                self.emit_commonjs_declaration_exports(data.modifiers.as_ref(), &names);
             }
             NodeData::FunctionDeclaration(data) => {
+                self.emit_runtime_declaration_modifiers(data.modifiers.as_ref());
                 if self.has_modifier(data.modifiers.as_ref(), SyntaxKind::AsyncKeyword) {
                     self.writer.write("async ");
                 }
@@ -1091,9 +1095,25 @@ impl Printer<'_> {
                 self.emit_parameters(&data.parameters)?;
                 self.writer.write(" ");
                 self.emit_block(data.body.expect("body checked above"))?;
+                if let Some(name) = data.name {
+                    let names = self.declaration_names(&[name]);
+                    self.emit_commonjs_declaration_exports(data.modifiers.as_ref(), &names);
+                }
             }
-            NodeData::ClassDeclaration(data) => self.emit_class(data)?,
-            NodeData::EnumDeclaration(data) => self.emit_enum(data)?,
+            NodeData::ClassDeclaration(data) => {
+                self.emit_runtime_declaration_modifiers(data.modifiers.as_ref());
+                self.emit_class(data)?;
+                if let Some(name) = data.name {
+                    let names = self.declaration_names(&[name]);
+                    self.emit_commonjs_declaration_exports(data.modifiers.as_ref(), &names);
+                }
+            }
+            NodeData::EnumDeclaration(data) => {
+                self.emit_runtime_declaration_modifiers(data.modifiers.as_ref());
+                self.emit_enum(data)?;
+                let names = self.declaration_names(&[data.name]);
+                self.emit_commonjs_declaration_exports(data.modifiers.as_ref(), &names);
+            }
             NodeData::ReturnStatement(data) => {
                 self.writer.write("return");
                 if let Some(expression) = data.expression {
@@ -1659,6 +1679,75 @@ impl Printer<'_> {
                     .is_some_and(|node| node.kind == kind)
             })
         })
+    }
+
+    fn emit_runtime_declaration_modifiers(&mut self, modifiers: Option<&ts_ast::ModifierList>) {
+        if self.settings.module == ModuleKind::CommonJs {
+            return;
+        }
+        if self.has_modifier(modifiers, SyntaxKind::ExportKeyword) {
+            self.writer.write("export ");
+        }
+        if self.has_modifier(modifiers, SyntaxKind::DefaultKeyword) {
+            self.writer.write("default ");
+        }
+    }
+
+    fn variable_declaration_names(&self, list: NodeId) -> Result<Vec<String>, EmitError> {
+        let node = self.node(list)?;
+        let NodeData::VariableDeclarationList(data) = &node.data else {
+            return Err(Self::unsupported(list, node.kind));
+        };
+        Ok(self.declaration_names(
+            &data
+                .declarations
+                .nodes
+                .iter()
+                .filter_map(|declaration| {
+                    let NodeData::VariableDeclaration(data) = &self.arena.get(*declaration)?.data
+                    else {
+                        return None;
+                    };
+                    Some(data.name)
+                })
+                .collect::<Vec<_>>(),
+        ))
+    }
+
+    fn declaration_names(&self, nodes: &[NodeId]) -> Vec<String> {
+        nodes
+            .iter()
+            .filter_map(|node| match &self.arena.get(*node)?.data {
+                NodeData::Identifier(identifier) => Some(identifier.text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn emit_commonjs_declaration_exports(
+        &mut self,
+        modifiers: Option<&ts_ast::ModifierList>,
+        names: &[String],
+    ) {
+        if self.settings.module != ModuleKind::CommonJs
+            || !self.has_modifier(modifiers, SyntaxKind::ExportKeyword)
+        {
+            return;
+        }
+        for (index, name) in names.iter().enumerate() {
+            self.writer.newline();
+            let exported = if index == 0 && self.has_modifier(modifiers, SyntaxKind::DefaultKeyword)
+            {
+                "default"
+            } else {
+                name
+            };
+            self.writer.write("exports.");
+            self.writer.write(exported);
+            self.writer.write(" = ");
+            self.writer.write(name);
+            self.writer.write(";");
+        }
     }
 
     #[allow(clippy::too_many_lines)]
@@ -2516,6 +2605,19 @@ mod tests {
     }
 
     #[test]
+    fn preserves_export_modifiers_for_es_modules() {
+        let result = emit_with(
+            "export const value: number = 1; export default function read() { return value; }",
+            ScriptTarget::EsNext,
+            ModuleKind::EsNext,
+        );
+        assert_eq!(
+            result.code,
+            "export const value = 1;\nexport default function read() {\n  return value;\n}\n"
+        );
+    }
+
+    #[test]
     fn transforms_es_modules_to_commonjs() {
         let result = emit_with(
             "import main, { read as load, write } from 'pkg'; import 'side'; export { load as result }; export * from 'other'; export default main;",
@@ -2526,6 +2628,23 @@ mod tests {
             result.code,
             "const main = require(\"pkg\").default;\nconst { read: load, write } = require(\"pkg\");\nrequire(\"side\");\nexports.result = load;\nObject.assign(exports, require(\"other\"));\nexports.default = main;\n"
         );
+    }
+
+    #[test]
+    fn transforms_exported_declarations_to_commonjs() {
+        let result = emit_with(
+            "export const value = 1; export function read() { return value; } export class Box {} export enum Color { Red }",
+            ScriptTarget::Es2015,
+            ModuleKind::CommonJs,
+        );
+        for assignment in [
+            "exports.value = value;",
+            "exports.read = read;",
+            "exports.Box = Box;",
+            "exports.Color = Color;",
+        ] {
+            assert!(result.code.contains(assignment), "{}", result.code);
+        }
     }
 
     #[test]
