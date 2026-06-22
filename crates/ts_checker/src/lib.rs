@@ -5635,11 +5635,19 @@ impl<'a> Checker<'a> {
                 data.type_,
                 data.type_parameters.as_ref(),
             ),
-            NodeData::ConstructorTypeNode(data) => self.signature_type(
-                &data.parameters.nodes,
-                data.type_,
-                data.type_parameters.as_ref(),
-            ),
+            NodeData::ConstructorTypeNode(data) => {
+                let function = self.signature_type(
+                    &data.parameters.nodes,
+                    data.type_,
+                    data.type_parameters.as_ref(),
+                );
+                let TypeKind::Function(signature) =
+                    self.result.types.get(function).unwrap().kind.clone()
+                else {
+                    unreachable!("signature_type always creates a function type");
+                };
+                self.result.types.alloc(TypeKind::Constructor(signature))
+            }
             NodeData::IndexedAccessTypeNode(data) => {
                 let object = self.type_from_type_node(data.object_type);
                 let index = self.type_from_type_node(data.index_type);
@@ -8824,6 +8832,28 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(constructors.len(), 2);
+        let timestamped_constructor = constructors
+            .iter()
+            .find(|constructor| {
+                matches!(
+                    &checked.files[1]
+                        .types
+                        .get(constructor.return_type)
+                        .unwrap()
+                        .kind,
+                    TypeKind::Object(instance) if instance.properties.contains_key("timestamp")
+                )
+            })
+            .unwrap();
+        assert_eq!(timestamped_constructor.parameters.len(), 1);
+        assert!(matches!(
+            checked.files[1]
+                .types
+                .get(timestamped_constructor.parameters[0])
+                .unwrap()
+                .kind,
+            TypeKind::Array(element) if element == checked.files[1].types.any()
+        ));
         let instance_properties = constructors
             .iter()
             .filter_map(|constructor| {
