@@ -4359,7 +4359,13 @@ impl<'a> Checker<'a> {
         ) {
             let mut saw_return = false;
             self.check_node(data.body, expected_return, &mut saw_return);
-            expected_return.unwrap_or_else(|| self.result.types.any())
+            expected_return.unwrap_or_else(|| {
+                if self.options.is_javascript_file && !saw_return {
+                    self.result.types.void()
+                } else {
+                    self.result.types.any()
+                }
+            })
         } else {
             let return_context = expected_return.filter(|expected| {
                 !matches!(
@@ -4450,7 +4456,13 @@ impl<'a> Checker<'a> {
                     .as_ref()
                     .map(|signature| signature.return_type)
             })
-            .unwrap_or_else(|| self.result.types.any());
+            .unwrap_or_else(|| {
+                if self.options.is_javascript_file && !self.function_body_has_return(data.body) {
+                    self.result.types.void()
+                } else {
+                    self.result.types.any()
+                }
+            });
         let mut saw_return = false;
         self.check_node(data.body, Some(return_type), &mut saw_return);
         self.local_scopes.pop();
@@ -5125,11 +5137,51 @@ impl<'a> Checker<'a> {
     }
 
     fn function_type(&mut self, data: &ts_ast::FunctionDeclarationData) -> TypeId {
-        self.signature_type(
+        let function = self.signature_type(
             &data.parameters.nodes,
             data.type_,
             data.type_parameters.as_ref(),
-        )
+        );
+        if self.options.is_javascript_file
+            && data.type_.is_none()
+            && data
+                .body
+                .is_some_and(|body| !self.function_body_has_return(body))
+        {
+            let void = self.result.types.void();
+            if let TypeKind::Function(signature) =
+                &mut self.result.types.types[function.index()].kind
+            {
+                signature.return_type = void;
+            }
+        }
+        function
+    }
+
+    fn function_body_has_return(&self, body: NodeId) -> bool {
+        let mut pending = vec![body];
+        while let Some(node_id) = pending.pop() {
+            let Some(node) = self.arena.get(node_id) else {
+                continue;
+            };
+            if matches!(node.data, NodeData::ReturnStatement(_)) {
+                return true;
+            }
+            if node_id != body
+                && matches!(
+                    node.data,
+                    NodeData::FunctionDeclaration(_)
+                        | NodeData::FunctionExpression(_)
+                        | NodeData::ArrowFunction(_)
+                )
+            {
+                continue;
+            }
+            if let Some(children) = self.children.get(&node_id) {
+                pending.extend(children.iter().copied());
+            }
+        }
+        false
     }
 
     fn function_signature(&mut self, data: &ts_ast::FunctionDeclarationData) -> FunctionType {
@@ -8565,6 +8617,63 @@ mod tests {
                 "Expected 1 arguments, but got 0.",
                 "Expected 1 arguments, but got 3."
             ]
+        );
+    }
+
+    #[test]
+    fn javascript_body_only_functions_infer_void_and_remain_reachable() {
+        let parsed = parse_source_file(
+            r"
+                const foo = { f1: (params) => {} };
+                function f2(x) { foo.f1({ x, arguments: [] }); }
+                f2(1, 2, 3);
+            ",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file_with_options(
+            &parsed.arena,
+            parsed.source_file,
+            &bindings,
+            CheckerOptions {
+                is_javascript_file: true,
+                ..CheckerOptions::default()
+            },
+        );
+        let root = bindings.root_scope().unwrap();
+        let f2 = result
+            .type_of_symbol(root.symbols.get("f2").unwrap())
+            .unwrap();
+        let TypeKind::Function(f2) = &result.types.get(f2).unwrap().kind else {
+            panic!("expected f2 function type");
+        };
+        assert_eq!(f2.parameters, [result.types.any()]);
+        assert_eq!(f2.return_type, result.types.void());
+
+        let foo = result
+            .type_of_symbol(root.symbols.get("foo").unwrap())
+            .unwrap();
+        let TypeKind::Object(foo) = &result.types.get(foo).unwrap().kind else {
+            panic!("expected foo object type");
+        };
+        let TypeKind::Function(f1) = &result.types.get(foo.properties["f1"]).unwrap().kind else {
+            panic!("expected f1 function type");
+        };
+        assert_eq!(f1.parameters, [result.types.any()]);
+        assert_eq!(f1.return_type, result.types.void());
+
+        let NodeData::SourceFile(source) = &parsed.arena.get(parsed.source_file).unwrap().data
+        else {
+            panic!("expected source file");
+        };
+        assert_eq!(
+            result
+                .declarations_to_emit(parsed.source_file)
+                .unwrap()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            source.statements.nodes[..2]
         );
     }
 
