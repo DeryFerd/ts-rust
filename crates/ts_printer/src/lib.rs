@@ -45,6 +45,7 @@ pub struct EmitContext<'a> {
     pub amd_dependencies: &'a [AmdDependency<'a>],
     pub enum_member_values: &'a BTreeMap<NodeId, EmitConstantValue>,
     pub enum_access_values: &'a BTreeMap<NodeId, EmitConstantValue>,
+    pub import_runtime_meanings: &'a BTreeMap<NodeId, bool>,
     pub preserve_const_enums: bool,
     pub inline_const_enums: bool,
 }
@@ -150,6 +151,7 @@ pub fn emit_source_file_with_settings_and_bindings(
     bindings: &BindResult,
 ) -> Result<EmitResult, EmitError> {
     let empty_enum_values = BTreeMap::new();
+    let empty_import_meanings = BTreeMap::new();
     emit_source_file_with_context(
         arena,
         source_file,
@@ -162,6 +164,7 @@ pub fn emit_source_file_with_settings_and_bindings(
             amd_dependencies: &[],
             enum_member_values: &empty_enum_values,
             enum_access_values: &empty_enum_values,
+            import_runtime_meanings: &empty_import_meanings,
             preserve_const_enums: true,
             inline_const_enums: false,
         },
@@ -213,6 +216,7 @@ pub fn emit_source_file_with_context(
         commonjs_module_transform: settings.module == ModuleKind::CommonJs,
         enum_member_values: context.enum_member_values,
         enum_access_values: context.enum_access_values,
+        import_runtime_meanings: context.import_runtime_meanings,
         const_enum_emit_mode: ConstEnumEmitMode::new(
             context.preserve_const_enums,
             context.inline_const_enums,
@@ -226,8 +230,12 @@ pub fn emit_source_file_with_context(
     let source_end = node.range.end.get();
     printer.runtime_identifier_uses = runtime_identifier_uses(arena, source_file);
     if settings.module == ModuleKind::CommonJs {
-        printer.commonjs_default_imports =
-            commonjs_default_imports(arena, &data.statements, &printer.runtime_identifier_uses);
+        printer.commonjs_default_imports = commonjs_default_imports(
+            arena,
+            &data.statements,
+            &printer.runtime_identifier_uses,
+            context.import_runtime_meanings,
+        );
     }
     let is_external_module = data.statements.nodes.iter().any(|statement| {
         arena
@@ -273,6 +281,7 @@ pub fn emit_source_file_with_context(
             arena,
             &data.statements,
             &printer.runtime_identifier_uses,
+            context.import_runtime_meanings,
         ) {
             printer.emit_import_star_helper();
         }
@@ -341,7 +350,7 @@ pub fn emit_source_file_with_context(
                 node.range.start.get(),
                 previous_emitted,
             );
-            previous_emitted = printer.statement_emits_runtime(node);
+            previous_emitted = printer.statement_emits_runtime(*statement, node);
             if previous_emitted {
                 printer.emit_reference_directives_between(
                     reference_owner_start,
@@ -394,8 +403,12 @@ fn source_needs_import_star_helper(
     arena: &NodeArena,
     statements: &NodeList,
     runtime_identifier_uses: &HashSet<String>,
+    import_runtime_meanings: &BTreeMap<NodeId, bool>,
 ) -> bool {
     statements.nodes.iter().any(|statement| {
+        if import_runtime_meanings.get(statement) == Some(&false) {
+            return false;
+        }
         let Some(NodeData::ImportDeclaration(import)) =
             arena.get(*statement).map(|node| &node.data)
         else {
@@ -425,10 +438,14 @@ fn commonjs_default_imports(
     arena: &NodeArena,
     statements: &NodeList,
     runtime_identifier_uses: &HashSet<String>,
+    import_runtime_meanings: &BTreeMap<NodeId, bool>,
 ) -> HashMap<String, String> {
     let mut imports = HashMap::new();
     let mut module_name_counts = HashMap::<String, usize>::new();
     for statement in &statements.nodes {
+        if import_runtime_meanings.get(statement) == Some(&false) {
+            continue;
+        }
         let Some(NodeData::ImportDeclaration(import)) =
             arena.get(*statement).map(|node| &node.data)
         else {
@@ -2003,7 +2020,12 @@ impl GeneratedNames {
 
 impl SystemModulePlan {
     #[allow(clippy::too_many_lines)]
-    fn analyze(arena: &NodeArena, bindings: &BindResult, data: &ts_ast::SourceFileData) -> Self {
+    fn analyze(
+        arena: &NodeArena,
+        bindings: &BindResult,
+        data: &ts_ast::SourceFileData,
+        import_runtime_meanings: &BTreeMap<NodeId, bool>,
+    ) -> Self {
         let mut names = GeneratedNames::new(arena);
         let export_function = names.generate("exports");
         let context_object = names.generate("context");
@@ -2011,6 +2033,9 @@ impl SystemModulePlan {
         let mut hoisted_names = Vec::new();
         let mut identifier_rewrites = HashMap::new();
         for statement in &data.statements.nodes {
+            if import_runtime_meanings.get(statement) == Some(&false) {
+                continue;
+            }
             let Some(node) = arena.get(*statement) else {
                 continue;
             };
@@ -2239,6 +2264,7 @@ struct Printer<'a> {
     commonjs_module_transform: bool,
     enum_member_values: &'a BTreeMap<NodeId, EmitConstantValue>,
     enum_access_values: &'a BTreeMap<NodeId, EmitConstantValue>,
+    import_runtime_meanings: &'a BTreeMap<NodeId, bool>,
     const_enum_emit_mode: ConstEnumEmitMode,
     enum_access_fallbacks: HashMap<NodeId, EmitConstantValue>,
 }
@@ -2251,8 +2277,12 @@ impl Printer<'_> {
         context: &EmitContext<'_>,
     ) -> Result<EmitResult, EmitError> {
         self.commonjs_module_transform = true;
-        self.commonjs_default_imports =
-            commonjs_default_imports(self.arena, &data.statements, &self.runtime_identifier_uses);
+        self.commonjs_default_imports = commonjs_default_imports(
+            self.arena,
+            &data.statements,
+            &self.runtime_identifier_uses,
+            context.import_runtime_meanings,
+        );
         let mut dependencies = context
             .amd_dependencies
             .iter()
@@ -2269,7 +2299,8 @@ impl Printer<'_> {
             else {
                 continue;
             };
-            if import.is_type_only
+            if !self.import_semantically_has_runtime_value(*statement)
+                || import.is_type_only
                 || (!self.has_modifier(import.modifiers.as_ref(), SyntaxKind::ExportKeyword)
                     && !self.import_binding_is_used(import.name))
             {
@@ -2345,6 +2376,7 @@ impl Printer<'_> {
             self.arena,
             &data.statements,
             &self.runtime_identifier_uses,
+            context.import_runtime_meanings,
         ) {
             self.emit_import_star_helper();
         }
@@ -2369,7 +2401,7 @@ impl Printer<'_> {
                 if statement_emits_javascript(self.arena, node) {
                     self.emit_source_comments_between(previous_end, node.range.start.get());
                 }
-                if self.statement_emits_runtime(node) {
+                if self.statement_emits_runtime(*statement, node) {
                     self.emit_reference_directives_between(
                         reference_owner_start,
                         node.range.start.get(),
@@ -2410,7 +2442,12 @@ impl Printer<'_> {
         &mut self,
         data: &ts_ast::SourceFileData,
     ) -> Result<EmitResult, EmitError> {
-        let plan = SystemModulePlan::analyze(self.arena, self.bindings, data);
+        let plan = SystemModulePlan::analyze(
+            self.arena,
+            self.bindings,
+            data,
+            self.import_runtime_meanings,
+        );
         self.identifier_rewrites = plan.identifier_rewrites;
         self.system_predeclared_names
             .extend(plan.hoisted_names.iter().cloned());
@@ -2510,6 +2547,9 @@ impl Printer<'_> {
             | NodeData::ExportDeclaration(_)
             | NodeData::ExportAssignment(_) => Ok(()),
             NodeData::ImportEqualsDeclaration(import) => {
+                if !self.import_semantically_has_runtime_value(statement) {
+                    return Ok(());
+                }
                 if external_module_reference_text(self.arena, import.module_reference).is_some() {
                     return Ok(());
                 }
@@ -2864,7 +2904,7 @@ impl Printer<'_> {
         EmitError { node: id, kind }
     }
 
-    fn statement_emits_runtime(&self, node: &Node) -> bool {
+    fn statement_emits_runtime(&self, id: NodeId, node: &Node) -> bool {
         if declaration_has_modifier(self.arena, node, SyntaxKind::DeclareKeyword)
             || (is_const_enum_declaration(self.arena, node)
                 && !self.const_enum_emit_mode.preserves_declarations())
@@ -2872,9 +2912,10 @@ impl Printer<'_> {
             return false;
         }
         match &node.data {
-            NodeData::ImportDeclaration(import) => self.import_has_runtime_use(import),
+            NodeData::ImportDeclaration(import) => self.import_has_runtime_use(id, import),
             NodeData::ImportEqualsDeclaration(import) => {
-                !import.is_type_only
+                self.import_semantically_has_runtime_value(id)
+                    && !import.is_type_only
                     && (self.has_modifier(import.modifiers.as_ref(), SyntaxKind::ExportKeyword)
                         || self.import_binding_is_used(import.name))
             }
@@ -2941,11 +2982,12 @@ impl Printer<'_> {
             return Ok(());
         }
         match &node.data {
-            NodeData::ImportDeclaration(import) if !self.import_has_runtime_use(import) => {
+            NodeData::ImportDeclaration(import) if !self.import_has_runtime_use(id, import) => {
                 return Ok(());
             }
             NodeData::ImportEqualsDeclaration(import)
-                if import.is_type_only
+                if !self.import_semantically_has_runtime_value(id)
+                    || import.is_type_only
                     || (!self
                         .has_modifier(import.modifiers.as_ref(), SyntaxKind::ExportKeyword)
                         && !self.import_binding_is_used(import.name)) =>
@@ -4970,7 +5012,21 @@ impl Printer<'_> {
             .is_ok_and(|name| self.runtime_identifier_uses.contains(name))
     }
 
-    fn import_has_runtime_use(&self, import: &ts_ast::ImportDeclarationData) -> bool {
+    fn import_semantically_has_runtime_value(&self, declaration: NodeId) -> bool {
+        self.import_runtime_meanings
+            .get(&declaration)
+            .copied()
+            .unwrap_or(true)
+    }
+
+    fn import_has_runtime_use(
+        &self,
+        declaration: NodeId,
+        import: &ts_ast::ImportDeclarationData,
+    ) -> bool {
+        if !self.import_semantically_has_runtime_value(declaration) {
+            return false;
+        }
         if import.attributes.is_some() {
             return true;
         }
@@ -6771,6 +6827,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let enum_values = BTreeMap::new();
+        let import_meanings = BTreeMap::new();
         emit_source_file_with_context(
             &parsed.arena,
             parsed.source_file,
@@ -6792,6 +6849,7 @@ mod tests {
                 amd_dependencies: &dependencies,
                 enum_member_values: &enum_values,
                 enum_access_values: &enum_values,
+                import_runtime_meanings: &import_meanings,
                 preserve_const_enums: true,
                 inline_const_enums: false,
             },
@@ -7054,6 +7112,7 @@ mod tests {
             })
             .collect::<BTreeMap<_, _>>();
         let member_values = BTreeMap::new();
+        let import_meanings = BTreeMap::new();
         let emitted = emit_source_file_with_context(
             &parsed.arena,
             parsed.source_file,
@@ -7075,6 +7134,7 @@ mod tests {
                 amd_dependencies: &[],
                 enum_member_values: &member_values,
                 enum_access_values: &accesses,
+                import_runtime_meanings: &import_meanings,
                 preserve_const_enums: false,
                 inline_const_enums: true,
             },

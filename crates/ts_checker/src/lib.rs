@@ -346,6 +346,9 @@ pub struct CheckResult {
     pub node_types: BTreeMap<NodeId, TypeId>,
     pub enum_member_values: BTreeMap<NodeId, EnumConstantValue>,
     pub enum_access_values: BTreeMap<NodeId, EnumConstantValue>,
+    /// Resolved import declarations and whether their target has runtime value meaning.
+    /// Missing entries are unresolved and should retain the emitter's syntactic fallback.
+    pub import_runtime_meanings: BTreeMap<NodeId, bool>,
     /// Declaration statements retained for emit, keyed by source file or module block.
     pub declaration_reachability: BTreeMap<NodeId, BTreeSet<NodeId>>,
     pub diagnostics: Vec<CheckDiagnostic>,
@@ -431,6 +434,7 @@ pub fn empty_check_result() -> CheckResult {
         node_types: BTreeMap::new(),
         enum_member_values: BTreeMap::new(),
         enum_access_values: BTreeMap::new(),
+        import_runtime_meanings: BTreeMap::new(),
         declaration_reachability: BTreeMap::new(),
         diagnostics: Vec::new(),
     }
@@ -530,16 +534,11 @@ impl<'a> ProgramChecker<'a> {
                 }
             })
             .collect::<Vec<_>>();
-        let exports = self
-            .sources
-            .iter()
-            .zip(&preliminary)
-            .map(|(source, result)| Self::module_exports(source, result))
-            .collect::<Vec<_>>();
         let (globals, duplicate_globals) = self.globals(&preliminary);
         let mut files = Vec::with_capacity(self.sources.len());
         for (file_index, source) in self.sources.iter().enumerate() {
-            let (external_symbols, mut import_diagnostics) = Self::imports(source, &exports);
+            let (external_symbols, mut import_diagnostics, import_runtime_meanings) =
+                self.imports(source, &preliminary);
             let mut result = if source.is_default_library {
                 preliminary[file_index].clone()
             } else {
@@ -551,6 +550,7 @@ impl<'a> ProgramChecker<'a> {
             if source.is_default_library || source.skip_diagnostics {
                 result.diagnostics.clear();
             }
+            result.import_runtime_meanings = import_runtime_meanings;
             result.diagnostics.append(&mut import_diagnostics);
             files.push(result);
         }
@@ -564,19 +564,242 @@ impl<'a> ProgramChecker<'a> {
         ProgramCheckResult { files }
     }
 
-    fn module_exports(
-        source: &ProgramSource<'_>,
-        result: &CheckResult,
-    ) -> BTreeMap<String, TypeDescriptor> {
+    fn resolved_module_export_symbols(
+        &self,
+        target: usize,
+        specifier: &str,
+    ) -> BTreeMap<String, SymbolId> {
+        let Some(source) = self.sources.get(target) else {
+            return BTreeMap::new();
+        };
+        let ambient = source
+            .bindings
+            .root_scope()
+            .and_then(|scope| scope.symbols.get(specifier))
+            .and_then(|symbol| source.bindings.symbols.get(symbol))
+            .filter(|symbol| {
+                symbol
+                    .flags
+                    .contains(ts_binder::SymbolFlags::NAMESPACE_MODULE)
+            });
+        if let Some(module) = ambient {
+            return module
+                .members
+                .iter()
+                .map(|(name, symbol)| (name.to_owned(), symbol))
+                .collect();
+        }
         source
             .bindings
             .exports
             .iter()
+            .map(|(name, symbol)| (name.to_owned(), symbol))
+            .collect()
+    }
+
+    fn resolved_module_exports(
+        &self,
+        target: usize,
+        specifier: &str,
+        result: &CheckResult,
+    ) -> BTreeMap<String, TypeDescriptor> {
+        let Some(source) = self.sources.get(target) else {
+            return BTreeMap::new();
+        };
+        self.resolved_module_export_symbols(target, specifier)
+            .into_iter()
             .filter_map(|(name, symbol)| {
-                Self::describe_symbol(source, result, symbol)
-                    .map(|descriptor| (name.to_owned(), descriptor))
+                Self::describe_symbol(source, result, symbol).map(|descriptor| (name, descriptor))
             })
             .collect()
+    }
+
+    fn import_runtime_meaning(
+        &self,
+        source: &ProgramSource<'_>,
+        declaration: NodeId,
+    ) -> Option<bool> {
+        match &source.arena.get(declaration)?.data {
+            NodeData::ImportDeclaration(import) => {
+                let specifier = string_literal_text(source.arena, import.module_specifier)?;
+                let target = source.resolved_modules.get(specifier).copied()?;
+                let exports = self.resolved_module_export_symbols(target, specifier);
+                let Some(clause) = import.import_clause else {
+                    return Some(true);
+                };
+                let NodeData::ImportClause(clause) = &source.arena.get(clause)?.data else {
+                    return Some(true);
+                };
+                if clause.phase_modifier == Some(SyntaxKind::TypeKeyword) {
+                    return Some(false);
+                }
+                let target_source = self.sources.get(target)?;
+                let mut has_value = clause.name.is_some_and(|_| {
+                    exports.get("default").is_some_and(|symbol| {
+                        Self::symbol_has_runtime_value(target_source, *symbol, &mut HashSet::new())
+                    })
+                });
+                if let Some(bindings) = clause.named_bindings {
+                    match &source.arena.get(bindings)?.data {
+                        NodeData::NamespaceImport(_) => {
+                            has_value |= exports.values().any(|symbol| {
+                                Self::symbol_has_runtime_value(
+                                    target_source,
+                                    *symbol,
+                                    &mut HashSet::new(),
+                                )
+                            });
+                        }
+                        NodeData::NamedImports(imports) => {
+                            has_value |= imports.elements.nodes.iter().any(|specifier| {
+                                let Some(NodeData::ImportSpecifier(import)) =
+                                    source.arena.get(*specifier).map(|node| &node.data)
+                                else {
+                                    return false;
+                                };
+                                if import.is_type_only {
+                                    return false;
+                                }
+                                let imported = import.property_name.unwrap_or(import.name);
+                                let Some(name) = identifier_text(source.arena, imported) else {
+                                    return false;
+                                };
+                                exports.get(name).is_some_and(|symbol| {
+                                    Self::symbol_has_runtime_value(
+                                        target_source,
+                                        *symbol,
+                                        &mut HashSet::new(),
+                                    )
+                                })
+                            });
+                        }
+                        _ => return Some(true),
+                    }
+                }
+                Some(has_value)
+            }
+            NodeData::ImportEqualsDeclaration(import) => {
+                if import.is_type_only {
+                    return Some(false);
+                }
+                if let Some(specifier) =
+                    Self::external_module_reference_text(source.arena, import.module_reference)
+                {
+                    let target = source.resolved_modules.get(specifier).copied()?;
+                    let exports = self.resolved_module_export_symbols(target, specifier);
+                    let target_source = self.sources.get(target)?;
+                    let symbol = exports.get("export=").copied();
+                    return Some(symbol.map_or_else(
+                        || {
+                            exports.values().any(|symbol| {
+                                Self::symbol_has_runtime_value(
+                                    target_source,
+                                    *symbol,
+                                    &mut HashSet::new(),
+                                )
+                            })
+                        },
+                        |symbol| {
+                            Self::symbol_has_runtime_value(
+                                target_source,
+                                symbol,
+                                &mut HashSet::new(),
+                            )
+                        },
+                    ));
+                }
+                let symbol = Self::resolve_entity_symbol(source, import.module_reference)?;
+                Some(Self::symbol_has_runtime_value(
+                    source,
+                    symbol,
+                    &mut HashSet::new(),
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    fn external_module_reference_text(arena: &NodeArena, reference: NodeId) -> Option<&str> {
+        let NodeData::ExternalModuleReference(reference) = &arena.get(reference)?.data else {
+            return None;
+        };
+        string_literal_text(arena, reference.expression)
+    }
+
+    fn resolve_entity_symbol(source: &ProgramSource<'_>, entity: NodeId) -> Option<SymbolId> {
+        let mut current = entity;
+        while let Some(NodeData::QualifiedName(name)) =
+            source.arena.get(current).map(|node| &node.data)
+        {
+            current = name.left;
+        }
+        let name = identifier_text(source.arena, current)?;
+        source.bindings.resolve_name_at(current, name)
+    }
+
+    fn symbol_has_runtime_value(
+        source: &ProgramSource<'_>,
+        symbol: SymbolId,
+        visited: &mut HashSet<SymbolId>,
+    ) -> bool {
+        let Some(symbol) = source.bindings.symbols.get(symbol) else {
+            return true;
+        };
+        let target = symbol.target.unwrap_or(symbol.id);
+        if !visited.insert(target) {
+            return false;
+        }
+        let Some(symbol) = source.bindings.symbols.get(target) else {
+            return true;
+        };
+        if symbol.declarations.iter().any(|declaration| {
+            matches!(
+                source.arena.get(*declaration).map(|node| &node.data),
+                Some(
+                    NodeData::VariableDeclaration(_)
+                        | NodeData::FunctionDeclaration(_)
+                        | NodeData::ClassDeclaration(_)
+                )
+            ) || matches!(
+                source.arena.get(*declaration).map(|node| &node.data),
+                Some(NodeData::EnumDeclaration(enum_))
+                    if !Self::has_modifier(source.arena, enum_.modifiers.as_ref(), SyntaxKind::ConstKeyword)
+            )
+        }) {
+            return true;
+        }
+        for declaration in &symbol.declarations {
+            let Some(NodeData::ExportAssignment(assignment)) =
+                source.arena.get(*declaration).map(|node| &node.data)
+            else {
+                continue;
+            };
+            if let Some(target) = Self::resolve_entity_symbol(source, assignment.expression) {
+                if Self::symbol_has_runtime_value(source, target, visited) {
+                    return true;
+                }
+            } else {
+                return true;
+            }
+        }
+        symbol
+            .members
+            .iter()
+            .any(|(_, member)| Self::symbol_has_runtime_value(source, member, &mut visited.clone()))
+    }
+
+    fn has_modifier(
+        arena: &NodeArena,
+        modifiers: Option<&ts_ast::ModifierList>,
+        kind: SyntaxKind,
+    ) -> bool {
+        modifiers.is_some_and(|modifiers| {
+            modifiers
+                .list
+                .nodes
+                .iter()
+                .any(|modifier| arena.get(*modifier).is_some_and(|node| node.kind == kind))
+        })
     }
 
     fn globals(&self, results: &[CheckResult]) -> GlobalCollection {
@@ -682,16 +905,23 @@ impl<'a> ProgramChecker<'a> {
     }
 
     fn imports(
+        &self,
         source: &ProgramSource<'_>,
-        exports: &[BTreeMap<String, TypeDescriptor>],
-    ) -> (HashMap<SymbolId, TypeDescriptor>, Vec<CheckDiagnostic>) {
+        results: &[CheckResult],
+    ) -> (
+        HashMap<SymbolId, TypeDescriptor>,
+        Vec<CheckDiagnostic>,
+        BTreeMap<NodeId, bool>,
+    ) {
         let mut symbols = HashMap::new();
         let mut diagnostics = Vec::new();
+        let mut runtime_meanings = BTreeMap::new();
         let Some(NodeData::SourceFile(file)) =
             source.arena.get(source.source_file).map(|node| &node.data)
         else {
-            return (symbols, diagnostics);
+            return (symbols, diagnostics, runtime_meanings);
         };
+        runtime_meanings = self.collect_import_runtime_meanings(source, &file.statements.nodes);
         for statement in &file.statements.nodes {
             let Some(NodeData::ImportDeclaration(import)) =
                 source.arena.get(*statement).map(|node| &node.data)
@@ -704,9 +934,10 @@ impl<'a> ProgramChecker<'a> {
             let Some(target) = source.resolved_modules.get(specifier).copied() else {
                 continue;
             };
-            let Some(module_exports) = exports.get(target) else {
+            let Some(target_result) = results.get(target) else {
                 continue;
             };
+            let module_exports = self.resolved_module_exports(target, specifier, target_result);
             let Some(clause) = import.import_clause else {
                 continue;
             };
@@ -723,7 +954,7 @@ impl<'a> ProgramChecker<'a> {
                     "default",
                     specifier,
                     name,
-                    module_exports,
+                    &module_exports,
                     &mut symbols,
                     &mut diagnostics,
                 );
@@ -753,7 +984,7 @@ impl<'a> ProgramChecker<'a> {
                         imported_name,
                         specifier,
                         *specifier_node,
-                        module_exports,
+                        &module_exports,
                         &mut symbols,
                         &mut diagnostics,
                     );
@@ -770,7 +1001,7 @@ impl<'a> ProgramChecker<'a> {
                 symbols.insert(
                     *symbol,
                     TypeDescriptor::Object {
-                        properties: module_exports.clone(),
+                        properties: module_exports,
                         optional_properties: BTreeSet::new(),
                         readonly_properties: BTreeSet::new(),
                         getter_properties: BTreeSet::new(),
@@ -778,7 +1009,21 @@ impl<'a> ProgramChecker<'a> {
                 );
             }
         }
-        (symbols, diagnostics)
+        (symbols, diagnostics, runtime_meanings)
+    }
+
+    fn collect_import_runtime_meanings(
+        &self,
+        source: &ProgramSource<'_>,
+        statements: &[NodeId],
+    ) -> BTreeMap<NodeId, bool> {
+        statements
+            .iter()
+            .filter_map(|statement| {
+                self.import_runtime_meaning(source, *statement)
+                    .map(|meaning| (*statement, meaning))
+            })
+            .collect()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -911,6 +1156,7 @@ impl<'a> Checker<'a> {
                 node_types: BTreeMap::new(),
                 enum_member_values: BTreeMap::new(),
                 enum_access_values: BTreeMap::new(),
+                import_runtime_meanings: BTreeMap::new(),
                 declaration_reachability: BTreeMap::new(),
                 diagnostics: Vec::new(),
             },
@@ -8812,6 +9058,79 @@ mod tests {
             "{:?}",
             checked.files[1].diagnostics
         );
+    }
+
+    #[test]
+    fn publishes_semantic_runtime_meaning_for_resolved_imports() {
+        let dependency = parse_source_file(
+            r#"
+                declare module "foo" {
+                    namespace B { export interface A {} }
+                    interface B { bar(name: string): B.A; }
+                    export = B;
+                }
+                declare module "value" {
+                    class C {}
+                    export = C;
+                }
+            "#,
+        );
+        let consumer = parse_source_file(
+            r#"
+                import foo = require("foo");
+                import C = require("value");
+                import Missing = require("missing");
+                import "foo";
+                declare var z: foo;
+                z.bar("hello");
+                foo.bar("hello");
+                new C();
+                Missing.run();
+            "#,
+        );
+        assert!(
+            dependency.diagnostics.is_empty(),
+            "{:?}",
+            dependency.diagnostics
+        );
+        assert!(
+            consumer.diagnostics.is_empty(),
+            "{:?}",
+            consumer.diagnostics
+        );
+        let dependency_bindings = bind_source_file(&dependency.arena, dependency.source_file);
+        let consumer_bindings = bind_source_file(&consumer.arena, consumer.source_file);
+        let dependency_modules = BTreeMap::new();
+        let consumer_modules = BTreeMap::from([("foo".into(), 0), ("value".into(), 0)]);
+        let checked = check_program(&[
+            ProgramSource {
+                arena: &dependency.arena,
+                source_file: dependency.source_file,
+                bindings: &dependency_bindings,
+                resolved_modules: &dependency_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+            ProgramSource {
+                arena: &consumer.arena,
+                source_file: consumer.source_file,
+                bindings: &consumer_bindings,
+                resolved_modules: &consumer_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+        ]);
+        let NodeData::SourceFile(source) = &consumer.arena.get(consumer.source_file).unwrap().data
+        else {
+            panic!("expected source file");
+        };
+        let meanings = &checked.files[1].import_runtime_meanings;
+        assert_eq!(meanings.get(&source.statements.nodes[0]), Some(&false));
+        assert_eq!(meanings.get(&source.statements.nodes[1]), Some(&true));
+        assert!(!meanings.contains_key(&source.statements.nodes[2]));
+        assert_eq!(meanings.get(&source.statements.nodes[3]), Some(&true));
     }
 
     #[test]

@@ -424,6 +424,7 @@ impl Program {
                     amd_dependencies: &amd_dependencies,
                     enum_member_values: &enum_member_values,
                     enum_access_values: &enum_access_values,
+                    import_runtime_meanings: &source_file.checking.import_runtime_meanings,
                     preserve_const_enums: self.options.preserve_const_enums
                         || self.options.isolated_modules
                         || self.options.verbatim_module_syntax,
@@ -561,6 +562,7 @@ impl Program {
                     amd_dependencies: &amd_dependencies,
                     enum_member_values: &enum_member_values,
                     enum_access_values: &enum_access_values,
+                    import_runtime_meanings: &source.checking.import_runtime_meanings,
                     preserve_const_enums: self.options.preserve_const_enums
                         || self.options.isolated_modules
                         || self.options.verbatim_module_syntax,
@@ -1843,6 +1845,74 @@ mod tests {
                 .map(String::as_str),
             Some("/project/ambient.ts")
         );
+    }
+
+    #[test]
+    fn elides_semantically_type_only_imports_from_merged_ambient_modules() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/ambient.ts",
+            r#"
+                declare module "foo" {
+                    namespace B { export interface A {} }
+                    interface B { bar(name: string): B.A; }
+                    export = B;
+                }
+                declare module "runtime" {
+                    class Runtime {}
+                    export = Runtime;
+                }
+            "#,
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/main.ts",
+            concat!(
+                "///<reference path='ambient.ts' />\n",
+                "import foo = require(\"foo\");\n",
+                "import Runtime = require(\"runtime\");\n",
+                "import Missing = require(\"missing\");\n",
+                "import \"foo\";\n",
+                "declare var z: foo;\n",
+                "z.bar(\"hello\");\n",
+                "var x: foo.A = foo.bar(\"hello\");\n",
+                "new Runtime();\n",
+                "Missing.run();\n",
+            ),
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["main.ts".to_owned(), "ambient.ts".to_owned()],
+            CompilerOptions {
+                module: ModuleKind::CommonJs,
+                target: ScriptTarget::Es2015,
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        let emitted = program.emit();
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        let javascript = emitted
+            .files
+            .iter()
+            .find(|file| file.file_name == "/project/main.js")
+            .unwrap();
+        assert!(!javascript.text.contains("const foo = require(\"foo\")"));
+        assert!(!javascript.text.contains("reference path"));
+        assert!(
+            javascript
+                .text
+                .contains("const Runtime = require(\"runtime\");")
+        );
+        assert!(
+            javascript
+                .text
+                .contains("const Missing = require(\"missing\");")
+        );
+        assert!(javascript.text.contains("require(\"foo\");"));
+        assert!(javascript.text.contains("foo.bar(\"hello\")"));
     }
 
     #[test]
