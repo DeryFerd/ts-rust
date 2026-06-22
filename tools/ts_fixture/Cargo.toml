@@ -9,7 +9,12 @@ description = "Parser for TypeScript compiler baseline fixtures"
 path = "src/lib.rs"
 
 [dependencies]
+ts_compiler = { path = "../../crates/ts_compiler" }
+ts_config = { path = "../../crates/ts_config" }
 ts_core = { path = "../../crates/ts_core" }
+ts_options = { path = "../../crates/ts_options" }
+ts_path = { path = "../../crates/ts_path" }
+ts_vfs = { path = "../../crates/ts_vfs" }
 
 [dev-dependencies]
 ts_parser = { path = "../../crates/ts_parser" }
