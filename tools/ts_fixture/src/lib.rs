@@ -403,13 +403,23 @@ fn compare_emitted_output_sections_excluding(
     let expected = parse_baseline_sections(baseline)
         .into_iter()
         .filter(|(name, _)| is_emitted_section(name))
-        .map(|(name, text)| (normalize_section_name(&name), normalize_newlines(&text)))
+        .map(|(name, text)| {
+            (
+                normalize_section_name(&name),
+                normalize_emitted_section(&text),
+            )
+        })
         .filter(|(name, _)| !excluded_expected.contains(name))
         .collect::<BTreeMap<_, _>>();
     let actual = outputs
         .iter()
         .filter(|(name, _)| is_emitted_section(name))
-        .map(|(name, text)| (normalize_section_name(name), normalize_newlines(text)))
+        .map(|(name, text)| {
+            (
+                normalize_section_name(name),
+                normalize_emitted_section(text),
+            )
+        })
         .collect::<BTreeMap<_, _>>();
     let names = expected
         .keys()
@@ -877,6 +887,17 @@ fn normalize_newlines(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
+fn normalize_emitted_section(text: &str) -> String {
+    let mut normalized = normalize_newlines(text);
+    while normalized.ends_with('\n') {
+        normalized.pop();
+    }
+    if !normalized.is_empty() {
+        normalized.push('\n');
+    }
+    normalized
+}
+
 /// One virtual source file declared by a fixture.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Unit {
@@ -1304,6 +1325,25 @@ mod tests {
             "//// [input.js] ////\r\n",
             "const value = 1;\r\n",
             "console.log(value);\r\n",
+        );
+        assert!(compare_emitted_output_sections(&outputs, baseline).is_match());
+    }
+
+    #[test]
+    fn ignores_baseline_separator_blank_lines_between_emitted_sections() {
+        let outputs = BTreeMap::from([
+            ("/case/input.js".into(), "const value = 1;\n".into()),
+            (
+                "/case/input.d.ts".into(),
+                "declare const value = 1;\n".into(),
+            ),
+        ]);
+        let baseline = concat!(
+            "//// [input.js] ////\n",
+            "const value = 1;\n",
+            "\n",
+            "//// [input.d.ts] ////\n",
+            "declare const value = 1;\n",
         );
         assert!(compare_emitted_output_sections(&outputs, baseline).is_match());
     }

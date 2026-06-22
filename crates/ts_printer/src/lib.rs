@@ -374,14 +374,6 @@ pub fn emit_source_file_with_context(
         printer.writer.write(";");
         printer.writer.newline();
     }
-    if data.statements.nodes.last().is_some_and(|statement| {
-        arena
-            .get(*statement)
-            .is_some_and(|node| !statement_emits_javascript(arena, node))
-    }) && export_equals_expression.is_none()
-    {
-        printer.writer.preserve_trailing_blank_line = true;
-    }
     let source_map = printer
         .source_map
         .map(|builder| builder.finish(None, vec![source_name.to_owned()]));
@@ -1782,7 +1774,6 @@ struct Writer {
     line_start: bool,
     line: u32,
     column: u32,
-    preserve_trailing_blank_line: bool,
 }
 
 impl Writer {
@@ -1829,9 +1820,6 @@ impl Writer {
         }
         if !self.output.is_empty() {
             self.output.push('\n');
-            if self.preserve_trailing_blank_line {
-                self.output.push_str("\n\n");
-            }
         }
         self.output
     }
@@ -8120,14 +8108,13 @@ class Board {
     }
 
     #[test]
-    fn preserves_blank_emit_tail_when_final_source_statements_are_erased() {
+    fn does_not_synthesize_blank_lines_for_erased_trailing_statements() {
         let source = "type T = number; export interface I { value: T; }\n";
         assert_eq!(
             emit_with(source, ScriptTarget::Es2015, ModuleKind::CommonJs).code,
             concat!(
                 "\"use strict\";\n",
                 "Object.defineProperty(exports, \"__esModule\", { value: true });\n",
-                "\n\n",
             )
         );
     }
