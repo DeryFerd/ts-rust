@@ -708,12 +708,7 @@ impl<'a> ProgramChecker<'a> {
                         },
                     ));
                 }
-                let symbol = Self::resolve_entity_symbol(source, import.module_reference)?;
-                Some(Self::symbol_has_runtime_value(
-                    source,
-                    symbol,
-                    &mut HashSet::new(),
-                ))
+                None
             }
             _ => None,
         }
@@ -9131,6 +9126,54 @@ mod tests {
         assert_eq!(meanings.get(&source.statements.nodes[1]), Some(&true));
         assert!(!meanings.contains_key(&source.statements.nodes[2]));
         assert_eq!(meanings.get(&source.statements.nodes[3]), Some(&true));
+    }
+
+    #[test]
+    fn leaves_internal_import_equals_aliases_on_runtime_fallback() {
+        let parsed = parse_source_file(
+            r#"
+                import alias = require("foo");
+                import { alias as alias2 } from "bar";
+                import cls = alias.Class;
+                export import cls2 = alias.Class;
+                import cls3 = alias2.Class;
+                let x = new cls();
+                let y = new cls2();
+                let z = new cls3();
+                namespace M {
+                    export import cls = alias.Class;
+                    let value = new cls();
+                }
+            "#,
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let modules = BTreeMap::new();
+        let checked = check_program(&[ProgramSource {
+            arena: &parsed.arena,
+            source_file: parsed.source_file,
+            bindings: &bindings,
+            resolved_modules: &modules,
+            is_default_library: false,
+            skip_diagnostics: false,
+            checker_options: CheckerOptions::default(),
+        }]);
+        let meanings = &checked.files[0].import_runtime_meanings;
+        assert!(meanings.is_empty(), "{meanings:?}");
+        for (node, data) in parsed.arena.iter() {
+            let NodeData::ImportEqualsDeclaration(import) = &data.data else {
+                continue;
+            };
+            if !matches!(
+                parsed
+                    .arena
+                    .get(import.module_reference)
+                    .map(|node| &node.data),
+                Some(NodeData::ExternalModuleReference(_))
+            ) {
+                assert!(!meanings.contains_key(&node));
+            }
+        }
     }
 
     #[test]
