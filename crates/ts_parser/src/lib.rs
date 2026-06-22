@@ -5,16 +5,17 @@ use ts_ast::{
     AwaitExpressionData, BigIntLiteralData, BinaryExpressionData, BindingElementData,
     BindingPatternData, BlockData, BreakStatementData, CallExpressionData,
     CallSignatureDeclarationData, CaseBlockData, CaseOrDefaultClauseData, CatchClauseData,
-    ClassDeclarationData, ClassStaticBlockDeclarationData, ComputedPropertyNameData,
-    ConditionalExpressionData, ConditionalTypeNodeData, ConstructSignatureDeclarationData,
-    ConstructorTypeNodeData, ContinueStatementData, DebuggerStatementData, DecoratorData,
-    DeleteExpressionData, DoStatementData, ElementAccessExpressionData, EmptyStatementData,
-    EnumDeclarationData, EnumMemberData, ExportAssignmentData, ExportDeclarationData,
-    ExportSpecifierData, ExpressionStatementData, ExpressionWithTypeArgumentsData,
-    ExternalModuleReferenceData, ForInOrOfStatementData, ForStatementData, FunctionDeclarationData,
-    FunctionExpressionData, FunctionTypeNodeData, GetAccessorDeclarationData, HeritageClauseData,
-    IdentifierData, IfStatementData, ImportAttributeData, ImportAttributesData, ImportClauseData,
-    ImportDeclarationData, ImportEqualsDeclarationData, ImportSpecifierData, ImportTypeNodeData,
+    ClassDeclarationData, ClassExpressionData, ClassStaticBlockDeclarationData,
+    ComputedPropertyNameData, ConditionalExpressionData, ConditionalTypeNodeData,
+    ConstructSignatureDeclarationData, ConstructorTypeNodeData, ContinueStatementData,
+    DebuggerStatementData, DecoratorData, DeleteExpressionData, DoStatementData,
+    ElementAccessExpressionData, EmptyStatementData, EnumDeclarationData, EnumMemberData,
+    ExportAssignmentData, ExportDeclarationData, ExportSpecifierData, ExpressionStatementData,
+    ExpressionWithTypeArgumentsData, ExternalModuleReferenceData, ForInOrOfStatementData,
+    ForStatementData, FunctionDeclarationData, FunctionExpressionData, FunctionTypeNodeData,
+    GetAccessorDeclarationData, HeritageClauseData, IdentifierData, IfStatementData,
+    ImportAttributeData, ImportAttributesData, ImportClauseData, ImportDeclarationData,
+    ImportEqualsDeclarationData, ImportSpecifierData, ImportTypeNodeData,
     IndexSignatureDeclarationData, IndexedAccessTypeNodeData, InferTypeNodeData,
     InterfaceDeclarationData, IntersectionTypeNodeData, JsDocData, JsDocTextData,
     JsDocUnknownTagData, JsxAttributeData, JsxAttributesData, JsxClosingElementData,
@@ -36,10 +37,10 @@ use ts_ast::{
     TemplateLiteralTypeNodeData, TemplateLiteralTypeSpanData, TemplateMiddleData, TemplateSpanData,
     TemplateTailData, ThisTypeNodeData, ThrowStatementData, TokenData, TokenFlags,
     TryStatementData, TupleTypeNodeData, TypeAliasDeclarationData, TypeAssertionData,
-    TypeLiteralNodeData, TypeOperatorNodeData, TypeParameterDeclarationData, TypePredicateNodeData,
-    TypeQueryNodeData, TypeReferenceNodeData, UnionTypeNodeData, VariableDeclarationData,
-    VariableDeclarationListData, VariableStatementData, WhileStatementData, WithStatementData,
-    YieldExpressionData,
+    TypeLiteralNodeData, TypeOfExpressionData, TypeOperatorNodeData, TypeParameterDeclarationData,
+    TypePredicateNodeData, TypeQueryNodeData, TypeReferenceNodeData, UnionTypeNodeData,
+    VariableDeclarationData, VariableDeclarationListData, VariableStatementData,
+    WhileStatementData, WithStatementData, YieldExpressionData,
 };
 use ts_core::{Diagnostic, DiagnosticCategory, TextPos, TextRange};
 use ts_diagnostics::{Category, message_by_code};
@@ -1103,6 +1104,43 @@ impl<'a> Parser<'a> {
             TextRange::new(start, end),
             NodeData::ClassDeclaration(Box::new(ClassDeclarationData {
                 flow_node: None,
+                heritage_clauses,
+                local_symbol: None,
+                locals: SymbolTable,
+                members,
+                next_container: None,
+                symbol: None,
+                type_parameters,
+                facts: 0,
+                modifiers: None,
+                name,
+            })),
+            &children,
+        )
+    }
+
+    fn parse_class_expression(&mut self) -> NodeId {
+        let start = self.consume().range.start;
+        let name = if self.current.kind != SyntaxKind::ExtendsKeyword
+            && (self.current.kind == SyntaxKind::Identifier || self.current.kind.is_keyword())
+        {
+            Some(self.parse_identifier_name("Expected a class name."))
+        } else {
+            None
+        };
+        let type_parameters = self.parse_type_parameters();
+        let heritage_clauses = self.parse_heritage_clauses();
+        let members = self.parse_class_members(false);
+        let end = members.range.end;
+        let mut children = Vec::new();
+        children.extend(name);
+        extend_list_children(&mut children, type_parameters.as_ref());
+        extend_list_children(&mut children, heritage_clauses.as_ref());
+        children.extend(members.nodes.iter().copied());
+        self.alloc_node(
+            SyntaxKind::ClassExpression,
+            TextRange::new(start, end),
+            NodeData::ClassExpression(Box::new(ClassExpressionData {
                 heritage_clauses,
                 local_symbol: None,
                 locals: SymbolTable,
@@ -3145,6 +3183,16 @@ impl<'a> Parser<'a> {
         if self.current.kind == SyntaxKind::YieldKeyword {
             return self.parse_yield_expression();
         }
+        if self.current.kind == SyntaxKind::TypeOfKeyword {
+            let start = self.consume().range.start;
+            let expression = self.parse_postfix_expression();
+            return self.alloc_node(
+                SyntaxKind::TypeOfExpression,
+                TextRange::new(start, self.node_end(expression)),
+                NodeData::TypeOfExpression(Box::new(TypeOfExpressionData { expression })),
+                &[expression],
+            );
+        }
         if self.current.kind == SyntaxKind::DeleteKeyword {
             let start = self.consume().range.start;
             let expression = self.parse_postfix_expression();
@@ -3596,6 +3644,7 @@ impl<'a> Parser<'a> {
                 self.parse_regular_expression_literal()
             }
             SyntaxKind::FunctionKeyword => self.parse_function_expression(),
+            SyntaxKind::ClassKeyword => self.parse_class_expression(),
             SyntaxKind::NoSubstitutionTemplateLiteral => self.parse_template_literal(),
             SyntaxKind::NullKeyword
             | SyntaxKind::TrueKeyword
@@ -6619,6 +6668,106 @@ mod tests {
                 SyntaxKind::FunctionExpression
             );
         }
+    }
+
+    #[test]
+    fn parses_anonymous_and_named_class_expressions_with_parent_links() {
+        let result = parse_source_file(
+            "const Anonymous = class extends Base { method() {} }; const Named = class Inner<T> extends Base { value = 1; }; const Kind = typeof class {};",
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let statements = source_statements(&result);
+
+        let class_expression = |statement| {
+            let (list, _) = variable_list(&result, statement);
+            let declaration = declaration_nodes(&result, list)[0];
+            let NodeData::VariableDeclaration(declaration) =
+                &result.arena.get(declaration).unwrap().data
+            else {
+                panic!("expected variable declaration");
+            };
+            declaration.initializer.unwrap()
+        };
+
+        let anonymous_id = class_expression(statements[0]);
+        let NodeData::ClassExpression(anonymous) = &result.arena.get(anonymous_id).unwrap().data
+        else {
+            panic!("expected anonymous class expression");
+        };
+        assert!(anonymous.name.is_none());
+        for child in anonymous
+            .heritage_clauses
+            .iter()
+            .flat_map(|clauses| &clauses.nodes)
+            .chain(&anonymous.members.nodes)
+        {
+            assert_eq!(result.arena.get(*child).unwrap().parent, Some(anonymous_id));
+        }
+
+        let named_id = class_expression(statements[1]);
+        let NodeData::ClassExpression(named) = &result.arena.get(named_id).unwrap().data else {
+            panic!("expected named class expression");
+        };
+        let name = named.name.unwrap();
+        let NodeData::Identifier(name_data) = &result.arena.get(name).unwrap().data else {
+            panic!("expected class expression name");
+        };
+        assert_eq!(name_data.text, "Inner");
+        assert_eq!(result.arena.get(name).unwrap().parent, Some(named_id));
+        for child in named
+            .type_parameters
+            .iter()
+            .flat_map(|parameters| &parameters.nodes)
+            .chain(
+                named
+                    .heritage_clauses
+                    .iter()
+                    .flat_map(|clauses| &clauses.nodes),
+            )
+            .chain(&named.members.nodes)
+        {
+            assert_eq!(result.arena.get(*child).unwrap().parent, Some(named_id));
+        }
+
+        let typeof_id = class_expression(statements[2]);
+        let NodeData::TypeOfExpression(typeof_expression) =
+            &result.arena.get(typeof_id).unwrap().data
+        else {
+            panic!("expected typeof expression");
+        };
+        let class_id = typeof_expression.expression;
+        assert!(matches!(
+            result.arena.get(class_id).unwrap().data,
+            NodeData::ClassExpression(_)
+        ));
+        assert_eq!(result.arena.get(class_id).unwrap().parent, Some(typeof_id));
+    }
+
+    #[test]
+    fn recovers_after_a_class_expression_missing_its_body() {
+        let result = parse_source_file("const Broken = class Named; const after = 1;");
+        assert!(!result.diagnostics.is_empty());
+        let statements = source_statements(&result);
+        assert_eq!(statements.len(), 2, "{:?}", result.diagnostics);
+        let (first_list, _) = variable_list(&result, statements[0]);
+        let first_declaration = declaration_nodes(&result, first_list)[0];
+        let NodeData::VariableDeclaration(first_declaration) =
+            &result.arena.get(first_declaration).unwrap().data
+        else {
+            panic!("expected variable declaration");
+        };
+        assert_eq!(
+            result
+                .arena
+                .get(first_declaration.initializer.unwrap())
+                .unwrap()
+                .kind,
+            SyntaxKind::ClassExpression
+        );
+        assert_eq!(
+            result.arena.get(statements[1]).unwrap().kind,
+            SyntaxKind::VariableStatement
+        );
     }
 
     #[test]
