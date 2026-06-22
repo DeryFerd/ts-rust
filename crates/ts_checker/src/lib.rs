@@ -886,6 +886,7 @@ struct Checker<'a> {
     checked_overload_symbols: HashSet<SymbolId>,
     reported_unresolved_type_names: HashSet<NodeId>,
     this_types: Vec<TypeId>,
+    preserve_literal_inference: bool,
 }
 
 enum DeclaredObject {
@@ -931,6 +932,7 @@ impl<'a> Checker<'a> {
             checked_overload_symbols: HashSet::new(),
             reported_unresolved_type_names: HashSet::new(),
             this_types: Vec::new(),
+            preserve_literal_inference: false,
         }
     }
 
@@ -3470,6 +3472,7 @@ impl<'a> Checker<'a> {
             NodeData::ParenthesizedExpression(data) => {
                 self.type_of_expression_context(data.expression, contextual_type)
             }
+            NodeData::PrefixUnaryExpression(data) => self.prefix_unary_type(data),
             NodeData::BinaryExpression(data) => {
                 let left = self.type_of_expression(data.left);
                 let right = self.type_of_expression(data.right);
@@ -3511,6 +3514,12 @@ impl<'a> Checker<'a> {
                 } else {
                     self.check_binary(node_id, operator, assignment_target, right)
                 }
+            }
+            NodeData::ConditionalExpression(data) => {
+                self.type_of_expression(data.condition);
+                let when_true = self.type_of_expression_context(data.when_true, contextual_type);
+                let when_false = self.type_of_expression_context(data.when_false, contextual_type);
+                self.result.types.union([when_true, when_false])
             }
             NodeData::ObjectLiteralExpression(data) => {
                 self.object_literal_type(data, contextual_type)
@@ -3611,7 +3620,12 @@ impl<'a> Checker<'a> {
                     self.error(data.expression, 6234, std::iter::empty());
                     self.result.types.any()
                 } else {
-                    self.call_expression_type(node_id, callee, &data.arguments.nodes, false)
+                    let previous = self.preserve_literal_inference;
+                    self.preserve_literal_inference = contextual_type.is_none();
+                    let result =
+                        self.call_expression_type(node_id, callee, &data.arguments.nodes, false);
+                    self.preserve_literal_inference = previous;
+                    result
                 }
             }
             NodeData::NewExpression(data) => {
@@ -3635,7 +3649,11 @@ impl<'a> Checker<'a> {
                     self.type_of_expression(data.expression)
                 };
                 let arguments = data.arguments.as_ref().map_or(&[][..], |list| &list.nodes);
-                self.call_expression_type(node_id, callee, arguments, true)
+                let previous = self.preserve_literal_inference;
+                self.preserve_literal_inference = false;
+                let result = self.call_expression_type(node_id, callee, arguments, true);
+                self.preserve_literal_inference = previous;
+                result
             }
             NodeData::DeleteExpression(data) => {
                 let operand = self.type_of_expression(data.expression);
@@ -3648,6 +3666,43 @@ impl<'a> Checker<'a> {
         };
         self.result.node_types.insert(node_id, result);
         result
+    }
+
+    fn prefix_unary_type(&mut self, expression: &ts_ast::PrefixUnaryExpressionData) -> TypeId {
+        let operand = self.type_of_expression(expression.operand);
+        let Some(kind) = self
+            .result
+            .types
+            .get(operand)
+            .map(|type_| type_.kind.clone())
+        else {
+            return self.result.types.unknown();
+        };
+        match (expression.operator, kind) {
+            (SyntaxKind::MinusToken, TypeKind::NumberLiteral(value)) => self.result.types.alloc(
+                TypeKind::NumberLiteral(format!("-{}", value.trim_start_matches('-'))),
+            ),
+            (SyntaxKind::PlusToken, TypeKind::NumberLiteral(value)) => {
+                self.result.types.alloc(TypeKind::NumberLiteral(value))
+            }
+            (SyntaxKind::MinusToken | SyntaxKind::PlusToken, TypeKind::Number) => {
+                self.result.types.number()
+            }
+            (SyntaxKind::MinusToken, TypeKind::BigIntLiteral(value)) => self.result.types.alloc(
+                TypeKind::BigIntLiteral(format!("-{}", value.trim_start_matches('-'))),
+            ),
+            (SyntaxKind::PlusToken, TypeKind::BigIntLiteral(value)) => {
+                self.result.types.alloc(TypeKind::BigIntLiteral(value))
+            }
+            (SyntaxKind::MinusToken | SyntaxKind::PlusToken, TypeKind::BigInt) => {
+                self.result.types.bigint()
+            }
+            (SyntaxKind::ExclamationToken, TypeKind::BooleanLiteral(value)) => {
+                self.result.types.alloc(TypeKind::BooleanLiteral(!value))
+            }
+            (SyntaxKind::ExclamationToken, _) => self.result.types.boolean(),
+            _ => self.result.types.any(),
+        }
     }
 
     fn check_delete_expression(&mut self, expression: NodeId, operand: TypeId) {
@@ -4398,7 +4453,20 @@ impl<'a> Checker<'a> {
     ) {
         match self.result.types.get(parameter).unwrap().kind.clone() {
             TypeKind::TypeParameter { .. } => {
-                let actual = self.widen_literal(actual);
+                let actual = if self.preserve_literal_inference
+                    && matches!(
+                        self.result.types.get(actual).map(|type_| &type_.kind),
+                        Some(
+                            TypeKind::BooleanLiteral(_)
+                                | TypeKind::NumberLiteral(_)
+                                | TypeKind::StringLiteral(_)
+                                | TypeKind::BigIntLiteral(_)
+                        )
+                    ) {
+                    actual
+                } else {
+                    self.widen_literal(actual)
+                };
                 inference
                     .entry(parameter)
                     .and_modify(|current| *current = self.result.types.union([*current, actual]))
@@ -7702,6 +7770,78 @@ mod tests {
             result.type_of_node(variable.initializer.unwrap()),
             Some(constructor_type)
         );
+    }
+
+    #[test]
+    fn infers_ambient_const_literal_declaration_types() {
+        let parsed = parse_source_file(
+            r#"
+                function f<T>(x: T): T { return x; }
+                enum E { A, B, C }
+                const c1 = "abc";
+                const c2 = 123;
+                const c3 = c1;
+                const c4 = c2;
+                const c5 = f(123);
+                const c6 = f(-123);
+                const c7 = true;
+                const c8 = E.A;
+                const c8b = E["A"];
+                const c9 = { x: "abc" };
+                const c10 = [123];
+                const c11 = "abc" + "def";
+                const c12 = 123 + 456;
+                const c13 = true ? "abc" : "def";
+                const c14 = true ? 123 : 456;
+            "#,
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let root = bindings.root_scope().unwrap();
+        let type_of = |name: &str| {
+            result
+                .type_of_symbol(root.symbols.get(name).unwrap())
+                .unwrap()
+        };
+
+        for (name, expected) in [
+            ("c1", TypeKind::StringLiteral("abc".into())),
+            ("c2", TypeKind::NumberLiteral("123".into())),
+            ("c3", TypeKind::StringLiteral("abc".into())),
+            ("c4", TypeKind::NumberLiteral("123".into())),
+            ("c5", TypeKind::NumberLiteral("123".into())),
+            ("c6", TypeKind::NumberLiteral("-123".into())),
+            ("c7", TypeKind::BooleanLiteral(true)),
+            ("c8", TypeKind::NumberLiteral("0".into())),
+            ("c8b", TypeKind::NumberLiteral("0".into())),
+            ("c11", TypeKind::String),
+            ("c12", TypeKind::Number),
+            ("c13", TypeKind::String),
+            ("c14", TypeKind::Number),
+        ] {
+            assert_eq!(
+                result.types.get(type_of(name)).unwrap().kind,
+                expected,
+                "{name}"
+            );
+            let symbol = root.symbols.get(name).unwrap();
+            let declaration = bindings.symbols.get(symbol).unwrap().declarations[0];
+            assert_eq!(
+                result.type_of_node(declaration),
+                Some(type_of(name)),
+                "{name}"
+            );
+        }
+        let TypeKind::Object(object) = &result.types.get(type_of("c9")).unwrap().kind else {
+            panic!("expected widened object type");
+        };
+        assert_eq!(object.properties["x"], result.types.string());
+        let TypeKind::Array(element) = result.types.get(type_of("c10")).unwrap().kind else {
+            panic!("expected widened array type");
+        };
+        assert_eq!(element, result.types.number());
     }
 
     #[test]
