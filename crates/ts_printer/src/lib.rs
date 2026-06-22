@@ -215,6 +215,8 @@ pub fn emit_source_file_with_context(
         bindings: context.bindings,
         identifier_rewrites: HashMap::new(),
         system_predeclared_names: HashSet::new(),
+        system_export_function: None,
+        system_exported_bindings: HashMap::new(),
         commonjs_module_transform: settings.module == ModuleKind::CommonJs,
         enum_member_values: context.enum_member_values,
         enum_access_values: context.enum_access_values,
@@ -2464,6 +2466,7 @@ struct SystemModulePlan {
     dependencies: Vec<SystemDependency>,
     hoisted_names: Vec<String>,
     identifier_rewrites: HashMap<ts_ast::SymbolId, String>,
+    exported_bindings: HashMap<ts_ast::SymbolId, String>,
 }
 
 struct GeneratedNames {
@@ -2509,6 +2512,7 @@ impl SystemModulePlan {
         let mut dependencies = Vec::new();
         let mut hoisted_names = Vec::new();
         let mut identifier_rewrites = HashMap::new();
+        let mut exported_bindings = HashMap::new();
         for statement in &data.statements.nodes {
             if import_runtime_meanings.get(statement) == Some(&false) {
                 continue;
@@ -2604,6 +2608,39 @@ impl SystemModulePlan {
                     for name in simple_variable_names(arena, statement.declaration_list) {
                         push_unique(&mut hoisted_names, &name);
                     }
+                    if declaration_has_modifier(arena, node, SyntaxKind::ExportKeyword)
+                        && let Some(NodeData::VariableDeclarationList(list)) =
+                            arena.get(statement.declaration_list).map(|node| &node.data)
+                    {
+                        for declaration in &list.declarations.nodes {
+                            let declaration_id = *declaration;
+                            let Some(NodeData::VariableDeclaration(declaration)) =
+                                arena.get(declaration_id).map(|node| &node.data)
+                            else {
+                                continue;
+                            };
+                            let Some(name) = declaration_name_text(arena, declaration.name) else {
+                                continue;
+                            };
+                            if let Some(symbol) = bindings.node_symbols.get(&declaration_id) {
+                                exported_bindings.insert(*symbol, name.to_owned());
+                            }
+                        }
+                    }
+                }
+                NodeData::ClassDeclaration(class)
+                    if !declaration_has_modifier(arena, node, SyntaxKind::DeclareKeyword) =>
+                {
+                    if let Some(name_id) = class.name
+                        && let Some(name) = declaration_name_text(arena, name_id)
+                    {
+                        push_unique(&mut hoisted_names, name);
+                        if declaration_has_modifier(arena, node, SyntaxKind::ExportKeyword)
+                            && let Some(symbol) = bindings.node_symbols.get(&name_id)
+                        {
+                            exported_bindings.insert(*symbol, name.to_owned());
+                        }
+                    }
                 }
                 NodeData::ModuleDeclaration(module)
                     if !declaration_has_modifier(arena, node, SyntaxKind::DeclareKeyword) =>
@@ -2628,6 +2665,7 @@ impl SystemModulePlan {
             dependencies,
             hoisted_names,
             identifier_rewrites,
+            exported_bindings,
         }
     }
 }
@@ -2739,6 +2777,8 @@ struct Printer<'a> {
     bindings: &'a BindResult,
     identifier_rewrites: HashMap<ts_ast::SymbolId, String>,
     system_predeclared_names: HashSet<String>,
+    system_export_function: Option<String>,
+    system_exported_bindings: HashMap<ts_ast::SymbolId, String>,
     commonjs_module_transform: bool,
     enum_member_values: &'a BTreeMap<NodeId, EmitConstantValue>,
     enum_access_values: &'a BTreeMap<NodeId, EmitConstantValue>,
@@ -2928,6 +2968,8 @@ impl Printer<'_> {
             self.import_runtime_meanings,
         );
         self.identifier_rewrites = plan.identifier_rewrites;
+        self.system_export_function = Some(plan.export_function.clone());
+        self.system_exported_bindings = plan.exported_bindings.clone();
         self.system_predeclared_names
             .extend(plan.hoisted_names.iter().cloned());
         self.writer.write("System.register([");
@@ -3050,6 +3092,8 @@ impl Printer<'_> {
                 Ok(())
             }
             NodeData::VariableStatement(variable) => {
+                let exported =
+                    self.has_modifier(variable.modifiers.as_ref(), SyntaxKind::ExportKeyword);
                 let list_node = self.node(variable.declaration_list)?.clone();
                 let NodeData::VariableDeclarationList(list) = &list_node.data else {
                     return Err(Self::unsupported(variable.declaration_list, list_node.kind));
@@ -3062,10 +3106,49 @@ impl Printer<'_> {
                     let Some(initializer) = declaration.initializer else {
                         continue;
                     };
+                    let name = declaration_name_text(self.arena, declaration.name);
+                    if exported && let Some(name) = name {
+                        self.writer.write(export_function);
+                        self.writer.write("(");
+                        write_quoted(&mut self.writer, name);
+                        self.writer.write(", ");
+                    }
                     self.emit_expression(declaration.name, 1)?;
                     self.writer.write(" = ");
                     self.emit_expression(initializer, 1)?;
+                    if exported && name.is_some() {
+                        self.writer.write(")");
+                    }
                     self.writer.write(";");
+                    self.writer.newline();
+                }
+                Ok(())
+            }
+            NodeData::ClassDeclaration(class) => {
+                let Some(name_id) = class.name else {
+                    return self.emit_statement(statement);
+                };
+                let name = self.identifier_text(name_id)?.to_owned();
+                self.writer.write(&name);
+                self.writer.write(" = ");
+                self.emit_class(class)?;
+                self.writer.write(";");
+                self.emit_auto_accessor_storage_initializers(class);
+                self.writer.newline();
+                if self.has_modifier(class.modifiers.as_ref(), SyntaxKind::ExportKeyword) {
+                    let exported_name = if self
+                        .has_modifier(class.modifiers.as_ref(), SyntaxKind::DefaultKeyword)
+                    {
+                        "default"
+                    } else {
+                        &name
+                    };
+                    self.writer.write(export_function);
+                    self.writer.write("(");
+                    write_quoted(&mut self.writer, exported_name);
+                    self.writer.write(", ");
+                    self.writer.write(&name);
+                    self.writer.write(");");
                     self.writer.newline();
                 }
                 Ok(())
@@ -6252,6 +6335,26 @@ impl Printer<'_> {
             .is_ok_and(|name| self.runtime_identifier_uses.contains(name))
     }
 
+    fn system_exported_name(&self, expression: NodeId) -> Option<String> {
+        let NodeData::Identifier(identifier) = &self.arena.get(expression)?.data else {
+            return None;
+        };
+        let symbol = self
+            .bindings
+            .resolve_name_at(expression, &identifier.text)?;
+        self.system_exported_bindings.get(&symbol).cloned()
+    }
+
+    fn emit_system_export_call_start(&mut self, name: &str) {
+        let Some(export_function) = self.system_export_function.as_deref() else {
+            return;
+        };
+        self.writer.write(export_function);
+        self.writer.write("(");
+        write_quoted(&mut self.writer, name);
+        self.writer.write(", ");
+    }
+
     fn import_semantically_has_runtime_value(&self, declaration: NodeId) -> bool {
         self.import_runtime_meanings
             .get(&declaration)
@@ -6475,7 +6578,14 @@ impl Printer<'_> {
                 }
                 let (precedence, right_associative) = binary_precedence(operator)
                     .ok_or_else(|| Self::unsupported(data.operator_token, operator))?;
-                let wrap = precedence < parent_precedence;
+                let system_export = operator
+                    .is_assignment_operator()
+                    .then(|| self.system_exported_name(data.left))
+                    .flatten();
+                if let Some(name) = &system_export {
+                    self.emit_system_export_call_start(name);
+                }
+                let wrap = system_export.is_none() && precedence < parent_precedence;
                 if wrap {
                     self.writer.write("(");
                 }
@@ -6505,6 +6615,9 @@ impl Printer<'_> {
                     self.writer.indent -= 1;
                 }
                 if wrap {
+                    self.writer.write(")");
+                }
+                if system_export.is_some() {
                     self.writer.write(")");
                 }
             }
@@ -6673,16 +6786,43 @@ impl Printer<'_> {
                 }
             }
             NodeData::PrefixUnaryExpression(data) => {
+                let system_export = matches!(
+                    data.operator,
+                    SyntaxKind::PlusPlusToken | SyntaxKind::MinusMinusToken
+                )
+                .then(|| self.system_exported_name(data.operand))
+                .flatten();
+                if let Some(name) = &system_export {
+                    self.emit_system_export_call_start(name);
+                }
                 self.writer.write(
                     operator_text(data.operator).ok_or_else(|| Self::unsupported(id, node.kind))?,
                 );
                 self.emit_expression(data.operand, 16)?;
+                if system_export.is_some() {
+                    self.writer.write(")");
+                }
             }
             NodeData::PostfixUnaryExpression(data) => {
+                let system_export = matches!(
+                    data.operator,
+                    SyntaxKind::PlusPlusToken | SyntaxKind::MinusMinusToken
+                )
+                .then(|| self.system_exported_name(data.operand))
+                .flatten();
+                if let Some(name) = &system_export {
+                    self.emit_system_export_call_start(name);
+                    self.writer.write("(");
+                }
                 self.emit_expression(data.operand, 17)?;
                 self.writer.write(
                     operator_text(data.operator).ok_or_else(|| Self::unsupported(id, node.kind))?,
                 );
+                if system_export.is_some() {
+                    self.writer.write(", ");
+                    self.emit_expression(data.operand, 0)?;
+                    self.writer.write("))");
+                }
             }
             NodeData::ObjectLiteralExpression(data) => {
                 if self.settings.target < ScriptTarget::Es2018
@@ -8839,6 +8979,58 @@ mod tests {
                 "                let y = new M.cls();\n",
                 "                let z = new cls2();\n",
                 "            })(M || (M = {}));\n",
+                "        }\n",
+                "    };\n",
+                "});\n",
+            )
+        );
+    }
+
+    #[test]
+    fn emits_system_default_import_storage_and_exported_initializer() {
+        let source = r#"
+            import Namespace from "./b";
+            export var x = new Namespace.Foo();
+        "#;
+        assert_eq!(
+            emit_with(source, ScriptTarget::Es2015, ModuleKind::System).code,
+            concat!(
+                "System.register([\"./b\"], function (exports_1, context_1) {\n",
+                "    \"use strict\";\n",
+                "    var b_1, x;\n",
+                "    var __moduleName = context_1 && context_1.id;\n",
+                "    return {\n",
+                "        setters: [\n",
+                "            function (b_1_1) {\n",
+                "                b_1 = b_1_1;\n",
+                "            }\n",
+                "        ],\n",
+                "        execute: function () {\n",
+                "            exports_1(\"x\", x = new b_1.default.Foo());\n",
+                "        }\n",
+                "    };\n",
+                "});\n",
+            )
+        );
+    }
+
+    #[test]
+    fn emits_system_export_updates() {
+        let source = "export let x = 1; x = 2; ++x; x++;";
+        assert_eq!(
+            emit_with(source, ScriptTarget::Es2015, ModuleKind::System).code,
+            concat!(
+                "System.register([], function (exports_1, context_1) {\n",
+                "    \"use strict\";\n",
+                "    var x;\n",
+                "    var __moduleName = context_1 && context_1.id;\n",
+                "    return {\n",
+                "        setters: [],\n",
+                "        execute: function () {\n",
+                "            exports_1(\"x\", x = 1);\n",
+                "            exports_1(\"x\", x = 2);\n",
+                "            exports_1(\"x\", ++x);\n",
+                "            exports_1(\"x\", (x++, x));\n",
                 "        }\n",
                 "    };\n",
                 "});\n",
