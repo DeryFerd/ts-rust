@@ -62,6 +62,7 @@ pub fn emit_source_file(arena: &NodeArena, source_file: NodeId) -> Result<EmitRe
 /// # Errors
 ///
 /// Returns an error when the tree contains an unsupported or missing node.
+#[allow(clippy::too_many_lines)]
 pub fn emit_source_file_with_settings(
     arena: &NodeArena,
     source_file: NodeId,
@@ -117,6 +118,9 @@ pub fn emit_source_file_with_settings(
         printer.emit_leading_source_comments(node.range.start.get());
     }
     if settings.module == ModuleKind::CommonJs && is_external_module {
+        if source_needs_import_star_helper(arena, &data.statements) {
+            printer.emit_import_star_helper();
+        }
         printer
             .writer
             .write("Object.defineProperty(exports, \"__esModule\", { value: true });");
@@ -157,7 +161,9 @@ pub fn emit_source_file_with_settings(
         .map_or(0, |node| node.range.start.get());
     for statement in &data.statements.nodes {
         if let Some(node) = arena.get(*statement) {
-            printer.emit_source_comments_between(previous_end, node.range.start.get());
+            if statement_emits_javascript(arena, node) {
+                printer.emit_source_comments_between(previous_end, node.range.start.get());
+            }
             previous_end = node.range.end.get();
         }
         printer.emit_statement(*statement)?;
@@ -186,6 +192,41 @@ fn source_needs_extends_helper(arena: &NodeArena) -> bool {
             })
         })
     })
+}
+
+fn source_needs_import_star_helper(arena: &NodeArena, statements: &NodeList) -> bool {
+    statements.nodes.iter().any(|statement| {
+        let Some(NodeData::ImportDeclaration(import)) =
+            arena.get(*statement).map(|node| &node.data)
+        else {
+            return false;
+        };
+        let Some(NodeData::ImportClause(clause)) = import
+            .import_clause
+            .and_then(|clause| arena.get(clause))
+            .map(|node| &node.data)
+        else {
+            return false;
+        };
+        clause.phase_modifier != Some(SyntaxKind::TypeKeyword)
+            && clause.named_bindings.is_some_and(|bindings| {
+                matches!(
+                    arena.get(bindings).map(|node| &node.data),
+                    Some(NodeData::NamespaceImport(_))
+                )
+            })
+    })
+}
+
+fn statement_emits_javascript(arena: &NodeArena, node: &Node) -> bool {
+    if declaration_has_modifier(arena, node, SyntaxKind::DeclareKeyword) {
+        return false;
+    }
+    match &node.data {
+        NodeData::InterfaceDeclaration(_) | NodeData::TypeAliasDeclaration(_) => false,
+        NodeData::FunctionDeclaration(function) => function.body.is_some(),
+        _ => true,
+    }
 }
 
 /// Emits one source file as a TypeScript declaration file.
@@ -1069,6 +1110,21 @@ impl Writer {
         self.column = 0;
     }
 
+    fn remove_trailing_newline(&mut self) {
+        if !self.output.ends_with('\n') {
+            return;
+        }
+        self.output.pop();
+        self.line_start = false;
+        self.line = self.line.saturating_sub(1);
+        self.column = u32::try_from(
+            self.output
+                .rsplit_once('\n')
+                .map_or(self.output.len(), |(_, line)| line.len()),
+        )
+        .unwrap_or(u32::MAX);
+    }
+
     fn finish(mut self) -> String {
         while self.output.ends_with('\n') {
             self.output.pop();
@@ -1245,6 +1301,47 @@ impl Printer<'_> {
             } else {
                 index += 1;
             }
+        }
+    }
+
+    fn emit_import_star_helper(&mut self) {
+        for line in [
+            "var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {",
+            "    if (k2 === undefined) k2 = k;",
+            "    var desc = Object.getOwnPropertyDescriptor(m, k);",
+            "    if (!desc || (\"get\" in desc ? !m.__esModule : desc.writable || desc.configurable)) {",
+            "      desc = { enumerable: true, get: function() { return m[k]; } };",
+            "    }",
+            "    Object.defineProperty(o, k2, desc);",
+            "}) : (function(o, m, k, k2) {",
+            "    if (k2 === undefined) k2 = k;",
+            "    o[k2] = m[k];",
+            "}));",
+            "var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {",
+            "    Object.defineProperty(o, \"default\", { enumerable: true, value: v });",
+            "}) : function(o, v) {",
+            "    o[\"default\"] = v;",
+            "});",
+            "var __importStar = (this && this.__importStar) || (function () {",
+            "    var ownKeys = function(o) {",
+            "        ownKeys = Object.getOwnPropertyNames || function (o) {",
+            "            var ar = [];",
+            "            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;",
+            "            return ar;",
+            "        };",
+            "        return ownKeys(o);",
+            "    };",
+            "    return function (mod) {",
+            "        if (mod && mod.__esModule) return mod;",
+            "        var result = {};",
+            "        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== \"default\") __createBinding(result, mod, k[i]);",
+            "        __setModuleDefault(result, mod);",
+            "        return result;",
+            "    };",
+            "})();",
+        ] {
+            self.writer.write(line);
+            self.writer.newline();
         }
     }
 
@@ -1445,7 +1542,8 @@ impl Printer<'_> {
                 self.writer.write(") ");
                 self.emit_embedded(data.then_statement)?;
                 if let Some(otherwise) = data.else_statement {
-                    self.writer.write(" else ");
+                    self.writer.newline();
+                    self.writer.write("else ");
                     self.emit_embedded(otherwise)?;
                 }
             }
@@ -1657,12 +1755,11 @@ impl Printer<'_> {
         if matches!(&self.node(id)?.data, NodeData::Block(_)) {
             return self.emit_block(id);
         }
-        self.writer.write("{");
         self.writer.newline();
         self.writer.indent += 1;
         self.emit_statement(id)?;
         self.writer.indent -= 1;
-        self.writer.write("}");
+        self.writer.remove_trailing_newline();
         Ok(())
     }
 
@@ -1701,14 +1798,19 @@ impl Printer<'_> {
 
     fn emit_parameters(&mut self, parameters: &NodeList) -> Result<(), EmitError> {
         self.writer.write("(");
-        for (index, parameter) in parameters.nodes.iter().enumerate() {
-            if index != 0 {
-                self.writer.write(", ");
-            }
+        let mut emitted = 0;
+        for parameter in &parameters.nodes {
             let node = self.node(*parameter)?.clone();
             let NodeData::ParameterDeclaration(data) = &node.data else {
                 return Err(Self::unsupported(*parameter, node.kind));
             };
+            if self.identifier_text(data.name).ok() == Some("this") {
+                continue;
+            }
+            if emitted != 0 {
+                self.writer.write(", ");
+            }
+            emitted += 1;
             if data.dot_dot_dot_token.is_some() {
                 self.writer.write("...");
             }
@@ -2414,18 +2516,20 @@ impl Printer<'_> {
         }
         if let Some(bindings) = clause.named_bindings {
             let bindings_node = self.node(bindings)?.clone();
+            let is_namespace_import = matches!(bindings_node.data, NodeData::NamespaceImport(_));
             self.writer.write(self.variable_keyword());
             self.writer.write(" ");
             if let NodeData::NamespaceImport(namespace) = &bindings_node.data {
                 self.emit_expression(namespace.name, 0)?;
-                self.writer.write(" = require(");
+                self.writer.write(" = __importStar(require(");
             } else {
                 self.writer.write("{ ");
                 self.emit_commonjs_named_imports(bindings)?;
                 self.writer.write(" } = require(");
             }
             self.emit_expression(data.module_specifier, 0)?;
-            self.writer.write(");");
+            self.writer
+                .write(if is_namespace_import { "));" } else { ");" });
         }
         Ok(())
     }
@@ -2708,9 +2812,19 @@ impl Printer<'_> {
                 self.writer.write("]");
             }
             NodeData::ParenthesizedExpression(data) => {
-                self.writer.write("(");
-                self.emit_expression(data.expression, 0)?;
-                self.writer.write(")");
+                let erases_to_inner_expression = matches!(
+                    self.node(data.expression)?.data,
+                    NodeData::AsExpression(_)
+                        | NodeData::SatisfiesExpression(_)
+                        | NodeData::TypeAssertion(_)
+                );
+                if erases_to_inner_expression {
+                    self.emit_expression(data.expression, parent_precedence)?;
+                } else {
+                    self.writer.write("(");
+                    self.emit_expression(data.expression, 0)?;
+                    self.writer.write(")");
+                }
             }
             NodeData::BinaryExpression(data) => {
                 let operator = self.node(data.operator_token)?.kind;
@@ -2732,7 +2846,14 @@ impl Printer<'_> {
                     operator_text(operator)
                         .ok_or_else(|| Self::unsupported(data.operator_token, operator))?,
                 );
-                self.writer.write(" ");
+                let line_break_after_operator =
+                    self.source_has_known_line_break_between(data.operator_token, data.right);
+                if line_break_after_operator {
+                    self.writer.indent += 1;
+                    self.writer.newline();
+                } else {
+                    self.writer.write(" ");
+                }
                 self.emit_expression(
                     data.right,
                     if right_associative {
@@ -2741,6 +2862,9 @@ impl Printer<'_> {
                         precedence + 1
                     },
                 )?;
+                if line_break_after_operator {
+                    self.writer.indent -= 1;
+                }
                 if wrap {
                     self.writer.write(")");
                 }
@@ -2755,12 +2879,30 @@ impl Printer<'_> {
                     )?;
                 } else {
                     self.emit_expression(data.expression, 18)?;
+                    let break_before_dot =
+                        self.source_has_line_break_before_property(data.expression, data.name);
+                    let break_after_dot =
+                        self.source_has_line_break_after_property_dot(data.expression, data.name);
+                    if break_before_dot {
+                        self.writer.indent += 1;
+                        self.writer.newline();
+                    }
                     self.writer.write(if data.question_dot_token.is_some() {
                         "?."
                     } else {
                         "."
                     });
+                    if break_before_dot {
+                        self.writer.indent -= 1;
+                    }
+                    if break_after_dot {
+                        self.writer.indent += 1;
+                        self.writer.newline();
+                    }
                     self.emit_expression(data.name, 18)?;
+                    if break_after_dot {
+                        self.writer.indent -= 1;
+                    }
                 }
             }
             NodeData::ElementAccessExpression(data) => {
@@ -2833,7 +2975,22 @@ impl Printer<'_> {
                 }
             }
             NodeData::NonNullExpression(data) => {
-                self.emit_expression(data.expression, parent_precedence)?;
+                let parenthesized_assertion = match &self.node(data.expression)?.data {
+                    NodeData::ParenthesizedExpression(parenthesized) => matches!(
+                        self.node(parenthesized.expression)?.data,
+                        NodeData::AsExpression(_)
+                            | NodeData::SatisfiesExpression(_)
+                            | NodeData::TypeAssertion(_)
+                    ),
+                    _ => false,
+                };
+                if parenthesized_assertion {
+                    self.writer.write("(");
+                    self.emit_expression(data.expression, parent_precedence)?;
+                    self.writer.write(")");
+                } else {
+                    self.emit_expression(data.expression, parent_precedence)?;
+                }
             }
             NodeData::AsExpression(data) => {
                 self.emit_expression(data.expression, parent_precedence)?;
@@ -3884,6 +4041,46 @@ impl Printer<'_> {
             .is_none_or(|text| text.contains('\n') || text.contains('\r'))
     }
 
+    fn source_has_known_line_break_between(&self, left: NodeId, right: NodeId) -> bool {
+        let Some(left) = self.arena.get(left) else {
+            return false;
+        };
+        let Some(right) = self.arena.get(right) else {
+            return false;
+        };
+        let start = usize::try_from(left.range.end.get()).unwrap_or(usize::MAX);
+        let end = usize::try_from(right.range.start.get()).unwrap_or(usize::MAX);
+        self.source_text
+            .get(start..end)
+            .is_some_and(|text| text.contains('\n') || text.contains('\r'))
+    }
+
+    fn source_has_line_break_before_property(&self, expression: NodeId, name: NodeId) -> bool {
+        self.source_property_separator(expression, name)
+            .is_some_and(|separator| {
+                let dot = separator.find('.').unwrap_or(separator.len());
+                separator[..dot].contains(['\n', '\r'])
+            })
+    }
+
+    fn source_has_line_break_after_property_dot(&self, expression: NodeId, name: NodeId) -> bool {
+        self.source_property_separator(expression, name)
+            .is_some_and(|separator| {
+                let Some(dot) = separator.find('.') else {
+                    return false;
+                };
+                separator[dot + 1..].contains(['\n', '\r'])
+            })
+    }
+
+    fn source_property_separator(&self, expression: NodeId, name: NodeId) -> Option<&str> {
+        let expression = self.arena.get(expression)?;
+        let name = self.arena.get(name)?;
+        let start = usize::try_from(expression.range.end.get()).unwrap_or(usize::MAX);
+        let end = usize::try_from(name.range.start.get()).unwrap_or(usize::MAX);
+        self.source_text.get(start..end)
+    }
+
     fn write_source_quoted_string(&mut self, id: NodeId, text: &str) {
         let quote = self
             .arena
@@ -4192,7 +4389,7 @@ mod tests {
             emit(
                 "let i = 0; do { i++; if (i === 1) continue; } while (i < 2); switch (i) { case 2: i = 3; break; default: i = 4; } try { throw i; } catch (error: unknown) { i = 5; } finally { i = 6; }"
             ),
-            "let i = 0;\ndo {\n    i++;\n    if (i === 1) {\n        continue;\n    }\n} while (i < 2);\nswitch (i) {\n    case 2:\n        i = 3;\n        break;\n    default:\n        i = 4;\n}\ntry {\n    throw i;\n} catch (error) {\n    i = 5;\n} finally {\n    i = 6;\n}\n"
+            "let i = 0;\ndo {\n    i++;\n    if (i === 1)\n        continue;\n} while (i < 2);\nswitch (i) {\n    case 2:\n        i = 3;\n        break;\n    default:\n        i = 4;\n}\ntry {\n    throw i;\n} catch (error) {\n    i = 5;\n} finally {\n    i = 6;\n}\n"
         );
     }
 
@@ -4200,7 +4397,7 @@ mod tests {
     fn prints_labeled_debugger_and_with_statements() {
         assert_eq!(
             emit("outer: while (value) { debugger; break outer; } with (obj) value;"),
-            "outer: while (value) {\n    debugger;\n    break outer;\n}\nwith (obj) {\n    value;\n}\n"
+            "outer: while (value) {\n    debugger;\n    break outer;\n}\nwith (obj)\n    value;\n"
         );
     }
 
@@ -4273,6 +4470,33 @@ mod tests {
                 "const callback = function (value: number): number { return value; }; const result = (function* named() { yield 1; })();"
             ),
             "const callback = function (value) { return value; };\nconst result = (function* named() {\n    yield 1;\n})();\n"
+        );
+    }
+
+    #[test]
+    fn erases_this_parameters_and_redundant_type_assertion_parentheses() {
+        assert_eq!(
+            emit(
+                "function read(this: Context,\n              candidate: Symbol,\n              value: number) { if (!candidate) return; return (value as NumberBox).amount; }"
+            ),
+            "function read(candidate, value) {\n    if (!candidate)\n        return;\n    return value.amount;\n}\n"
+        );
+    }
+
+    #[test]
+    fn preserves_multiline_call_chain_layout() {
+        let source = "function read() { let values = source.first()\n    .concat(source.second())\n    .concat(source.third()); }";
+        assert_eq!(
+            emit_with(source, ScriptTarget::Es2015, ModuleKind::EsNext).code,
+            "function read() {\n    let values = source.first()\n        .concat(source.second())\n        .concat(source.third());\n}\n"
+        );
+    }
+
+    #[test]
+    fn places_else_on_a_new_line() {
+        assert_eq!(
+            emit("if (value) { read(); } else { write(); }"),
+            "if (value) {\n    read();\n}\nelse {\n    write();\n}\n"
         );
     }
 
@@ -4520,9 +4744,33 @@ class Board {
             ScriptTarget::Es2015,
             ModuleKind::CommonJs,
         );
-        assert_eq!(
-            commonjs.code,
-            "\"use strict\";\nObject.defineProperty(exports, \"__esModule\", { value: true });\nconst ts = require('typescript');\nts.version;\n"
+        assert!(commonjs.code.contains("var __createBinding ="));
+        assert!(commonjs.code.contains("var __setModuleDefault ="));
+        assert!(commonjs.code.contains("var __importStar ="));
+        assert!(
+            commonjs
+                .code
+                .ends_with("const ts = __importStar(require('typescript'));\nts.version;\n")
+        );
+    }
+
+    #[test]
+    fn emits_import_star_helpers_once_for_commonjs_namespace_imports() {
+        let result = emit_with(
+            "import * as first from 'first'; import * as second from 'second'; first.read(second);",
+            ScriptTarget::Es2015,
+            ModuleKind::CommonJs,
+        );
+        assert_eq!(result.code.matches("var __importStar =").count(), 1);
+        assert!(
+            result
+                .code
+                .contains("const first = __importStar(require('first'));")
+        );
+        assert!(
+            result
+                .code
+                .contains("const second = __importStar(require('second'));")
         );
     }
 
