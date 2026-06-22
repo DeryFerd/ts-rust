@@ -1314,7 +1314,7 @@ impl<'a> Parser<'a> {
             let keyword = self.consume();
             let mut types = Vec::new();
             loop {
-                let expression = self.parse_entity_name();
+                let expression = self.parse_heritage_expression();
                 let type_arguments = self.parse_type_arguments();
                 let end = type_arguments
                     .as_ref()
@@ -1362,6 +1362,30 @@ impl<'a> Parser<'a> {
             nodes: clauses,
             has_trailing_comma: false,
         })
+    }
+
+    fn parse_heritage_expression(&mut self) -> NodeId {
+        let mut expression = self.parse_entity_name();
+        while self.current.kind == SyntaxKind::OpenParenToken {
+            let arguments = self.parse_argument_list();
+            let end = arguments.range.end;
+            let mut children = vec![expression];
+            children.extend(arguments.nodes.iter().copied());
+            expression = self.alloc_node(
+                SyntaxKind::CallExpression,
+                TextRange::new(self.node_start(expression), end),
+                NodeData::CallExpression(Box::new(CallExpressionData {
+                    arguments,
+                    expression,
+                    question_dot_token: None,
+                    symbol: None,
+                    type_arguments: None,
+                    facts: 0,
+                })),
+                &children,
+            );
+        }
+        expression
     }
 
     fn parse_class_members(&mut self, signature_only: bool) -> NodeList {
@@ -7864,6 +7888,78 @@ mod tests {
             NodeData::ClassExpression(_)
         ));
         assert_eq!(result.arena.get(class_id).unwrap().parent, Some(typeof_id));
+    }
+
+    #[test]
+    fn parses_call_expressions_in_class_heritage() {
+        let source = "class User {} class TimestampedUser extends Timestamped(User) { constructor() { super(); } }";
+        let result = parse_source_file(source);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let statements = source_statements(&result);
+        let class_id = statements[1];
+        let NodeData::ClassDeclaration(class) = &result.arena.get(class_id).unwrap().data else {
+            panic!("expected class declaration");
+        };
+        assert_eq!(class.members.nodes.len(), 1);
+        let clause_id = class.heritage_clauses.as_ref().unwrap().nodes[0];
+        assert_eq!(result.arena.get(clause_id).unwrap().parent, Some(class_id));
+        let NodeData::HeritageClause(clause) = &result.arena.get(clause_id).unwrap().data else {
+            panic!("expected heritage clause");
+        };
+        let heritage_id = clause.types.nodes[0];
+        assert_eq!(
+            result.arena.get(heritage_id).unwrap().parent,
+            Some(clause_id)
+        );
+        let NodeData::ExpressionWithTypeArguments(heritage) =
+            &result.arena.get(heritage_id).unwrap().data
+        else {
+            panic!("expected heritage expression");
+        };
+        let call_id = heritage.expression;
+        assert_eq!(result.arena.get(call_id).unwrap().parent, Some(heritage_id));
+        let NodeData::CallExpression(call) = &result.arena.get(call_id).unwrap().data else {
+            panic!("expected call expression");
+        };
+        assert_eq!(call.arguments.nodes.len(), 1);
+        assert_eq!(
+            result.arena.get(call.expression).unwrap().parent,
+            Some(call_id)
+        );
+        assert_eq!(
+            result.arena.get(call.arguments.nodes[0]).unwrap().parent,
+            Some(call_id)
+        );
+        let range = result.arena.get(call_id).unwrap().range;
+        assert_eq!(
+            &source[usize::try_from(range.start.get()).unwrap()
+                ..usize::try_from(range.end.get()).unwrap()],
+            "Timestamped(User)"
+        );
+
+        let generic = parse_source_file("interface Derived<T> extends ns.Base<T> {} ");
+        assert!(generic.diagnostics.is_empty(), "{:?}", generic.diagnostics);
+        let generic_statement = source_statements(&generic)[0];
+        let NodeData::InterfaceDeclaration(interface) =
+            &generic.arena.get(generic_statement).unwrap().data
+        else {
+            panic!("expected interface declaration");
+        };
+        let clause_id = interface.heritage_clauses.as_ref().unwrap().nodes[0];
+        let NodeData::HeritageClause(clause) = &generic.arena.get(clause_id).unwrap().data else {
+            panic!("expected heritage clause");
+        };
+        let heritage_id = clause.types.nodes[0];
+        let NodeData::ExpressionWithTypeArguments(heritage) =
+            &generic.arena.get(heritage_id).unwrap().data
+        else {
+            panic!("expected heritage expression");
+        };
+        assert!(matches!(
+            generic.arena.get(heritage.expression).unwrap().data,
+            NodeData::QualifiedName(_)
+        ));
+        assert_eq!(heritage.type_arguments.as_ref().unwrap().nodes.len(), 1);
     }
 
     #[test]
