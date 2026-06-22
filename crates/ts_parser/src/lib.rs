@@ -1,33 +1,38 @@
 //! TypeScript parser.
 
 use ts_ast::{
-    ArrayLiteralExpressionData, ArrowFunctionData, AsExpressionData, BigIntLiteralData,
-    BinaryExpressionData, BlockData, BreakStatementData, CallExpressionData,
+    ArrayLiteralExpressionData, ArrayTypeNodeData, ArrowFunctionData, AsExpressionData,
+    BigIntLiteralData, BinaryExpressionData, BlockData, BreakStatementData, CallExpressionData,
     CallSignatureDeclarationData, CaseBlockData, CaseOrDefaultClauseData, CatchClauseData,
-    ClassDeclarationData, ConditionalExpressionData, ConstructSignatureDeclarationData,
-    ContinueStatementData, DecoratorData, DoStatementData, ElementAccessExpressionData,
-    EmptyStatementData, EnumDeclarationData, EnumMemberData, ExportAssignmentData,
-    ExportDeclarationData, ExportSpecifierData, ExpressionStatementData,
-    ExpressionWithTypeArgumentsData, ExternalModuleReferenceData, ForInOrOfStatementData,
-    ForStatementData, FunctionDeclarationData, HeritageClauseData, IdentifierData, IfStatementData,
-    ImportClauseData, ImportDeclarationData, ImportEqualsDeclarationData, ImportSpecifierData,
-    IndexSignatureDeclarationData, InterfaceDeclarationData, JsDocData, JsDocTextData,
+    ClassDeclarationData, ConditionalExpressionData, ConditionalTypeNodeData,
+    ConstructSignatureDeclarationData, ConstructorTypeNodeData, ContinueStatementData,
+    DecoratorData, DoStatementData, ElementAccessExpressionData, EmptyStatementData,
+    EnumDeclarationData, EnumMemberData, ExportAssignmentData, ExportDeclarationData,
+    ExportSpecifierData, ExpressionStatementData, ExpressionWithTypeArgumentsData,
+    ExternalModuleReferenceData, ForInOrOfStatementData, ForStatementData, FunctionDeclarationData,
+    FunctionTypeNodeData, HeritageClauseData, IdentifierData, IfStatementData, ImportClauseData,
+    ImportDeclarationData, ImportEqualsDeclarationData, ImportSpecifierData, ImportTypeNodeData,
+    IndexSignatureDeclarationData, IndexedAccessTypeNodeData, InferTypeNodeData,
+    InterfaceDeclarationData, IntersectionTypeNodeData, JsDocData, JsDocTextData,
     JsDocUnknownTagData, JsxAttributeData, JsxAttributesData, JsxClosingElementData,
     JsxElementData, JsxExpressionData, JsxOpeningElementData, JsxSelfClosingElementData,
-    JsxTextData, KeywordExpressionData, KeywordTypeNodeData, MethodDeclarationData,
-    MethodSignatureDeclarationData, ModifierList, ModuleBlockData, ModuleDeclarationData,
-    NamedExportsData, NamedImportsData, NamespaceImportData, NewExpressionData,
-    NoSubstitutionTemplateLiteralData, Node, NodeArena, NodeData, NodeFlags, NodeId, NodeList,
-    NonNullExpressionData, NumericLiteralData, ObjectLiteralExpressionData,
-    ParameterDeclarationData, ParenthesizedExpressionData, PostfixUnaryExpressionData,
-    PrefixUnaryExpressionData, PropertyAccessExpressionData, PropertyAssignmentData,
-    PropertyDeclarationData, QualifiedNameData, ReturnStatementData, SatisfiesExpressionData,
+    JsxTextData, KeywordExpressionData, KeywordTypeNodeData, LiteralTypeNodeData,
+    MappedTypeNodeData, MethodDeclarationData, MethodSignatureDeclarationData, ModifierList,
+    ModuleBlockData, ModuleDeclarationData, NamedExportsData, NamedImportsData,
+    NamespaceImportData, NewExpressionData, NoSubstitutionTemplateLiteralData, Node, NodeArena,
+    NodeData, NodeFlags, NodeId, NodeList, NonNullExpressionData, NumericLiteralData,
+    ObjectLiteralExpressionData, ParameterDeclarationData, ParenthesizedExpressionData,
+    ParenthesizedTypeNodeData, PostfixUnaryExpressionData, PrefixUnaryExpressionData,
+    PropertyAccessExpressionData, PropertyAssignmentData, PropertyDeclarationData,
+    QualifiedNameData, RestTypeNodeData, ReturnStatementData, SatisfiesExpressionData,
     ShorthandPropertyAssignmentData, SourceFileData, SpreadAssignmentData, StringLiteralData,
     SwitchStatementData, SymbolTable, SyntaxKind, TemplateExpressionData, TemplateHeadData,
-    TemplateMiddleData, TemplateSpanData, TemplateTailData, ThrowStatementData, TokenData,
-    TokenFlags, TryStatementData, TypeAliasDeclarationData, TypeAssertionData, TypeLiteralNodeData,
-    TypeParameterDeclarationData, TypeReferenceNodeData, VariableDeclarationData,
-    VariableDeclarationListData, VariableStatementData, WhileStatementData,
+    TemplateMiddleData, TemplateSpanData, TemplateTailData, ThisTypeNodeData, ThrowStatementData,
+    TokenData, TokenFlags, TryStatementData, TupleTypeNodeData, TypeAliasDeclarationData,
+    TypeAssertionData, TypeLiteralNodeData, TypeOperatorNodeData, TypeParameterDeclarationData,
+    TypePredicateNodeData, TypeQueryNodeData, TypeReferenceNodeData, UnionTypeNodeData,
+    VariableDeclarationData, VariableDeclarationListData, VariableStatementData,
+    WhileStatementData,
 };
 use ts_core::{Diagnostic, TextPos, TextRange};
 use ts_scanner::{LanguageVariant, Scanner, Token, TokenFlags as ScannerTokenFlags};
@@ -771,7 +776,7 @@ impl<'a> Parser<'a> {
 
     fn parse_class_member(&mut self, signature_only: bool) -> NodeId {
         let start = self.current.range.start;
-        let name = self.parse_identifier_name("Expected a member name.");
+        let name = self.parse_property_name("Expected a member name.");
         if self.current.kind == SyntaxKind::OpenParenToken {
             let parameters = self.parse_parameter_list();
             let return_type = self.parse_optional_type_annotation();
@@ -963,7 +968,7 @@ impl<'a> Parser<'a> {
         start: TextPos,
         modifiers: Option<ModifierList>,
     ) -> NodeId {
-        let name = self.parse_identifier("Expected a member name.");
+        let name = self.parse_property_name("Expected a member name.");
         let postfix_token = if self.current.kind == SyntaxKind::QuestionToken {
             Some(self.consume_token_node())
         } else {
@@ -3026,6 +3031,14 @@ impl<'a> Parser<'a> {
         )
     }
 
+    fn parse_property_name(&mut self, message: &str) -> NodeId {
+        match self.current.kind {
+            SyntaxKind::StringLiteral => self.parse_string_literal(),
+            SyntaxKind::NumericLiteral => self.parse_numeric_literal(),
+            _ => self.parse_identifier_name(message),
+        }
+    }
+
     fn missing_identifier(&mut self, position: TextPos) -> NodeId {
         self.alloc_node_with_flags(
             SyntaxKind::Identifier,
@@ -3113,55 +3126,271 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_type(&mut self) -> NodeId {
-        if self.current.kind == SyntaxKind::OpenBraceToken {
-            let members = self.parse_class_members(true);
-            let range = members.range;
-            let children = members.nodes.clone();
-            return self.alloc_node(
-                SyntaxKind::TypeLiteral,
-                range,
-                NodeData::TypeLiteralNode(Box::new(TypeLiteralNodeData {
-                    members,
-                    symbol: None,
-                })),
-                &children,
-            );
+        if self.is_type_predicate() {
+            return self.parse_type_predicate();
         }
-        if is_keyword_type(self.current.kind) {
-            let token = self.consume();
-            return self.alloc_node(
-                token.kind,
-                token.range,
-                NodeData::KeywordTypeNode(Box::new(KeywordTypeNodeData)),
-                &[],
-            );
+        let check_type = self.parse_union_type();
+        if self.current.kind != SyntaxKind::ExtendsKeyword {
+            return check_type;
         }
+        self.bump();
+        let extends_type = self.parse_union_type();
+        self.expect_and_bump(SyntaxKind::QuestionToken, "Expected '?'.");
+        let true_type = self.parse_type();
+        self.expect_and_bump(SyntaxKind::ColonToken, "Expected ':'.");
+        let false_type = self.parse_type();
+        self.alloc_node(
+            SyntaxKind::ConditionalType,
+            TextRange::new(self.node_start(check_type), self.node_end(false_type)),
+            NodeData::ConditionalTypeNode(Box::new(ConditionalTypeNodeData {
+                check_type,
+                extends_type,
+                false_type,
+                locals: SymbolTable,
+                next_container: None,
+                true_type,
+            })),
+            &[check_type, extends_type, true_type, false_type],
+        )
+    }
 
+    fn is_type_predicate(&mut self) -> bool {
+        if !matches!(
+            self.current.kind,
+            SyntaxKind::Identifier | SyntaxKind::ThisKeyword
+        ) {
+            return false;
+        }
+        let checkpoint = self.scanner.mark();
+        let next = self.scanner.scan();
+        self.scanner.rewind(checkpoint);
+        next.kind == SyntaxKind::IsKeyword
+    }
+
+    fn parse_type_predicate(&mut self) -> NodeId {
         let start = self.current.range.start;
-        let mut type_name = self.parse_identifier("Expected a type name.");
-        while self.current.kind == SyntaxKind::DotToken {
+        let parameter_name = if self.current.kind == SyntaxKind::ThisKeyword {
+            let token = self.consume();
+            self.alloc_node(
+                SyntaxKind::ThisType,
+                token.range,
+                NodeData::ThisTypeNode(Box::new(ThisTypeNodeData)),
+                &[],
+            )
+        } else {
+            self.parse_identifier("Expected a predicate parameter name.")
+        };
+        self.expect_and_bump(SyntaxKind::IsKeyword, "Expected 'is'.");
+        let type_node = self.parse_type();
+        self.alloc_node(
+            SyntaxKind::TypePredicate,
+            TextRange::new(start, self.node_end(type_node)),
+            NodeData::TypePredicateNode(Box::new(TypePredicateNodeData {
+                asserts_modifier: None,
+                parameter_name,
+                type_: Some(type_node),
+            })),
+            &[parameter_name, type_node],
+        )
+    }
+
+    fn parse_union_type(&mut self) -> NodeId {
+        let start = self.current.range.start;
+        if self.current.kind == SyntaxKind::BarToken {
             self.bump();
-            let right = self.parse_identifier("Expected an identifier after '.'.");
-            type_name = self.alloc_node(
-                SyntaxKind::QualifiedName,
-                TextRange::new(self.node_start(type_name), self.node_end(right)),
-                NodeData::QualifiedName(Box::new(QualifiedNameData {
-                    flow_node: None,
-                    left: type_name,
-                    right,
-                    facts: 0,
+        }
+        let first = self.parse_intersection_type();
+        if self.current.kind != SyntaxKind::BarToken {
+            return first;
+        }
+        let mut types = vec![first];
+        while self.current.kind == SyntaxKind::BarToken {
+            self.bump();
+            types.push(self.parse_intersection_type());
+        }
+        let end = types.last().map_or(start, |node| self.node_end(*node));
+        self.alloc_node(
+            SyntaxKind::UnionType,
+            TextRange::new(start, end),
+            NodeData::UnionTypeNode(Box::new(UnionTypeNodeData {
+                types: NodeList {
+                    range: TextRange::new(start, end),
+                    nodes: types.clone(),
+                    has_trailing_comma: false,
+                },
+            })),
+            &types,
+        )
+    }
+
+    fn parse_intersection_type(&mut self) -> NodeId {
+        let start = self.current.range.start;
+        if self.current.kind == SyntaxKind::AmpersandToken {
+            self.bump();
+        }
+        let first = self.parse_type_operator_or_postfix();
+        if self.current.kind != SyntaxKind::AmpersandToken {
+            return first;
+        }
+        let mut types = vec![first];
+        while self.current.kind == SyntaxKind::AmpersandToken {
+            self.bump();
+            types.push(self.parse_type_operator_or_postfix());
+        }
+        let end = types.last().map_or(start, |node| self.node_end(*node));
+        self.alloc_node(
+            SyntaxKind::IntersectionType,
+            TextRange::new(start, end),
+            NodeData::IntersectionTypeNode(Box::new(IntersectionTypeNodeData {
+                types: NodeList {
+                    range: TextRange::new(start, end),
+                    nodes: types.clone(),
+                    has_trailing_comma: false,
+                },
+            })),
+            &types,
+        )
+    }
+
+    fn parse_type_operator_or_postfix(&mut self) -> NodeId {
+        if matches!(
+            self.current.kind,
+            SyntaxKind::KeyOfKeyword | SyntaxKind::ReadonlyKeyword | SyntaxKind::UniqueKeyword
+        ) {
+            let operator = self.consume();
+            let type_node = self.parse_type_operator_or_postfix();
+            return self.alloc_node(
+                SyntaxKind::TypeOperator,
+                TextRange::new(operator.range.start, self.node_end(type_node)),
+                NodeData::TypeOperatorNode(Box::new(TypeOperatorNodeData {
+                    operator: operator.kind,
+                    type_: type_node,
                 })),
-                &[type_name, right],
+                &[type_node],
             );
         }
+        let mut type_node = self.parse_primary_type();
+        while self.current.kind == SyntaxKind::OpenBracketToken {
+            self.bump();
+            if self.current.kind == SyntaxKind::CloseBracketToken {
+                let end = self.consume().range.end;
+                type_node = self.alloc_node(
+                    SyntaxKind::ArrayType,
+                    TextRange::new(self.node_start(type_node), end),
+                    NodeData::ArrayTypeNode(Box::new(ArrayTypeNodeData {
+                        element_type: type_node,
+                    })),
+                    &[type_node],
+                );
+            } else {
+                let index_type = self.parse_type();
+                let end = if self.current.kind == SyntaxKind::CloseBracketToken {
+                    self.consume().range.end
+                } else {
+                    self.error_current("Expected ']'.");
+                    self.node_end(index_type)
+                };
+                type_node = self.alloc_node(
+                    SyntaxKind::IndexedAccessType,
+                    TextRange::new(self.node_start(type_node), end),
+                    NodeData::IndexedAccessTypeNode(Box::new(IndexedAccessTypeNodeData {
+                        index_type,
+                        object_type: type_node,
+                    })),
+                    &[type_node, index_type],
+                );
+            }
+        }
+        type_node
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn parse_primary_type(&mut self) -> NodeId {
+        let parenthesized_function =
+            self.current.kind == SyntaxKind::OpenParenToken && self.is_parenthesized_arrow();
+        let mapped_type = self.current.kind == SyntaxKind::OpenBraceToken && self.is_mapped_type();
+        match self.current.kind {
+            SyntaxKind::OpenBraceToken if mapped_type => self.parse_mapped_type(),
+            SyntaxKind::OpenBraceToken => {
+                let members = self.parse_class_members(true);
+                let range = members.range;
+                let children = members.nodes.clone();
+                self.alloc_node(
+                    SyntaxKind::TypeLiteral,
+                    range,
+                    NodeData::TypeLiteralNode(Box::new(TypeLiteralNodeData {
+                        members,
+                        symbol: None,
+                    })),
+                    &children,
+                )
+            }
+            kind if is_keyword_type(kind) => {
+                let token = self.consume();
+                self.alloc_node(
+                    token.kind,
+                    token.range,
+                    NodeData::KeywordTypeNode(Box::new(KeywordTypeNodeData)),
+                    &[],
+                )
+            }
+            SyntaxKind::ThisKeyword => {
+                let token = self.consume();
+                self.alloc_node(
+                    SyntaxKind::ThisType,
+                    token.range,
+                    NodeData::ThisTypeNode(Box::new(ThisTypeNodeData)),
+                    &[],
+                )
+            }
+            SyntaxKind::InferKeyword => self.parse_infer_type(),
+            SyntaxKind::TypeOfKeyword => self.parse_type_query(),
+            SyntaxKind::ImportKeyword => self.parse_import_type(),
+            SyntaxKind::OpenParenToken if parenthesized_function => self.parse_function_type(None),
+            SyntaxKind::LessThanToken => {
+                let type_parameters = self.parse_type_parameters();
+                self.parse_function_type(type_parameters)
+            }
+            SyntaxKind::NewKeyword => self.parse_constructor_type(),
+            SyntaxKind::AbstractKeyword => self.parse_abstract_constructor_type(),
+            SyntaxKind::OpenParenToken => {
+                let start = self.consume().range.start;
+                let type_node = self.parse_type();
+                let end = if self.current.kind == SyntaxKind::CloseParenToken {
+                    self.consume().range.end
+                } else {
+                    self.error_current("Expected ')'.");
+                    self.node_end(type_node)
+                };
+                self.alloc_node(
+                    SyntaxKind::ParenthesizedType,
+                    TextRange::new(start, end),
+                    NodeData::ParenthesizedTypeNode(Box::new(ParenthesizedTypeNodeData {
+                        type_: type_node,
+                    })),
+                    &[type_node],
+                )
+            }
+            SyntaxKind::OpenBracketToken => self.parse_tuple_type(),
+            SyntaxKind::StringLiteral
+            | SyntaxKind::NumericLiteral
+            | SyntaxKind::BigIntLiteral
+            | SyntaxKind::TrueKeyword
+            | SyntaxKind::FalseKeyword
+            | SyntaxKind::NullKeyword => self.parse_literal_type(),
+            _ => self.parse_type_reference(),
+        }
+    }
+
+    fn parse_type_reference(&mut self) -> NodeId {
+        let start = self.current.range.start;
+        let type_name = self.parse_entity_name();
         let type_arguments = self.parse_type_arguments();
         let end = type_arguments
             .as_ref()
             .map_or_else(|| self.node_end(type_name), |arguments| arguments.range.end);
         let mut children = vec![type_name];
-        if let Some(arguments) = &type_arguments {
-            children.extend(arguments.nodes.iter().copied());
-        }
+        extend_list_children(&mut children, type_arguments.as_ref());
         self.alloc_node(
             SyntaxKind::TypeReference,
             TextRange::new(start, end),
@@ -3170,6 +3399,334 @@ impl<'a> Parser<'a> {
                 type_name,
             })),
             &children,
+        )
+    }
+
+    fn parse_function_type(&mut self, type_parameters: Option<NodeList>) -> NodeId {
+        let start = type_parameters
+            .as_ref()
+            .map_or(self.current.range.start, |parameters| {
+                parameters.range.start
+            });
+        let parameters = self.parse_parameter_list();
+        self.expect_and_bump(SyntaxKind::EqualsGreaterThanToken, "Expected '=>'.");
+        let return_type = self.parse_type();
+        let mut children = Vec::new();
+        extend_list_children(&mut children, type_parameters.as_ref());
+        children.extend(parameters.nodes.iter().copied());
+        children.push(return_type);
+        self.alloc_node(
+            SyntaxKind::FunctionType,
+            TextRange::new(start, self.node_end(return_type)),
+            NodeData::FunctionTypeNode(Box::new(FunctionTypeNodeData {
+                full_signature: None,
+                locals: SymbolTable,
+                next_container: None,
+                parameters,
+                symbol: None,
+                type_: Some(return_type),
+                type_parameters,
+                modifiers: None,
+            })),
+            &children,
+        )
+    }
+
+    fn parse_constructor_type(&mut self) -> NodeId {
+        let start = self.consume().range.start;
+        self.parse_constructor_type_tail(start, None)
+    }
+
+    fn parse_abstract_constructor_type(&mut self) -> NodeId {
+        let start = self.current.range.start;
+        let abstract_modifier = self.consume_token_node();
+        self.expect_and_bump(SyntaxKind::NewKeyword, "Expected 'new'.");
+        let modifiers = Some(ModifierList {
+            list: NodeList {
+                range: TextRange::new(start, self.current.range.start),
+                nodes: vec![abstract_modifier],
+                has_trailing_comma: false,
+            },
+            flags: ts_ast::ModifierFlags::default(),
+        });
+        self.parse_constructor_type_tail(start, modifiers)
+    }
+
+    fn parse_constructor_type_tail(
+        &mut self,
+        start: TextPos,
+        modifiers: Option<ModifierList>,
+    ) -> NodeId {
+        let type_parameters = self.parse_type_parameters();
+        let parameters = self.parse_parameter_list();
+        self.expect_and_bump(SyntaxKind::EqualsGreaterThanToken, "Expected '=>'.");
+        let return_type = self.parse_type();
+        let mut children = Vec::new();
+        if let Some(modifiers) = &modifiers {
+            children.extend(modifiers.list.nodes.iter().copied());
+        }
+        extend_list_children(&mut children, type_parameters.as_ref());
+        children.extend(parameters.nodes.iter().copied());
+        children.push(return_type);
+        self.alloc_node(
+            SyntaxKind::ConstructorType,
+            TextRange::new(start, self.node_end(return_type)),
+            NodeData::ConstructorTypeNode(Box::new(ConstructorTypeNodeData {
+                full_signature: None,
+                locals: SymbolTable,
+                next_container: None,
+                parameters,
+                symbol: None,
+                type_: Some(return_type),
+                type_parameters,
+                modifiers,
+            })),
+            &children,
+        )
+    }
+
+    fn parse_type_query(&mut self) -> NodeId {
+        let start = self.consume().range.start;
+        let expr_name = self.parse_entity_name();
+        let type_arguments = self.parse_type_arguments();
+        let end = type_arguments
+            .as_ref()
+            .map_or_else(|| self.node_end(expr_name), |arguments| arguments.range.end);
+        let mut children = vec![expr_name];
+        extend_list_children(&mut children, type_arguments.as_ref());
+        self.alloc_node(
+            SyntaxKind::TypeQuery,
+            TextRange::new(start, end),
+            NodeData::TypeQueryNode(Box::new(TypeQueryNodeData {
+                expr_name,
+                type_arguments,
+            })),
+            &children,
+        )
+    }
+
+    fn parse_import_type(&mut self) -> NodeId {
+        let start = self.consume().range.start;
+        self.expect_and_bump(SyntaxKind::OpenParenToken, "Expected '('.");
+        let argument = self.parse_literal_type();
+        self.expect_and_bump(SyntaxKind::CloseParenToken, "Expected ')'.");
+        let qualifier = if self.current.kind == SyntaxKind::DotToken {
+            self.bump();
+            Some(self.parse_entity_name())
+        } else {
+            None
+        };
+        let type_arguments = self.parse_type_arguments();
+        let end = type_arguments.as_ref().map_or_else(
+            || qualifier.map_or_else(|| self.node_end(argument), |node| self.node_end(node)),
+            |arguments| arguments.range.end,
+        );
+        let mut children = vec![argument];
+        children.extend(qualifier);
+        extend_list_children(&mut children, type_arguments.as_ref());
+        self.alloc_node(
+            SyntaxKind::ImportType,
+            TextRange::new(start, end),
+            NodeData::ImportTypeNode(Box::new(ImportTypeNodeData {
+                argument,
+                attributes: None,
+                is_type_of: false,
+                qualifier,
+                type_arguments,
+            })),
+            &children,
+        )
+    }
+
+    fn parse_literal_type(&mut self) -> NodeId {
+        let literal = match self.current.kind {
+            SyntaxKind::StringLiteral => self.parse_string_literal(),
+            SyntaxKind::NumericLiteral => self.parse_numeric_literal(),
+            SyntaxKind::BigIntLiteral => self.parse_bigint_literal(),
+            _ => self.parse_keyword_expression(),
+        };
+        self.alloc_node(
+            SyntaxKind::LiteralType,
+            self.arena.get(literal).unwrap().range,
+            NodeData::LiteralTypeNode(Box::new(LiteralTypeNodeData { literal })),
+            &[literal],
+        )
+    }
+
+    fn parse_infer_type(&mut self) -> NodeId {
+        let start = self.consume().range.start;
+        let name = self.parse_identifier("Expected a type parameter name.");
+        let type_parameter = self.alloc_node(
+            SyntaxKind::TypeParameter,
+            self.arena.get(name).unwrap().range,
+            NodeData::TypeParameterDeclaration(Box::new(TypeParameterDeclarationData {
+                constraint: None,
+                default_type: None,
+                expression: None,
+                symbol: None,
+                modifiers: None,
+                name,
+            })),
+            &[name],
+        );
+        self.alloc_node(
+            SyntaxKind::InferType,
+            TextRange::new(start, self.node_end(type_parameter)),
+            NodeData::InferTypeNode(Box::new(InferTypeNodeData { type_parameter })),
+            &[type_parameter],
+        )
+    }
+
+    fn is_mapped_type(&mut self) -> bool {
+        let checkpoint = self.scanner.mark();
+        let mut token = self.scanner.scan();
+        if matches!(token.kind, SyntaxKind::PlusToken | SyntaxKind::MinusToken) {
+            token = self.scanner.scan();
+        }
+        if token.kind == SyntaxKind::ReadonlyKeyword {
+            token = self.scanner.scan();
+        }
+        let result = if token.kind == SyntaxKind::OpenBracketToken {
+            let name = self.scanner.scan();
+            let in_token = self.scanner.scan();
+            name.kind == SyntaxKind::Identifier && in_token.kind == SyntaxKind::InKeyword
+        } else {
+            false
+        };
+        self.scanner.rewind(checkpoint);
+        result
+    }
+
+    fn parse_mapped_type(&mut self) -> NodeId {
+        let start = self.consume().range.start;
+        let readonly_token = if matches!(
+            self.current.kind,
+            SyntaxKind::PlusToken | SyntaxKind::MinusToken
+        ) {
+            let token = Some(self.consume_token_node());
+            self.expect_and_bump(SyntaxKind::ReadonlyKeyword, "Expected 'readonly'.");
+            token
+        } else if self.current.kind == SyntaxKind::ReadonlyKeyword {
+            Some(self.consume_token_node())
+        } else {
+            None
+        };
+        self.expect_and_bump(SyntaxKind::OpenBracketToken, "Expected '['.");
+        let parameter_start = self.current.range.start;
+        let name = self.parse_identifier("Expected a type parameter name.");
+        self.expect_and_bump(SyntaxKind::InKeyword, "Expected 'in'.");
+        let constraint = self.parse_type();
+        let name_type = if self.current.kind == SyntaxKind::AsKeyword {
+            self.bump();
+            Some(self.parse_type())
+        } else {
+            None
+        };
+        self.expect_and_bump(SyntaxKind::CloseBracketToken, "Expected ']'.");
+        let question_token = if matches!(
+            self.current.kind,
+            SyntaxKind::PlusToken | SyntaxKind::MinusToken
+        ) {
+            let token = Some(self.consume_token_node());
+            self.expect_and_bump(SyntaxKind::QuestionToken, "Expected '?'.");
+            token
+        } else if self.current.kind == SyntaxKind::QuestionToken {
+            Some(self.consume_token_node())
+        } else {
+            None
+        };
+        let type_node = if self.current.kind == SyntaxKind::ColonToken {
+            self.bump();
+            Some(self.parse_type())
+        } else {
+            None
+        };
+        self.parse_semicolon(
+            type_node.map_or(self.current.range.start, |node| self.node_end(node)),
+        );
+        let end = if self.current.kind == SyntaxKind::CloseBraceToken {
+            self.consume().range.end
+        } else {
+            self.error_current("Expected '}'.");
+            type_node.map_or(self.current.range.start, |node| self.node_end(node))
+        };
+        let type_parameter = self.alloc_node(
+            SyntaxKind::TypeParameter,
+            TextRange::new(parameter_start, self.node_end(constraint)),
+            NodeData::TypeParameterDeclaration(Box::new(TypeParameterDeclarationData {
+                constraint: Some(constraint),
+                default_type: None,
+                expression: None,
+                symbol: None,
+                modifiers: None,
+                name,
+            })),
+            &[name, constraint],
+        );
+        let mut children = vec![type_parameter];
+        children.extend(readonly_token);
+        children.extend(name_type);
+        children.extend(question_token);
+        children.extend(type_node);
+        self.alloc_node(
+            SyntaxKind::MappedType,
+            TextRange::new(start, end),
+            NodeData::MappedTypeNode(Box::new(MappedTypeNodeData {
+                locals: SymbolTable,
+                members: None,
+                name_type,
+                next_container: None,
+                question_token,
+                readonly_token,
+                symbol: None,
+                type_: type_node,
+                type_parameter,
+            })),
+            &children,
+        )
+    }
+
+    fn parse_tuple_type(&mut self) -> NodeId {
+        let start = self.consume().range.start;
+        let mut elements = Vec::new();
+        while !matches!(
+            self.current.kind,
+            SyntaxKind::CloseBracketToken | SyntaxKind::EndOfFile
+        ) {
+            if self.current.kind == SyntaxKind::DotDotDotToken {
+                let rest_start = self.consume().range.start;
+                let type_node = self.parse_type();
+                elements.push(self.alloc_node(
+                    SyntaxKind::RestType,
+                    TextRange::new(rest_start, self.node_end(type_node)),
+                    NodeData::RestTypeNode(Box::new(RestTypeNodeData { type_: type_node })),
+                    &[type_node],
+                ));
+            } else {
+                elements.push(self.parse_type());
+            }
+            if self.current.kind != SyntaxKind::CommaToken {
+                break;
+            }
+            self.bump();
+        }
+        let end = if self.current.kind == SyntaxKind::CloseBracketToken {
+            self.consume().range.end
+        } else {
+            self.error_current("Expected ']'.");
+            elements.last().map_or(start, |node| self.node_end(*node))
+        };
+        self.alloc_node(
+            SyntaxKind::TupleType,
+            TextRange::new(start, end),
+            NodeData::TupleTypeNode(Box::new(TupleTypeNodeData {
+                elements: NodeList {
+                    range: TextRange::new(start, end),
+                    nodes: elements.clone(),
+                    has_trailing_comma: false,
+                },
+            })),
+            &elements,
         )
     }
 
@@ -3868,6 +4425,40 @@ mod tests {
             panic!("expected type literal");
         };
         assert_eq!(literal.members.nodes.len(), 4);
+    }
+
+    #[test]
+    fn parses_advanced_declaration_types_without_recovery() {
+        let result = parse_source_file(
+            r#"
+                type Advanced<T, K extends keyof T = keyof T> =
+                    T extends readonly (infer U)[]
+                        ? { readonly [P in K]-?: T[P] }
+                        : import("pkg").Thing<T>;
+                type Predicate<T> = (this: T, value: T, ...rest: [...T[]]) => value is T;
+                type Constructor<T> = abstract new (...args: any[]) => T;
+                type Query = typeof ns.value;
+                interface LiteralNames { "prototype": Query; 0: string; }
+            "#,
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let kinds: Vec<_> = result.arena.iter().map(|(_, node)| node.kind).collect();
+        for expected in [
+            SyntaxKind::ConditionalType,
+            SyntaxKind::TypeOperator,
+            SyntaxKind::InferType,
+            SyntaxKind::ArrayType,
+            SyntaxKind::MappedType,
+            SyntaxKind::IndexedAccessType,
+            SyntaxKind::ImportType,
+            SyntaxKind::FunctionType,
+            SyntaxKind::TypePredicate,
+            SyntaxKind::RestType,
+            SyntaxKind::ConstructorType,
+            SyntaxKind::TypeQuery,
+        ] {
+            assert!(kinds.contains(&expected), "missing {expected:?}");
+        }
     }
 
     #[test]
