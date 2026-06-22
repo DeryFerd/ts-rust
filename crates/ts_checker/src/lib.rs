@@ -1,6 +1,6 @@
 //! Initial semantic type checking over the arena-backed TypeScript AST.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use ts_ast::{NodeArena, NodeData, NodeId, SymbolId, SyntaxKind};
 use ts_binder::BindResult;
@@ -332,6 +332,8 @@ pub struct CheckResult {
     pub node_types: BTreeMap<NodeId, TypeId>,
     pub enum_member_values: BTreeMap<NodeId, EnumConstantValue>,
     pub enum_access_values: BTreeMap<NodeId, EnumConstantValue>,
+    /// Declaration statements retained for emit, keyed by source file or module block.
+    pub declaration_reachability: BTreeMap<NodeId, BTreeSet<NodeId>>,
     pub diagnostics: Vec<CheckDiagnostic>,
 }
 
@@ -379,6 +381,11 @@ impl CheckResult {
     pub fn type_of_node(&self, node: NodeId) -> Option<TypeId> {
         self.node_types.get(&node).copied()
     }
+
+    #[must_use]
+    pub fn declarations_to_emit(&self, scope: NodeId) -> Option<&BTreeSet<NodeId>> {
+        self.declaration_reachability.get(&scope)
+    }
 }
 
 #[must_use]
@@ -410,6 +417,7 @@ pub fn empty_check_result() -> CheckResult {
         node_types: BTreeMap::new(),
         enum_member_values: BTreeMap::new(),
         enum_access_values: BTreeMap::new(),
+        declaration_reachability: BTreeMap::new(),
         diagnostics: Vec::new(),
     }
 }
@@ -882,6 +890,7 @@ impl<'a> Checker<'a> {
                 node_types: BTreeMap::new(),
                 enum_member_values: BTreeMap::new(),
                 enum_access_values: BTreeMap::new(),
+                declaration_reachability: BTreeMap::new(),
                 diagnostics: Vec::new(),
             },
             children,
@@ -931,6 +940,12 @@ impl<'a> Checker<'a> {
         let mut saw_return = false;
         self.check_node(source_file, None, &mut saw_return);
         self.check_unused_symbols();
+        self.result.declaration_reachability = DeclarationReachability::analyze(
+            self.arena,
+            self.bindings,
+            source_file,
+            self.options.is_declaration_file,
+        );
         self.result
     }
 
@@ -5436,6 +5451,259 @@ impl<'a> Checker<'a> {
     }
 }
 
+struct DeclarationReachability<'a> {
+    arena: &'a NodeArena,
+    bindings: &'a BindResult,
+    children: HashMap<NodeId, Vec<NodeId>>,
+    scopes: BTreeMap<NodeId, Vec<NodeId>>,
+    retained: BTreeMap<NodeId, BTreeSet<NodeId>>,
+    pending: VecDeque<NodeId>,
+}
+
+impl<'a> DeclarationReachability<'a> {
+    fn analyze(
+        arena: &'a NodeArena,
+        bindings: &'a BindResult,
+        source_file: NodeId,
+        is_declaration_file: bool,
+    ) -> BTreeMap<NodeId, BTreeSet<NodeId>> {
+        let mut children = HashMap::<NodeId, Vec<NodeId>>::new();
+        for (id, node) in arena.iter() {
+            if let Some(parent) = node.parent {
+                children.entry(parent).or_default().push(id);
+            }
+        }
+        let mut analyzer = Self {
+            arena,
+            bindings,
+            children,
+            scopes: BTreeMap::new(),
+            retained: BTreeMap::new(),
+            pending: VecDeque::new(),
+        };
+        let Some(NodeData::SourceFile(source)) = arena.get(source_file).map(|node| &node.data)
+        else {
+            return BTreeMap::new();
+        };
+        let external = !bindings.exports.is_empty()
+            || source.statements.nodes.iter().any(|statement| {
+                arena.get(*statement).is_some_and(|statement| {
+                    matches!(
+                        statement.data,
+                        NodeData::ImportDeclaration(_)
+                            | NodeData::ImportEqualsDeclaration(_)
+                            | NodeData::ExportDeclaration(_)
+                            | NodeData::ExportAssignment(_)
+                    )
+                })
+            });
+        analyzer.collect_scope(
+            source_file,
+            &source.statements.nodes,
+            is_declaration_file || !external,
+            is_declaration_file,
+        );
+        analyzer.seed_roots();
+        analyzer.trace_dependencies();
+        analyzer.retained
+    }
+
+    fn collect_scope(
+        &mut self,
+        scope: NodeId,
+        statements: &[NodeId],
+        root_all: bool,
+        implicit_ambient: bool,
+    ) {
+        self.scopes.insert(scope, statements.to_vec());
+        self.retained.entry(scope).or_default();
+        for statement in statements {
+            let Some(NodeData::ModuleDeclaration(module)) =
+                self.arena.get(*statement).map(|node| &node.data)
+            else {
+                continue;
+            };
+            let ambient =
+                implicit_ambient || self.node_has_modifier(*statement, SyntaxKind::DeclareKeyword);
+            let Some(body) = module.body else {
+                continue;
+            };
+            match &self.arena.get(body).map(|node| &node.data) {
+                Some(NodeData::ModuleBlock(block)) => {
+                    self.collect_scope(body, &block.statements.nodes, ambient, ambient);
+                }
+                Some(NodeData::ModuleDeclaration(_)) => {
+                    self.collect_scope(body, &[body], ambient, ambient);
+                }
+                _ => {}
+            }
+        }
+        if root_all {
+            for statement in statements {
+                if self.is_declaration_statement(*statement) {
+                    self.retain(*statement);
+                }
+            }
+        }
+    }
+
+    fn seed_roots(&mut self) {
+        let scopes = self.scopes.clone();
+        for (scope, statements) in scopes {
+            let already_rooted = self
+                .retained
+                .get(&scope)
+                .is_some_and(|retained| !retained.is_empty());
+            if already_rooted {
+                continue;
+            }
+            for statement in statements {
+                if self.node_has_modifier(statement, SyntaxKind::ExportKeyword)
+                    || matches!(
+                        self.arena.get(statement).map(|node| &node.data),
+                        Some(NodeData::ExportDeclaration(_) | NodeData::ExportAssignment(_))
+                    )
+                {
+                    self.retain(statement);
+                }
+            }
+        }
+    }
+
+    fn trace_dependencies(&mut self) {
+        while let Some(declaration) = self.pending.pop_front() {
+            let mut stack = vec![declaration];
+            while let Some(node_id) = stack.pop() {
+                let Some(node) = self.arena.get(node_id) else {
+                    continue;
+                };
+                match &node.data {
+                    NodeData::TypeReferenceNode(reference) => {
+                        self.retain_entity(reference.type_name);
+                    }
+                    NodeData::TypeQueryNode(query) => self.retain_entity(query.expr_name),
+                    NodeData::ExpressionWithTypeArguments(expression) => {
+                        self.retain_entity(expression.expression);
+                    }
+                    NodeData::ImportEqualsDeclaration(import) => {
+                        self.retain_entity(import.module_reference);
+                    }
+                    NodeData::Block(_) | NodeData::ModuleBlock(_) if node_id != declaration => {
+                        continue;
+                    }
+                    NodeData::ModuleDeclaration(_) if node_id != declaration => continue,
+                    _ => {}
+                }
+                if let Some(children) = self.children.get(&node_id) {
+                    stack.extend(children.iter().copied());
+                }
+            }
+        }
+    }
+
+    fn retain_entity(&mut self, entity: NodeId) {
+        let Some((identifier, name)) = self.leftmost_entity_name(entity) else {
+            return;
+        };
+        let Some(symbol) = self.bindings.resolve_name_at(identifier, &name) else {
+            return;
+        };
+        let target = self
+            .bindings
+            .symbols
+            .get(symbol)
+            .and_then(|symbol| symbol.target)
+            .unwrap_or(symbol);
+        let declarations = self
+            .bindings
+            .symbols
+            .get(target)
+            .map(|symbol| symbol.declarations.clone())
+            .unwrap_or_default();
+        for declaration in declarations {
+            if let Some(statement) = self.declaration_statement(declaration) {
+                self.retain(statement);
+            }
+        }
+    }
+
+    fn retain(&mut self, statement: NodeId) {
+        let Some(scope) = self
+            .arena
+            .get(statement)
+            .and_then(|node| node.parent)
+            .filter(|parent| self.scopes.contains_key(parent))
+        else {
+            return;
+        };
+        if self.retained.entry(scope).or_default().insert(statement) {
+            self.pending.push_back(statement);
+        }
+    }
+
+    fn declaration_statement(&self, declaration: NodeId) -> Option<NodeId> {
+        let mut current = declaration;
+        loop {
+            let parent = self.arena.get(current)?.parent?;
+            if self.scopes.contains_key(&parent) {
+                return Some(current);
+            }
+            current = parent;
+        }
+    }
+
+    fn leftmost_entity_name(&self, entity: NodeId) -> Option<(NodeId, String)> {
+        match &self.arena.get(entity)?.data {
+            NodeData::Identifier(identifier) => Some((entity, identifier.text.clone())),
+            NodeData::QualifiedName(name) => self.leftmost_entity_name(name.left),
+            NodeData::PropertyAccessExpression(access) => {
+                self.leftmost_entity_name(access.expression)
+            }
+            _ => None,
+        }
+    }
+
+    fn node_has_modifier(&self, node: NodeId, kind: SyntaxKind) -> bool {
+        let modifiers = match &self.arena.get(node).map(|node| &node.data) {
+            Some(NodeData::VariableStatement(declaration)) => declaration.modifiers.as_ref(),
+            Some(NodeData::FunctionDeclaration(declaration)) => declaration.modifiers.as_ref(),
+            Some(NodeData::ClassDeclaration(declaration)) => declaration.modifiers.as_ref(),
+            Some(NodeData::InterfaceDeclaration(declaration)) => declaration.modifiers.as_ref(),
+            Some(NodeData::TypeAliasDeclaration(declaration)) => declaration.modifiers.as_ref(),
+            Some(NodeData::EnumDeclaration(declaration)) => declaration.modifiers.as_ref(),
+            Some(NodeData::ModuleDeclaration(declaration)) => declaration.modifiers.as_ref(),
+            Some(NodeData::ImportEqualsDeclaration(declaration)) => declaration.modifiers.as_ref(),
+            _ => None,
+        };
+        modifiers.is_some_and(|modifiers| {
+            modifiers.list.nodes.iter().any(|modifier| {
+                self.arena
+                    .get(*modifier)
+                    .is_some_and(|modifier| modifier.kind == kind)
+            })
+        })
+    }
+
+    fn is_declaration_statement(&self, statement: NodeId) -> bool {
+        matches!(
+            self.arena.get(statement).map(|node| &node.data),
+            Some(
+                NodeData::VariableStatement(_)
+                    | NodeData::FunctionDeclaration(_)
+                    | NodeData::ClassDeclaration(_)
+                    | NodeData::InterfaceDeclaration(_)
+                    | NodeData::TypeAliasDeclaration(_)
+                    | NodeData::EnumDeclaration(_)
+                    | NodeData::ModuleDeclaration(_)
+                    | NodeData::ImportDeclaration(_)
+                    | NodeData::ImportEqualsDeclaration(_)
+                    | NodeData::ExportDeclaration(_)
+                    | NodeData::ExportAssignment(_)
+            )
+        )
+    }
+}
+
 fn describe_alias(
     source: &ProgramSource<'_>,
     alias: &ts_ast::TypeAliasDeclarationData,
@@ -7733,6 +8001,86 @@ mod tests {
             "{:?}",
             checked.files[1].diagnostics
         );
+    }
+
+    #[test]
+    fn retains_private_declarations_referenced_by_exported_types() {
+        let parsed = parse_source_file(
+            r"
+                type T = { x: number };
+                type Unused = { hidden: string };
+                export interface I { value: T; }
+            ",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let NodeData::SourceFile(source) = &parsed.arena.get(parsed.source_file).unwrap().data
+        else {
+            panic!("expected source file");
+        };
+        let retained = result.declarations_to_emit(parsed.source_file).unwrap();
+
+        assert_eq!(retained.len(), 2);
+        assert!(retained.contains(&source.statements.nodes[0]));
+        assert!(!retained.contains(&source.statements.nodes[1]));
+        assert!(retained.contains(&source.statements.nodes[2]));
+    }
+
+    #[test]
+    fn retains_transitive_namespace_alias_dependencies_but_not_their_private_members() {
+        let parsed = parse_source_file(
+            r"
+                namespace M {
+                    namespace N { class Hidden {} }
+                    import R = N;
+                    export import X = R;
+                }
+            ",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let NodeData::SourceFile(source) = &parsed.arena.get(parsed.source_file).unwrap().data
+        else {
+            panic!("expected source file");
+        };
+        let module_id = source.statements.nodes[0];
+        let NodeData::ModuleDeclaration(module) = &parsed.arena.get(module_id).unwrap().data else {
+            panic!("expected namespace");
+        };
+        let module_body = module.body.unwrap();
+        let NodeData::ModuleBlock(block) = &parsed.arena.get(module_body).unwrap().data else {
+            panic!("expected namespace body");
+        };
+        let nested_module = block.statements.nodes[0];
+        let NodeData::ModuleDeclaration(nested) = &parsed.arena.get(nested_module).unwrap().data
+        else {
+            panic!("expected nested namespace");
+        };
+        let nested_body = nested.body.unwrap();
+
+        assert_eq!(
+            result
+                .declarations_to_emit(parsed.source_file)
+                .unwrap()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            [module_id]
+        );
+        assert_eq!(
+            result
+                .declarations_to_emit(module_body)
+                .unwrap()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            block.statements.nodes
+        );
+        assert!(result.declarations_to_emit(nested_body).unwrap().is_empty());
     }
 
     #[test]
