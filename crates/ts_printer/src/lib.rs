@@ -1770,6 +1770,21 @@ impl Printer<'_> {
         Ok(())
     }
 
+    fn emit_accessor_body(&mut self, body: Option<NodeId>) -> Result<(), EmitError> {
+        let Some(body) = body else {
+            self.writer.write("{ }");
+            return Ok(());
+        };
+        if let Some(expression) = self.single_line_return_expression(body)? {
+            self.writer.write("{ return ");
+            self.emit_expression(expression, 0)?;
+            self.writer.write("; }");
+        } else {
+            self.emit_block(body)?;
+        }
+        Ok(())
+    }
+
     fn emit_embedded(&mut self, id: NodeId) -> Result<(), EmitError> {
         if matches!(&self.node(id)?.data, NodeData::Block(_)) {
             return self.emit_block(id);
@@ -1929,7 +1944,7 @@ impl Printer<'_> {
                     self.emit_expression(accessor.name, 0)?;
                     self.emit_parameters(&accessor.parameters)?;
                     self.writer.write(" ");
-                    self.emit_block(accessor.body.expect("body checked above"))?;
+                    self.emit_accessor_body(accessor.body)?;
                     self.writer.newline();
                 }
                 NodeData::SetAccessorDeclaration(accessor) if accessor.body.is_some() => {
@@ -1940,7 +1955,7 @@ impl Printer<'_> {
                     self.emit_expression(accessor.name, 0)?;
                     self.emit_parameters(&accessor.parameters)?;
                     self.writer.write(" ");
-                    self.emit_block(accessor.body.expect("body checked above"))?;
+                    self.emit_accessor_body(accessor.body)?;
                     self.writer.newline();
                 }
                 NodeData::ClassStaticBlockDeclaration(block) => {
@@ -2191,6 +2206,7 @@ impl Printer<'_> {
             self.writer.write(";");
             self.writer.newline();
         }
+        self.emit_downlevel_accessors(data, &name)?;
         self.emit_static_fields(data, &name)?;
         self.writer.write("return ");
         self.writer.write(&name);
@@ -2202,6 +2218,195 @@ impl Printer<'_> {
             self.emit_expression(base, 0)?;
         }
         self.writer.write("));");
+        Ok(())
+    }
+
+    fn emit_downlevel_accessors(
+        &mut self,
+        class: &ts_ast::ClassDeclarationData,
+        class_name: &str,
+    ) -> Result<(), EmitError> {
+        for (index, member) in class.members.nodes.iter().enumerate() {
+            let Some((_, name, is_static, key)) = self.accessor_info(*member) else {
+                continue;
+            };
+            if class.members.nodes[..index].iter().any(|previous| {
+                self.accessor_info(*previous).is_some_and(
+                    |(_, _, previous_static, previous_key)| {
+                        previous_static == is_static && previous_key == key
+                    },
+                )
+            }) {
+                continue;
+            }
+            let mut getter = None;
+            let mut setter = None;
+            for candidate in &class.members.nodes {
+                let Some((is_getter, _, candidate_static, candidate_key)) =
+                    self.accessor_info(*candidate)
+                else {
+                    continue;
+                };
+                if candidate_static == is_static && candidate_key == key {
+                    if is_getter {
+                        getter = Some(*candidate);
+                    } else {
+                        setter = Some(*candidate);
+                    }
+                }
+            }
+            self.writer.write("Object.defineProperty(");
+            self.writer.write(class_name);
+            if !is_static {
+                self.writer.write(".prototype");
+            }
+            self.writer.write(", ");
+            self.emit_downlevel_property_name(name)?;
+            self.writer.write(", {");
+            self.writer.newline();
+            self.writer.indent += 1;
+            if let Some(getter) = getter {
+                self.writer.write("get: ");
+                self.emit_downlevel_accessor_function(getter)?;
+                self.writer.write(",");
+                self.writer.newline();
+            }
+            if let Some(setter) = setter {
+                self.writer.write("set: ");
+                self.emit_downlevel_accessor_function(setter)?;
+                self.writer.write(",");
+                self.writer.newline();
+            }
+            self.writer.write("enumerable: false,");
+            self.writer.newline();
+            self.writer.write("configurable: true");
+            self.writer.newline();
+            self.writer.indent -= 1;
+            self.writer.write("});");
+            self.writer.newline();
+        }
+        Ok(())
+    }
+
+    fn accessor_info(&self, id: NodeId) -> Option<(bool, NodeId, bool, String)> {
+        let node = self.arena.get(id)?;
+        let (is_getter, name, modifiers) = match &node.data {
+            NodeData::GetAccessorDeclaration(accessor) => {
+                (true, accessor.name, accessor.modifiers.as_ref())
+            }
+            NodeData::SetAccessorDeclaration(accessor) => {
+                (false, accessor.name, accessor.modifiers.as_ref())
+            }
+            _ => return None,
+        };
+        let is_static = self.has_modifier(modifiers, SyntaxKind::StaticKeyword);
+        Some((is_getter, name, is_static, self.accessor_key(name)?))
+    }
+
+    fn accessor_key(&self, name: NodeId) -> Option<String> {
+        let node = self.arena.get(name)?;
+        match &node.data {
+            NodeData::Identifier(name) => Some(name.text.clone()),
+            NodeData::StringLiteral(name) => Some(name.text.clone()),
+            NodeData::NumericLiteral(name) => Some(name.text.clone()),
+            NodeData::ComputedPropertyName(_) => {
+                let start = usize::try_from(node.range.start.get()).ok()?;
+                let end = usize::try_from(node.range.end.get()).ok()?;
+                self.source_text.get(start..end).map(str::to_owned)
+            }
+            _ => None,
+        }
+    }
+
+    fn emit_downlevel_property_name(&mut self, name: NodeId) -> Result<(), EmitError> {
+        let node = self.node(name)?.clone();
+        match &node.data {
+            NodeData::Identifier(name) => write_quoted(&mut self.writer, &name.text),
+            NodeData::StringLiteral(name) => write_quoted(&mut self.writer, &name.text),
+            NodeData::NumericLiteral(name) => write_quoted(&mut self.writer, &name.text),
+            NodeData::ComputedPropertyName(name) => self.emit_expression(name.expression, 0)?,
+            _ => self.emit_expression(name, 0)?,
+        }
+        Ok(())
+    }
+
+    fn emit_downlevel_accessor_function(&mut self, id: NodeId) -> Result<(), EmitError> {
+        let node = self.node(id)?.clone();
+        let (parameters, body) = match &node.data {
+            NodeData::GetAccessorDeclaration(accessor) => (&accessor.parameters, accessor.body),
+            NodeData::SetAccessorDeclaration(accessor) => (&accessor.parameters, accessor.body),
+            _ => return Err(Self::unsupported(id, node.kind)),
+        };
+        self.writer.write("function ");
+        self.emit_parameter_names(parameters)?;
+        self.writer.write(" ");
+        self.emit_downlevel_accessor_body(parameters, body)
+    }
+
+    fn emit_parameter_names(&mut self, parameters: &NodeList) -> Result<(), EmitError> {
+        self.writer.write("(");
+        for (index, parameter) in parameters.nodes.iter().enumerate() {
+            if index != 0 {
+                self.writer.write(", ");
+            }
+            let node = self.node(*parameter)?.clone();
+            let NodeData::ParameterDeclaration(parameter) = &node.data else {
+                return Err(Self::unsupported(*parameter, node.kind));
+            };
+            if parameter.dot_dot_dot_token.is_some() {
+                self.writer.write("...");
+            }
+            self.emit_expression(parameter.name, 0)?;
+        }
+        self.writer.write(")");
+        Ok(())
+    }
+
+    fn emit_downlevel_accessor_body(
+        &mut self,
+        parameters: &NodeList,
+        body: Option<NodeId>,
+    ) -> Result<(), EmitError> {
+        let has_defaults = parameters.nodes.iter().any(|parameter| {
+            matches!(
+                self.arena.get(*parameter).map(|node| &node.data),
+                Some(NodeData::ParameterDeclaration(parameter)) if parameter.initializer.is_some()
+            )
+        });
+        if !has_defaults {
+            return self.emit_accessor_body(body);
+        }
+        self.writer.write("{");
+        self.writer.newline();
+        self.writer.indent += 1;
+        for parameter in &parameters.nodes {
+            let node = self.node(*parameter)?.clone();
+            let NodeData::ParameterDeclaration(parameter) = &node.data else {
+                return Err(Self::unsupported(*parameter, node.kind));
+            };
+            let Some(initializer) = parameter.initializer else {
+                continue;
+            };
+            self.writer.write("if (");
+            self.emit_expression(parameter.name, 0)?;
+            self.writer.write(" === void 0) { ");
+            self.emit_expression(parameter.name, 0)?;
+            self.writer.write(" = ");
+            self.emit_expression(initializer, 1)?;
+            self.writer.write("; }");
+            self.writer.newline();
+        }
+        if let Some(body) = body {
+            let body_node = self.node(body)?.clone();
+            let NodeData::Block(block) = &body_node.data else {
+                return Err(Self::unsupported(body, body_node.kind));
+            };
+            for statement in &block.statements.nodes {
+                self.emit_statement(*statement)?;
+            }
+        }
+        self.writer.indent -= 1;
+        self.writer.write("}");
         Ok(())
     }
 
@@ -3209,6 +3414,20 @@ impl Printer<'_> {
                             self.writer.write(" ");
                             self.emit_block(method.body.expect("body checked above"))?;
                         }
+                        NodeData::GetAccessorDeclaration(accessor) => {
+                            self.writer.write("get ");
+                            self.emit_expression(accessor.name, 0)?;
+                            self.emit_parameters(&accessor.parameters)?;
+                            self.writer.write(" ");
+                            self.emit_accessor_body(accessor.body)?;
+                        }
+                        NodeData::SetAccessorDeclaration(accessor) => {
+                            self.writer.write("set ");
+                            self.emit_expression(accessor.name, 0)?;
+                            self.emit_parameters(&accessor.parameters)?;
+                            self.writer.write(" ");
+                            self.emit_accessor_body(accessor.body)?;
+                        }
                         _ => return Err(Self::unsupported(*property, node.kind)),
                     }
                     if multiline
@@ -3998,6 +4217,20 @@ impl Printer<'_> {
                 self.writer.write(" ");
                 self.emit_block(method.body.expect("body checked above"))?;
             }
+            NodeData::GetAccessorDeclaration(accessor) => {
+                self.writer.write("get ");
+                self.emit_expression(accessor.name, 0)?;
+                self.emit_parameters(&accessor.parameters)?;
+                self.writer.write(" ");
+                self.emit_accessor_body(accessor.body)?;
+            }
+            NodeData::SetAccessorDeclaration(accessor) => {
+                self.writer.write("set ");
+                self.emit_expression(accessor.name, 0)?;
+                self.emit_parameters(&accessor.parameters)?;
+                self.writer.write(" ");
+                self.emit_accessor_body(accessor.body)?;
+            }
             _ => return Err(Self::unsupported(id, node.kind)),
         }
         Ok(())
@@ -4579,6 +4812,39 @@ mod tests {
                 "const callback = function (value: number): number { return value; }; const result = (function* named() { yield 1; })();"
             ),
             "const callback = function (value) { return value; };\nconst result = (function* named() {\n    yield 1;\n})();\n"
+        );
+    }
+
+    #[test]
+    fn emits_and_recovers_object_literal_accessors() {
+        let source = "var value = { get item(), set item(next: number) };";
+        let parsed = parse_source_file(source);
+        assert_eq!(parsed.diagnostics.len(), 2, "{:?}", parsed.diagnostics);
+        assert!(
+            parsed
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code == Some(1005))
+        );
+        assert_eq!(
+            emit_source_file(&parsed.arena, parsed.source_file)
+                .unwrap()
+                .code,
+            "var value = { get item() { }, set item(next) { } };\n"
+        );
+    }
+
+    #[test]
+    fn emits_native_and_downlevel_class_accessors() {
+        let source =
+            "class C { get X() { return 1; } set X(v = 0) { } static get Y() { return 2; } }";
+        assert_eq!(
+            emit_with(source, ScriptTarget::Es2015, ModuleKind::EsNext).code,
+            "class C {\n    get X() { return 1; }\n    set X(v = 0) { }\n    static get Y() { return 2; }\n}\n"
+        );
+        assert_eq!(
+            emit_with(source, ScriptTarget::Es5, ModuleKind::EsNext).code,
+            "var C = /** @class */ (function () {\n    function C() {\n    }\n    Object.defineProperty(C.prototype, \"X\", {\n        get: function () { return 1; },\n        set: function (v) {\n            if (v === void 0) { v = 0; }\n        },\n        enumerable: false,\n        configurable: true\n    });\n    Object.defineProperty(C, \"Y\", {\n        get: function () { return 2; },\n        enumerable: false,\n        configurable: true\n    });\n    return C;\n}());\n"
         );
     }
 

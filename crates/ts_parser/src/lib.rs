@@ -1091,7 +1091,7 @@ impl<'a> Parser<'a> {
             SyntaxKind::GetKeyword | SyntaxKind::SetKeyword
         ) && self.is_accessor_signature()
         {
-            return self.parse_class_accessor(start, modifiers, modifier_nodes);
+            return self.parse_class_accessor(start, modifiers, modifier_nodes, false);
         }
         let asterisk_token = if self.current.kind == SyntaxKind::AsteriskToken {
             Some(self.consume_token_node())
@@ -1175,6 +1175,7 @@ impl<'a> Parser<'a> {
         start: TextPos,
         modifiers: Option<ModifierList>,
         modifier_nodes: Vec<NodeId>,
+        body_required: bool,
     ) -> NodeId {
         let kind = self.consume().kind;
         let name = self.parse_property_name("Expected an accessor name.");
@@ -1183,9 +1184,13 @@ impl<'a> Parser<'a> {
         let body = if self.current.kind == SyntaxKind::OpenBraceToken {
             Some(self.parse_block())
         } else {
-            self.parse_semicolon(
-                return_type.map_or(parameters.range.end, |node| self.node_end(node)),
-            );
+            if body_required {
+                self.error_current("Expected '{'.");
+            } else {
+                self.parse_semicolon(
+                    return_type.map_or(parameters.range.end, |node| self.node_end(node)),
+                );
+            }
             None
         };
         let end = body
@@ -3471,6 +3476,19 @@ impl<'a> Parser<'a> {
                 }
                 continue;
             }
+            if matches!(
+                self.current.kind,
+                SyntaxKind::GetKeyword | SyntaxKind::SetKeyword
+            ) && self.is_accessor_signature()
+            {
+                properties.push(self.parse_class_accessor(property_start, None, Vec::new(), true));
+                if self.current.kind != SyntaxKind::CommaToken {
+                    break;
+                }
+                self.bump();
+                trailing = self.current.kind == SyntaxKind::CloseBraceToken;
+                continue;
+            }
             let mut modifier_nodes = Vec::new();
             if self.current.kind == SyntaxKind::AsyncKeyword
                 && !matches!(
@@ -5504,6 +5522,44 @@ mod tests {
         for span in &template_data.template_spans.nodes {
             assert_eq!(result.arena.get(*span).unwrap().parent, Some(template));
         }
+    }
+
+    #[test]
+    fn parses_object_accessors_and_recovers_a_missing_body() {
+        let result = parse_source_file(
+            "const value = { get item() { return 1; }, set item(next: number) };",
+        );
+        assert_eq!(result.diagnostics.len(), 1, "{:?}", result.diagnostics);
+        assert_eq!(result.diagnostics[0].code, Some(1005));
+        let statements = source_statements(&result);
+        let (list, _) = variable_list(&result, statements[0]);
+        let declaration = declaration_nodes(&result, list)[0];
+        let NodeData::VariableDeclaration(declaration) =
+            &result.arena.get(declaration).unwrap().data
+        else {
+            panic!("expected declaration");
+        };
+        let NodeData::ObjectLiteralExpression(object) = &result
+            .arena
+            .get(declaration.initializer.unwrap())
+            .unwrap()
+            .data
+        else {
+            panic!("expected object literal");
+        };
+        assert_eq!(object.properties.nodes.len(), 2);
+        let NodeData::GetAccessorDeclaration(getter) =
+            &result.arena.get(object.properties.nodes[0]).unwrap().data
+        else {
+            panic!("expected getter");
+        };
+        assert!(getter.body.is_some());
+        let NodeData::SetAccessorDeclaration(setter) =
+            &result.arena.get(object.properties.nodes[1]).unwrap().data
+        else {
+            panic!("expected setter");
+        };
+        assert!(setter.body.is_none());
     }
 
     #[test]
