@@ -1164,6 +1164,40 @@ mod tests {
     }
 
     #[test]
+    fn moduleless_fixtures_preserve_exports_and_commonjs_remains_explicit() {
+        let preserved = Case::parse(
+            "preserved.ts",
+            "// @target: es2015\n// @noLib: true\nexport const value: number = 1;\n",
+        )
+        .unwrap();
+        let preserved = compile_case(&preserved).unwrap();
+        let javascript = &preserved.outputs["/case/preserved.js"];
+        assert!(
+            javascript.contains("export const value = 1;"),
+            "{javascript}"
+        );
+        assert!(!javascript.contains("exports.value"), "{javascript}");
+
+        let commonjs = Case::parse(
+            "commonjs.ts",
+            concat!(
+                "// @target: es2015\n",
+                "// @module: commonjs\n",
+                "// @noLib: true\n",
+                "export const value: number = 1;\n",
+            ),
+        )
+        .unwrap();
+        let commonjs = compile_case(&commonjs).unwrap();
+        let javascript = &commonjs.outputs["/case/commonjs.js"];
+        assert!(
+            javascript.contains("exports.value = value;"),
+            "{javascript}"
+        );
+        assert!(!javascript.contains("export const value"), "{javascript}");
+    }
+
+    #[test]
     fn parses_typescript_baseline_sections() {
         let sections = parse_baseline_sections(concat!(
             "preamble\n",

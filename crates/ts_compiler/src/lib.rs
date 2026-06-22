@@ -2480,6 +2480,7 @@ mod tests {
             "/",
             &["exported.ts".to_owned()],
             CompilerOptions {
+                module: ModuleKind::CommonJs,
                 target: ScriptTarget::Es2015,
                 no_lib: true,
                 ..CompilerOptions::default()
@@ -2585,6 +2586,24 @@ mod tests {
         assert!(program.diagnostics().is_empty());
         assert!(program.options().no_emit);
         assert!(program.emit().files.is_empty());
+    }
+
+    #[test]
+    fn config_without_module_preserves_ecmascript_exports() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/tsconfig.json",
+            r#"{"files":["main.ts"],"compilerOptions":{"target":"es2015","noLib":true}}"#,
+        )
+        .unwrap();
+        fs.write_file("/project/main.ts", "export class Model {}")
+            .unwrap();
+
+        let program = Program::from_config(&fs, "/project/tsconfig.json");
+        assert_eq!(program.options().module, ModuleKind::None);
+        let javascript = &program.emit().files[0].text;
+        assert!(javascript.contains("export class Model"), "{javascript}");
+        assert!(!javascript.contains("exports.Model"), "{javascript}");
     }
 
     #[test]

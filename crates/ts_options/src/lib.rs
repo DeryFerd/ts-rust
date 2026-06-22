@@ -9,8 +9,8 @@ use ts_module::{ResolutionMode, ResolutionOptions};
 /// JavaScript module format used by the emitter.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ModuleKind {
-    None,
     #[default]
+    None,
     CommonJs,
     Amd,
     Umd,
@@ -163,7 +163,7 @@ impl Default for CompilerOptions {
             use_unknown_in_catch_variables: false,
             verbatim_module_syntax: false,
             lib: None,
-            module: ModuleKind::CommonJs,
+            module: ModuleKind::default(),
             module_resolution: ModuleResolutionKind::Node10,
             target: ScriptTarget::Es5,
             jsx: JsxEmit::Preserve,
@@ -937,6 +937,22 @@ mod tests {
                 .map(|(name, value)| (name.to_owned(), value))
                 .collect::<BTreeMap<_, _>>(),
         )
+    }
+
+    #[test]
+    fn defaults_to_untransformed_modules_with_node10_resolution() {
+        let direct = CompilerOptions::default();
+        assert_eq!(ModuleKind::default(), ModuleKind::None);
+        assert_eq!(direct.module, ModuleKind::None);
+        assert_eq!(direct.module_resolution, ModuleResolutionKind::Node10);
+
+        let parsed = parse_compiler_options(&object([]));
+        assert!(parsed.is_ok(), "{:?}", parsed.diagnostics);
+        assert_eq!(parsed.options.module, ModuleKind::None);
+        assert_eq!(
+            parsed.options.module_resolution,
+            ModuleResolutionKind::Node10
+        );
     }
 
     #[test]

@@ -212,6 +212,74 @@ fn emits_direct_file() {
 }
 
 #[test]
+fn direct_file_preserves_ecmascript_modules_by_default() {
+    let directory = TestDirectory::new("emit-default-module");
+    fs::write(
+        directory.0.join("main.ts"),
+        "export const answer: number = 42;\n",
+    )
+    .unwrap();
+    let output = run(
+        env!("CARGO_BIN_EXE_tsgo"),
+        &directory.0,
+        &[
+            "main.ts",
+            "--ignoreConfig",
+            "--target",
+            "es2015",
+            "--pretty",
+            "false",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let javascript = fs::read_to_string(directory.0.join("main.js")).unwrap();
+    assert!(
+        javascript.contains("export const answer = 42;"),
+        "{javascript}"
+    );
+    assert!(!javascript.contains("exports.answer"), "{javascript}");
+}
+
+#[test]
+fn direct_file_transforms_explicit_commonjs_modules() {
+    let directory = TestDirectory::new("emit-commonjs-module");
+    fs::write(
+        directory.0.join("main.ts"),
+        "export const answer: number = 42;\n",
+    )
+    .unwrap();
+    let output = run(
+        env!("CARGO_BIN_EXE_tsgo"),
+        &directory.0,
+        &[
+            "main.ts",
+            "--ignoreConfig",
+            "--target",
+            "es2015",
+            "--module",
+            "commonjs",
+            "--pretty",
+            "false",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let javascript = fs::read_to_string(directory.0.join("main.js")).unwrap();
+    assert!(
+        javascript.contains("exports.answer = answer;"),
+        "{javascript}"
+    );
+    assert!(!javascript.contains("export const answer"), "{javascript}");
+}
+
+#[test]
 fn creates_project_output_directory() {
     let directory = TestDirectory::new("emit-project");
     fs::write(directory.0.join("main.ts"), "export const answer = 42;\n").unwrap();
@@ -230,7 +298,12 @@ fn creates_project_output_directory() {
         "{}",
         String::from_utf8_lossy(&output.stdout)
     );
-    assert!(directory.0.join("dist/main.js").is_file());
+    let javascript = fs::read_to_string(directory.0.join("dist/main.js")).unwrap();
+    assert!(
+        javascript.contains("export var answer = 42;"),
+        "{javascript}"
+    );
+    assert!(!javascript.contains("exports.answer"), "{javascript}");
 }
 
 #[test]

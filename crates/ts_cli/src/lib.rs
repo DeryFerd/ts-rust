@@ -415,6 +415,21 @@ mod tests {
     }
 
     #[test]
+    fn defaults_to_preserving_ecmascript_modules() {
+        let Command::Compile(options) = parse(&["main.ts"]).unwrap() else {
+            panic!("expected compile command");
+        };
+        assert_eq!(
+            options.compiler_options.module,
+            ts_options::ModuleKind::None
+        );
+        assert_eq!(
+            options.compiler_options.module_resolution,
+            ts_options::ModuleResolutionKind::Node10
+        );
+    }
+
+    #[test]
     fn normalizes_common_compiler_options() {
         let Command::Compile(options) = parse(&[
             "--target",
