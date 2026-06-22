@@ -658,6 +658,10 @@ impl Program {
                         allow_unreachable_code: self.options.allow_unreachable_code,
                         exact_optional_property_types: self.options.exact_optional_property_types,
                         is_declaration_file: ts_path::is_declaration_file(&source_file.file_name),
+                        is_javascript_file: matches!(
+                            ts_path::script_kind_from_path(&source_file.file_name),
+                            ts_path::ScriptKind::Js | ts_path::ScriptKind::Jsx
+                        ),
                         no_fallthrough_cases_in_switch: self.options.no_fallthrough_cases_in_switch,
                         strict_null_checks: self.options.strict_null_checks,
                         no_implicit_any: self.options.no_implicit_any,

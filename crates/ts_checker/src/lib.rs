@@ -59,6 +59,7 @@ pub struct ObjectType {
 pub struct FunctionType {
     pub parameters: Vec<TypeId>,
     pub return_type: TypeId,
+    pub parameters_optional: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -340,6 +341,7 @@ pub struct CheckerOptions {
     pub allow_unreachable_code: Option<bool>,
     pub exact_optional_property_types: bool,
     pub is_declaration_file: bool,
+    pub is_javascript_file: bool,
     pub no_fallthrough_cases_in_switch: bool,
     pub strict_null_checks: bool,
     pub no_implicit_any: bool,
@@ -355,6 +357,7 @@ impl Default for CheckerOptions {
             allow_unreachable_code: None,
             exact_optional_property_types: false,
             is_declaration_file: false,
+            is_javascript_file: false,
             no_fallthrough_cases_in_switch: false,
             strict_null_checks: true,
             no_implicit_any: false,
@@ -466,6 +469,7 @@ enum TypeDescriptor {
     Function {
         parameters: Vec<Self>,
         return_type: Box<Self>,
+        parameters_optional: bool,
     },
     Overload(Vec<Self>),
 }
@@ -3587,6 +3591,7 @@ impl<'a> Checker<'a> {
         self.result.types.alloc(TypeKind::Function(FunctionType {
             parameters,
             return_type,
+            parameters_optional: self.options.is_javascript_file,
         }))
     }
 
@@ -3650,6 +3655,7 @@ impl<'a> Checker<'a> {
         self.result.types.alloc(TypeKind::Function(FunctionType {
             parameters,
             return_type,
+            parameters_optional: self.options.is_javascript_file,
         }))
     }
 
@@ -3957,11 +3963,12 @@ impl<'a> Checker<'a> {
         };
         let minimum_parameters = self.minimum_parameter_count(signature);
         if arguments.len() < minimum_parameters || arguments.len() > signature.parameters.len() {
-            self.error(
-                node,
-                2554,
-                [minimum_parameters.to_string(), arguments.len().to_string()],
-            );
+            let expected = if minimum_parameters == signature.parameters.len() {
+                minimum_parameters.to_string()
+            } else {
+                format!("{minimum_parameters}-{}", signature.parameters.len())
+            };
+            self.error(node, 2554, [expected, arguments.len().to_string()]);
         }
         let mut inference = HashMap::new();
         for (argument, parameter) in arguments.iter().zip(&signature.parameters) {
@@ -3988,6 +3995,9 @@ impl<'a> Checker<'a> {
     }
 
     fn minimum_parameter_count(&self, signature: &FunctionType) -> usize {
+        if signature.parameters_optional {
+            return 0;
+        }
         signature
             .parameters
             .iter()
@@ -4094,6 +4104,7 @@ impl<'a> Checker<'a> {
                 self.result.types.alloc(TypeKind::Function(FunctionType {
                     parameters,
                     return_type,
+                    parameters_optional: signature.parameters_optional,
                 }))
             }
             TypeKind::Tuple(elements) => {
@@ -4293,6 +4304,7 @@ impl<'a> Checker<'a> {
         self.result.types.alloc(TypeKind::Function(FunctionType {
             parameters: parameter_types,
             return_type,
+            parameters_optional: self.options.is_javascript_file,
         }))
     }
 
@@ -5148,6 +5160,7 @@ impl<'a> Checker<'a> {
             TypeDescriptor::Function {
                 parameters,
                 return_type,
+                parameters_optional,
             } => {
                 let parameters = parameters
                     .iter()
@@ -5157,6 +5170,7 @@ impl<'a> Checker<'a> {
                 self.result.types.alloc(TypeKind::Function(FunctionType {
                     parameters,
                     return_type,
+                    parameters_optional: *parameters_optional,
                 }))
             }
             TypeDescriptor::Overload(signatures) => {
@@ -5166,6 +5180,7 @@ impl<'a> Checker<'a> {
                         let TypeDescriptor::Function {
                             parameters,
                             return_type,
+                            parameters_optional,
                         } = signature
                         else {
                             return None;
@@ -5176,6 +5191,7 @@ impl<'a> Checker<'a> {
                                 .map(|parameter| self.import_type(parameter))
                                 .collect(),
                             return_type: self.import_type(return_type),
+                            parameters_optional: *parameters_optional,
                         })
                     })
                     .collect();
@@ -5677,6 +5693,7 @@ fn describe_type(types: &TypeArena, type_id: TypeId) -> TypeDescriptor {
                 .map(|parameter| describe_type(types, *parameter))
                 .collect(),
             return_type: Box::new(describe_type(types, function.return_type)),
+            parameters_optional: function.parameters_optional,
         },
         TypeKind::Overload(signatures) => TypeDescriptor::Overload(
             signatures
@@ -5688,6 +5705,7 @@ fn describe_type(types: &TypeArena, type_id: TypeId) -> TypeDescriptor {
                         .map(|parameter| describe_type(types, *parameter))
                         .collect(),
                     return_type: Box::new(describe_type(types, signature.return_type)),
+                    parameters_optional: signature.parameters_optional,
                 })
                 .collect(),
         ),
@@ -5746,12 +5764,14 @@ fn substitute_descriptor(
         TypeDescriptor::Function {
             parameters,
             return_type,
+            parameters_optional,
         } => TypeDescriptor::Function {
             parameters: parameters
                 .iter()
                 .map(|parameter| substitute_descriptor(parameter, substitutions))
                 .collect(),
             return_type: Box::new(substitute_descriptor(return_type, substitutions)),
+            parameters_optional: *parameters_optional,
         },
         TypeDescriptor::Overload(signatures) => TypeDescriptor::Overload(
             signatures
@@ -6972,6 +6992,48 @@ mod tests {
         assert_eq!(
             result.diagnostics[2].diagnostic.render().unwrap(),
             "Expected 1 arguments, but got 0."
+        );
+    }
+
+    #[test]
+    fn javascript_function_parameters_are_optional_for_minimum_arity() {
+        let parsed = parse_source_file(
+            r"
+                function f2(x) {}
+                f2();
+                f2(1, 2, 3);
+            ",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+
+        let javascript = check_source_file_with_options(
+            &parsed.arena,
+            parsed.source_file,
+            &bindings,
+            CheckerOptions {
+                is_javascript_file: true,
+                ..CheckerOptions::default()
+            },
+        );
+        assert_eq!(javascript.diagnostics.len(), 1);
+        assert_eq!(javascript.diagnostics[0].diagnostic.code(), 2554);
+        assert_eq!(
+            javascript.diagnostics[0].diagnostic.render().unwrap(),
+            "Expected 0-1 arguments, but got 3."
+        );
+
+        let typescript = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        assert_eq!(
+            typescript
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.render().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "Expected 1 arguments, but got 0.",
+                "Expected 1 arguments, but got 3."
+            ]
         );
     }
 
