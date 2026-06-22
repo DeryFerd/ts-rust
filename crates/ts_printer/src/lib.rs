@@ -2726,6 +2726,11 @@ struct AmdRuntimeDependency {
     parameter: Option<String>,
 }
 
+struct AmdImportInitializer {
+    parameter: String,
+    helper: &'static str,
+}
+
 struct SystemModulePlan {
     export_function: String,
     context_object: String,
@@ -3062,12 +3067,6 @@ impl Printer<'_> {
         context: &EmitContext<'_>,
     ) -> Result<EmitResult, EmitError> {
         self.commonjs_module_transform = true;
-        self.commonjs_default_imports = commonjs_default_imports(
-            self.arena,
-            &data.statements,
-            &self.runtime_identifier_uses,
-            context.import_runtime_meanings,
-        );
         let mut dependencies = context
             .amd_dependencies
             .iter()
@@ -3078,27 +3077,139 @@ impl Printer<'_> {
                 })
             })
             .collect::<Vec<_>>();
+        let mut side_effect_dependencies = Vec::new();
+        let mut import_initializers = Vec::new();
+        let mut generated_names = GeneratedNames::new(self.arena);
         for statement in &data.statements.nodes {
-            let Some(NodeData::ImportEqualsDeclaration(import)) =
-                self.arena.get(*statement).map(|node| &node.data)
-            else {
-                continue;
-            };
-            if !self.import_semantically_has_runtime_value(*statement)
-                || import.is_type_only
-                || (!self.has_modifier(import.modifiers.as_ref(), SyntaxKind::ExportKeyword)
-                    && !self.import_binding_is_used(import.name))
-            {
-                continue;
+            match self.arena.get(*statement).map(|node| &node.data) {
+                Some(NodeData::ImportEqualsDeclaration(import)) => {
+                    if !self.import_semantically_has_runtime_value(*statement)
+                        || import.is_type_only
+                        || (!self
+                            .has_modifier(import.modifiers.as_ref(), SyntaxKind::ExportKeyword)
+                            && !self.import_binding_is_used(import.name))
+                    {
+                        continue;
+                    }
+                    let Some(path) =
+                        external_module_reference_text(self.arena, import.module_reference)
+                    else {
+                        continue;
+                    };
+                    dependencies.push(AmdRuntimeDependency {
+                        path: path.to_owned(),
+                        parameter: Some(self.identifier_text(import.name)?.to_owned()),
+                    });
+                }
+                Some(NodeData::ImportDeclaration(import)) => {
+                    if !self.import_semantically_has_runtime_value(*statement) {
+                        continue;
+                    }
+                    let Some(path) = string_literal_text(self.arena, import.module_specifier)
+                    else {
+                        continue;
+                    };
+                    let Some(clause_id) = import.import_clause else {
+                        side_effect_dependencies.push(AmdRuntimeDependency {
+                            path: path.to_owned(),
+                            parameter: None,
+                        });
+                        continue;
+                    };
+                    if !self.import_has_runtime_use(*statement, import) {
+                        continue;
+                    }
+                    let Some(NodeData::ImportClause(clause)) =
+                        self.arena.get(clause_id).map(|node| &node.data)
+                    else {
+                        continue;
+                    };
+                    let namespace = clause.named_bindings.and_then(|bindings| {
+                        let NodeData::NamespaceImport(namespace) = &self.arena.get(bindings)?.data
+                        else {
+                            return None;
+                        };
+                        self.import_binding_is_used(namespace.name)
+                            .then_some(namespace.name)
+                    });
+                    let parameter = if let Some(namespace) = namespace {
+                        self.identifier_text(namespace)?.to_owned()
+                    } else {
+                        generated_names.generate(&commonjs_module_temp_base(
+                            self.arena,
+                            import.module_specifier,
+                        ))
+                    };
+                    if let Some(default) = clause.name
+                        && self.import_binding_is_used(default)
+                    {
+                        let local = self.identifier_text(default)?.to_owned();
+                        self.commonjs_default_imports
+                            .insert(local, parameter.clone());
+                        import_initializers.push(AmdImportInitializer {
+                            parameter: parameter.clone(),
+                            helper: "__importDefault",
+                        });
+                    }
+                    if let Some(bindings) = clause.named_bindings {
+                        match self.arena.get(bindings).map(|node| &node.data) {
+                            Some(NodeData::NamespaceImport(_)) if namespace.is_some() => {
+                                import_initializers.push(AmdImportInitializer {
+                                    parameter: parameter.clone(),
+                                    helper: "__importStar",
+                                });
+                            }
+                            Some(NodeData::NamedImports(imports)) => {
+                                for specifier_id in &imports.elements.nodes {
+                                    let Some(NodeData::ImportSpecifier(specifier)) =
+                                        self.arena.get(*specifier_id).map(|node| &node.data)
+                                    else {
+                                        continue;
+                                    };
+                                    if specifier.is_type_only
+                                        || !self.import_binding_is_used(specifier.name)
+                                    {
+                                        continue;
+                                    }
+                                    let imported = specifier
+                                        .property_name
+                                        .and_then(|name| declaration_name_text(self.arena, name))
+                                        .or_else(|| {
+                                            declaration_name_text(self.arena, specifier.name)
+                                        });
+                                    let Some(imported) = imported else {
+                                        continue;
+                                    };
+                                    if imported == "default" {
+                                        let Some(local) =
+                                            declaration_name_text(self.arena, specifier.name)
+                                        else {
+                                            continue;
+                                        };
+                                        self.commonjs_default_imports
+                                            .insert(local.to_owned(), parameter.clone());
+                                        import_initializers.push(AmdImportInitializer {
+                                            parameter: parameter.clone(),
+                                            helper: "__importDefault",
+                                        });
+                                    } else if let Some(symbol) =
+                                        self.bindings.node_symbols.get(&specifier.name)
+                                    {
+                                        self.identifier_rewrites
+                                            .insert(*symbol, format!("{parameter}.{imported}"));
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    dependencies.push(AmdRuntimeDependency {
+                        path: path.to_owned(),
+                        parameter: Some(parameter),
+                    });
+                }
+                _ => {}
             }
-            let Some(path) = external_module_reference_text(self.arena, import.module_reference)
-            else {
-                continue;
-            };
-            dependencies.push(AmdRuntimeDependency {
-                path: path.to_owned(),
-                parameter: Some(self.identifier_text(import.name)?.to_owned()),
-            });
         }
         dependencies.extend(
             context
@@ -3110,6 +3221,7 @@ impl Printer<'_> {
                     parameter: None,
                 }),
         );
+        dependencies.extend(side_effect_dependencies);
 
         for dependency in context.amd_dependencies {
             let start = usize::try_from(dependency.comment_start).unwrap_or(usize::MAX);
@@ -3118,6 +3230,17 @@ impl Printer<'_> {
                 self.writer.write(comment);
                 self.writer.newline();
             }
+        }
+        if source_needs_import_star_helper(
+            self.arena,
+            &data.statements,
+            &self.runtime_identifier_uses,
+            context.import_runtime_meanings,
+        ) {
+            self.emit_import_star_helper();
+        }
+        if !self.commonjs_default_imports.is_empty() {
+            self.emit_import_default_helper();
         }
         self.writer.write("define(");
         if let Some(name) = context.amd_module_name {
@@ -3157,20 +3280,28 @@ impl Printer<'_> {
         let export_equals_expression =
             runtime_export_equals_expression(self.arena, &data.statements);
         self.has_runtime_export_equals = export_equals_expression.is_some();
-        if source_needs_import_star_helper(
-            self.arena,
-            &data.statements,
-            &self.runtime_identifier_uses,
-            context.import_runtime_meanings,
-        ) {
-            self.emit_import_star_helper();
-        }
-        if !self.commonjs_default_imports.is_empty() {
-            self.emit_import_default_helper();
-        }
         if export_equals_expression.is_none() {
             self.writer
                 .write("Object.defineProperty(exports, \"__esModule\", { value: true });");
+            self.writer.newline();
+        }
+        let preinitialized_exports = self.commonjs_preinitialized_export_names(&data.statements);
+        if !preinitialized_exports.is_empty() {
+            for name in preinitialized_exports.iter().rev() {
+                self.writer.write("exports.");
+                self.writer.write(name);
+                self.writer.write(" = ");
+            }
+            self.writer.write("void 0;");
+            self.writer.newline();
+        }
+        for initializer in &import_initializers {
+            self.writer.write(&initializer.parameter);
+            self.writer.write(" = ");
+            self.writer.write(initializer.helper);
+            self.writer.write("(");
+            self.writer.write(&initializer.parameter);
+            self.writer.write(");");
             self.writer.newline();
         }
         self.emit_automatic_jsx_prelude();
@@ -3197,11 +3328,14 @@ impl Printer<'_> {
                 previous_end = node.range.end.get();
                 reference_owner_start = node.range.end.get();
             }
-            if matches!(
-                self.arena.get(*statement).map(|node| &node.data),
-                Some(NodeData::ImportEqualsDeclaration(import))
-                    if external_module_reference_text(self.arena, import.module_reference).is_some()
-            ) {
+            let skip_import = match self.arena.get(*statement).map(|node| &node.data) {
+                Some(NodeData::ImportDeclaration(_)) => true,
+                Some(NodeData::ImportEqualsDeclaration(import)) => {
+                    external_module_reference_text(self.arena, import.module_reference).is_some()
+                }
+                _ => false,
+            };
+            if skip_import {
                 continue;
             }
             self.emit_statement(*statement)?;
@@ -4324,8 +4458,10 @@ impl Printer<'_> {
             NodeData::EnumDeclaration(data) => {
                 self.emit_runtime_declaration_modifiers(data.modifiers.as_ref());
                 self.emit_enum(data)?;
-                let names = self.declaration_names(&[data.name]);
-                self.emit_commonjs_declaration_exports(data.modifiers.as_ref(), &names);
+                if !self.commonjs_module_transform || !self.namespace_containers.is_empty() {
+                    let names = self.declaration_names(&[data.name]);
+                    self.emit_commonjs_declaration_exports(data.modifiers.as_ref(), &names);
+                }
             }
             NodeData::ModuleDeclaration(data) => self.emit_namespace(data)?,
             NodeData::ReturnStatement(data) => {
@@ -5988,6 +6124,14 @@ impl Printer<'_> {
         self.writer.write("})(");
         self.writer.write(&name);
         self.writer.write(" || (");
+        if self.commonjs_module_transform
+            && self.namespace_containers.is_empty()
+            && self.has_modifier(data.modifiers.as_ref(), SyntaxKind::ExportKeyword)
+        {
+            self.writer.write("exports.");
+            self.writer.write(&name);
+            self.writer.write(" = ");
+        }
         self.writer.write(&name);
         self.writer.write(" = {}));");
         Ok(())
@@ -9300,6 +9444,82 @@ mod tests {
     }
 
     #[test]
+    fn orders_amd_es_imports_between_dependency_pragmas() {
+        let source = concat!(
+            "///<amd-dependency path='namedPragma' name='pragma'/>",
+            "\n///<amd-dependency path='unnamedPragma'/>",
+            "\nimport { value } from \"bound\";",
+            "\nvalue;",
+            "\nimport \"sideEffect\";",
+        );
+        assert_eq!(
+            emit_amd(source).code,
+            concat!(
+                "///<amd-dependency path='namedPragma' name='pragma'/>\n",
+                "///<amd-dependency path='unnamedPragma'/>\n",
+                "define([\"require\", \"exports\", \"namedPragma\", \"bound\", \"unnamedPragma\", \"sideEffect\"], function (require, exports, pragma, bound_1) {\n",
+                "    \"use strict\";\n",
+                "    Object.defineProperty(exports, \"__esModule\", { value: true });\n",
+                "    bound_1.value;\n",
+                "});\n",
+            )
+        );
+    }
+
+    #[test]
+    fn emits_amd_import_helpers_before_define() {
+        let source = concat!(
+            "import value from \"defaultModule\";\n",
+            "import * as ns from \"namespaceModule\";\n",
+            "value; ns;",
+        );
+        let output = emit_amd(source).code;
+        let star_helper = output.find("var __createBinding").unwrap();
+        let default_helper = output.find("var __importDefault").unwrap();
+        let define = output.find("define([").unwrap();
+        assert!(
+            star_helper < default_helper && default_helper < define,
+            "{output}"
+        );
+        assert!(
+            output.contains(
+                "define([\"require\", \"exports\", \"defaultModule\", \"namespaceModule\"], function (require, exports, defaultModule_1, ns) {"
+            ),
+            "{output}"
+        );
+        assert!(
+            output.contains(
+                "defaultModule_1 = __importDefault(defaultModule_1);\n    ns = __importStar(ns);"
+            ),
+            "{output}"
+        );
+        assert!(
+            output.contains("defaultModule_1.default;\n    ns;"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn emits_amd_exported_enums_through_exports_mutation() {
+        let source = "export enum CharCode { A, B }";
+        assert_eq!(
+            emit_amd(source).code,
+            concat!(
+                "define([\"require\", \"exports\"], function (require, exports) {\n",
+                "    \"use strict\";\n",
+                "    Object.defineProperty(exports, \"__esModule\", { value: true });\n",
+                "    exports.CharCode = void 0;\n",
+                "    var CharCode;\n",
+                "    (function (CharCode) {\n",
+                "        CharCode[CharCode[\"A\"] = 0] = \"A\";\n",
+                "        CharCode[CharCode[\"B\"] = 1] = \"B\";\n",
+                "    })(CharCode || (exports.CharCode = CharCode = {}));\n",
+                "});\n",
+            )
+        );
+    }
+
+    #[test]
     fn routes_commonjs_amd_dependency_before_the_generated_prologue() {
         let source =
             "///<amd-dependency path='bar' name='b'/>\nimport m1 = require(\"m2\");\nm1.f();";
@@ -10475,7 +10695,7 @@ class Board {
             "exports.value = 1;",
             "exports.read = read;",
             "exports.Box = Box;",
-            "exports.Color = Color;",
+            "exports.Color = Color = {}",
         ] {
             assert!(result.code.contains(assignment), "{}", result.code);
         }
@@ -10530,7 +10750,7 @@ class Board {
         for assignment in [
             "exports.First = First;",
             "exports.value = 1;",
-            "exports.State = State;",
+            "exports.State = State = {}",
             "exports.default = Last;",
         ] {
             assert!(result.code.contains(assignment), "{}", result.code);
