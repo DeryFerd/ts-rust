@@ -2610,6 +2610,32 @@ impl<'a> Parser<'a> {
             self.attach_modifiers(declaration, vec![export_modifier], start);
             return declaration;
         }
+        if self.current.kind == SyntaxKind::EqualsToken {
+            self.bump();
+            let expression = self.parse_binary_expression(0);
+            let end = self.parse_semicolon(self.node_end(expression));
+            return self.alloc_node(
+                SyntaxKind::ExportAssignment,
+                TextRange::new(start, end),
+                NodeData::ExportAssignment(Box::new(ExportAssignmentData {
+                    expression,
+                    flow_node: None,
+                    is_export_equals: true,
+                    symbol: None,
+                    type_: expression,
+                    facts: 0,
+                    modifiers: Some(ModifierList {
+                        list: NodeList {
+                            range: TextRange::new(start, self.node_start(expression)),
+                            nodes: vec![export_modifier],
+                            has_trailing_comma: false,
+                        },
+                        flags: ts_ast::ModifierFlags::default(),
+                    }),
+                })),
+                &[export_modifier, expression],
+            );
+        }
         if self.current.kind == SyntaxKind::DefaultKeyword {
             let default_modifier = self.consume_token_node();
             if matches!(
@@ -5762,6 +5788,24 @@ mod tests {
                 .parent,
             Some(source_statements(&result)[0])
         );
+    }
+
+    #[test]
+    fn parses_export_equals_assignments() {
+        let result = parse_source_file("export = runtimeValue;");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let statements = source_statements(&result);
+        let NodeData::ExportAssignment(assignment) = &result.arena.get(statements[0]).unwrap().data
+        else {
+            panic!("expected export assignment");
+        };
+        assert!(assignment.is_export_equals);
+        let NodeData::Identifier(expression) =
+            &result.arena.get(assignment.expression).unwrap().data
+        else {
+            panic!("expected identifier expression");
+        };
+        assert_eq!(expression.text, "runtimeValue");
     }
 
     #[test]

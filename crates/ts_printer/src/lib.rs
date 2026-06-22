@@ -87,6 +87,7 @@ pub fn emit_source_file_with_settings(
         namespace_containers: Vec::new(),
         namespace_declarations: vec![HashSet::new()],
         runtime_identifier_uses: HashSet::new(),
+        has_runtime_export_equals: false,
     };
     let node = printer.node(source_file)?.clone();
     let NodeData::SourceFile(data) = &node.data else {
@@ -121,6 +122,11 @@ pub fn emit_source_file_with_settings(
     {
         printer.emit_leading_source_comments(node.range.start.get());
     }
+    if settings.target < ScriptTarget::Es2015 && source_needs_extends_helper(arena) {
+        printer.emit_extends_helper();
+    }
+    let export_equals_expression = runtime_export_equals_expression(arena, &data.statements);
+    printer.has_runtime_export_equals = export_equals_expression.is_some();
     if settings.module == ModuleKind::CommonJs && is_external_module {
         if source_needs_import_star_helper(
             arena,
@@ -129,10 +135,12 @@ pub fn emit_source_file_with_settings(
         ) {
             printer.emit_import_star_helper();
         }
-        printer
-            .writer
-            .write("Object.defineProperty(exports, \"__esModule\", { value: true });");
-        printer.writer.newline();
+        if export_equals_expression.is_none() {
+            printer
+                .writer
+                .write("Object.defineProperty(exports, \"__esModule\", { value: true });");
+            printer.writer.newline();
+        }
         let preinitialized_exports = commonjs_preinitialized_export_names(arena, &data.statements);
         if !preinitialized_exports.is_empty() {
             for name in preinitialized_exports.iter().rev() {
@@ -143,32 +151,31 @@ pub fn emit_source_file_with_settings(
             printer.writer.write("void 0;");
             printer.writer.newline();
         }
-        for statement in &data.statements.nodes {
-            let Some(node) = arena.get(*statement) else {
-                continue;
-            };
-            let NodeData::FunctionDeclaration(function) = &node.data else {
-                continue;
-            };
-            if !declaration_has_modifier(arena, node, SyntaxKind::ExportKeyword) {
-                continue;
+        if export_equals_expression.is_none() {
+            for statement in &data.statements.nodes {
+                let Some(node) = arena.get(*statement) else {
+                    continue;
+                };
+                let NodeData::FunctionDeclaration(function) = &node.data else {
+                    continue;
+                };
+                if !declaration_has_modifier(arena, node, SyntaxKind::ExportKeyword) {
+                    continue;
+                }
+                let Some(name) = function
+                    .name
+                    .and_then(|name| declaration_name_text(arena, name))
+                else {
+                    continue;
+                };
+                printer.writer.write("exports.");
+                printer.writer.write(name);
+                printer.writer.write(" = ");
+                printer.writer.write(name);
+                printer.writer.write(";");
+                printer.writer.newline();
             }
-            let Some(name) = function
-                .name
-                .and_then(|name| declaration_name_text(arena, name))
-            else {
-                continue;
-            };
-            printer.writer.write("exports.");
-            printer.writer.write(name);
-            printer.writer.write(" = ");
-            printer.writer.write(name);
-            printer.writer.write(";");
-            printer.writer.newline();
         }
-    }
-    if settings.target < ScriptTarget::Es2015 && source_needs_extends_helper(arena) {
-        printer.emit_extends_helper();
     }
     printer.emit_automatic_jsx_prelude();
     let mut previous_end = data
@@ -185,6 +192,14 @@ pub fn emit_source_file_with_settings(
             previous_end = node.range.end.get();
         }
         printer.emit_statement(*statement)?;
+    }
+    if settings.module == ModuleKind::CommonJs
+        && let Some(expression) = export_equals_expression
+    {
+        printer.writer.write("module.exports = ");
+        printer.emit_expression(expression, 0)?;
+        printer.writer.write(";");
+        printer.writer.newline();
     }
     let source_map = printer
         .source_map
@@ -300,6 +315,83 @@ fn commonjs_preinitialized_export_names(arena: &NodeArena, statements: &NodeList
         }
     }
     names
+}
+
+fn runtime_export_equals_expression(arena: &NodeArena, statements: &NodeList) -> Option<NodeId> {
+    let mut type_only_names = HashSet::new();
+    let mut runtime_names = HashSet::new();
+    for statement in &statements.nodes {
+        let Some(node) = arena.get(*statement) else {
+            continue;
+        };
+        match &node.data {
+            NodeData::InterfaceDeclaration(declaration) => {
+                if let Some(name) = declaration_name_text(arena, declaration.name) {
+                    type_only_names.insert(name.to_owned());
+                }
+            }
+            NodeData::TypeAliasDeclaration(declaration) => {
+                if let Some(name) = declaration_name_text(arena, declaration.name) {
+                    type_only_names.insert(name.to_owned());
+                }
+            }
+            NodeData::ClassDeclaration(declaration) => {
+                if let Some(name) = declaration
+                    .name
+                    .and_then(|name| declaration_name_text(arena, name))
+                {
+                    runtime_names.insert(name.to_owned());
+                }
+            }
+            NodeData::FunctionDeclaration(declaration) => {
+                if let Some(name) = declaration
+                    .name
+                    .and_then(|name| declaration_name_text(arena, name))
+                {
+                    runtime_names.insert(name.to_owned());
+                }
+            }
+            NodeData::EnumDeclaration(declaration) => {
+                if let Some(name) = declaration_name_text(arena, declaration.name) {
+                    runtime_names.insert(name.to_owned());
+                }
+            }
+            NodeData::ModuleDeclaration(declaration) => {
+                if let Some(name) = declaration_name_text(arena, declaration.name) {
+                    runtime_names.insert(name.to_owned());
+                }
+            }
+            NodeData::VariableStatement(statement) => {
+                let Some(NodeData::VariableDeclarationList(list)) =
+                    arena.get(statement.declaration_list).map(|node| &node.data)
+                else {
+                    continue;
+                };
+                for declaration in &list.declarations.nodes {
+                    let Some(NodeData::VariableDeclaration(declaration)) =
+                        arena.get(*declaration).map(|node| &node.data)
+                    else {
+                        continue;
+                    };
+                    if let Some(name) = declaration_name_text(arena, declaration.name) {
+                        runtime_names.insert(name.to_owned());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    statements.nodes.iter().find_map(|statement| {
+        let NodeData::ExportAssignment(assignment) = &arena.get(*statement)?.data else {
+            return None;
+        };
+        if !assignment.is_export_equals {
+            return None;
+        }
+        let type_only = declaration_name_text(arena, assignment.expression)
+            .is_some_and(|name| type_only_names.contains(name) && !runtime_names.contains(name));
+        (!type_only).then_some(assignment.expression)
+    })
 }
 
 fn statement_emits_javascript(arena: &NodeArena, node: &Node) -> bool {
@@ -1423,6 +1515,7 @@ struct Printer<'a> {
     namespace_containers: Vec<String>,
     namespace_declarations: Vec<HashSet<String>>,
     runtime_identifier_uses: HashSet<String>,
+    has_runtime_export_equals: bool,
 }
 
 impl Printer<'_> {
@@ -1674,6 +1767,12 @@ impl Printer<'_> {
     fn emit_statement(&mut self, id: NodeId) -> Result<(), EmitError> {
         let node = self.node(id)?.clone();
         if declaration_has_modifier(self.arena, &node, SyntaxKind::DeclareKeyword) {
+            return Ok(());
+        }
+        if matches!(
+            &node.data,
+            NodeData::ExportAssignment(assignment) if assignment.is_export_equals
+        ) {
             return Ok(());
         }
         match &node.data {
@@ -3393,6 +3492,7 @@ impl Printer<'_> {
         names: &[String],
     ) {
         if self.settings.module != ModuleKind::CommonJs
+            || self.has_runtime_export_equals
             || !self.has_modifier(modifiers, SyntaxKind::ExportKeyword)
         {
             return;
@@ -5663,6 +5763,37 @@ class Board {
         ] {
             assert!(result.code.contains(assignment), "{}", result.code);
         }
+    }
+
+    #[test]
+    fn emits_commonjs_export_equals_after_runtime_declarations() {
+        let source = "export = B;\nexport class C {\n}\n";
+        assert_eq!(
+            emit_with(source, ScriptTarget::Es2015, ModuleKind::CommonJs).code,
+            "\"use strict\";\nexports.C = void 0;\nclass C {\n}\nmodule.exports = B;\n"
+        );
+
+        let type_only = emit_with(
+            "interface Shape { value: number; } export = Shape;",
+            ScriptTarget::Es2015,
+            ModuleKind::CommonJs,
+        );
+        assert_eq!(
+            type_only.code,
+            "\"use strict\";\nObject.defineProperty(exports, \"__esModule\", { value: true });\n"
+        );
+    }
+
+    #[test]
+    fn emits_extends_helper_before_commonjs_module_prologue() {
+        let result = emit_with(
+            "export class Derived extends Base {}",
+            ScriptTarget::Es5,
+            ModuleKind::CommonJs,
+        );
+        let helper = result.code.find("var __extends").unwrap();
+        let module = result.code.find("Object.defineProperty(exports").unwrap();
+        assert!(helper < module, "{}", result.code);
     }
 
     #[test]
