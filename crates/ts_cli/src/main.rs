@@ -1,7 +1,10 @@
 use std::{env, fs, process::ExitCode};
 
 use ts_cli::{Command, ExitStatus, VERSION, parse_command_line};
+use ts_compiler::Program;
+use ts_module::ResolutionOptions;
 use ts_scanner::Scanner;
+use ts_vfs::OsFileSystem;
 
 fn main() -> ExitCode {
     let args: Vec<_> = env::args().skip(1).collect();
@@ -13,6 +16,12 @@ fn main() -> ExitCode {
     }
     if args.first().is_some_and(|argument| argument == "--parse") {
         return parse(args.get(1));
+    }
+    if args
+        .first()
+        .is_some_and(|argument| argument == "--compile-dev")
+    {
+        return compile_development(&args[1..]);
     }
     match parse_command_line(&args, |path| fs::read_to_string(path)) {
         Ok(Command::Version) => {
@@ -37,6 +46,51 @@ fn main() -> ExitCode {
             ExitCode::from(ExitStatus::DiagnosticsPresentOutputsSkipped as u8)
         }
     }
+}
+
+fn compile_development(files: &[String]) -> ExitCode {
+    if files.is_empty() {
+        eprintln!("error: --compile-dev requires at least one source file");
+        return ExitCode::from(2);
+    }
+    let Ok(current_directory) = env::current_dir() else {
+        eprintln!("error: could not determine the current directory");
+        return ExitCode::from(2);
+    };
+    let file_system = OsFileSystem::default();
+    let program = Program::new_with_module_resolution(
+        &file_system,
+        &current_directory.to_string_lossy(),
+        files,
+        ResolutionOptions::default(),
+    );
+    if !program.diagnostics().is_empty() {
+        for diagnostic in program.diagnostics() {
+            let code = diagnostic
+                .code
+                .map_or(String::new(), |code| format!(" TS{code}"));
+            let file = diagnostic
+                .file_name
+                .as_deref()
+                .map_or(String::new(), |file| format!("{file}: "));
+            println!("{file}error{code}: {}", diagnostic.message);
+        }
+        return ExitCode::from(ExitStatus::DiagnosticsPresentOutputsSkipped as u8);
+    }
+    let emitted = program.emit();
+    if !emitted.diagnostics.is_empty() {
+        for diagnostic in emitted.diagnostics {
+            println!("error: {}", diagnostic.message);
+        }
+        return ExitCode::from(ExitStatus::DiagnosticsPresentOutputsSkipped as u8);
+    }
+    for output in emitted.files {
+        if let Err(error) = fs::write(&output.file_name, output.text) {
+            eprintln!("error: could not write '{}': {error}", output.file_name);
+            return ExitCode::from(ExitStatus::DiagnosticsPresentOutputsSkipped as u8);
+        }
+    }
+    ExitCode::SUCCESS
 }
 
 fn parse(path: Option<&String>) -> ExitCode {
@@ -116,5 +170,6 @@ fn print_help() {
     println!("  -h, --help       Print this message");
     println!("  -v, --version    Print the compiler version");
     println!("      --parse      Parse one source file (development)");
+    println!("      --compile-dev  Run the development compiler pipeline");
     println!("      --tokenize   Print the token stream for one source file");
 }

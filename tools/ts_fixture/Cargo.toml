@@ -8,5 +8,8 @@ description = "Parser for TypeScript compiler baseline fixtures"
 [lib]
 path = "src/lib.rs"
 
+[dependencies]
+ts_core = { path = "../../crates/ts_core" }
+
 [lints]
 workspace = true

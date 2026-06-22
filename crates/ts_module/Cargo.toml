@@ -1,0 +1,13 @@
+[package]
+name = "ts_module"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde_json = "1"
+ts_path = { path = "../ts_path" }
+ts_vfs = { path = "../ts_vfs" }
+
+[lints]
+workspace = true

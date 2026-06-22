@@ -1,0 +1,14 @@
+[package]
+name = "ts_printer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ts_ast = { path = "../ts_ast" }
+
+[dev-dependencies]
+ts_parser = { path = "../ts_parser" }
+
+[lints]
+workspace = true

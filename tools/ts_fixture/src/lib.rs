@@ -6,13 +6,15 @@
 
 use std::{fmt, ops::Range, path::PathBuf};
 
+use ts_core::SourceText;
+
 /// A parsed compiler test case.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Case {
     /// Path of the fixture containing the test case.
     pub path: PathBuf,
     /// Exact, unmodified contents of the fixture.
-    pub source_text: String,
+    pub source_text: SourceText,
     /// Directives in source order, including `filename` directives.
     pub directives: Vec<Directive>,
     /// Source units in compilation order.
@@ -27,7 +29,7 @@ impl Case {
     /// Returns an error when a `filename` directive has an empty value.
     pub fn parse(
         path: impl Into<PathBuf>,
-        source_text: impl Into<String>,
+        source_text: impl Into<SourceText>,
     ) -> Result<Self, ParseError> {
         let path = path.into();
         let source_text = source_text.into();
@@ -36,25 +38,25 @@ impl Case {
         let mut current = UnitBuilder::new(path.clone(), 1, false);
         let mut byte_offset = 0;
 
-        for (line_index, line_with_ending) in source_text.split_inclusive('\n').enumerate() {
+        for (line_index, line_with_ending) in source_text
+            .as_bytes()
+            .split_inclusive(|byte| *byte == b'\n')
+            .enumerate()
+        {
             let line_number = line_index + 1;
-            let line = line_with_ending
-                .strip_suffix('\n')
-                .unwrap_or(line_with_ending)
-                .strip_suffix('\r')
-                .unwrap_or_else(|| {
-                    line_with_ending
-                        .strip_suffix('\n')
-                        .unwrap_or(line_with_ending)
-                });
+            let line = strip_line_ending(line_with_ending);
 
-            if let Some((name, value)) = parse_directive_line(line) {
+            if let Some((line_text, name, value)) =
+                std::str::from_utf8(line).ok().and_then(|text| {
+                    parse_directive_line(text).map(|(name, value)| (text, name, value))
+                })
+            {
                 let directive = Directive {
                     name: name.to_owned(),
                     value: value.to_owned(),
                     line: line_number,
                     byte_range: byte_offset..byte_offset + line.len(),
-                    raw_text: line.to_owned(),
+                    raw_text: line_text.to_owned(),
                 };
 
                 if directive.is_filename() {
@@ -73,7 +75,7 @@ impl Case {
                 }
                 directives.push(directive);
             } else {
-                current.source_text.push_str(line_with_ending);
+                current.source_bytes.extend_from_slice(line_with_ending);
             }
 
             byte_offset += line_with_ending.len();
@@ -109,7 +111,7 @@ pub struct Unit {
     pub path: PathBuf,
     /// Source text with harness directive lines removed. Line endings and all
     /// other bytes are preserved.
-    pub source_text: String,
+    pub source_text: SourceText,
     /// One-based fixture line at which this unit's source begins.
     pub start_line: usize,
 }
@@ -158,7 +160,7 @@ impl std::error::Error for ParseError {}
 
 struct UnitBuilder {
     path: PathBuf,
-    source_text: String,
+    source_bytes: Vec<u8>,
     start_line: usize,
     explicit: bool,
 }
@@ -167,23 +169,31 @@ impl UnitBuilder {
     fn new(path: PathBuf, start_line: usize, explicit: bool) -> Self {
         Self {
             path,
-            source_text: String::new(),
+            source_bytes: Vec::new(),
             start_line,
             explicit,
         }
     }
 
     fn has_source(&self) -> bool {
-        !self.source_text.trim().is_empty()
+        !SourceText::from_bytes(self.source_bytes.clone())
+            .as_scannable_str()
+            .trim()
+            .is_empty()
     }
 
     fn finish(self) -> Unit {
         Unit {
             path: self.path,
-            source_text: self.source_text,
+            source_text: SourceText::from_bytes(self.source_bytes),
             start_line: self.start_line,
         }
     }
+}
+
+fn strip_line_ending(line: &[u8]) -> &[u8] {
+    let line = line.strip_suffix(b"\n").unwrap_or(line);
+    line.strip_suffix(b"\r").unwrap_or(line)
 }
 
 fn parse_directive_line(line: &str) -> Option<(&str, &str)> {
@@ -292,5 +302,19 @@ mod tests {
         assert_eq!(case.units.len(), 1);
         assert_eq!(case.units[0].path, Path::new("empty.ts"));
         assert!(case.units[0].source_text.is_empty());
+    }
+
+    #[test]
+    fn preserves_invalid_utf8_in_cases_and_units() {
+        let bytes = b"// @target: esnext\n/\x80/u\n".to_vec();
+        let case = Case::parse("invalid.ts", bytes.clone()).unwrap();
+
+        assert_eq!(case.source_text.as_bytes(), bytes);
+        assert!(!case.source_text.is_valid_utf8());
+        assert_eq!(case.units[0].source_text.as_bytes(), b"/\x80/u\n");
+        assert_eq!(
+            case.directive_values("target").collect::<Vec<_>>(),
+            ["esnext"]
+        );
     }
 }

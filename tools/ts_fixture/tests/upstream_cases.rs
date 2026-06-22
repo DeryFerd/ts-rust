@@ -20,11 +20,10 @@ fn parses_all_available_upstream_compiler_cases() {
             let bytes = fs::read(path).unwrap_or_else(|error| {
                 panic!("failed to read upstream case {}: {error}", path.display())
             });
-            let Ok(source) = String::from_utf8(bytes) else {
+            if std::str::from_utf8(&bytes).is_err() {
                 invalid_utf8 += 1;
-                return;
-            };
-            Case::parse(path, source).unwrap_or_else(|error| {
+            }
+            Case::parse(path, bytes).unwrap_or_else(|error| {
                 panic!("failed to parse upstream case {}: {error}", path.display())
             });
             parsed += 1;

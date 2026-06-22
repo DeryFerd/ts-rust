@@ -1,0 +1,23 @@
+[package]
+name = "ts_compiler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ts_binder = { path = "../ts_binder" }
+ts_checker = { path = "../ts_checker" }
+ts_ast = { path = "../ts_ast" }
+ts_config = { path = "../ts_config" }
+ts_core = { path = "../ts_core" }
+ts_diagnostics = { path = "../ts_diagnostics" }
+ts_glob = { path = "../ts_glob" }
+ts_module = { path = "../ts_module" }
+ts_options = { path = "../ts_options" }
+ts_parser = { path = "../ts_parser" }
+ts_path = { path = "../ts_path" }
+ts_printer = { path = "../ts_printer" }
+ts_vfs = { path = "../ts_vfs" }
+
+[lints]
+workspace = true

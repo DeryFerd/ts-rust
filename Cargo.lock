@@ -102,17 +102,58 @@ dependencies = [
 ]
 
 [[package]]
+name = "ts_binder"
+version = "7.0.0-dev"
+dependencies = [
+ "ts_ast",
+ "ts_core",
+ "ts_diagnostics",
+]
+
+[[package]]
+name = "ts_checker"
+version = "7.0.0-dev"
+dependencies = [
+ "ts_ast",
+ "ts_binder",
+ "ts_core",
+ "ts_diagnostics",
+]
+
+[[package]]
 name = "ts_cli"
 version = "7.0.0-dev"
 dependencies = [
  "ts_ast",
+ "ts_compiler",
+ "ts_module",
  "ts_parser",
  "ts_scanner",
+ "ts_vfs",
 ]
 
 [[package]]
 name = "ts_compare"
 version = "7.0.0-dev"
+
+[[package]]
+name = "ts_compiler"
+version = "7.0.0-dev"
+dependencies = [
+ "ts_ast",
+ "ts_binder",
+ "ts_checker",
+ "ts_config",
+ "ts_core",
+ "ts_diagnostics",
+ "ts_glob",
+ "ts_module",
+ "ts_options",
+ "ts_parser",
+ "ts_path",
+ "ts_printer",
+ "ts_vfs",
+]
 
 [[package]]
 name = "ts_config"
@@ -141,6 +182,35 @@ dependencies = [
 [[package]]
 name = "ts_fixture"
 version = "7.0.0-dev"
+dependencies = [
+ "ts_core",
+]
+
+[[package]]
+name = "ts_glob"
+version = "7.0.0-dev"
+dependencies = [
+ "ts_path",
+ "ts_vfs",
+]
+
+[[package]]
+name = "ts_module"
+version = "7.0.0-dev"
+dependencies = [
+ "serde_json",
+ "ts_path",
+ "ts_vfs",
+]
+
+[[package]]
+name = "ts_options"
+version = "7.0.0-dev"
+dependencies = [
+ "ts_config",
+ "ts_diagnostics",
+ "ts_module",
+]
 
 [[package]]
 name = "ts_parser"
@@ -154,6 +224,14 @@ dependencies = [
 [[package]]
 name = "ts_path"
 version = "7.0.0-dev"
+
+[[package]]
+name = "ts_printer"
+version = "7.0.0-dev"
+dependencies = [
+ "ts_ast",
+ "ts_parser",
+]
 
 [[package]]
 name = "ts_scanner"

@@ -1,0 +1,13 @@
+[package]
+name = "ts_options"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ts_config = { path = "../ts_config" }
+ts_diagnostics = { path = "../ts_diagnostics" }
+ts_module = { path = "../ts_module" }
+
+[lints]
+workspace = true

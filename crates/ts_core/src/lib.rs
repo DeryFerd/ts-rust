@@ -1,6 +1,142 @@
 //! Shared compiler primitives.
 
-use std::fmt;
+use std::{fmt, ops::Range, sync::Arc};
+
+/// Lossless source bytes plus a byte-offset-preserving scanner view.
+///
+/// Invalid UTF-8 bytes are retained in `as_bytes` and represented by one ASCII
+/// sentinel byte each in `as_scannable_str`, so scanner byte offsets remain
+/// identical to offsets in the original input.
+#[derive(Clone, Eq, PartialEq)]
+pub struct SourceText {
+    bytes: Arc<[u8]>,
+    scannable: Arc<str>,
+    invalid_byte_ranges: Arc<[Range<usize>]>,
+}
+
+impl SourceText {
+    #[must_use]
+    pub fn from_bytes(bytes: impl Into<Vec<u8>>) -> Self {
+        let bytes = bytes.into();
+        let (scannable, invalid_byte_ranges) = make_scannable(&bytes);
+        Self {
+            bytes: bytes.into(),
+            scannable: scannable.into(),
+            invalid_byte_ranges: invalid_byte_ranges.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> Option<&str> {
+        if self.invalid_byte_ranges.is_empty() {
+            Some(&self.scannable)
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub fn as_scannable_str(&self) -> &str {
+        &self.scannable
+    }
+
+    #[must_use]
+    pub fn invalid_byte_ranges(&self) -> &[Range<usize>] {
+        &self.invalid_byte_ranges
+    }
+
+    #[must_use]
+    pub fn is_valid_utf8(&self) -> bool {
+        self.invalid_byte_ranges.is_empty()
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    #[must_use]
+    pub fn to_string_lossy(&self) -> String {
+        String::from_utf8_lossy(&self.bytes).into_owned()
+    }
+}
+
+impl From<String> for SourceText {
+    fn from(value: String) -> Self {
+        Self::from_bytes(value.into_bytes())
+    }
+}
+
+impl From<&str> for SourceText {
+    fn from(value: &str) -> Self {
+        Self::from_bytes(value.as_bytes().to_vec())
+    }
+}
+
+impl From<Vec<u8>> for SourceText {
+    fn from(value: Vec<u8>) -> Self {
+        Self::from_bytes(value)
+    }
+}
+
+impl fmt::Debug for SourceText {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SourceText")
+            .field("bytes", &self.bytes)
+            .field("scannable", &self.scannable)
+            .field("invalid_byte_ranges", &self.invalid_byte_ranges)
+            .finish()
+    }
+}
+
+impl PartialEq<str> for SourceText {
+    fn eq(&self, other: &str) -> bool {
+        self.as_bytes() == other.as_bytes()
+    }
+}
+
+impl PartialEq<&str> for SourceText {
+    fn eq(&self, other: &&str) -> bool {
+        self == *other
+    }
+}
+
+fn make_scannable(bytes: &[u8]) -> (String, Vec<Range<usize>>) {
+    let mut scannable = String::with_capacity(bytes.len());
+    let mut invalid = Vec::new();
+    let mut offset = 0;
+    while offset < bytes.len() {
+        match std::str::from_utf8(&bytes[offset..]) {
+            Ok(valid) => {
+                scannable.push_str(valid);
+                break;
+            }
+            Err(error) => {
+                let valid_end = offset + error.valid_up_to();
+                // SAFETY is unnecessary: `valid_up_to` guarantees this prefix.
+                scannable.push_str(std::str::from_utf8(&bytes[offset..valid_end]).unwrap());
+                let invalid_len = error.error_len().unwrap_or(bytes.len() - valid_end);
+                let invalid_end = valid_end + invalid_len;
+                invalid.push(valid_end..invalid_end);
+                scannable.extend(std::iter::repeat_n('\u{7f}', invalid_len));
+                offset = invalid_end;
+            }
+        }
+    }
+    debug_assert_eq!(scannable.len(), bytes.len());
+    (scannable, invalid)
+}
 
 /// A JavaScript string represented as UTF-16 code units. Unlike Rust `String`,
 /// this preserves lone surrogates produced by escape sequences.
@@ -169,7 +305,17 @@ impl Diagnostic {
 
 #[cfg(test)]
 mod tests {
-    use super::{JsString, PositionMap, TextPos, TextRange};
+    use super::{JsString, PositionMap, SourceText, TextPos, TextRange};
+
+    #[test]
+    fn source_text_preserves_invalid_bytes_and_offsets() {
+        let source = SourceText::from_bytes(vec![b'a', 0x80, b'b', 0xf0, 0x9f]);
+        assert_eq!(source.as_bytes(), &[b'a', 0x80, b'b', 0xf0, 0x9f]);
+        assert_eq!(source.as_scannable_str().as_bytes(), b"a\x7fb\x7f\x7f");
+        assert_eq!(source.invalid_byte_ranges(), &[1..2, 3..5]);
+        assert_eq!(source.as_scannable_str().len(), source.len());
+        assert!(source.as_str().is_none());
+    }
 
     #[test]
     fn ranges_are_half_open() {

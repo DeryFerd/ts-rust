@@ -11,6 +11,11 @@ against the upstream TypeScript fixtures independently:
 - `ts_ast`: generated syntax kinds and arena-backed AST nodes
 - `ts_scanner`: lexical analysis
 - `ts_parser`: the TypeScript grammar and error recovery
+- `ts_binder` / `ts_checker`: symbols, scopes, and semantic types
+- `ts_module` / `ts_glob`: module resolution and project file discovery
+- `ts_options`: normalized compiler options
+- `ts_compiler`: Program graph, diagnostics, checking, and emit orchestration
+- `ts_printer`: modern JavaScript emission
 - `ts_diagnostics`: generated TypeScript diagnostic catalog
 - `ts_config`: JSONC and `tsconfig.json` parsing
 - `ts_path` / `ts_vfs`: compiler path and filesystem abstractions
@@ -23,7 +28,13 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Development-only `tsgo --tokenize file.ts` and `tsgo --parse file.ts`
-commands expose the current scanner/parser vertical slice. Standard compilation
-still exits explicitly as not implemented until Program, binding, checking, and
-emit are connected.
+Or run the complete local gate, including generated-source checks:
+
+```sh
+./scripts/verify.sh
+```
+
+Development-only `tsgo --tokenize file.ts`, `tsgo --parse file.ts`, and
+`tsgo --compile-dev file.ts` commands expose the scanner/parser and current
+end-to-end compiler pipeline. Standard compilation still exits explicitly as
+not implemented until option/default-library/diagnostic parity is sufficient.
