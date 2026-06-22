@@ -294,11 +294,7 @@ pub fn emit_source_file_with_context(
                 .write("Object.defineProperty(exports, \"__esModule\", { value: true });");
             printer.writer.newline();
         }
-        let preinitialized_exports = commonjs_preinitialized_export_names(
-            arena,
-            &data.statements,
-            context.preserve_const_enums,
-        );
+        let preinitialized_exports = printer.commonjs_preinitialized_export_names(&data.statements);
         if !preinitialized_exports.is_empty() {
             for name in preinitialized_exports.iter().rev() {
                 printer.writer.write("exports.");
@@ -548,72 +544,6 @@ fn commonjs_module_temp_base(arena: &NodeArena, module_specifier: NodeId) -> Str
     } else {
         base
     }
-}
-
-fn commonjs_preinitialized_export_names(
-    arena: &NodeArena,
-    statements: &NodeList,
-    preserve_const_enums: bool,
-) -> Vec<String> {
-    let mut names = Vec::new();
-    let mut seen = HashSet::new();
-    for statement in &statements.nodes {
-        let Some(node) = arena.get(*statement) else {
-            continue;
-        };
-        if !declaration_has_modifier(arena, node, SyntaxKind::ExportKeyword) {
-            continue;
-        }
-        if is_const_enum_declaration(arena, node) && !preserve_const_enums {
-            continue;
-        }
-        let default_export = declaration_has_modifier(arena, node, SyntaxKind::DefaultKeyword);
-        match &node.data {
-            NodeData::ClassDeclaration(class) => {
-                let name = if default_export {
-                    Some("default")
-                } else {
-                    class
-                        .name
-                        .and_then(|name| declaration_name_text(arena, name))
-                };
-                if let Some(name) = name
-                    && seen.insert(name.to_owned())
-                {
-                    names.push(name.to_owned());
-                }
-            }
-            NodeData::EnumDeclaration(enumeration) => {
-                if let Some(name) = declaration_name_text(arena, enumeration.name)
-                    && seen.insert(name.to_owned())
-                {
-                    names.push(name.to_owned());
-                }
-            }
-            NodeData::VariableStatement(statement) => {
-                let Some(NodeData::VariableDeclarationList(list)) =
-                    arena.get(statement.declaration_list).map(|node| &node.data)
-                else {
-                    continue;
-                };
-                for declaration in &list.declarations.nodes {
-                    let Some(NodeData::VariableDeclaration(declaration)) =
-                        arena.get(*declaration).map(|node| &node.data)
-                    else {
-                        continue;
-                    };
-                    let Some(name) = declaration_name_text(arena, declaration.name) else {
-                        continue;
-                    };
-                    if seen.insert(name.to_owned()) {
-                        names.push(name.to_owned());
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    names
 }
 
 fn runtime_export_equals_expression(arena: &NodeArena, statements: &NodeList) -> Option<NodeId> {
@@ -2942,6 +2872,112 @@ impl Printer<'_> {
         EmitError { node: id, kind }
     }
 
+    fn commonjs_preinitialized_export_names(&self, statements: &NodeList) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut seen = HashSet::new();
+        for statement in &statements.nodes {
+            let Some(node) = self.arena.get(*statement) else {
+                continue;
+            };
+            if is_const_enum_declaration(self.arena, node)
+                && !self.const_enum_emit_mode.preserves_declarations()
+            {
+                continue;
+            }
+            let exported = declaration_has_modifier(self.arena, node, SyntaxKind::ExportKeyword);
+            let default_export =
+                declaration_has_modifier(self.arena, node, SyntaxKind::DefaultKeyword);
+            match &node.data {
+                NodeData::ClassDeclaration(class) if exported => {
+                    let name = if default_export {
+                        Some("default")
+                    } else {
+                        class
+                            .name
+                            .and_then(|name| declaration_name_text(self.arena, name))
+                    };
+                    if let Some(name) = name
+                        && seen.insert(name.to_owned())
+                    {
+                        names.push(name.to_owned());
+                    }
+                }
+                NodeData::EnumDeclaration(enumeration) if exported => {
+                    if let Some(name) = declaration_name_text(self.arena, enumeration.name)
+                        && seen.insert(name.to_owned())
+                    {
+                        names.push(name.to_owned());
+                    }
+                }
+                NodeData::VariableStatement(statement) if exported => {
+                    let Some(NodeData::VariableDeclarationList(list)) = self
+                        .arena
+                        .get(statement.declaration_list)
+                        .map(|node| &node.data)
+                    else {
+                        continue;
+                    };
+                    for declaration in &list.declarations.nodes {
+                        let Some(NodeData::VariableDeclaration(declaration)) =
+                            self.arena.get(*declaration).map(|node| &node.data)
+                        else {
+                            continue;
+                        };
+                        let Some(name) = declaration_name_text(self.arena, declaration.name) else {
+                            continue;
+                        };
+                        if seen.insert(name.to_owned()) {
+                            names.push(name.to_owned());
+                        }
+                    }
+                }
+                NodeData::ExportDeclaration(export) if export.module_specifier.is_none() => {
+                    let Some(NodeData::NamedExports(exports)) = export
+                        .export_clause
+                        .and_then(|clause| self.arena.get(clause))
+                        .map(|node| &node.data)
+                    else {
+                        continue;
+                    };
+                    for element in &exports.elements.nodes {
+                        let Some(NodeData::ExportSpecifier(specifier)) =
+                            self.arena.get(*element).map(|node| &node.data)
+                        else {
+                            continue;
+                        };
+                        if specifier.is_type_only
+                            || !self.export_specifier_target_has_runtime_value(specifier)
+                        {
+                            continue;
+                        }
+                        let Some(name) = declaration_name_text(self.arena, specifier.name) else {
+                            continue;
+                        };
+                        if seen.insert(name.to_owned()) {
+                            names.push(name.to_owned());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        names
+    }
+
+    fn export_specifier_target_has_runtime_value(
+        &self,
+        specifier: &ts_ast::ExportSpecifierData,
+    ) -> bool {
+        let local = specifier.property_name.unwrap_or(specifier.name);
+        let Some(name) = declaration_name_text(self.arena, local) else {
+            return false;
+        };
+        let Some(symbol) = self.bindings.resolve_name_at(local, name) else {
+            return false;
+        };
+        self.symbol_has_runtime_value(symbol, &mut HashSet::new())
+    }
+
     fn statement_emits_runtime(&self, id: NodeId, node: &Node) -> bool {
         if declaration_has_modifier(self.arena, node, SyntaxKind::DeclareKeyword)
             || (is_const_enum_declaration(self.arena, node)
@@ -3083,6 +3119,14 @@ impl Printer<'_> {
                         return true;
                     }
                 }
+                NodeData::ImportClause(_)
+                | NodeData::ImportSpecifier(_)
+                | NodeData::NamespaceImport(_)
+                | NodeData::NamedImports(_) => {
+                    if self.import_binding_has_runtime_value(*declaration) {
+                        return true;
+                    }
+                }
                 NodeData::InterfaceDeclaration(_) | NodeData::TypeAliasDeclaration(_) => {}
                 NodeData::FunctionDeclaration(function) if function.body.is_none() => {}
                 NodeData::EnumDeclaration(_)
@@ -3095,6 +3139,31 @@ impl Printer<'_> {
             }
         }
         false
+    }
+
+    fn import_binding_has_runtime_value(&self, declaration: NodeId) -> bool {
+        let mut current = declaration;
+        loop {
+            let Some(node) = self.arena.get(current) else {
+                return true;
+            };
+            match &node.data {
+                NodeData::ImportDeclaration(_) => {
+                    return self.import_semantically_has_runtime_value(current);
+                }
+                NodeData::ImportClause(clause)
+                    if clause.phase_modifier == Some(SyntaxKind::TypeKeyword) =>
+                {
+                    return false;
+                }
+                NodeData::ImportSpecifier(specifier) if specifier.is_type_only => return false,
+                _ => {}
+            }
+            let Some(parent) = node.parent else {
+                return true;
+            };
+            current = parent;
+        }
     }
 
     fn namespace_has_runtime_contents(
@@ -8242,8 +8311,32 @@ class Board {
         );
         assert_eq!(
             result.code,
-            "\"use strict\";\nvar __importDefault = (this && this.__importDefault) || function (mod) {\n    return (mod && mod.__esModule) ? mod : { \"default\": mod };\n};\nObject.defineProperty(exports, \"__esModule\", { value: true });\nconst pkg_1 = __importDefault(require('pkg'));\nconst { read: load, write } = require('pkg');\nrequire('side');\nexports.result = load;\nObject.assign(exports, require('other'));\nexports.default = pkg_1.default;\n"
+            "\"use strict\";\nvar __importDefault = (this && this.__importDefault) || function (mod) {\n    return (mod && mod.__esModule) ? mod : { \"default\": mod };\n};\nObject.defineProperty(exports, \"__esModule\", { value: true });\nexports.result = void 0;\nconst pkg_1 = __importDefault(require('pkg'));\nconst { read: load, write } = require('pkg');\nrequire('side');\nexports.result = load;\nObject.assign(exports, require('other'));\nexports.default = pkg_1.default;\n"
         );
+    }
+
+    #[test]
+    fn preinitializes_local_named_exports_by_their_exported_runtime_name() {
+        let runtime = emit_with(
+            "import value from './dep'; export { value as result };",
+            ScriptTarget::Es2015,
+            ModuleKind::CommonJs,
+        );
+        assert!(
+            runtime
+                .code
+                .contains("exports.result = void 0;\nconst dep_1 = __importDefault"),
+            "{}",
+            runtime.code
+        );
+        assert!(!runtime.code.contains("exports.value = void 0;"));
+
+        let type_only = emit_with(
+            "interface Shape {} export { Shape };",
+            ScriptTarget::Es2015,
+            ModuleKind::CommonJs,
+        );
+        assert!(!type_only.code.contains("void 0;"), "{}", type_only.code);
     }
 
     #[test]
