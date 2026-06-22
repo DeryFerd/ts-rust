@@ -339,9 +339,24 @@ pub fn emit_source_file_with_context(
         .map_or(0, |node| node.range.start.get());
     let mut reference_owner_start = 0;
     let mut previous_emitted = false;
+    let mut pending_commonjs_imports = Vec::new();
     for statement in &data.statements.nodes {
+        let current_emitted = arena
+            .get(*statement)
+            .is_some_and(|node| printer.statement_emits_runtime(*statement, node));
+        let current_is_import = matches!(
+            arena.get(*statement).map(|node| &node.data),
+            Some(NodeData::ImportDeclaration(_))
+        );
+        if settings.module == ModuleKind::CommonJs
+            && current_emitted
+            && !current_is_import
+        {
+            for import in pending_commonjs_imports.drain(..) {
+                printer.emit_commonjs_import_binding_exports(import, &data.statements)?;
+            }
+        }
         if let Some(node) = arena.get(*statement) {
-            let current_emitted = printer.statement_emits_runtime(*statement, node);
             printer.emit_source_comments_between_with_ownership(
                 previous_end,
                 node.range.start.get(),
@@ -359,6 +374,12 @@ pub fn emit_source_file_with_context(
             reference_owner_start = node.range.end.get();
         }
         printer.emit_statement(*statement)?;
+        if settings.module == ModuleKind::CommonJs && current_emitted && current_is_import {
+            pending_commonjs_imports.push(*statement);
+        }
+    }
+    for import in pending_commonjs_imports {
+        printer.emit_commonjs_import_binding_exports(import, &data.statements)?;
     }
     printer.emit_source_comments_between_with_ownership(
         previous_end,
@@ -3270,6 +3291,12 @@ impl Printer<'_> {
             {
                 return Ok(());
             }
+            NodeData::ExportDeclaration(export)
+                if self.commonjs_module_transform
+                    && self.commonjs_export_is_fully_hoisted(export) =>
+            {
+                return Ok(());
+            }
             _ => {}
         }
         if let Some(container) = self.namespace_containers.last().cloned()
@@ -3304,7 +3331,7 @@ impl Printer<'_> {
             NodeData::Block(_) => self.emit_block(id)?,
             NodeData::EmptyStatement(_) => self.writer.write(";"),
             NodeData::VariableStatement(data) => {
-                if !self.emit_commonjs_default_import_export_variable(data)? {
+                if !self.emit_commonjs_export_variable_initializer(data)? {
                     self.emit_runtime_declaration_modifiers(data.modifiers.as_ref());
                     self.emit_variable_list(data.declaration_list)?;
                     self.writer.write(";");
@@ -5129,8 +5156,16 @@ impl Printer<'_> {
         let NodeData::NamedExports(exports) = &node.data else {
             return Err(Self::unsupported(clause, node.kind));
         };
-        for (index, specifier_id) in exports.elements.nodes.iter().enumerate() {
-            if index != 0 {
+        let mut emitted = false;
+        for specifier_id in &exports.elements.nodes {
+            if data.module_specifier.is_none()
+                && self
+                    .commonjs_export_import_declaration(*specifier_id)
+                    .is_some()
+            {
+                continue;
+            }
+            if emitted {
                 self.writer.newline();
             }
             let node = self.node(*specifier_id)?.clone();
@@ -5147,8 +5182,114 @@ impl Printer<'_> {
             }
             self.emit_expression(specifier.property_name.unwrap_or(specifier.name), 0)?;
             self.writer.write(";");
+            emitted = true;
         }
         Ok(())
+    }
+
+    fn emit_commonjs_import_binding_exports(
+        &mut self,
+        import_declaration: NodeId,
+        statements: &NodeList,
+    ) -> Result<(), EmitError> {
+        for statement in &statements.nodes {
+            let Some(NodeData::ExportDeclaration(export)) =
+                self.arena.get(*statement).map(|node| &node.data)
+            else {
+                continue;
+            };
+            if export.is_type_only || export.module_specifier.is_some() {
+                continue;
+            }
+            let Some(NodeData::NamedExports(exports)) = export
+                .export_clause
+                .and_then(|clause| self.arena.get(clause))
+                .map(|node| &node.data)
+            else {
+                continue;
+            };
+            for specifier_id in &exports.elements.nodes {
+                if self.commonjs_export_import_declaration(*specifier_id)
+                    != Some(import_declaration)
+                {
+                    continue;
+                }
+                let node = self.node(*specifier_id)?.clone();
+                let NodeData::ExportSpecifier(specifier) = &node.data else {
+                    return Err(Self::unsupported(*specifier_id, node.kind));
+                };
+                self.writer.write("exports.");
+                if let Some(name) = declaration_name_text(self.arena, specifier.name) {
+                    self.writer.write(name);
+                } else {
+                    self.emit_expression(specifier.name, 0)?;
+                }
+                self.writer.write(" = ");
+                self.emit_expression(specifier.property_name.unwrap_or(specifier.name), 0)?;
+                self.writer.write(";");
+                self.writer.newline();
+            }
+        }
+        Ok(())
+    }
+
+    fn commonjs_export_is_fully_hoisted(
+        &self,
+        export: &ts_ast::ExportDeclarationData,
+    ) -> bool {
+        if export.is_type_only || export.module_specifier.is_some() {
+            return false;
+        }
+        let Some(NodeData::NamedExports(exports)) = export
+            .export_clause
+            .and_then(|clause| self.arena.get(clause))
+            .map(|node| &node.data)
+        else {
+            return false;
+        };
+        !exports.elements.nodes.is_empty()
+            && exports.elements.nodes.iter().all(|specifier| {
+                self.commonjs_export_import_declaration(*specifier)
+                    .is_some()
+            })
+    }
+
+    fn commonjs_export_import_declaration(&self, specifier: NodeId) -> Option<NodeId> {
+        let NodeData::ExportSpecifier(specifier) = &self.arena.get(specifier)?.data else {
+            return None;
+        };
+        if specifier.is_type_only {
+            return None;
+        }
+        let local = specifier.property_name.unwrap_or(specifier.name);
+        let name = declaration_name_text(self.arena, local)?;
+        let symbol = self.bindings.resolve_name_at(local, name)?;
+        self.bindings
+            .symbols
+            .get(symbol)?
+            .declarations
+            .iter()
+            .find_map(|declaration| {
+                if !matches!(
+                    self.arena.get(*declaration).map(|node| &node.data),
+                    Some(
+                        NodeData::ImportClause(_)
+                            | NodeData::ImportSpecifier(_)
+                            | NodeData::NamespaceImport(_)
+                    )
+                ) || !self.import_binding_has_runtime_value(*declaration)
+                {
+                    return None;
+                }
+                let mut current = *declaration;
+                loop {
+                    let node = self.arena.get(current)?;
+                    if matches!(node.data, NodeData::ImportDeclaration(_)) {
+                        return Some(current);
+                    }
+                    current = node.parent?;
+                }
+            })
     }
 
     fn variable_keyword(&self) -> &'static str {
@@ -5258,12 +5399,11 @@ impl Printer<'_> {
             })
     }
 
-    fn emit_commonjs_default_import_export_variable(
+    fn emit_commonjs_export_variable_initializer(
         &mut self,
         statement: &ts_ast::VariableStatementData,
     ) -> Result<bool, EmitError> {
         if !self.commonjs_module_transform
-            || self.commonjs_default_imports.is_empty()
             || !self.has_modifier(statement.modifiers.as_ref(), SyntaxKind::ExportKeyword)
         {
             return Ok(false);
@@ -5285,8 +5425,13 @@ impl Printer<'_> {
         let Some(name) = declaration_name_text(self.arena, declaration.name) else {
             return Ok(false);
         };
-        if !self.expression_uses_commonjs_default_import(initializer) {
+        let symbol = self.bindings.node_symbols.get(&declaration.name).copied();
+        if !self.commonjs_export_initializer_can_be_direct(initializer, symbol) {
             return Ok(false);
+        }
+        if let Some(symbol) = symbol {
+            self.identifier_rewrites
+                .insert(symbol, format!("exports.{name}"));
         }
         self.writer.write("exports.");
         self.writer.write(name);
@@ -5294,6 +5439,41 @@ impl Printer<'_> {
         self.emit_expression(initializer, 1)?;
         self.writer.write(";");
         Ok(true)
+    }
+
+    fn commonjs_export_initializer_can_be_direct(
+        &self,
+        initializer: NodeId,
+        symbol: Option<SymbolId>,
+    ) -> bool {
+        let simple_literal = matches!(
+            self.arena.get(initializer).map(|node| &node.data),
+            Some(
+                NodeData::NumericLiteral(_)
+                    | NodeData::BigIntLiteral(_)
+                    | NodeData::StringLiteral(_)
+                    | NodeData::NoSubstitutionTemplateLiteral(_)
+                    | NodeData::KeywordExpression(_)
+            )
+        );
+        self.expression_uses_commonjs_default_import(initializer)
+            || (simple_literal
+                && symbol.is_some_and(|symbol| self.symbol_is_default_exported(symbol)))
+    }
+
+    fn symbol_is_default_exported(&self, symbol: SymbolId) -> bool {
+        self.arena.iter().any(|(_, node)| {
+            let NodeData::ExportAssignment(assignment) = &node.data else {
+                return false;
+            };
+            if assignment.is_export_equals {
+                return false;
+            }
+            let Some(name) = declaration_name_text(self.arena, assignment.expression) else {
+                return false;
+            };
+            self.bindings.resolve_name_at(assignment.expression, name) == Some(symbol)
+        })
     }
 
     fn expression_uses_commonjs_default_import(&self, expression: NodeId) -> bool {
@@ -8324,6 +8504,53 @@ class Board {
             ModuleKind::CommonJs,
         );
         assert!(!type_only.code.contains("void 0;"), "{}", type_only.code);
+    }
+
+    #[test]
+    fn emits_merged_type_and_import_binding_as_a_commonjs_default_export() {
+        let source = concat!(
+            "export default interface zzz { x: string; }\n",
+            "import zzz from \"./b\";\n",
+            "const x: zzz = { x: \"\" };\n",
+            "zzz;\n",
+            "export { zzz as default };\n",
+        );
+        let result = emit_with(source, ScriptTarget::Es2015, ModuleKind::CommonJs);
+        assert_eq!(
+            result.code,
+            concat!(
+                "\"use strict\";\n",
+                "var __importDefault = (this && this.__importDefault) || function (mod) {\n",
+                "    return (mod && mod.__esModule) ? mod : { \"default\": mod };\n",
+                "};\n",
+                "Object.defineProperty(exports, \"__esModule\", { value: true });\n",
+                "exports.default = void 0;\n",
+                "const b_1 = __importDefault(require(\"./b\"));\n",
+                "exports.default = b_1.default;\n",
+                "const x = { x: \"\" };\n",
+                "b_1.default;\n",
+            )
+        );
+    }
+
+    #[test]
+    fn lowers_simple_commonjs_export_initializers_and_rewrites_local_uses() {
+        let result = emit_with(
+            "export const zzz = 123; zzz; export default zzz;",
+            ScriptTarget::Es2015,
+            ModuleKind::CommonJs,
+        );
+        assert_eq!(
+            result.code,
+            concat!(
+                "\"use strict\";\n",
+                "Object.defineProperty(exports, \"__esModule\", { value: true });\n",
+                "exports.zzz = void 0;\n",
+                "exports.zzz = 123;\n",
+                "exports.zzz;\n",
+                "exports.default = exports.zzz;\n",
+            )
+        );
     }
 
     #[test]
