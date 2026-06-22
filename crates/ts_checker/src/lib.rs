@@ -567,8 +567,12 @@ impl<'a> ProgramChecker<'a> {
                             duplicates.push((file_index, *declaration, code, name.to_owned()));
                         }
                     }
-                    if existing_flags.contains(ts_binder::SymbolFlags::INTERFACE)
-                        && symbol.flags.contains(ts_binder::SymbolFlags::INTERFACE)
+                    if ((existing_flags.contains(ts_binder::SymbolFlags::INTERFACE)
+                        && symbol.flags.contains(ts_binder::SymbolFlags::INTERFACE))
+                        || (existing_flags.contains(ts_binder::SymbolFlags::NAMESPACE_MODULE)
+                            && symbol
+                                .flags
+                                .contains(ts_binder::SymbolFlags::NAMESPACE_MODULE)))
                         && let Some(descriptor) = if source.is_default_library {
                             Self::describe_default_library_symbol(source, symbol_id)
                         } else {
@@ -695,6 +699,24 @@ impl<'a> ProgramChecker<'a> {
                         &mut diagnostics,
                     );
                 }
+            } else if let Some(bindings) = clause_data.named_bindings
+                && let Some(NodeData::NamespaceImport(namespace)) =
+                    source.arena.get(bindings).map(|node| &node.data)
+                && let Some(symbol) = source
+                    .bindings
+                    .node_symbols
+                    .get(&bindings)
+                    .or_else(|| source.bindings.node_symbols.get(&namespace.name))
+            {
+                symbols.insert(
+                    *symbol,
+                    TypeDescriptor::Object {
+                        properties: module_exports.clone(),
+                        optional_properties: BTreeSet::new(),
+                        readonly_properties: BTreeSet::new(),
+                        getter_properties: BTreeSet::new(),
+                    },
+                );
             }
         }
         (symbols, diagnostics)
@@ -729,10 +751,34 @@ impl<'a> ProgramChecker<'a> {
         result: &CheckResult,
         symbol_id: SymbolId,
     ) -> Option<TypeDescriptor> {
-        if let Some(descriptor) = describe_declaration_symbol(source, symbol_id) {
-            return Some(descriptor);
-        }
         let symbol = source.bindings.symbols.get(symbol_id)?;
+        let namespace = symbol
+            .flags
+            .contains(ts_binder::SymbolFlags::NAMESPACE_MODULE)
+            .then(|| {
+                let properties = symbol
+                    .members
+                    .iter()
+                    .filter_map(|(name, member)| {
+                        Self::describe_symbol(source, result, member)
+                            .map(|descriptor| (name.to_owned(), descriptor))
+                    })
+                    .collect();
+                TypeDescriptor::Object {
+                    properties,
+                    optional_properties: BTreeSet::new(),
+                    readonly_properties: BTreeSet::new(),
+                    getter_properties: BTreeSet::new(),
+                }
+            });
+        if let Some(declaration) = describe_declaration_symbol(source, symbol_id) {
+            return Some(namespace.map_or(declaration.clone(), |namespace| {
+                TypeDescriptor::Intersection(vec![declaration, namespace])
+            }));
+        }
+        if namespace.is_some() {
+            return namespace;
+        }
         let target = symbol.target.unwrap_or(symbol_id);
         let target_symbol = source.bindings.symbols.get(target)?;
         for declaration in &target_symbol.declarations {
@@ -924,6 +970,53 @@ impl<'a> Checker<'a> {
                 symbol.id,
                 symbol_type.unwrap_or_else(|| self.result.types.any()),
             );
+        }
+        self.seed_namespace_types();
+    }
+
+    fn seed_namespace_types(&mut self) {
+        let namespaces = self
+            .bindings
+            .symbols
+            .iter()
+            .filter(|symbol| {
+                symbol
+                    .flags
+                    .contains(ts_binder::SymbolFlags::NAMESPACE_MODULE)
+            })
+            .map(|symbol| symbol.id)
+            .collect::<Vec<_>>();
+        for symbol_id in namespaces.into_iter().rev() {
+            let Some(symbol) = self.bindings.symbols.get(symbol_id) else {
+                continue;
+            };
+            let properties = symbol
+                .members
+                .iter()
+                .filter_map(|(name, member)| {
+                    self.result
+                        .symbol_types
+                        .get(&member)
+                        .copied()
+                        .map(|type_id| (name.to_owned(), type_id))
+                })
+                .collect::<BTreeMap<_, _>>();
+            let namespace_type = self.result.types.alloc(TypeKind::Object(ObjectType {
+                properties,
+                ..ObjectType::default()
+            }));
+            let existing = self
+                .result
+                .symbol_types
+                .get(&symbol_id)
+                .copied()
+                .unwrap_or_else(|| self.result.types.any());
+            let combined = if existing == self.result.types.any() {
+                namespace_type
+            } else {
+                self.result.types.intersection([existing, namespace_type])
+            };
+            self.result.symbol_types.insert(symbol_id, combined);
         }
     }
 
@@ -3043,6 +3136,20 @@ impl<'a> Checker<'a> {
         }
     }
 
+    fn callable_signatures(&self, kind: TypeKind) -> Option<Vec<FunctionType>> {
+        match kind {
+            TypeKind::Function(signature) => Some(vec![signature]),
+            TypeKind::Overload(signatures) => Some(signatures),
+            TypeKind::Intersection(members) => members.into_iter().find_map(|member| {
+                self.result
+                    .types
+                    .get(member)
+                    .and_then(|type_| self.callable_signatures(type_.kind.clone()))
+            }),
+            _ => None,
+        }
+    }
+
     fn call_expression_type(
         &mut self,
         node: NodeId,
@@ -3063,17 +3170,13 @@ impl<'a> Checker<'a> {
             }
             return self.result.types.any();
         }
-        let signatures = match callee_kind {
-            TypeKind::Function(signature) => vec![signature],
-            TypeKind::Overload(signatures) => signatures,
-            _ => {
-                self.error(
-                    node,
-                    if construct { 2351 } else { 2349 },
-                    std::iter::empty(),
-                );
-                return self.result.types.any();
-            }
+        let Some(signatures) = self.callable_signatures(callee_kind) else {
+            self.error(
+                node,
+                if construct { 2351 } else { 2349 },
+                std::iter::empty(),
+            );
+            return self.result.types.any();
         };
         if signatures.len() > 1 {
             let actuals = arguments
@@ -4919,6 +5022,8 @@ fn global_declarations_merge(
         || (existing == ts_binder::SymbolFlags::FUNCTION && new == ts_binder::SymbolFlags::FUNCTION)
         || (existing == ts_binder::SymbolFlags::FUNCTION_SCOPED_VARIABLE
             && new == ts_binder::SymbolFlags::FUNCTION_SCOPED_VARIABLE)
+        || (existing.contains(ts_binder::SymbolFlags::NAMESPACE_MODULE)
+            && new.contains(ts_binder::SymbolFlags::NAMESPACE_MODULE))
 }
 
 fn merge_global_descriptor(existing: &mut TypeDescriptor, new: TypeDescriptor) {
@@ -4937,7 +5042,13 @@ fn merge_global_descriptor(existing: &mut TypeDescriptor, new: TypeDescriptor) {
                 getter_properties: new_getters,
             },
         ) => {
-            existing.extend(new);
+            for (name, descriptor) in new {
+                if let Some(existing) = existing.get_mut(&name) {
+                    merge_global_descriptor(existing, descriptor);
+                } else {
+                    existing.insert(name, descriptor);
+                }
+            }
             existing_optional.extend(new_optional);
             existing_readonly.extend(new_readonly);
             existing_getters.extend(new_getters);
@@ -4967,7 +5078,13 @@ fn merge_global_descriptor(existing: &mut TypeDescriptor, new: TypeDescriptor) {
                 },
             ) = (existing_body.as_mut(), *new_body)
             {
-                existing.extend(new);
+                for (name, descriptor) in new {
+                    if let Some(existing) = existing.get_mut(&name) {
+                        merge_global_descriptor(existing, descriptor);
+                    } else {
+                        existing.insert(name, descriptor);
+                    }
+                }
                 existing_optional.extend(new_optional);
                 existing_readonly.extend(new_readonly);
                 existing_getters.extend(new_getters);
@@ -5986,6 +6103,68 @@ mod tests {
                 .map(|diagnostic| diagnostic.diagnostic.code())
                 .collect::<Vec<_>>(),
             [2322, 2345]
+        );
+    }
+
+    #[test]
+    fn resolves_ambient_namespace_members_as_object_properties() {
+        let parsed = parse_source_file(
+            r"
+                declare namespace A {
+                    namespace AA {
+                        function func(): number;
+                        const value: string;
+                    }
+                }
+                const numberValue: number = A.AA.func();
+                const stringValue: string = A.AA.value;
+                const bad: string = A.AA.func();
+            ",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        assert!(
+            bindings.diagnostics.is_empty(),
+            "{:?}",
+            bindings.diagnostics
+        );
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2322]
+        );
+    }
+
+    #[test]
+    fn preserves_callable_types_when_functions_merge_with_namespaces() {
+        let parsed = parse_source_file(
+            r"
+                function Factory(): number { return 1; }
+                namespace Factory { export const version: number = 1; }
+                const value: number = Factory();
+                const version: number = Factory.version;
+                const bad: string = Factory.version;
+            ",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        assert!(
+            bindings.diagnostics.is_empty(),
+            "{:?}",
+            bindings.diagnostics
+        );
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2322]
         );
     }
 

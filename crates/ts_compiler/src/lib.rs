@@ -1348,6 +1348,54 @@ mod tests {
     }
 
     #[test]
+    fn emits_recovered_class_statements_and_erases_keyword_named_interfaces() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/class.ts",
+            "class C { public const var export foo = 10; var constructor() { } }",
+        )
+        .unwrap();
+        fs.write_file("/interface.ts", "interface string {}")
+            .unwrap();
+        let options = CompilerOptions {
+            no_lib: true,
+            target: ScriptTarget::Es2015,
+            ..CompilerOptions::default()
+        };
+
+        let class_program =
+            Program::new_with_options(&fs, "/", &["class.ts".to_owned()], options.clone());
+        let class_output = class_program.emit();
+        assert!(
+            class_output.diagnostics.is_empty(),
+            "{:?}",
+            class_output.diagnostics
+        );
+        assert_eq!(class_output.files.len(), 1);
+        assert!(class_output.files[0].text.contains("var constructor;"));
+        assert!(class_output.files[0].text.contains("() => { };"));
+
+        let interface_program =
+            Program::new_with_options(&fs, "/", &["interface.ts".to_owned()], options);
+        let interface_output = interface_program.emit();
+        assert!(
+            interface_output.diagnostics.is_empty(),
+            "{:?}",
+            interface_output.diagnostics
+        );
+        assert_eq!(interface_output.files.len(), 1);
+        assert_eq!(interface_output.files[0].text, "\"use strict\";\n");
+        assert_eq!(
+            interface_program
+                .diagnostics()
+                .iter()
+                .filter_map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [2427]
+        );
+    }
+
+    #[test]
     fn binds_files_and_reports_duplicate_block_declarations() {
         let fs = MemoryFileSystem::new(true);
         fs.write_file("/duplicate.ts", "let value = 1; let value = 2;")
@@ -1471,6 +1519,81 @@ mod tests {
                 .diagnostics()
                 .iter()
                 .any(|diagnostic| diagnostic.code == Some(2304))
+        );
+    }
+
+    #[test]
+    fn resolves_nested_ambient_namespace_members_across_files() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/functions.d.ts",
+            r"
+                declare namespace A {
+                    namespace AA {
+                        function func(): number;
+                    }
+                }
+            ",
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/values.d.ts",
+            "declare namespace A { namespace AA { const value: string; } }",
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/main.ts",
+            "const count: number = A.AA.func(); const text: string = A.AA.value;",
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &[
+                "main.ts".to_owned(),
+                "functions.d.ts".to_owned(),
+                "values.d.ts".to_owned(),
+            ],
+            CompilerOptions {
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        assert!(
+            program.diagnostics().is_empty(),
+            "{:?}",
+            program.diagnostics()
+        );
+    }
+
+    #[test]
+    fn resolves_exported_namespaces_through_namespace_imports() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/library.ts",
+            "export namespace Tools { export function value(): number { return 1; } }",
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/main.ts",
+            "import * as Library from './library'; const value: number = Library.Tools.value();",
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["main.ts".to_owned()],
+            CompilerOptions {
+                module: ModuleKind::EsNext,
+                target: ScriptTarget::Es2015,
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        assert!(
+            program.diagnostics().is_empty(),
+            "{:?}",
+            program.diagnostics()
         );
     }
 

@@ -238,6 +238,7 @@ struct Binder<'a> {
     arena: &'a NodeArena,
     result: BindResult,
     children: HashMap<NodeId, Vec<NodeId>>,
+    implicit_export_depth: usize,
 }
 
 impl<'a> Binder<'a> {
@@ -252,6 +253,7 @@ impl<'a> Binder<'a> {
             arena,
             result: BindResult::default(),
             children,
+            implicit_export_depth: 0,
         }
     }
 
@@ -413,6 +415,8 @@ impl<'a> Binder<'a> {
                 }
             }
             NodeData::ModuleDeclaration(data) => {
+                let ambient = self.implicit_export_depth > 0
+                    || self.has_modifier(node_id, SyntaxKind::DeclareKeyword);
                 let symbol = self.declare_and_export(
                     scope,
                     node_id,
@@ -423,7 +427,13 @@ impl<'a> Binder<'a> {
                 let module_scope = self.create_scope(ScopeKind::Module, node_id, Some(scope));
                 self.result.node_scopes.insert(node_id, module_scope);
                 if let Some(body) = data.body {
+                    if ambient {
+                        self.implicit_export_depth += 1;
+                    }
                     self.bind_node(body, module_scope, node_id, symbol);
+                    if ambient {
+                        self.implicit_export_depth -= 1;
+                    }
                 }
             }
             NodeData::EnumMember(data) => {
@@ -437,7 +447,7 @@ impl<'a> Binder<'a> {
             }
             NodeData::VariableStatement(data) => {
                 self.bind_variable_list(data.declaration_list, scope, container, parent_symbol);
-                if self.has_modifier(node_id, SyntaxKind::ExportKeyword) {
+                if self.should_export(node_id, parent_symbol) {
                     self.export_variable_list(data.declaration_list, parent_symbol);
                 }
             }
@@ -965,7 +975,7 @@ impl<'a> Binder<'a> {
         parent_symbol: Option<SymbolId>,
     ) -> Option<SymbolId> {
         let id = self.declare_named(scope, declaration, name_node, flags, parent_symbol)?;
-        if self.has_modifier(declaration, SyntaxKind::ExportKeyword) {
+        if self.should_export(declaration, parent_symbol) {
             let export_name = if self.has_modifier(declaration, SyntaxKind::DefaultKeyword) {
                 "default".to_owned()
             } else {
@@ -1109,6 +1119,23 @@ impl<'a> Binder<'a> {
         })
     }
 
+    fn should_export(&self, declaration: NodeId, parent_symbol: Option<SymbolId>) -> bool {
+        self.has_modifier(declaration, SyntaxKind::ExportKeyword)
+            || (parent_symbol.is_some()
+                && self.implicit_export_depth > 0
+                && self
+                    .result
+                    .containers
+                    .get(&declaration)
+                    .and_then(|container| self.arena.get(*container))
+                    .is_some_and(|container| {
+                        matches!(
+                            container.data,
+                            NodeData::ModuleBlock(_) | NodeData::ModuleDeclaration(_)
+                        )
+                    }))
+    }
+
     fn bind_children(
         &mut self,
         node_id: NodeId,
@@ -1165,12 +1192,22 @@ impl<'a> Binder<'a> {
 }
 
 fn can_merge(existing: SymbolFlags, new: SymbolFlags) -> bool {
-    (existing == SymbolFlags::FUNCTION_SCOPED_VARIABLE
+    (existing.contains(SymbolFlags::FUNCTION_SCOPED_VARIABLE)
         && new == SymbolFlags::FUNCTION_SCOPED_VARIABLE)
-        || (existing == SymbolFlags::FUNCTION && new == SymbolFlags::FUNCTION)
-        || (existing == SymbolFlags::INTERFACE && new == SymbolFlags::INTERFACE)
-        || (existing == SymbolFlags::REGULAR_ENUM && new == SymbolFlags::REGULAR_ENUM)
-        || (existing == SymbolFlags::NAMESPACE_MODULE && new == SymbolFlags::NAMESPACE_MODULE)
+        || (existing.contains(SymbolFlags::FUNCTION) && new == SymbolFlags::FUNCTION)
+        || (existing.contains(SymbolFlags::INTERFACE) && new == SymbolFlags::INTERFACE)
+        || (existing.contains(SymbolFlags::REGULAR_ENUM) && new == SymbolFlags::REGULAR_ENUM)
+        || (existing.contains(SymbolFlags::NAMESPACE_MODULE)
+            && new == SymbolFlags::NAMESPACE_MODULE)
+        || (new == SymbolFlags::NAMESPACE_MODULE
+            && existing.intersects(
+                SymbolFlags::FUNCTION
+                    | SymbolFlags::CLASS
+                    | SymbolFlags::ENUM
+                    | SymbolFlags::NAMESPACE_MODULE,
+            ))
+        || (existing.contains(SymbolFlags::NAMESPACE_MODULE)
+            && new.intersects(SymbolFlags::FUNCTION | SymbolFlags::CLASS | SymbolFlags::ENUM))
         || (existing == SymbolFlags::GET_ACCESSOR && new == SymbolFlags::SET_ACCESSOR)
         || (existing == SymbolFlags::SET_ACCESSOR && new == SymbolFlags::GET_ACCESSOR)
         || (new == SymbolFlags::CLASS
@@ -1727,6 +1764,78 @@ mod tests {
                 .iter()
                 .any(|scope| scope.kind == ScopeKind::Module)
         );
+    }
+
+    #[test]
+    fn binds_namespace_exports_and_ambient_export_contexts() {
+        let parsed = parse_source_file(
+            r"
+                namespace Ordinary {
+                    const hidden = 0;
+                    function hiddenFunction() {}
+                    export const visible = 1;
+                    export function visibleFunction() {}
+                }
+                declare namespace Ambient {
+                    namespace Nested {
+                        function func(): number;
+                        const value: string;
+                    }
+                }
+            ",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let result = bind_source_file(&parsed.arena, parsed.source_file);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let root = result.root_scope().unwrap();
+
+        let ordinary = result
+            .symbols
+            .get(root.symbols.get("Ordinary").unwrap())
+            .unwrap();
+        assert!(ordinary.members.get("visible").is_some());
+        assert!(ordinary.members.get("visibleFunction").is_some());
+        assert!(ordinary.members.get("hidden").is_none());
+        assert!(ordinary.members.get("hiddenFunction").is_none());
+
+        let ambient = result
+            .symbols
+            .get(root.symbols.get("Ambient").unwrap())
+            .unwrap();
+        let nested = result
+            .symbols
+            .get(ambient.members.get("Nested").unwrap())
+            .unwrap();
+        assert!(nested.members.get("func").is_some());
+        assert!(nested.members.get("value").is_some());
+    }
+
+    #[test]
+    fn merges_functions_classes_and_enums_with_namespaces() {
+        let parsed = parse_source_file(
+            r#"
+                function Factory() {}
+                namespace Factory { export const version = 1; }
+                class Model {}
+                namespace Model { export const kind = "model"; }
+                enum Color { Red }
+                namespace Color { export const label = "red"; }
+            "#,
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let result = bind_source_file(&parsed.arena, parsed.source_file);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let root = result.root_scope().unwrap();
+        for (name, declaration_flag, member) in [
+            ("Factory", SymbolFlags::FUNCTION, "version"),
+            ("Model", SymbolFlags::CLASS, "kind"),
+            ("Color", SymbolFlags::REGULAR_ENUM, "label"),
+        ] {
+            let symbol = result.symbols.get(root.symbols.get(name).unwrap()).unwrap();
+            assert!(symbol.flags.contains(declaration_flag));
+            assert!(symbol.flags.contains(SymbolFlags::NAMESPACE_MODULE));
+            assert!(symbol.members.get(member).is_some());
+        }
     }
 
     #[test]
