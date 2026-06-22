@@ -93,6 +93,7 @@ pub struct CompilerOptions {
     pub module_detection: ModuleDetectionKind,
     pub no_check: bool,
     pub no_emit: bool,
+    pub no_emit_on_error: bool,
     pub no_implicit_any: bool,
     pub no_lib: bool,
     pub no_unused_locals: bool,
@@ -137,6 +138,7 @@ impl Default for CompilerOptions {
             module_detection: ModuleDetectionKind::Auto,
             no_check: false,
             no_emit: false,
+            no_emit_on_error: false,
             no_implicit_any: false,
             no_lib: false,
             no_unused_locals: false,
@@ -233,6 +235,7 @@ impl CompilerOptions {
                 "moduleresolution" => self.module_resolution = overrides.module_resolution,
                 "nocheck" => self.no_check = overrides.no_check,
                 "noemit" => self.no_emit = overrides.no_emit,
+                "noemitonerror" => self.no_emit_on_error = overrides.no_emit_on_error,
                 "noimplicitany" => self.no_implicit_any = overrides.no_implicit_any,
                 "nolib" => self.no_lib = overrides.no_lib,
                 "nounusedlocals" => self.no_unused_locals = overrides.no_unused_locals,
@@ -388,6 +391,9 @@ pub fn parse_compiler_options_map(options: &BTreeMap<String, JsonValue>) -> Pars
             }
             "nocheck" => parsed.no_check = boolean(original_name, value, &mut diagnostics),
             "noemit" => parsed.no_emit = boolean(original_name, value, &mut diagnostics),
+            "noemitonerror" => {
+                parsed.no_emit_on_error = boolean(original_name, value, &mut diagnostics);
+            }
             "noimplicitany" => {
                 parsed.no_implicit_any = boolean(original_name, value, &mut diagnostics);
             }
@@ -464,6 +470,7 @@ struct PartialOptions {
     module_detection: Option<ModuleDetectionKind>,
     no_check: Option<bool>,
     no_emit: Option<bool>,
+    no_emit_on_error: Option<bool>,
     no_implicit_any: Option<bool>,
     no_lib: Option<bool>,
     no_unused_locals: Option<bool>,
@@ -522,6 +529,7 @@ impl PartialOptions {
             module_detection: self.module_detection.unwrap_or_default(),
             no_check: self.no_check.unwrap_or(false),
             no_emit: self.no_emit.unwrap_or(false),
+            no_emit_on_error: self.no_emit_on_error.unwrap_or(false),
             no_implicit_any: self.no_implicit_any.unwrap_or(strict),
             no_lib: self.no_lib.unwrap_or(false),
             no_unused_locals: self.no_unused_locals.unwrap_or(false),
@@ -849,12 +857,14 @@ mod tests {
             ("emitDeclarationOnly", JsonValue::Bool(true)),
             ("incremental", JsonValue::Bool(true)),
             ("noCheck", JsonValue::Bool(true)),
+            ("noEmitOnError", JsonValue::Bool(true)),
         ]));
         assert!(result.options.allow_js);
         assert!(result.options.declaration);
         assert!(result.options.composite);
         assert!(result.options.incremental);
         assert!(result.options.no_check);
+        assert!(result.options.no_emit_on_error);
         let settings = result.options.printer_settings();
         assert!(!settings.emit_javascript);
         assert!(settings.emit_declarations);

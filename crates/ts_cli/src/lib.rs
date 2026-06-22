@@ -175,6 +175,7 @@ fn compiler_boolean_name(argument: &str) -> Option<&'static str> {
         "--isolatedmodules" => "isolatedmodules",
         "--nocheck" => "nocheck",
         "--noemit" => "noemit",
+        "--noemitonerror" => "noemitonerror",
         "--noimplicitany" => "noimplicitany",
         "--nolib" => "nolib",
         "--nounusedlocals" => "nounusedlocals",
@@ -349,6 +350,7 @@ mod tests {
         let Command::Compile(options) = parse(&[
             "--NOCHECK",
             "--noEmit",
+            "--noEmitOnError",
             "--noLib",
             "--ignoreConfig",
             "source.ts",
@@ -358,6 +360,7 @@ mod tests {
         };
         assert!(options.no_check);
         assert!(options.no_emit);
+        assert!(options.compiler_options.no_emit_on_error);
         assert!(options.no_lib);
         assert!(options.ignore_config);
         assert_eq!(options.files, ["source.ts"]);

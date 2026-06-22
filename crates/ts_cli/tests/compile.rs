@@ -65,6 +65,26 @@ fn direct_file_no_emit_matches_oracle() {
 }
 
 #[test]
+fn no_emit_on_error_skips_output_and_uses_status_one() {
+    let directory = TestDirectory::new("no-emit-on-error");
+    fs::write(directory.0.join("main.ts"), "const answer: string = 42;\n").unwrap();
+    let output = run(
+        env!("CARGO_BIN_EXE_tsgo"),
+        &directory.0,
+        &[
+            "main.ts",
+            "--ignoreConfig",
+            "--noEmitOnError",
+            "--noLib",
+            "--pretty",
+            "false",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert!(!directory.0.join("main.js").exists());
+}
+
+#[test]
 fn project_no_emit_matches_oracle() {
     let directory = TestDirectory::new("project");
     fs::write(directory.0.join("main.ts"), "export const answer = 42;\n").unwrap();

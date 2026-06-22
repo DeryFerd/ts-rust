@@ -325,6 +325,9 @@ impl Program {
     #[allow(clippy::too_many_lines)]
     pub fn emit(&self) -> EmitOutput {
         let mut output = EmitOutput::default();
+        if self.options.no_emit_on_error && !self.diagnostics.is_empty() {
+            return output;
+        }
         let settings = self.options.printer_settings();
         if !settings.emit_javascript && !settings.emit_declarations {
             return output;
@@ -435,6 +438,9 @@ impl Program {
                         .push(emit_diagnostic(source_file, &error)),
                 }
             }
+        }
+        if self.options.no_emit_on_error && !output.diagnostics.is_empty() {
+            output.files.clear();
         }
         output
     }
@@ -1140,6 +1146,41 @@ mod tests {
     }
 
     #[test]
+    fn no_emit_on_error_suppresses_all_outputs() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/type-error.ts", "const value: string = 1;")
+            .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/",
+            &["type-error.ts".to_owned()],
+            CompilerOptions {
+                no_emit_on_error: true,
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        assert!(
+            program
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code == Some(2322))
+        );
+        assert!(program.emit().files.is_empty());
+
+        let ordinary = Program::new_with_options(
+            &fs,
+            "/",
+            &["type-error.ts".to_owned()],
+            CompilerOptions {
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        assert_eq!(ordinary.emit().files.len(), 1);
+    }
+
+    #[test]
     fn config_options_control_emit_and_resolution() {
         let fs = MemoryFileSystem::new(true);
         fs.write_file(
@@ -1651,6 +1692,43 @@ mod tests {
             skipped.diagnostics().is_empty(),
             "{:?}",
             skipped.diagnostics()
+        );
+    }
+
+    #[test]
+    fn checks_structural_shapes_and_generic_argument_inference() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/tsconfig.json",
+            r#"{
+                "files": ["main.ts"],
+                "compilerOptions": { "noLib": true, "strict": true }
+            }"#,
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/main.ts",
+            r#"
+                interface Base { readonly id: number; note?: string; }
+                interface Entry extends Base { value: string; }
+                const good: Entry = { id: 1, value: "ok" };
+                const missing: Entry = { id: 1 };
+                const excess: Entry = { id: 1, value: "ok", other: true };
+                good.id = 2;
+                function unwrap<T>(box: { value: T }): T { return box.value; }
+                const inferred: number = unwrap({ value: 1 });
+                const wrong: string = unwrap({ value: 1 });
+            "#,
+        )
+        .unwrap();
+        let program = Program::from_config(&fs, "/project/tsconfig.json");
+        assert_eq!(
+            program
+                .diagnostics()
+                .iter()
+                .filter_map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [2322, 2353, 2540, 2322]
         );
     }
 }
