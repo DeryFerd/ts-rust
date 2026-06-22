@@ -330,6 +330,7 @@ pub struct CheckResult {
     pub symbol_types: HashMap<SymbolId, TypeId>,
     pub node_types: BTreeMap<NodeId, TypeId>,
     pub enum_member_values: BTreeMap<NodeId, EnumConstantValue>,
+    pub enum_access_values: BTreeMap<NodeId, EnumConstantValue>,
     pub diagnostics: Vec<CheckDiagnostic>,
 }
 
@@ -405,6 +406,7 @@ pub fn empty_check_result() -> CheckResult {
         symbol_types: HashMap::new(),
         node_types: BTreeMap::new(),
         enum_member_values: BTreeMap::new(),
+        enum_access_values: BTreeMap::new(),
         diagnostics: Vec::new(),
     }
 }
@@ -445,6 +447,7 @@ enum TypeDescriptor {
     NumberLiteral(String),
     StringLiteral(String),
     BigIntLiteral(String),
+    ConstEnum(Box<Self>),
     TypeParameter(String),
     Alias {
         parameters: Vec<String>,
@@ -802,9 +805,19 @@ impl<'a> ProgramChecker<'a> {
                 return Some(describe_type(&result.types, type_id));
             }
         }
-        result
+        let descriptor = result
             .type_of_symbol(target)
-            .map(|type_id| describe_type(&result.types, type_id))
+            .map(|type_id| describe_type(&result.types, type_id))?;
+        Some(
+            if target_symbol
+                .flags
+                .contains(ts_binder::SymbolFlags::CONST_ENUM)
+            {
+                TypeDescriptor::ConstEnum(Box::new(descriptor))
+            } else {
+                descriptor
+            },
+        )
     }
 }
 
@@ -851,6 +864,7 @@ impl<'a> Checker<'a> {
                 symbol_types: HashMap::new(),
                 node_types: BTreeMap::new(),
                 enum_member_values: BTreeMap::new(),
+                enum_access_values: BTreeMap::new(),
                 diagnostics: Vec::new(),
             },
             children,
@@ -990,6 +1004,7 @@ impl<'a> Checker<'a> {
             );
         }
         self.seed_namespace_types();
+        self.seed_import_equals_types();
     }
 
     fn seed_namespace_types(&mut self) {
@@ -1035,6 +1050,42 @@ impl<'a> Checker<'a> {
                 self.result.types.intersection([existing, namespace_type])
             };
             self.result.symbol_types.insert(symbol_id, combined);
+        }
+    }
+
+    fn seed_import_equals_types(&mut self) {
+        let aliases = self
+            .bindings
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.flags.contains(ts_binder::SymbolFlags::ALIAS))
+            .filter_map(|symbol| {
+                symbol.declarations.iter().find_map(|declaration| {
+                    let NodeData::ImportEqualsDeclaration(import) =
+                        &self.arena.get(*declaration)?.data
+                    else {
+                        return None;
+                    };
+                    Some((symbol.id, import.module_reference))
+                })
+            })
+            .collect::<Vec<_>>();
+        for (symbol, reference) in aliases {
+            if let Some(type_id) = self.entity_name_type(reference) {
+                self.result.symbol_types.insert(symbol, type_id);
+            }
+        }
+    }
+
+    fn entity_name_type(&mut self, node: NodeId) -> Option<TypeId> {
+        match self.arena.get(node)?.data.clone() {
+            NodeData::Identifier(identifier) => Some(self.identifier_type(node, &identifier.text)),
+            NodeData::QualifiedName(name) => {
+                let receiver = self.entity_name_type(name.left)?;
+                let property = self.property_name(name.right)?;
+                self.lookup_property_type(receiver, &property)
+            }
+            _ => None,
         }
     }
 
@@ -1190,6 +1241,28 @@ impl<'a> Checker<'a> {
             _ => return,
         };
         self.result.enum_member_values.insert(member, value);
+    }
+
+    fn record_const_enum_access(&mut self, node: NodeId, receiver: TypeId, value: TypeId) {
+        if !self.const_enum_types.contains(&receiver) {
+            return;
+        }
+        let constant = match &self
+            .result
+            .types
+            .get(value)
+            .expect("expression type originates from arena")
+            .kind
+        {
+            TypeKind::NumberLiteral(value) => {
+                value.parse::<f64>().ok().map(EnumConstantValue::Number)
+            }
+            TypeKind::StringLiteral(value) => Some(EnumConstantValue::String(value.clone())),
+            _ => None,
+        };
+        if let Some(constant) = constant {
+            self.result.enum_access_values.insert(node, constant);
+        }
     }
 
     #[allow(clippy::too_many_lines)]
@@ -2760,7 +2833,9 @@ impl<'a> Checker<'a> {
                     return self.result.types.any();
                 }
                 let name = self.property_name(data.name).unwrap_or_default();
-                self.property_access_type(node_id, receiver, &name)
+                let value = self.property_access_type(node_id, receiver, &name);
+                self.record_const_enum_access(node_id, receiver, value);
+                value
             }
             NodeData::ElementAccessExpression(data) => {
                 let receiver = self.type_of_expression(data.expression);
@@ -2777,7 +2852,9 @@ impl<'a> Checker<'a> {
                     return self.result.types.any();
                 }
                 let index = self.type_of_expression(data.argument_expression);
-                self.element_access_type(node_id, receiver, index)
+                let value = self.element_access_type(node_id, receiver, index);
+                self.record_const_enum_access(node_id, receiver, value);
+                value
             }
             NodeData::CallExpression(data) => {
                 let getter_call = self.property_access_is_getter(data.expression);
@@ -4596,6 +4673,11 @@ impl<'a> Checker<'a> {
                 .result
                 .types
                 .alloc(TypeKind::BigIntLiteral(value.clone())),
+            TypeDescriptor::ConstEnum(enum_type) => {
+                let type_id = self.import_type(enum_type);
+                self.const_enum_types.insert(type_id);
+                type_id
+            }
             TypeDescriptor::Alias { .. } => self.import_alias(descriptor, &[]),
             TypeDescriptor::Array(element) => {
                 let element = self.import_type(element);
@@ -5203,6 +5285,9 @@ fn substitute_descriptor(
             .get(name)
             .cloned()
             .unwrap_or_else(|| descriptor.clone()),
+        TypeDescriptor::ConstEnum(enum_type) => {
+            TypeDescriptor::ConstEnum(Box::new(substitute_descriptor(enum_type, substitutions)))
+        }
         TypeDescriptor::Array(element) => {
             TypeDescriptor::Array(Box::new(substitute_descriptor(element, substitutions)))
         }
@@ -5521,8 +5606,8 @@ mod tests {
     use ts_parser::parse_source_file;
 
     use super::{
-        Checker, CheckerOptions, EnumConstantValue, ObjectType, TypeKind, check_source_file,
-        check_source_file_with_options,
+        Checker, CheckerOptions, EnumConstantValue, ObjectType, ProgramSource, TypeKind,
+        check_program, check_source_file, check_source_file_with_options,
     };
 
     struct Builder {
@@ -6231,6 +6316,121 @@ mod tests {
                 EnumConstantValue::Number(-14.0),
                 EnumConstantValue::Number(5.0),
                 EnumConstantValue::String("ok".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn publishes_const_enum_access_values_for_local_forms_and_aliases() {
+        let parsed = parse_source_file(
+            r#"
+                const enum E { A = 3, Text = "text" }
+                namespace N { export const enum Inner { B = 4 } }
+                import Alias = N.Inner;
+                const dot = E.A;
+                const bracket = E["A"];
+                const template = E[`A`];
+                const nested = N.Inner.B;
+                const alias = Alias.B;
+                const text = E.Text;
+            "#,
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert_eq!(result.enum_access_values.len(), 6);
+        assert_eq!(
+            result
+                .enum_access_values
+                .values()
+                .filter(|value| **value == EnumConstantValue::Number(3.0))
+                .count(),
+            3
+        );
+        assert_eq!(
+            result
+                .enum_access_values
+                .values()
+                .filter(|value| **value == EnumConstantValue::Number(4.0))
+                .count(),
+            2
+        );
+        assert!(
+            result
+                .enum_access_values
+                .values()
+                .any(|value| value == &EnumConstantValue::String("text".into()))
+        );
+        assert!(result.enum_access_values.keys().all(|node| matches!(
+            parsed.arena.get(*node).map(|node| &node.data),
+            Some(NodeData::PropertyAccessExpression(_) | NodeData::ElementAccessExpression(_))
+        )));
+    }
+
+    #[test]
+    fn publishes_const_enum_access_values_across_imports() {
+        let dependency = parse_source_file(r#"export const enum E { A = 7, Text = "imported" }"#);
+        let consumer = parse_source_file(
+            r#"
+                import { E } from "./dependency";
+                import * as ns from "./dependency";
+                const direct = E.A;
+                const text = E["Text"];
+                const namespaced = ns.E.A;
+            "#,
+        );
+        assert!(
+            dependency.diagnostics.is_empty(),
+            "{:?}",
+            dependency.diagnostics
+        );
+        assert!(
+            consumer.diagnostics.is_empty(),
+            "{:?}",
+            consumer.diagnostics
+        );
+        let dependency_bindings = bind_source_file(&dependency.arena, dependency.source_file);
+        let consumer_bindings = bind_source_file(&consumer.arena, consumer.source_file);
+        let dependency_modules = BTreeMap::new();
+        let consumer_modules = BTreeMap::from([("./dependency".into(), 0)]);
+        let checked = check_program(&[
+            ProgramSource {
+                arena: &dependency.arena,
+                source_file: dependency.source_file,
+                bindings: &dependency_bindings,
+                resolved_modules: &dependency_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+            ProgramSource {
+                arena: &consumer.arena,
+                source_file: consumer.source_file,
+                bindings: &consumer_bindings,
+                resolved_modules: &consumer_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+        ]);
+
+        assert!(
+            checked.files[1].diagnostics.is_empty(),
+            "{:?}",
+            checked.files[1].diagnostics
+        );
+        assert_eq!(
+            checked.files[1]
+                .enum_access_values
+                .values()
+                .cloned()
+                .collect::<Vec<_>>(),
+            [
+                EnumConstantValue::Number(7.0),
+                EnumConstantValue::String("imported".into()),
+                EnumConstantValue::Number(7.0),
             ]
         );
     }
