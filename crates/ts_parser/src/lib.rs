@@ -2966,7 +2966,9 @@ impl<'a> Parser<'a> {
             let default_modifier = self.consume_token_node();
             if matches!(
                 self.current.kind,
-                SyntaxKind::FunctionKeyword | SyntaxKind::ClassKeyword
+                SyntaxKind::FunctionKeyword
+                    | SyntaxKind::ClassKeyword
+                    | SyntaxKind::InterfaceKeyword
             ) {
                 let declaration = self.parse_statement();
                 self.attach_modifiers(declaration, vec![export_modifier, default_modifier], start);
@@ -6425,6 +6427,36 @@ mod tests {
                 .unwrap()
                 .parent,
             Some(source_statements(&result)[0])
+        );
+    }
+
+    #[test]
+    fn parses_default_exported_interfaces_as_declarations() {
+        let result = parse_source_file("export default interface Shape { value: string; }");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let statements = source_statements(&result);
+        assert_eq!(statements.len(), 1);
+        let NodeData::InterfaceDeclaration(interface) =
+            &result.arena.get(statements[0]).unwrap().data
+        else {
+            panic!("expected interface declaration");
+        };
+        let NodeData::Identifier(name) = &result.arena.get(interface.name).unwrap().data else {
+            panic!("expected interface name");
+        };
+        assert_eq!(name.text, "Shape");
+        let modifier_kinds = interface
+            .modifiers
+            .as_ref()
+            .unwrap()
+            .list
+            .nodes
+            .iter()
+            .map(|modifier| result.arena.get(*modifier).unwrap().kind)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            modifier_kinds,
+            [SyntaxKind::ExportKeyword, SyntaxKind::DefaultKeyword]
         );
     }
 

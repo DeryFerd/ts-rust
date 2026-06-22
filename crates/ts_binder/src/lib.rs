@@ -1251,6 +1251,16 @@ impl<'a> Binder<'a> {
 }
 
 fn can_merge(existing: SymbolFlags, new: SymbolFlags) -> bool {
+    let existing_has_alias = existing.contains(SymbolFlags::ALIAS);
+    let new_has_alias = new.contains(SymbolFlags::ALIAS);
+    if new_has_alias {
+        return !existing_has_alias;
+    }
+    if existing_has_alias {
+        let existing_without_alias = SymbolFlags(existing.0 & !SymbolFlags::ALIAS.0);
+        return existing_without_alias == SymbolFlags::NONE
+            || can_merge(existing_without_alias, new);
+    }
     (existing.contains(SymbolFlags::FUNCTION_SCOPED_VARIABLE)
         && new == SymbolFlags::FUNCTION_SCOPED_VARIABLE)
         || (existing.contains(SymbolFlags::FUNCTION) && new == SymbolFlags::FUNCTION)
@@ -1745,6 +1755,49 @@ mod tests {
                 .flags
                 .contains(SymbolFlags::TYPE_PARAMETER)
         );
+    }
+
+    #[test]
+    fn merges_import_aliases_with_type_declarations_in_either_order() {
+        for source in [
+            r#"export default interface Shape {} import Shape from "pkg";"#,
+            r#"interface Shape {} import Shape from "pkg";"#,
+            r#"import Shape from "pkg"; interface Shape {}"#,
+            r#"type Shape = {}; import Shape from "pkg";"#,
+            r#"import Shape from "pkg"; type Shape = {};"#,
+        ] {
+            let parsed = parse_source_file(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let result = bind_source_file(&parsed.arena, parsed.source_file);
+            assert!(
+                result.diagnostics.is_empty(),
+                "{source}: {:?}",
+                result.diagnostics
+            );
+            let root = result.root_scope().unwrap();
+            let symbol_id = root.symbols.get("Shape").unwrap();
+            let symbol = result.symbols.get(symbol_id).unwrap();
+            assert!(symbol.flags.contains(SymbolFlags::ALIAS), "{source}");
+            assert!(
+                symbol
+                    .flags
+                    .intersects(SymbolFlags::INTERFACE | SymbolFlags::TYPE_ALIAS),
+                "{source}"
+            );
+            assert_eq!(symbol.declarations.len(), 2, "{source}");
+            if source.starts_with("export default") {
+                assert_eq!(result.exports.get("default"), Some(symbol_id));
+            }
+        }
+    }
+
+    #[test]
+    fn does_not_merge_two_import_aliases() {
+        let parsed = parse_source_file(r#"import Shape from "first"; import Shape from "second";"#);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let result = bind_source_file(&parsed.arena, parsed.source_file);
+        assert_eq!(result.diagnostics.len(), 1);
+        assert_eq!(result.diagnostics[0].diagnostic.code(), 2300);
     }
 
     #[test]
