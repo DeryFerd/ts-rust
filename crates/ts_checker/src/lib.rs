@@ -2221,9 +2221,14 @@ impl<'a> Checker<'a> {
                 {
                     self.error(node_id, 2540, [name]);
                     if !self.is_assignable(right, assignment_target) {
-                        self.assignability_error(node_id, right, assignment_target);
+                        self.assignment_target_error(data.left, right, assignment_target);
                     }
                     right
+                } else if operator == SyntaxKind::EqualsToken
+                    && !self.is_assignable(right, assignment_target)
+                {
+                    self.assignment_target_error(data.left, right, assignment_target);
+                    assignment_target
                 } else {
                     self.check_binary(node_id, operator, assignment_target, right)
                 }
@@ -2391,7 +2396,7 @@ impl<'a> Checker<'a> {
             return;
         }
         if self.options.exact_optional_property_types {
-            if self.delete_target_is_optional(expression) != Some(true) {
+            if self.property_target_is_optional(expression) != Some(true) {
                 self.error(expression, 2790, std::iter::empty());
             }
         } else if !self.type_includes_undefined(operand) {
@@ -2406,7 +2411,7 @@ impl<'a> Checker<'a> {
         )
     }
 
-    fn delete_target_is_optional(&mut self, expression: NodeId) -> Option<bool> {
+    fn property_target_is_optional(&mut self, expression: NodeId) -> Option<bool> {
         match self.arena.get(expression).map(|node| node.data.clone())? {
             NodeData::PropertyAccessExpression(access) => {
                 let receiver = self.type_of_expression(access.expression);
@@ -2446,6 +2451,25 @@ impl<'a> Checker<'a> {
                 ..
             } => self.property_is_optional(*constraint, name),
             _ => None,
+        }
+    }
+
+    fn assignment_target_error(&mut self, left: NodeId, actual: TypeId, expected: TypeId) {
+        let exact_optional_mismatch = self.options.exact_optional_property_types
+            && self.type_includes_undefined(actual)
+            && !self.type_includes_undefined(expected)
+            && self.property_target_is_optional(left) == Some(true);
+        if exact_optional_mismatch {
+            self.error(
+                left,
+                2412,
+                [
+                    self.result.types.display(actual),
+                    self.result.types.display(expected),
+                ],
+            );
+        } else {
+            self.assignability_error(left, actual, expected);
         }
     }
 
@@ -4292,9 +4316,14 @@ impl<'a> Checker<'a> {
     }
 
     fn assignability_error(&mut self, node: NodeId, actual: TypeId, expected: TypeId) {
+        let code = if self.exact_optional_property_mismatch(actual, expected) {
+            2375
+        } else {
+            2322
+        };
         self.error(
             node,
-            2322,
+            code,
             [
                 self.result.types.display(actual),
                 self.result.types.display(expected),
@@ -6015,6 +6044,7 @@ mod tests {
                 options["text"] = undefined;
                 options.explicit = undefined;
                 options["explicit"] = undefined;
+                options.explicit = true;
             "#,
         );
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
@@ -6034,7 +6064,61 @@ mod tests {
                 .iter()
                 .map(|diagnostic| diagnostic.diagnostic.code())
                 .collect::<Vec<_>>(),
-            [2379, 2322, 2322],
+            [2379, 2412, 2412, 2322],
+            "{:?}",
+            exact
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.render().unwrap())
+                .collect::<Vec<_>>()
+        );
+
+        let legacy = check_source_file_with_options(
+            &parsed.arena,
+            parsed.source_file,
+            &bindings,
+            CheckerOptions::default(),
+        );
+        assert_eq!(
+            legacy
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2322]
+        );
+    }
+
+    #[test]
+    fn reports_exact_optional_structural_assignment_diagnostics() {
+        let parsed = parse_source_file(
+            r"
+                type Options = { text?: string };
+                const initialized: Options = { text: undefined };
+                let assigned: Options = {};
+                assigned = { text: undefined };
+                function take(value: Options): void {}
+                take({ text: undefined });
+            ",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let exact = check_source_file_with_options(
+            &parsed.arena,
+            parsed.source_file,
+            &bindings,
+            CheckerOptions {
+                exact_optional_property_types: true,
+                ..CheckerOptions::default()
+            },
+        );
+        assert_eq!(
+            exact
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2375, 2375, 2379],
             "{:?}",
             exact
                 .diagnostics

@@ -2071,6 +2071,63 @@ mod tests {
     }
 
     #[test]
+    fn reports_contextual_exact_optional_diagnostic_codes() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/main.ts",
+            r"
+                interface Options { text?: string; }
+                declare let options: Options;
+                options.text = undefined;
+                const initialized: Options = { text: undefined };
+                declare function take(value: Options): void;
+                take({ text: undefined });
+            ",
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/tsconfig.json",
+            r#"{
+                "files": ["main.ts"],
+                "compilerOptions": {
+                    "noLib": true,
+                    "strictNullChecks": true,
+                    "exactOptionalPropertyTypes": true
+                }
+            }"#,
+        )
+        .unwrap();
+        let exact = Program::from_config(&fs, "/project/tsconfig.json");
+        assert_eq!(
+            exact
+                .diagnostics()
+                .iter()
+                .filter_map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [2412, 2375, 2379]
+        );
+
+        fs.write_file(
+            "/project/tsconfig.json",
+            r#"{
+                "files": ["main.ts"],
+                "compilerOptions": {
+                    "noLib": true,
+                    "strictNullChecks": true,
+                    "exactOptionalPropertyTypes": false
+                }
+            }"#,
+        )
+        .unwrap();
+        let legacy = Program::from_config(&fs, "/project/tsconfig.json");
+        assert!(
+            legacy.diagnostics().is_empty(),
+            "{:?}",
+            legacy.diagnostics()
+        );
+    }
+
+    #[test]
     fn reports_implicit_any_and_unused_bindings() {
         let fs = MemoryFileSystem::new(true);
         fs.write_file(
