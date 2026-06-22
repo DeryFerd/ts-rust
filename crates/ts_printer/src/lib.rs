@@ -223,6 +223,7 @@ pub fn emit_source_file_with_context(
     let NodeData::SourceFile(data) = &node.data else {
         return Err(Printer::unsupported(source_file, node.kind));
     };
+    let source_end = node.range.end.get();
     printer.runtime_identifier_uses = runtime_identifier_uses(arena, source_file);
     if settings.module == ModuleKind::CommonJs {
         printer.commonjs_default_imports =
@@ -331,15 +332,20 @@ pub fn emit_source_file_with_context(
         .first()
         .and_then(|statement| arena.get(*statement))
         .map_or(0, |node| node.range.start.get());
+    let mut previous_emitted = false;
     for statement in &data.statements.nodes {
         if let Some(node) = arena.get(*statement) {
-            if statement_emits_javascript(arena, node) {
-                printer.emit_source_comments_between(previous_end, node.range.start.get());
-            }
+            printer.emit_source_comments_between_with_trailing(
+                previous_end,
+                node.range.start.get(),
+                previous_emitted,
+            );
+            previous_emitted = statement_emits_javascript(arena, node);
             previous_end = node.range.end.get();
         }
         printer.emit_statement(*statement)?;
     }
+    printer.emit_source_comments_between_with_trailing(previous_end, source_end, previous_emitted);
     if settings.module == ModuleKind::CommonJs
         && let Some(expression) = export_equals_expression
     {
@@ -2531,6 +2537,15 @@ impl Printer<'_> {
     }
 
     fn emit_source_comments_between(&mut self, start: u32, end: u32) {
+        self.emit_source_comments_between_with_trailing(start, end, true);
+    }
+
+    fn emit_source_comments_between_with_trailing(
+        &mut self,
+        start: u32,
+        end: u32,
+        preserve_immediate_trailing: bool,
+    ) {
         let start = usize::try_from(start).unwrap_or(usize::MAX);
         let end = usize::try_from(end).unwrap_or(usize::MAX);
         let Some(trivia) = self.source_text.get(start..end) else {
@@ -2544,21 +2559,35 @@ impl Printer<'_> {
                     .iter()
                     .position(|byte| *byte == b'\n' || *byte == b'\r')
                     .map_or(bytes.len(), |offset| index + offset);
-                self.writer.write(&trivia[index..comment_end]);
-                self.writer.newline();
+                let immediate_trailing = !trivia[..index].contains(['\n', '\r']);
+                if !immediate_trailing || preserve_immediate_trailing {
+                    if immediate_trailing {
+                        self.writer.remove_trailing_newline();
+                        self.writer.write(" ");
+                    }
+                    self.writer.write(&trivia[index..comment_end]);
+                    self.writer.newline();
+                }
                 index = comment_end;
             } else if bytes[index..].starts_with(b"/*") {
                 let comment_end = bytes[index + 2..]
                     .windows(2)
                     .position(|window| window == b"*/")
                     .map_or(bytes.len(), |offset| index + 2 + offset + 2);
-                for line in trivia[index..comment_end]
-                    .replace("\r\n", "\n")
-                    .replace('\r', "\n")
-                    .split('\n')
-                {
-                    self.writer.write(line);
-                    self.writer.newline();
+                let immediate_trailing = !trivia[..index].contains(['\n', '\r']);
+                if !immediate_trailing || preserve_immediate_trailing {
+                    if immediate_trailing {
+                        self.writer.remove_trailing_newline();
+                        self.writer.write(" ");
+                    }
+                    for line in trivia[index..comment_end]
+                        .replace("\r\n", "\n")
+                        .replace('\r', "\n")
+                        .split('\n')
+                    {
+                        self.writer.write(line);
+                        self.writer.newline();
+                    }
                 }
                 index = comment_end;
             } else {
@@ -3125,12 +3154,23 @@ impl Printer<'_> {
         self.writer.newline();
         self.writer.indent += 1;
         let mut previous_end = node.range.start.get().saturating_add(1);
+        let mut previous_emitted = false;
         for statement in &data.statements.nodes {
             let statement_node = self.node(*statement)?.clone();
-            self.emit_source_comments_between(previous_end, statement_node.range.start.get());
+            self.emit_source_comments_between_with_trailing(
+                previous_end,
+                statement_node.range.start.get(),
+                previous_emitted,
+            );
             self.emit_statement(*statement)?;
             previous_end = statement_node.range.end.get();
+            previous_emitted = statement_emits_javascript(self.arena, &statement_node);
         }
+        self.emit_source_comments_between_with_trailing(
+            previous_end,
+            node.range.end.get().saturating_sub(1),
+            previous_emitted,
+        );
         self.writer.indent -= 1;
         self.writer.write("}");
         Ok(())
@@ -3287,8 +3327,29 @@ impl Printer<'_> {
         if lower_fields && self.has_instance_field_initializers(data) && !has_constructor {
             self.emit_synthesized_native_constructor(data, has_base)?;
         }
-        for (index, member) in data.members.nodes.iter().enumerate() {
+        let mut previous_end = data.members.range.start.get();
+        let mut previous_emitted = false;
+        for member in &data.members.nodes {
             let node = self.node(*member)?.clone();
+            self.emit_source_comments_between_with_trailing(
+                previous_end,
+                node.range.start.get(),
+                previous_emitted,
+            );
+            if previous_emitted {
+                self.emit_class_empty_elements_between(previous_end, node.range.start.get());
+            }
+            let current_emitted = !self.class_member_is_abstract(&node)
+                && match &node.data {
+                    NodeData::MethodDeclaration(method) => method.body.is_some(),
+                    NodeData::PropertyDeclaration(_) => !lower_fields,
+                    NodeData::GetAccessorDeclaration(accessor) => accessor.body.is_some(),
+                    NodeData::SetAccessorDeclaration(accessor) => accessor.body.is_some(),
+                    NodeData::ClassStaticBlockDeclaration(_) => true,
+                    _ => false,
+                };
+            previous_end = node.range.end.get();
+            previous_emitted = current_emitted;
             if self.class_member_is_abstract(&node) {
                 continue;
             }
@@ -3356,15 +3417,14 @@ impl Printer<'_> {
                 }
                 _ => return Err(Self::unsupported(*member, node.kind)),
             }
-            if Self::class_member_has_body(&node) {
-                let separator_end = data
-                    .members
-                    .nodes
-                    .get(index + 1)
-                    .and_then(|next| self.arena.get(*next))
-                    .map_or(data.members.range.end.get(), |next| next.range.start.get());
-                self.emit_class_empty_elements_between(node.range.end.get(), separator_end);
-            }
+        }
+        self.emit_source_comments_between_with_trailing(
+            previous_end,
+            data.members.range.end.get(),
+            previous_emitted,
+        );
+        if previous_emitted {
+            self.emit_class_empty_elements_between(previous_end, data.members.range.end.get());
         }
         self.writer.indent -= 1;
         self.writer.write("}");
@@ -3404,9 +3464,9 @@ impl Printer<'_> {
         has_base: bool,
     ) -> Result<(), EmitError> {
         let body_id = method.body.expect("constructor body checked");
-        let body = self.node(body_id)?.clone();
-        let NodeData::Block(body) = &body.data else {
-            return Err(Self::unsupported(body_id, body.kind));
+        let body_node = self.node(body_id)?.clone();
+        let NodeData::Block(body) = &body_node.data else {
+            return Err(Self::unsupported(body_id, body_node.kind));
         };
         self.writer.write("constructor");
         self.emit_parameters(&method.parameters)?;
@@ -3427,14 +3487,29 @@ impl Printer<'_> {
             self.emit_parameter_properties(&method.parameters, "this")?;
         }
         let mut emitted_fields = !has_base;
+        let mut previous_end = body_node.range.start.get().saturating_add(1);
+        let mut previous_emitted = false;
         for statement in &body.statements.nodes {
+            let statement_node = self.node(*statement)?.clone();
+            self.emit_source_comments_between_with_trailing(
+                previous_end,
+                statement_node.range.start.get(),
+                previous_emitted,
+            );
             self.emit_statement(*statement)?;
             if has_base && !emitted_fields && self.is_super_call_statement(*statement)? {
                 self.emit_instance_fields(data, "this")?;
                 self.emit_parameter_properties(&method.parameters, "this")?;
                 emitted_fields = true;
             }
+            previous_end = statement_node.range.end.get();
+            previous_emitted = statement_emits_javascript(self.arena, &statement_node);
         }
+        self.emit_source_comments_between_with_trailing(
+            previous_end,
+            body_node.range.end.get().saturating_sub(1),
+            previous_emitted,
+        );
         if !emitted_fields {
             self.emit_instance_fields(data, "this")?;
             self.emit_parameter_properties(&method.parameters, "this")?;
@@ -3572,14 +3647,22 @@ impl Printer<'_> {
             let previous_this_alias = self.this_alias;
             let mut uses_this_alias = false;
             if let Some(body) = constructor.body {
-                let body = self.node(body)?.clone();
-                let NodeData::Block(body) = &body.data else {
+                let body_node = self.node(body)?.clone();
+                let NodeData::Block(body) = &body_node.data else {
                     return Err(Self::unsupported(
                         constructor.body.expect("body"),
-                        body.kind,
+                        body_node.kind,
                     ));
                 };
+                let mut previous_end = body_node.range.start.get().saturating_add(1);
+                let mut previous_emitted = false;
                 for statement in &body.statements.nodes {
+                    let statement_node = self.node(*statement)?.clone();
+                    self.emit_source_comments_between_with_trailing(
+                        previous_end,
+                        statement_node.range.start.get(),
+                        previous_emitted,
+                    );
                     if base.is_some() && self.emit_super_statement(*statement)? {
                         self.this_alias = Some("_this");
                         uses_this_alias = true;
@@ -3590,7 +3673,14 @@ impl Printer<'_> {
                     } else {
                         self.emit_statement(*statement)?;
                     }
+                    previous_end = statement_node.range.end.get();
+                    previous_emitted = statement_emits_javascript(self.arena, &statement_node);
                 }
+                self.emit_source_comments_between_with_trailing(
+                    previous_end,
+                    body_node.range.end.get().saturating_sub(1),
+                    previous_emitted,
+                );
             }
             if !emitted_fields {
                 self.emit_instance_fields(data, "this")?;
@@ -3633,8 +3723,31 @@ impl Printer<'_> {
             self.writer.newline();
         }
 
+        let mut previous_end = data.members.range.start.get();
+        let mut previous_emitted = false;
         for (index, member) in data.members.nodes.iter().enumerate() {
             let node = self.node(*member)?.clone();
+            self.emit_source_comments_between_with_trailing(
+                previous_end,
+                node.range.start.get(),
+                previous_emitted,
+            );
+            if previous_emitted {
+                self.emit_class_empty_elements_between(previous_end, node.range.start.get());
+            }
+            let current_emitted = !self.class_member_is_abstract(&node)
+                && (matches!(
+                    &node.data,
+                    NodeData::MethodDeclaration(method) if method.body.is_some()
+                ) || matches!(
+                    &node.data,
+                    NodeData::GetAccessorDeclaration(accessor) if accessor.body.is_some()
+                ) || matches!(
+                    &node.data,
+                    NodeData::SetAccessorDeclaration(accessor) if accessor.body.is_some()
+                ));
+            previous_end = node.range.end.get();
+            previous_emitted = current_emitted;
             if self.class_member_is_abstract(&node) {
                 // Abstract members have no runtime representation.
             } else {
@@ -3669,15 +3782,14 @@ impl Printer<'_> {
                     _ => {}
                 }
             }
-            if Self::class_member_has_body(&node) {
-                let separator_end = data
-                    .members
-                    .nodes
-                    .get(index + 1)
-                    .and_then(|next| self.arena.get(*next))
-                    .map_or(data.members.range.end.get(), |next| next.range.start.get());
-                self.emit_class_empty_elements_between(node.range.end.get(), separator_end);
-            }
+        }
+        self.emit_source_comments_between_with_trailing(
+            previous_end,
+            data.members.range.end.get(),
+            previous_emitted,
+        );
+        if previous_emitted {
+            self.emit_class_empty_elements_between(previous_end, data.members.range.end.get());
         }
         self.emit_static_fields(data, &name)?;
         self.writer.write("return ");
@@ -4073,17 +4185,23 @@ impl Printer<'_> {
             match &body_node.data {
                 NodeData::ModuleBlock(block) => {
                     let mut previous_end = body_node.range.start.get().saturating_add(1);
+                    let mut previous_emitted = false;
                     for statement in &block.statements.nodes {
                         let statement_node = self.node(*statement)?.clone();
-                        if statement_emits_javascript(self.arena, &statement_node) {
-                            self.emit_source_comments_between(
-                                previous_end,
-                                statement_node.range.start.get(),
-                            );
-                        }
+                        self.emit_source_comments_between_with_trailing(
+                            previous_end,
+                            statement_node.range.start.get(),
+                            previous_emitted,
+                        );
                         self.emit_statement(*statement)?;
                         previous_end = statement_node.range.end.get();
+                        previous_emitted = statement_emits_javascript(self.arena, &statement_node);
                     }
+                    self.emit_source_comments_between_with_trailing(
+                        previous_end,
+                        body_node.range.end.get().saturating_sub(1),
+                        previous_emitted,
+                    );
                 }
                 NodeData::ModuleDeclaration(module) => self.emit_namespace(module)?,
                 _ => return Err(Self::unsupported(body, body_node.kind)),
@@ -4559,16 +4677,6 @@ impl Printer<'_> {
             _ => None,
         };
         self.has_modifier(modifiers, SyntaxKind::AbstractKeyword)
-    }
-
-    fn class_member_has_body(node: &Node) -> bool {
-        match &node.data {
-            NodeData::MethodDeclaration(member) => member.body.is_some(),
-            NodeData::GetAccessorDeclaration(member) => member.body.is_some(),
-            NodeData::SetAccessorDeclaration(member) => member.body.is_some(),
-            NodeData::ClassStaticBlockDeclaration(_) => true,
-            _ => false,
-        }
     }
 
     fn emit_class_empty_elements_between(&mut self, start: u32, end: u32) {
@@ -7258,6 +7366,144 @@ class Board {
         )
         .unwrap();
         assert_eq!(result.code, "\"use strict\";\nclass C {\n}\n");
+    }
+
+    #[test]
+    fn preserves_only_the_implemented_constructor_trailing_comment() {
+        let result = emit_with(
+            concat!(
+                "class C1 {\n",
+                " constructor(public p1: string); // ERROR\n",
+                " constructor(private p2: number); // ERROR\n",
+                " constructor(public p3: any) {} // OK\n",
+                "}",
+            ),
+            ScriptTarget::Es2015,
+            ModuleKind::EsNext,
+        );
+        assert_eq!(
+            result.code,
+            concat!(
+                "class C1 {\n",
+                "    constructor(p3) {\n",
+                "        this.p3 = p3;\n",
+                "    } // OK\n",
+                "}\n",
+            )
+        );
+    }
+
+    #[test]
+    fn keeps_leading_comments_after_erased_overloads() {
+        let result = emit_with(
+            concat!(
+                "class C {\n",
+                " method(value: string): void; // erased overload\n",
+                " // implementation comment\n",
+                " method(value: string) {}\n",
+                "}\n",
+            ),
+            ScriptTarget::Es2015,
+            ModuleKind::EsNext,
+        );
+        assert_eq!(
+            result.code,
+            concat!(
+                "class C {\n",
+                "    // implementation comment\n",
+                "    method(value) { }\n",
+                "}\n",
+            )
+        );
+    }
+
+    #[test]
+    fn preserves_immediate_trailing_statement_comments() {
+        let result = emit_with(
+            concat!(
+                "import moduleA = require(\"./aliasAssignments_moduleA\");\n",
+                "var x = moduleA;\n",
+                "x = 1; // Should be error\n",
+                "var y = 1;\n",
+                "y = moduleA; // should be error\n",
+            ),
+            ScriptTarget::Es2015,
+            ModuleKind::CommonJs,
+        );
+        assert_eq!(
+            result.code,
+            concat!(
+                "\"use strict\";\n",
+                "Object.defineProperty(exports, \"__esModule\", { value: true });\n",
+                "const moduleA = require(\"./aliasAssignments_moduleA\");\n",
+                "var x = moduleA;\n",
+                "x = 1; // Should be error\n",
+                "var y = 1;\n",
+                "y = moduleA; // should be error\n",
+            )
+        );
+    }
+
+    #[test]
+    fn preserves_constructor_body_comments_around_lowered_fields() {
+        let source = concat!(
+            "abstract class A {\n",
+            " other = this.prop;\n",
+            " constructor() {\n",
+            "  this.cb(); // OK\n",
+            "  const inner = () => this.prop; // nested reference\n",
+            " }\n",
+            " abstract prop: string;\n",
+            " abstract cb(): void;\n",
+            "}\n",
+        );
+        let result = emit_with(source, ScriptTarget::Es2015, ModuleKind::EsNext);
+        assert_eq!(
+            result.code,
+            concat!(
+                "class A {\n",
+                "    constructor() {\n",
+                "        this.other = this.prop;\n",
+                "        this.cb(); // OK\n",
+                "        const inner = () => this.prop; // nested reference\n",
+                "    }\n",
+                "}\n",
+            )
+        );
+        let downlevel = emit_with(source, ScriptTarget::Es5, ModuleKind::EsNext).code;
+        assert!(downlevel.contains("this.cb(); // OK"), "{downlevel}");
+        assert!(downlevel.contains("// nested reference"), "{downlevel}");
+    }
+
+    #[test]
+    fn preserves_trailing_comments_across_erased_abstract_type_statements() {
+        let source = concat!(
+            "class ConcreteA {}\n",
+            "class ConcreteB {}\n",
+            "abstract class AbstractA { a: string; }\n",
+            "abstract class AbstractB { b: string; }\n",
+            "type Abstracts = typeof AbstractA | typeof AbstractB;\n",
+            "declare const cls1: Abstracts;\n",
+            "new cls1(); // should error\n",
+            "[ConcreteA, AbstractA].map(cls => new cls()); // should error\n",
+            "[ConcreteA, ConcreteB].map(cls => new cls()); // should work\n",
+        );
+        assert_eq!(
+            emit_with(source, ScriptTarget::Es2015, ModuleKind::EsNext).code,
+            concat!(
+                "class ConcreteA {\n",
+                "}\n",
+                "class ConcreteB {\n",
+                "}\n",
+                "class AbstractA {\n",
+                "}\n",
+                "class AbstractB {\n",
+                "}\n",
+                "new cls1(); // should error\n",
+                "[ConcreteA, AbstractA].map(cls => new cls()); // should error\n",
+                "[ConcreteA, ConcreteB].map(cls => new cls()); // should work\n",
+            )
+        );
     }
 
     #[test]
