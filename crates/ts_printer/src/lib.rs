@@ -6,7 +6,7 @@ use std::fmt;
 
 use ts_ast::{Node, NodeArena, NodeData, NodeId, NodeList, SymbolId, SyntaxKind};
 use ts_binder::{BindResult, bind_source_file};
-use ts_checker::{ObjectType, TypeArena, TypeId, TypeKind};
+use ts_checker::{ImportTypeReference, ObjectType, TypeArena, TypeId, TypeKind};
 use ts_options::{JsxEmit, ModuleKind, PrinterSettings, ScriptTarget};
 use ts_sourcemap::{SourceMap, SourceMapBuilder};
 
@@ -999,6 +999,7 @@ pub fn emit_declaration_file_with_reachability(
         enum_member_values,
         None,
         None,
+        None,
     )
 }
 
@@ -1018,6 +1019,7 @@ pub fn emit_declaration_file_with_semantics(
     enum_member_values: Option<&BTreeMap<NodeId, EmitConstantValue>>,
     semantic_types: Option<&TypeArena>,
     node_types: Option<&BTreeMap<NodeId, TypeId>>,
+    import_type_references: Option<&BTreeMap<TypeId, ImportTypeReference>>,
 ) -> Result<EmitResult, EmitError> {
     let mut printer = DeclarationPrinter {
         arena,
@@ -1031,6 +1033,7 @@ pub fn emit_declaration_file_with_semantics(
         enum_member_values,
         semantic_types,
         node_types,
+        import_type_references,
         javascript_source: [".js", ".jsx", ".mjs", ".cjs"]
             .iter()
             .any(|extension| source_name.to_ascii_lowercase().ends_with(extension)),
@@ -1073,6 +1076,7 @@ struct DeclarationPrinter<'a> {
     enum_member_values: Option<&'a BTreeMap<NodeId, EmitConstantValue>>,
     semantic_types: Option<&'a TypeArena>,
     node_types: Option<&'a BTreeMap<NodeId, TypeId>>,
+    import_type_references: Option<&'a BTreeMap<TypeId, ImportTypeReference>>,
     javascript_source: bool,
     generated_names: HashSet<String>,
 }
@@ -1850,6 +1854,16 @@ impl DeclarationPrinter<'_> {
     }
 
     fn emit_semantic_type(&mut self, id: TypeId) -> Result<(), EmitError> {
+        if let Some(reference) = self
+            .import_type_references
+            .and_then(|references| references.get(&id))
+        {
+            self.writer.write("import(");
+            write_quoted(&mut self.writer, &reference.module_specifier);
+            self.writer.write(").");
+            self.writer.write(&reference.qualifier);
+            return Ok(());
+        }
         let Some(kind) = self
             .semantic_types
             .and_then(|types| types.get(id))

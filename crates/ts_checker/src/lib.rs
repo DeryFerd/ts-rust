@@ -64,6 +64,12 @@ pub struct FunctionType {
     pub parameters_optional: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImportTypeReference {
+    pub module_specifier: String,
+    pub qualifier: String,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Type {
     pub id: TypeId,
@@ -344,6 +350,8 @@ pub struct CheckResult {
     pub symbol_types: HashMap<SymbolId, TypeId>,
     /// Expression and declaration types, stable after checking completes.
     pub node_types: BTreeMap<NodeId, TypeId>,
+    /// Imported type identities retained for declaration serialization.
+    pub import_type_references: BTreeMap<TypeId, ImportTypeReference>,
     pub enum_member_values: BTreeMap<NodeId, EnumConstantValue>,
     pub enum_access_values: BTreeMap<NodeId, EnumConstantValue>,
     /// Resolved import declarations and whether their target has runtime value meaning.
@@ -432,6 +440,7 @@ pub fn empty_check_result() -> CheckResult {
         types: TypeArena::new(),
         symbol_types: HashMap::new(),
         node_types: BTreeMap::new(),
+        import_type_references: BTreeMap::new(),
         enum_member_values: BTreeMap::new(),
         enum_access_values: BTreeMap::new(),
         import_runtime_meanings: BTreeMap::new(),
@@ -478,6 +487,10 @@ enum TypeDescriptor {
     BigIntLiteral(String),
     ConstEnum(Box<Self>),
     TypeParameter(String),
+    Import {
+        reference: ImportTypeReference,
+        target: Box<Self>,
+    },
     Alias {
         parameters: Vec<String>,
         body: Box<Self>,
@@ -511,6 +524,12 @@ struct ProgramChecker<'a> {
 
 type DuplicateGlobal = (usize, NodeId, u32, String);
 type GlobalCollection = (BTreeMap<String, TypeDescriptor>, Vec<DuplicateGlobal>);
+type ImportCollection = (
+    HashMap<SymbolId, TypeDescriptor>,
+    HashMap<SymbolId, ImportTypeReference>,
+    Vec<CheckDiagnostic>,
+    BTreeMap<NodeId, bool>,
+);
 
 impl<'a> ProgramChecker<'a> {
     const fn new(sources: &'a [ProgramSource<'a>]) -> Self {
@@ -537,14 +556,18 @@ impl<'a> ProgramChecker<'a> {
         let (globals, duplicate_globals) = self.globals(&preliminary);
         let mut files = Vec::with_capacity(self.sources.len());
         for (file_index, source) in self.sources.iter().enumerate() {
-            let (external_symbols, mut import_diagnostics, import_runtime_meanings) =
-                self.imports(source, &preliminary);
+            let (
+                external_symbols,
+                external_imports,
+                mut import_diagnostics,
+                import_runtime_meanings,
+            ) = self.imports(source, &preliminary, &files);
             let mut result = if source.is_default_library {
                 preliminary[file_index].clone()
             } else {
                 Checker::new(source.arena, source.bindings)
                     .with_options(source.checker_options)
-                    .with_environment(external_symbols, globals.clone())
+                    .with_environment(external_symbols, external_imports, globals.clone())
                     .check(source.source_file)
             };
             if source.is_default_library || source.skip_diagnostics {
@@ -1003,25 +1026,24 @@ impl<'a> ProgramChecker<'a> {
         if !preserve {
             return Some(TypeDescriptor::Any);
         }
-        describe_declaration_symbol(source, symbol_id).or(Some(TypeDescriptor::Any))
+        describe_declaration_symbol(source, None, symbol_id).or(Some(TypeDescriptor::Any))
     }
 
+    #[allow(clippy::too_many_lines)]
     fn imports(
         &self,
         source: &ProgramSource<'_>,
-        results: &[CheckResult],
-    ) -> (
-        HashMap<SymbolId, TypeDescriptor>,
-        Vec<CheckDiagnostic>,
-        BTreeMap<NodeId, bool>,
-    ) {
+        preliminary: &[CheckResult],
+        completed: &[CheckResult],
+    ) -> ImportCollection {
         let mut symbols = HashMap::new();
+        let mut import_references = HashMap::new();
         let mut diagnostics = Vec::new();
         let mut runtime_meanings = BTreeMap::new();
         let Some(NodeData::SourceFile(file)) =
             source.arena.get(source.source_file).map(|node| &node.data)
         else {
-            return (symbols, diagnostics, runtime_meanings);
+            return (symbols, import_references, diagnostics, runtime_meanings);
         };
         runtime_meanings = self.collect_import_runtime_meanings(source, &file.statements.nodes);
         for statement in &file.statements.nodes {
@@ -1036,7 +1058,8 @@ impl<'a> ProgramChecker<'a> {
             let Some(target) = source.resolved_modules.get(specifier).copied() else {
                 continue;
             };
-            let Some(target_result) = results.get(target) else {
+            let Some(target_result) = completed.get(target).or_else(|| preliminary.get(target))
+            else {
                 continue;
             };
             let module_exports = self.resolved_module_exports(target, specifier, target_result);
@@ -1058,6 +1081,7 @@ impl<'a> ProgramChecker<'a> {
                     name,
                     &module_exports,
                     &mut symbols,
+                    &mut import_references,
                     &mut diagnostics,
                 );
             }
@@ -1088,6 +1112,7 @@ impl<'a> ProgramChecker<'a> {
                         *specifier_node,
                         &module_exports,
                         &mut symbols,
+                        &mut import_references,
                         &mut diagnostics,
                     );
                 }
@@ -1111,7 +1136,7 @@ impl<'a> ProgramChecker<'a> {
                 );
             }
         }
-        (symbols, diagnostics, runtime_meanings)
+        (symbols, import_references, diagnostics, runtime_meanings)
     }
 
     fn collect_import_runtime_meanings(
@@ -1136,10 +1161,18 @@ impl<'a> ProgramChecker<'a> {
         node: NodeId,
         exports: &BTreeMap<String, TypeDescriptor>,
         symbols: &mut HashMap<SymbolId, TypeDescriptor>,
+        import_references: &mut HashMap<SymbolId, ImportTypeReference>,
         diagnostics: &mut Vec<CheckDiagnostic>,
     ) {
         if let Some(descriptor) = exports.get(imported_name) {
             symbols.insert(symbol, descriptor.clone());
+            import_references.insert(
+                symbol,
+                ImportTypeReference {
+                    module_specifier: module_name.to_owned(),
+                    qualifier: imported_name.to_owned(),
+                },
+            );
         } else {
             let message = message_by_code(2305).expect("checker diagnostic is in catalog");
             diagnostics.push(CheckDiagnostic {
@@ -1177,7 +1210,7 @@ impl<'a> ProgramChecker<'a> {
                     getter_properties: BTreeSet::new(),
                 }
             });
-        if let Some(declaration) = describe_declaration_symbol(source, symbol_id) {
+        if let Some(declaration) = describe_declaration_symbol(source, Some(result), symbol_id) {
             return Some(namespace.map_or(declaration.clone(), |namespace| {
                 TypeDescriptor::Intersection(vec![declaration, namespace])
             }));
@@ -1224,6 +1257,7 @@ struct Checker<'a> {
     external_symbols: HashMap<SymbolId, TypeDescriptor>,
     external_names: BTreeMap<String, TypeDescriptor>,
     external_aliases: HashMap<SymbolId, TypeDescriptor>,
+    external_imports: HashMap<SymbolId, ImportTypeReference>,
     imported_type_parameters: HashMap<String, TypeId>,
     options: CheckerOptions,
     symbol_reads: HashMap<SymbolId, usize>,
@@ -1256,6 +1290,7 @@ impl<'a> Checker<'a> {
                 types: TypeArena::new(),
                 symbol_types: HashMap::new(),
                 node_types: BTreeMap::new(),
+                import_type_references: BTreeMap::new(),
                 enum_member_values: BTreeMap::new(),
                 enum_access_values: BTreeMap::new(),
                 import_runtime_meanings: BTreeMap::new(),
@@ -1271,6 +1306,7 @@ impl<'a> Checker<'a> {
             external_symbols: HashMap::new(),
             external_names: BTreeMap::new(),
             external_aliases: HashMap::new(),
+            external_imports: HashMap::new(),
             imported_type_parameters: HashMap::new(),
             options: CheckerOptions::default(),
             symbol_reads: HashMap::new(),
@@ -1287,9 +1323,11 @@ impl<'a> Checker<'a> {
     fn with_environment(
         mut self,
         symbols: HashMap<SymbolId, TypeDescriptor>,
+        imports: HashMap<SymbolId, ImportTypeReference>,
         names: BTreeMap<String, TypeDescriptor>,
     ) -> Self {
         self.external_symbols = symbols;
+        self.external_imports = imports;
         self.external_names = names;
         self
     }
@@ -1300,7 +1338,6 @@ impl<'a> Checker<'a> {
     }
 
     fn check(mut self, source_file: NodeId) -> CheckResult {
-        self.seed_symbol_types();
         for (symbol, descriptor) in std::mem::take(&mut self.external_symbols) {
             if matches!(descriptor, TypeDescriptor::Alias { .. }) {
                 self.external_aliases.insert(symbol, descriptor.clone());
@@ -1308,6 +1345,7 @@ impl<'a> Checker<'a> {
             let type_id = self.import_type(&descriptor);
             self.result.symbol_types.insert(symbol, type_id);
         }
+        self.seed_symbol_types();
         let mut saw_return = false;
         self.check_node(source_file, None, &mut saw_return);
         self.check_unused_symbols();
@@ -1515,15 +1553,26 @@ impl<'a> Checker<'a> {
                 }
                 if let Some(symbol) = self.resolve_identifier(node, &identifier.text) {
                     if let Some(descriptor) = self.external_aliases.get(&symbol).cloned() {
-                        return Some(self.import_alias(&descriptor, &[]));
+                        let type_id = self.import_alias(&descriptor, &[]);
+                        if let Some(reference) = self.external_imports.get(&symbol).cloned() {
+                            self.result
+                                .import_type_references
+                                .insert(type_id, reference);
+                        }
+                        return Some(type_id);
                     }
-                    return Some(
+                    let type_id = self
+                        .result
+                        .symbol_types
+                        .get(&symbol)
+                        .copied()
+                        .unwrap_or_else(|| self.result.types.any());
+                    if let Some(reference) = self.external_imports.get(&symbol).cloned() {
                         self.result
-                            .symbol_types
-                            .get(&symbol)
-                            .copied()
-                            .unwrap_or_else(|| self.result.types.any()),
-                    );
+                            .import_type_references
+                            .insert(type_id, reference);
+                    }
+                    return Some(type_id);
                 }
                 let descriptor = self.external_names.get(&identifier.text)?.clone();
                 Some(self.import_type(&descriptor))
@@ -4922,7 +4971,7 @@ impl<'a> Checker<'a> {
         if let Some(inferred) = inference.get(&type_id) {
             return *inferred;
         }
-        match self.result.types.get(type_id).unwrap().kind.clone() {
+        let substituted = match self.result.types.get(type_id).unwrap().kind.clone() {
             TypeKind::Array(element) => {
                 let element = self.substitute_type(element, inference);
                 self.result.types.alloc(TypeKind::Array(element))
@@ -4969,7 +5018,15 @@ impl<'a> Checker<'a> {
                 }))
             }
             _ => type_id,
+        };
+        if substituted != type_id
+            && let Some(reference) = self.result.import_type_references.get(&type_id).cloned()
+        {
+            self.result
+                .import_type_references
+                .insert(substituted, reference);
         }
+        substituted
     }
 
     fn check_binary(
@@ -5240,18 +5297,26 @@ impl<'a> Checker<'a> {
                     }
                     return self.unresolved_type_name(data.type_name, name);
                 };
-                if let Some(descriptor) = self.external_aliases.get(&symbol).cloned() {
-                    return self.import_alias(&descriptor, &arguments);
+                let type_id = if let Some(descriptor) = self.external_aliases.get(&symbol).cloned()
+                {
+                    self.import_alias(&descriptor, &arguments)
+                } else {
+                    self.instantiate_alias(symbol, &arguments)
+                        .or_else(|| self.instantiate_declared_object(symbol, &arguments))
+                        .unwrap_or_else(|| {
+                            self.result
+                                .symbol_types
+                                .get(&symbol)
+                                .copied()
+                                .unwrap_or_else(|| self.result.types.unknown())
+                        })
+                };
+                if let Some(reference) = self.external_imports.get(&symbol).cloned() {
+                    self.result
+                        .import_type_references
+                        .insert(type_id, reference);
                 }
-                self.instantiate_alias(symbol, &arguments)
-                    .or_else(|| self.instantiate_declared_object(symbol, &arguments))
-                    .unwrap_or_else(|| {
-                        self.result
-                            .symbol_types
-                            .get(&symbol)
-                            .copied()
-                            .unwrap_or_else(|| self.result.types.unknown())
-                    })
+                type_id
             }
             NodeData::TypeQueryNode(data) => self.type_of_expression(data.expr_name),
             NodeData::UnionTypeNode(data) => {
@@ -5921,6 +5986,13 @@ impl<'a> Checker<'a> {
                     type_id
                 }
             }
+            TypeDescriptor::Import { reference, target } => {
+                let type_id = self.import_type(target);
+                self.result
+                    .import_type_references
+                    .insert(type_id, reference.clone());
+                type_id
+            }
             TypeDescriptor::Unknown => self.result.types.unknown(),
             TypeDescriptor::Never => self.result.types.never(),
             TypeDescriptor::Void => self.result.types.void(),
@@ -6073,7 +6145,7 @@ impl<'a> Checker<'a> {
     }
 
     fn widen_literal(&mut self, type_id: TypeId) -> TypeId {
-        match self
+        let widened = match self
             .result
             .types
             .get(type_id)
@@ -6127,7 +6199,15 @@ impl<'a> Checker<'a> {
                 }))
             }
             _ => type_id,
+        };
+        if widened != type_id
+            && let Some(reference) = self.result.import_type_references.get(&type_id).cloned()
+        {
+            self.result
+                .import_type_references
+                .insert(widened, reference);
         }
+        widened
     }
 
     fn is_const_declaration(&self, declaration: NodeId) -> bool {
@@ -6604,8 +6684,10 @@ fn describe_alias(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn describe_declaration_symbol(
     source: &ProgramSource<'_>,
+    result: Option<&CheckResult>,
     symbol_id: SymbolId,
 ) -> Option<TypeDescriptor> {
     let symbol = source.bindings.symbols.get(symbol_id)?;
@@ -6629,6 +6711,11 @@ fn describe_declaration_symbol(
         })
         .collect::<Vec<_>>();
     if !function_declarations.is_empty() {
+        if let Some(result) = result
+            && let Some(type_id) = result.type_of_symbol(symbol_id)
+        {
+            return Some(describe_checked_type(result, type_id));
+        }
         let mut checker = Checker::new(source.arena, source.bindings);
         let signatures = function_declarations
             .iter()
@@ -6770,7 +6857,20 @@ fn is_core_library_name(name: &str) -> bool {
 }
 
 fn describe_type(types: &TypeArena, type_id: TypeId) -> TypeDescriptor {
-    match &types
+    describe_type_with_imports(types, &BTreeMap::new(), type_id)
+}
+
+fn describe_checked_type(result: &CheckResult, type_id: TypeId) -> TypeDescriptor {
+    describe_type_with_imports(&result.types, &result.import_type_references, type_id)
+}
+
+#[allow(clippy::too_many_lines)]
+fn describe_type_with_imports(
+    types: &TypeArena,
+    imports: &BTreeMap<TypeId, ImportTypeReference>,
+    type_id: TypeId,
+) -> TypeDescriptor {
+    let descriptor = match &types
         .get(type_id)
         .expect("type ID originates from arena")
         .kind
@@ -6790,30 +6890,37 @@ fn describe_type(types: &TypeArena, type_id: TypeId) -> TypeDescriptor {
         TypeKind::StringLiteral(value) => TypeDescriptor::StringLiteral(value.clone()),
         TypeKind::BigIntLiteral(value) => TypeDescriptor::BigIntLiteral(value.clone()),
         TypeKind::TypeParameter { name, .. } => TypeDescriptor::TypeParameter(name.clone()),
-        TypeKind::Array(element) => TypeDescriptor::Array(Box::new(describe_type(types, *element))),
+        TypeKind::Array(element) => TypeDescriptor::Array(Box::new(describe_type_with_imports(
+            types, imports, *element,
+        ))),
         TypeKind::Tuple(elements) => TypeDescriptor::Tuple(
             elements
                 .iter()
-                .map(|element| describe_type(types, *element))
+                .map(|element| describe_type_with_imports(types, imports, *element))
                 .collect(),
         ),
         TypeKind::Union(members) => TypeDescriptor::Union(
             members
                 .iter()
-                .map(|member| describe_type(types, *member))
+                .map(|member| describe_type_with_imports(types, imports, *member))
                 .collect(),
         ),
         TypeKind::Intersection(members) => TypeDescriptor::Intersection(
             members
                 .iter()
-                .map(|member| describe_type(types, *member))
+                .map(|member| describe_type_with_imports(types, imports, *member))
                 .collect(),
         ),
         TypeKind::Object(object) => TypeDescriptor::Object {
             properties: object
                 .properties
                 .iter()
-                .map(|(name, property)| (name.clone(), describe_type(types, *property)))
+                .map(|(name, property)| {
+                    (
+                        name.clone(),
+                        describe_type_with_imports(types, imports, *property),
+                    )
+                })
                 .collect(),
             optional_properties: object.optional_properties.clone(),
             readonly_properties: object.readonly_properties.clone(),
@@ -6823,18 +6930,26 @@ fn describe_type(types: &TypeArena, type_id: TypeId) -> TypeDescriptor {
             parameters: function
                 .parameters
                 .iter()
-                .map(|parameter| describe_type(types, *parameter))
+                .map(|parameter| describe_type_with_imports(types, imports, *parameter))
                 .collect(),
-            return_type: Box::new(describe_type(types, function.return_type)),
+            return_type: Box::new(describe_type_with_imports(
+                types,
+                imports,
+                function.return_type,
+            )),
             parameters_optional: function.parameters_optional,
         },
         TypeKind::Constructor(constructor) => TypeDescriptor::Constructor {
             parameters: constructor
                 .parameters
                 .iter()
-                .map(|parameter| describe_type(types, *parameter))
+                .map(|parameter| describe_type_with_imports(types, imports, *parameter))
                 .collect(),
-            return_type: Box::new(describe_type(types, constructor.return_type)),
+            return_type: Box::new(describe_type_with_imports(
+                types,
+                imports,
+                constructor.return_type,
+            )),
             parameters_optional: constructor.parameters_optional,
         },
         TypeKind::Overload(signatures) => TypeDescriptor::Overload(
@@ -6844,13 +6959,25 @@ fn describe_type(types: &TypeArena, type_id: TypeId) -> TypeDescriptor {
                     parameters: signature
                         .parameters
                         .iter()
-                        .map(|parameter| describe_type(types, *parameter))
+                        .map(|parameter| describe_type_with_imports(types, imports, *parameter))
                         .collect(),
-                    return_type: Box::new(describe_type(types, signature.return_type)),
+                    return_type: Box::new(describe_type_with_imports(
+                        types,
+                        imports,
+                        signature.return_type,
+                    )),
                     parameters_optional: signature.parameters_optional,
                 })
                 .collect(),
         ),
+    };
+    if let Some(reference) = imports.get(&type_id) {
+        TypeDescriptor::Import {
+            reference: reference.clone(),
+            target: Box::new(descriptor),
+        }
+    } else {
+        descriptor
     }
 }
 
@@ -6863,6 +6990,10 @@ fn substitute_descriptor(
             .get(name)
             .cloned()
             .unwrap_or_else(|| descriptor.clone()),
+        TypeDescriptor::Import { reference, target } => TypeDescriptor::Import {
+            reference: reference.clone(),
+            target: Box::new(substitute_descriptor(target, substitutions)),
+        },
         TypeDescriptor::ConstEnum(enum_type) => {
             TypeDescriptor::ConstEnum(Box::new(substitute_descriptor(enum_type, substitutions)))
         }
@@ -7214,8 +7345,8 @@ mod tests {
     use ts_parser::parse_source_file;
 
     use super::{
-        Checker, CheckerOptions, EnumConstantValue, ObjectType, ProgramSource, TypeKind,
-        check_program, check_source_file, check_source_file_with_options,
+        Checker, CheckerOptions, EnumConstantValue, ImportTypeReference, ObjectType, ProgramSource,
+        TypeKind, check_program, check_source_file, check_source_file_with_options,
     };
 
     struct Builder {
@@ -9917,6 +10048,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn default_export_assignment_retains_private_alias_chain_across_modules() {
         let color = parse_source_file(
             r"
@@ -9976,6 +10108,65 @@ mod tests {
                 checker_options: CheckerOptions::default(),
             },
         ]);
+        let styled = file1_bindings
+            .root_scope()
+            .unwrap()
+            .symbols
+            .get("styled")
+            .unwrap();
+        let styled_type = checked.files[1].type_of_symbol(styled).unwrap();
+        let TypeKind::Function(styled_signature) =
+            &checked.files[1].types.get(styled_type).unwrap().kind
+        else {
+            panic!("expected styled function type");
+        };
+        assert_eq!(
+            checked.files[1]
+                .import_type_references
+                .get(&styled_signature.return_type),
+            Some(&ImportTypeReference {
+                module_specifier: "./color".into(),
+                qualifier: "default".into(),
+            })
+        );
+        let imported_styled = file2_bindings
+            .root_scope()
+            .unwrap()
+            .symbols
+            .get("styled")
+            .unwrap();
+        let imported_styled_type = checked.files[2].type_of_symbol(imported_styled).unwrap();
+        let TypeKind::Function(imported_styled_signature) = &checked.files[2]
+            .types
+            .get(imported_styled_type)
+            .unwrap()
+            .kind
+        else {
+            panic!("expected imported styled function type");
+        };
+        assert_eq!(
+            checked.files[2]
+                .import_type_references
+                .get(&imported_styled_signature.return_type),
+            Some(&ImportTypeReference {
+                module_specifier: "./color".into(),
+                qualifier: "default".into(),
+            })
+        );
+        let value = file2_bindings
+            .root_scope()
+            .unwrap()
+            .symbols
+            .get("value")
+            .unwrap();
+        let value_type = checked.files[2].type_of_symbol(value).unwrap();
+        assert_eq!(
+            checked.files[2].import_type_references.get(&value_type),
+            Some(&ImportTypeReference {
+                module_specifier: "./color".into(),
+                qualifier: "default".into(),
+            })
+        );
         let NodeData::SourceFile(source) = &color.arena.get(color.source_file).unwrap().data else {
             panic!("expected source file");
         };

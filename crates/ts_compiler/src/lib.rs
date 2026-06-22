@@ -484,6 +484,7 @@ impl Program {
                     Some(&enum_member_values),
                     Some(&source_file.checking.types),
                     Some(&source_file.checking.node_types),
+                    Some(&source_file.checking.import_type_references),
                 ) {
                     Ok(mut emitted) => {
                         let Some(file_name) = paths.declaration.clone() else {
@@ -639,6 +640,7 @@ impl Program {
                     Some(&enum_member_values),
                     Some(&source.checking.types),
                     Some(&source.checking.node_types),
+                    Some(&source.checking.import_type_references),
                 ) {
                     Ok(emitted) => {
                         if !emitted.code.is_empty() {
@@ -2882,6 +2884,49 @@ mod tests {
                 .unwrap();
             assert_eq!(declaration.text, expected);
         }
+    }
+
+    #[test]
+    fn declaration_emit_preserves_cross_module_default_type_identity() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/color.ts",
+            "interface Color { c: string; } export default Color;",
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/file1.ts",
+            "import Color from './color'; export declare function styled(): Color;",
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/file2.ts",
+            "import { styled } from './file1'; export const A = styled();",
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["color.ts".into(), "file1.ts".into(), "file2.ts".into()],
+            CompilerOptions {
+                declaration: true,
+                module: ModuleKind::CommonJs,
+                target: ScriptTarget::Es2015,
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        let emitted = program.emit();
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        let declaration = emitted
+            .files
+            .iter()
+            .find(|file| file.file_name == "/project/file2.d.ts")
+            .unwrap();
+        assert_eq!(
+            declaration.text,
+            "export declare const A: import(\"./color\").default;\n"
+        );
     }
 
     #[test]
