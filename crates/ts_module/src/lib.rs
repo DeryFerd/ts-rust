@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 use ts_path::{FileExtension, is_absolute, is_relative, normalize_path, resolve_path, root_length};
+use ts_semver::{Version, VersionRange};
 use ts_vfs::FileSystem;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -519,10 +520,13 @@ fn select_export_condition(value: &Value, prefer_types: bool) -> Option<&str> {
 
 fn types_version_targets(types_versions: &Value, rest: &str) -> Option<Vec<String>> {
     let versions = types_versions.as_object()?;
-    let mapping = versions
-        .get("*")
-        .or_else(|| versions.values().next())?
-        .as_object()?;
+    let compiler_version = Version::parse(env!("CARGO_PKG_VERSION")).ok()?;
+    let mapping = versions.iter().find_map(|(range, mapping)| {
+        VersionRange::parse(range)
+            .ok()
+            .filter(|range| range.test(&compiler_version))
+            .and_then(|_| mapping.as_object())
+    })?;
     let (_, capture, targets) = mapping
         .iter()
         .filter_map(|(pattern, targets)| {
@@ -839,8 +843,9 @@ mod tests {
         let fs = fs(&[
             (
                 "/app/node_modules/pkg/package.json",
-                r#"{"typesVersions":{"*":{"feature/*":["types/feature/*"],"*":["types/*"]}}}"#,
+                r#"{"typesVersions":{"<7":{"feature/*":["old/feature/*"]},">=7":{"feature/*":["types/feature/*"],"*":["types/*"]}}}"#,
             ),
+            ("/app/node_modules/pkg/old/feature/tool.d.ts", ""),
             ("/app/node_modules/pkg/types/feature/tool.d.ts", ""),
         ]);
         let resolved = Resolver::new(&fs, ResolutionOptions::default())

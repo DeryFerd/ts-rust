@@ -1,14 +1,12 @@
 [package]
-name = "ts_module"
+name = "ts_outputpaths"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-serde_json = { version = "1", features = ["preserve_order"] }
+ts_options = { path = "../ts_options" }
 ts_path = { path = "../ts_path" }
-ts_semver = { path = "../ts_semver" }
-ts_vfs = { path = "../ts_vfs" }
 
 [lints]
 workspace = true

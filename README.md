@@ -14,6 +14,8 @@ against the upstream TypeScript fixtures independently:
 - `ts_binder` / `ts_checker`: symbols, scopes, and semantic types
 - `ts_module` / `ts_glob`: module resolution and project file discovery
 - `ts_options`: normalized compiler options
+- `ts_outputpaths`: JavaScript/declaration output path calculation
+- `ts_semver`: npm-style semantic versions and package range matching
 - `ts_compiler`: Program graph, diagnostics, checking, and emit orchestration
 - `ts_printer` / `ts_sourcemap`: target-aware JavaScript and source-map emission
 - `ts_bundled`: the pinned TypeScript default-library declarations
