@@ -13,7 +13,7 @@ use ts_module::{ResolutionOptions, Resolver};
 use ts_options::{CompilerOptions, parse_project_options};
 use ts_parser::{ParseResult, parse_source_file};
 use ts_path::{CaseSensitivity, canonicalize, is_absolute, resolve_path};
-use ts_printer::emit_source_file_with_settings;
+use ts_printer::{emit_declaration_file, emit_source_file_with_settings};
 use ts_sourcemap::SourceMap;
 use ts_vfs::FileSystem;
 
@@ -231,10 +231,11 @@ impl Program {
     /// Emits modern JavaScript for all implementation source files currently
     /// supported by the printer.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn emit(&self) -> EmitOutput {
         let mut output = EmitOutput::default();
         let settings = self.options.printer_settings();
-        if !settings.emit_javascript {
+        if !settings.emit_javascript && !settings.emit_declarations {
             return output;
         }
         let source_names = self
@@ -252,60 +253,91 @@ impl Program {
             if ts_path::is_declaration_file(&source_file.file_name) {
                 continue;
             }
-            match emit_source_file_with_settings(
-                &source_file.parse.arena,
-                source_file.parse.source_file,
+            let paths = ts_outputpaths::output_paths(
                 &source_file.file_name,
-                &source_file.source_text,
-                settings,
-            ) {
-                Ok(mut emitted) => {
-                    let paths = ts_outputpaths::output_paths(
-                        &source_file.file_name,
-                        &self.options,
-                        &self.current_directory,
-                        &common_source_directory,
-                        self.case_sensitivity,
-                    );
-                    let Some(file_name) = paths.javascript else {
-                        continue;
-                    };
-                    if let Some(mut source_map) = emitted.source_map {
-                        source_map.file = file_name.rsplit('/').next().map(str::to_owned);
-                        let serialized = serialize_source_map(&source_map);
-                        if settings.inline_source_map {
-                            emitted
-                                .code
-                                .push_str("//# sourceMappingURL=data:application/json;base64,");
-                            emitted.code.push_str(&base64_encode(serialized.as_bytes()));
-                            emitted.code.push('\n');
-                        } else if let Some(map_file_name) = paths.source_map {
-                            emitted.code.push_str("//# sourceMappingURL=");
-                            emitted.code.push_str(
-                                map_file_name.rsplit('/').next().unwrap_or(&map_file_name),
-                            );
-                            emitted.code.push('\n');
-                            output.files.push(OutputFile {
-                                file_name: map_file_name,
-                                text: serialized,
-                            });
+                &self.options,
+                &self.current_directory,
+                &common_source_directory,
+                self.case_sensitivity,
+            );
+            if settings.emit_javascript {
+                match emit_source_file_with_settings(
+                    &source_file.parse.arena,
+                    source_file.parse.source_file,
+                    &source_file.file_name,
+                    &source_file.source_text,
+                    settings,
+                ) {
+                    Ok(mut emitted) => {
+                        let Some(file_name) = paths.javascript.clone() else {
+                            continue;
+                        };
+                        if let Some(mut source_map) = emitted.source_map {
+                            source_map.file = file_name.rsplit('/').next().map(str::to_owned);
+                            let serialized = serialize_source_map(&source_map);
+                            if settings.inline_source_map {
+                                emitted
+                                    .code
+                                    .push_str("//# sourceMappingURL=data:application/json;base64,");
+                                emitted.code.push_str(&base64_encode(serialized.as_bytes()));
+                                emitted.code.push('\n');
+                            } else if let Some(map_file_name) = paths.source_map.clone() {
+                                emitted.code.push_str("//# sourceMappingURL=");
+                                emitted.code.push_str(
+                                    map_file_name.rsplit('/').next().unwrap_or(&map_file_name),
+                                );
+                                emitted.code.push('\n');
+                                output.files.push(OutputFile {
+                                    file_name: map_file_name,
+                                    text: serialized,
+                                });
+                            }
                         }
+                        output.files.push(OutputFile {
+                            file_name,
+                            text: emitted.code,
+                        });
                     }
-                    output.files.push(OutputFile {
-                        file_name,
-                        text: emitted.code,
-                    });
+                    Err(error) => output
+                        .diagnostics
+                        .push(emit_diagnostic(source_file, &error)),
                 }
-                Err(error) => output.diagnostics.push(ProgramDiagnostic {
-                    file_name: Some(source_file.file_name.clone()),
-                    range: source_file
-                        .parse
-                        .arena
-                        .get(error.node)
-                        .map(|node| node.range),
-                    code: None,
-                    message: error.to_string(),
-                }),
+            }
+            if settings.emit_declarations {
+                match emit_declaration_file(
+                    &source_file.parse.arena,
+                    source_file.parse.source_file,
+                    &source_file.file_name,
+                    &source_file.source_text,
+                    self.options.declaration_map,
+                ) {
+                    Ok(mut emitted) => {
+                        let Some(file_name) = paths.declaration.clone() else {
+                            continue;
+                        };
+                        if let Some(mut source_map) = emitted.source_map {
+                            source_map.file = file_name.rsplit('/').next().map(str::to_owned);
+                            if let Some(map_file_name) = paths.declaration_map.clone() {
+                                emitted.code.push_str("//# sourceMappingURL=");
+                                emitted.code.push_str(
+                                    map_file_name.rsplit('/').next().unwrap_or(&map_file_name),
+                                );
+                                emitted.code.push('\n');
+                                output.files.push(OutputFile {
+                                    file_name: map_file_name,
+                                    text: serialize_source_map(&source_map),
+                                });
+                            }
+                        }
+                        output.files.push(OutputFile {
+                            file_name,
+                            text: emitted.code,
+                        });
+                    }
+                    Err(error) => output
+                        .diagnostics
+                        .push(emit_diagnostic(source_file, &error)),
+                }
             }
         }
         output
@@ -435,6 +467,19 @@ fn serialize_source_map(source_map: &SourceMap) -> String {
         mappings: &source_map.mappings,
     })
     .expect("source map fields are JSON-serializable")
+}
+
+fn emit_diagnostic(source_file: &SourceFile, error: &ts_printer::EmitError) -> ProgramDiagnostic {
+    ProgramDiagnostic {
+        file_name: Some(source_file.file_name.clone()),
+        range: source_file
+            .parse
+            .arena
+            .get(error.node)
+            .map(|node| node.range),
+        code: None,
+        message: error.to_string(),
+    }
 }
 
 fn base64_encode(bytes: &[u8]) -> String {
@@ -940,6 +985,91 @@ mod tests {
             emitted.files[0]
                 .text
                 .contains("sourceMappingURL=data:application/json;base64,")
+        );
+    }
+
+    #[test]
+    fn emits_declarations_and_declaration_maps_to_declaration_dir() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/tsconfig.json",
+            r#"{
+                "files": ["src/api.mts"],
+                "compilerOptions": {
+                    "outDir": "dist",
+                    "rootDir": "src",
+                    "declaration": true,
+                    "declarationMap": true,
+                    "declarationDir": "types"
+                }
+            }"#,
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/src/api.mts",
+            r"
+                export const version: number = 1;
+                export function identity<T>(value: T): T { return value; }
+                export interface Box<T> { value: T; }
+                export type Maybe<T> = T | undefined;
+                export enum Color { Red, Blue = 2 }
+            ",
+        )
+        .unwrap();
+        let program = Program::from_config(&fs, "/project/tsconfig.json");
+        assert!(
+            program.diagnostics().is_empty(),
+            "{:?}",
+            program.diagnostics()
+        );
+        let emitted = program.emit();
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        let declaration = emitted
+            .files
+            .iter()
+            .find(|file| file.file_name == "/project/types/api.d.mts")
+            .unwrap();
+        assert_eq!(
+            declaration.text,
+            "export declare const version: number;\nexport declare function identity<T>(value: T): T;\nexport interface Box<T> {\n  value: T;\n}\nexport type Maybe<T> = T | undefined;\nexport declare enum Color {\n  Red,\n  Blue = 2,\n}\n//# sourceMappingURL=api.d.mts.map\n"
+        );
+        assert!(
+            emitted
+                .files
+                .iter()
+                .any(|file| file.file_name == "/project/types/api.d.mts.map")
+        );
+        assert!(
+            emitted
+                .files
+                .iter()
+                .any(|file| file.file_name == "/project/dist/api.mjs")
+        );
+    }
+
+    #[test]
+    fn emit_declaration_only_suppresses_javascript() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/tsconfig.json",
+            r#"{
+                "files": ["src/index.ts"],
+                "compilerOptions": { "outDir": "types", "emitDeclarationOnly": true }
+            }"#,
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/src/index.ts",
+            "export const value: string = 'ok';",
+        )
+        .unwrap();
+        let program = Program::from_config(&fs, "/project/tsconfig.json");
+        let emitted = program.emit();
+        assert_eq!(emitted.files.len(), 1);
+        assert_eq!(emitted.files[0].file_name, "/project/types/index.d.ts");
+        assert_eq!(
+            emitted.files[0].text,
+            "export declare const value: string;\n"
         );
     }
 }
