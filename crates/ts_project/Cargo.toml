@@ -12,6 +12,7 @@ ts_diagnostics = { path = "../ts_diagnostics" }
 ts_incremental = { path = "../ts_incremental" }
 ts_outputpaths = { path = "../ts_outputpaths" }
 ts_path = { path = "../ts_path" }
+ts_printer = { path = "../ts_printer" }
 ts_vfs = { path = "../ts_vfs" }
 
 [lints]

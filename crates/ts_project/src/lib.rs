@@ -9,8 +9,9 @@ use ts_compiler::{EmitOutput, Program, ProgramOptionsOverride};
 use ts_config::resolve_config_file;
 use ts_core::TextRange;
 use ts_diagnostics::message_by_code;
-use ts_incremental::{BuildDecision, BuildInfo};
+use ts_incremental::{BuildDecision, BuildInfo, hash_text};
 use ts_path::{change_extension, is_absolute, normalize_path, resolve_path};
+use ts_printer::emit_declaration_file;
 use ts_vfs::FileSystem;
 
 /// A diagnostic produced while loading a project graph.
@@ -124,8 +125,9 @@ pub fn build_projects(
         );
         if enabled
             && BuildInfo::decision(previous.as_ref(), &preliminary, |path| {
-                file_system.file_exists(path)
+                output_is_current(file_system, path, config_path, &preliminary)
             }) == BuildDecision::UpToDate
+            && output_is_current(file_system, &build_info_path, config_path, &preliminary)
         {
             signatures.insert(config_path.clone(), preliminary.project_signature());
             skipped.push(config_path.clone());
@@ -180,6 +182,58 @@ fn project_build_info(
         dependencies,
         outputs,
     )
+    .with_declaration_signature(declaration_signature(program))
+}
+
+fn declaration_signature(program: &Program) -> String {
+    let mut declarations = program
+        .source_files()
+        .iter()
+        .filter(|source| !source.is_default_library)
+        .map(|source| {
+            let text = if ts_path::is_declaration_file(&source.file_name) {
+                source.source_text.clone()
+            } else {
+                emit_declaration_file(
+                    &source.parse.arena,
+                    source.parse.source_file,
+                    &source.file_name,
+                    &source.source_text,
+                    false,
+                )
+                .map_or_else(|_| source.source_text.clone(), |emitted| emitted.code)
+            };
+            (source.file_name.as_str(), text)
+        })
+        .collect::<Vec<_>>();
+    declarations.sort_by_key(|(path, _)| *path);
+    let mut serialized = String::new();
+    for (path, text) in declarations {
+        serialized.push_str(&path.len().to_string());
+        serialized.push(':');
+        serialized.push_str(path);
+        serialized.push_str(&text.len().to_string());
+        serialized.push(':');
+        serialized.push_str(&text);
+    }
+    hash_text(&serialized)
+}
+
+fn output_is_current(
+    file_system: &dyn FileSystem,
+    output: &str,
+    config_path: &str,
+    info: &BuildInfo,
+) -> bool {
+    let Some(output_time) = file_system.modified_time(output) else {
+        return false;
+    };
+    info.files
+        .keys()
+        .map(String::as_str)
+        .chain(std::iter::once(config_path))
+        .filter_map(|path| file_system.modified_time(path))
+        .all(|input_time| input_time <= output_time)
 }
 
 struct GraphLoader<'a> {
@@ -306,9 +360,25 @@ fn render_message(code: u32, arguments: &[&str]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use ts_compiler::ProgramOptionsOverride;
     use ts_vfs::{FileSystem, MemoryFileSystem};
 
-    use super::load_project_graph;
+    use super::{BuildResult, build_projects, load_project_graph};
+
+    fn write_build_outputs(file_system: &MemoryFileSystem, result: BuildResult) {
+        for project in result.projects {
+            for output in project.emit.files {
+                file_system
+                    .write_file(&output.file_name, &output.text)
+                    .unwrap();
+            }
+            if let Some(build_info) = project.build_info {
+                file_system
+                    .write_file(&build_info.file_name, &build_info.text)
+                    .unwrap();
+            }
+        }
+    }
 
     #[test]
     fn orders_dependencies_before_consumers() {
@@ -376,5 +446,83 @@ mod tests {
                 .message
                 .contains("missing/tsconfig.json")
         );
+    }
+
+    #[test]
+    fn only_declaration_changes_invalidate_consumers() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/repo/tsconfig.json",
+            r#"{"files":[],"include":[],"references":[{"path":"./app"},{"path":"./lib"}]}"#,
+        )
+        .unwrap();
+        fs.write_file(
+            "/repo/lib/tsconfig.json",
+            r#"{"files":["index.ts"],"compilerOptions":{"composite":true,"noLib":true,"outDir":"dist"}}"#,
+        )
+        .unwrap();
+        fs.write_file(
+            "/repo/lib/index.ts",
+            "export function value(): number { return 1; }\n",
+        )
+        .unwrap();
+        fs.write_file(
+            "/repo/app/tsconfig.json",
+            r#"{"files":["index.ts"],"references":[{"path":"../lib"}],"compilerOptions":{"composite":true,"noLib":true,"outDir":"dist"}}"#,
+        )
+        .unwrap();
+        fs.write_file("/repo/app/index.ts", "export const app = true;\n")
+            .unwrap();
+
+        write_build_outputs(
+            &fs,
+            build_projects(
+                &fs,
+                "/repo",
+                &["tsconfig.json".into()],
+                ProgramOptionsOverride::default(),
+                true,
+            ),
+        );
+        fs.write_file(
+            "/repo/lib/index.ts",
+            "export function value(): number { return 2; }\n",
+        )
+        .unwrap();
+        let implementation_change = build_projects(
+            &fs,
+            "/repo",
+            &["tsconfig.json".into()],
+            ProgramOptionsOverride::default(),
+            true,
+        );
+        assert_eq!(
+            implementation_change
+                .projects
+                .iter()
+                .map(|project| project.config_path.as_str())
+                .collect::<Vec<_>>(),
+            ["/repo/lib/tsconfig.json"]
+        );
+        assert_eq!(
+            implementation_change.projects[0].config_path,
+            "/repo/lib/tsconfig.json"
+        );
+        write_build_outputs(&fs, implementation_change);
+
+        fs.write_file(
+            "/repo/lib/index.ts",
+            "export function value(): string { return 'two'; }\n",
+        )
+        .unwrap();
+        let declaration_change = build_projects(
+            &fs,
+            "/repo",
+            &["tsconfig.json".into()],
+            ProgramOptionsOverride::default(),
+            true,
+        );
+        assert_eq!(declaration_change.projects.len(), 3);
+        assert!(declaration_change.skipped.is_empty());
     }
 }

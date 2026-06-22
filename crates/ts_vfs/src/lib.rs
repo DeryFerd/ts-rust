@@ -3,7 +3,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
-use std::sync::RwLock;
+use std::sync::{
+    RwLock,
+    atomic::{AtomicU64, Ordering},
+};
+use std::time::UNIX_EPOCH;
 
 /// The immediate children of a directory, sorted by name.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -20,6 +24,9 @@ pub trait FileSystem: Send + Sync {
     fn file_exists(&self, path: &str) -> bool;
 
     fn directory_exists(&self, path: &str) -> bool;
+
+    /// Returns a monotonically comparable last-modified value for a file.
+    fn modified_time(&self, path: &str) -> Option<u128>;
 
     /// Reads a UTF-8 text file.
     ///
@@ -126,6 +133,16 @@ impl FileSystem for OsFileSystem {
         fs::metadata(normalize_path(path)).is_ok_and(|metadata| metadata.is_dir())
     }
 
+    fn modified_time(&self, path: &str) -> Option<u128> {
+        fs::metadata(normalize_path(path))
+            .ok()?
+            .modified()
+            .ok()?
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .map(|duration| duration.as_nanos())
+    }
+
     fn read_file(&self, path: &str) -> io::Result<String> {
         fs::read_to_string(normalize_path(path))
     }
@@ -161,6 +178,7 @@ impl FileSystem for OsFileSystem {
 struct MemoryFile {
     path: String,
     contents: String,
+    modified_time: u128,
 }
 
 /// A deterministic, thread-safe file system for compiler tests.
@@ -168,6 +186,7 @@ struct MemoryFile {
 pub struct MemoryFileSystem {
     case_sensitive: bool,
     files: RwLock<BTreeMap<String, MemoryFile>>,
+    clock: AtomicU64,
 }
 
 impl MemoryFileSystem {
@@ -176,6 +195,7 @@ impl MemoryFileSystem {
         Self {
             case_sensitive,
             files: RwLock::new(BTreeMap::new()),
+            clock: AtomicU64::new(0),
         }
     }
 
@@ -244,6 +264,15 @@ impl FileSystem for MemoryFileSystem {
         self.normalized_directory_exists(&normalize_path(path))
     }
 
+    fn modified_time(&self, path: &str) -> Option<u128> {
+        let canonical = self.canonical_path(path);
+        self.files
+            .read()
+            .ok()?
+            .get(&canonical)
+            .map(|file| file.modified_time)
+    }
+
     fn read_file(&self, path: &str) -> io::Result<String> {
         let canonical = self.canonical_path(path);
         self.files
@@ -263,15 +292,20 @@ impl FileSystem for MemoryFileSystem {
             ));
         }
         let canonical = self.canonical_path(&normalized);
+        let modified_time = u128::from(self.clock.fetch_add(1, Ordering::Relaxed) + 1);
         let mut files = self.files.write().map_err(|_| Self::lock_error())?;
         match files.get_mut(&canonical) {
-            Some(file) => contents.clone_into(&mut file.contents),
+            Some(file) => {
+                contents.clone_into(&mut file.contents);
+                file.modified_time = modified_time;
+            }
             None => {
                 files.insert(
                     canonical,
                     MemoryFile {
                         path: normalized,
                         contents: contents.to_owned(),
+                        modified_time,
                     },
                 );
             }

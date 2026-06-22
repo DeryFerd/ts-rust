@@ -194,3 +194,66 @@ fn composite_project_uses_configured_build_info_path() {
     assert!(run(&directory.0, &arguments).status.success());
     assert_eq!(fs::read_to_string(output).unwrap(), "composite sentinel");
 }
+
+#[test]
+fn implementation_only_changes_do_not_rebuild_consumers() {
+    let directory = TestDirectory::new("implementation-signature");
+    write_project(&directory.0);
+    fs::write(
+        directory.0.join("packages/lib/index.ts"),
+        "export function libraryValue(): number { return 1; }\n",
+    )
+    .unwrap();
+    let arguments = ["--build", "--incremental", "--pretty", "false"];
+    assert!(run(&directory.0, &arguments).status.success());
+    let library_output = directory.0.join("packages/lib/dist/index.js");
+    let application_output = directory.0.join("packages/app/dist/index.js");
+    fs::write(&library_output, "library sentinel").unwrap();
+    fs::write(&application_output, "application sentinel").unwrap();
+
+    fs::write(
+        directory.0.join("packages/lib/index.ts"),
+        "export function libraryValue(): number { return 2; }\n",
+    )
+    .unwrap();
+    assert!(run(&directory.0, &arguments).status.success());
+    assert_ne!(
+        fs::read_to_string(library_output).unwrap(),
+        "library sentinel"
+    );
+    assert_eq!(
+        fs::read_to_string(application_output).unwrap(),
+        "application sentinel"
+    );
+}
+
+#[test]
+fn stale_or_missing_outputs_are_rebuilt_with_deterministic_build_info() {
+    let directory = TestDirectory::new("output-freshness");
+    fs::write(
+        directory.0.join("tsconfig.json"),
+        r#"{"files":["main.ts"],"compilerOptions":{"composite":true,"noLib":true,"outDir":"dist"}}"#,
+    )
+    .unwrap();
+    let source = directory.0.join("main.ts");
+    fs::write(&source, "export const value: number = 1;\n").unwrap();
+    let arguments = ["--build", "--pretty", "false"];
+    assert!(run(&directory.0, &arguments).status.success());
+    let output = directory.0.join("dist/main.js");
+    let build_info = directory.0.join("tsconfig.tsbuildinfo");
+    let original_build_info = fs::read_to_string(&build_info).unwrap();
+
+    fs::remove_file(&output).unwrap();
+    assert!(run(&directory.0, &arguments).status.success());
+    assert!(output.is_file());
+    assert_eq!(
+        fs::read_to_string(&build_info).unwrap(),
+        original_build_info
+    );
+
+    fs::write(&output, "stale sentinel").unwrap();
+    fs::write(&source, "export const value: number = 1;\n").unwrap();
+    assert!(run(&directory.0, &arguments).status.success());
+    assert_ne!(fs::read_to_string(output).unwrap(), "stale sentinel");
+    assert_eq!(fs::read_to_string(build_info).unwrap(), original_build_info);
+}

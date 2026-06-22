@@ -525,6 +525,7 @@ dependencies = [
  "ts_incremental",
  "ts_outputpaths",
  "ts_path",
+ "ts_printer",
  "ts_vfs",
 ]
 

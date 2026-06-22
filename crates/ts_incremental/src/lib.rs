@@ -15,6 +15,8 @@ pub struct BuildInfo {
     pub files: BTreeMap<String, String>,
     pub dependencies: BTreeMap<String, String>,
     pub outputs: Vec<String>,
+    #[serde(default)]
+    pub declaration_signature: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -56,16 +58,25 @@ impl BuildInfo {
     ) -> Self {
         outputs.sort();
         outputs.dedup();
+        let files = files
+            .into_iter()
+            .map(|(path, text)| (path, hash_text(&text)))
+            .collect::<BTreeMap<_, _>>();
+        let declaration_signature = hash_entries(&files);
         Self {
             version: version.into(),
             options_hash: hash_text(options),
-            files: files
-                .into_iter()
-                .map(|(path, text)| (path, hash_text(&text)))
-                .collect(),
+            files,
             dependencies,
             outputs,
+            declaration_signature,
         }
+    }
+
+    #[must_use]
+    pub fn with_declaration_signature(mut self, signature: impl Into<String>) -> Self {
+        self.declaration_signature = signature.into();
+        self
     }
 
     /// # Errors
@@ -99,6 +110,7 @@ impl BuildInfo {
                 && previous.files == current.files
                 && previous.dependencies == current.dependencies
                 && previous.outputs == current.outputs
+                && previous.declaration_signature == current.declaration_signature
                 && previous.outputs.iter().all(|path| output_exists(path))
         });
         if unchanged {
@@ -126,9 +138,21 @@ impl BuildInfo {
 
     #[must_use]
     pub fn project_signature(&self) -> String {
-        self.to_json()
-            .map_or_else(|_| hash_text("invalid"), |json| hash_text(&json))
+        self.declaration_signature.clone()
     }
+}
+
+fn hash_entries(entries: &BTreeMap<String, String>) -> String {
+    let mut serialized = String::new();
+    for (path, value) in entries {
+        serialized.push_str(&path.len().to_string());
+        serialized.push(':');
+        serialized.push_str(path);
+        serialized.push_str(&value.len().to_string());
+        serialized.push(':');
+        serialized.push_str(value);
+    }
+    hash_text(&serialized)
 }
 
 #[must_use]
@@ -163,6 +187,35 @@ mod tests {
         let first = info("const x = 1;", "a");
         let json = first.to_json().unwrap();
         assert_eq!(BuildInfo::from_json(&json, "1").unwrap(), first);
+
+        let ordered = BuildInfo::new(
+            "1",
+            "options",
+            [("/a.ts".into(), "a".into()), ("/b.ts".into(), "b".into())],
+            BTreeMap::new(),
+            vec!["/b.js".into(), "/a.js".into()],
+        );
+        let reversed = BuildInfo::new(
+            "1",
+            "options",
+            [("/b.ts".into(), "b".into()), ("/a.ts".into(), "a".into())],
+            BTreeMap::new(),
+            vec!["/a.js".into(), "/b.js".into()],
+        );
+        assert_eq!(ordered.to_json().unwrap(), reversed.to_json().unwrap());
+    }
+
+    #[test]
+    fn project_signature_is_independent_of_implementation_state() {
+        let first = info("const implementation = 1;", "a").with_declaration_signature("public-api");
+        let second =
+            info("const implementation = 2;", "a").with_declaration_signature("public-api");
+        assert_ne!(first.files, second.files);
+        assert_eq!(first.project_signature(), second.project_signature());
+        assert_eq!(
+            BuildInfo::decision(Some(&first), &second, |_| true),
+            BuildDecision::Affected
+        );
     }
 
     #[test]
