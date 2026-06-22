@@ -4178,6 +4178,11 @@ impl<'a> Checker<'a> {
                         .copied()
                 })
                 .unwrap_or_else(|| self.result.types.any());
+            let parameter_type = if parameter_data.type_.is_none() {
+                self.javascript_contextual_parameter_type(parameter_type)
+            } else {
+                parameter_type
+            };
             if let Some(name) = self.property_name(parameter_data.name) {
                 local_scope.insert(name, parameter_type);
             }
@@ -4270,6 +4275,11 @@ impl<'a> Checker<'a> {
                         .copied()
                 })
                 .unwrap_or_else(|| self.result.types.any());
+            let parameter_type = if parameter_data.type_.is_none() {
+                self.javascript_contextual_parameter_type(parameter_type)
+            } else {
+                parameter_type
+            };
             if let Some(name) = self.property_name(parameter_data.name) {
                 local_scope.insert(name, parameter_type);
             }
@@ -4298,6 +4308,16 @@ impl<'a> Checker<'a> {
     fn property_access_type(&mut self, node: NodeId, receiver: TypeId, name: &str) -> TypeId {
         if let Some(property) = self.lookup_property_type(receiver, name) {
             property
+        } else if self.options.is_javascript_file && self.is_assignment_left_hand_side(node) {
+            let property = self.result.types.any();
+            if let Some(Type {
+                kind: TypeKind::Object(object),
+                ..
+            }) = self.result.types.types.get_mut(receiver.index())
+            {
+                object.properties.insert(name.to_owned(), property);
+            }
+            property
         } else {
             self.error(
                 node,
@@ -4306,6 +4326,35 @@ impl<'a> Checker<'a> {
             );
             self.result.types.any()
         }
+    }
+
+    fn javascript_contextual_parameter_type(&self, type_id: TypeId) -> TypeId {
+        if self.options.is_javascript_file
+            && matches!(
+                self.result.types.get(type_id).map(|type_| &type_.kind),
+                Some(TypeKind::Array(element)) if *element == self.result.types.unknown()
+            )
+        {
+            self.result.types.any()
+        } else {
+            type_id
+        }
+    }
+
+    fn is_assignment_left_hand_side(&self, node: NodeId) -> bool {
+        let Some(parent) = self.arena.get(node).and_then(|node| node.parent) else {
+            return false;
+        };
+        let Some(NodeData::BinaryExpression(binary)) =
+            self.arena.get(parent).map(|node| &node.data)
+        else {
+            return false;
+        };
+        binary.left == node
+            && self
+                .arena
+                .get(binary.operator_token)
+                .is_some_and(|operator| operator.kind == SyntaxKind::EqualsToken)
     }
 
     fn property_receiver_display(&self, receiver: TypeId) -> String {
@@ -8195,6 +8244,93 @@ mod tests {
     }
 
     #[test]
+    fn supports_javascript_expando_writes_without_suppressing_missing_reads() {
+        let parsed = parse_source_file(
+            r"
+                const module = {};
+                module.exports = 1;
+                module.exports;
+                const other = {};
+                other.missing;
+            ",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let javascript = check_source_file_with_options(
+            &parsed.arena,
+            parsed.source_file,
+            &bindings,
+            CheckerOptions {
+                is_javascript_file: true,
+                ..CheckerOptions::default()
+            },
+        );
+        assert_eq!(
+            javascript
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2339]
+        );
+        let module = bindings
+            .root_scope()
+            .unwrap()
+            .symbols
+            .get("module")
+            .unwrap();
+        let module_type = javascript.type_of_symbol(module).unwrap();
+        let TypeKind::Object(module) = &javascript.types.get(module_type).unwrap().kind else {
+            panic!("expected module object");
+        };
+        assert_eq!(module.properties["exports"], javascript.types.any());
+
+        let typescript = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        assert_eq!(
+            typescript
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2339, 2339, 2339]
+        );
+    }
+
+    #[test]
+    fn relaxes_only_unannotated_javascript_parameters_from_unknown_rest_contexts() {
+        let parsed = parse_source_file(
+            r"
+                declare function use(callback: (...values: unknown[]) => void): void;
+                use(value => value.allowedByJsContext);
+                const explicit = (value: unknown[]) => value.stillChecked;
+            ",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let javascript = check_source_file_with_options(
+            &parsed.arena,
+            parsed.source_file,
+            &bindings,
+            CheckerOptions {
+                is_javascript_file: true,
+                ..CheckerOptions::default()
+            },
+        );
+        assert_eq!(
+            javascript
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2339]
+        );
+        assert_eq!(
+            javascript.diagnostics[0].diagnostic.render().unwrap(),
+            "Property 'stillChecked' does not exist on type 'unknown[]'."
+        );
+    }
+
+    #[test]
     fn instantiates_parsed_generic_and_non_generic_aliases() {
         let parsed = parse_source_file(
             r#"
@@ -9174,6 +9310,96 @@ mod tests {
                 assert!(!meanings.contains_key(&node));
             }
         }
+    }
+
+    #[test]
+    fn checks_amd_like_javascript_module_exports_expando() {
+        let typing = parse_source_file(
+            "declare function define<T=unknown>(name: string, modules: string[], ready: (...modules: unknown[]) => T);",
+        );
+        let base = parse_source_file(
+            r#"
+                declare module "deps/BaseClass" {
+                    class BaseClass {
+                        static extends<A>(a: A): new () => A & BaseClass;
+                    }
+                    export = BaseClass;
+                }
+            "#,
+        );
+        let extended = parse_source_file(
+            r#"
+                define("lib/ExtendedClass", ["deps/BaseClass"],
+                /**
+                 * {typeof import("deps/BaseClass")}
+                 * @param {typeof import("deps/BaseClass")} BaseClass
+                 * @returns
+                 */
+                (BaseClass) => {
+                    const ExtendedClass = BaseClass.extends({
+                        f: function() { return "something"; }
+                    });
+                    const module = {};
+                    module.exports = ExtendedClass;
+                    return module.exports;
+                });
+            "#,
+        );
+        assert!(typing.diagnostics.is_empty(), "{:?}", typing.diagnostics);
+        assert!(base.diagnostics.is_empty(), "{:?}", base.diagnostics);
+        assert!(
+            extended.diagnostics.is_empty(),
+            "{:?}",
+            extended.diagnostics
+        );
+        let typing_bindings = bind_source_file(&typing.arena, typing.source_file);
+        let base_bindings = bind_source_file(&base.arena, base.source_file);
+        let extended_bindings = bind_source_file(&extended.arena, extended.source_file);
+        let no_modules = BTreeMap::new();
+        let extended_modules = BTreeMap::from([("deps/BaseClass".into(), 1)]);
+        let checked = check_program(&[
+            ProgramSource {
+                arena: &typing.arena,
+                source_file: typing.source_file,
+                bindings: &typing_bindings,
+                resolved_modules: &no_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions {
+                    is_declaration_file: true,
+                    ..CheckerOptions::default()
+                },
+            },
+            ProgramSource {
+                arena: &base.arena,
+                source_file: base.source_file,
+                bindings: &base_bindings,
+                resolved_modules: &no_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions {
+                    is_declaration_file: true,
+                    ..CheckerOptions::default()
+                },
+            },
+            ProgramSource {
+                arena: &extended.arena,
+                source_file: extended.source_file,
+                bindings: &extended_bindings,
+                resolved_modules: &extended_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions {
+                    is_javascript_file: true,
+                    ..CheckerOptions::default()
+                },
+            },
+        ]);
+        assert!(
+            checked.files[2].diagnostics.is_empty(),
+            "{:?}",
+            checked.files[2].diagnostics
+        );
     }
 
     #[test]
