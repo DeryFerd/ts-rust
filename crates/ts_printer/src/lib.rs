@@ -4151,7 +4151,7 @@ impl Printer<'_> {
             self.emit_source_comments_between_with_trailing(
                 previous_end,
                 statement_node.range.start.get(),
-                previous_emitted,
+                previous_emitted || previous_end == node.range.start.get().saturating_add(1),
             );
             self.emit_statement(*statement)?;
             previous_end = statement_node.range.end.get();
@@ -4168,9 +4168,7 @@ impl Printer<'_> {
     }
 
     fn emit_function_body(&mut self, body: NodeId) -> Result<(), EmitError> {
-        if self.commonjs_module_transform
-            && let Some(statement) = self.single_line_body_statement(body)?
-        {
+        if let Some(statement) = self.single_line_body_statement(body)? {
             self.writer.write("{ ");
             self.emit_statement(statement)?;
             self.writer.remove_trailing_newline();
@@ -4365,7 +4363,7 @@ impl Printer<'_> {
                     self.emit_expression(method.name, 0)?;
                     self.emit_parameters(&method.parameters)?;
                     self.writer.write(" ");
-                    self.emit_block(method.body.expect("body checked above"))?;
+                    self.emit_function_body(method.body.expect("body checked above"))?;
                     self.writer.newline();
                 }
                 NodeData::MethodDeclaration(_) => {}
@@ -4882,7 +4880,7 @@ impl Printer<'_> {
                         self.writer.write(" ");
                         self.emit_parameters(&method.parameters)?;
                         self.writer.write(" ");
-                        self.emit_block(method.body.expect("body checked"))?;
+                        self.emit_function_body(method.body.expect("body checked"))?;
                         self.writer.write(";");
                         self.writer.newline();
                     }
@@ -6748,7 +6746,7 @@ impl Printer<'_> {
                             self.emit_expression(method.name, 0)?;
                             self.emit_parameters(&method.parameters)?;
                             self.writer.write(" ");
-                            self.emit_block(method.body.expect("body checked above"))?;
+                            self.emit_function_body(method.body.expect("body checked above"))?;
                         }
                         NodeData::GetAccessorDeclaration(accessor) => {
                             self.writer.write("get ");
@@ -6847,12 +6845,14 @@ impl Printer<'_> {
                 }
                 self.emit_parameters(&data.parameters)?;
                 self.writer.write(" ");
-                if let Some(expression) = self.single_line_return_expression(data.body)? {
+                if self.source_text.is_empty()
+                    && let Some(expression) = self.single_line_return_expression(data.body)?
+                {
                     self.writer.write("{ return ");
                     self.emit_expression(expression, 0)?;
                     self.writer.write("; }");
                 } else {
-                    self.emit_block(data.body)?;
+                    self.emit_function_body(data.body)?;
                 }
                 if wrap {
                     self.writer.write(")");
@@ -7552,7 +7552,7 @@ impl Printer<'_> {
                 self.emit_expression(method.name, 0)?;
                 self.emit_parameters(&method.parameters)?;
                 self.writer.write(" ");
-                self.emit_block(method.body.expect("body checked above"))?;
+                self.emit_function_body(method.body.expect("body checked above"))?;
             }
             NodeData::GetAccessorDeclaration(accessor) => {
                 self.writer.write("get ");
@@ -7709,6 +7709,19 @@ impl Printer<'_> {
         if self.node_source_is_multiline(block) {
             return Ok(None);
         }
+        let statement_node = self.node(*statement)?;
+        if self.statement_contains_class_expression(*statement)? {
+            return Ok(None);
+        }
+        if self.source_range_contains_comment(
+            node.range.start.get().saturating_add(1),
+            statement_node.range.start.get(),
+        ) || self.source_range_contains_comment(
+            statement_node.range.end.get(),
+            node.range.end.get().saturating_sub(1),
+        ) {
+            return Ok(None);
+        }
         Ok(matches!(
             &self.node(*statement)?.data,
             NodeData::ExpressionStatement(_)
@@ -7716,6 +7729,51 @@ impl Printer<'_> {
                 | NodeData::ThrowStatement(_)
         )
         .then_some(*statement))
+    }
+
+    fn source_range_contains_comment(&self, start: u32, end: u32) -> bool {
+        let start = usize::try_from(start).unwrap_or(usize::MAX);
+        let end = usize::try_from(end).unwrap_or(usize::MAX);
+        self.source_text
+            .get(start..end)
+            .is_some_and(|text| text.contains("//") || text.contains("/*"))
+    }
+
+    fn statement_contains_class_expression(&self, statement: NodeId) -> Result<bool, EmitError> {
+        let expression = match &self.node(statement)?.data {
+            NodeData::ExpressionStatement(data) => Some(data.expression),
+            NodeData::ReturnStatement(data) => data.expression,
+            NodeData::ThrowStatement(data) => Some(data.expression),
+            _ => None,
+        };
+        Ok(expression
+            .is_some_and(|expression| self.expression_contains_class_expression(expression)))
+    }
+
+    fn expression_contains_class_expression(&self, expression: NodeId) -> bool {
+        match self.arena.get(expression).map(|node| &node.data) {
+            Some(NodeData::ClassExpression(_)) => true,
+            Some(NodeData::ParenthesizedExpression(data)) => {
+                self.expression_contains_class_expression(data.expression)
+            }
+            Some(NodeData::AsExpression(data)) => {
+                self.expression_contains_class_expression(data.expression)
+            }
+            Some(NodeData::SatisfiesExpression(data)) => {
+                self.expression_contains_class_expression(data.expression)
+            }
+            Some(NodeData::TypeAssertion(data)) => {
+                self.expression_contains_class_expression(data.expression)
+            }
+            Some(NodeData::BinaryExpression(data)) => {
+                self.expression_contains_class_expression(data.left)
+                    || self.expression_contains_class_expression(data.right)
+            }
+            Some(NodeData::TypeOfExpression(data)) => {
+                self.expression_contains_class_expression(data.expression)
+            }
+            _ => false,
+        }
     }
 
     fn node_source_is_multiline(&self, id: NodeId) -> bool {
@@ -8254,6 +8312,24 @@ mod tests {
         assert_eq!(
             emit_with(source, ScriptTarget::Es2015, ModuleKind::CommonJs).code,
             "function compact() { return 1; }\nfunction multiline() {\n}\nclass Box {\n    constructor(value) {\n        this.value = value;\n    }\n    set item(next) { next = 1; }\n}\n"
+        );
+    }
+
+    #[test]
+    fn emits_source_compact_function_and_method_bodies_for_es_modules() {
+        let source = "function declared(value: number) { return value; }\nconst expression = function () { value; };\nclass Box { method(value: number) { return value; } }\nconst object = { method() { value; } };";
+        assert_eq!(
+            emit_with(source, ScriptTarget::Es2015, ModuleKind::EsNext).code,
+            "function declared(value) { return value; }\nconst expression = function () { value; };\nclass Box {\n    method(value) { return value; }\n}\nconst object = { method() { value; } };\n"
+        );
+    }
+
+    #[test]
+    fn keeps_comment_bearing_and_source_multiline_function_bodies_expanded() {
+        let source = "function commented() { /* keep */ return 1; }\nfunction multiline() {\n    return 2;\n}";
+        assert_eq!(
+            emit_with(source, ScriptTarget::Es2015, ModuleKind::EsNext).code,
+            "function commented() { /* keep */\n    return 1;\n}\nfunction multiline() {\n    return 2;\n}\n"
         );
     }
 
@@ -8815,7 +8891,7 @@ mod tests {
         );
         assert_eq!(
             result.code,
-            "var __extends = (this && this.__extends) || (function () {\n    var extendStatics = function (d, b) {\n        extendStatics = Object.setPrototypeOf ||\n            ({ __proto__: [] } instanceof Array && function (d, b) { d.__proto__ = b; }) ||\n            function (d, b) { for (var p in b) if (Object.prototype.hasOwnProperty.call(b, p)) d[p] = b[p]; };\n        return extendStatics(d, b);\n    };\n    return function (d, b) {\n        if (typeof b !== \"function\" && b !== null)\n            throw new TypeError(\"Class extends value \" + String(b) + \" is not a constructor or null\");\n        extendStatics(d, b);\n        function __() { this.constructor = d; }\n        d.prototype = b === null ? Object.create(b) : (__.prototype = b.prototype, new __());\n    };\n})();\nvar Point = /** @class */ (function () {\n    function Point(y) {\n        this.x = 1;\n        this.y = y;\n    }\n    Point.prototype.move = function (d) {\n        this.x = this.x + d;\n    };\n    Point.make = function () {\n        return new Point(0);\n    };\n    Point.origin = 0;\n    return Point;\n}());\nvar ColoredPoint = /** @class */ (function (_super) {\n    __extends(ColoredPoint, _super);\n    function ColoredPoint(y) {\n        var _this = _super.call(this, y) || this;\n        _this.color = 'red';\n        _this.color = 'blue';\n        return _this;\n    }\n    ColoredPoint.prototype.paint = function () {\n        return this.color;\n    };\n    return ColoredPoint;\n}(Point));\n"
+            "var __extends = (this && this.__extends) || (function () {\n    var extendStatics = function (d, b) {\n        extendStatics = Object.setPrototypeOf ||\n            ({ __proto__: [] } instanceof Array && function (d, b) { d.__proto__ = b; }) ||\n            function (d, b) { for (var p in b) if (Object.prototype.hasOwnProperty.call(b, p)) d[p] = b[p]; };\n        return extendStatics(d, b);\n    };\n    return function (d, b) {\n        if (typeof b !== \"function\" && b !== null)\n            throw new TypeError(\"Class extends value \" + String(b) + \" is not a constructor or null\");\n        extendStatics(d, b);\n        function __() { this.constructor = d; }\n        d.prototype = b === null ? Object.create(b) : (__.prototype = b.prototype, new __());\n    };\n})();\nvar Point = /** @class */ (function () {\n    function Point(y) {\n        this.x = 1;\n        this.y = y;\n    }\n    Point.prototype.move = function (d) { this.x = this.x + d; };\n    Point.make = function () { return new Point(0); };\n    Point.origin = 0;\n    return Point;\n}());\nvar ColoredPoint = /** @class */ (function (_super) {\n    __extends(ColoredPoint, _super);\n    function ColoredPoint(y) {\n        var _this = _super.call(this, y) || this;\n        _this.color = 'red';\n        _this.color = 'blue';\n        return _this;\n    }\n    ColoredPoint.prototype.paint = function () { return this.color; };\n    return ColoredPoint;\n}(Point));\n"
         );
     }
 
@@ -8852,9 +8928,7 @@ mod tests {
             emit_with(named, ScriptTarget::Es2015, ModuleKind::EsNext).code,
             concat!(
                 "const Value = class Inner {\n",
-                "    method() {\n",
-                "        return 1;\n",
-                "    }\n",
+                "    method() { return 1; }\n",
                 "};\n",
             )
         );
@@ -8864,9 +8938,7 @@ mod tests {
                 "var Value = /** @class */ (function () {\n",
                 "    function Inner() {\n",
                 "    }\n",
-                "    Inner.prototype.method = function () {\n",
-                "        return 1;\n",
-                "    };\n",
+                "    Inner.prototype.method = function () { return 1; };\n",
                 "    return Inner;\n",
                 "}());\n",
             )
@@ -8930,7 +9002,7 @@ mod tests {
         );
         assert_eq!(
             result.code,
-            "class Box {\n    constructor() {\n        this.value = 1;\n    }\n    read() {\n        return this.value;\n    }\n}\n"
+            "class Box {\n    constructor() {\n        this.value = 1;\n    }\n    read() { return this.value; }\n}\n"
         );
     }
 
@@ -9331,7 +9403,7 @@ class Board {
         );
         assert_eq!(
             result.code,
-            "export const value = 1;\nexport default function read() {\n    return value;\n}\n"
+            "export const value = 1;\nexport default function read() { return value; }\n"
         );
     }
 
