@@ -332,6 +332,7 @@ struct Parser<'a> {
     language_variant: LanguageVariant,
     arena: NodeArena,
     diagnostics: Vec<Diagnostic>,
+    invalid_token_recovery_ranges: Vec<TextRange>,
     amd_dependencies: Vec<AmdDependency>,
     amd_module_names: Vec<AmdModuleName>,
 }
@@ -352,6 +353,7 @@ impl<'a> Parser<'a> {
             language_variant: variant,
             arena: NodeArena::new(),
             diagnostics,
+            invalid_token_recovery_ranges: Vec::new(),
             amd_dependencies,
             amd_module_names,
         }
@@ -383,8 +385,22 @@ impl<'a> Parser<'a> {
             })),
             &children,
         );
-        self.diagnostics
-            .extend(self.scanner.diagnostics().iter().cloned());
+        for diagnostic in self.scanner.diagnostics().iter().cloned() {
+            if diagnostic.code == Some(1127)
+                && self.invalid_token_recovery_ranges.iter().any(|range| {
+                    range.start <= diagnostic.range.start && diagnostic.range.end <= range.end
+                })
+            {
+                continue;
+            }
+            self.diagnostics.push(diagnostic);
+        }
+        self.diagnostics.extend(
+            self.invalid_token_recovery_ranges
+                .iter()
+                .copied()
+                .map(|range| diagnostic_with_code(range, 1127)),
+        );
         ParseResult {
             arena: self.arena,
             source_file,
@@ -402,6 +418,17 @@ impl<'a> Parser<'a> {
         let start = self.current.full_start;
         let mut statements = Vec::new();
         while self.current.kind != terminator && self.current.kind != SyntaxKind::EndOfFile {
+            if self.current.kind == SyntaxKind::Unknown
+                || (self.current.kind == SyntaxKind::AtToken
+                    && self.next_token_kind() == SyntaxKind::Unknown)
+            {
+                if self.current.kind == SyntaxKind::AtToken {
+                    self.bump();
+                }
+                self.error_code_at(self.current.range, 1128, std::iter::empty::<String>());
+                self.recover_invalid_token_statement(terminator);
+                continue;
+            }
             if terminator == SyntaxKind::EndOfFile
                 && self.current.kind == SyntaxKind::CloseBraceToken
             {
@@ -421,6 +448,36 @@ impl<'a> Parser<'a> {
             nodes: statements,
             has_trailing_comma: false,
         }
+    }
+
+    fn recover_invalid_token_statement(&mut self, terminator: SyntaxKind) {
+        let start = self.current.range.start;
+        let mut end = self.current.range.end;
+        let mut first = true;
+        while self.current.kind != SyntaxKind::EndOfFile
+            && self.current.kind != terminator
+            && self.current.kind != SyntaxKind::CloseBraceToken
+        {
+            if !first
+                && self
+                    .current
+                    .flags
+                    .contains(ScannerTokenFlags::PRECEDING_LINE_BREAK)
+            {
+                break;
+            }
+            first = false;
+            let at_semicolon = self.current.kind == SyntaxKind::SemicolonToken;
+            if !at_semicolon {
+                end = self.current.range.end;
+            }
+            self.bump();
+            if at_semicolon {
+                break;
+            }
+        }
+        self.invalid_token_recovery_ranges
+            .push(TextRange::new(start, end));
     }
 
     fn parse_statement(&mut self) -> NodeId {
@@ -1640,14 +1697,27 @@ impl<'a> Parser<'a> {
         let parameters = self.parse_parameter_list();
         let return_type = self.parse_optional_type_annotation();
         let fallback = return_type.map_or(parameters.range.end, |node| self.node_end(node));
-        let end = self.parse_semicolon(fallback);
+        let body = if self.current.kind == SyntaxKind::OpenBraceToken {
+            let body = self.parse_block();
+            self.error_code_at(
+                self.arena.get(body).unwrap().range,
+                1183,
+                std::iter::empty::<String>(),
+            );
+            Some(body)
+        } else {
+            self.parse_semicolon(fallback);
+            None
+        };
+        let end = body.map_or(fallback, |node| self.node_end(node));
         let mut children = vec![name];
         children.extend(parameters.nodes.iter().copied());
         children.extend(return_type);
+        children.extend(body);
         let data = if kind == SyntaxKind::GetKeyword {
             NodeData::GetAccessorDeclaration(Box::new(GetAccessorDeclarationData {
                 asterisk_token: None,
-                body: None,
+                body,
                 end_flow_node: None,
                 flow_node: None,
                 full_signature: None,
@@ -1665,7 +1735,7 @@ impl<'a> Parser<'a> {
         } else {
             NodeData::SetAccessorDeclaration(Box::new(SetAccessorDeclarationData {
                 asterisk_token: None,
-                body: None,
+                body,
                 end_flow_node: None,
                 flow_node: None,
                 full_signature: None,
@@ -5949,6 +6019,124 @@ mod tests {
             panic!("expected setter");
         };
         assert!(setter.body.is_none());
+    }
+
+    #[test]
+    fn type_accessor_implementations_own_their_bodies() {
+        let source = concat!(
+            "type A = { get foo() { return 0 } };\n",
+            "type B = { set foo(v: any) { } };\n",
+            "interface X { get foo() { return 0 } }\n",
+            "interface Y { set foo(v: any) { } }\n",
+        );
+        let result = parse_source_file(source);
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .filter_map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [1183, 1183, 1183, 1183]
+        );
+
+        let statements = source_statements(&result);
+        assert_eq!(statements.len(), 4, "{:?}", result.diagnostics);
+        assert_eq!(
+            statements
+                .iter()
+                .map(|statement| result.arena.get(*statement).unwrap().kind)
+                .collect::<Vec<_>>(),
+            [
+                SyntaxKind::TypeAliasDeclaration,
+                SyntaxKind::TypeAliasDeclaration,
+                SyntaxKind::InterfaceDeclaration,
+                SyntaxKind::InterfaceDeclaration,
+            ]
+        );
+        assert!(
+            result
+                .arena
+                .iter()
+                .all(|(_, node)| node.kind != SyntaxKind::EmptyStatement)
+        );
+
+        let accessors = result
+            .arena
+            .iter()
+            .filter_map(|(id, node)| match &node.data {
+                NodeData::GetAccessorDeclaration(accessor) => Some((id, accessor.body)),
+                NodeData::SetAccessorDeclaration(accessor) => Some((id, accessor.body)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(accessors.len(), 4);
+        for (accessor, body) in accessors {
+            let body = body.expect("type accessor implementation should retain its body");
+            assert_eq!(result.arena.get(body).unwrap().kind, SyntaxKind::Block);
+            assert_eq!(result.arena.get(body).unwrap().parent, Some(accessor));
+        }
+
+        for statement in &statements[..2] {
+            let range = result.arena.get(*statement).unwrap().range;
+            assert_eq!(source.as_bytes()[range.end.get() as usize - 1], b';');
+        }
+    }
+
+    #[test]
+    fn coalesces_invalid_token_statement_tails_without_creating_statements() {
+        let source = "G@\u{0004}\u{fffd}\u{0004}G@\u{0005}\u{fffd}\u{0005}";
+        let result = parse_source_file(source);
+        let statements = source_statements(&result);
+        assert_eq!(statements.len(), 1, "{:?}", result.diagnostics);
+        let NodeData::ExpressionStatement(statement) =
+            &result.arena.get(statements[0]).unwrap().data
+        else {
+            panic!("expected the leading G expression statement");
+        };
+        let NodeData::Identifier(identifier) =
+            &result.arena.get(statement.expression).unwrap().data
+        else {
+            panic!("expected the leading G identifier");
+        };
+        assert_eq!(identifier.text, "G");
+        assert!(
+            result
+                .arena
+                .iter()
+                .all(|(_, node)| node.kind != SyntaxKind::EmptyStatement)
+        );
+
+        let invalid_character_diagnostics = result
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == Some(1127))
+            .collect::<Vec<_>>();
+        assert_eq!(invalid_character_diagnostics.len(), 1);
+        assert_eq!(invalid_character_diagnostics[0].range.start.get(), 2);
+        assert_eq!(
+            invalid_character_diagnostics[0].range.end.get(),
+            u32::try_from(source.len()).unwrap()
+        );
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == Some(1128))
+        );
+    }
+
+    #[test]
+    fn invalid_token_recovery_preserves_following_and_explicit_empty_statements() {
+        let result = parse_source_file("\u{0004} junk;\nG;;");
+        let statements = source_statements(&result);
+        assert_eq!(statements.len(), 2, "{:?}", result.diagnostics);
+        assert_eq!(
+            statements
+                .iter()
+                .map(|statement| result.arena.get(*statement).unwrap().kind)
+                .collect::<Vec<_>>(),
+            [SyntaxKind::ExpressionStatement, SyntaxKind::EmptyStatement]
+        );
     }
 
     #[test]
