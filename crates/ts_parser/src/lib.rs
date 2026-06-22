@@ -24,9 +24,9 @@ use ts_ast::{
     JsxSpreadAttributeData, JsxTextData, KeywordExpressionData, KeywordTypeNodeData,
     LabeledStatementData, LiteralTypeNodeData, MappedTypeNodeData, MethodDeclarationData,
     MethodSignatureDeclarationData, ModifierList, ModuleBlockData, ModuleDeclarationData,
-    NamedExportsData, NamedImportsData, NamespaceImportData, NewExpressionData,
-    NoSubstitutionTemplateLiteralData, Node, NodeArena, NodeData, NodeFlags, NodeId, NodeList,
-    NonNullExpressionData, NumericLiteralData, ObjectLiteralExpressionData,
+    NamedExportsData, NamedImportsData, NamespaceExportDeclarationData, NamespaceImportData,
+    NewExpressionData, NoSubstitutionTemplateLiteralData, Node, NodeArena, NodeData, NodeFlags,
+    NodeId, NodeList, NonNullExpressionData, NumericLiteralData, ObjectLiteralExpressionData,
     ParameterDeclarationData, ParenthesizedExpressionData, ParenthesizedTypeNodeData,
     PostfixUnaryExpressionData, PrefixUnaryExpressionData, PrivateIdentifierData,
     PropertyAccessExpressionData, PropertyAssignmentData, PropertyDeclarationData,
@@ -3057,6 +3057,33 @@ impl<'a> Parser<'a> {
                     }),
                 })),
                 &[export_modifier, expression],
+            );
+        }
+        if self.current.kind == SyntaxKind::AsKeyword {
+            self.bump();
+            self.expect_and_bump(
+                SyntaxKind::NamespaceKeyword,
+                "Expected 'namespace' after 'export as'.",
+            );
+            let name = self.parse_identifier("Expected a namespace export name.");
+            let end = self.parse_semicolon(self.node_end(name));
+            return self.alloc_node(
+                SyntaxKind::NamespaceExportDeclaration,
+                TextRange::new(start, end),
+                NodeData::NamespaceExportDeclaration(Box::new(NamespaceExportDeclarationData {
+                    flow_node: None,
+                    symbol: None,
+                    modifiers: Some(ModifierList {
+                        list: NodeList {
+                            range: TextRange::new(start, self.node_start(name)),
+                            nodes: vec![export_modifier],
+                            has_trailing_comma: false,
+                        },
+                        flags: ts_ast::ModifierFlags::default(),
+                    }),
+                    name,
+                })),
+                &[export_modifier, name],
             );
         }
         if self.current.kind == SyntaxKind::DefaultKeyword {
@@ -6805,6 +6832,101 @@ mod tests {
             modifier_kinds,
             [SyntaxKind::ExportKeyword, SyntaxKind::DefaultKeyword]
         );
+    }
+
+    #[test]
+    fn parses_ambient_default_and_namespace_exports_without_recovery_diagnostics() {
+        let source = concat!(
+            "export default 2 + 2;\n",
+            "export as namespace Foo;\n",
+            "declare module \"indirect\" { export default typeof Foo.default; }\n",
+        );
+        let result = parse_source_file(source);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let statements = source_statements(&result);
+        assert_eq!(statements.len(), 3);
+        assert!(matches!(
+            result.arena.get(statements[0]).unwrap().data,
+            NodeData::ExportAssignment(_)
+        ));
+        let namespace_id = statements[1];
+        let NodeData::NamespaceExportDeclaration(namespace) =
+            &result.arena.get(namespace_id).unwrap().data
+        else {
+            panic!("expected namespace export declaration");
+        };
+        let NodeData::Identifier(name) = &result.arena.get(namespace.name).unwrap().data else {
+            panic!("expected namespace export name");
+        };
+        assert_eq!(name.text, "Foo");
+        assert_eq!(
+            result.arena.get(namespace.name).unwrap().parent,
+            Some(namespace_id)
+        );
+        assert_eq!(
+            namespace
+                .modifiers
+                .as_ref()
+                .unwrap()
+                .list
+                .nodes
+                .iter()
+                .map(|modifier| result.arena.get(*modifier).unwrap().kind)
+                .collect::<Vec<_>>(),
+            [SyntaxKind::ExportKeyword]
+        );
+        let NodeData::ModuleDeclaration(module) = &result.arena.get(statements[2]).unwrap().data
+        else {
+            panic!("expected ambient module");
+        };
+        let NodeData::ModuleBlock(block) = &result.arena.get(module.body.unwrap()).unwrap().data
+        else {
+            panic!("expected ambient module block");
+        };
+        assert!(matches!(
+            result.arena.get(block.statements.nodes[0]).unwrap().data,
+            NodeData::ExportAssignment(_)
+        ));
+    }
+
+    #[test]
+    fn preserves_default_export_declaration_forms() {
+        let result = parse_source_file(concat!(
+            "export default interface Shape {}\n",
+            "export default class Model {}\n",
+            "export default function make() {}\n",
+        ));
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let statements = source_statements(&result);
+        assert_eq!(
+            statements
+                .iter()
+                .map(|statement| result.arena.get(*statement).unwrap().kind)
+                .collect::<Vec<_>>(),
+            [
+                SyntaxKind::InterfaceDeclaration,
+                SyntaxKind::ClassDeclaration,
+                SyntaxKind::FunctionDeclaration,
+            ]
+        );
+        for statement in statements {
+            let modifiers = match &result.arena.get(*statement).unwrap().data {
+                NodeData::InterfaceDeclaration(declaration) => declaration.modifiers.as_ref(),
+                NodeData::ClassDeclaration(declaration) => declaration.modifiers.as_ref(),
+                NodeData::FunctionDeclaration(declaration) => declaration.modifiers.as_ref(),
+                _ => None,
+            }
+            .unwrap();
+            assert_eq!(
+                modifiers
+                    .list
+                    .nodes
+                    .iter()
+                    .map(|modifier| result.arena.get(*modifier).unwrap().kind)
+                    .collect::<Vec<_>>(),
+                [SyntaxKind::ExportKeyword, SyntaxKind::DefaultKeyword]
+            );
+        }
     }
 
     #[test]
