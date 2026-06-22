@@ -17,7 +17,8 @@ use ts_ast::{
     ImportTypeNodeData, IndexSignatureDeclarationData, IndexedAccessTypeNodeData,
     InferTypeNodeData, InterfaceDeclarationData, IntersectionTypeNodeData, JsDocData,
     JsDocTextData, JsDocUnknownTagData, JsxAttributeData, JsxAttributesData, JsxClosingElementData,
-    JsxElementData, JsxExpressionData, JsxOpeningElementData, JsxSelfClosingElementData,
+    JsxClosingFragmentData, JsxElementData, JsxExpressionData, JsxFragmentData,
+    JsxOpeningElementData, JsxOpeningFragmentData, JsxSelfClosingElementData,
     JsxSpreadAttributeData, JsxTextData, KeywordExpressionData, KeywordTypeNodeData,
     LiteralTypeNodeData, MappedTypeNodeData, MethodDeclarationData, MethodSignatureDeclarationData,
     ModifierList, ModuleBlockData, ModuleDeclarationData, NamedExportsData, NamedImportsData,
@@ -3580,6 +3581,9 @@ impl<'a> Parser<'a> {
     fn parse_jsx_element(&mut self, resume_jsx: bool) -> NodeId {
         let start = self.current.range.start;
         self.bump();
+        if self.current.kind == SyntaxKind::GreaterThanToken {
+            return self.parse_jsx_fragment(start, resume_jsx);
+        }
         let tag_name = self.parse_identifier("Expected a JSX tag name.");
         let attributes = self.parse_jsx_attributes();
         if self.current.kind == SyntaxKind::SlashToken {
@@ -3609,6 +3613,44 @@ impl<'a> Parser<'a> {
             })),
             &[tag_name, attributes],
         );
+        let children = self.parse_jsx_children();
+        let closing_start = self.current.range.start;
+        if self.current.kind == SyntaxKind::LessThanSlashToken {
+            self.current = self.scanner.scan();
+        } else {
+            self.error_current("Expected a JSX closing tag.");
+        }
+        let closing_name = self.parse_identifier("Expected a JSX closing tag name.");
+        let end = self.finish_jsx_tag(resume_jsx);
+        let closing = self.alloc_node(
+            SyntaxKind::JsxClosingElement,
+            TextRange::new(closing_start, end),
+            NodeData::JsxClosingElement(Box::new(JsxClosingElementData {
+                tag_name: closing_name,
+            })),
+            &[closing_name],
+        );
+        let mut all_children = vec![opening];
+        all_children.extend(children.iter().copied());
+        all_children.push(closing);
+        self.alloc_node(
+            SyntaxKind::JsxElement,
+            TextRange::new(start, end),
+            NodeData::JsxElement(Box::new(JsxElementData {
+                children: NodeList {
+                    range: TextRange::new(opening_end, closing_start),
+                    nodes: children,
+                    has_trailing_comma: false,
+                },
+                closing_element: closing,
+                opening_element: opening,
+                facts: 0,
+            })),
+            &all_children,
+        )
+    }
+
+    fn parse_jsx_children(&mut self) -> Vec<NodeId> {
         let mut children = Vec::new();
         while !matches!(
             self.current.kind,
@@ -3664,36 +3706,45 @@ impl<'a> Parser<'a> {
                 }
             }
         }
+        children
+    }
+
+    fn parse_jsx_fragment(&mut self, start: TextPos, resume_jsx: bool) -> NodeId {
+        let opening_end = self.finish_jsx_tag(true);
+        let opening = self.alloc_node(
+            SyntaxKind::JsxOpeningFragment,
+            TextRange::new(start, opening_end),
+            NodeData::JsxOpeningFragment(Box::new(JsxOpeningFragmentData)),
+            &[],
+        );
+        let children = self.parse_jsx_children();
         let closing_start = self.current.range.start;
         if self.current.kind == SyntaxKind::LessThanSlashToken {
             self.current = self.scanner.scan();
         } else {
-            self.error_current("Expected a JSX closing tag.");
+            self.error_current("Expected a JSX closing fragment.");
         }
-        let closing_name = self.parse_identifier("Expected a JSX closing tag name.");
         let end = self.finish_jsx_tag(resume_jsx);
         let closing = self.alloc_node(
-            SyntaxKind::JsxClosingElement,
+            SyntaxKind::JsxClosingFragment,
             TextRange::new(closing_start, end),
-            NodeData::JsxClosingElement(Box::new(JsxClosingElementData {
-                tag_name: closing_name,
-            })),
-            &[closing_name],
+            NodeData::JsxClosingFragment(Box::new(JsxClosingFragmentData)),
+            &[],
         );
         let mut all_children = vec![opening];
         all_children.extend(children.iter().copied());
         all_children.push(closing);
         self.alloc_node(
-            SyntaxKind::JsxElement,
+            SyntaxKind::JsxFragment,
             TextRange::new(start, end),
-            NodeData::JsxElement(Box::new(JsxElementData {
+            NodeData::JsxFragment(Box::new(JsxFragmentData {
                 children: NodeList {
                     range: TextRange::new(opening_end, closing_start),
                     nodes: children,
                     has_trailing_comma: false,
                 },
-                closing_element: closing,
-                opening_element: opening,
+                closing_fragment: closing,
+                opening_fragment: opening,
                 facts: 0,
             })),
             &all_children,

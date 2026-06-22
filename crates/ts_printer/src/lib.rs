@@ -2174,6 +2174,7 @@ impl Printer<'_> {
             }
             NodeData::JsxElement(data) => self.emit_jsx_element(data)?,
             NodeData::JsxSelfClosingElement(data) => self.emit_jsx_self_closing(data)?,
+            NodeData::JsxFragment(data) => self.emit_jsx_fragment(data)?,
             _ => return Err(Self::unsupported(id, node.kind)),
         }
         Ok(())
@@ -2216,6 +2217,25 @@ impl Printer<'_> {
             return Ok(());
         }
         self.emit_react_create_element(data.tag_name, data.attributes, None)
+    }
+
+    fn emit_jsx_fragment(&mut self, data: &ts_ast::JsxFragmentData) -> Result<(), EmitError> {
+        if matches!(self.settings.jsx, JsxEmit::Preserve | JsxEmit::ReactNative) {
+            self.writer.write("<>");
+            for child in &data.children.nodes {
+                self.emit_jsx_child(*child, true)?;
+            }
+            self.writer.write("</>");
+            return Ok(());
+        }
+        self.writer
+            .write("React.createElement(React.Fragment, null");
+        for child in &data.children.nodes {
+            self.writer.write(", ");
+            self.emit_jsx_child(*child, false)?;
+        }
+        self.writer.write(")");
+        Ok(())
     }
 
     fn emit_react_create_element(
@@ -2356,6 +2376,7 @@ impl Printer<'_> {
             }
             NodeData::JsxElement(element) => self.emit_jsx_element(element)?,
             NodeData::JsxSelfClosingElement(element) => self.emit_jsx_self_closing(element)?,
+            NodeData::JsxFragment(fragment) => self.emit_jsx_fragment(fragment)?,
             _ => return Err(Self::unsupported(id, node.kind)),
         }
         Ok(())
@@ -2878,6 +2899,15 @@ mod tests {
         assert_eq!(
             emit_jsx(source, JsxEmit::React),
             "const view = React.createElement(Panel, {enabled: true, ...props, title: \"hello\"}, React.createElement(\"span\", null, value), React.createElement(Icon, null));\n"
+        );
+        let fragment = "const view = <><span />{value}</>;";
+        assert_eq!(
+            emit_jsx(fragment, JsxEmit::Preserve),
+            "const view = <><span />{value}</>;\n"
+        );
+        assert_eq!(
+            emit_jsx(fragment, JsxEmit::React),
+            "const view = React.createElement(React.Fragment, null, React.createElement(\"span\", null), value);\n"
         );
     }
 
