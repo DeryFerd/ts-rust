@@ -81,11 +81,24 @@ pub fn emit_source_file_with_settings(
         source_name,
         source_line_starts: settings.source_map.then(|| line_starts(source_text)),
         automatic_jsx,
+        this_alias: None,
     };
     let node = printer.node(source_file)?.clone();
     let NodeData::SourceFile(data) = &node.data else {
         return Err(Printer::unsupported(source_file, node.kind));
     };
+    let is_external_module = data.statements.nodes.iter().any(|statement| {
+        arena
+            .get(*statement)
+            .is_some_and(|statement| declaration_is_module_indicator(arena, statement))
+    });
+    if settings.module == ModuleKind::CommonJs && is_external_module {
+        printer.writer.write("\"use strict\";");
+        printer.writer.newline();
+    }
+    if settings.target < ScriptTarget::Es2015 && source_needs_extends_helper(arena) {
+        printer.emit_extends_helper();
+    }
     printer.emit_automatic_jsx_prelude();
     for statement in &data.statements.nodes {
         printer.emit_statement(*statement)?;
@@ -96,6 +109,23 @@ pub fn emit_source_file_with_settings(
     Ok(EmitResult {
         code: printer.writer.finish(),
         source_map,
+    })
+}
+
+fn source_needs_extends_helper(arena: &NodeArena) -> bool {
+    arena.iter().any(|(_, node)| {
+        let NodeData::ClassDeclaration(class) = &node.data else {
+            return false;
+        };
+        class.heritage_clauses.as_ref().is_some_and(|clauses| {
+            clauses.nodes.iter().any(|clause| {
+                matches!(
+                    arena.get(*clause).map(|node| &node.data),
+                    Some(NodeData::HeritageClause(clause))
+                        if clause.token == SyntaxKind::ExtendsKeyword
+                )
+            })
+        })
     })
 }
 
@@ -1081,9 +1111,64 @@ struct Printer<'a> {
     source_name: &'a str,
     source_line_starts: Option<Vec<usize>>,
     automatic_jsx: AutomaticJsxUsage,
+    this_alias: Option<&'static str>,
 }
 
 impl Printer<'_> {
+    fn emit_extends_helper(&mut self) {
+        self.writer
+            .write("var __extends = (this && this.__extends) || (function () {");
+        self.writer.newline();
+        self.writer.indent += 1;
+        self.writer.write("var extendStatics = function (d, b) {");
+        self.writer.newline();
+        self.writer.indent += 1;
+        self.writer
+            .write("extendStatics = Object.setPrototypeOf ||");
+        self.writer.newline();
+        self.writer.indent += 1;
+        self.writer.write(
+            "({ __proto__: [] } instanceof Array && function (d, b) { d.__proto__ = b; }) ||",
+        );
+        self.writer.newline();
+        self.writer.write(
+            "function (d, b) { for (var p in b) if (Object.prototype.hasOwnProperty.call(b, p)) d[p] = b[p]; };",
+        );
+        self.writer.indent -= 1;
+        self.writer.newline();
+        self.writer.write("return extendStatics(d, b);");
+        self.writer.newline();
+        self.writer.indent -= 1;
+        self.writer.write("};");
+        self.writer.newline();
+        self.writer.write("return function (d, b) {");
+        self.writer.newline();
+        self.writer.indent += 1;
+        self.writer
+            .write("if (typeof b !== \"function\" && b !== null)");
+        self.writer.newline();
+        self.writer.indent += 1;
+        self.writer.write(
+            "throw new TypeError(\"Class extends value \" + String(b) + \" is not a constructor or null\");",
+        );
+        self.writer.newline();
+        self.writer.indent -= 1;
+        self.writer.write("extendStatics(d, b);");
+        self.writer.newline();
+        self.writer.write("function __() { this.constructor = d; }");
+        self.writer.newline();
+        self.writer.write(
+            "d.prototype = b === null ? Object.create(b) : (__.prototype = b.prototype, new __());",
+        );
+        self.writer.newline();
+        self.writer.indent -= 1;
+        self.writer.write("};");
+        self.writer.newline();
+        self.writer.indent -= 1;
+        self.writer.write("})();");
+        self.writer.newline();
+    }
+
     fn emit_automatic_jsx_prelude(&mut self) {
         if !self.automatic_jsx.any() {
             return;
@@ -1484,6 +1569,9 @@ impl Printer<'_> {
     }
 
     fn emit_class(&mut self, data: &ts_ast::ClassDeclarationData) -> Result<(), EmitError> {
+        if self.settings.target < ScriptTarget::Es2015 {
+            return self.emit_downlevel_class(data);
+        }
         self.writer.write("class");
         if let Some(name) = data.name {
             self.writer.write(" ");
@@ -1572,6 +1660,290 @@ impl Printer<'_> {
         self.writer.indent -= 1;
         self.writer.write("}");
         Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn emit_downlevel_class(
+        &mut self,
+        data: &ts_ast::ClassDeclarationData,
+    ) -> Result<(), EmitError> {
+        let name = data
+            .name
+            .and_then(|name| self.identifier_text(name).ok())
+            .unwrap_or("_class")
+            .to_owned();
+        let base = self.class_base_expression(data)?;
+        self.writer.write("var ");
+        self.writer.write(&name);
+        self.writer.write(" = /** @class */ (function (");
+        if base.is_some() {
+            self.writer.write("_super");
+        }
+        self.writer.write(") {");
+        self.writer.newline();
+        self.writer.indent += 1;
+        if base.is_some() {
+            self.writer.write("__extends(");
+            self.writer.write(&name);
+            self.writer.write(", _super);");
+            self.writer.newline();
+        }
+
+        let constructor = data.members.nodes.iter().find_map(|member| {
+            let NodeData::MethodDeclaration(method) = &self.arena.get(*member)?.data else {
+                return None;
+            };
+            (method.body.is_some() && self.identifier_text(method.name).ok()? == "constructor")
+                .then_some(method.as_ref())
+        });
+        self.writer.write("function ");
+        self.writer.write(&name);
+        if let Some(constructor) = constructor {
+            self.emit_parameters(&constructor.parameters)?;
+            self.writer.write(" {");
+            self.writer.newline();
+            self.writer.indent += 1;
+            if base.is_none() {
+                self.emit_instance_fields(data, "this")?;
+            }
+            let mut emitted_fields = base.is_none();
+            let previous_this_alias = self.this_alias;
+            let mut uses_this_alias = false;
+            if let Some(body) = constructor.body {
+                let body = self.node(body)?.clone();
+                let NodeData::Block(body) = &body.data else {
+                    return Err(Self::unsupported(
+                        constructor.body.expect("body"),
+                        body.kind,
+                    ));
+                };
+                for statement in &body.statements.nodes {
+                    if base.is_some() && self.emit_super_statement(*statement)? {
+                        self.this_alias = Some("_this");
+                        uses_this_alias = true;
+                        if !emitted_fields {
+                            self.emit_instance_fields(data, "_this")?;
+                            emitted_fields = true;
+                        }
+                    } else {
+                        self.emit_statement(*statement)?;
+                    }
+                }
+            }
+            if !emitted_fields {
+                self.emit_instance_fields(data, "this")?;
+            }
+            if uses_this_alias {
+                self.writer.write("return _this;");
+                self.writer.newline();
+            }
+            self.this_alias = previous_this_alias;
+            self.writer.indent -= 1;
+            self.writer.write("}");
+            self.writer.newline();
+        } else if base.is_some() {
+            self.emit_parameters(&NodeList::default())?;
+            self.writer.write(" {");
+            self.writer.newline();
+            self.writer.indent += 1;
+            let has_fields = self.has_instance_field_initializers(data);
+            if has_fields {
+                self.writer
+                    .write("var _this = _super !== null && _super.apply(this, arguments) || this;");
+                self.writer.newline();
+                self.emit_instance_fields(data, "_this")?;
+                self.writer.write("return _this;");
+            } else {
+                self.writer
+                    .write("return _super !== null && _super.apply(this, arguments) || this;");
+            }
+            self.writer.newline();
+            self.writer.indent -= 1;
+            self.writer.write("}");
+            self.writer.newline();
+        } else {
+            self.writer.write("() {");
+            self.writer.newline();
+            self.writer.indent += 1;
+            self.emit_instance_fields(data, "this")?;
+            self.writer.indent -= 1;
+            self.writer.write("}");
+            self.writer.newline();
+        }
+
+        for member in &data.members.nodes {
+            let node = self.node(*member)?.clone();
+            let NodeData::MethodDeclaration(method) = &node.data else {
+                continue;
+            };
+            if method.body.is_none() || self.identifier_text(method.name)? == "constructor" {
+                continue;
+            }
+            self.writer.write(&name);
+            if !self.has_modifier(method.modifiers.as_ref(), SyntaxKind::StaticKeyword) {
+                self.writer.write(".prototype");
+            }
+            self.emit_downlevel_member_access(method.name)?;
+            self.writer.write(" = ");
+            if self.has_modifier(method.modifiers.as_ref(), SyntaxKind::AsyncKeyword) {
+                self.writer.write("async ");
+            }
+            self.writer.write("function");
+            if method.asterisk_token.is_some() {
+                self.writer.write("*");
+            }
+            self.writer.write(" ");
+            self.emit_parameters(&method.parameters)?;
+            self.writer.write(" ");
+            self.emit_block(method.body.expect("body checked"))?;
+            self.writer.write(";");
+            self.writer.newline();
+        }
+        self.emit_static_fields(data, &name)?;
+        self.writer.write("return ");
+        self.writer.write(&name);
+        self.writer.write(";");
+        self.writer.newline();
+        self.writer.indent -= 1;
+        self.writer.write("}(");
+        if let Some(base) = base {
+            self.emit_expression(base, 0)?;
+        }
+        self.writer.write("));");
+        Ok(())
+    }
+
+    fn class_base_expression(
+        &self,
+        data: &ts_ast::ClassDeclarationData,
+    ) -> Result<Option<NodeId>, EmitError> {
+        let Some(clauses) = &data.heritage_clauses else {
+            return Ok(None);
+        };
+        for clause in &clauses.nodes {
+            let node = self.node(*clause)?;
+            if let NodeData::HeritageClause(clause) = &node.data
+                && clause.token == SyntaxKind::ExtendsKeyword
+                && let Some(base) = clause.types.nodes.first()
+            {
+                let base_node = self.node(*base)?;
+                if let NodeData::ExpressionWithTypeArguments(base) = &base_node.data {
+                    return Ok(Some(base.expression));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn has_instance_field_initializers(&self, data: &ts_ast::ClassDeclarationData) -> bool {
+        data.members.nodes.iter().any(|member| {
+            matches!(
+                self.arena.get(*member).map(|node| &node.data),
+                Some(NodeData::PropertyDeclaration(property))
+                    if property.initializer.is_some()
+                        && !self.has_modifier(property.modifiers.as_ref(), SyntaxKind::StaticKeyword)
+            )
+        })
+    }
+
+    fn emit_instance_fields(
+        &mut self,
+        data: &ts_ast::ClassDeclarationData,
+        receiver: &str,
+    ) -> Result<(), EmitError> {
+        for member in &data.members.nodes {
+            let node = self.node(*member)?.clone();
+            let NodeData::PropertyDeclaration(property) = &node.data else {
+                continue;
+            };
+            if self.has_modifier(property.modifiers.as_ref(), SyntaxKind::StaticKeyword) {
+                continue;
+            }
+            let Some(initializer) = property.initializer else {
+                continue;
+            };
+            self.writer.write(receiver);
+            self.emit_downlevel_member_access(property.name)?;
+            self.writer.write(" = ");
+            self.emit_expression(initializer, 1)?;
+            self.writer.write(";");
+            self.writer.newline();
+        }
+        Ok(())
+    }
+
+    fn emit_static_fields(
+        &mut self,
+        data: &ts_ast::ClassDeclarationData,
+        name: &str,
+    ) -> Result<(), EmitError> {
+        for member in &data.members.nodes {
+            let node = self.node(*member)?.clone();
+            let NodeData::PropertyDeclaration(property) = &node.data else {
+                continue;
+            };
+            if !self.has_modifier(property.modifiers.as_ref(), SyntaxKind::StaticKeyword) {
+                continue;
+            }
+            let Some(initializer) = property.initializer else {
+                continue;
+            };
+            self.writer.write(name);
+            self.emit_downlevel_member_access(property.name)?;
+            self.writer.write(" = ");
+            self.emit_expression(initializer, 1)?;
+            self.writer.write(";");
+            self.writer.newline();
+        }
+        Ok(())
+    }
+
+    fn emit_downlevel_member_access(&mut self, name: NodeId) -> Result<(), EmitError> {
+        let node = self.node(name)?.clone();
+        match &node.data {
+            NodeData::Identifier(identifier) => {
+                self.writer.write(".");
+                self.writer.write(&identifier.text);
+            }
+            NodeData::PrivateIdentifier(identifier) => {
+                self.writer.write(".");
+                self.writer.write(identifier.text.trim_start_matches('#'));
+            }
+            NodeData::ComputedPropertyName(computed) => {
+                self.writer.write("[");
+                self.emit_expression(computed.expression, 0)?;
+                self.writer.write("]");
+            }
+            _ => {
+                self.writer.write("[");
+                self.emit_expression(name, 0)?;
+                self.writer.write("]");
+            }
+        }
+        Ok(())
+    }
+
+    fn emit_super_statement(&mut self, statement: NodeId) -> Result<bool, EmitError> {
+        let statement_node = self.node(statement)?.clone();
+        let NodeData::ExpressionStatement(expression) = &statement_node.data else {
+            return Ok(false);
+        };
+        let call_node = self.node(expression.expression)?.clone();
+        let NodeData::CallExpression(call) = &call_node.data else {
+            return Ok(false);
+        };
+        let callee = self.node(call.expression)?;
+        if callee.kind != SyntaxKind::SuperKeyword {
+            return Ok(false);
+        }
+        self.writer.write("var _this = _super.call(this");
+        for argument in &call.arguments.nodes {
+            self.writer.write(", ");
+            self.emit_expression(*argument, 0)?;
+        }
+        self.writer.write(") || this;");
+        self.writer.newline();
+        Ok(true)
     }
 
     fn emit_enum(&mut self, data: &ts_ast::EnumDeclarationData) -> Result<(), EmitError> {
@@ -1951,14 +2323,22 @@ impl Printer<'_> {
             NodeData::NumericLiteral(data) => self.writer.write(&data.text),
             NodeData::BigIntLiteral(data) => self.writer.write(&data.text),
             NodeData::StringLiteral(data) => write_quoted(&mut self.writer, &data.text),
-            NodeData::KeywordExpression(_) => self.writer.write(match node.kind {
-                SyntaxKind::NullKeyword => "null",
-                SyntaxKind::TrueKeyword => "true",
-                SyntaxKind::FalseKeyword => "false",
-                SyntaxKind::ThisKeyword => "this",
-                SyntaxKind::SuperKeyword => "super",
-                _ => return Err(Self::unsupported(id, node.kind)),
-            }),
+            NodeData::KeywordExpression(_) => {
+                if node.kind == SyntaxKind::ThisKeyword
+                    && let Some(alias) = self.this_alias
+                {
+                    self.writer.write(alias);
+                } else {
+                    self.writer.write(match node.kind {
+                        SyntaxKind::NullKeyword => "null",
+                        SyntaxKind::TrueKeyword => "true",
+                        SyntaxKind::FalseKeyword => "false",
+                        SyntaxKind::ThisKeyword => "this",
+                        SyntaxKind::SuperKeyword => "super",
+                        _ => return Err(Self::unsupported(id, node.kind)),
+                    });
+                }
+            }
             NodeData::BindingPattern(data) => {
                 self.writer
                     .write(if node.kind == SyntaxKind::ArrayBindingPattern {
@@ -3396,6 +3776,32 @@ mod tests {
     }
 
     #[test]
+    fn downlevels_es5_classes_with_fields_methods_and_inheritance() {
+        let result = emit_with(
+            "class Point { x = 1; static origin = 0; constructor(y: number) { this.y = y; } move(d: number) { this.x = this.x + d; } static make() { return new Point(0); } } class ColoredPoint extends Point { color = 'red'; constructor(y: number) { super(y); this.color = 'blue'; } paint() { return this.color; } }",
+            ScriptTarget::Es5,
+            ModuleKind::EsNext,
+        );
+        assert_eq!(
+            result.code,
+            "var __extends = (this && this.__extends) || (function () {\n  var extendStatics = function (d, b) {\n    extendStatics = Object.setPrototypeOf ||\n      ({ __proto__: [] } instanceof Array && function (d, b) { d.__proto__ = b; }) ||\n      function (d, b) { for (var p in b) if (Object.prototype.hasOwnProperty.call(b, p)) d[p] = b[p]; };\n    return extendStatics(d, b);\n  };\n  return function (d, b) {\n    if (typeof b !== \"function\" && b !== null)\n      throw new TypeError(\"Class extends value \" + String(b) + \" is not a constructor or null\");\n    extendStatics(d, b);\n    function __() { this.constructor = d; }\n    d.prototype = b === null ? Object.create(b) : (__.prototype = b.prototype, new __());\n  };\n})();\nvar Point = /** @class */ (function () {\n  function Point(y) {\n    this.x = 1;\n    this.y = y;\n  }\n  Point.prototype.move = function (d) {\n    this.x = this.x + d;\n  };\n  Point.make = function () {\n    return new Point(0);\n  };\n  Point.origin = 0;\n  return Point;\n}());\nvar ColoredPoint = /** @class */ (function (_super) {\n  __extends(ColoredPoint, _super);\n  function ColoredPoint(y) {\n    var _this = _super.call(this, y) || this;\n    _this.color = \"red\";\n    _this.color = \"blue\";\n    return _this;\n  }\n  ColoredPoint.prototype.paint = function () {\n    return this.color;\n  };\n  return ColoredPoint;\n}(Point));\n"
+        );
+    }
+
+    #[test]
+    fn preserves_class_syntax_for_es2015_and_newer() {
+        let result = emit_with(
+            "class Box { value = 1; read() { return this.value; } }",
+            ScriptTarget::Es2015,
+            ModuleKind::EsNext,
+        );
+        assert_eq!(
+            result.code,
+            "class Box {\n  value = 1;\n  read() {\n    return this.value;\n  }\n}\n"
+        );
+    }
+
+    #[test]
     fn preserves_export_modifiers_for_es_modules() {
         let result = emit_with(
             "export const value: number = 1; export default function read() { return value; }",
@@ -3417,8 +3823,20 @@ mod tests {
         );
         assert_eq!(
             result.code,
-            "const main = require(\"pkg\").default;\nconst { read: load, write } = require(\"pkg\");\nrequire(\"side\");\nexports.result = load;\nObject.assign(exports, require(\"other\"));\nexports.default = main;\n"
+            "\"use strict\";\nconst main = require(\"pkg\").default;\nconst { read: load, write } = require(\"pkg\");\nrequire(\"side\");\nexports.result = load;\nObject.assign(exports, require(\"other\"));\nexports.default = main;\n"
         );
+    }
+
+    #[test]
+    fn emits_commonjs_strict_prologue_only_for_modules() {
+        let module = emit_with(
+            "export const value = 1;",
+            ScriptTarget::Es5,
+            ModuleKind::CommonJs,
+        );
+        assert!(module.code.starts_with("\"use strict\";\n"));
+        let script = emit_with("const value = 1;", ScriptTarget::Es5, ModuleKind::CommonJs);
+        assert_eq!(script.code, "var value = 1;\n");
     }
 
     #[test]
