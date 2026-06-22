@@ -75,6 +75,7 @@ pub struct CompilerOptions {
     pub allow_js: bool,
     pub check_js: bool,
     pub declaration: bool,
+    pub declaration_map: bool,
     pub emit_declaration_only: bool,
     pub no_emit: bool,
     pub module: ModuleKind,
@@ -83,6 +84,11 @@ pub struct CompilerOptions {
     pub jsx: JsxEmit,
     pub resolve_json_module: bool,
     pub source_map: bool,
+    pub inline_source_map: bool,
+    pub out_dir: Option<String>,
+    pub root_dir: Option<String>,
+    pub declaration_dir: Option<String>,
+    pub ts_build_info_file: Option<String>,
     pub base_url: Option<String>,
     pub paths: BTreeMap<String, Vec<String>>,
     pub root_dirs: Vec<String>,
@@ -94,6 +100,7 @@ impl Default for CompilerOptions {
             allow_js: false,
             check_js: false,
             declaration: false,
+            declaration_map: false,
             emit_declaration_only: false,
             no_emit: false,
             module: ModuleKind::CommonJs,
@@ -102,6 +109,11 @@ impl Default for CompilerOptions {
             jsx: JsxEmit::Preserve,
             resolve_json_module: false,
             source_map: false,
+            inline_source_map: false,
+            out_dir: None,
+            root_dir: None,
+            declaration_dir: None,
+            ts_build_info_file: None,
             base_url: None,
             paths: BTreeMap::new(),
             root_dirs: Vec::new(),
@@ -111,6 +123,7 @@ impl Default for CompilerOptions {
 
 /// Emitter-facing settings derived from normalized compiler options.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct PrinterSettings {
     pub target: ScriptTarget,
     pub module: ModuleKind,
@@ -118,6 +131,7 @@ pub struct PrinterSettings {
     pub emit_javascript: bool,
     pub emit_declarations: bool,
     pub source_map: bool,
+    pub inline_source_map: bool,
 }
 
 /// Result of parsing a `compilerOptions` JSON object.
@@ -164,7 +178,10 @@ impl CompilerOptions {
             jsx: self.jsx,
             emit_javascript: !self.no_emit && !self.emit_declaration_only,
             emit_declarations: !self.no_emit && self.declaration,
-            source_map: self.source_map && !self.no_emit && !self.emit_declaration_only,
+            source_map: (self.source_map || self.inline_source_map)
+                && !self.no_emit
+                && !self.emit_declaration_only,
+            inline_source_map: self.inline_source_map,
         }
     }
 }
@@ -196,6 +213,18 @@ pub fn parse_project_options(config: &ProjectConfig) -> ParseOptionsResult {
             *root_dir = ts_path::resolve_path(directory, &[root_dir]);
         }
     }
+    for path in [
+        &mut result.options.out_dir,
+        &mut result.options.root_dir,
+        &mut result.options.declaration_dir,
+        &mut result.options.ts_build_info_file,
+    ] {
+        if let Some(path) = path
+            && !ts_path::is_absolute(path)
+        {
+            *path = ts_path::resolve_path(directory, &[path]);
+        }
+    }
     result
 }
 
@@ -212,6 +241,9 @@ pub fn parse_compiler_options_map(options: &BTreeMap<String, JsonValue>) -> Pars
             "declaration" => {
                 parsed.declaration = boolean(original_name, value, &mut diagnostics);
             }
+            "declarationmap" => {
+                parsed.declaration_map = boolean(original_name, value, &mut diagnostics);
+            }
             "emitdeclarationonly" => {
                 parsed.emit_declaration_only = boolean(original_name, value, &mut diagnostics);
             }
@@ -220,6 +252,17 @@ pub fn parse_compiler_options_map(options: &BTreeMap<String, JsonValue>) -> Pars
                 parsed.resolve_json_module = boolean(original_name, value, &mut diagnostics);
             }
             "sourcemap" => parsed.source_map = boolean(original_name, value, &mut diagnostics),
+            "inlinesourcemap" => {
+                parsed.inline_source_map = boolean(original_name, value, &mut diagnostics);
+            }
+            "outdir" => parsed.out_dir = string(original_name, value, &mut diagnostics),
+            "rootdir" => parsed.root_dir = string(original_name, value, &mut diagnostics),
+            "declarationdir" => {
+                parsed.declaration_dir = string(original_name, value, &mut diagnostics);
+            }
+            "tsbuildinfofile" => {
+                parsed.ts_build_info_file = string(original_name, value, &mut diagnostics);
+            }
             "baseurl" => parsed.base_url = string(original_name, value, &mut diagnostics),
             "paths" => parsed.paths = paths(original_name, value, &mut diagnostics),
             "rootdirs" => parsed.root_dirs = string_array(original_name, value, &mut diagnostics),
@@ -245,6 +288,7 @@ struct PartialOptions {
     allow_js: Option<bool>,
     check_js: Option<bool>,
     declaration: Option<bool>,
+    declaration_map: Option<bool>,
     emit_declaration_only: Option<bool>,
     no_emit: Option<bool>,
     module: Option<ModuleKind>,
@@ -253,6 +297,11 @@ struct PartialOptions {
     jsx: Option<JsxEmit>,
     resolve_json_module: Option<bool>,
     source_map: Option<bool>,
+    inline_source_map: Option<bool>,
+    out_dir: Option<String>,
+    root_dir: Option<String>,
+    declaration_dir: Option<String>,
+    ts_build_info_file: Option<String>,
     base_url: Option<String>,
     paths: Option<BTreeMap<String, Vec<String>>>,
     root_dirs: Option<Vec<String>>,
@@ -267,6 +316,7 @@ impl PartialOptions {
             allow_js: self.allow_js.unwrap_or(check_js),
             check_js,
             declaration: self.declaration.unwrap_or(emit_declaration_only),
+            declaration_map: self.declaration_map.unwrap_or(false),
             emit_declaration_only,
             no_emit: self.no_emit.unwrap_or(false),
             module,
@@ -277,6 +327,11 @@ impl PartialOptions {
             jsx: self.jsx.unwrap_or_default(),
             resolve_json_module: self.resolve_json_module.unwrap_or(false),
             source_map: self.source_map.unwrap_or(false),
+            inline_source_map: self.inline_source_map.unwrap_or(false),
+            out_dir: self.out_dir,
+            root_dir: self.root_dir,
+            declaration_dir: self.declaration_dir,
+            ts_build_info_file: self.ts_build_info_file,
             base_url: self.base_url,
             paths: self.paths.unwrap_or_default(),
             root_dirs: self.root_dirs.unwrap_or_default(),
@@ -298,6 +353,9 @@ const fn default_module_resolution(module: ModuleKind) -> ModuleResolutionKind {
 fn validate_options(options: &PartialOptions, diagnostics: &mut Vec<Diagnostic>) {
     if options.no_emit == Some(true) && options.emit_declaration_only == Some(true) {
         diagnostics.push(diagnostic(5053, ["emitDeclarationOnly", "noEmit"]));
+    }
+    if options.source_map == Some(true) && options.inline_source_map == Some(true) {
+        diagnostics.push(diagnostic(5053, ["sourceMap", "inlineSourceMap"]));
     }
 
     let (Some(module), Some(resolution)) = (options.module, options.module_resolution) else {
@@ -637,5 +695,49 @@ mod tests {
                 .collect::<Vec<_>>(),
             [5053, 5109]
         );
+    }
+
+    #[test]
+    fn parses_and_normalizes_emit_path_options() {
+        let config = parse_config_text(
+            "/repo/tsconfig.json",
+            r#"{
+                "compilerOptions": {
+                    "outDir": "dist",
+                    "rootDir": "src",
+                    "declarationDir": "types",
+                    "declarationMap": true,
+                    "inlineSourceMap": true,
+                    "tsBuildInfoFile": ".cache/project.tsbuildinfo"
+                }
+            }"#,
+        )
+        .value
+        .unwrap();
+        let result = parse_project_options(&config);
+        assert!(result.diagnostics.is_empty());
+        assert_eq!(result.options.out_dir.as_deref(), Some("/repo/dist"));
+        assert_eq!(result.options.root_dir.as_deref(), Some("/repo/src"));
+        assert_eq!(
+            result.options.declaration_dir.as_deref(),
+            Some("/repo/types")
+        );
+        assert!(result.options.declaration_map);
+        assert!(result.options.inline_source_map);
+        assert_eq!(
+            result.options.ts_build_info_file.as_deref(),
+            Some("/repo/.cache/project.tsbuildinfo")
+        );
+        assert!(result.options.printer_settings().source_map);
+    }
+
+    #[test]
+    fn rejects_external_and_inline_source_maps_together() {
+        let result = parse_compiler_options(&object([
+            ("sourceMap", JsonValue::Bool(true)),
+            ("inlineSourceMap", JsonValue::Bool(true)),
+        ]));
+        assert_eq!(result.diagnostics.len(), 1);
+        assert_eq!(result.diagnostics[0].code(), 5053);
     }
 }

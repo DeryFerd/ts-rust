@@ -233,9 +233,21 @@ impl Program {
     #[must_use]
     pub fn emit(&self) -> EmitOutput {
         let mut output = EmitOutput::default();
-        if !self.options.printer_settings().emit_javascript {
+        let settings = self.options.printer_settings();
+        if !settings.emit_javascript {
             return output;
         }
+        let source_names = self
+            .source_files
+            .iter()
+            .filter(|source_file| !ts_path::is_declaration_file(&source_file.file_name))
+            .map(|source_file| source_file.file_name.clone())
+            .collect::<Vec<_>>();
+        let common_source_directory = ts_outputpaths::common_source_directory(
+            &source_names,
+            &self.current_directory,
+            self.case_sensitivity,
+        );
         for source_file in &self.source_files {
             if ts_path::is_declaration_file(&source_file.file_name) {
                 continue;
@@ -245,25 +257,39 @@ impl Program {
                 source_file.parse.source_file,
                 &source_file.file_name,
                 &source_file.source_text,
-                self.options.printer_settings(),
+                settings,
             ) {
                 Ok(mut emitted) => {
-                    let file_name = javascript_output_path(
+                    let paths = ts_outputpaths::output_paths(
                         &source_file.file_name,
-                        self.options.printer_settings().jsx,
+                        &self.options,
+                        &self.current_directory,
+                        &common_source_directory,
+                        self.case_sensitivity,
                     );
+                    let Some(file_name) = paths.javascript else {
+                        continue;
+                    };
                     if let Some(mut source_map) = emitted.source_map {
-                        let map_file_name = format!("{file_name}.map");
                         source_map.file = file_name.rsplit('/').next().map(str::to_owned);
-                        emitted.code.push_str("//# sourceMappingURL=");
-                        emitted
-                            .code
-                            .push_str(map_file_name.rsplit('/').next().unwrap_or(&map_file_name));
-                        emitted.code.push('\n');
-                        output.files.push(OutputFile {
-                            file_name: map_file_name,
-                            text: serialize_source_map(&source_map),
-                        });
+                        let serialized = serialize_source_map(&source_map);
+                        if settings.inline_source_map {
+                            emitted
+                                .code
+                                .push_str("//# sourceMappingURL=data:application/json;base64,");
+                            emitted.code.push_str(&base64_encode(serialized.as_bytes()));
+                            emitted.code.push('\n');
+                        } else if let Some(map_file_name) = paths.source_map {
+                            emitted.code.push_str("//# sourceMappingURL=");
+                            emitted.code.push_str(
+                                map_file_name.rsplit('/').next().unwrap_or(&map_file_name),
+                            );
+                            emitted.code.push('\n');
+                            output.files.push(OutputFile {
+                                file_name: map_file_name,
+                                text: serialized,
+                            });
+                        }
                     }
                     output.files.push(OutputFile {
                         file_name,
@@ -388,10 +414,6 @@ impl Program {
     }
 }
 
-fn javascript_output_path(file_name: &str, jsx: ts_options::JsxEmit) -> String {
-    ts_path::change_extension(file_name, ts_outputpaths::output_extension(file_name, jsx))
-}
-
 fn serialize_source_map(source_map: &SourceMap) -> String {
     #[derive(serde::Serialize)]
     #[serde(rename_all = "camelCase")]
@@ -413,6 +435,31 @@ fn serialize_source_map(source_map: &SourceMap) -> String {
         mappings: &source_map.mappings,
     })
     .expect("source map fields are JSON-serializable")
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let first = chunk[0];
+        let second = chunk.get(1).copied().unwrap_or(0);
+        let third = chunk.get(2).copied().unwrap_or(0);
+        encoded.push(char::from(ALPHABET[usize::from(first >> 2)]));
+        encoded.push(char::from(
+            ALPHABET[usize::from(((first & 0x03) << 4) | (second >> 4))],
+        ));
+        encoded.push(if chunk.len() > 1 {
+            char::from(ALPHABET[usize::from(((second & 0x0f) << 2) | (third >> 6))])
+        } else {
+            '='
+        });
+        encoded.push(if chunk.len() > 2 {
+            char::from(ALPHABET[usize::from(third & 0x3f)])
+        } else {
+            '='
+        });
+    }
+    encoded
 }
 
 fn module_specifiers(parse: &ParseResult) -> Vec<(String, TextRange)> {
@@ -838,5 +885,61 @@ mod tests {
             .unwrap();
         assert!(javascript.text.contains("exports.value"));
         assert!(javascript.text.contains("sourceMappingURL=main.js.map"));
+    }
+
+    #[test]
+    fn out_dir_and_root_dir_preserve_source_structure() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/tsconfig.json",
+            r#"{
+                "files": ["src/main.ts", "src/nested/other.ts"],
+                "compilerOptions": {
+                    "outDir": "build",
+                    "rootDir": "src",
+                    "sourceMap": true
+                }
+            }"#,
+        )
+        .unwrap();
+        fs.write_file("/project/src/main.ts", "const main = 1;")
+            .unwrap();
+        fs.write_file("/project/src/nested/other.ts", "const other = 2;")
+            .unwrap();
+        let program = Program::from_config(&fs, "/project/tsconfig.json");
+        let emitted = program.emit();
+        let paths = emitted
+            .files
+            .iter()
+            .map(|file| file.file_name.as_str())
+            .collect::<Vec<_>>();
+        assert!(paths.contains(&"/project/build/main.js"));
+        assert!(paths.contains(&"/project/build/main.js.map"));
+        assert!(paths.contains(&"/project/build/nested/other.js"));
+        assert!(paths.contains(&"/project/build/nested/other.js.map"));
+    }
+
+    #[test]
+    fn inline_source_maps_are_embedded_without_map_files() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/tsconfig.json",
+            r#"{
+                "files": ["src/main.ts"],
+                "compilerOptions": { "outDir": "build", "inlineSourceMap": true }
+            }"#,
+        )
+        .unwrap();
+        fs.write_file("/project/src/main.ts", "const main = 1;")
+            .unwrap();
+        let program = Program::from_config(&fs, "/project/tsconfig.json");
+        let emitted = program.emit();
+        assert_eq!(emitted.files.len(), 1);
+        assert_eq!(emitted.files[0].file_name, "/project/build/main.js");
+        assert!(
+            emitted.files[0]
+                .text
+                .contains("sourceMappingURL=data:application/json;base64,")
+        );
     }
 }

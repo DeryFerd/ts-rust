@@ -50,6 +50,7 @@ pub fn emit_source_file(arena: &NodeArena, source_file: NodeId) -> Result<EmitRe
             emit_javascript: true,
             emit_declarations: false,
             source_map: false,
+            inline_source_map: false,
         },
     )
 }
@@ -1169,6 +1170,7 @@ mod tests {
                 emit_javascript: true,
                 emit_declarations: false,
                 source_map: true,
+                inline_source_map: false,
             },
         )
         .unwrap()

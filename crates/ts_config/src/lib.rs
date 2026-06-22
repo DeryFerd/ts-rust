@@ -404,6 +404,16 @@ fn resolve_config_patterns(mut config: ProjectConfig) -> ProjectConfig {
     {
         *base_url = resolve_relative(directory, base_url);
     }
+    for (name, value) in &mut config.compiler_options {
+        if matches!(
+            name.to_ascii_lowercase().as_str(),
+            "outdir" | "rootdir" | "declarationdir" | "tsbuildinfofile"
+        ) && let JsonValue::String(path) = value
+            && !Path::new(path.as_str()).is_absolute()
+        {
+            *path = resolve_relative(directory, path);
+        }
+    }
     if let Some(JsonValue::Array(root_dirs)) = config.compiler_options.get_mut("rootDirs") {
         for root_dir in root_dirs {
             if let JsonValue::String(root_dir) = root_dir
@@ -857,6 +867,41 @@ mod tests {
             config.compiler_options.get("declaration"),
             Some(&JsonValue::Bool(true))
         );
+    }
+
+    #[test]
+    fn resolves_emit_paths_relative_to_their_config() {
+        let file_system = MemoryFileSystem::default();
+        file_system
+            .write_file(
+                "/repo/config/tsconfig.json",
+                r#"{
+                    "compilerOptions": {
+                        "outDir": "../dist",
+                        "rootDir": "src",
+                        "declarationDir": "../types",
+                        "tsBuildInfoFile": "../cache/project.tsbuildinfo"
+                    }
+                }"#,
+            )
+            .unwrap();
+        let config = resolve_config_file(&file_system, "/repo/config/tsconfig.json")
+            .value
+            .unwrap();
+        for (name, expected) in [
+            ("outDir", "/repo/dist"),
+            ("rootDir", "/repo/config/src"),
+            ("declarationDir", "/repo/types"),
+            ("tsBuildInfoFile", "/repo/cache/project.tsbuildinfo"),
+        ] {
+            assert_eq!(
+                config
+                    .compiler_options
+                    .get(name)
+                    .and_then(JsonValue::as_str),
+                Some(expected)
+            );
+        }
     }
 
     #[test]
