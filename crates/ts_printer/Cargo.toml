@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 ts_ast = { path = "../ts_ast" }
+ts_binder = { path = "../ts_binder" }
 ts_options = { path = "../ts_options" }
 ts_sourcemap = { path = "../ts_sourcemap" }
 
