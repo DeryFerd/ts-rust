@@ -16,7 +16,10 @@ use ts_module::{ResolutionOptions, Resolver, automatic_type_directive_names};
 use ts_options::{CompilerOptions, PrinterSettings, parse_project_options};
 use ts_parser::{ParseResult, parse_jsx_source_file, parse_source_file};
 use ts_path::{CaseSensitivity, canonicalize, directory_path, is_absolute, resolve_path};
-use ts_printer::{emit_declaration_file, emit_source_file_with_settings};
+use ts_printer::{
+    AmdDependency as PrinterAmdDependency, EmitContext, emit_declaration_file,
+    emit_source_file_with_context,
+};
 use ts_sourcemap::{SourceMap, SourceMapBuilder};
 use ts_vfs::FileSystem;
 
@@ -399,12 +402,29 @@ impl Program {
                 self.case_sensitivity,
             );
             if settings.emit_javascript {
-                match emit_source_file_with_settings(
+                let amd_dependencies = source_file
+                    .parse
+                    .amd_dependencies
+                    .iter()
+                    .map(|dependency| PrinterAmdDependency {
+                        path: &dependency.path,
+                        name: dependency.name.as_deref(),
+                        comment_start: dependency.range.start.get(),
+                        comment_end: dependency.range.end.get(),
+                    })
+                    .collect::<Vec<_>>();
+                let emit_context = EmitContext {
+                    bindings: &source_file.binding,
+                    amd_module_name: source_file.parse.amd_module_name.as_deref(),
+                    amd_dependencies: &amd_dependencies,
+                };
+                match emit_source_file_with_context(
                     &source_file.parse.arena,
                     source_file.parse.source_file,
                     &source_file.file_name,
                     &source_file.source_text,
                     settings,
+                    &emit_context,
                 ) {
                     Ok(mut emitted) => {
                         let Some(file_name) = paths.javascript.clone() else {
@@ -509,12 +529,29 @@ impl Program {
                 source_settings.source_map = false;
                 source_settings.inline_source_map = false;
                 source_settings.always_strict = settings.always_strict && code.is_empty();
-                match emit_source_file_with_settings(
+                let amd_dependencies = source
+                    .parse
+                    .amd_dependencies
+                    .iter()
+                    .map(|dependency| PrinterAmdDependency {
+                        path: &dependency.path,
+                        name: dependency.name.as_deref(),
+                        comment_start: dependency.range.start.get(),
+                        comment_end: dependency.range.end.get(),
+                    })
+                    .collect::<Vec<_>>();
+                let emit_context = EmitContext {
+                    bindings: &source.binding,
+                    amd_module_name: source.parse.amd_module_name.as_deref(),
+                    amd_dependencies: &amd_dependencies,
+                };
+                match emit_source_file_with_context(
                     &source.parse.arena,
                     source.parse.source_file,
                     &source.file_name,
                     &source.source_text,
                     source_settings,
+                    &emit_context,
                 ) {
                     Ok(emitted) => {
                         if !emitted.code.is_empty() {
@@ -1765,6 +1802,62 @@ mod tests {
                 .get(&("/project/main.ts".to_owned(), "M".to_owned()))
                 .map(String::as_str),
             Some("/project/ambient.ts")
+        );
+    }
+
+    #[test]
+    fn emits_amd_wrapper_for_ambient_import_equals_consumer() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/ambient.ts",
+            r#"declare module "M" { const value: number; }"#,
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/main.ts",
+            concat!(
+                "///<amd-module name='Consumer'/>\n",
+                "///<amd-dependency path='side' name='side'/>\n",
+                "import M = require(\"M\");\n",
+                "M.value;\n",
+            ),
+        )
+        .unwrap();
+
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["main.ts".to_owned(), "ambient.ts".to_owned()],
+            CompilerOptions {
+                module: ModuleKind::Amd,
+                target: ScriptTarget::Es2015,
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        assert!(
+            program.diagnostics().is_empty(),
+            "{:?}",
+            program.diagnostics()
+        );
+        let emitted = program.emit();
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        let javascript = emitted
+            .files
+            .iter()
+            .find(|file| file.file_name == "/project/main.js")
+            .unwrap();
+        assert_eq!(
+            javascript.text,
+            concat!(
+                "///<amd-dependency path='side' name='side'/>\n",
+                "define(\"Consumer\", [\"require\", \"exports\", \"side\", \"M\"], function (require, exports, side, M) {\n",
+                "    \"use strict\";\n",
+                "    ///<amd-module name='Consumer'/>\n",
+                "    Object.defineProperty(exports, \"__esModule\", { value: true });\n",
+                "    M.value;\n",
+                "});\n",
+            )
         );
     }
 

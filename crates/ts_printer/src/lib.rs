@@ -21,6 +21,23 @@ pub struct EmitError {
     pub kind: SyntaxKind,
 }
 
+/// One parsed AMD dependency pragma supplied by the compiler.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AmdDependency<'a> {
+    pub path: &'a str,
+    pub name: Option<&'a str>,
+    pub comment_start: u32,
+    pub comment_end: u32,
+}
+
+/// Semantic and source-file metadata used while emitting one file.
+#[derive(Debug)]
+pub struct EmitContext<'a> {
+    pub bindings: &'a BindResult,
+    pub amd_module_name: Option<&'a str>,
+    pub amd_dependencies: &'a [AmdDependency<'a>],
+}
+
 impl fmt::Display for EmitError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -96,6 +113,34 @@ pub fn emit_source_file_with_settings_and_bindings(
     settings: PrinterSettings,
     bindings: &BindResult,
 ) -> Result<EmitResult, EmitError> {
+    emit_source_file_with_context(
+        arena,
+        source_file,
+        source_name,
+        source_text,
+        settings,
+        &EmitContext {
+            bindings,
+            amd_module_name: None,
+            amd_dependencies: &[],
+        },
+    )
+}
+
+/// Emits one source file using existing bindings and parsed emit metadata.
+///
+/// # Errors
+///
+/// Returns an error when the tree contains an unsupported or missing node.
+#[allow(clippy::too_many_lines)]
+pub fn emit_source_file_with_context(
+    arena: &NodeArena,
+    source_file: NodeId,
+    source_name: &str,
+    source_text: &str,
+    settings: PrinterSettings,
+    context: &EmitContext<'_>,
+) -> Result<EmitResult, EmitError> {
     if !settings.emit_javascript {
         return Ok(EmitResult::default());
     }
@@ -115,9 +160,10 @@ pub fn emit_source_file_with_settings_and_bindings(
         runtime_identifier_uses: HashSet::new(),
         commonjs_default_imports: HashMap::new(),
         has_runtime_export_equals: false,
-        bindings,
+        bindings: context.bindings,
         identifier_rewrites: HashMap::new(),
         system_predeclared_names: HashSet::new(),
+        commonjs_module_transform: settings.module == ModuleKind::CommonJs,
     };
     let node = printer.node(source_file)?.clone();
     let NodeData::SourceFile(data) = &node.data else {
@@ -135,6 +181,9 @@ pub fn emit_source_file_with_settings_and_bindings(
     });
     if settings.module == ModuleKind::System && is_external_module {
         return printer.emit_system_source_file(data);
+    }
+    if settings.module == ModuleKind::Amd && is_external_module {
+        return printer.emit_amd_source_file(data, context);
     }
     let has_use_strict = data.statements.nodes.first().is_some_and(|statement| {
         let Some(NodeData::ExpressionStatement(statement)) =
@@ -1646,6 +1695,11 @@ struct SystemDependency {
     parameter: String,
 }
 
+struct AmdRuntimeDependency {
+    path: String,
+    parameter: Option<String>,
+}
+
 struct SystemModulePlan {
     export_function: String,
     context_object: String,
@@ -1918,9 +1972,164 @@ struct Printer<'a> {
     bindings: &'a BindResult,
     identifier_rewrites: HashMap<ts_ast::SymbolId, String>,
     system_predeclared_names: HashSet<String>,
+    commonjs_module_transform: bool,
 }
 
 impl Printer<'_> {
+    #[allow(clippy::too_many_lines)]
+    fn emit_amd_source_file(
+        &mut self,
+        data: &ts_ast::SourceFileData,
+        context: &EmitContext<'_>,
+    ) -> Result<EmitResult, EmitError> {
+        self.commonjs_module_transform = true;
+        self.commonjs_default_imports =
+            commonjs_default_imports(self.arena, &data.statements, &self.runtime_identifier_uses);
+        let mut dependencies = context
+            .amd_dependencies
+            .iter()
+            .filter_map(|dependency| {
+                dependency.name.map(|name| AmdRuntimeDependency {
+                    path: dependency.path.to_owned(),
+                    parameter: Some(name.to_owned()),
+                })
+            })
+            .collect::<Vec<_>>();
+        for statement in &data.statements.nodes {
+            let Some(NodeData::ImportEqualsDeclaration(import)) =
+                self.arena.get(*statement).map(|node| &node.data)
+            else {
+                continue;
+            };
+            if import.is_type_only
+                || (!self.has_modifier(import.modifiers.as_ref(), SyntaxKind::ExportKeyword)
+                    && !self.import_binding_is_used(import.name))
+            {
+                continue;
+            }
+            let Some(path) = external_module_reference_text(self.arena, import.module_reference)
+            else {
+                continue;
+            };
+            dependencies.push(AmdRuntimeDependency {
+                path: path.to_owned(),
+                parameter: Some(self.identifier_text(import.name)?.to_owned()),
+            });
+        }
+        dependencies.extend(
+            context
+                .amd_dependencies
+                .iter()
+                .filter(|dependency| dependency.name.is_none())
+                .map(|dependency| AmdRuntimeDependency {
+                    path: dependency.path.to_owned(),
+                    parameter: None,
+                }),
+        );
+
+        for dependency in context.amd_dependencies {
+            let start = usize::try_from(dependency.comment_start).unwrap_or(usize::MAX);
+            let end = usize::try_from(dependency.comment_end).unwrap_or(usize::MAX);
+            if let Some(comment) = self.source_text.get(start..end) {
+                self.writer.write(comment);
+                self.writer.newline();
+            }
+        }
+        self.writer.write("define(");
+        if let Some(name) = context.amd_module_name {
+            write_quoted(&mut self.writer, name);
+            self.writer.write(", ");
+        }
+        self.writer.write("[\"require\", \"exports\"");
+        for dependency in &dependencies {
+            self.writer.write(", ");
+            write_quoted(&mut self.writer, &dependency.path);
+        }
+        self.writer.write("], function (require, exports");
+        for dependency in &dependencies {
+            if let Some(parameter) = &dependency.parameter {
+                self.writer.write(", ");
+                self.writer.write(parameter);
+            }
+        }
+        self.writer.write(") {");
+        self.writer.newline();
+        self.writer.indent += 1;
+        self.writer.write("\"use strict\";");
+        self.writer.newline();
+        if let Some(first_statement) = data.statements.nodes.first()
+            && let Some(node) = self.arena.get(*first_statement)
+        {
+            let excluded = context
+                .amd_dependencies
+                .iter()
+                .map(|dependency| (dependency.comment_start, dependency.comment_end))
+                .collect::<Vec<_>>();
+            self.emit_leading_source_comments_excluding(node.range.start.get(), &excluded);
+        }
+        if self.settings.target < ScriptTarget::Es2015 && source_needs_extends_helper(self.arena) {
+            self.emit_extends_helper();
+        }
+        let export_equals_expression =
+            runtime_export_equals_expression(self.arena, &data.statements);
+        self.has_runtime_export_equals = export_equals_expression.is_some();
+        if source_needs_import_star_helper(
+            self.arena,
+            &data.statements,
+            &self.runtime_identifier_uses,
+        ) {
+            self.emit_import_star_helper();
+        }
+        if !self.commonjs_default_imports.is_empty() {
+            self.emit_import_default_helper();
+        }
+        if export_equals_expression.is_none() {
+            self.writer
+                .write("Object.defineProperty(exports, \"__esModule\", { value: true });");
+            self.writer.newline();
+        }
+        self.emit_automatic_jsx_prelude();
+        let mut previous_end = data
+            .statements
+            .nodes
+            .first()
+            .and_then(|statement| self.arena.get(*statement))
+            .map_or(0, |node| node.range.start.get());
+        for statement in &data.statements.nodes {
+            if let Some(node) = self.arena.get(*statement) {
+                if statement_emits_javascript(self.arena, node) {
+                    self.emit_source_comments_between(previous_end, node.range.start.get());
+                }
+                previous_end = node.range.end.get();
+            }
+            if matches!(
+                self.arena.get(*statement).map(|node| &node.data),
+                Some(NodeData::ImportEqualsDeclaration(import))
+                    if external_module_reference_text(self.arena, import.module_reference).is_some()
+            ) {
+                continue;
+            }
+            self.emit_statement(*statement)?;
+        }
+        if let Some(expression) = export_equals_expression {
+            self.writer.write("return ");
+            self.emit_expression(expression, 0)?;
+            self.writer.write(";");
+            self.writer.newline();
+        }
+        self.writer.indent -= 1;
+        self.writer.write("});");
+        self.writer.newline();
+        let source_map = self
+            .source_map
+            .take()
+            .map(|builder| builder.finish(None, vec![self.source_name.to_owned()]));
+        Ok(EmitResult {
+            code: std::mem::take(&mut self.writer).finish(),
+            source_map,
+        })
+    }
+
     fn emit_system_source_file(
         &mut self,
         data: &ts_ast::SourceFileData,
@@ -2108,6 +2317,10 @@ impl Printer<'_> {
     }
 
     fn emit_leading_source_comments(&mut self, end: u32) {
+        self.emit_leading_source_comments_excluding(end, &[]);
+    }
+
+    fn emit_leading_source_comments_excluding(&mut self, end: u32, excluded: &[(u32, u32)]) {
         let end = usize::try_from(end).unwrap_or(usize::MAX);
         let Some(prefix) = self.source_text.get(..end) else {
             return;
@@ -2120,8 +2333,12 @@ impl Printer<'_> {
                     .iter()
                     .position(|byte| *byte == b'\n' || *byte == b'\r')
                     .map_or(bytes.len(), |offset| index + offset);
-                self.writer.write(&prefix[index..comment_end]);
-                self.writer.newline();
+                if !excluded.iter().any(|(start, end)| {
+                    usize::try_from(*start) == Ok(index) && usize::try_from(*end) == Ok(comment_end)
+                }) {
+                    self.writer.write(&prefix[index..comment_end]);
+                    self.writer.newline();
+                }
                 index = comment_end;
             } else if bytes[index..].starts_with(b"/*") {
                 let comment_end = bytes[index + 2..]
@@ -2259,7 +2476,7 @@ impl Printer<'_> {
         } else {
             "react/jsx-runtime"
         };
-        if self.settings.module == ModuleKind::CommonJs {
+        if self.commonjs_module_transform {
             self.writer.write("const jsx_runtime_1 = require(");
             write_quoted(&mut self.writer, runtime);
             self.writer.write(");");
@@ -2366,7 +2583,7 @@ impl Printer<'_> {
             }
             _ => {}
         }
-        if self.settings.module == ModuleKind::CommonJs
+        if self.commonjs_module_transform
             && declaration_has_modifier(self.arena, &node, SyntaxKind::ExportKeyword)
             && let NodeData::VariableStatement(statement) = &node.data
             && self.variable_list_is_uninitialized(statement.declaration_list)
@@ -2557,7 +2774,7 @@ impl Printer<'_> {
             NodeData::ImportDeclaration(data) => self.emit_import(data)?,
             NodeData::ImportEqualsDeclaration(data) => self.emit_import_equals(data)?,
             NodeData::ExportAssignment(data) => {
-                if self.settings.module == ModuleKind::CommonJs {
+                if self.commonjs_module_transform {
                     self.writer.write("exports.default = ");
                 } else {
                     self.writer.write("export default ");
@@ -2664,7 +2881,7 @@ impl Printer<'_> {
     }
 
     fn emit_function_body(&mut self, body: NodeId) -> Result<(), EmitError> {
-        if self.settings.module == ModuleKind::CommonJs
+        if self.commonjs_module_transform
             && let Some(statement) = self.single_line_body_statement(body)?
         {
             self.writer.write("{ ");
@@ -3589,7 +3806,7 @@ impl Printer<'_> {
                 self.writer.write(&name);
                 self.writer.write(" = {})");
             }
-        } else if exported && self.settings.module == ModuleKind::CommonJs {
+        } else if exported && self.commonjs_module_transform {
             self.writer.write(&name);
             self.writer.write(" || (exports.");
             self.writer.write(&name);
@@ -3670,7 +3887,7 @@ impl Printer<'_> {
     }
 
     fn emit_import(&mut self, data: &ts_ast::ImportDeclarationData) -> Result<(), EmitError> {
-        if self.settings.module == ModuleKind::CommonJs {
+        if self.commonjs_module_transform {
             return self.emit_commonjs_import(data);
         }
         self.writer.write("import ");
@@ -3918,7 +4135,7 @@ impl Printer<'_> {
     }
 
     fn emit_export(&mut self, data: &ts_ast::ExportDeclarationData) -> Result<(), EmitError> {
-        if self.settings.module == ModuleKind::CommonJs {
+        if self.commonjs_module_transform {
             return self.emit_commonjs_export(data);
         }
         self.writer.write("export ");
@@ -4016,7 +4233,7 @@ impl Printer<'_> {
     }
 
     fn emit_runtime_declaration_modifiers(&mut self, modifiers: Option<&ts_ast::ModifierList>) {
-        if self.settings.module == ModuleKind::CommonJs || !self.namespace_containers.is_empty() {
+        if self.commonjs_module_transform || !self.namespace_containers.is_empty() {
             return;
         }
         if self.has_modifier(modifiers, SyntaxKind::ExportKeyword) {
@@ -4068,7 +4285,7 @@ impl Printer<'_> {
         &mut self,
         statement: &ts_ast::VariableStatementData,
     ) -> Result<bool, EmitError> {
-        if self.settings.module != ModuleKind::CommonJs
+        if !self.commonjs_module_transform
             || self.commonjs_default_imports.is_empty()
             || !self.has_modifier(statement.modifiers.as_ref(), SyntaxKind::ExportKeyword)
         {
@@ -4190,7 +4407,7 @@ impl Printer<'_> {
         modifiers: Option<&ts_ast::ModifierList>,
         names: &[String],
     ) {
-        if self.settings.module != ModuleKind::CommonJs
+        if !self.commonjs_module_transform
             || self.has_runtime_export_equals
             || !self.has_modifier(modifiers, SyntaxKind::ExportKeyword)
         {
@@ -4870,7 +5087,7 @@ impl Printer<'_> {
     }
 
     fn emit_automatic_helper(&mut self, static_children: bool) {
-        if self.settings.module == ModuleKind::CommonJs {
+        if self.commonjs_module_transform {
             self.writer.write("(0, jsx_runtime_1.");
             self.writer
                 .write(if self.settings.jsx == JsxEmit::ReactJsxDev {
@@ -4891,7 +5108,7 @@ impl Printer<'_> {
     }
 
     fn emit_automatic_fragment_reference(&mut self) {
-        if self.settings.module == ModuleKind::CommonJs {
+        if self.commonjs_module_transform {
             self.writer.write("jsx_runtime_1.Fragment");
         } else {
             self.writer.write("_Fragment");
@@ -5829,11 +6046,13 @@ fn binary_precedence(kind: SyntaxKind) -> Option<(u8, bool)> {
 
 #[cfg(test)]
 mod tests {
+    use ts_binder::bind_source_file;
     use ts_options::{JsxEmit, ModuleKind, PrinterSettings, ScriptTarget};
     use ts_parser::{parse_jsx_source_file, parse_source_file};
 
     use super::{
-        emit_declaration_file, emit_source_file, emit_source_file_with_settings, original_position,
+        AmdDependency, EmitContext, emit_declaration_file, emit_source_file,
+        emit_source_file_with_context, emit_source_file_with_settings, original_position,
     };
 
     fn emit(source: &str) -> String {
@@ -5861,6 +6080,43 @@ mod tests {
                 emit_declarations: false,
                 source_map: true,
                 inline_source_map: false,
+            },
+        )
+        .unwrap()
+    }
+
+    fn emit_amd(source: &str) -> super::EmitResult {
+        let parsed = parse_source_file(source);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let dependencies = parsed
+            .amd_dependencies
+            .iter()
+            .map(|dependency| AmdDependency {
+                path: &dependency.path,
+                name: dependency.name.as_deref(),
+                comment_start: dependency.range.start.get(),
+                comment_end: dependency.range.end.get(),
+            })
+            .collect::<Vec<_>>();
+        emit_source_file_with_context(
+            &parsed.arena,
+            parsed.source_file,
+            "input.ts",
+            source,
+            PrinterSettings {
+                always_strict: false,
+                target: ScriptTarget::Es2015,
+                module: ModuleKind::Amd,
+                jsx: JsxEmit::Preserve,
+                emit_javascript: true,
+                emit_declarations: false,
+                source_map: true,
+                inline_source_map: false,
+            },
+            &EmitContext {
+                bindings: &bindings,
+                amd_module_name: parsed.amd_module_name.as_deref(),
+                amd_dependencies: &dependencies,
             },
         )
         .unwrap()
@@ -6127,6 +6383,130 @@ mod tests {
         assert_eq!(
             emit_with(source, ScriptTarget::Es5, ModuleKind::Amd).code,
             "var C;\n(function (C) {\n    var Name = /** @class */ (function () {\n        function Name(parameters) {\n        }\n        Name.funcData = A.AA.func();\n        Name.someConst = A.AA.foo;\n        return Name;\n    }());\n    C.Name = Name;\n})(C || (C = {}));\n"
+        );
+    }
+
+    #[test]
+    fn emits_named_amd_modules_and_returns_export_equals() {
+        let first = concat!(
+            "///<amd-module name='NamedModule'/>\n",
+            "class Foo {\n",
+            "    x: number;\n",
+            "    constructor() {\n",
+            "        this.x = 5;\n",
+            "    }\n",
+            "}\n",
+            "export = Foo;\n",
+        );
+        assert_eq!(
+            emit_amd(first).code,
+            concat!(
+                "define(\"NamedModule\", [\"require\", \"exports\"], function (require, exports) {\n",
+                "    \"use strict\";\n",
+                "    ///<amd-module name='NamedModule'/>\n",
+                "    class Foo {\n",
+                "        constructor() {\n",
+                "            this.x = 5;\n",
+                "        }\n",
+                "    }\n",
+                "    return Foo;\n",
+                "});\n",
+            )
+        );
+
+        let duplicate = concat!(
+            "///<amd-module name='FirstModuleName'/>\n",
+            "///<amd-module name='SecondModuleName'/>\n",
+            "class Foo {\n",
+            "    x: number;\n",
+            "    constructor() {\n",
+            "        this.x = 5;\n",
+            "    }\n",
+            "}\n",
+            "export = Foo;\n",
+        );
+        assert_eq!(
+            emit_amd(duplicate).code,
+            concat!(
+                "define(\"SecondModuleName\", [\"require\", \"exports\"], function (require, exports) {\n",
+                "    \"use strict\";\n",
+                "    ///<amd-module name='FirstModuleName'/>\n",
+                "    ///<amd-module name='SecondModuleName'/>\n",
+                "    class Foo {\n",
+                "        constructor() {\n",
+                "            this.x = 5;\n",
+                "        }\n",
+                "    }\n",
+                "    return Foo;\n",
+                "});\n",
+            )
+        );
+    }
+
+    #[test]
+    fn orders_amd_dependency_pragmas_around_import_equals() {
+        let source = concat!(
+            "///<amd-dependency path='bar' name='b'/>\n",
+            "///<amd-dependency path='foo'/>\n",
+            "///<amd-dependency path='goo' name='c'/>\n",
+            "\n",
+            "import m1 = require(\"m2\")\n",
+            "m1.f();",
+        );
+        assert_eq!(
+            emit_amd(source).code,
+            concat!(
+                "///<amd-dependency path='bar' name='b'/>\n",
+                "///<amd-dependency path='foo'/>\n",
+                "///<amd-dependency path='goo' name='c'/>\n",
+                "define([\"require\", \"exports\", \"bar\", \"goo\", \"m2\", \"foo\"], function (require, exports, b, c, m1) {\n",
+                "    \"use strict\";\n",
+                "    Object.defineProperty(exports, \"__esModule\", { value: true });\n",
+                "    m1.f();\n",
+                "});\n",
+            )
+        );
+    }
+
+    #[test]
+    fn appends_unnamed_amd_dependency_after_import_equals() {
+        let source = concat!(
+            "///<amd-dependency path='bar'/>\n",
+            "\n",
+            "import m1 = require(\"m2\")\n",
+            "m1.f();",
+        );
+        assert_eq!(
+            emit_amd(source).code,
+            concat!(
+                "///<amd-dependency path='bar'/>\n",
+                "define([\"require\", \"exports\", \"m2\", \"bar\"], function (require, exports, m1) {\n",
+                "    \"use strict\";\n",
+                "    Object.defineProperty(exports, \"__esModule\", { value: true });\n",
+                "    m1.f();\n",
+                "});\n",
+            )
+        );
+    }
+
+    #[test]
+    fn prepends_named_amd_dependency_before_import_equals() {
+        let source = concat!(
+            "///<amd-dependency path='bar' name='b'/>\n",
+            "\n",
+            "import m1 = require(\"m2\")\n",
+            "m1.f();",
+        );
+        assert_eq!(
+            emit_amd(source).code,
+            concat!(
+                "///<amd-dependency path='bar' name='b'/>\n",
+                "define([\"require\", \"exports\", \"bar\", \"m2\"], function (require, exports, b, m1) {\n",
+                "    \"use strict\";\n",
+                "    Object.defineProperty(exports, \"__esModule\", { value: true });\n",
+                "    m1.f();\n",
+                "});\n",
+            )
         );
     }
 
