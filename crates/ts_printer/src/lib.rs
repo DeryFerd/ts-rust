@@ -127,6 +127,16 @@ pub fn emit_source_file_with_settings(
             .writer
             .write("Object.defineProperty(exports, \"__esModule\", { value: true });");
         printer.writer.newline();
+        let preinitialized_exports = commonjs_preinitialized_export_names(arena, &data.statements);
+        if !preinitialized_exports.is_empty() {
+            for name in preinitialized_exports.iter().rev() {
+                printer.writer.write("exports.");
+                printer.writer.write(name);
+                printer.writer.write(" = ");
+            }
+            printer.writer.write("void 0;");
+            printer.writer.newline();
+        }
         for statement in &data.statements.nodes {
             let Some(node) = arena.get(*statement) else {
                 continue;
@@ -218,6 +228,65 @@ fn source_needs_import_star_helper(arena: &NodeArena, statements: &NodeList) -> 
                 )
             })
     })
+}
+
+fn commonjs_preinitialized_export_names(arena: &NodeArena, statements: &NodeList) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut seen = HashSet::new();
+    for statement in &statements.nodes {
+        let Some(node) = arena.get(*statement) else {
+            continue;
+        };
+        if !declaration_has_modifier(arena, node, SyntaxKind::ExportKeyword) {
+            continue;
+        }
+        let default_export = declaration_has_modifier(arena, node, SyntaxKind::DefaultKeyword);
+        match &node.data {
+            NodeData::ClassDeclaration(class) => {
+                let name = if default_export {
+                    Some("default")
+                } else {
+                    class
+                        .name
+                        .and_then(|name| declaration_name_text(arena, name))
+                };
+                if let Some(name) = name
+                    && seen.insert(name.to_owned())
+                {
+                    names.push(name.to_owned());
+                }
+            }
+            NodeData::EnumDeclaration(enumeration) => {
+                if let Some(name) = declaration_name_text(arena, enumeration.name)
+                    && seen.insert(name.to_owned())
+                {
+                    names.push(name.to_owned());
+                }
+            }
+            NodeData::VariableStatement(statement) => {
+                let Some(NodeData::VariableDeclarationList(list)) =
+                    arena.get(statement.declaration_list).map(|node| &node.data)
+                else {
+                    continue;
+                };
+                for declaration in &list.declarations.nodes {
+                    let Some(NodeData::VariableDeclaration(declaration)) =
+                        arena.get(*declaration).map(|node| &node.data)
+                    else {
+                        continue;
+                    };
+                    let Some(name) = declaration_name_text(arena, declaration.name) else {
+                        continue;
+                    };
+                    if seen.insert(name.to_owned()) {
+                        names.push(name.to_owned());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    names
 }
 
 fn statement_emits_javascript(arena: &NodeArena, node: &Node) -> bool {
@@ -1483,6 +1552,13 @@ impl Printer<'_> {
     fn emit_statement(&mut self, id: NodeId) -> Result<(), EmitError> {
         let node = self.node(id)?.clone();
         if declaration_has_modifier(self.arena, &node, SyntaxKind::DeclareKeyword) {
+            return Ok(());
+        }
+        if self.settings.module == ModuleKind::CommonJs
+            && declaration_has_modifier(self.arena, &node, SyntaxKind::ExportKeyword)
+            && let NodeData::VariableStatement(statement) = &node.data
+            && self.variable_list_is_uninitialized(statement.declaration_list)
+        {
             return Ok(());
         }
         match &node.data {
@@ -3027,6 +3103,22 @@ impl Printer<'_> {
                 })
                 .collect::<Vec<_>>(),
         ))
+    }
+
+    fn variable_list_is_uninitialized(&self, list: NodeId) -> bool {
+        let Some(NodeData::VariableDeclarationList(list)) =
+            self.arena.get(list).map(|node| &node.data)
+        else {
+            return false;
+        };
+        !list.declarations.nodes.is_empty()
+            && list.declarations.nodes.iter().all(|declaration| {
+                matches!(
+                    self.arena.get(*declaration).map(|node| &node.data),
+                    Some(NodeData::VariableDeclaration(declaration))
+                        if declaration.initializer.is_none()
+                )
+            })
     }
 
     fn declaration_names(&self, nodes: &[NodeId]) -> Vec<String> {
@@ -5244,6 +5336,44 @@ class Board {
         ] {
             assert!(result.code.contains(assignment), "{}", result.code);
         }
+    }
+
+    #[test]
+    fn preinitializes_commonjs_value_exports_once_in_source_order() {
+        let result = emit_with(
+            "export class First {} export const value = 1; export enum State { Ready } export default class Last {}",
+            ScriptTarget::Es2015,
+            ModuleKind::CommonJs,
+        );
+        assert!(
+            result.code.contains(
+                "exports.default = exports.State = exports.value = exports.First = void 0;"
+            ),
+            "{}",
+            result.code
+        );
+        assert_eq!(result.code.matches(" = void 0;").count(), 1);
+        for assignment in [
+            "exports.First = First;",
+            "exports.value = value;",
+            "exports.State = State;",
+            "exports.default = Last;",
+        ] {
+            assert!(result.code.contains(assignment), "{}", result.code);
+        }
+    }
+
+    #[test]
+    fn preinitialization_is_the_only_emit_for_uninitialized_exported_variables() {
+        let result = emit_with(
+            "export var id: number;",
+            ScriptTarget::Es2015,
+            ModuleKind::CommonJs,
+        );
+        assert_eq!(
+            result.code,
+            "\"use strict\";\nObject.defineProperty(exports, \"__esModule\", { value: true });\nexports.id = void 0;\n"
+        );
     }
 
     #[test]
