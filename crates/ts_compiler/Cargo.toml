@@ -16,6 +16,7 @@ ts_diagnostics = { path = "../ts_diagnostics" }
 ts_glob = { path = "../ts_glob" }
 ts_module = { path = "../ts_module" }
 ts_options = { path = "../ts_options" }
+ts_outputpaths = { path = "../ts_outputpaths" }
 ts_parser = { path = "../ts_parser" }
 ts_path = { path = "../ts_path" }
 ts_printer = { path = "../ts_printer" }

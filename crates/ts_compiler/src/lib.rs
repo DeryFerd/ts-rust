@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use ts_ast::{NodeData, NodeId};
 use ts_binder::{BindResult, bind_source_file};
-use ts_checker::{CheckResult, check_source_file};
+use ts_checker::{CheckResult, ProgramSource, check_program, check_source_file};
 use ts_config::{ConfigDiagnostic, resolve_config_file};
 use ts_core::TextRange;
 use ts_diagnostics::message_by_code;
@@ -53,6 +53,7 @@ pub struct EmitOutput {
 pub struct Program {
     source_files: Vec<SourceFile>,
     file_index: BTreeMap<String, usize>,
+    resolved_modules: BTreeMap<(String, String), String>,
     diagnostics: Vec<ProgramDiagnostic>,
     current_directory: String,
     case_sensitivity: CaseSensitivity,
@@ -63,6 +64,16 @@ impl Program {
     /// Creates a Program from explicit root file names.
     #[must_use]
     pub fn new(
+        file_system: &dyn FileSystem,
+        current_directory: &str,
+        root_names: &[String],
+    ) -> Self {
+        let mut program = Self::new_unchecked(file_system, current_directory, root_names);
+        program.check_program();
+        program
+    }
+
+    fn new_unchecked(
         file_system: &dyn FileSystem,
         current_directory: &str,
         root_names: &[String],
@@ -98,7 +109,7 @@ impl Program {
         root_names: &[String],
         resolution_options: ResolutionOptions,
     ) -> Self {
-        let mut program = Self::new(file_system, current_directory, root_names);
+        let mut program = Self::new_unchecked(file_system, current_directory, root_names);
         let resolver = Resolver::new(file_system, resolution_options);
         let mut file_index = 0;
         while file_index < program.source_files.len() {
@@ -107,6 +118,19 @@ impl Program {
             for (specifier, range) in specifiers {
                 let result = resolver.resolve(&specifier, &containing_file);
                 if let Some(resolved) = result.resolved {
+                    let containing = canonicalize(
+                        &containing_file,
+                        &program.current_directory,
+                        program.case_sensitivity,
+                    );
+                    let target = canonicalize(
+                        &resolved.resolved_file_name,
+                        &program.current_directory,
+                        program.case_sensitivity,
+                    );
+                    program
+                        .resolved_modules
+                        .insert((containing, specifier.clone()), target);
                     program.load_file(file_system, &resolved.resolved_file_name, false);
                 } else {
                     program.diagnostics.push(module_not_found_diagnostic(
@@ -118,6 +142,7 @@ impl Program {
             }
             file_index += 1;
         }
+        program.check_program();
         program
     }
 
@@ -223,7 +248,10 @@ impl Program {
                 self.options.printer_settings(),
             ) {
                 Ok(mut emitted) => {
-                    let file_name = javascript_output_path(&source_file.file_name);
+                    let file_name = javascript_output_path(
+                        &source_file.file_name,
+                        self.options.printer_settings().jsx,
+                    );
                     if let Some(mut source_map) = emitted.source_map {
                         let map_file_name = format!("{file_name}.map");
                         source_map.file = file_name.rsplit('/').next().map(str::to_owned);
@@ -255,6 +283,63 @@ impl Program {
             }
         }
         output
+    }
+
+    fn check_program(&mut self) {
+        let module_maps = self
+            .source_files
+            .iter()
+            .map(|source_file| {
+                let containing = canonicalize(
+                    &source_file.file_name,
+                    &self.current_directory,
+                    self.case_sensitivity,
+                );
+                self.resolved_modules
+                    .iter()
+                    .filter_map(|((source, specifier), target)| {
+                        (source == &containing).then(|| {
+                            self.file_index
+                                .get(target)
+                                .map(|index| (specifier.clone(), *index))
+                        })?
+                    })
+                    .collect::<BTreeMap<_, _>>()
+            })
+            .collect::<Vec<_>>();
+        let checked = {
+            let inputs = self
+                .source_files
+                .iter()
+                .zip(&module_maps)
+                .map(|(source_file, resolved_modules)| ProgramSource {
+                    arena: &source_file.parse.arena,
+                    source_file: source_file.parse.source_file,
+                    bindings: &source_file.binding,
+                    resolved_modules,
+                })
+                .collect::<Vec<_>>();
+            check_program(&inputs)
+        };
+        for (source_file, checking) in self.source_files.iter_mut().zip(checked.files) {
+            for diagnostic in &checking.diagnostics {
+                let range = source_file
+                    .parse
+                    .arena
+                    .get(diagnostic.node)
+                    .map(|node| node.range);
+                self.diagnostics.push(ProgramDiagnostic {
+                    file_name: Some(source_file.file_name.clone()),
+                    range,
+                    code: Some(diagnostic.diagnostic.code()),
+                    message: diagnostic
+                        .diagnostic
+                        .render()
+                        .unwrap_or_else(|error| error.to_string()),
+                });
+            }
+            source_file.checking = checking;
+        }
     }
 
     fn load_file(&mut self, file_system: &dyn FileSystem, file_name: &str, report_missing: bool) {
@@ -291,18 +376,6 @@ impl Program {
             });
         }
         let checking = check_source_file(&parse.arena, parse.source_file, &binding);
-        for diagnostic in &checking.diagnostics {
-            let range = parse.arena.get(diagnostic.node).map(|node| node.range);
-            self.diagnostics.push(ProgramDiagnostic {
-                file_name: Some(file_name.to_owned()),
-                range,
-                code: Some(diagnostic.diagnostic.code()),
-                message: diagnostic
-                    .diagnostic
-                    .render()
-                    .unwrap_or_else(|error| error.to_string()),
-            });
-        }
         let index = self.source_files.len();
         self.file_index.insert(canonical, index);
         self.source_files.push(SourceFile {
@@ -315,18 +388,8 @@ impl Program {
     }
 }
 
-fn javascript_output_path(file_name: &str) -> String {
-    for (source, output) in [
-        (".mts", ".mjs"),
-        (".cts", ".cjs"),
-        (".tsx", ".js"),
-        (".ts", ".js"),
-    ] {
-        if let Some(stem) = file_name.strip_suffix(source) {
-            return format!("{stem}{output}");
-        }
-    }
-    file_name.to_owned()
+fn javascript_output_path(file_name: &str, jsx: ts_options::JsxEmit) -> String {
+    ts_path::change_extension(file_name, ts_outputpaths::output_extension(file_name, jsx))
 }
 
 fn serialize_source_map(source_map: &SourceMap) -> String {
@@ -585,6 +648,92 @@ mod tests {
     }
 
     #[test]
+    fn checks_named_default_and_type_imports_across_files() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/dep.ts",
+            r"
+                export const count: number = 1;
+                const internal: number = 2;
+                export { internal as value };
+                export type Box<T> = Array<T>;
+                export default function label(value: string): string { return value; }
+            ",
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/main.ts",
+            r#"
+                import label, { count, value, Box } from "./dep";
+                const total: number = count + value;
+                const wrong: string = count;
+                const boxed: Box<number> = [1, "wrong"];
+                label(1);
+            "#,
+        )
+        .unwrap();
+        let program = Program::new_with_module_resolution(
+            &fs,
+            "/project",
+            &["main.ts".to_owned()],
+            ts_module::ResolutionOptions::default(),
+        );
+        assert_eq!(program.source_files().len(), 2);
+        assert_eq!(
+            program
+                .diagnostics()
+                .iter()
+                .filter_map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [2322, 2322, 2345]
+        );
+    }
+
+    #[test]
+    fn declaration_files_contribute_globals_and_report_duplicates() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/globals.d.ts",
+            "interface Shared { value: string; } declare const duplicate: number;",
+        )
+        .unwrap();
+        fs.write_file("/project/other.d.ts", "declare const duplicate: string;")
+            .unwrap();
+        fs.write_file(
+            "/project/main.ts",
+            "const good: Shared = { value: 'ok' }; const bad: Shared = { value: 1 };",
+        )
+        .unwrap();
+        let program = Program::new(
+            &fs,
+            "/project",
+            &[
+                "globals.d.ts".to_owned(),
+                "other.d.ts".to_owned(),
+                "main.ts".to_owned(),
+            ],
+        );
+        assert!(
+            program
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code == Some(2451))
+        );
+        assert!(
+            program
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code == Some(2322))
+        );
+        assert!(
+            !program
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code == Some(2304))
+        );
+    }
+
+    #[test]
     fn emits_type_erased_modern_javascript() {
         let fs = MemoryFileSystem::new(true);
         fs.write_file(
@@ -597,6 +746,28 @@ mod tests {
         assert!(emitted.diagnostics.is_empty());
         assert_eq!(emitted.files[0].file_name, "/project/main.js");
         assert_eq!(emitted.files[0].text, "var point = { x: 1 };\n");
+    }
+
+    #[test]
+    fn emit_paths_follow_jsx_and_module_extension_rules() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/view.tsx", "const view = 1;")
+            .unwrap();
+        fs.write_file("/project/module.mts", "const value = 1;")
+            .unwrap();
+        let program = Program::new(
+            &fs,
+            "/project",
+            &["view.tsx".to_owned(), "module.mts".to_owned()],
+        );
+        let emitted = program.emit();
+        let paths: Vec<_> = emitted
+            .files
+            .iter()
+            .map(|file| file.file_name.as_str())
+            .collect();
+        assert!(paths.contains(&"/project/view.jsx"));
+        assert!(paths.contains(&"/project/module.mjs"));
     }
 
     #[test]

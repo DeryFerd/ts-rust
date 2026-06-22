@@ -437,6 +437,9 @@ impl<'a> Binder<'a> {
             }
             NodeData::VariableStatement(data) => {
                 self.bind_variable_list(data.declaration_list, scope, container, parent_symbol);
+                if self.has_modifier(node_id, SyntaxKind::ExportKeyword) {
+                    self.export_variable_list(data.declaration_list, parent_symbol);
+                }
             }
             NodeData::VariableDeclarationList(_) => {
                 self.bind_variable_list(node_id, scope, container, parent_symbol);
@@ -661,6 +664,33 @@ impl<'a> Binder<'a> {
                 if let Some(initializer) = initializer {
                     self.bind_node(initializer, scope, container, parent_symbol);
                 }
+            }
+        }
+    }
+
+    fn export_variable_list(&mut self, list_id: NodeId, parent_symbol: Option<SymbolId>) {
+        let Some(NodeData::VariableDeclarationList(list)) =
+            self.arena.get(list_id).map(|node| &node.data)
+        else {
+            return;
+        };
+        for declaration in &list.declarations.nodes {
+            let Some(symbol_id) = self.result.node_symbols.get(declaration).copied() else {
+                continue;
+            };
+            let Some(symbol) = self.result.symbols.get(symbol_id) else {
+                continue;
+            };
+            let name = symbol.name.clone();
+            if let Some(parent) = parent_symbol {
+                self.result
+                    .symbols
+                    .get_mut(parent)
+                    .unwrap()
+                    .members
+                    .insert(name, symbol_id);
+            } else {
+                self.result.exports.insert(name, symbol_id);
             }
         }
     }
@@ -1013,6 +1043,7 @@ impl<'a> Binder<'a> {
             Some(NodeData::TypeAliasDeclaration(data)) => data.modifiers.as_ref(),
             Some(NodeData::EnumDeclaration(data)) => data.modifiers.as_ref(),
             Some(NodeData::ModuleDeclaration(data)) => data.modifiers.as_ref(),
+            Some(NodeData::VariableStatement(data)) => data.modifiers.as_ref(),
             _ => None,
         };
         modifiers.is_some_and(|modifiers| {
