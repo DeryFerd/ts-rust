@@ -89,6 +89,9 @@ dependencies = [
 [[package]]
 name = "ts_ast"
 version = "7.0.0-dev"
+dependencies = [
+ "ts_core",
+]
 
 [[package]]
 name = "ts_ast_codegen"
@@ -103,7 +106,20 @@ name = "ts_cli"
 version = "7.0.0-dev"
 dependencies = [
  "ts_ast",
+ "ts_parser",
  "ts_scanner",
+]
+
+[[package]]
+name = "ts_compare"
+version = "7.0.0-dev"
+
+[[package]]
+name = "ts_config"
+version = "7.0.0-dev"
+dependencies = [
+ "ts_diagnostics",
+ "ts_vfs",
 ]
 
 [[package]]
@@ -111,7 +127,32 @@ name = "ts_core"
 version = "7.0.0-dev"
 
 [[package]]
+name = "ts_diagnostics"
+version = "7.0.0-dev"
+
+[[package]]
+name = "ts_diagnostics_codegen"
+version = "7.0.0-dev"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ts_fixture"
+version = "7.0.0-dev"
+
+[[package]]
+name = "ts_parser"
+version = "7.0.0-dev"
+dependencies = [
+ "ts_ast",
+ "ts_core",
+ "ts_scanner",
+]
+
+[[package]]
+name = "ts_path"
 version = "7.0.0-dev"
 
 [[package]]

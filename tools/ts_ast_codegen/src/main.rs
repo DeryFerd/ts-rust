@@ -4,7 +4,7 @@ use std::{
     process::{Command, Stdio},
 };
 
-use ts_ast_codegen::generate_syntax_kind_file;
+use ts_ast_codegen::{generate_ast_file, generate_syntax_kind_file};
 
 fn main() {
     if let Err(error) = run(std::env::args_os().skip(1)) {
@@ -17,23 +17,36 @@ fn run(args: impl Iterator<Item = std::ffi::OsString>) -> Result<(), String> {
     let args: Vec<_> = args.collect();
     let default_schema = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("spec/ast.json");
     match args.as_slice() {
-        [command] if command == "emit" => emit(&default_schema, None),
-        [command, output] if command == "emit" => emit(&default_schema, Some(Path::new(output))),
-        [command, output] if command == "check" => check(&default_schema, Path::new(output)),
+        [command] if command == "emit" => emit_syntax_kind(&default_schema, None),
+        [command, output] if command == "emit" => {
+            emit_syntax_kind(&default_schema, Some(Path::new(output)))
+        }
+        [command, output] if command == "check" => {
+            check_syntax_kind(&default_schema, Path::new(output))
+        }
         [command, schema, output] if command == "emit" => {
-            emit(Path::new(schema), Some(Path::new(output)))
+            emit_syntax_kind(Path::new(schema), Some(Path::new(output)))
         }
         [command, schema, output] if command == "check" => {
-            check(Path::new(schema), Path::new(output))
+            check_syntax_kind(Path::new(schema), Path::new(output))
         }
-        _ => Err(
-            "usage: ts_ast_codegen emit [SCHEMA OUTPUT] | emit [OUTPUT] | check [SCHEMA] OUTPUT"
-                .to_owned(),
-        ),
+        [command, output] if command == "emit-ast" => {
+            emit_ast(&default_schema, Path::new(output))
+        }
+        [command, output] if command == "check-ast" => {
+            check_ast(&default_schema, Path::new(output))
+        }
+        [command, schema, output] if command == "emit-ast" => {
+            emit_ast(Path::new(schema), Path::new(output))
+        }
+        [command, schema, output] if command == "check-ast" => {
+            check_ast(Path::new(schema), Path::new(output))
+        }
+        _ => Err("usage: ts_ast_codegen emit [SCHEMA OUTPUT] | emit [OUTPUT] | check [SCHEMA] OUTPUT | emit-ast [SCHEMA] OUTPUT | check-ast [SCHEMA] OUTPUT".to_owned()),
     }
 }
 
-fn emit(schema: &Path, output: Option<&Path>) -> Result<(), String> {
+fn emit_syntax_kind(schema: &Path, output: Option<&Path>) -> Result<(), String> {
     let generated = format_rust(&generate_syntax_kind_file(schema)?)?;
     if let Some(output) = output {
         std::fs::write(output, generated)
@@ -44,7 +57,7 @@ fn emit(schema: &Path, output: Option<&Path>) -> Result<(), String> {
     Ok(())
 }
 
-fn check(schema: &Path, output: &Path) -> Result<(), String> {
+fn check_syntax_kind(schema: &Path, output: &Path) -> Result<(), String> {
     let generated = format_rust(&generate_syntax_kind_file(schema)?)?;
     let existing = std::fs::read_to_string(output)
         .map_err(|error| format!("failed to read {}: {error}", output.display()))?;
@@ -53,6 +66,27 @@ fn check(schema: &Path, output: &Path) -> Result<(), String> {
     } else {
         Err(format!(
             "{} is stale; regenerate it with `ts_ast_codegen emit {}`",
+            output.display(),
+            output.display()
+        ))
+    }
+}
+
+fn emit_ast(schema: &Path, output: &Path) -> Result<(), String> {
+    let generated = format_rust(&generate_ast_file(schema)?)?;
+    std::fs::write(output, generated)
+        .map_err(|error| format!("failed to write {}: {error}", output.display()))
+}
+
+fn check_ast(schema: &Path, output: &Path) -> Result<(), String> {
+    let generated = format_rust(&generate_ast_file(schema)?)?;
+    let existing = std::fs::read_to_string(output)
+        .map_err(|error| format!("failed to read {}: {error}", output.display()))?;
+    if generated == existing {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} is stale; regenerate it with `ts_ast_codegen emit-ast {}`",
             output.display(),
             output.display()
         ))

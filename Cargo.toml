@@ -2,10 +2,16 @@
 members = [
     "crates/ts_core",
     "crates/ts_ast",
+    "crates/ts_parser",
+    "crates/ts_path",
     "crates/ts_scanner",
     "crates/ts_cli",
+    "crates/ts_config",
+    "crates/ts_diagnostics",
     "crates/ts_vfs",
     "tools/ts_ast_codegen",
+    "tools/ts_compare",
+    "tools/ts_diagnostics_codegen",
     "tools/ts_fixture",
 ]
 resolver = "3"

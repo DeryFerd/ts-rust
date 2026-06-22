@@ -1,11 +1,13 @@
 [package]
-name = "ts_ast"
+name = "ts_config"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-ts_core = { path = "../ts_core" }
+ts_diagnostics = { path = "../ts_diagnostics" }
+ts_vfs = { path = "../ts_vfs" }
 
 [lints]
 workspace = true
+

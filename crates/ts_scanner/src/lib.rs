@@ -2,4 +2,4 @@
 
 mod scanner;
 
-pub use scanner::{Scanner, ScannerCheckpoint, Token, TokenFlags};
+pub use scanner::{LanguageVariant, Scanner, ScannerCheckpoint, Token, TokenFlags};

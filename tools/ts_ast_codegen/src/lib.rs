@@ -1,6 +1,6 @@
 //! Generation of Rust AST definitions from TypeScript Go's `ast.json`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::Path;
 
@@ -9,6 +9,10 @@ use serde::Deserialize;
 #[derive(Debug, Deserialize)]
 struct Schema {
     kinds: Kinds,
+    #[serde(default)]
+    bases: BTreeMap<String, BaseDef>,
+    #[serde(default)]
+    nodes: Nodes,
 }
 
 #[derive(Debug, Deserialize)]
@@ -16,7 +20,106 @@ struct Kinds {
     elements: Vec<KindElement>,
     markers: Vec<KindMarker>,
     #[serde(default)]
-    aliases: HashMap<String, KindAlias>,
+    aliases: BTreeMap<String, KindAlias>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BaseDef {
+    #[serde(default)]
+    extends: Vec<String>,
+    #[serde(default)]
+    fields: BTreeMap<String, FieldDef>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Nodes {
+    definitions: BTreeMap<String, NodeDef>,
+    aliases: BTreeMap<String, NodeAlias>,
+    #[serde(default)]
+    list_aliases: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum NodeAlias {
+    Base { base: String },
+    Members(Vec<String>),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+struct NodeDef {
+    #[serde(default)]
+    kind: Option<StringOrList>,
+    extends: Vec<String>,
+    #[serde(default)]
+    members: Vec<MemberDef>,
+    #[serde(default)]
+    type_parameters: Vec<TypeParameterDef>,
+    #[serde(default)]
+    instantiation_aliases: BTreeMap<String, String>,
+    #[serde(default)]
+    hand_written: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+struct TypeParameterDef {
+    name: String,
+    constraint: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+struct MemberDef {
+    name: String,
+    #[serde(default)]
+    r#type: Option<StringOrList>,
+    #[serde(default)]
+    inherited: bool,
+    #[serde(default)]
+    optional: Option<bool>,
+    #[serde(default)]
+    list: Option<ListKind>,
+    #[serde(default)]
+    go_only: bool,
+    #[serde(default)]
+    no_go: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+struct FieldDef {
+    r#type: StringOrList,
+    #[serde(default)]
+    optional: bool,
+    #[serde(default)]
+    list: Option<ListKind>,
+    #[serde(default)]
+    go_only: bool,
+    #[serde(default)]
+    no_go: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+enum StringOrList {
+    One(String),
+    Many(Vec<String>),
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+enum ListKind {
+    NodeList,
+    ModifierList,
+    #[serde(rename = "raw")]
+    Raw,
 }
 
 #[derive(Debug, Deserialize)]
@@ -72,6 +175,10 @@ pub fn generate_syntax_kind_file(path: &Path) -> Result<String, String> {
         .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
     generate_syntax_kind(&json)
 }
+
+mod ast;
+
+pub use ast::{generate_ast, generate_ast_file};
 
 struct Generator<'a> {
     schema: &'a Schema,

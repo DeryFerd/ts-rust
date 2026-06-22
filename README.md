@@ -8,8 +8,12 @@ The implementation is split into compiler layers so each layer can be tested
 against the upstream TypeScript fixtures independently:
 
 - `ts_core`: source positions and diagnostics
-- `ts_ast`: syntax kinds and, eventually, AST nodes
+- `ts_ast`: generated syntax kinds and arena-backed AST nodes
 - `ts_scanner`: lexical analysis
+- `ts_parser`: the TypeScript grammar and error recovery
+- `ts_diagnostics`: generated TypeScript diagnostic catalog
+- `ts_config`: JSONC and `tsconfig.json` parsing
+- `ts_path` / `ts_vfs`: compiler path and filesystem abstractions
 - `ts_cli`: the `tsgo` executable
 
 Run the current checks with:
@@ -18,3 +22,8 @@ Run the current checks with:
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
+
+Development-only `tsgo --tokenize file.ts` and `tsgo --parse file.ts`
+commands expose the current scanner/parser vertical slice. Standard compilation
+still exits explicitly as not implemented until Program, binding, checking, and
+emit are connected.
