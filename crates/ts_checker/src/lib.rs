@@ -50,6 +50,7 @@ pub struct ObjectType {
     pub properties: BTreeMap<String, TypeId>,
     pub optional_properties: BTreeSet<String>,
     pub readonly_properties: BTreeSet<String>,
+    pub getter_properties: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -444,6 +445,7 @@ enum TypeDescriptor {
         properties: BTreeMap<String, Self>,
         optional_properties: BTreeSet<String>,
         readonly_properties: BTreeSet<String>,
+        getter_properties: BTreeSet<String>,
     },
     Function {
         parameters: Vec<Self>,
@@ -964,6 +966,7 @@ impl<'a> Checker<'a> {
             properties: properties.clone(),
             optional_properties: BTreeSet::new(),
             readonly_properties: properties.keys().cloned().collect(),
+            getter_properties: BTreeSet::new(),
         }));
         for member_type in properties.values() {
             self.enum_member_owners.insert(*member_type, enum_type);
@@ -1472,6 +1475,7 @@ impl<'a> Checker<'a> {
         let mut properties = BTreeMap::new();
         let mut optional_properties = BTreeSet::new();
         let mut readonly_properties = BTreeSet::new();
+        let mut getter_properties = BTreeSet::new();
         for member in members {
             let Some(node) = self.arena.get(*member) else {
                 continue;
@@ -1568,6 +1572,38 @@ impl<'a> Checker<'a> {
                         }
                     }
                 }
+                NodeData::GetAccessorDeclaration(data) => {
+                    if let Some(name) = self.property_name(data.name) {
+                        let property_type = if let Some(type_node) = data.type_ {
+                            self.type_from_type_node(type_node)
+                        } else {
+                            self.result.types.any()
+                        };
+                        properties.insert(name.clone(), property_type);
+                        getter_properties.insert(name);
+                    }
+                }
+                NodeData::SetAccessorDeclaration(data) => {
+                    if let Some(name) = self.property_name(data.name)
+                        && !getter_properties.contains(&name)
+                    {
+                        let type_node = data
+                            .parameters
+                            .nodes
+                            .first()
+                            .and_then(|parameter| self.arena.get(*parameter))
+                            .and_then(|parameter| match &parameter.data {
+                                NodeData::ParameterDeclaration(parameter) => parameter.type_,
+                                _ => None,
+                            });
+                        let property_type = if let Some(type_node) = type_node {
+                            self.type_from_type_node(type_node)
+                        } else {
+                            self.result.types.any()
+                        };
+                        properties.insert(name, property_type);
+                    }
+                }
                 _ => {}
             }
         }
@@ -1575,6 +1611,7 @@ impl<'a> Checker<'a> {
             properties,
             optional_properties,
             readonly_properties,
+            getter_properties,
         }))
     }
 
@@ -1706,6 +1743,7 @@ impl<'a> Checker<'a> {
         let mut properties = BTreeMap::new();
         let mut optional_properties = BTreeSet::new();
         let mut readonly_properties = BTreeSet::new();
+        let mut getter_properties = BTreeSet::new();
         if let Some(clauses) = heritage_clauses {
             for clause in &clauses.nodes {
                 let Some(NodeData::HeritageClause(clause)) =
@@ -1745,6 +1783,7 @@ impl<'a> Checker<'a> {
                         properties.extend(base.properties);
                         optional_properties.extend(base.optional_properties);
                         readonly_properties.extend(base.readonly_properties);
+                        getter_properties.extend(base.getter_properties);
                     }
                 }
             }
@@ -1754,11 +1793,13 @@ impl<'a> Checker<'a> {
             properties.extend(own.properties);
             optional_properties.extend(own.optional_properties);
             readonly_properties.extend(own.readonly_properties);
+            getter_properties.extend(own.getter_properties);
         }
         let result = self.result.types.alloc(TypeKind::Object(ObjectType {
             properties,
             optional_properties,
             readonly_properties,
+            getter_properties,
         }));
         self.type_parameter_scopes.pop();
         result
@@ -1833,6 +1874,54 @@ impl<'a> Checker<'a> {
                     let mut saw_return = false;
                     if let Some(body) = data.body {
                         self.check_node(body, Some(return_type), &mut saw_return);
+                    }
+                    self.local_scopes.pop();
+                }
+                NodeData::GetAccessorDeclaration(data) => {
+                    if !data.parameters.nodes.is_empty() {
+                        self.error(*member, 1054, std::iter::empty());
+                    }
+                    let return_type = if let Some(type_node) = data.type_ {
+                        self.type_from_type_node(type_node)
+                    } else {
+                        self.result.types.any()
+                    };
+                    let local_scope = self.parameter_scope(&data.parameters.nodes);
+                    self.local_scopes.push(local_scope);
+                    let mut saw_return = false;
+                    if let Some(body) = data.body {
+                        self.check_node(body, Some(return_type), &mut saw_return);
+                    }
+                    self.local_scopes.pop();
+                }
+                NodeData::SetAccessorDeclaration(data) => {
+                    if data.parameters.nodes.len() != 1 {
+                        self.error(*member, 1049, std::iter::empty());
+                    }
+                    if data.type_.is_some() {
+                        self.error(*member, 1095, std::iter::empty());
+                    }
+                    for parameter_id in &data.parameters.nodes {
+                        if let Some(NodeData::ParameterDeclaration(parameter)) =
+                            self.arena.get(*parameter_id).map(|node| &node.data)
+                        {
+                            if parameter.question_token.is_some() {
+                                self.error(*parameter_id, 1051, std::iter::empty());
+                            }
+                            if parameter.initializer.is_some() {
+                                self.error(*parameter_id, 1052, std::iter::empty());
+                            }
+                            if parameter.dot_dot_dot_token.is_some() {
+                                self.error(*parameter_id, 1053, std::iter::empty());
+                            }
+                        }
+                        self.check_parameter(*parameter_id);
+                    }
+                    let local_scope = self.parameter_scope(&data.parameters.nodes);
+                    self.local_scopes.push(local_scope);
+                    let mut saw_return = false;
+                    if let Some(body) = data.body {
+                        self.check_node(body, None, &mut saw_return);
                     }
                     self.local_scopes.pop();
                 }
@@ -2352,8 +2441,17 @@ impl<'a> Checker<'a> {
                 self.element_access_type(node_id, receiver, index)
             }
             NodeData::CallExpression(data) => {
+                let getter_call = self.property_access_is_getter(data.expression);
                 let callee = self.type_of_expression(data.expression);
-                self.call_expression_type(node_id, callee, &data.arguments.nodes, false)
+                if getter_call && !self.type_is_callable(callee) {
+                    for argument in &data.arguments.nodes {
+                        self.type_of_expression(*argument);
+                    }
+                    self.error(data.expression, 6234, std::iter::empty());
+                    self.result.types.any()
+                } else {
+                    self.call_expression_type(node_id, callee, &data.arguments.nodes, false)
+                }
             }
             NodeData::NewExpression(data) => {
                 let type_arguments = data
@@ -2428,6 +2526,43 @@ impl<'a> Checker<'a> {
                 self.property_is_optional(receiver, &name)
             }
             _ => None,
+        }
+    }
+
+    fn property_access_is_getter(&mut self, expression: NodeId) -> bool {
+        let Some(NodeData::PropertyAccessExpression(access)) =
+            self.arena.get(expression).map(|node| node.data.clone())
+        else {
+            return false;
+        };
+        let receiver = self.type_of_expression(access.expression);
+        let Some(name) = self.property_name(access.name) else {
+            return false;
+        };
+        self.property_is_getter(receiver, &name)
+    }
+
+    fn property_is_getter(&self, receiver: TypeId, name: &str) -> bool {
+        match &self.result.types.get(receiver).unwrap().kind {
+            TypeKind::Object(object) => object.getter_properties.contains(name),
+            TypeKind::Union(members) | TypeKind::Intersection(members) => members
+                .iter()
+                .any(|member| self.property_is_getter(*member, name)),
+            TypeKind::TypeParameter {
+                constraint: Some(constraint),
+                ..
+            } => self.property_is_getter(*constraint, name),
+            _ => false,
+        }
+    }
+
+    fn type_is_callable(&self, type_id: TypeId) -> bool {
+        match &self.result.types.get(type_id).unwrap().kind {
+            TypeKind::Any | TypeKind::Function(_) | TypeKind::Overload(_) => true,
+            TypeKind::Union(members) | TypeKind::Intersection(members) => {
+                members.iter().all(|member| self.type_is_callable(*member))
+            }
+            _ => false,
         }
     }
 
@@ -3130,6 +3265,7 @@ impl<'a> Checker<'a> {
                     properties,
                     optional_properties: object.optional_properties,
                     readonly_properties: object.readonly_properties,
+                    getter_properties: object.getter_properties,
                 }))
             }
             _ => type_id,
@@ -3784,6 +3920,7 @@ impl<'a> Checker<'a> {
             properties,
             optional_properties,
             readonly_properties,
+            getter_properties: BTreeSet::new(),
         }))
     }
 
@@ -4125,6 +4262,7 @@ impl<'a> Checker<'a> {
                 properties,
                 optional_properties,
                 readonly_properties,
+                getter_properties,
             } => {
                 let properties = properties
                     .iter()
@@ -4134,6 +4272,7 @@ impl<'a> Checker<'a> {
                     properties,
                     optional_properties: optional_properties.clone(),
                     readonly_properties: readonly_properties.clone(),
+                    getter_properties: getter_properties.clone(),
                 }))
             }
             TypeDescriptor::Function {
@@ -4227,6 +4366,7 @@ impl<'a> Checker<'a> {
             Some(TypeKind::Object(object)) => {
                 let optional_properties = object.optional_properties;
                 let readonly_properties = object.readonly_properties;
+                let getter_properties = object.getter_properties;
                 let properties = object
                     .properties
                     .into_iter()
@@ -4236,6 +4376,7 @@ impl<'a> Checker<'a> {
                     properties,
                     optional_properties,
                     readonly_properties,
+                    getter_properties,
                 }))
             }
             _ => type_id,
@@ -4657,6 +4798,7 @@ fn describe_type(types: &TypeArena, type_id: TypeId) -> TypeDescriptor {
                 .collect(),
             optional_properties: object.optional_properties.clone(),
             readonly_properties: object.readonly_properties.clone(),
+            getter_properties: object.getter_properties.clone(),
         },
         TypeKind::Function(function) => TypeDescriptor::Function {
             parameters: function
@@ -4716,6 +4858,7 @@ fn substitute_descriptor(
             properties,
             optional_properties,
             readonly_properties,
+            getter_properties,
         } => TypeDescriptor::Object {
             properties: properties
                 .iter()
@@ -4725,6 +4868,7 @@ fn substitute_descriptor(
                 .collect(),
             optional_properties: optional_properties.clone(),
             readonly_properties: readonly_properties.clone(),
+            getter_properties: getter_properties.clone(),
         },
         TypeDescriptor::Function {
             parameters,
@@ -4784,16 +4928,19 @@ fn merge_global_descriptor(existing: &mut TypeDescriptor, new: TypeDescriptor) {
                 properties: existing,
                 optional_properties: existing_optional,
                 readonly_properties: existing_readonly,
+                getter_properties: existing_getters,
             },
             TypeDescriptor::Object {
                 properties: new,
                 optional_properties: new_optional,
                 readonly_properties: new_readonly,
+                getter_properties: new_getters,
             },
         ) => {
             existing.extend(new);
             existing_optional.extend(new_optional);
             existing_readonly.extend(new_readonly);
+            existing_getters.extend(new_getters);
         }
         (
             TypeDescriptor::Alias {
@@ -4810,17 +4957,20 @@ fn merge_global_descriptor(existing: &mut TypeDescriptor, new: TypeDescriptor) {
                     properties: existing,
                     optional_properties: existing_optional,
                     readonly_properties: existing_readonly,
+                    getter_properties: existing_getters,
                 },
                 TypeDescriptor::Object {
                     properties: new,
                     optional_properties: new_optional,
                     readonly_properties: new_readonly,
+                    getter_properties: new_getters,
                 },
             ) = (existing_body.as_mut(), *new_body)
             {
                 existing.extend(new);
                 existing_optional.extend(new_optional);
                 existing_readonly.extend(new_readonly);
+                existing_getters.extend(new_getters);
             }
         }
         _ => {}
@@ -6025,6 +6175,71 @@ mod tests {
         assert_eq!(
             result.diagnostics[1].diagnostic.render().unwrap(),
             "Object literal may only specify known properties, and 'extra' does not exist in type '{ id: number; label: undefined | string; value: string }'."
+        );
+    }
+
+    #[test]
+    fn checks_accessor_property_types_and_accidental_calls() {
+        let parsed = parse_source_file(
+            r"
+                class Model {
+                    get value(): number { return 1; }
+                    set label(value: string) {}
+                    get callback(): () => number { return () => 1; }
+                }
+                declare const model: Model;
+                const value: number = model.value;
+                const label: string = model.label;
+                const structural: { value: number } = model;
+                const bad: { value: string } = model;
+                model.value();
+                model.label();
+                const result: number = model.callback();
+            ",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2322, 6234, 2349],
+            "{:?}",
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.render().unwrap())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn checks_accessor_parameter_grammar() {
+        let parsed = parse_source_file(
+            r#"
+                class InvalidAccessors {
+                    get withParameter(value: number): number { return value; }
+                    set none() {}
+                    set optional(value?: string) {}
+                    set initialized(value: string = "value") {}
+                    set rest(...value: string[]) {}
+                    set returns(value: string): void {}
+                }
+            "#,
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [1054, 1049, 1051, 1052, 1053, 1095]
         );
     }
 
