@@ -43,6 +43,7 @@ pub enum EmitConstantValue {
 pub struct EmitContext<'a> {
     pub bindings: &'a BindResult,
     pub amd_module_name: Option<&'a str>,
+    pub amd_bundle: bool,
     pub amd_dependencies: &'a [AmdDependency<'a>],
     pub enum_member_values: &'a BTreeMap<NodeId, EmitConstantValue>,
     pub enum_access_values: &'a BTreeMap<NodeId, EmitConstantValue>,
@@ -162,6 +163,7 @@ pub fn emit_source_file_with_settings_and_bindings(
         &EmitContext {
             bindings,
             amd_module_name: None,
+            amd_bundle: false,
             amd_dependencies: &[],
             enum_member_values: &empty_enum_values,
             enum_access_values: &empty_enum_values,
@@ -686,6 +688,14 @@ fn commonjs_module_temp_base(arena: &NodeArena, module_specifier: NodeId) -> Str
         "module".to_owned()
     } else {
         base
+    }
+}
+
+fn amd_import_dependency_path(path: &str, bundle: bool) -> String {
+    if bundle {
+        path.strip_prefix("./").unwrap_or(path).to_owned()
+    } else {
+        path.to_owned()
     }
 }
 
@@ -3896,7 +3906,7 @@ impl Printer<'_> {
                         continue;
                     };
                     dependencies.push(AmdRuntimeDependency {
-                        path: path.to_owned(),
+                        path: amd_import_dependency_path(path, context.amd_bundle),
                         parameter: Some(self.identifier_text(import.name)?.to_owned()),
                     });
                 }
@@ -3910,7 +3920,7 @@ impl Printer<'_> {
                     };
                     let Some(clause_id) = import.import_clause else {
                         side_effect_dependencies.push(AmdRuntimeDependency {
-                            path: path.to_owned(),
+                            path: amd_import_dependency_path(path, context.amd_bundle),
                             parameter: None,
                         });
                         continue;
@@ -4003,7 +4013,7 @@ impl Printer<'_> {
                         }
                     }
                     dependencies.push(AmdRuntimeDependency {
-                        path: path.to_owned(),
+                        path: amd_import_dependency_path(path, context.amd_bundle),
                         parameter: Some(parameter),
                     });
                 }
@@ -4063,16 +4073,6 @@ impl Printer<'_> {
         self.writer.indent += 1;
         self.writer.write("\"use strict\";");
         self.writer.newline();
-        if let Some(first_statement) = data.statements.nodes.first()
-            && let Some(node) = self.arena.get(*first_statement)
-        {
-            let excluded = context
-                .amd_dependencies
-                .iter()
-                .map(|dependency| (dependency.comment_start, dependency.comment_end))
-                .collect::<Vec<_>>();
-            self.emit_leading_source_comments_excluding(node.range.start.get(), &excluded);
-        }
         if self.settings.target < ScriptTarget::Es2015 && source_needs_extends_helper(self.arena) {
             self.emit_extends_helper();
         }
@@ -4094,6 +4094,33 @@ impl Printer<'_> {
             self.writer.write("void 0;");
             self.writer.newline();
         }
+        if export_equals_expression.is_none() {
+            for statement in &data.statements.nodes {
+                let Some(node) = self.arena.get(*statement) else {
+                    continue;
+                };
+                let NodeData::FunctionDeclaration(function) = &node.data else {
+                    continue;
+                };
+                if function.body.is_none()
+                    || !declaration_has_modifier(self.arena, node, SyntaxKind::ExportKeyword)
+                {
+                    continue;
+                }
+                let Some(name) = function
+                    .name
+                    .and_then(|name| declaration_name_text(self.arena, name))
+                else {
+                    continue;
+                };
+                self.writer.write("exports.");
+                self.writer.write(name);
+                self.writer.write(" = ");
+                self.writer.write(name);
+                self.writer.write(";");
+                self.writer.newline();
+            }
+        }
         for initializer in &import_initializers {
             self.writer.write(&initializer.parameter);
             self.writer.write(" = ");
@@ -4102,6 +4129,16 @@ impl Printer<'_> {
             self.writer.write(&initializer.parameter);
             self.writer.write(");");
             self.writer.newline();
+        }
+        if let Some(first_statement) = data.statements.nodes.first()
+            && let Some(node) = self.arena.get(*first_statement)
+        {
+            let excluded = context
+                .amd_dependencies
+                .iter()
+                .map(|dependency| (dependency.comment_start, dependency.comment_end))
+                .collect::<Vec<_>>();
+            self.emit_leading_source_comments_excluding(node.range.start.get(), &excluded);
         }
         self.emit_automatic_jsx_prelude();
         let mut previous_end = data
@@ -9966,6 +10003,7 @@ mod tests {
             &EmitContext {
                 bindings: &bindings,
                 amd_module_name: parsed.amd_module_name.as_deref(),
+                amd_bundle: false,
                 amd_dependencies: &dependencies,
                 enum_member_values: &enum_values,
                 enum_access_values: &enum_values,
@@ -10424,6 +10462,7 @@ mod tests {
             &EmitContext {
                 bindings: &bindings,
                 amd_module_name: None,
+                amd_bundle: false,
                 amd_dependencies: &[],
                 enum_member_values: &member_values,
                 enum_access_values: &accesses,
@@ -10659,6 +10698,7 @@ mod tests {
                 &EmitContext {
                     bindings: &bindings,
                     amd_module_name: None,
+                    amd_bundle: false,
                     amd_dependencies: &[],
                     enum_member_values: &enum_values,
                     enum_access_values: &enum_values,

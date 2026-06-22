@@ -16,7 +16,7 @@ use ts_core::TextRange;
 use ts_diagnostics::message_by_code;
 use ts_glob::{DiscoveryOptions, discover_files};
 use ts_module::{ResolutionOptions, Resolver, automatic_type_directive_names};
-use ts_options::{CompilerOptions, PrinterSettings, parse_project_options};
+use ts_options::{CompilerOptions, ModuleKind, PrinterSettings, parse_project_options};
 use ts_parser::{ParseResult, parse_jsx_source_file, parse_source_file};
 use ts_path::{CaseSensitivity, canonicalize, directory_path, is_absolute, resolve_path};
 use ts_printer::{
@@ -421,6 +421,7 @@ impl Program {
                 let emit_context = EmitContext {
                     bindings: &source_file.binding,
                     amd_module_name: source_file.parse.amd_module_name.as_deref(),
+                    amd_bundle: false,
                     amd_dependencies: &amd_dependencies,
                     enum_member_values: &enum_member_values,
                     enum_access_values: &enum_access_values,
@@ -527,13 +528,7 @@ impl Program {
         let mut output = EmitOutput::default();
         let paths = ts_outputpaths::bundle_output_paths(&self.options, &self.current_directory)
             .expect("outFile was checked before bundle emission");
-        let sources = self
-            .source_files
-            .iter()
-            .filter(|source| {
-                !source.is_default_library && !ts_path::is_declaration_file(&source.file_name)
-            })
-            .collect::<Vec<_>>();
+        let sources = self.bundle_sources();
 
         if settings.emit_javascript {
             let mut code = String::new();
@@ -560,9 +555,13 @@ impl Program {
                         comment_end: dependency.range.end.get(),
                     })
                     .collect::<Vec<_>>();
+                let amd_module_name = (settings.module == ModuleKind::Amd
+                    && source_is_external_module(source))
+                .then(|| amd_bundle_module_name(source));
                 let emit_context = EmitContext {
                     bindings: &source.binding,
-                    amd_module_name: source.parse.amd_module_name.as_deref(),
+                    amd_module_name: amd_module_name.as_deref(),
+                    amd_bundle: true,
                     amd_dependencies: &amd_dependencies,
                     enum_member_values: &enum_member_values,
                     enum_access_values: &enum_access_values,
@@ -652,7 +651,13 @@ impl Program {
                                 let _ = builder.add_mapping(generated_line, 0, source_index, 0, 0);
                             }
                             map_sources.push(source.file_name.clone());
-                            code.push_str(&emitted.code);
+                            if settings.module == ModuleKind::Amd
+                                && source_is_external_module(source)
+                            {
+                                append_amd_declaration_module(&mut code, source, &emitted.code);
+                            } else {
+                                code.push_str(&emitted.code);
+                            }
                         }
                     }
                     Err(error) => output.diagnostics.push(emit_diagnostic(source, &error)),
@@ -685,6 +690,46 @@ impl Program {
             output.files.clear();
         }
         output
+    }
+
+    fn bundle_sources(&self) -> Vec<&SourceFile> {
+        fn visit(
+            program: &Program,
+            index: usize,
+            visited: &mut BTreeSet<usize>,
+            ordered: &mut Vec<usize>,
+        ) {
+            if !visited.insert(index) {
+                return;
+            }
+            let source = &program.source_files[index];
+            let canonical = canonicalize(
+                &source.file_name,
+                &program.current_directory,
+                program.case_sensitivity,
+            );
+            for ((containing, _), target) in &program.resolved_modules {
+                if containing != &canonical {
+                    continue;
+                }
+                if let Some(target) = program.file_index.get(target) {
+                    visit(program, *target, visited, ordered);
+                }
+            }
+            if !source.is_default_library && !ts_path::is_declaration_file(&source.file_name) {
+                ordered.push(index);
+            }
+        }
+
+        let mut visited = BTreeSet::new();
+        let mut ordered = Vec::new();
+        for index in 0..self.source_files.len() {
+            visit(self, index, &mut visited, &mut ordered);
+        }
+        ordered
+            .into_iter()
+            .map(|index| &self.source_files[index])
+            .collect()
     }
 
     fn check_program(&mut self) {
@@ -1093,6 +1138,68 @@ fn declaration_node_types_for_emit(source: &SourceFile) -> BTreeMap<NodeId, ts_c
         node_types.insert(id, type_id);
     }
     node_types
+}
+
+fn source_is_external_module(source: &SourceFile) -> bool {
+    if !source.binding.exports.is_empty() {
+        return true;
+    }
+    let Some(NodeData::SourceFile(file)) = source
+        .parse
+        .arena
+        .get(source.parse.source_file)
+        .map(|node| &node.data)
+    else {
+        return false;
+    };
+    file.statements.nodes.iter().any(|statement| {
+        matches!(
+            source.parse.arena.get(*statement).map(|node| &node.data),
+            Some(
+                NodeData::ImportDeclaration(_)
+                    | NodeData::ImportEqualsDeclaration(_)
+                    | NodeData::ExportDeclaration(_)
+                    | NodeData::ExportAssignment(_)
+            )
+        )
+    })
+}
+
+fn append_amd_declaration_module(code: &mut String, source: &SourceFile, declaration: &str) {
+    if let Some(pragma) = source.parse.amd_module_names.last() {
+        let start = usize::try_from(pragma.range.start.get()).unwrap_or(usize::MAX);
+        let end = usize::try_from(pragma.range.end.get()).unwrap_or(usize::MAX);
+        if let Some(comment) = source.source_text.get(start..end) {
+            code.push_str(comment.trim_end_matches(['\r', '\n']));
+            code.push('\n');
+        }
+    }
+    let module_name = amd_bundle_module_name(source);
+    code.push_str("declare module \"");
+    code.push_str(&module_name.replace('"', "\\\""));
+    code.push_str("\" {\n");
+    for line in declaration.lines() {
+        let line = line.strip_prefix("export declare ").map_or_else(
+            || line.strip_prefix("declare ").unwrap_or(line).to_owned(),
+            |line| format!("export {line}"),
+        );
+        if !line.is_empty() {
+            code.push_str("    ");
+            code.push_str(&line);
+        }
+        code.push('\n');
+    }
+    code.push_str("}\n");
+}
+
+fn amd_bundle_module_name(source: &SourceFile) -> String {
+    source.parse.amd_module_name.clone().unwrap_or_else(|| {
+        Path::new(&source.file_name)
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or("module")
+            .to_owned()
+    })
 }
 
 fn base64_encode(bytes: &[u8]) -> String {
@@ -2025,8 +2132,8 @@ mod tests {
                 "///<amd-dependency path='side' name='side'/>\n",
                 "define(\"Consumer\", [\"require\", \"exports\", \"side\", \"M\"], function (require, exports, side, M) {\n",
                 "    \"use strict\";\n",
-                "    ///<amd-module name='Consumer'/>\n",
                 "    Object.defineProperty(exports, \"__esModule\", { value: true });\n",
+                "    ///<amd-module name='Consumer'/>\n",
                 "    M.value;\n",
                 "});\n",
             )
@@ -2631,6 +2738,130 @@ mod tests {
         assert!(
             map.text
                 .contains("\"sources\":[\"/project/second.ts\",\"/project/first.ts\"]")
+        );
+    }
+
+    #[test]
+    fn amd_out_file_emits_dependency_ordered_named_declaration_modules() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/Class.ts",
+            concat!(
+                "import { Configurable } from './Configurable';\n",
+                "export class HiddenClass {}\n",
+                "export class ActualClass extends Configurable(HiddenClass) {}\n",
+            ),
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/Configurable.ts",
+            concat!(
+                "export type Constructor<T = {}> = new (...args: any[]) => T;\n",
+                "export function Configurable<TBase extends Constructor>(Base: TBase) { return Base; }\n",
+            ),
+        )
+        .unwrap();
+
+        let program = Program::new_with_module_resolution(
+            &fs,
+            "/project",
+            &["Class.ts".to_owned()],
+            ts_module::ResolutionOptions::default(),
+        );
+        let emitted = Program {
+            options: CompilerOptions {
+                declaration: true,
+                out_file: Some("dist.js".into()),
+                module: ModuleKind::Amd,
+                target: ScriptTarget::Es2015,
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+            ..program
+        }
+        .emit();
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        let declaration = emitted
+            .files
+            .iter()
+            .find(|file| file.file_name == "/project/dist.d.ts")
+            .unwrap();
+        assert_eq!(
+            declaration.text,
+            concat!(
+                "declare module \"Configurable\" {\n",
+                "    export type Constructor<T = {}> = new (...args: any[]) => T;\n",
+                "    export function Configurable<TBase extends Constructor>(Base: TBase): TBase;\n",
+                "}\n",
+                "declare module \"Class\" {\n",
+                "    export class HiddenClass {\n",
+                "    }\n",
+                "    const ActualClass_base: typeof HiddenClass;\n",
+                "    export class ActualClass extends ActualClass_base {\n",
+                "    }\n",
+                "}\n",
+            )
+        );
+        let javascript = emitted
+            .files
+            .iter()
+            .find(|file| file.file_name == "/project/dist.js")
+            .unwrap();
+        assert!(javascript.text.starts_with("define(\"Configurable\""));
+        assert!(
+            javascript
+                .text
+                .contains("define(\"Class\", [\"require\", \"exports\", \"Configurable\"]")
+        );
+    }
+
+    #[test]
+    fn amd_out_file_preserves_each_module_pragma_once_in_declarations() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/a.ts",
+            "/// <amd-module name=\"NamedA\" />\nexport class Foo {}\n",
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/b.ts",
+            "/// <amd-module name=\"NamedB\" />\nexport class Bar {}\n",
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["a.ts".to_owned(), "b.ts".to_owned()],
+            CompilerOptions {
+                declaration: true,
+                out_file: Some("out.js".into()),
+                module: ModuleKind::Amd,
+                target: ScriptTarget::Es2015,
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        let emitted = program.emit();
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        let declaration = emitted
+            .files
+            .iter()
+            .find(|file| file.file_name == "/project/out.d.ts")
+            .unwrap();
+        assert_eq!(
+            declaration.text,
+            concat!(
+                "/// <amd-module name=\"NamedA\" />\n",
+                "declare module \"NamedA\" {\n",
+                "    export class Foo {\n",
+                "    }\n",
+                "}\n",
+                "/// <amd-module name=\"NamedB\" />\n",
+                "declare module \"NamedB\" {\n",
+                "    export class Bar {\n",
+                "    }\n",
+                "}\n",
+            )
         );
     }
 
