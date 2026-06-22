@@ -232,7 +232,19 @@ impl TextRange {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Diagnostic {
     pub range: TextRange,
+    pub code: Option<u32>,
+    pub category: DiagnosticCategory,
     pub message: String,
+}
+
+/// TypeScript's diagnostic severity categories.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(u8)]
+pub enum DiagnosticCategory {
+    Warning = 0,
+    Error = 1,
+    Suggestion = 2,
+    Message = 3,
 }
 
 /// Bidirectional mapping between native UTF-8 byte offsets and JavaScript
@@ -298,6 +310,23 @@ impl Diagnostic {
     pub fn new(range: TextRange, message: impl Into<String>) -> Self {
         Self {
             range,
+            code: None,
+            category: DiagnosticCategory::Error,
+            message: message.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn typescript(
+        range: TextRange,
+        code: u32,
+        category: DiagnosticCategory,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            range,
+            code: Some(code),
+            category,
             message: message.into(),
         }
     }
@@ -305,7 +334,22 @@ impl Diagnostic {
 
 #[cfg(test)]
 mod tests {
-    use super::{JsString, PositionMap, SourceText, TextPos, TextRange};
+    use super::{
+        Diagnostic, DiagnosticCategory, JsString, PositionMap, SourceText, TextPos, TextRange,
+    };
+
+    #[test]
+    fn diagnostics_support_legacy_and_typescript_metadata() {
+        let range = TextRange::new(TextPos::new(1), TextPos::new(2));
+        let legacy = Diagnostic::new(range, "legacy");
+        assert_eq!(legacy.code, None);
+        assert_eq!(legacy.category, DiagnosticCategory::Error);
+
+        let structured =
+            Diagnostic::typescript(range, 9999, DiagnosticCategory::Warning, "structured");
+        assert_eq!(structured.code, Some(9999));
+        assert_eq!(structured.category, DiagnosticCategory::Warning);
+    }
 
     #[test]
     fn source_text_preserves_invalid_bytes_and_offsets() {

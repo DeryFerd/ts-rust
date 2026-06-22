@@ -1,5 +1,6 @@
 use ts_ast::SyntaxKind;
-use ts_core::{Diagnostic, JsString, TextPos, TextRange};
+use ts_core::{Diagnostic, DiagnosticCategory, JsString, TextPos, TextRange};
+use ts_diagnostics::{Category, message_by_code};
 
 /// One lexical token. `range` uses UTF-8 byte offsets and `text` is the exact
 /// source spelling.
@@ -1273,13 +1274,53 @@ impl<'a> Scanner<'a> {
     }
 
     fn error(&mut self, start: usize, end: usize, message: &str) {
-        self.diagnostics.push(Diagnostic::new(
-            TextRange::new(
-                TextPos::new(u32::try_from(start).expect("source exceeds 4 GiB")),
-                TextPos::new(u32::try_from(end).expect("source exceeds 4 GiB")),
-            ),
-            message,
-        ));
+        let range = TextRange::new(
+            TextPos::new(u32::try_from(start).expect("source exceeds 4 GiB")),
+            TextPos::new(u32::try_from(end).expect("source exceeds 4 GiB")),
+        );
+        self.diagnostics
+            .push(scanner_diagnostic_code(message).map_or_else(
+                || Diagnostic::new(range, message),
+                |code| {
+                    let catalog = message_by_code(code).expect("scanner diagnostic code exists");
+                    Diagnostic::typescript(
+                        range,
+                        code,
+                        diagnostic_category(catalog.category()),
+                        catalog.text(),
+                    )
+                },
+            ));
+    }
+}
+
+fn scanner_diagnostic_code(message: &str) -> Option<u32> {
+    match message {
+        "Unterminated string literal." => Some(1002),
+        "Unterminated comment." => Some(1010),
+        "Digit expected." => Some(1124),
+        "Hexadecimal digit expected." => Some(1125),
+        "Invalid character." => Some(1127),
+        "Unterminated template literal." => Some(1160),
+        "Unterminated regular expression literal." => Some(1161),
+        "Binary digit expected." => Some(1177),
+        "Octal digit expected." => Some(1178),
+        "An identifier or keyword cannot immediately follow a numeric literal." => Some(1351),
+        "A bigint literal cannot use exponential notation." => Some(1352),
+        "A bigint literal must be an integer." => Some(1353),
+        "Decimals with leading zeros are not allowed." => Some(1489),
+        "Numeric separators are not allowed here." => Some(6188),
+        "Multiple consecutive numeric separators are not permitted." => Some(6189),
+        _ => None,
+    }
+}
+
+const fn diagnostic_category(category: Category) -> DiagnosticCategory {
+    match category {
+        Category::Warning => DiagnosticCategory::Warning,
+        Category::Error => DiagnosticCategory::Error,
+        Category::Suggestion => DiagnosticCategory::Suggestion,
+        Category::Message => DiagnosticCategory::Message,
     }
 }
 
@@ -1433,6 +1474,8 @@ fn keyword(text: &str) -> Option<SyntaxKind> {
 
 #[cfg(test)]
 mod tests {
+    use ts_core::DiagnosticCategory;
+
     use super::{LanguageVariant, Scanner, SyntaxKind, TokenFlags};
 
     fn kinds(source: &str) -> Vec<SyntaxKind> {
@@ -1496,6 +1539,35 @@ mod tests {
         let mut scanner = Scanner::new("'oops");
         assert_eq!(scanner.scan().kind, SyntaxKind::StringLiteral);
         assert_eq!(scanner.diagnostics().len(), 1);
+        assert_eq!(scanner.diagnostics()[0].code, Some(1002));
+        assert_eq!(scanner.diagnostics()[0].category, DiagnosticCategory::Error);
+        assert_eq!(
+            scanner.diagnostics()[0].message,
+            "Unterminated string literal."
+        );
+    }
+
+    #[test]
+    fn reports_catalog_codes_for_invalid_characters_and_literals() {
+        for (source, code, message) in [
+            ("😀", 1127, "Invalid character."),
+            ("0x", 1125, "Hexadecimal digit expected."),
+            ("0b", 1177, "Binary digit expected."),
+            ("1e+", 1124, "Digit expected."),
+            (
+                "1__0",
+                6189,
+                "Multiple consecutive numeric separators are not permitted.",
+            ),
+            ("1.0n", 1353, "A bigint literal must be an integer."),
+        ] {
+            let mut scanner = Scanner::new(source);
+            scanner.scan();
+            let diagnostic = &scanner.diagnostics()[0];
+            assert_eq!(diagnostic.code, Some(code), "source: {source}");
+            assert_eq!(diagnostic.category, DiagnosticCategory::Error);
+            assert_eq!(diagnostic.message, message);
+        }
     }
 
     #[test]

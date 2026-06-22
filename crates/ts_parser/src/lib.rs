@@ -37,7 +37,8 @@ use ts_ast::{
     TypeReferenceNodeData, UnionTypeNodeData, VariableDeclarationData, VariableDeclarationListData,
     VariableStatementData, WhileStatementData, YieldExpressionData,
 };
-use ts_core::{Diagnostic, TextPos, TextRange};
+use ts_core::{Diagnostic, DiagnosticCategory, TextPos, TextRange};
+use ts_diagnostics::{Category, message_by_code};
 use ts_scanner::{LanguageVariant, Scanner, Token, TokenFlags as ScannerTokenFlags};
 
 const NODE_FLAG_LET: NodeFlags = NodeFlags(1 << 0);
@@ -2049,9 +2050,9 @@ impl<'a> Parser<'a> {
                 NodeData::EnumDeclaration(data) => data.modifiers = Some(modifiers.clone()),
                 NodeData::VariableStatement(data) => data.modifiers = Some(modifiers.clone()),
                 NodeData::ModuleDeclaration(data) => data.modifiers = Some(modifiers.clone()),
-                _ => self.diagnostics.push(Diagnostic::new(
+                _ => self.diagnostics.push(parser_diagnostic(
                     node.range,
-                    "Decorators are not valid on this declaration.",
+                    "Decorators are not valid here.",
                 )),
             }
             node.range.start = start;
@@ -4652,7 +4653,7 @@ impl<'a> Parser<'a> {
 
     fn error_current(&mut self, message: &str) {
         self.diagnostics
-            .push(Diagnostic::new(self.current.range, message));
+            .push(parser_diagnostic(self.current.range, message));
     }
 
     fn bump(&mut self) {
@@ -4709,6 +4710,70 @@ fn token_value(token: &Token<'_>) -> String {
         .value
         .as_ref()
         .map_or_else(|| token.text.to_owned(), ts_core::JsString::to_string_lossy)
+}
+
+fn parser_diagnostic(range: TextRange, message: &str) -> Diagnostic {
+    let catalog = match message {
+        "Expected an expression." => Some((1109, Vec::new())),
+        "Expected a type name." | "Expected a type annotation." => Some((1110, Vec::new())),
+        "Expected 'case' or 'default'." => Some((1130, Vec::new())),
+        "Expected a member name." => Some((1131, Vec::new())),
+        "Expected a variable name." => Some((1134, Vec::new())),
+        "Expected an argument." => Some((1135, Vec::new())),
+        "Expected a string literal." | "Expected a module specifier." => Some((1141, Vec::new())),
+        "Expected 'catch' or 'finally'." => Some((1472, Vec::new())),
+        "Decorators are not valid here." => Some((1206, Vec::new())),
+        "Line break not permitted after 'throw'." => Some((1142, Vec::new())),
+        "Expected a function name."
+        | "Expected a class name."
+        | "Expected a parameter name."
+        | "Expected a binding name."
+        | "Expected a type parameter name."
+        | "Expected a property name."
+        | "Expected an accessor name."
+        | "Expected a module name."
+        | "Expected a module reference."
+        | "Expected an identifier after '.'."
+        | "Expected an import binding."
+        | "Expected an import name."
+        | "Expected a local import name."
+        | "Expected a namespace import name."
+        | "Expected an export name."
+        | "Expected an exported name."
+        | "Expected a predicate parameter name." => Some((1003, Vec::new())),
+        "Expected a method body." => Some((1005, vec!["{".to_owned()])),
+        _ => expected_token_argument(message).map(|token| (1005, vec![token])),
+    };
+    let Some((code, arguments)) = catalog else {
+        return Diagnostic::new(range, message);
+    };
+    let catalog = message_by_code(code).expect("parser diagnostic code exists");
+    Diagnostic::typescript(
+        range,
+        code,
+        parser_diagnostic_category(catalog.category()),
+        catalog
+            .format(&arguments)
+            .expect("parser diagnostic arguments match catalog message"),
+    )
+}
+
+fn expected_token_argument(message: &str) -> Option<String> {
+    Some(
+        message
+            .strip_prefix("Expected '")?
+            .strip_suffix("'.")?
+            .to_owned(),
+    )
+}
+
+const fn parser_diagnostic_category(category: Category) -> DiagnosticCategory {
+    match category {
+        Category::Warning => DiagnosticCategory::Warning,
+        Category::Error => DiagnosticCategory::Error,
+        Category::Suggestion => DiagnosticCategory::Suggestion,
+        Category::Message => DiagnosticCategory::Message,
+    }
 }
 
 fn is_expression_terminator(kind: SyntaxKind) -> bool {
@@ -4803,6 +4868,7 @@ fn binary_precedence(kind: SyntaxKind) -> Option<(u8, bool)> {
 #[cfg(test)]
 mod tests {
     use ts_ast::{NodeData, NodeFlags, NodeId, SyntaxKind};
+    use ts_core::DiagnosticCategory;
 
     use super::{
         NODE_FLAG_AWAIT_USING, NODE_FLAG_USING, ParseResult, parse_jsdoc_comment,
@@ -5548,27 +5614,43 @@ mod tests {
             result
                 .diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.message.contains("variable name"))
+                .any(|diagnostic| diagnostic.code == Some(1134))
         );
         assert!(
             result
                 .diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.message.contains("expression"))
+                .any(|diagnostic| diagnostic.code == Some(1109))
         );
-        assert!(
-            result
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.message.contains("Expected '}'"))
-        );
+        assert!(result.diagnostics.iter().any(
+            |diagnostic| diagnostic.code == Some(1005) && diagnostic.message == "'}' expected."
+        ));
         let missing_name = result
             .diagnostics
             .iter()
-            .find(|diagnostic| diagnostic.message.contains("variable name"))
+            .find(|diagnostic| diagnostic.code == Some(1134))
             .unwrap();
         assert_eq!(missing_name.range.start.get(), 4);
+        assert_eq!(missing_name.category, DiagnosticCategory::Error);
         assert_eq!(source_statements(&result).len(), 2);
+    }
+
+    #[test]
+    fn reports_catalog_codes_for_expected_parser_tokens() {
+        let result = parse_source_file("function () { const value = ;");
+        for (code, message) in [
+            (1003, "Identifier expected."),
+            (1109, "Expression expected."),
+            (1005, "'}' expected."),
+        ] {
+            let diagnostic = result
+                .diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.code == Some(code))
+                .unwrap_or_else(|| panic!("missing TS{code}: {:?}", result.diagnostics));
+            assert_eq!(diagnostic.message, message);
+            assert_eq!(diagnostic.category, DiagnosticCategory::Error);
+        }
     }
 
     fn source_statements(result: &ParseResult) -> &[NodeId] {

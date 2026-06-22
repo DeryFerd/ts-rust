@@ -7,8 +7,8 @@ license.workspace = true
 [dependencies]
 ts_ast = { path = "../ts_ast" }
 ts_core = { path = "../ts_core" }
+ts_diagnostics = { path = "../ts_diagnostics" }
 ts_scanner = { path = "../ts_scanner" }
 
 [lints]
 workspace = true
-
