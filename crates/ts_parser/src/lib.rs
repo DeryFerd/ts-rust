@@ -2,20 +2,21 @@
 
 use ts_ast::{
     ArrayLiteralExpressionData, ArrayTypeNodeData, ArrowFunctionData, AsExpressionData,
-    BigIntLiteralData, BinaryExpressionData, BindingElementData, BindingPatternData, BlockData,
-    BreakStatementData, CallExpressionData, CallSignatureDeclarationData, CaseBlockData,
-    CaseOrDefaultClauseData, CatchClauseData, ClassDeclarationData, ComputedPropertyNameData,
+    AwaitExpressionData, BigIntLiteralData, BinaryExpressionData, BindingElementData,
+    BindingPatternData, BlockData, BreakStatementData, CallExpressionData,
+    CallSignatureDeclarationData, CaseBlockData, CaseOrDefaultClauseData, CatchClauseData,
+    ClassDeclarationData, ClassStaticBlockDeclarationData, ComputedPropertyNameData,
     ConditionalExpressionData, ConditionalTypeNodeData, ConstructSignatureDeclarationData,
     ConstructorTypeNodeData, ContinueStatementData, DecoratorData, DoStatementData,
     ElementAccessExpressionData, EmptyStatementData, EnumDeclarationData, EnumMemberData,
     ExportAssignmentData, ExportDeclarationData, ExportSpecifierData, ExpressionStatementData,
     ExpressionWithTypeArgumentsData, ExternalModuleReferenceData, ForInOrOfStatementData,
     ForStatementData, FunctionDeclarationData, FunctionTypeNodeData, GetAccessorDeclarationData,
-    HeritageClauseData, IdentifierData, IfStatementData, ImportClauseData, ImportDeclarationData,
-    ImportEqualsDeclarationData, ImportSpecifierData, ImportTypeNodeData,
-    IndexSignatureDeclarationData, IndexedAccessTypeNodeData, InferTypeNodeData,
-    InterfaceDeclarationData, IntersectionTypeNodeData, JsDocData, JsDocTextData,
-    JsDocUnknownTagData, JsxAttributeData, JsxAttributesData, JsxClosingElementData,
+    HeritageClauseData, IdentifierData, IfStatementData, ImportAttributeData, ImportAttributesData,
+    ImportClauseData, ImportDeclarationData, ImportEqualsDeclarationData, ImportSpecifierData,
+    ImportTypeNodeData, IndexSignatureDeclarationData, IndexedAccessTypeNodeData,
+    InferTypeNodeData, InterfaceDeclarationData, IntersectionTypeNodeData, JsDocData,
+    JsDocTextData, JsDocUnknownTagData, JsxAttributeData, JsxAttributesData, JsxClosingElementData,
     JsxElementData, JsxExpressionData, JsxOpeningElementData, JsxSelfClosingElementData,
     JsxTextData, KeywordExpressionData, KeywordTypeNodeData, LiteralTypeNodeData,
     MappedTypeNodeData, MethodDeclarationData, MethodSignatureDeclarationData, ModifierList,
@@ -24,23 +25,25 @@ use ts_ast::{
     NodeData, NodeFlags, NodeId, NodeList, NonNullExpressionData, NumericLiteralData,
     ObjectLiteralExpressionData, ParameterDeclarationData, ParenthesizedExpressionData,
     ParenthesizedTypeNodeData, PostfixUnaryExpressionData, PrefixUnaryExpressionData,
-    PropertyAccessExpressionData, PropertyAssignmentData, PropertyDeclarationData,
-    QualifiedNameData, RestTypeNodeData, ReturnStatementData, SatisfiesExpressionData,
-    SetAccessorDeclarationData, ShorthandPropertyAssignmentData, SourceFileData,
-    SpreadAssignmentData, StringLiteralData, SwitchStatementData, SymbolTable, SyntaxKind,
-    TemplateExpressionData, TemplateHeadData, TemplateLiteralTypeNodeData,
+    PrivateIdentifierData, PropertyAccessExpressionData, PropertyAssignmentData,
+    PropertyDeclarationData, QualifiedNameData, RestTypeNodeData, ReturnStatementData,
+    SatisfiesExpressionData, SetAccessorDeclarationData, ShorthandPropertyAssignmentData,
+    SourceFileData, SpreadAssignmentData, StringLiteralData, SwitchStatementData, SymbolTable,
+    SyntaxKind, TemplateExpressionData, TemplateHeadData, TemplateLiteralTypeNodeData,
     TemplateLiteralTypeSpanData, TemplateMiddleData, TemplateSpanData, TemplateTailData,
     ThisTypeNodeData, ThrowStatementData, TokenData, TokenFlags, TryStatementData,
     TupleTypeNodeData, TypeAliasDeclarationData, TypeAssertionData, TypeLiteralNodeData,
     TypeOperatorNodeData, TypeParameterDeclarationData, TypePredicateNodeData, TypeQueryNodeData,
     TypeReferenceNodeData, UnionTypeNodeData, VariableDeclarationData, VariableDeclarationListData,
-    VariableStatementData, WhileStatementData,
+    VariableStatementData, WhileStatementData, YieldExpressionData,
 };
 use ts_core::{Diagnostic, TextPos, TextRange};
 use ts_scanner::{LanguageVariant, Scanner, Token, TokenFlags as ScannerTokenFlags};
 
 const NODE_FLAG_LET: NodeFlags = NodeFlags(1 << 0);
 const NODE_FLAG_CONST: NodeFlags = NodeFlags(1 << 1);
+const NODE_FLAG_USING: NodeFlags = NodeFlags(1 << 2);
+const NODE_FLAG_AWAIT_USING: NodeFlags = NodeFlags((1 << 1) | (1 << 2));
 const NODE_FLAG_HAS_ERROR: NodeFlags = NodeFlags(1 << 15);
 
 /// Result of parsing one source file.
@@ -245,6 +248,8 @@ impl<'a> Parser<'a> {
             SyntaxKind::VarKeyword | SyntaxKind::LetKeyword | SyntaxKind::ConstKeyword => {
                 self.parse_variable_statement()
             }
+            SyntaxKind::UsingKeyword => self.parse_using_statement(),
+            SyntaxKind::AwaitKeyword => self.parse_await_statement(),
             SyntaxKind::FunctionKeyword => self.parse_function_declaration(),
             SyntaxKind::ClassKeyword => self.parse_class_declaration(),
             SyntaxKind::InterfaceKeyword => self.parse_interface_declaration(),
@@ -318,6 +323,35 @@ impl<'a> Parser<'a> {
             SyntaxKind::ConstKeyword => NODE_FLAG_CONST,
             _ => NodeFlags::default(),
         };
+        self.parse_variable_statement_tail(keyword.range.start, declaration_flags)
+    }
+
+    fn parse_using_statement(&mut self) -> NodeId {
+        let start = self.consume().range.start;
+        self.parse_variable_statement_tail(start, NODE_FLAG_USING)
+    }
+
+    fn parse_await_statement(&mut self) -> NodeId {
+        if self.next_token_kind() != SyntaxKind::UsingKeyword {
+            return self.parse_expression_statement();
+        }
+        let start = self.consume().range.start;
+        self.bump();
+        self.parse_variable_statement_tail(start, NODE_FLAG_AWAIT_USING)
+    }
+
+    fn next_token_kind(&mut self) -> SyntaxKind {
+        let checkpoint = self.scanner.mark();
+        let kind = self.scanner.scan().kind;
+        self.scanner.rewind(checkpoint);
+        kind
+    }
+
+    fn parse_variable_statement_tail(
+        &mut self,
+        statement_start: TextPos,
+        declaration_flags: NodeFlags,
+    ) -> NodeId {
         let declaration_start = self.current.range.start;
         let mut declarations = Vec::new();
         loop {
@@ -348,7 +382,7 @@ impl<'a> Parser<'a> {
         let end = self.parse_semicolon(declarations_end);
         self.alloc_node(
             SyntaxKind::VariableStatement,
-            TextRange::new(keyword.range.start, end),
+            TextRange::new(statement_start, end),
             NodeData::VariableStatement(Box::new(VariableStatementData {
                 declaration_list,
                 flow_node: None,
@@ -399,6 +433,11 @@ impl<'a> Parser<'a> {
 
     fn parse_function_declaration(&mut self) -> NodeId {
         let start = self.consume().range.start;
+        let asterisk_token = if self.current.kind == SyntaxKind::AsteriskToken {
+            Some(self.consume_token_node())
+        } else {
+            None
+        };
         let name = if self.current.kind == SyntaxKind::Identifier || self.current.kind.is_keyword()
         {
             Some(self.parse_identifier_name("Expected a function name."))
@@ -420,6 +459,7 @@ impl<'a> Parser<'a> {
             .and_then(|id| self.arena.get(id))
             .map_or(parameters.range.end, |node| node.range.end);
         let mut children = Vec::new();
+        children.extend(asterisk_token);
         children.extend(name);
         extend_list_children(&mut children, type_parameters.as_ref());
         children.extend(parameters.nodes.iter().copied());
@@ -429,7 +469,7 @@ impl<'a> Parser<'a> {
             SyntaxKind::FunctionDeclaration,
             TextRange::new(start, end),
             NodeData::FunctionDeclaration(Box::new(FunctionDeclarationData {
-                asterisk_token: None,
+                asterisk_token,
                 body,
                 end_flow_node: None,
                 flow_node: None,
@@ -848,6 +888,9 @@ impl<'a> Parser<'a> {
 
     fn parse_class_member(&mut self, signature_only: bool) -> NodeId {
         let start = self.current.range.start;
+        if self.current.kind == SyntaxKind::StaticKeyword && self.next_token_is_open_brace() {
+            return self.parse_class_static_block(start);
+        }
         let mut modifier_nodes = Vec::new();
         while self.current.kind.is_modifier() {
             modifier_nodes.push(self.consume_token_node());
@@ -860,6 +903,18 @@ impl<'a> Parser<'a> {
             },
             flags: ts_ast::ModifierFlags::default(),
         });
+        if matches!(
+            self.current.kind,
+            SyntaxKind::GetKeyword | SyntaxKind::SetKeyword
+        ) && self.is_accessor_signature()
+        {
+            return self.parse_class_accessor(start, modifiers, modifier_nodes);
+        }
+        let asterisk_token = if self.current.kind == SyntaxKind::AsteriskToken {
+            Some(self.consume_token_node())
+        } else {
+            None
+        };
         let name = self.parse_property_name("Expected a member name.");
         if self.current.kind == SyntaxKind::OpenParenToken {
             let parameters = self.parse_parameter_list();
@@ -874,6 +929,7 @@ impl<'a> Parser<'a> {
                 .or(return_type)
                 .map_or(parameters.range.end, |id| self.node_end(id));
             let mut children = modifier_nodes.clone();
+            children.extend(asterisk_token);
             children.push(name);
             children.extend(parameters.nodes.iter().copied());
             children.extend(return_type);
@@ -882,7 +938,7 @@ impl<'a> Parser<'a> {
                 SyntaxKind::MethodDeclaration,
                 TextRange::new(start, end),
                 NodeData::MethodDeclaration(Box::new(MethodDeclarationData {
-                    asterisk_token: None,
+                    asterisk_token,
                     body,
                     end_flow_node: None,
                     flow_node: None,
@@ -929,6 +985,114 @@ impl<'a> Parser<'a> {
                 &children,
             )
         }
+    }
+
+    fn parse_class_accessor(
+        &mut self,
+        start: TextPos,
+        modifiers: Option<ModifierList>,
+        modifier_nodes: Vec<NodeId>,
+    ) -> NodeId {
+        let kind = self.consume().kind;
+        let name = self.parse_property_name("Expected an accessor name.");
+        let parameters = self.parse_parameter_list();
+        let return_type = self.parse_optional_type_annotation();
+        let body = if self.current.kind == SyntaxKind::OpenBraceToken {
+            Some(self.parse_block())
+        } else {
+            self.parse_semicolon(
+                return_type.map_or(parameters.range.end, |node| self.node_end(node)),
+            );
+            None
+        };
+        let end = body
+            .or(return_type)
+            .map_or(parameters.range.end, |node| self.node_end(node));
+        let mut children = modifier_nodes;
+        children.push(name);
+        children.extend(parameters.nodes.iter().copied());
+        children.extend(return_type);
+        children.extend(body);
+        let data = if kind == SyntaxKind::GetKeyword {
+            NodeData::GetAccessorDeclaration(Box::new(GetAccessorDeclarationData {
+                asterisk_token: None,
+                body,
+                end_flow_node: None,
+                flow_node: None,
+                full_signature: None,
+                locals: SymbolTable,
+                next_container: None,
+                parameters,
+                postfix_token: None,
+                symbol: None,
+                type_: return_type,
+                type_parameters: None,
+                facts: 0,
+                modifiers,
+                name,
+            }))
+        } else {
+            NodeData::SetAccessorDeclaration(Box::new(SetAccessorDeclarationData {
+                asterisk_token: None,
+                body,
+                end_flow_node: None,
+                flow_node: None,
+                full_signature: None,
+                locals: SymbolTable,
+                next_container: None,
+                parameters,
+                postfix_token: None,
+                symbol: None,
+                type_: return_type,
+                type_parameters: None,
+                facts: 0,
+                modifiers,
+                name,
+            }))
+        };
+        self.alloc_node(
+            if kind == SyntaxKind::GetKeyword {
+                SyntaxKind::GetAccessor
+            } else {
+                SyntaxKind::SetAccessor
+            },
+            TextRange::new(start, end),
+            data,
+            &children,
+        )
+    }
+
+    fn next_token_is_open_brace(&mut self) -> bool {
+        let checkpoint = self.scanner.mark();
+        let next = self.scanner.scan();
+        self.scanner.rewind(checkpoint);
+        next.kind == SyntaxKind::OpenBraceToken
+    }
+
+    fn parse_class_static_block(&mut self, start: TextPos) -> NodeId {
+        let static_modifier = self.consume_token_node();
+        let body = self.parse_block();
+        self.alloc_node(
+            SyntaxKind::ClassStaticBlockDeclaration,
+            TextRange::new(start, self.node_end(body)),
+            NodeData::ClassStaticBlockDeclaration(Box::new(ClassStaticBlockDeclarationData {
+                body,
+                locals: SymbolTable,
+                next_container: None,
+                return_flow_node: None,
+                symbol: None,
+                facts: 0,
+                modifiers: Some(ModifierList {
+                    list: NodeList {
+                        range: TextRange::new(start, self.node_start(body)),
+                        nodes: vec![static_modifier],
+                        has_trailing_comma: false,
+                    },
+                    flags: ts_ast::ModifierFlags::default(),
+                }),
+            })),
+            &[static_modifier, body],
+        )
     }
 
     fn parse_type_member(&mut self) -> NodeId {
@@ -1388,19 +1552,29 @@ impl<'a> Parser<'a> {
         )
     }
 
+    #[allow(clippy::too_many_lines)]
     fn parse_for_statement(&mut self) -> NodeId {
         let start = self.consume().range.start;
+        let await_modifier = if self.current.kind == SyntaxKind::AwaitKeyword {
+            Some(self.consume_token_node())
+        } else {
+            None
+        };
         self.expect_and_bump(SyntaxKind::OpenParenToken, "Expected '('.");
         let initializer = if self.current.kind == SyntaxKind::SemicolonToken {
             None
         } else if matches!(
             self.current.kind,
-            SyntaxKind::VarKeyword | SyntaxKind::LetKeyword | SyntaxKind::ConstKeyword
+            SyntaxKind::VarKeyword
+                | SyntaxKind::LetKeyword
+                | SyntaxKind::ConstKeyword
+                | SyntaxKind::UsingKeyword
         ) {
             let keyword = self.consume();
             let flags = match keyword.kind {
                 SyntaxKind::LetKeyword => NODE_FLAG_LET,
                 SyntaxKind::ConstKeyword => NODE_FLAG_CONST,
+                SyntaxKind::UsingKeyword => NODE_FLAG_USING,
                 _ => NodeFlags::default(),
             };
             let declaration = self.parse_variable_declaration();
@@ -1442,7 +1616,7 @@ impl<'a> Parser<'a> {
                 loop_kind,
                 TextRange::new(start, self.node_end(statement)),
                 NodeData::ForInOrOfStatement(Box::new(ForInOrOfStatementData {
-                    await_modifier: None,
+                    await_modifier,
                     expression,
                     flow_node: None,
                     initializer,
@@ -1451,7 +1625,10 @@ impl<'a> Parser<'a> {
                     statement,
                     facts: 0,
                 })),
-                &[initializer, expression, statement],
+                &await_modifier
+                    .into_iter()
+                    .chain([initializer, expression, statement])
+                    .collect::<Vec<_>>(),
             );
         }
         self.expect_and_bump(SyntaxKind::SemicolonToken, "Expected ';'.");
@@ -1942,12 +2119,18 @@ impl<'a> Parser<'a> {
         };
         children.extend(import_clause);
         children.push(module_specifier);
-        let end = self.parse_semicolon(self.node_end(module_specifier));
+        let attributes = self.parse_import_attributes();
+        children.extend(attributes);
+        let fallback = attributes.map_or_else(
+            || self.node_end(module_specifier),
+            |node| self.node_end(node),
+        );
+        let end = self.parse_semicolon(fallback);
         self.alloc_node(
             SyntaxKind::ImportDeclaration,
             TextRange::new(start, end),
             NodeData::ImportDeclaration(Box::new(ImportDeclarationData {
-                attributes: None,
+                attributes,
                 flow_node: None,
                 import_clause,
                 module_specifier,
@@ -1957,6 +2140,69 @@ impl<'a> Parser<'a> {
             })),
             &children,
         )
+    }
+
+    fn parse_import_attributes(&mut self) -> Option<NodeId> {
+        if !matches!(
+            self.current.kind,
+            SyntaxKind::WithKeyword | SyntaxKind::AssertKeyword
+        ) {
+            return None;
+        }
+        let keyword = self.consume();
+        self.expect_and_bump(SyntaxKind::OpenBraceToken, "Expected '{'.");
+        let list_start = self.current.range.start;
+        let mut attributes = Vec::new();
+        while !matches!(
+            self.current.kind,
+            SyntaxKind::CloseBraceToken | SyntaxKind::EndOfFile
+        ) {
+            let start = self.current.range.start;
+            let name = self.parse_property_name("Expected an import attribute name.");
+            self.expect_and_bump(SyntaxKind::ColonToken, "Expected ':'.");
+            let value = if self.current.kind == SyntaxKind::StringLiteral {
+                self.parse_string_literal()
+            } else {
+                self.parse_identifier_name("Expected an import attribute value.")
+            };
+            attributes.push(self.alloc_node(
+                SyntaxKind::ImportAttribute,
+                TextRange::new(start, self.node_end(value)),
+                NodeData::ImportAttribute(Box::new(ImportAttributeData {
+                    value,
+                    facts: 0,
+                    name,
+                })),
+                &[name, value],
+            ));
+            if self.current.kind != SyntaxKind::CommaToken {
+                break;
+            }
+            self.bump();
+        }
+        let end = if self.current.kind == SyntaxKind::CloseBraceToken {
+            self.consume().range.end
+        } else {
+            self.error_current("Expected '}'.");
+            attributes
+                .last()
+                .map_or(list_start, |node| self.node_end(*node))
+        };
+        Some(self.alloc_node(
+            SyntaxKind::ImportAttributes,
+            TextRange::new(keyword.range.start, end),
+            NodeData::ImportAttributes(Box::new(ImportAttributesData {
+                attributes: NodeList {
+                    range: TextRange::new(list_start, end),
+                    nodes: attributes.clone(),
+                    has_trailing_comma: false,
+                },
+                multi_line: false,
+                token: keyword.kind,
+                facts: 0,
+            })),
+            &attributes,
+        ))
     }
 
     fn parse_namespace_import(&mut self) -> NodeId {
@@ -2183,18 +2429,21 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        let fallback = export_clause
+        let attributes = self.parse_import_attributes();
+        let fallback = attributes
             .or(module_specifier)
+            .or(export_clause)
             .map_or(start, |id| self.node_end(id));
         let end = self.parse_semicolon(fallback);
         let mut children = vec![export_modifier];
         children.extend(export_clause);
         children.extend(module_specifier);
+        children.extend(attributes);
         self.alloc_node(
             SyntaxKind::ExportDeclaration,
             TextRange::new(start, end),
             NodeData::ExportDeclaration(Box::new(ExportDeclarationData {
-                attributes: None,
+                attributes,
                 export_clause,
                 flow_node: None,
                 is_type_only: false,
@@ -2289,6 +2538,9 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_binary_expression(&mut self, minimum_precedence: u8) -> NodeId {
+        if self.current.kind == SyntaxKind::AsyncKeyword && self.is_async_arrow_function() {
+            return self.parse_async_arrow_function();
+        }
         if self.current.kind == SyntaxKind::OpenParenToken && self.is_parenthesized_arrow() {
             return self.parse_parenthesized_arrow_function();
         }
@@ -2359,8 +2611,111 @@ impl<'a> Parser<'a> {
         left
     }
 
+    fn is_async_arrow_function(&mut self) -> bool {
+        let checkpoint = self.scanner.mark();
+        let first = self.scanner.scan();
+        let result = if first.kind == SyntaxKind::Identifier {
+            self.scanner.scan().kind == SyntaxKind::EqualsGreaterThanToken
+        } else if first.kind == SyntaxKind::OpenParenToken {
+            let mut depth = 1_u32;
+            let mut token = self.scanner.scan();
+            while token.kind != SyntaxKind::EndOfFile && depth > 0 {
+                match token.kind {
+                    SyntaxKind::OpenParenToken => depth += 1,
+                    SyntaxKind::CloseParenToken => depth -= 1,
+                    _ => {}
+                }
+                if depth > 0 {
+                    token = self.scanner.scan();
+                }
+            }
+            self.scanner.scan().kind == SyntaxKind::EqualsGreaterThanToken
+        } else {
+            false
+        };
+        self.scanner.rewind(checkpoint);
+        result
+    }
+
+    fn parse_async_arrow_function(&mut self) -> NodeId {
+        let async_modifier = self.consume_token_node();
+        let start = self.node_start(async_modifier);
+        let parameters = if self.current.kind == SyntaxKind::OpenParenToken {
+            self.parse_parameter_list()
+        } else {
+            let name = self.parse_identifier("Expected a parameter name.");
+            let parameter = self.alloc_node(
+                SyntaxKind::Parameter,
+                self.arena.get(name).unwrap().range,
+                NodeData::ParameterDeclaration(Box::new(ParameterDeclarationData {
+                    dot_dot_dot_token: None,
+                    initializer: None,
+                    question_token: None,
+                    symbol: None,
+                    type_: None,
+                    facts: 0,
+                    modifiers: None,
+                    name,
+                })),
+                &[name],
+            );
+            NodeList {
+                range: self.arena.get(parameter).unwrap().range,
+                nodes: vec![parameter],
+                has_trailing_comma: false,
+            }
+        };
+        let return_type = self.parse_optional_type_annotation();
+        let arrow =
+            self.parse_expected_token_node(SyntaxKind::EqualsGreaterThanToken, "Expected '=>'.");
+        let body = if self.current.kind == SyntaxKind::OpenBraceToken {
+            self.parse_block()
+        } else {
+            self.parse_binary_expression(2)
+        };
+        let mut children = vec![async_modifier];
+        children.extend(parameters.nodes.iter().copied());
+        children.extend(return_type);
+        children.push(arrow);
+        children.push(body);
+        self.alloc_node(
+            SyntaxKind::ArrowFunction,
+            TextRange::new(start, self.node_end(body)),
+            NodeData::ArrowFunction(Box::new(ArrowFunctionData {
+                asterisk_token: None,
+                body,
+                end_flow_node: None,
+                equals_greater_than_token: arrow,
+                flow_node: None,
+                full_signature: None,
+                locals: SymbolTable,
+                next_container: None,
+                parameters,
+                symbol: None,
+                type_: return_type,
+                type_parameters: None,
+                facts: 0,
+                modifiers: Some(ModifierList {
+                    list: NodeList {
+                        range: TextRange::new(start, self.node_end(async_modifier)),
+                        nodes: vec![async_modifier],
+                        has_trailing_comma: false,
+                    },
+                    flags: ts_ast::ModifierFlags::default(),
+                }),
+            })),
+            &children,
+        )
+    }
+
     #[allow(clippy::too_many_lines)]
     fn parse_postfix_expression(&mut self) -> NodeId {
+        if self.current.kind == SyntaxKind::AwaitKeyword {
+            return self.parse_await_expression();
+        }
+        if self.current.kind == SyntaxKind::YieldKeyword {
+            return self.parse_yield_expression();
+        }
         if is_prefix_operator(self.current.kind) {
             let operator_token = self.consume();
             let operator = operator_token.kind;
@@ -2384,7 +2739,7 @@ impl<'a> Parser<'a> {
             match self.current.kind {
                 SyntaxKind::DotToken => {
                     self.bump();
-                    let name = self.parse_identifier("Expected a property name.");
+                    let name = self.parse_property_name("Expected a property name.");
                     expression = self.alloc_node(
                         SyntaxKind::PropertyAccessExpression,
                         TextRange::new(self.node_start(expression), self.node_end(name)),
@@ -2399,6 +2754,67 @@ impl<'a> Parser<'a> {
                         )),
                         &[expression, name],
                     );
+                }
+                SyntaxKind::QuestionDotToken => {
+                    let question_dot_token = self.consume_token_node();
+                    if self.current.kind == SyntaxKind::OpenParenToken {
+                        let arguments = self.parse_argument_list();
+                        let end = arguments.range.end;
+                        let mut children = vec![expression, question_dot_token];
+                        children.extend(arguments.nodes.iter().copied());
+                        expression = self.alloc_node(
+                            SyntaxKind::CallExpression,
+                            TextRange::new(self.node_start(expression), end),
+                            NodeData::CallExpression(Box::new(CallExpressionData {
+                                arguments,
+                                expression,
+                                question_dot_token: Some(question_dot_token),
+                                symbol: None,
+                                type_arguments: None,
+                                facts: 0,
+                            })),
+                            &children,
+                        );
+                    } else if self.current.kind == SyntaxKind::OpenBracketToken {
+                        self.bump();
+                        let argument_expression = self.parse_binary_expression(0);
+                        let end = if self.current.kind == SyntaxKind::CloseBracketToken {
+                            self.consume().range.end
+                        } else {
+                            self.error_current("Expected ']'.");
+                            self.node_end(argument_expression)
+                        };
+                        expression = self.alloc_node(
+                            SyntaxKind::ElementAccessExpression,
+                            TextRange::new(self.node_start(expression), end),
+                            NodeData::ElementAccessExpression(Box::new(
+                                ElementAccessExpressionData {
+                                    argument_expression,
+                                    expression,
+                                    flow_node: None,
+                                    question_dot_token: Some(question_dot_token),
+                                    facts: 0,
+                                },
+                            )),
+                            &[expression, question_dot_token, argument_expression],
+                        );
+                    } else {
+                        let name = self.parse_property_name("Expected a property name.");
+                        expression = self.alloc_node(
+                            SyntaxKind::PropertyAccessExpression,
+                            TextRange::new(self.node_start(expression), self.node_end(name)),
+                            NodeData::PropertyAccessExpression(Box::new(
+                                PropertyAccessExpressionData {
+                                    expression,
+                                    flow_node: None,
+                                    question_dot_token: Some(question_dot_token),
+                                    facts: 0,
+                                    name,
+                                },
+                            )),
+                            &[expression, question_dot_token, name],
+                        );
+                    }
                 }
                 SyntaxKind::OpenParenToken => {
                     let arguments = self.parse_argument_list();
@@ -2491,6 +2907,51 @@ impl<'a> Parser<'a> {
             }
         }
         expression
+    }
+
+    fn parse_await_expression(&mut self) -> NodeId {
+        let start = self.consume().range.start;
+        let expression = self.parse_postfix_expression();
+        self.alloc_node(
+            SyntaxKind::AwaitExpression,
+            TextRange::new(start, self.node_end(expression)),
+            NodeData::AwaitExpression(Box::new(AwaitExpressionData { expression })),
+            &[expression],
+        )
+    }
+
+    fn parse_yield_expression(&mut self) -> NodeId {
+        let keyword = self.consume();
+        let asterisk_token = if self.current.kind == SyntaxKind::AsteriskToken {
+            Some(self.consume_token_node())
+        } else {
+            None
+        };
+        let expression = if self.current.kind == SyntaxKind::SemicolonToken
+            || self.current.kind == SyntaxKind::CloseBraceToken
+            || self.current.kind == SyntaxKind::EndOfFile
+            || self
+                .current
+                .flags
+                .contains(ScannerTokenFlags::PRECEDING_LINE_BREAK)
+        {
+            None
+        } else {
+            Some(self.parse_binary_expression(2))
+        };
+        let end = expression.map_or(keyword.range.end, |node| self.node_end(node));
+        let mut children = Vec::new();
+        children.extend(asterisk_token);
+        children.extend(expression);
+        self.alloc_node(
+            SyntaxKind::YieldExpression,
+            TextRange::new(keyword.range.start, end),
+            NodeData::YieldExpression(Box::new(YieldExpressionData {
+                asterisk_token,
+                expression,
+            })),
+            &children,
+        )
     }
 
     fn parse_new_expression(&mut self) -> NodeId {
@@ -2671,13 +3132,16 @@ impl<'a> Parser<'a> {
     fn parse_primary_expression(&mut self) -> NodeId {
         match self.current.kind {
             SyntaxKind::Identifier => self.parse_identifier("Expected an expression."),
+            SyntaxKind::PrivateIdentifier => self.parse_private_identifier(),
             SyntaxKind::NumericLiteral => self.parse_numeric_literal(),
             SyntaxKind::BigIntLiteral => self.parse_bigint_literal(),
             SyntaxKind::StringLiteral => self.parse_string_literal(),
             SyntaxKind::NoSubstitutionTemplateLiteral => self.parse_template_literal(),
-            SyntaxKind::NullKeyword | SyntaxKind::TrueKeyword | SyntaxKind::FalseKeyword => {
-                self.parse_keyword_expression()
-            }
+            SyntaxKind::NullKeyword
+            | SyntaxKind::TrueKeyword
+            | SyntaxKind::FalseKeyword
+            | SyntaxKind::ThisKeyword
+            | SyntaxKind::SuperKeyword => self.parse_keyword_expression(),
             SyntaxKind::OpenParenToken => self.parse_parenthesized_expression(),
             SyntaxKind::OpenBracketToken => self.parse_array_literal(),
             SyntaxKind::OpenBraceToken => self.parse_object_literal(),
@@ -2791,8 +3255,37 @@ impl<'a> Parser<'a> {
                 }
                 continue;
             }
-            let name = self.parse_identifier("Expected a property name.");
-            if self.current.kind == SyntaxKind::OpenParenToken {
+            let mut modifier_nodes = Vec::new();
+            if self.current.kind == SyntaxKind::AsyncKeyword
+                && !matches!(
+                    self.next_token_kind(),
+                    SyntaxKind::OpenParenToken
+                        | SyntaxKind::ColonToken
+                        | SyntaxKind::CommaToken
+                        | SyntaxKind::CloseBraceToken
+                )
+            {
+                modifier_nodes.push(self.consume_token_node());
+            }
+            let modifiers = (!modifier_nodes.is_empty()).then(|| ModifierList {
+                list: NodeList {
+                    range: TextRange::new(property_start, self.current.range.start),
+                    nodes: modifier_nodes.clone(),
+                    has_trailing_comma: false,
+                },
+                flags: ts_ast::ModifierFlags::default(),
+            });
+            let asterisk_token = if self.current.kind == SyntaxKind::AsteriskToken {
+                Some(self.consume_token_node())
+            } else {
+                None
+            };
+            let name = self.parse_property_name("Expected a property name.");
+            if matches!(
+                self.current.kind,
+                SyntaxKind::LessThanToken | SyntaxKind::OpenParenToken
+            ) {
+                let type_parameters = self.parse_type_parameters();
                 let parameters = self.parse_parameter_list();
                 let return_type = self.parse_optional_type_annotation();
                 let body = if self.current.kind == SyntaxKind::OpenBraceToken {
@@ -2802,7 +3295,10 @@ impl<'a> Parser<'a> {
                     None
                 };
                 let end = body.map_or(parameters.range.end, |id| self.node_end(id));
-                let mut children = vec![name];
+                let mut children = modifier_nodes;
+                children.extend(asterisk_token);
+                children.push(name);
+                extend_list_children(&mut children, type_parameters.as_ref());
                 children.extend(parameters.nodes.iter().copied());
                 children.extend(return_type);
                 children.extend(body);
@@ -2810,7 +3306,7 @@ impl<'a> Parser<'a> {
                     SyntaxKind::MethodDeclaration,
                     TextRange::new(property_start, end),
                     NodeData::MethodDeclaration(Box::new(MethodDeclarationData {
-                        asterisk_token: None,
+                        asterisk_token,
                         body,
                         end_flow_node: None,
                         flow_node: None,
@@ -2821,9 +3317,9 @@ impl<'a> Parser<'a> {
                         postfix_token: None,
                         symbol: None,
                         type_: return_type,
-                        type_parameters: None,
+                        type_parameters,
                         facts: 0,
-                        modifiers: None,
+                        modifiers,
                         name,
                     })),
                     &children,
@@ -3227,6 +3723,7 @@ impl<'a> Parser<'a> {
         match self.current.kind {
             SyntaxKind::StringLiteral => self.parse_string_literal(),
             SyntaxKind::NumericLiteral => self.parse_numeric_literal(),
+            SyntaxKind::PrivateIdentifier => self.parse_private_identifier(),
             SyntaxKind::OpenBracketToken => {
                 let start = self.consume().range.start;
                 let expression = self.parse_binary_expression(0);
@@ -3248,6 +3745,18 @@ impl<'a> Parser<'a> {
             }
             _ => self.parse_identifier_name(message),
         }
+    }
+
+    fn parse_private_identifier(&mut self) -> NodeId {
+        let token = self.consume();
+        self.alloc_node(
+            SyntaxKind::PrivateIdentifier,
+            token.range,
+            NodeData::PrivateIdentifier(Box::new(PrivateIdentifierData {
+                text: token_value(&token),
+            })),
+            &[],
+        )
     }
 
     fn missing_identifier(&mut self, position: TextPos) -> NodeId {
@@ -4295,7 +4804,10 @@ fn binary_precedence(kind: SyntaxKind) -> Option<(u8, bool)> {
 mod tests {
     use ts_ast::{NodeData, NodeFlags, NodeId, SyntaxKind};
 
-    use super::{ParseResult, parse_jsdoc_comment, parse_jsx_source_file, parse_source_file};
+    use super::{
+        NODE_FLAG_AWAIT_USING, NODE_FLAG_USING, ParseResult, parse_jsdoc_comment,
+        parse_jsx_source_file, parse_source_file,
+    };
 
     #[test]
     fn parses_variable_types_and_binary_precedence() {
@@ -4815,6 +5327,54 @@ mod tests {
         ] {
             assert!(kinds.contains(&expected), "missing {expected:?}");
         }
+    }
+
+    #[test]
+    fn parses_modern_async_class_resource_and_import_syntax() {
+        let result = parse_source_file(
+            r#"
+                async function* stream(source: any) {
+                    await source?.next?.();
+                    yield* source?.[0]!;
+                }
+                class Box {
+                    #value = 1;
+                    *values() { yield this.#value; }
+                    async read() { return await this?.#value; }
+                    static { this.#value++; }
+                }
+                for await (const item of items) { item; }
+                using resource = acquire();
+                await using asyncResource = acquire();
+                const methods = {
+                    async run() { await resource?.close?.(); },
+                    *iterate() { yield 1; }
+                };
+                import data from "pkg" with { type: "json" };
+                export { data } from "pkg" with { type: "json" };
+            "#,
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let kinds: Vec<_> = result.arena.iter().map(|(_, node)| node.kind).collect();
+        for expected in [
+            SyntaxKind::AwaitExpression,
+            SyntaxKind::YieldExpression,
+            SyntaxKind::PrivateIdentifier,
+            SyntaxKind::ClassStaticBlockDeclaration,
+            SyntaxKind::ForOfStatement,
+            SyntaxKind::ImportAttributes,
+        ] {
+            assert!(kinds.contains(&expected), "missing {expected:?}");
+        }
+        let declaration_flags: Vec<_> = result
+            .arena
+            .iter()
+            .filter_map(|(_, node)| {
+                (node.kind == SyntaxKind::VariableDeclarationList).then_some(node.flags)
+            })
+            .collect();
+        assert!(declaration_flags.contains(&NODE_FLAG_USING));
+        assert!(declaration_flags.contains(&NODE_FLAG_AWAIT_USING));
     }
 
     #[test]
