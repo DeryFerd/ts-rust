@@ -401,13 +401,13 @@ impl<'a> Binder<'a> {
                 }
             }
             NodeData::EnumDeclaration(data) => {
-                let symbol = self.declare_and_export(
-                    scope,
-                    node_id,
-                    data.name,
-                    SymbolFlags::REGULAR_ENUM,
-                    parent_symbol,
-                );
+                let flags = if self.has_modifier(node_id, SyntaxKind::ConstKeyword) {
+                    SymbolFlags::CONST_ENUM
+                } else {
+                    SymbolFlags::REGULAR_ENUM
+                };
+                let symbol =
+                    self.declare_and_export(scope, node_id, data.name, flags, parent_symbol);
                 let enum_scope = self.create_scope(ScopeKind::Enum, node_id, Some(scope));
                 self.result.node_scopes.insert(node_id, enum_scope);
                 for member in &data.members.nodes {
@@ -1196,6 +1196,7 @@ fn can_merge(existing: SymbolFlags, new: SymbolFlags) -> bool {
         && new == SymbolFlags::FUNCTION_SCOPED_VARIABLE)
         || (existing.contains(SymbolFlags::FUNCTION) && new == SymbolFlags::FUNCTION)
         || (existing.contains(SymbolFlags::INTERFACE) && new == SymbolFlags::INTERFACE)
+        || (existing.contains(SymbolFlags::CONST_ENUM) && new == SymbolFlags::CONST_ENUM)
         || (existing.contains(SymbolFlags::REGULAR_ENUM) && new == SymbolFlags::REGULAR_ENUM)
         || (existing.contains(SymbolFlags::NAMESPACE_MODULE)
             && new == SymbolFlags::NAMESPACE_MODULE)
@@ -1836,6 +1837,48 @@ mod tests {
             assert!(symbol.flags.contains(SymbolFlags::NAMESPACE_MODULE));
             assert!(symbol.members.get(member).is_some());
         }
+    }
+
+    #[test]
+    fn binds_and_merges_const_enums_with_namespaces() {
+        let parsed = parse_source_file(
+            r"
+                export declare const enum Status { Ready }
+                export declare const enum Status { Done }
+                export declare namespace Status { const label: string; }
+                enum Ordinary { Value }
+            ",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let result = bind_source_file(&parsed.arena, parsed.source_file);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let root = result.root_scope().unwrap();
+
+        let status = result
+            .symbols
+            .get(root.symbols.get("Status").unwrap())
+            .unwrap();
+        assert!(status.flags.contains(SymbolFlags::CONST_ENUM));
+        assert!(!status.flags.contains(SymbolFlags::REGULAR_ENUM));
+        assert!(status.flags.contains(SymbolFlags::NAMESPACE_MODULE));
+        assert_eq!(status.declarations.len(), 3);
+        assert!(status.members.get("label").is_some());
+
+        let ordinary = result
+            .symbols
+            .get(root.symbols.get("Ordinary").unwrap())
+            .unwrap();
+        assert!(ordinary.flags.contains(SymbolFlags::REGULAR_ENUM));
+        assert!(!ordinary.flags.contains(SymbolFlags::CONST_ENUM));
+    }
+
+    #[test]
+    fn rejects_mixed_regular_and_const_enum_merges() {
+        let parsed = parse_source_file("enum Mixed { A } const enum Mixed { B }");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let result = bind_source_file(&parsed.arena, parsed.source_file);
+        assert_eq!(result.diagnostics.len(), 1);
+        assert_eq!(result.diagnostics[0].diagnostic.code(), 2300);
     }
 
     #[test]

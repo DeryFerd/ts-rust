@@ -103,6 +103,7 @@ pub struct CompilerOptions {
     pub no_fallthrough_cases_in_switch: bool,
     pub no_unused_locals: bool,
     pub no_unused_parameters: bool,
+    pub preserve_const_enums: bool,
     pub skip_lib_check: bool,
     pub strict: bool,
     pub strict_null_checks: bool,
@@ -155,6 +156,7 @@ impl Default for CompilerOptions {
             no_fallthrough_cases_in_switch: false,
             no_unused_locals: false,
             no_unused_parameters: false,
+            preserve_const_enums: false,
             skip_lib_check: false,
             strict: false,
             strict_null_checks: false,
@@ -268,6 +270,9 @@ impl CompilerOptions {
                 "nounusedparameters" => self.no_unused_parameters = overrides.no_unused_parameters,
                 "outfile" => self.out_file.clone_from(&overrides.out_file),
                 "outdir" => self.out_dir.clone_from(&overrides.out_dir),
+                "preserveconstenums" => {
+                    self.preserve_const_enums = overrides.preserve_const_enums;
+                }
                 "rootdir" => self.root_dir.clone_from(&overrides.root_dir),
                 "skiplibcheck" => self.skip_lib_check = overrides.skip_lib_check,
                 "sourcemap" => self.source_map = overrides.source_map,
@@ -458,6 +463,9 @@ pub fn parse_compiler_options_map(options: &BTreeMap<String, JsonValue>) -> Pars
             "nounusedparameters" => {
                 parsed.no_unused_parameters = boolean(original_name, value, &mut diagnostics);
             }
+            "preserveconstenums" => {
+                parsed.preserve_const_enums = boolean(original_name, value, &mut diagnostics);
+            }
             "skiplibcheck" => {
                 parsed.skip_lib_check = boolean(original_name, value, &mut diagnostics);
             }
@@ -539,6 +547,7 @@ struct PartialOptions {
     no_fallthrough_cases_in_switch: Option<bool>,
     no_unused_locals: Option<bool>,
     no_unused_parameters: Option<bool>,
+    preserve_const_enums: Option<bool>,
     skip_lib_check: Option<bool>,
     strict: Option<bool>,
     strict_null_checks: Option<bool>,
@@ -609,6 +618,7 @@ impl PartialOptions {
             no_fallthrough_cases_in_switch: self.no_fallthrough_cases_in_switch.unwrap_or(false),
             no_unused_locals: self.no_unused_locals.unwrap_or(false),
             no_unused_parameters: self.no_unused_parameters.unwrap_or(false),
+            preserve_const_enums: self.preserve_const_enums.unwrap_or(false),
             skip_lib_check: self.skip_lib_check.unwrap_or(false),
             strict,
             strict_null_checks: self.strict_null_checks.unwrap_or(strict),
@@ -910,7 +920,7 @@ fn diagnostic<const N: usize>(code: u32, arguments: [&str; N]) -> Diagnostic {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use ts_config::{JsonValue, parse_config_text};
     use ts_module::{ResolutionMode, ResolutionOptions};
@@ -1070,6 +1080,37 @@ mod tests {
         let disabled = parse_compiler_options(&object([("alwaysStrict", JsonValue::Bool(false))]));
         assert!(disabled.is_ok());
         assert!(!disabled.options.always_strict);
+    }
+
+    #[test]
+    fn parses_and_applies_preserve_const_enums() {
+        let defaults = parse_compiler_options(&object([]));
+        assert!(!defaults.options.preserve_const_enums);
+
+        let enabled =
+            parse_compiler_options(&object([("PreserveConstEnums", JsonValue::Bool(true))]));
+        assert!(enabled.is_ok(), "{:?}", enabled.diagnostics);
+        assert!(enabled.options.preserve_const_enums);
+
+        let mut applied = CompilerOptions::default();
+        applied.apply_overrides(
+            &enabled.options,
+            &BTreeSet::from(["preserveconstenums".to_owned()]),
+        );
+        assert!(applied.preserve_const_enums);
+
+        let invalid = parse_compiler_options(&object([(
+            "preserveConstEnums",
+            JsonValue::String("yes".into()),
+        )]));
+        assert_eq!(
+            invalid
+                .diagnostics
+                .iter()
+                .map(ts_diagnostics::Diagnostic::code)
+                .collect::<Vec<_>>(),
+            [5024]
+        );
     }
 
     #[test]

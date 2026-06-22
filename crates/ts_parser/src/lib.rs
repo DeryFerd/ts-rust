@@ -257,8 +257,11 @@ impl<'a> Parser<'a> {
     fn parse_statement(&mut self) -> NodeId {
         let is_labeled_statement = self.current.kind == SyntaxKind::Identifier
             && self.next_token_kind() == SyntaxKind::ColonToken;
+        let is_const_enum = self.current.kind == SyntaxKind::ConstKeyword
+            && self.next_token_kind() == SyntaxKind::EnumKeyword;
         match self.current.kind {
             SyntaxKind::OpenBraceToken => self.parse_block(),
+            SyntaxKind::ConstKeyword if is_const_enum => self.parse_const_enum_declaration(),
             SyntaxKind::VarKeyword | SyntaxKind::LetKeyword | SyntaxKind::ConstKeyword => {
                 self.parse_variable_statement()
             }
@@ -386,6 +389,14 @@ impl<'a> Parser<'a> {
             _ => NodeFlags::default(),
         };
         self.parse_variable_statement_tail(keyword.range.start, declaration_flags)
+    }
+
+    fn parse_const_enum_declaration(&mut self) -> NodeId {
+        let start = self.current.range.start;
+        let const_modifier = self.consume_token_node();
+        let declaration = self.parse_enum_declaration();
+        self.attach_modifiers(declaration, vec![const_modifier], start);
+        declaration
     }
 
     fn parse_using_statement(&mut self) -> NodeId {
@@ -5877,6 +5888,66 @@ mod tests {
                     .range
                     .start
             );
+        }
+    }
+
+    #[test]
+    fn parses_const_enums_with_composed_modifiers() {
+        let result = parse_source_file(
+            r"
+                const value = 1;
+                const enum Local { A }
+                declare const enum Ambient { A }
+                export const enum Exported { A }
+                export declare const enum ExportedAmbient { A }
+            ",
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let statements = source_statements(&result);
+        assert_eq!(
+            statements
+                .iter()
+                .map(|statement| result.arena.get(*statement).unwrap().kind)
+                .collect::<Vec<_>>(),
+            [
+                SyntaxKind::VariableStatement,
+                SyntaxKind::EnumDeclaration,
+                SyntaxKind::EnumDeclaration,
+                SyntaxKind::EnumDeclaration,
+                SyntaxKind::EnumDeclaration,
+            ]
+        );
+
+        for (statement, expected) in statements[1..].iter().zip([
+            vec![SyntaxKind::ConstKeyword],
+            vec![SyntaxKind::DeclareKeyword, SyntaxKind::ConstKeyword],
+            vec![SyntaxKind::ExportKeyword, SyntaxKind::ConstKeyword],
+            vec![
+                SyntaxKind::ExportKeyword,
+                SyntaxKind::DeclareKeyword,
+                SyntaxKind::ConstKeyword,
+            ],
+        ]) {
+            let NodeData::EnumDeclaration(data) = &result.arena.get(*statement).unwrap().data
+            else {
+                panic!("expected enum declaration");
+            };
+            let modifiers = data.modifiers.as_ref().unwrap();
+            assert_eq!(
+                modifiers
+                    .list
+                    .nodes
+                    .iter()
+                    .map(|modifier| result.arena.get(*modifier).unwrap().kind)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            for modifier in &modifiers.list.nodes {
+                assert_eq!(
+                    result.arena.get(*modifier).unwrap().parent,
+                    Some(*statement)
+                );
+            }
         }
     }
 

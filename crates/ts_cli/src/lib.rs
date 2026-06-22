@@ -184,6 +184,7 @@ fn compiler_boolean_name(argument: &str) -> Option<&'static str> {
         "--nofallthroughcasesinswitch" => "nofallthroughcasesinswitch",
         "--nounusedlocals" => "nounusedlocals",
         "--nounusedparameters" => "nounusedparameters",
+        "--preserveconstenums" => "preserveconstenums",
         "--skiplibcheck" => "skiplibcheck",
         "--sourcemap" => "sourcemap",
         "--strict" => "strict",
@@ -430,6 +431,7 @@ mod tests {
             "src",
             "--declaration",
             "--sourceMap",
+            "--preserveConstEnums",
             "--checkJs",
             "--strict",
             "main.ts",
@@ -454,6 +456,7 @@ mod tests {
         assert_eq!(options.compiler_options.root_dir.as_deref(), Some("src"));
         assert!(options.compiler_options.declaration);
         assert!(options.compiler_options.source_map);
+        assert!(options.compiler_options.preserve_const_enums);
         assert!(options.compiler_options.check_js);
         assert!(options.compiler_options.allow_js);
         assert!(options.compiler_options.strict);

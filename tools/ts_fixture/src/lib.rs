@@ -620,6 +620,7 @@ const SCALAR_OPTION_NAMES: &[&str] = &[
     "noUnusedParameters",
     "outFile",
     "outDir",
+    "preserveConstEnums",
     "resolveJsonModule",
     "rootDir",
     "skipLibCheck",
