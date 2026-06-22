@@ -1,0 +1,13 @@
+[package]
+name = "ts_scanner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ts_ast = { path = "../ts_ast" }
+ts_core = { path = "../ts_core" }
+
+[lints]
+workspace = true
+

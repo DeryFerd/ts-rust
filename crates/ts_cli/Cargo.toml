@@ -1,0 +1,16 @@
+[package]
+name = "ts_cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "tsgo"
+path = "src/main.rs"
+
+[dependencies]
+ts_ast = { path = "../ts_ast" }
+ts_scanner = { path = "../ts_scanner" }
+
+[lints]
+workspace = true
