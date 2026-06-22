@@ -3070,6 +3070,7 @@ impl Printer<'_> {
         let node = self.node(id)?.clone();
         match &node.data {
             NodeData::Identifier(data) => self.writer.write(&data.text),
+            NodeData::QualifiedName(data) => self.emit_qualified_name(data)?,
             NodeData::PrivateIdentifier(data) => self.writer.write(&data.text),
             NodeData::NumericLiteral(data) => self.writer.write(&data.text),
             NodeData::BigIntLiteral(data) => self.writer.write(&data.text),
@@ -4723,6 +4724,17 @@ mod tests {
             ),
             "class Counter extends Base {\n    value = 0;\n    inc(step) {\n        value = value + step;\n    }\n}\nlet i = 0;\nwhile (i < 2) {\n    i = i + 1;\n}\nfor (let j = 0; j < 2; j = j + 1) {\n    i = i + j;\n}\n"
         );
+    }
+
+    #[test]
+    fn emits_qualified_names_in_class_heritage_expressions() {
+        let source = "class VisualizationModel extends Backbone.Model {}";
+        assert_eq!(
+            emit_with(source, ScriptTarget::Es2015, ModuleKind::EsNext).code,
+            "class VisualizationModel extends Backbone.Model {\n}\n"
+        );
+        let es5 = emit_with(source, ScriptTarget::Es5, ModuleKind::EsNext).code;
+        assert!(es5.contains("}(Backbone.Model));"), "{es5}");
     }
 
     #[test]
