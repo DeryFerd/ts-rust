@@ -8,6 +8,10 @@ description = "Parser for TypeScript compiler baseline fixtures"
 [lib]
 path = "src/lib.rs"
 
+[[bin]]
+name = "ts_fixture_baseline"
+path = "src/main.rs"
+
 [dependencies]
 ts_compiler = { path = "../../crates/ts_compiler" }
 ts_config = { path = "../../crates/ts_config" }

@@ -4,7 +4,13 @@
 //! separated by `// @filename: path` directives. Other directives are retained
 //! as name/value metadata for the compiler harness.
 
-use std::{collections::BTreeMap, fmt, ops::Range, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    fmt, fs,
+    io::{self, Write},
+    ops::Range,
+    path::{Path, PathBuf},
+};
 
 use ts_core::SourceText;
 use ts_vfs::{FileSystem, MemoryFileSystem};
@@ -156,6 +162,132 @@ pub enum OutputDifferenceKind {
     Missing { expected: String },
     Unexpected { actual: String },
     Content { expected: String, actual: String },
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RunnerOptions {
+    pub filter: Option<String>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RunnerSummary {
+    pub matched: usize,
+    pub mismatched: usize,
+    pub missing: usize,
+}
+
+impl RunnerSummary {
+    #[must_use]
+    pub const fn is_success(self) -> bool {
+        self.mismatched == 0 && self.missing == 0
+    }
+}
+
+/// Discovers upstream cases/reference baselines and runs emitted-output comparisons.
+///
+/// # Errors
+///
+/// Returns an error when a case, baseline, or fixture compilation cannot be read.
+pub fn run_upstream_baselines(
+    repository: &Path,
+    options: &RunnerOptions,
+    writer: &mut impl Write,
+) -> io::Result<RunnerSummary> {
+    let layouts = upstream_layouts(repository);
+    if layouts.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "no TypeScript cases/reference baseline layout below {}",
+                repository.display()
+            ),
+        ));
+    }
+    let mut cases = Vec::new();
+    let mut baseline_sets = Vec::new();
+    for (case_root, baseline_root) in &layouts {
+        let baselines = collect_files(baseline_root, is_emit_baseline_file)?;
+        let baseline_index = baseline_sets.len();
+        baseline_sets.push(index_baselines(baselines));
+        for case_path in collect_files(case_root, is_case_file)? {
+            cases.push((case_path, baseline_index));
+        }
+    }
+    cases.sort_by(|left, right| left.0.cmp(&right.0));
+    cases.dedup_by(|left, right| left.0 == right.0);
+    let filter = options.filter.as_deref().map(str::to_ascii_lowercase);
+    let cases = cases
+        .into_iter()
+        .filter(|(path, _)| {
+            filter
+                .as_ref()
+                .is_none_or(|filter| path.to_string_lossy().to_ascii_lowercase().contains(filter))
+        })
+        .take(options.limit.unwrap_or(usize::MAX));
+
+    let mut summary = RunnerSummary::default();
+    for (case_path, baseline_index) in cases {
+        let baseline_files = &baseline_sets[baseline_index];
+        let source = fs::read(&case_path)?;
+        let case = Case::parse(&case_path, source)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let axes = matrix_axes(&case);
+        let case_name = case_path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        let candidates = baseline_files
+            .get(case_name)
+            .map_or_else(Vec::new, |paths| paths.iter().collect::<Vec<_>>());
+        for (variant, compilation) in compile_case_matrix(&case)? {
+            let selected = select_variant_baselines(&candidates, case_name, &variant, &axes);
+            let display_path = case_path
+                .strip_prefix(repository)
+                .unwrap_or(&case_path)
+                .display();
+            let label = variant_label(&variant, &axes);
+            if selected.is_empty() {
+                if compilation
+                    .outputs
+                    .keys()
+                    .any(|name| is_emitted_section(name))
+                {
+                    summary.missing += 1;
+                    writeln!(writer, "MISSING {display_path}{label}")?;
+                } else {
+                    summary.matched += 1;
+                }
+                continue;
+            }
+            let mut baseline = String::new();
+            for path in selected {
+                let text = fs::read_to_string(path)?;
+                if !baseline.is_empty() && !baseline.ends_with('\n') {
+                    baseline.push('\n');
+                }
+                baseline.push_str(&text);
+            }
+            let comparison = compare_emitted_output_sections(&compilation.outputs, &baseline);
+            if comparison.is_match() {
+                summary.matched += 1;
+            } else {
+                summary.mismatched += 1;
+                let difference = &comparison.differences[0];
+                writeln!(
+                    writer,
+                    "MISMATCH {display_path}{label}: {}",
+                    describe_difference(difference)
+                )?;
+            }
+        }
+    }
+    writeln!(
+        writer,
+        "summary: matched={} mismatched={} missing={}",
+        summary.matched, summary.mismatched, summary.missing
+    )?;
+    Ok(summary)
 }
 
 /// Parses TypeScript's `//// [file]` baseline sections, preserving section
@@ -366,9 +498,6 @@ fn compile_case_variant(case: &Case, variant: &OptionVariant) -> std::io::Result
 
 fn virtual_unit_path(case: &Case, unit: &Unit, index: usize) -> String {
     let path = unit.path.to_string_lossy().replace('\\', "/");
-    if path.starts_with('/') {
-        return ts_path::normalize_path(&path);
-    }
     if unit.path == case.path {
         let base = unit
             .path
@@ -376,6 +505,9 @@ fn virtual_unit_path(case: &Case, unit: &Unit, index: usize) -> String {
             .and_then(|name| name.to_str())
             .map_or_else(|| format!("unit{index}.ts"), str::to_owned);
         return ts_path::resolve_path("/case", &[&base]);
+    }
+    if path.starts_with('/') {
+        return ts_path::normalize_path(&path);
     }
     ts_path::resolve_path("/case", &[&path])
 }
@@ -435,6 +567,7 @@ const SCALAR_OPTION_NAMES: &[&str] = &[
     "moduleResolution",
     "noCheck",
     "noEmit",
+    "noEmitOnError",
     "noImplicitAny",
     "noLib",
     "noUnusedLocals",
@@ -452,6 +585,190 @@ const SCALAR_OPTION_NAMES: &[&str] = &[
 ];
 
 const LIST_OPTION_NAMES: &[&str] = &["lib", "rootDirs", "typeRoots", "types"];
+
+fn upstream_layouts(repository: &Path) -> Vec<(PathBuf, PathBuf)> {
+    let candidates = [
+        ("testdata/tests/cases", "testdata/tests/baselines/reference"),
+        (
+            "_submodules/TypeScript/tests/cases",
+            "_submodules/TypeScript/tests/baselines/reference",
+        ),
+        ("tests/cases", "tests/baselines/reference"),
+    ];
+    candidates
+        .into_iter()
+        .map(|(cases, baselines)| (repository.join(cases), repository.join(baselines)))
+        .find(|(cases, baselines)| cases.is_dir() && baselines.is_dir())
+        .into_iter()
+        .collect()
+}
+
+fn collect_files(root: &Path, include: fn(&Path) -> bool) -> io::Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    if !root.is_dir() {
+        return Ok(files);
+    }
+    let mut pending = vec![root.to_owned()];
+    while let Some(directory) = pending.pop() {
+        let mut entries = fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
+        entries.sort_by_key(std::fs::DirEntry::path);
+        for entry in entries.into_iter().rev() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if include(&path) {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn is_case_file(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|extension| extension.to_str()),
+        Some("ts" | "tsx" | "js" | "jsx")
+    )
+}
+
+fn is_emit_baseline_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(is_emitted_section)
+}
+
+fn index_baselines(paths: Vec<PathBuf>) -> BTreeMap<String, Vec<PathBuf>> {
+    let mut index = BTreeMap::<String, Vec<PathBuf>>::new();
+    for path in paths {
+        let Some(base) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(emitted_baseline_base)
+        else {
+            continue;
+        };
+        let case_name = base.split_once('(').map_or(base, |(name, _)| name);
+        index.entry(case_name.to_owned()).or_default().push(path);
+    }
+    index
+}
+
+fn emitted_baseline_base(file_name: &str) -> Option<&str> {
+    [".d.mts", ".d.cts", ".d.ts", ".jsx", ".mjs", ".cjs", ".js"]
+        .into_iter()
+        .find_map(|extension| file_name.strip_suffix(extension))
+}
+
+fn matrix_axes(case: &Case) -> Vec<String> {
+    SCALAR_OPTION_NAMES
+        .iter()
+        .filter_map(|name| {
+            case.directive_values(name)
+                .next()
+                .filter(|value| {
+                    value
+                        .split(',')
+                        .filter(|part| !part.trim().is_empty())
+                        .count()
+                        > 1
+                })
+                .map(|_| (*name).to_owned())
+        })
+        .collect()
+}
+
+fn select_variant_baselines<'a>(
+    candidates: &[&'a PathBuf],
+    case_name: &str,
+    variant: &OptionVariant,
+    axes: &[String],
+) -> Vec<&'a PathBuf> {
+    if axes.is_empty() {
+        return candidates.to_vec();
+    }
+    let tagged = candidates
+        .iter()
+        .copied()
+        .filter(|path| {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            axes.iter().all(|axis| {
+                variant.values.get(axis).is_some_and(|value| {
+                    name.contains(&format!(
+                        "{}={}",
+                        axis.to_ascii_lowercase(),
+                        value.to_ascii_lowercase()
+                    ))
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    if tagged.is_empty() {
+        candidates
+            .iter()
+            .copied()
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(emitted_baseline_base)
+                    == Some(case_name)
+            })
+            .collect()
+    } else {
+        tagged
+    }
+}
+
+fn variant_label(variant: &OptionVariant, axes: &[String]) -> String {
+    if axes.is_empty() {
+        return String::new();
+    }
+    let values = axes
+        .iter()
+        .filter_map(|axis| {
+            variant
+                .values
+                .get(axis)
+                .map(|value| format!("{axis}={value}"))
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(" [{values}]")
+}
+
+fn describe_difference(difference: &OutputDifference) -> String {
+    match &difference.kind {
+        OutputDifferenceKind::Missing { .. } => format!("missing section {}", difference.section),
+        OutputDifferenceKind::Unexpected { .. } => {
+            format!("unexpected section {}", difference.section)
+        }
+        OutputDifferenceKind::Content { expected, actual } => {
+            let (line, expected, actual) = first_different_line(expected, actual);
+            format!(
+                "section {} differs at line {line}; expected {expected:?}, actual {actual:?}",
+                difference.section
+            )
+        }
+    }
+}
+
+fn first_different_line<'a>(expected: &'a str, actual: &'a str) -> (usize, &'a str, &'a str) {
+    let mut expected_lines = expected.lines();
+    let mut actual_lines = actual.lines();
+    let mut line = 1;
+    loop {
+        let expected = expected_lines.next().unwrap_or("");
+        let actual = actual_lines.next().unwrap_or("");
+        if expected != actual || (expected.is_empty() && actual.is_empty()) {
+            return (line, expected, actual);
+        }
+        line += 1;
+    }
+}
 
 fn is_emitted_section(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
