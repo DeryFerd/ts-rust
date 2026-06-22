@@ -345,24 +345,31 @@ pub fn emit_source_file_with_context(
     let mut previous_emitted = false;
     for statement in &data.statements.nodes {
         if let Some(node) = arena.get(*statement) {
-            printer.emit_source_comments_between_with_trailing(
+            let current_emitted = printer.statement_emits_runtime(*statement, node);
+            printer.emit_source_comments_between_with_ownership(
                 previous_end,
                 node.range.start.get(),
                 previous_emitted,
+                current_emitted,
             );
-            previous_emitted = printer.statement_emits_runtime(*statement, node);
-            if previous_emitted {
+            if current_emitted {
                 printer.emit_reference_directives_between(
                     reference_owner_start,
                     node.range.start.get(),
                 );
             }
+            previous_emitted = current_emitted;
             previous_end = node.range.end.get();
             reference_owner_start = node.range.end.get();
         }
         printer.emit_statement(*statement)?;
     }
-    printer.emit_source_comments_between_with_trailing(previous_end, source_end, previous_emitted);
+    printer.emit_source_comments_between_with_ownership(
+        previous_end,
+        source_end,
+        previous_emitted,
+        false,
+    );
     if settings.module == ModuleKind::CommonJs
         && let Some(expression) = export_equals_expression
     {
@@ -370,6 +377,14 @@ pub fn emit_source_file_with_context(
         printer.emit_expression(expression, 0)?;
         printer.writer.write(";");
         printer.writer.newline();
+    }
+    if data.statements.nodes.last().is_some_and(|statement| {
+        arena
+            .get(*statement)
+            .is_some_and(|node| !statement_emits_javascript(arena, node))
+    }) && export_equals_expression.is_none()
+    {
+        printer.writer.preserve_trailing_blank_line = true;
     }
     let source_map = printer
         .source_map
@@ -1837,6 +1852,7 @@ struct Writer {
     line_start: bool,
     line: u32,
     column: u32,
+    preserve_trailing_blank_line: bool,
 }
 
 impl Writer {
@@ -1883,6 +1899,9 @@ impl Writer {
         }
         if !self.output.is_empty() {
             self.output.push('\n');
+            if self.preserve_trailing_blank_line {
+                self.output.push_str("\n\n");
+            }
         }
         self.output
     }
@@ -2636,6 +2655,21 @@ impl Printer<'_> {
         end: u32,
         preserve_immediate_trailing: bool,
     ) {
+        self.emit_source_comments_between_with_ownership(
+            start,
+            end,
+            preserve_immediate_trailing,
+            true,
+        );
+    }
+
+    fn emit_source_comments_between_with_ownership(
+        &mut self,
+        start: u32,
+        end: u32,
+        preserve_immediate_trailing: bool,
+        preserve_leading: bool,
+    ) {
         let start = usize::try_from(start).unwrap_or(usize::MAX);
         let end = usize::try_from(end).unwrap_or(usize::MAX);
         let Some(trivia) = self.source_text.get(start..end) else {
@@ -2655,7 +2689,9 @@ impl Printer<'_> {
                     continue;
                 }
                 let immediate_trailing = !trivia[..index].contains(['\n', '\r']);
-                if !immediate_trailing || preserve_immediate_trailing {
+                if (immediate_trailing && preserve_immediate_trailing)
+                    || (!immediate_trailing && preserve_leading)
+                {
                     if immediate_trailing {
                         self.writer.remove_trailing_newline();
                         self.writer.write(" ");
@@ -2670,7 +2706,9 @@ impl Printer<'_> {
                     .position(|window| window == b"*/")
                     .map_or(bytes.len(), |offset| index + 2 + offset + 2);
                 let immediate_trailing = !trivia[..index].contains(['\n', '\r']);
-                if !immediate_trailing || preserve_immediate_trailing {
+                if (immediate_trailing && preserve_immediate_trailing)
+                    || (!immediate_trailing && preserve_leading)
+                {
                     if immediate_trailing {
                         self.writer.remove_trailing_newline();
                         self.writer.write(" ");
@@ -3459,14 +3497,6 @@ impl Printer<'_> {
         let mut previous_emitted = false;
         for member in &data.members.nodes {
             let node = self.node(*member)?.clone();
-            self.emit_source_comments_between_with_trailing(
-                previous_end,
-                node.range.start.get(),
-                previous_emitted,
-            );
-            if previous_emitted {
-                self.emit_class_empty_elements_between(previous_end, node.range.start.get());
-            }
             let current_emitted = !self.class_member_is_abstract(&node)
                 && match &node.data {
                     NodeData::MethodDeclaration(method) => method.body.is_some(),
@@ -3476,6 +3506,15 @@ impl Printer<'_> {
                     NodeData::ClassStaticBlockDeclaration(_) => true,
                     _ => false,
                 };
+            self.emit_source_comments_between_with_ownership(
+                previous_end,
+                node.range.start.get(),
+                previous_emitted,
+                current_emitted,
+            );
+            if previous_emitted {
+                self.emit_class_empty_elements_between(previous_end, node.range.start.get());
+            }
             previous_end = node.range.end.get();
             previous_emitted = current_emitted;
             if self.class_member_is_abstract(&node) {
@@ -3546,10 +3585,11 @@ impl Printer<'_> {
                 _ => return Err(Self::unsupported(*member, node.kind)),
             }
         }
-        self.emit_source_comments_between_with_trailing(
+        self.emit_source_comments_between_with_ownership(
             previous_end,
             data.members.range.end.get(),
             previous_emitted,
+            false,
         );
         if previous_emitted {
             self.emit_class_empty_elements_between(previous_end, data.members.range.end.get());
@@ -3920,14 +3960,6 @@ impl Printer<'_> {
         let mut previous_emitted = false;
         for (index, member) in data.members.nodes.iter().enumerate() {
             let node = self.node(*member)?.clone();
-            self.emit_source_comments_between_with_trailing(
-                previous_end,
-                node.range.start.get(),
-                previous_emitted,
-            );
-            if previous_emitted {
-                self.emit_class_empty_elements_between(previous_end, node.range.start.get());
-            }
             let current_emitted = !self.class_member_is_abstract(&node)
                 && (matches!(
                     &node.data,
@@ -3939,6 +3971,15 @@ impl Printer<'_> {
                     &node.data,
                     NodeData::SetAccessorDeclaration(accessor) if accessor.body.is_some()
                 ));
+            self.emit_source_comments_between_with_ownership(
+                previous_end,
+                node.range.start.get(),
+                previous_emitted,
+                current_emitted,
+            );
+            if previous_emitted {
+                self.emit_class_empty_elements_between(previous_end, node.range.start.get());
+            }
             previous_end = node.range.end.get();
             previous_emitted = current_emitted;
             if self.class_member_is_abstract(&node) {
@@ -3976,10 +4017,11 @@ impl Printer<'_> {
                 }
             }
         }
-        self.emit_source_comments_between_with_trailing(
+        self.emit_source_comments_between_with_ownership(
             previous_end,
             data.members.range.end.get(),
             previous_emitted,
+            false,
         );
         if previous_emitted {
             self.emit_class_empty_elements_between(previous_end, data.members.range.end.get());
@@ -7763,6 +7805,51 @@ class Board {
                 "    // implementation comment\n",
                 "    method(value) { }\n",
                 "}\n",
+            )
+        );
+    }
+
+    #[test]
+    fn drops_comments_without_an_emitted_class_member_owner() {
+        let source = concat!(
+            "class VisualizationModel extends Base {\n",
+            "    // interesting stuff here\n",
+            "}\n",
+        );
+        for target in [ScriptTarget::Es2015, ScriptTarget::Es5] {
+            let output = emit_with(source, target, ModuleKind::EsNext).code;
+            assert!(!output.contains("interesting stuff"), "{output}");
+        }
+    }
+
+    #[test]
+    fn assigns_comments_to_emitted_previous_or_next_nodes() {
+        let source = concat!(
+            "function before() {} // keep trailing\n",
+            "// erased interface comment\n",
+            "interface Hidden {}\n",
+            "// keep leading\n",
+            "function after() {}\n",
+        );
+        assert_eq!(
+            emit_with(source, ScriptTarget::Es2015, ModuleKind::EsNext).code,
+            concat!(
+                "function before() { } // keep trailing\n",
+                "// keep leading\n",
+                "function after() { }\n",
+            )
+        );
+    }
+
+    #[test]
+    fn preserves_blank_emit_tail_when_final_source_statements_are_erased() {
+        let source = "type T = number; export interface I { value: T; }\n";
+        assert_eq!(
+            emit_with(source, ScriptTarget::Es2015, ModuleKind::CommonJs).code,
+            concat!(
+                "\"use strict\";\n",
+                "Object.defineProperty(exports, \"__esModule\", { value: true });\n",
+                "\n\n",
             )
         );
     }
