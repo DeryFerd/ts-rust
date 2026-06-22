@@ -2002,6 +2002,40 @@ mod tests {
     }
 
     #[test]
+    fn binds_dotted_ambient_namespaces_as_nested_exports() {
+        let parsed =
+            parse_source_file("declare namespace Foo.Bar { export var foo; }; Foo.Bar.foo = 5;");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let result = bind_source_file(&parsed.arena, parsed.source_file);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let root = result.root_scope().unwrap();
+
+        let foo_id = root.symbols.get("Foo").unwrap();
+        let foo = result.symbols.get(foo_id).unwrap();
+        assert!(foo.flags.contains(SymbolFlags::NAMESPACE_MODULE));
+        let bar_id = foo.members.get("Bar").unwrap();
+        let bar = result.symbols.get(bar_id).unwrap();
+        assert!(bar.flags.contains(SymbolFlags::NAMESPACE_MODULE));
+        assert_eq!(bar.parent, Some(foo_id));
+        let value_id = bar.members.get("foo").unwrap();
+        let value = result.symbols.get(value_id).unwrap();
+        assert_eq!(value.parent, Some(bar_id));
+
+        let NodeData::SourceFile(source) = &parsed.arena.get(parsed.source_file).unwrap().data
+        else {
+            panic!("expected source file");
+        };
+        assert_eq!(source.statements.nodes.len(), 3);
+        let outer_id = source.statements.nodes[0];
+        let NodeData::ModuleDeclaration(outer) = &parsed.arena.get(outer_id).unwrap().data else {
+            panic!("expected outer namespace");
+        };
+        let inner_id = outer.body.unwrap();
+        assert_eq!(result.node_symbols.get(&outer_id), Some(&foo_id));
+        assert_eq!(result.node_symbols.get(&inner_id), Some(&bar_id));
+    }
+
+    #[test]
     fn merges_functions_classes_and_enums_with_namespaces() {
         let parsed = parse_source_file(
             r#"

@@ -2508,6 +2508,8 @@ impl<'a> Parser<'a> {
 
     fn parse_module_declaration(&mut self) -> NodeId {
         let keyword = self.consume();
+        let allows_dotted_name = keyword.kind != SyntaxKind::GlobalKeyword
+            && self.current.kind != SyntaxKind::StringLiteral;
         let name = if keyword.kind == SyntaxKind::GlobalKeyword {
             self.alloc_node(
                 SyntaxKind::Identifier,
@@ -2523,7 +2525,29 @@ impl<'a> Parser<'a> {
         } else {
             self.parse_identifier("Expected a module name.")
         };
-        let body = if self.current.kind == SyntaxKind::OpenBraceToken {
+        let body = if allows_dotted_name && self.current.kind == SyntaxKind::DotToken {
+            self.bump();
+            Some(self.parse_nested_module_declaration(keyword.kind))
+        } else {
+            self.parse_module_block()
+        };
+        self.alloc_module_declaration(keyword.range.start, keyword.kind, name, body)
+    }
+
+    fn parse_nested_module_declaration(&mut self, keyword: SyntaxKind) -> NodeId {
+        let start = self.current.range.start;
+        let name = self.parse_identifier("Expected a module name.");
+        let body = if self.current.kind == SyntaxKind::DotToken {
+            self.bump();
+            Some(self.parse_nested_module_declaration(keyword))
+        } else {
+            self.parse_module_block()
+        };
+        self.alloc_module_declaration(start, keyword, name, body)
+    }
+
+    fn parse_module_block(&mut self) -> Option<NodeId> {
+        if self.current.kind == SyntaxKind::OpenBraceToken {
             let block = self.parse_block();
             let block_node = self.arena.get(block).unwrap();
             let NodeData::Block(block_data) = &block_node.data else {
@@ -2542,19 +2566,28 @@ impl<'a> Parser<'a> {
         } else {
             self.error_current("Expected '{'.");
             None
-        };
+        }
+    }
+
+    fn alloc_module_declaration(
+        &mut self,
+        start: TextPos,
+        keyword: SyntaxKind,
+        name: NodeId,
+        body: Option<NodeId>,
+    ) -> NodeId {
         let end = body.map_or_else(|| self.node_end(name), |id| self.node_end(id));
         let mut children = vec![name];
         children.extend(body);
         self.alloc_node(
             SyntaxKind::ModuleDeclaration,
-            TextRange::new(keyword.range.start, end),
+            TextRange::new(start, end),
             NodeData::ModuleDeclaration(Box::new(ModuleDeclarationData {
                 asterisk_token: None,
                 body,
                 end_flow_node: None,
                 flow_node: None,
-                keyword: keyword.kind,
+                keyword,
                 local_symbol: None,
                 locals: SymbolTable,
                 next_container: None,
@@ -7013,6 +7046,80 @@ mod tests {
             panic!("expected decorated class");
         };
         assert_eq!(class_data.modifiers.as_ref().unwrap().list.nodes.len(), 1);
+    }
+
+    #[test]
+    fn parses_dotted_ambient_namespaces_as_nested_declarations() {
+        let source = "declare namespace Foo.Bar { export var foo; }; Foo.Bar.foo = 5;";
+        let result = parse_source_file(source);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let statements = source_statements(&result);
+        assert_eq!(statements.len(), 3);
+        assert_eq!(
+            result.arena.get(statements[1]).unwrap().kind,
+            SyntaxKind::EmptyStatement
+        );
+        assert_eq!(
+            result.arena.get(statements[2]).unwrap().kind,
+            SyntaxKind::ExpressionStatement
+        );
+
+        let outer_id = statements[0];
+        let outer_node = result.arena.get(outer_id).unwrap();
+        let NodeData::ModuleDeclaration(outer) = &outer_node.data else {
+            panic!("expected outer namespace");
+        };
+        assert_eq!(outer_node.range.start.get(), 0);
+        assert_eq!(
+            outer_node.range.end.get(),
+            u32::try_from(source.find('}').unwrap()).unwrap() + 1
+        );
+        assert_eq!(result.arena.get(outer.name).unwrap().parent, Some(outer_id));
+        let modifiers = outer.modifiers.as_ref().unwrap();
+        assert_eq!(modifiers.list.nodes.len(), 1);
+        assert_eq!(
+            result.arena.get(modifiers.list.nodes[0]).unwrap().kind,
+            SyntaxKind::DeclareKeyword
+        );
+
+        let inner_id = outer.body.unwrap();
+        let inner_node = result.arena.get(inner_id).unwrap();
+        let NodeData::ModuleDeclaration(inner) = &inner_node.data else {
+            panic!("expected nested namespace");
+        };
+        assert_eq!(inner_node.parent, Some(outer_id));
+        assert_eq!(
+            inner_node.range.start.get(),
+            u32::try_from(source.find("Bar").unwrap()).unwrap()
+        );
+        assert_eq!(inner_node.range.end, outer_node.range.end);
+        assert!(inner.modifiers.is_none());
+        assert_eq!(result.arena.get(inner.name).unwrap().parent, Some(inner_id));
+
+        let block_id = inner.body.unwrap();
+        let block_node = result.arena.get(block_id).unwrap();
+        let NodeData::ModuleBlock(block) = &block_node.data else {
+            panic!("expected nested namespace block");
+        };
+        assert_eq!(block_node.parent, Some(inner_id));
+        assert_eq!(block.statements.nodes.len(), 1);
+        assert_eq!(
+            result.arena.get(block.statements.nodes[0]).unwrap().parent,
+            Some(block_id)
+        );
+    }
+
+    #[test]
+    fn retains_namespace_recovery_after_a_missing_dotted_name() {
+        let result = parse_source_file(
+            "namespace Plain { const value = 1; } namespace Broken. { const recovered = 2; }",
+        );
+        assert_eq!(result.diagnostics.len(), 1, "{:?}", result.diagnostics);
+        let statements = source_statements(&result);
+        assert_eq!(statements.len(), 2);
+        assert!(statements.iter().all(|statement| {
+            result.arena.get(*statement).unwrap().kind == SyntaxKind::ModuleDeclaration
+        }));
     }
 
     #[test]

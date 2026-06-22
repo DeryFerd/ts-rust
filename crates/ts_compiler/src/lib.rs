@@ -1680,6 +1680,32 @@ mod tests {
     }
 
     #[test]
+    fn accepts_dotted_ambient_namespace_declarations() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/main.ts",
+            "declare namespace Foo.Bar { export var foo; }; Foo.Bar.foo = 5;",
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["main.ts".to_owned()],
+            CompilerOptions {
+                no_lib: true,
+                no_emit: true,
+                target: ScriptTarget::Es2015,
+                ..CompilerOptions::default()
+            },
+        );
+        assert!(
+            program.diagnostics().is_empty(),
+            "{:?}",
+            program.diagnostics()
+        );
+    }
+
+    #[test]
     fn binds_files_and_reports_duplicate_block_declarations() {
         let fs = MemoryFileSystem::new(true);
         fs.write_file("/duplicate.ts", "let value = 1; let value = 2;")
