@@ -631,6 +631,7 @@ impl Program {
                     checker_options: CheckerOptions {
                         allow_unreachable_code: self.options.allow_unreachable_code,
                         exact_optional_property_types: self.options.exact_optional_property_types,
+                        is_declaration_file: ts_path::is_declaration_file(&source_file.file_name),
                         no_fallthrough_cases_in_switch: self.options.no_fallthrough_cases_in_switch,
                         strict_null_checks: self.options.strict_null_checks,
                         no_implicit_any: self.options.no_implicit_any,
@@ -1392,6 +1393,62 @@ mod tests {
                 .filter_map(|diagnostic| diagnostic.code)
                 .collect::<Vec<_>>(),
             [2427]
+        );
+    }
+
+    #[test]
+    fn reports_missing_function_implementations_without_rejecting_ambient_declarations() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/main.ts",
+            r"
+                namespace M { function foo(); }
+                function valid(value: string): string;
+                function valid(value: string): string { return value; }
+            ",
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/tsconfig.json",
+            r#"{
+                "files": ["main.ts"],
+                "compilerOptions": {
+                    "noLib": true,
+                    "noEmit": true,
+                    "noImplicitAny": true
+                }
+            }"#,
+        )
+        .unwrap();
+        let program = Program::from_config(&fs, "/project/tsconfig.json");
+        assert_eq!(
+            program
+                .diagnostics()
+                .iter()
+                .filter_map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [2391, 7010]
+        );
+
+        fs.write_file(
+            "/project/ambient.d.ts",
+            "function fromDeclarationFile(); declare function explicitlyAmbient();",
+        )
+        .unwrap();
+        let ambient = Program::new_with_options(
+            &fs,
+            "/project",
+            &["ambient.d.ts".to_owned()],
+            CompilerOptions {
+                no_lib: true,
+                no_emit: true,
+                ..CompilerOptions::default()
+            },
+        );
+        assert!(
+            ambient.diagnostics().is_empty(),
+            "{:?}",
+            ambient.diagnostics()
         );
     }
 

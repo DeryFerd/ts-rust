@@ -1,6 +1,6 @@
 //! Initial semantic type checking over the arena-backed TypeScript AST.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use ts_ast::{NodeArena, NodeData, NodeId, SymbolId, SyntaxKind};
 use ts_binder::BindResult;
@@ -328,6 +328,7 @@ pub struct CheckResult {
 pub struct CheckerOptions {
     pub allow_unreachable_code: Option<bool>,
     pub exact_optional_property_types: bool,
+    pub is_declaration_file: bool,
     pub no_fallthrough_cases_in_switch: bool,
     pub strict_null_checks: bool,
     pub no_implicit_any: bool,
@@ -342,6 +343,7 @@ impl Default for CheckerOptions {
         Self {
             allow_unreachable_code: None,
             exact_optional_property_types: false,
+            is_declaration_file: false,
             no_fallthrough_cases_in_switch: false,
             strict_null_checks: true,
             no_implicit_any: false,
@@ -813,6 +815,7 @@ struct Checker<'a> {
     symbol_reads: HashMap<SymbolId, usize>,
     enum_member_owners: HashMap<TypeId, TypeId>,
     enum_types: BTreeSet<TypeId>,
+    checked_overload_symbols: HashSet<SymbolId>,
 }
 
 enum DeclaredObject {
@@ -851,6 +854,7 @@ impl<'a> Checker<'a> {
             symbol_reads: HashMap::new(),
             enum_member_owners: HashMap::new(),
             enum_types: BTreeSet::new(),
+            checked_overload_symbols: HashSet::new(),
         }
     }
 
@@ -1477,6 +1481,7 @@ impl<'a> Checker<'a> {
     }
 
     fn check_function(&mut self, node_id: NodeId, data: &ts_ast::FunctionDeclarationData) {
+        self.check_function_overload_group(node_id);
         let function_type = self
             .bindings
             .node_symbols
@@ -1537,6 +1542,107 @@ impl<'a> Checker<'a> {
         } else if has_implicit_return && saw_return && self.options.no_implicit_returns {
             self.error(data.name.unwrap_or(node_id), 7030, std::iter::empty());
         }
+    }
+
+    fn check_function_overload_group(&mut self, node_id: NodeId) {
+        let Some(symbol) = self.bindings.node_symbols.get(&node_id).copied() else {
+            return;
+        };
+        if !self.checked_overload_symbols.insert(symbol) {
+            return;
+        }
+        let declarations = self
+            .bindings
+            .symbols
+            .get(symbol)
+            .map(|symbol| symbol.declarations.clone())
+            .unwrap_or_default();
+        let functions = declarations
+            .into_iter()
+            .filter_map(|declaration| {
+                let NodeData::FunctionDeclaration(function) = &self.arena.get(declaration)?.data
+                else {
+                    return None;
+                };
+                Some((declaration, function.as_ref().clone()))
+            })
+            .collect::<Vec<_>>();
+
+        if let Some((signature, _)) = functions.iter().rev().find(|(declaration, function)| {
+            function.body.is_none() && !self.function_is_ambient(*declaration, function)
+        }) {
+            let immediately_following_implementation =
+                self.next_statement(*signature).is_some_and(|next| {
+                    self.bindings.node_symbols.get(&next) == Some(&symbol)
+                        && matches!(
+                            self.arena.get(next).map(|node| &node.data),
+                            Some(NodeData::FunctionDeclaration(function)) if function.body.is_some()
+                        )
+                });
+            if !immediately_following_implementation {
+                let location = self
+                    .arena
+                    .get(*signature)
+                    .and_then(|node| match &node.data {
+                        NodeData::FunctionDeclaration(function) => function.name,
+                        _ => None,
+                    })
+                    .unwrap_or(*signature);
+                self.error(location, 2391, std::iter::empty());
+            }
+        }
+
+        if self.options.no_implicit_any {
+            for (declaration, function) in &functions {
+                if function.body.is_none() && function.type_.is_none() {
+                    let location = function.name.unwrap_or(*declaration);
+                    let name = function
+                        .name
+                        .and_then(|name| self.property_name(name))
+                        .unwrap_or_else(|| "function".into());
+                    self.error(location, 7010, [name, "any".into()]);
+                }
+            }
+        }
+    }
+
+    fn function_is_ambient(
+        &self,
+        declaration: NodeId,
+        function: &ts_ast::FunctionDeclarationData,
+    ) -> bool {
+        if self.options.is_declaration_file
+            || self.has_ast_modifier(function.modifiers.as_ref(), SyntaxKind::DeclareKeyword)
+        {
+            return true;
+        }
+        let mut parent = self.arena.get(declaration).and_then(|node| node.parent);
+        while let Some(node_id) = parent {
+            let Some(node) = self.arena.get(node_id) else {
+                break;
+            };
+            if let NodeData::ModuleDeclaration(module) = &node.data
+                && self.has_ast_modifier(module.modifiers.as_ref(), SyntaxKind::DeclareKeyword)
+            {
+                return true;
+            }
+            parent = node.parent;
+        }
+        false
+    }
+
+    fn next_statement(&self, declaration: NodeId) -> Option<NodeId> {
+        let parent = self.arena.get(declaration)?.parent?;
+        let statements = match &self.arena.get(parent)?.data {
+            NodeData::SourceFile(source) => &source.statements.nodes,
+            NodeData::ModuleBlock(block) => &block.statements.nodes,
+            NodeData::Block(block) => &block.statements.nodes,
+            _ => return None,
+        };
+        let index = statements
+            .iter()
+            .position(|statement| *statement == declaration)?;
+        statements.get(index + 1).copied()
     }
 
     fn check_parameter(&mut self, parameter: NodeId) {
@@ -6103,6 +6209,51 @@ mod tests {
                 .map(|diagnostic| diagnostic.diagnostic.code())
                 .collect::<Vec<_>>(),
             [2322, 2345]
+        );
+    }
+
+    #[test]
+    fn reports_missing_overload_implementations_and_implicit_any_returns() {
+        let parsed = parse_source_file(
+            r"
+                namespace M { function missing(); }
+
+                function valid(value: string): string;
+                function valid(value: number): number;
+                function valid(value: string | number): string | number { return value; }
+
+                function misplaced(value: string): string;
+                const gap = 1;
+                function misplaced(value: string): string { return value; }
+
+                declare function ambient();
+                declare namespace Ambient { function nested(); }
+            ",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file_with_options(
+            &parsed.arena,
+            parsed.source_file,
+            &bindings,
+            CheckerOptions {
+                no_implicit_any: true,
+                ..CheckerOptions::default()
+            },
+        );
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2391, 7010, 2391, 7010, 7010],
+            "{:?}",
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.render().unwrap())
+                .collect::<Vec<_>>()
         );
     }
 
