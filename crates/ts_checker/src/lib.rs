@@ -330,6 +330,7 @@ pub enum EnumConstantValue {
 pub struct CheckResult {
     pub types: TypeArena,
     pub symbol_types: HashMap<SymbolId, TypeId>,
+    /// Expression and declaration types, stable after checking completes.
     pub node_types: BTreeMap<NodeId, TypeId>,
     pub enum_member_values: BTreeMap<NodeId, EnumConstantValue>,
     pub enum_access_values: BTreeMap<NodeId, EnumConstantValue>,
@@ -1402,26 +1403,27 @@ impl<'a> Checker<'a> {
                 {
                     self.assignability_error(node_id, actual, expected);
                 }
-                if let Some(symbol) = self.bindings.node_symbols.get(&node_id) {
-                    let inferred = annotation
-                        .or(initializer.map(|value| {
-                            if self.is_const_declaration(node_id)
-                                && matches!(
-                                    self.result.types.get(value).map(|value| &value.kind),
-                                    Some(
-                                        TypeKind::NumberLiteral(_)
-                                            | TypeKind::StringLiteral(_)
-                                            | TypeKind::BigIntLiteral(_)
-                                            | TypeKind::BooleanLiteral(_)
-                                    )
+                let inferred = annotation
+                    .or(initializer.map(|value| {
+                        if self.is_const_declaration(node_id)
+                            && matches!(
+                                self.result.types.get(value).map(|value| &value.kind),
+                                Some(
+                                    TypeKind::NumberLiteral(_)
+                                        | TypeKind::StringLiteral(_)
+                                        | TypeKind::BigIntLiteral(_)
+                                        | TypeKind::BooleanLiteral(_)
                                 )
-                            {
-                                value
-                            } else {
-                                self.widen_literal(value)
-                            }
-                        }))
-                        .unwrap_or_else(|| self.result.types.any());
+                            )
+                        {
+                            value
+                        } else {
+                            self.widen_literal(value)
+                        }
+                    }))
+                    .unwrap_or_else(|| self.result.types.any());
+                self.result.node_types.insert(node_id, inferred);
+                if let Some(symbol) = self.bindings.node_symbols.get(&node_id) {
                     self.result.symbol_types.insert(*symbol, inferred);
                 }
             }
@@ -1445,6 +1447,7 @@ impl<'a> Checker<'a> {
                         } else {
                             self.result.types.any()
                         };
+                        self.result.node_types.insert(variable, type_id);
                         self.result.symbol_types.insert(symbol, type_id);
                     }
                 }
@@ -2057,6 +2060,7 @@ impl<'a> Checker<'a> {
                 NodeData::GetAccessorDeclaration(data) => {
                     if let Some(name) = self.property_name(data.name) {
                         let property_type = self.getter_property_type(data.type_, data.body);
+                        self.result.node_types.insert(*member, property_type);
                         properties.insert(name.clone(), property_type);
                         getter_properties.insert(name);
                     }
@@ -2064,9 +2068,6 @@ impl<'a> Checker<'a> {
                 NodeData::SetAccessorDeclaration(data) => {
                     if let Some(name) = self.property_name(data.name) {
                         setter_properties.insert(name.clone());
-                        if getter_properties.contains(&name) {
-                            continue;
-                        }
                         let type_node = data
                             .parameters
                             .nodes
@@ -2081,7 +2082,10 @@ impl<'a> Checker<'a> {
                         } else {
                             self.result.types.any()
                         };
-                        properties.insert(name, property_type);
+                        self.result.node_types.insert(*member, property_type);
+                        if !getter_properties.contains(&name) {
+                            properties.insert(name, property_type);
+                        }
                     }
                 }
                 _ => {}
@@ -2384,9 +2388,11 @@ impl<'a> Checker<'a> {
             };
             match &node.data {
                 NodeData::GetAccessorDeclaration(data) => {
-                    self.check_object_literal_getter(data, &mut properties);
+                    self.check_object_literal_getter(*property, data, &mut properties);
                 }
                 NodeData::SetAccessorDeclaration(data) => {
+                    let property_type = self.object_literal_setter_type(data);
+                    self.result.node_types.insert(*property, property_type);
                     let local_scope = self.parameter_scope(&data.parameters.nodes);
                     self.local_scopes.push(local_scope);
                     let mut saw_return = false;
@@ -2475,19 +2481,7 @@ impl<'a> Checker<'a> {
                     let Some(name) = self.property_name(data.name) else {
                         continue;
                     };
-                    let annotation = data
-                        .parameters
-                        .nodes
-                        .first()
-                        .and_then(|parameter| self.arena.get(*parameter))
-                        .and_then(|parameter| match &parameter.data {
-                            NodeData::ParameterDeclaration(parameter) => parameter.type_,
-                            _ => None,
-                        });
-                    let type_id = match annotation {
-                        Some(annotation) => self.type_from_type_node(annotation),
-                        None => self.result.types.any(),
-                    };
+                    let type_id = self.object_literal_setter_type(data);
                     properties.entry(name.clone()).or_insert(type_id);
                     setter_properties.insert(name);
                 }
@@ -2508,6 +2502,7 @@ impl<'a> Checker<'a> {
 
     fn check_object_literal_getter(
         &mut self,
+        getter_node: NodeId,
         getter: &ts_ast::GetAccessorDeclarationData,
         properties: &mut BTreeMap<String, TypeId>,
     ) {
@@ -2527,6 +2522,7 @@ impl<'a> Checker<'a> {
         }
         self.local_scopes.pop();
         if getter.type_.is_some() {
+            self.result.node_types.insert(getter_node, expected);
             properties.insert(name, expected);
             return;
         }
@@ -2562,7 +2558,27 @@ impl<'a> Checker<'a> {
                 },
             );
         }
+        self.result.node_types.insert(getter_node, inferred);
         properties.insert(name, inferred);
+    }
+
+    fn object_literal_setter_type(
+        &mut self,
+        setter: &ts_ast::SetAccessorDeclarationData,
+    ) -> TypeId {
+        let annotation = setter
+            .parameters
+            .nodes
+            .first()
+            .and_then(|parameter| self.arena.get(*parameter))
+            .and_then(|parameter| match &parameter.data {
+                NodeData::ParameterDeclaration(parameter) => parameter.type_,
+                _ => None,
+            });
+        match annotation {
+            Some(annotation) => self.type_from_type_node(annotation),
+            None => self.result.types.any(),
+        }
     }
 
     fn getter_return_expressions(&self, body: NodeId) -> Vec<NodeId> {
@@ -8189,6 +8205,25 @@ mod tests {
             .get("basePrototype")
             .unwrap();
         let type_id = result.type_of_symbol(symbol).unwrap();
+        let declaration = bindings.symbols.get(symbol).unwrap().declarations[0];
+        assert_eq!(result.type_of_node(declaration), Some(type_id));
+        let NodeData::VariableDeclaration(variable) = &parsed.arena.get(declaration).unwrap().data
+        else {
+            panic!("expected variable declaration");
+        };
+        let initializer = variable.initializer.unwrap();
+        let initializer_type = result.type_of_node(initializer).unwrap();
+        assert!(matches!(
+            result.types.get(initializer_type).unwrap().kind,
+            TypeKind::Object(_)
+        ));
+        let NodeData::ObjectLiteralExpression(literal) =
+            &parsed.arena.get(initializer).unwrap().data
+        else {
+            panic!("expected object literal");
+        };
+        let getter = literal.properties.nodes[0];
+        assert_eq!(result.type_of_node(getter), Some(result.types.any()));
         let TypeKind::Object(object) = &result.types.get(type_id).unwrap().kind else {
             panic!("expected object type");
         };
@@ -8250,6 +8285,42 @@ mod tests {
         ));
         assert!(matches!(
             result.types.get(object.properties["paired"]).unwrap().kind,
+            TypeKind::String
+        ));
+
+        let declaration = bindings.symbols.get(symbol).unwrap().declarations[0];
+        let NodeData::VariableDeclaration(variable) = &parsed.arena.get(declaration).unwrap().data
+        else {
+            panic!("expected variable declaration");
+        };
+        let NodeData::ObjectLiteralExpression(literal) = &parsed
+            .arena
+            .get(variable.initializer.unwrap())
+            .unwrap()
+            .data
+        else {
+            panic!("expected object literal");
+        };
+        let accessor_types = literal
+            .properties
+            .nodes
+            .iter()
+            .map(|accessor| result.type_of_node(*accessor).unwrap())
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            result.types.get(accessor_types[0]).unwrap().kind,
+            TypeKind::String
+        ));
+        assert!(matches!(
+            result.types.get(accessor_types[1]).unwrap().kind,
+            TypeKind::Number
+        ));
+        assert!(matches!(
+            result.types.get(accessor_types[2]).unwrap().kind,
+            TypeKind::String
+        ));
+        assert!(matches!(
+            result.types.get(accessor_types[3]).unwrap().kind,
             TypeKind::String
         ));
     }
