@@ -1,0 +1,15 @@
+[package]
+name = "ts_evaluator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ts_ast = { path = "../ts_ast" }
+ts_jsnum = { path = "../ts_jsnum" }
+
+[dev-dependencies]
+ts_parser = { path = "../ts_parser" }
+
+[lints]
+workspace = true

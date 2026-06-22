@@ -256,6 +256,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ts_evaluator"
+version = "7.0.0-dev"
+dependencies = [
+ "ts_ast",
+ "ts_jsnum",
+ "ts_parser",
+]
+
+[[package]]
 name = "ts_fixture"
 version = "7.0.0-dev"
 dependencies = [

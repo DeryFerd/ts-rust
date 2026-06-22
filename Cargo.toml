@@ -20,6 +20,7 @@ members = [
     "crates/ts_config",
     "crates/ts_compiler",
     "crates/ts_diagnostics",
+    "crates/ts_evaluator",
     "crates/ts_vfs",
     "tools/ts_ast_codegen",
     "tools/ts_compare",
