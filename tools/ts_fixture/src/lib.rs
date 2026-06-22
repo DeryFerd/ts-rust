@@ -843,16 +843,17 @@ fn record_mismatch(
 }
 
 fn first_different_line<'a>(expected: &'a str, actual: &'a str) -> (usize, &'a str, &'a str) {
-    let mut expected_lines = expected.lines();
-    let mut actual_lines = actual.lines();
+    let mut expected_lines = expected.split('\n');
+    let mut actual_lines = actual.split('\n');
     let mut line = 1;
     loop {
-        let expected = expected_lines.next().unwrap_or("");
-        let actual = actual_lines.next().unwrap_or("");
-        if expected != actual || (expected.is_empty() && actual.is_empty()) {
-            return (line, expected, actual);
+        match (expected_lines.next(), actual_lines.next()) {
+            (Some(expected), Some(actual)) if expected == actual => line += 1,
+            (Some(expected), Some(actual)) => return (line, expected, actual),
+            (Some(expected), None) => return (line, expected, "<end of file>"),
+            (None, Some(actual)) => return (line, "<end of file>", actual),
+            (None, None) => return (line, "<no differing line>", "<no differing line>"),
         }
-        line += 1;
     }
 }
 
@@ -992,7 +993,7 @@ mod tests {
 
     use super::{
         Case, OutputDifferenceKind, ParseError, compare_emitted_output_sections, compile_case,
-        compile_case_matrix, expand_option_matrix, parse_baseline_sections,
+        compile_case_matrix, expand_option_matrix, first_different_line, parse_baseline_sections,
         run_case_against_baseline,
     };
 
@@ -1304,6 +1305,18 @@ mod tests {
             "console.log(value);\r\n",
         );
         assert!(compare_emitted_output_sections(&outputs, baseline).is_match());
+    }
+
+    #[test]
+    fn reports_end_of_file_differences_explicitly() {
+        assert_eq!(
+            first_different_line("first\nsecond", "first"),
+            (2, "second", "<end of file>")
+        );
+        assert_eq!(
+            first_different_line("first", "first\nsecond"),
+            (2, "<end of file>", "second")
+        );
     }
 
     #[test]
