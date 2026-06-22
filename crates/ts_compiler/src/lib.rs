@@ -2008,6 +2008,69 @@ mod tests {
     }
 
     #[test]
+    fn checks_delete_operands_with_exact_optional_property_types() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/main.ts",
+            r"
+                interface Model {
+                    required: number;
+                    includesUndefined: number | undefined;
+                    optional?: number;
+                }
+                declare const model: Model;
+                delete model.required;
+                delete model.includesUndefined;
+                delete model.optional;
+            ",
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/tsconfig.json",
+            r#"{
+                "files": ["main.ts"],
+                "compilerOptions": {
+                    "noLib": true,
+                    "strictNullChecks": true,
+                    "exactOptionalPropertyTypes": true
+                }
+            }"#,
+        )
+        .unwrap();
+        let exact = Program::from_config(&fs, "/project/tsconfig.json");
+        assert_eq!(
+            exact
+                .diagnostics()
+                .iter()
+                .filter_map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [2790, 2790]
+        );
+
+        fs.write_file(
+            "/project/tsconfig.json",
+            r#"{
+                "files": ["main.ts"],
+                "compilerOptions": {
+                    "noLib": true,
+                    "strictNullChecks": true,
+                    "exactOptionalPropertyTypes": false
+                }
+            }"#,
+        )
+        .unwrap();
+        let legacy = Program::from_config(&fs, "/project/tsconfig.json");
+        assert_eq!(
+            legacy
+                .diagnostics()
+                .iter()
+                .filter_map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [2790]
+        );
+    }
+
+    #[test]
     fn reports_implicit_any_and_unused_bindings() {
         let fs = MemoryFileSystem::new(true);
         fs.write_file(

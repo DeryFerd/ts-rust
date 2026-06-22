@@ -2373,12 +2373,80 @@ impl<'a> Checker<'a> {
                 let arguments = data.arguments.as_ref().map_or(&[][..], |list| &list.nodes);
                 self.call_expression_type(node_id, callee, arguments, true)
             }
+            NodeData::DeleteExpression(data) => {
+                let operand = self.type_of_expression(data.expression);
+                self.check_delete_expression(data.expression, operand);
+                self.result.types.boolean()
+            }
             NodeData::TypeOfExpression(_) => self.result.types.string(),
             NodeData::FunctionDeclaration(data) => self.function_type(data),
             _ => self.result.types.unknown(),
         };
         self.result.node_types.insert(node_id, result);
         result
+    }
+
+    fn check_delete_expression(&mut self, expression: NodeId, operand: TypeId) {
+        if !self.options.strict_null_checks || self.delete_operand_type_is_permitted(operand) {
+            return;
+        }
+        if self.options.exact_optional_property_types {
+            if self.delete_target_is_optional(expression) != Some(true) {
+                self.error(expression, 2790, std::iter::empty());
+            }
+        } else if !self.type_includes_undefined(operand) {
+            self.error(expression, 2790, std::iter::empty());
+        }
+    }
+
+    fn delete_operand_type_is_permitted(&self, operand: TypeId) -> bool {
+        matches!(
+            self.result.types.get(operand).map(|type_| &type_.kind),
+            Some(TypeKind::Any | TypeKind::Unknown | TypeKind::Never)
+        )
+    }
+
+    fn delete_target_is_optional(&mut self, expression: NodeId) -> Option<bool> {
+        match self.arena.get(expression).map(|node| node.data.clone())? {
+            NodeData::PropertyAccessExpression(access) => {
+                let receiver = self.type_of_expression(access.expression);
+                let name = self.property_name(access.name)?;
+                self.property_is_optional(receiver, &name)
+            }
+            NodeData::ElementAccessExpression(access) => {
+                let receiver = self.type_of_expression(access.expression);
+                let index = self.type_of_expression(access.argument_expression);
+                let name = match &self.result.types.get(index)?.kind {
+                    TypeKind::StringLiteral(name) | TypeKind::NumberLiteral(name) => name.clone(),
+                    _ => return None,
+                };
+                self.property_is_optional(receiver, &name)
+            }
+            _ => None,
+        }
+    }
+
+    fn property_is_optional(&self, receiver: TypeId, name: &str) -> Option<bool> {
+        match &self.result.types.get(receiver)?.kind {
+            TypeKind::Object(object) => object
+                .properties
+                .contains_key(name)
+                .then(|| object.optional_properties.contains(name)),
+            TypeKind::Union(members) => members
+                .iter()
+                .map(|member| self.property_is_optional(*member, name))
+                .collect::<Option<Vec<_>>>()
+                .map(|members| members.into_iter().any(std::convert::identity)),
+            TypeKind::Intersection(members) => members
+                .iter()
+                .filter_map(|member| self.property_is_optional(*member, name))
+                .reduce(|left, right| left && right),
+            TypeKind::TypeParameter {
+                constraint: Some(constraint),
+                ..
+            } => self.property_is_optional(*constraint, name),
+            _ => None,
+        }
     }
 
     fn identifier_type(&mut self, node: NodeId, name: &str) -> TypeId {
@@ -5982,5 +6050,84 @@ mod tests {
             CheckerOptions::default(),
         );
         assert!(legacy.diagnostics.is_empty(), "{:?}", legacy.diagnostics);
+    }
+
+    #[test]
+    fn requires_delete_operands_to_be_optional() {
+        let parsed = parse_source_file(
+            r"
+                interface Foo {
+                    a: number;
+                    b: number | undefined;
+                    c: number | null;
+                    d?: number;
+                    e: number | undefined | null;
+                    f?: number | undefined | null;
+                    g: unknown;
+                    h: any;
+                    i: never;
+                }
+                declare const value: Foo;
+                delete value.a;
+                delete value.b;
+                delete value.c;
+                delete value.d;
+                delete value.e;
+                delete value.f;
+                delete value.g;
+                delete value.h;
+                delete value.i;
+            ",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+
+        let exact = check_source_file_with_options(
+            &parsed.arena,
+            parsed.source_file,
+            &bindings,
+            CheckerOptions {
+                exact_optional_property_types: true,
+                strict_null_checks: true,
+                ..CheckerOptions::default()
+            },
+        );
+        assert_eq!(
+            exact
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2790, 2790, 2790, 2790]
+        );
+
+        let legacy = check_source_file_with_options(
+            &parsed.arena,
+            parsed.source_file,
+            &bindings,
+            CheckerOptions {
+                strict_null_checks: true,
+                ..CheckerOptions::default()
+            },
+        );
+        assert_eq!(
+            legacy
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2790, 2790]
+        );
+
+        let loose = check_source_file_with_options(
+            &parsed.arena,
+            parsed.source_file,
+            &bindings,
+            CheckerOptions {
+                strict_null_checks: false,
+                ..CheckerOptions::default()
+            },
+        );
+        assert!(loose.diagnostics.is_empty(), "{:?}", loose.diagnostics);
     }
 }
