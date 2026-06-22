@@ -2836,6 +2836,54 @@ mod tests {
     }
 
     #[test]
+    fn namespace_alias_runtime_emit_tracks_instantiation_and_source_order() {
+        for (source, expected) in [
+            (
+                "namespace M { namespace N {} export import X = N; }",
+                "\"use strict\";\nvar M;\n(function (M) {\n})(M || (M = {}));\n",
+            ),
+            (
+                "namespace M { namespace N { class C {} } import R = N; export import X = R; }",
+                concat!(
+                    "\"use strict\";\n",
+                    "var M;\n",
+                    "(function (M) {\n",
+                    "    let N;\n",
+                    "    (function (N) {\n",
+                    "        class C {\n",
+                    "        }\n",
+                    "    })(N || (N = {}));\n",
+                    "    var R = N;\n",
+                    "    M.X = R;\n",
+                    "})(M || (M = {}));\n",
+                ),
+            ),
+        ] {
+            let fs = MemoryFileSystem::new(true);
+            fs.write_file("/project/alias.ts", source).unwrap();
+            let program = Program::new_with_options(
+                &fs,
+                "/project",
+                &["alias.ts".to_owned()],
+                CompilerOptions {
+                    module: ModuleKind::None,
+                    target: ScriptTarget::Es2015,
+                    no_lib: true,
+                    ..CompilerOptions::default()
+                },
+            );
+            let emitted = program.emit();
+            assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+            let javascript = emitted
+                .files
+                .iter()
+                .find(|file| file.file_name == "/project/alias.js")
+                .unwrap();
+            assert_eq!(javascript.text, expected);
+        }
+    }
+
+    #[test]
     fn declaration_emit_uses_evaluated_const_enum_values() {
         let fs = MemoryFileSystem::new(true);
         fs.write_file(

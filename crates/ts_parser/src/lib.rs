@@ -2824,7 +2824,11 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_entity_name(&mut self) -> NodeId {
-        let mut entity = self.parse_identifier("Expected a module reference.");
+        let mut entity = if self.current.kind == SyntaxKind::UndefinedKeyword {
+            self.parse_identifier_name("Expected a module reference.")
+        } else {
+            self.parse_identifier("Expected a module reference.")
+        };
         while self.current.kind == SyntaxKind::DotToken {
             self.bump();
             let right = self.parse_identifier("Expected an identifier after '.'.");
@@ -7154,6 +7158,25 @@ mod tests {
             panic!("expected namespace block");
         };
         assert_exported_alias(block.statements.nodes[0]);
+    }
+
+    #[test]
+    fn parses_undefined_as_an_import_equals_entity_name() {
+        let result = parse_source_file("import value = undefined;");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let statements = source_statements(&result);
+        assert_eq!(statements.len(), 1);
+        let NodeData::ImportEqualsDeclaration(import) =
+            &result.arena.get(statements[0]).unwrap().data
+        else {
+            panic!("expected import-equals declaration");
+        };
+        let NodeData::Identifier(reference) =
+            &result.arena.get(import.module_reference).unwrap().data
+        else {
+            panic!("expected identifier module reference");
+        };
+        assert_eq!(reference.text, "undefined");
     }
 
     #[test]
