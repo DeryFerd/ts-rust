@@ -5,6 +5,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use ts_ast::{NodeArena, NodeData, NodeId, SymbolId, SyntaxKind};
 use ts_binder::BindResult;
 use ts_diagnostics::{Diagnostic, message_by_code};
+use ts_evaluator::{Evaluation, EvaluationOutcome, UnknownReason, Value, evaluate_with};
+use ts_jsnum::Number;
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct TypeId(u32);
@@ -315,11 +317,19 @@ pub struct CheckDiagnostic {
     pub diagnostic: Diagnostic,
 }
 
+/// A compile-time value assigned to an enum member.
+#[derive(Clone, Debug, PartialEq)]
+pub enum EnumConstantValue {
+    Number(f64),
+    String(String),
+}
+
 #[derive(Clone, Debug)]
 pub struct CheckResult {
     pub types: TypeArena,
     pub symbol_types: HashMap<SymbolId, TypeId>,
     pub node_types: BTreeMap<NodeId, TypeId>,
+    pub enum_member_values: BTreeMap<NodeId, EnumConstantValue>,
     pub diagnostics: Vec<CheckDiagnostic>,
 }
 
@@ -394,6 +404,7 @@ pub fn empty_check_result() -> CheckResult {
         types: TypeArena::new(),
         symbol_types: HashMap::new(),
         node_types: BTreeMap::new(),
+        enum_member_values: BTreeMap::new(),
         diagnostics: Vec::new(),
     }
 }
@@ -815,6 +826,7 @@ struct Checker<'a> {
     symbol_reads: HashMap<SymbolId, usize>,
     enum_member_owners: HashMap<TypeId, TypeId>,
     enum_types: BTreeSet<TypeId>,
+    const_enum_types: BTreeSet<TypeId>,
     checked_overload_symbols: HashSet<SymbolId>,
 }
 
@@ -838,6 +850,7 @@ impl<'a> Checker<'a> {
                 types: TypeArena::new(),
                 symbol_types: HashMap::new(),
                 node_types: BTreeMap::new(),
+                enum_member_values: BTreeMap::new(),
                 diagnostics: Vec::new(),
             },
             children,
@@ -854,6 +867,7 @@ impl<'a> Checker<'a> {
             symbol_reads: HashMap::new(),
             enum_member_owners: HashMap::new(),
             enum_types: BTreeSet::new(),
+            const_enum_types: BTreeSet::new(),
             checked_overload_symbols: HashSet::new(),
         }
     }
@@ -1026,7 +1040,21 @@ impl<'a> Checker<'a> {
 
     fn enum_type(&mut self, data: &ts_ast::EnumDeclarationData) -> TypeId {
         let mut properties = BTreeMap::new();
-        let mut next_numeric_value = Some(0_i64);
+        let mut resolved_values = BTreeMap::<String, Value>::new();
+        let member_names = data
+            .members
+            .nodes
+            .iter()
+            .filter_map(|member_id| {
+                let NodeData::EnumMember(member) = &self.arena.get(*member_id)?.data else {
+                    return None;
+                };
+                self.property_name(member.name)
+            })
+            .collect::<BTreeSet<_>>();
+        let enum_name = self.property_name(data.name).unwrap_or_default();
+        let is_const = self.has_ast_modifier(data.modifiers.as_ref(), SyntaxKind::ConstKeyword);
+        let mut next_numeric_value = Some(0.0_f64);
         for member_id in &data.members.nodes {
             let Some(NodeData::EnumMember(member)) =
                 self.arena.get(*member_id).map(|node| &node.data)
@@ -1036,22 +1064,37 @@ impl<'a> Checker<'a> {
             let Some(name) = self.property_name(member.name) else {
                 continue;
             };
-            let member_type = if let Some(initializer) = member.initializer {
-                let value = self.type_of_expression(initializer);
-                next_numeric_value = match &self.result.types.get(value).unwrap().kind {
-                    TypeKind::NumberLiteral(value) => value
-                        .parse::<i64>()
-                        .ok()
-                        .and_then(|value| value.checked_add(1)),
+            let initializer = member.initializer;
+            let constant = initializer.and_then(|initializer| {
+                self.evaluate_enum_initializer(
+                    initializer,
+                    is_const,
+                    &enum_name,
+                    &member_names,
+                    &resolved_values,
+                )
+            });
+            let member_type = if let Some(value) = constant {
+                let member_type = self.enum_constant_type(&value);
+                next_numeric_value = match &value {
+                    Value::Number(value) => Some(value.value() + 1.0),
                     _ => None,
                 };
-                value
+                resolved_values.insert(name.clone(), value.clone());
+                self.record_enum_constant(*member_id, &value);
+                member_type
+            } else if let Some(initializer) = initializer {
+                next_numeric_value = None;
+                self.type_of_expression(initializer)
             } else if let Some(value) = next_numeric_value {
-                next_numeric_value = value.checked_add(1);
-                self.result
-                    .types
-                    .alloc(TypeKind::NumberLiteral(value.to_string()))
+                next_numeric_value = Some(value + 1.0);
+                let value = Value::Number(Number::new(value));
+                let member_type = self.enum_constant_type(&value);
+                resolved_values.insert(name.clone(), value.clone());
+                self.record_enum_constant(*member_id, &value);
+                member_type
             } else {
+                self.error(*member_id, 1061, std::iter::empty());
                 self.result.types.number()
             };
             if let Some(symbol) = self.bindings.node_symbols.get(member_id).copied() {
@@ -1069,7 +1112,84 @@ impl<'a> Checker<'a> {
             self.enum_member_owners.insert(*member_type, enum_type);
         }
         self.enum_types.insert(enum_type);
+        if is_const {
+            self.const_enum_types.insert(enum_type);
+        }
         enum_type
+    }
+
+    fn evaluate_enum_initializer(
+        &mut self,
+        initializer: NodeId,
+        is_const: bool,
+        enum_name: &str,
+        member_names: &BTreeSet<String>,
+        resolved_values: &BTreeMap<String, Value>,
+    ) -> Option<Value> {
+        if is_const && !is_const_enum_expression(self.arena, initializer) {
+            self.error(initializer, 2474, std::iter::empty());
+            return None;
+        }
+        let mut forward_reference = false;
+        let evaluation = evaluate_with(self.arena, initializer, &mut |reference| {
+            let Some(reference_name) = enum_member_reference_name(self.arena, reference, enum_name)
+            else {
+                return Evaluation::unknown(UnknownReason::UnresolvedEntity(reference));
+            };
+            if let Some(value) = resolved_values.get(&reference_name) {
+                Evaluation::known(value.clone())
+            } else {
+                forward_reference |= member_names.contains(&reference_name);
+                Evaluation::unknown(UnknownReason::UnresolvedEntity(reference))
+            }
+        });
+        match evaluation.outcome {
+            EvaluationOutcome::Value(Value::Number(value)) if value.is_nan() => {
+                if is_const {
+                    self.error(initializer, 2478, std::iter::empty());
+                }
+                None
+            }
+            EvaluationOutcome::Value(Value::Number(value)) if value.is_infinite() => {
+                if is_const {
+                    self.error(initializer, 2477, std::iter::empty());
+                }
+                None
+            }
+            EvaluationOutcome::Value(value @ (Value::Number(_) | Value::String(_))) => Some(value),
+            _ if is_const && forward_reference => {
+                self.error(initializer, 2651, std::iter::empty());
+                None
+            }
+            _ if is_const => {
+                self.error(initializer, 2474, std::iter::empty());
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn enum_constant_type(&mut self, value: &Value) -> TypeId {
+        match value {
+            Value::Number(value) => self
+                .result
+                .types
+                .alloc(TypeKind::NumberLiteral(value.to_string())),
+            Value::String(value) => self
+                .result
+                .types
+                .alloc(TypeKind::StringLiteral(value.clone())),
+            _ => unreachable!("enum constants are numeric or string values"),
+        }
+    }
+
+    fn record_enum_constant(&mut self, member: NodeId, value: &Value) {
+        let value = match value {
+            Value::Number(value) => EnumConstantValue::Number(value.value()),
+            Value::String(value) => EnumConstantValue::String(value.clone()),
+            _ => return,
+        };
+        self.result.enum_member_values.insert(member, value);
     }
 
     #[allow(clippy::too_many_lines)]
@@ -2475,7 +2595,15 @@ impl<'a> Checker<'a> {
                 SyntaxKind::UndefinedKeyword => self.result.types.undefined(),
                 _ => self.result.types.unknown(),
             },
-            NodeData::Identifier(identifier) => self.identifier_type(node_id, &identifier.text),
+            NodeData::Identifier(identifier) => {
+                let type_id = self.identifier_type(node_id, &identifier.text);
+                if self.const_enum_types.contains(&type_id)
+                    && !self.const_enum_value_usage_permitted(node_id)
+                {
+                    self.error(node_id, 2475, std::iter::empty());
+                }
+                type_id
+            }
             NodeData::ParenthesizedExpression(data) => {
                 self.type_of_expression_context(data.expression, contextual_type)
             }
@@ -2636,6 +2764,18 @@ impl<'a> Checker<'a> {
             }
             NodeData::ElementAccessExpression(data) => {
                 let receiver = self.type_of_expression(data.expression);
+                if self.const_enum_types.contains(&receiver)
+                    && !matches!(
+                        self.arena
+                            .get(data.argument_expression)
+                            .map(|argument| argument.kind),
+                        Some(SyntaxKind::StringLiteral | SyntaxKind::NoSubstitutionTemplateLiteral)
+                    )
+                {
+                    self.type_of_expression(data.argument_expression);
+                    self.error(node_id, 2476, std::iter::empty());
+                    return self.result.types.any();
+                }
                 let index = self.type_of_expression(data.argument_expression);
                 self.element_access_type(node_id, receiver, index)
             }
@@ -2698,6 +2838,27 @@ impl<'a> Checker<'a> {
             }
         } else if !self.type_includes_undefined(operand) {
             self.error(expression, 2790, std::iter::empty());
+        }
+    }
+
+    fn const_enum_value_usage_permitted(&self, expression: NodeId) -> bool {
+        let mut current = expression;
+        loop {
+            let Some(parent) = self.arena.get(current).and_then(|node| node.parent) else {
+                return false;
+            };
+            match &self.arena.get(parent).expect("parent node exists").data {
+                NodeData::ParenthesizedExpression(data) if data.expression == current => {
+                    current = parent;
+                }
+                NodeData::PropertyAccessExpression(access) => {
+                    return access.expression == current;
+                }
+                NodeData::ElementAccessExpression(access) => {
+                    return access.expression == current;
+                }
+                _ => return false,
+            }
         }
     }
 
@@ -5268,6 +5429,79 @@ fn operator_text(operator: SyntaxKind) -> &'static str {
     }
 }
 
+fn enum_member_reference_name(
+    arena: &NodeArena,
+    reference: NodeId,
+    enum_name: &str,
+) -> Option<String> {
+    match &arena.get(reference)?.data {
+        NodeData::Identifier(identifier) => Some(identifier.text.clone()),
+        NodeData::PropertyAccessExpression(access)
+            if identifier_text(arena, access.expression) == Some(enum_name) =>
+        {
+            property_name_text(arena, access.name)
+        }
+        NodeData::ElementAccessExpression(access)
+            if identifier_text(arena, access.expression) == Some(enum_name) =>
+        {
+            property_name_text(arena, access.argument_expression)
+        }
+        _ => None,
+    }
+}
+
+fn is_const_enum_expression(arena: &NodeArena, expression: NodeId) -> bool {
+    let Some(node) = arena.get(expression) else {
+        return false;
+    };
+    match &node.data {
+        NodeData::NumericLiteral(_)
+        | NodeData::StringLiteral(_)
+        | NodeData::NoSubstitutionTemplateLiteral(_)
+        | NodeData::Identifier(_)
+        | NodeData::PropertyAccessExpression(_)
+        | NodeData::ElementAccessExpression(_) => true,
+        NodeData::ParenthesizedExpression(data) => is_const_enum_expression(arena, data.expression),
+        NodeData::PrefixUnaryExpression(data) => {
+            matches!(
+                data.operator,
+                SyntaxKind::PlusToken | SyntaxKind::MinusToken | SyntaxKind::TildeToken
+            ) && is_const_enum_expression(arena, data.operand)
+        }
+        NodeData::BinaryExpression(data) => {
+            let operator = arena.get(data.operator_token).map(|token| token.kind);
+            matches!(
+                operator,
+                Some(
+                    SyntaxKind::BarToken
+                        | SyntaxKind::AmpersandToken
+                        | SyntaxKind::CaretToken
+                        | SyntaxKind::GreaterThanGreaterThanToken
+                        | SyntaxKind::GreaterThanGreaterThanGreaterThanToken
+                        | SyntaxKind::LessThanLessThanToken
+                        | SyntaxKind::AsteriskToken
+                        | SyntaxKind::SlashToken
+                        | SyntaxKind::PlusToken
+                        | SyntaxKind::MinusToken
+                        | SyntaxKind::PercentToken
+                        | SyntaxKind::AsteriskAsteriskToken
+                )
+            ) && is_const_enum_expression(arena, data.left)
+                && is_const_enum_expression(arena, data.right)
+        }
+        _ => false,
+    }
+}
+
+fn property_name_text(arena: &NodeArena, node: NodeId) -> Option<String> {
+    match &arena.get(node)?.data {
+        NodeData::Identifier(identifier) => Some(identifier.text.clone()),
+        NodeData::StringLiteral(literal) => Some(literal.text.clone()),
+        NodeData::NoSubstitutionTemplateLiteral(literal) => Some(literal.text.clone()),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -5287,7 +5521,7 @@ mod tests {
     use ts_parser::parse_source_file;
 
     use super::{
-        Checker, CheckerOptions, ObjectType, TypeKind, check_source_file,
+        Checker, CheckerOptions, EnumConstantValue, ObjectType, TypeKind, check_source_file,
         check_source_file_with_options,
     };
 
@@ -5955,6 +6189,105 @@ mod tests {
         assert_eq!(
             result.diagnostics[2].diagnostic.render().unwrap(),
             "Argument of type '\"x\"' is not assignable to parameter of type 'number'."
+        );
+    }
+
+    #[test]
+    fn evaluates_const_enum_members_and_publishes_their_values() {
+        let parsed = parse_source_file(
+            r#"
+                const enum E {
+                    A = 2,
+                    B = A + 3,
+                    C,
+                    Complement = ~C,
+                    Shift = Complement << 1,
+                    Qualified = E["B"],
+                    Text = "ok",
+                }
+                const b: 5 = E.B;
+                const c: 6 = E.C;
+                const shift: -14 = E.Shift;
+                const qualified: 5 = E.Qualified;
+                const text: "ok" = E.Text;
+            "#,
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert_eq!(
+            result
+                .enum_member_values
+                .values()
+                .cloned()
+                .collect::<Vec<_>>(),
+            [
+                EnumConstantValue::Number(2.0),
+                EnumConstantValue::Number(5.0),
+                EnumConstantValue::Number(6.0),
+                EnumConstantValue::Number(-7.0),
+                EnumConstantValue::Number(-14.0),
+                EnumConstantValue::Number(5.0),
+                EnumConstantValue::String("ok".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn reports_invalid_const_enum_initializers() {
+        let parsed = parse_source_file(
+            r"
+                declare function runtime(): number;
+                const enum Bad {
+                    Forward = Later,
+                    Later = 1,
+                    Runtime = runtime(),
+                    Conditional = (true ? 1 : 2),
+                    Infinite = 1 / 0,
+                    NotNumber = 0 / 0,
+                }
+            ",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2651, 2474, 2474, 2477, 2478]
+        );
+    }
+
+    #[test]
+    fn restricts_const_enum_object_and_element_access_usage() {
+        let parsed = parse_source_file(
+            r#"
+                const enum E { A, Text = "text", MissingInitializer }
+                declare const key: string;
+                const object = E;
+                const dynamic = E[key];
+                const numeric = E[0];
+                const valid = E["A"];
+                const template = E[`A`];
+            "#,
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [1061, 2475, 2476, 2476]
         );
     }
 

@@ -8,6 +8,8 @@ license.workspace = true
 ts_ast = { path = "../ts_ast" }
 ts_binder = { path = "../ts_binder" }
 ts_diagnostics = { path = "../ts_diagnostics" }
+ts_evaluator = { path = "../ts_evaluator" }
+ts_jsnum = { path = "../ts_jsnum" }
 
 [dev-dependencies]
 ts_core = { path = "../ts_core" }

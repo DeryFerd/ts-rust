@@ -304,6 +304,8 @@ dependencies = [
  "ts_binder",
  "ts_core",
  "ts_diagnostics",
+ "ts_evaluator",
+ "ts_jsnum",
  "ts_parser",
 ]
 
