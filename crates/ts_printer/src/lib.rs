@@ -84,6 +84,8 @@ pub fn emit_source_file_with_settings(
         source_line_starts: settings.source_map.then(|| line_starts(source_text)),
         automatic_jsx,
         this_alias: None,
+        namespace_containers: Vec::new(),
+        namespace_declarations: vec![HashSet::new()],
     };
     let node = printer.node(source_file)?.clone();
     let NodeData::SourceFile(data) = &node.data else {
@@ -1228,6 +1230,8 @@ struct Printer<'a> {
     source_line_starts: Option<Vec<usize>>,
     automatic_jsx: AutomaticJsxUsage,
     this_alias: Option<&'static str>,
+    namespace_containers: Vec<String>,
+    namespace_declarations: Vec<HashSet<String>>,
 }
 
 impl Printer<'_> {
@@ -1519,7 +1523,21 @@ impl Printer<'_> {
                 self.emit_class(data)?;
                 if let Some(name) = data.name {
                     let names = self.declaration_names(&[name]);
-                    self.emit_commonjs_declaration_exports(data.modifiers.as_ref(), &names);
+                    if let Some(container) = self.namespace_containers.last().cloned() {
+                        if self.has_modifier(data.modifiers.as_ref(), SyntaxKind::ExportKeyword)
+                            && let Some(name) = names.first()
+                        {
+                            self.writer.newline();
+                            self.writer.write(&container);
+                            self.writer.write(".");
+                            self.writer.write(name);
+                            self.writer.write(" = ");
+                            self.writer.write(name);
+                            self.writer.write(";");
+                        }
+                    } else {
+                        self.emit_commonjs_declaration_exports(data.modifiers.as_ref(), &names);
+                    }
                 }
             }
             NodeData::EnumDeclaration(data) => {
@@ -1528,6 +1546,7 @@ impl Printer<'_> {
                 let names = self.declaration_names(&[data.name]);
                 self.emit_commonjs_declaration_exports(data.modifiers.as_ref(), &names);
             }
+            NodeData::ModuleDeclaration(data) => self.emit_namespace(data)?,
             NodeData::ReturnStatement(data) => {
                 self.writer.write("return");
                 if let Some(expression) = data.expression {
@@ -2331,6 +2350,96 @@ impl Printer<'_> {
         Ok(self.node(call.expression)?.kind == SyntaxKind::SuperKeyword)
     }
 
+    fn emit_namespace(&mut self, data: &ts_ast::ModuleDeclarationData) -> Result<(), EmitError> {
+        let name = self.identifier_text(data.name)?.to_owned();
+        let exported = self.has_modifier(data.modifiers.as_ref(), SyntaxKind::ExportKeyword);
+        let parent_container = self.namespace_containers.last().cloned();
+        let first_declaration = self
+            .namespace_declarations
+            .last_mut()
+            .expect("every namespace has a lexical declaration scope")
+            .insert(name.clone());
+
+        if first_declaration {
+            if parent_container.is_some() && self.settings.target >= ScriptTarget::Es2015 {
+                self.writer.write("let ");
+            } else {
+                self.writer.write("var ");
+            }
+            self.writer.write(&name);
+            self.writer.write(";");
+            self.writer.newline();
+        }
+
+        self.writer.write("(function (");
+        self.writer.write(&name);
+        self.writer.write(") {");
+        self.writer.newline();
+        self.writer.indent += 1;
+        self.namespace_containers.push(name.clone());
+        self.namespace_declarations.push(HashSet::new());
+
+        if let Some(body) = data.body {
+            let body_node = self.node(body)?.clone();
+            match &body_node.data {
+                NodeData::ModuleBlock(block) => {
+                    let mut previous_end = body_node.range.start.get().saturating_add(1);
+                    for statement in &block.statements.nodes {
+                        let statement_node = self.node(*statement)?.clone();
+                        if statement_emits_javascript(self.arena, &statement_node) {
+                            self.emit_source_comments_between(
+                                previous_end,
+                                statement_node.range.start.get(),
+                            );
+                        }
+                        self.emit_statement(*statement)?;
+                        previous_end = statement_node.range.end.get();
+                    }
+                }
+                NodeData::ModuleDeclaration(module) => self.emit_namespace(module)?,
+                _ => return Err(Self::unsupported(body, body_node.kind)),
+            }
+        }
+
+        self.namespace_declarations.pop();
+        self.namespace_containers.pop();
+        self.writer.indent -= 1;
+        self.writer.write("})(");
+        if let Some(parent) = parent_container {
+            if exported {
+                self.writer.write(&name);
+                self.writer.write(" = ");
+                self.writer.write(&parent);
+                self.writer.write(".");
+                self.writer.write(&name);
+                self.writer.write(" || (");
+                self.writer.write(&parent);
+                self.writer.write(".");
+                self.writer.write(&name);
+                self.writer.write(" = {})");
+            } else {
+                self.writer.write(&name);
+                self.writer.write(" || (");
+                self.writer.write(&name);
+                self.writer.write(" = {})");
+            }
+        } else if exported && self.settings.module == ModuleKind::CommonJs {
+            self.writer.write(&name);
+            self.writer.write(" || (exports.");
+            self.writer.write(&name);
+            self.writer.write(" = ");
+            self.writer.write(&name);
+            self.writer.write(" = {})");
+        } else {
+            self.writer.write(&name);
+            self.writer.write(" || (");
+            self.writer.write(&name);
+            self.writer.write(" = {})");
+        }
+        self.writer.write(");");
+        Ok(())
+    }
+
     fn emit_enum(&mut self, data: &ts_ast::EnumDeclarationData) -> Result<(), EmitError> {
         let name = self.identifier_text(data.name)?.to_owned();
         self.writer.write("var ");
@@ -2683,7 +2792,7 @@ impl Printer<'_> {
     }
 
     fn emit_runtime_declaration_modifiers(&mut self, modifiers: Option<&ts_ast::ModifierList>) {
-        if self.settings.module == ModuleKind::CommonJs {
+        if self.settings.module == ModuleKind::CommonJs || !self.namespace_containers.is_empty() {
             return;
         }
         if self.has_modifier(modifiers, SyntaxKind::ExportKeyword) {
@@ -4505,6 +4614,49 @@ mod tests {
         assert_eq!(
             emit("enum Color { Red, Green = 4, Blue, Label = 'blue' }"),
             "var Color;\n(function (Color) {\n    Color[Color[\"Red\"] = 0] = \"Red\";\n    Color[Color[\"Green\"] = 4] = \"Green\";\n    Color[Color[\"Blue\"] = 5] = \"Blue\";\n    Color[\"Label\"] = \"blue\";\n})(Color || (Color = {}));\n"
+        );
+    }
+
+    #[test]
+    fn emits_global_namespace_iife_and_erases_ambient_namespaces() {
+        assert_eq!(
+            emit_with(
+                "namespace M { function foo(); }",
+                ScriptTarget::Es2015,
+                ModuleKind::EsNext,
+            )
+            .code,
+            "var M;\n(function (M) {\n})(M || (M = {}));\n"
+        );
+        assert_eq!(
+            emit_with(
+                "declare namespace Types { function read(): string; }",
+                ScriptTarget::Es2015,
+                ModuleKind::EsNext,
+            )
+            .code,
+            ""
+        );
+    }
+
+    #[test]
+    fn emits_exported_namespace_class_for_es2015_and_es5() {
+        let source = r"
+            namespace C {
+                export class Name {
+                    static funcData = A.AA.func();
+                    static someConst = A.AA.foo;
+                    constructor(parameters) {}
+                }
+            }
+        ";
+        assert_eq!(
+            emit_with(source, ScriptTarget::Es2015, ModuleKind::Amd).code,
+            "var C;\n(function (C) {\n    class Name {\n        constructor(parameters) { }\n    }\n    Name.funcData = A.AA.func();\n    Name.someConst = A.AA.foo;\n    C.Name = Name;\n})(C || (C = {}));\n"
+        );
+        assert_eq!(
+            emit_with(source, ScriptTarget::Es5, ModuleKind::Amd).code,
+            "var C;\n(function (C) {\n    var Name = /** @class */ (function () {\n        function Name(parameters) {\n        }\n        Name.funcData = A.AA.func();\n        Name.someConst = A.AA.foo;\n        return Name;\n    }());\n    C.Name = Name;\n})(C || (C = {}));\n"
         );
     }
 
