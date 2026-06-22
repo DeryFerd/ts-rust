@@ -3657,4 +3657,35 @@ mod tests {
             assert_eq!(declaration.text, expected);
         }
     }
+
+    #[test]
+    fn resolves_non_relative_imports_from_base_url() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/proj/defs/cc.ts", "export const enum CharCode { A, B }")
+            .unwrap();
+        fs.write_file(
+            "/proj/component/file.ts",
+            "import { CharCode } from 'defs/cc'; export const value = CharCode.A;",
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/proj",
+            &["component/file.ts".to_owned()],
+            CompilerOptions {
+                base_url: Some("/proj".into()),
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        assert!(
+            program
+                .diagnostics()
+                .iter()
+                .all(|diagnostic| diagnostic.code != Some(2307)),
+            "{:?}",
+            program.diagnostics()
+        );
+        assert!(program.source_file("/proj/defs/cc.ts").is_some());
+    }
 }

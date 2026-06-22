@@ -432,7 +432,7 @@ fn compare_emitted_output_sections_excluding(
         })
         .filter(|(name, _)| !excluded_expected.contains(name))
         .collect::<BTreeMap<_, _>>();
-    let actual = outputs
+    let actual_sections = outputs
         .iter()
         .filter(|(name, _)| is_emitted_section(name))
         .map(|(name, text)| {
@@ -440,6 +440,28 @@ fn compare_emitted_output_sections_excluding(
                 normalize_section_name(name),
                 normalize_emitted_section(text),
             )
+        })
+        .collect::<Vec<_>>();
+    let basename_counts =
+        actual_sections
+            .iter()
+            .fold(BTreeMap::<String, usize>::new(), |mut counts, (name, _)| {
+                *counts.entry(section_basename(name).to_owned()).or_default() += 1;
+                counts
+            });
+    let actual = actual_sections
+        .into_iter()
+        .map(|(name, text)| {
+            let basename = section_basename(&name);
+            let name = if !expected.contains_key(&name)
+                && expected.contains_key(basename)
+                && basename_counts.get(basename) == Some(&1)
+            {
+                basename.to_owned()
+            } else {
+                name
+            };
+            (name, text)
         })
         .collect::<BTreeMap<_, _>>();
     let names = expected
@@ -630,6 +652,7 @@ const SCALAR_OPTION_NAMES: &[&str] = &[
     "alwaysStrict",
     "allowJs",
     "allowSyntheticDefaultImports",
+    "baseUrl",
     "checkJs",
     "composite",
     "declaration",
@@ -913,6 +936,10 @@ fn normalize_section_name(name: &str) -> String {
         .or_else(|| name.strip_prefix("./"))
         .unwrap_or(name.trim_start_matches('/'))
         .to_owned()
+}
+
+fn section_basename(name: &str) -> &str {
+    name.rsplit('/').next().unwrap_or(name)
 }
 
 fn normalize_newlines(text: &str) -> String {
@@ -1339,6 +1366,33 @@ mod tests {
     }
 
     #[test]
+    fn applies_base_url_to_non_relative_virtual_module_imports() {
+        let case = Case::parse(
+            "baseUrl.ts",
+            concat!(
+                "// @baseUrl: /proj\n",
+                "// @filename: /proj/defs/cc.ts\n",
+                "export const enum CharCode { A }\n",
+                "// @filename: /proj/component/file.ts\n",
+                "import { CharCode } from 'defs/cc';\n",
+                "export const value = CharCode.A;\n",
+            ),
+        )
+        .unwrap();
+        let variants = expand_option_matrix(&case);
+        assert_eq!(variants[0].values["baseUrl"], "/proj");
+        let compilation = compile_case(&case).unwrap();
+        assert!(
+            compilation
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != Some(2307)),
+            "{:?}",
+            compilation.diagnostics
+        );
+    }
+
+    #[test]
     fn compares_only_emitted_baseline_sections_with_actionable_differences() {
         let outputs = BTreeMap::from([
             ("/case/a.js".into(), "const a = 1;\n".into()),
@@ -1412,6 +1466,16 @@ mod tests {
             "//// [input.d.ts] ////\n",
             "declare const value = 1;\n",
         );
+        assert!(compare_emitted_output_sections(&outputs, baseline).is_match());
+    }
+
+    #[test]
+    fn matches_unique_baseline_basenames_for_absolute_virtual_outputs() {
+        let outputs = BTreeMap::from([(
+            "/proj/defs/cc.js".into(),
+            "export const value = 1;\n".into(),
+        )]);
+        let baseline = "//// [cc.js] ////\nexport const value = 1;\n";
         assert!(compare_emitted_output_sections(&outputs, baseline).is_match());
     }
 
