@@ -101,7 +101,17 @@ pub struct ServerCapabilities {
     pub references_provider: bool,
     pub rename_provider: bool,
     pub document_symbol_provider: bool,
+    pub workspace_symbol_provider: bool,
+    pub call_hierarchy_provider: bool,
+    pub signature_help_provider: SignatureHelpOptions,
     pub completion_provider: CompletionOptions,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignatureHelpOptions {
+    pub trigger_characters: Vec<String>,
+    pub retrigger_characters: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -226,6 +236,86 @@ pub struct DocumentSymbol {
 pub struct CompletionItem {
     pub label: String,
     pub kind: u8,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignatureHelpParams {
+    pub text_document: TextDocumentIdentifier,
+    pub position: Position,
+    #[serde(default)]
+    pub context: Option<Value>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignatureHelp {
+    pub signatures: Vec<SignatureInformation>,
+    pub active_signature: u32,
+    pub active_parameter: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignatureInformation {
+    pub label: String,
+    pub parameters: Vec<ParameterInformation>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct ParameterInformation {
+    pub label: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CallHierarchyItem {
+    pub name: String,
+    pub kind: u8,
+    pub uri: DocumentUri,
+    pub range: Range,
+    pub selection_range: Range,
+    pub data: Value,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct CallHierarchyCallsParams {
+    pub item: CallHierarchyItem,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CallHierarchyIncomingCall {
+    pub from: CallHierarchyItem,
+    pub from_ranges: Vec<Range>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CallHierarchyOutgoingCall {
+    pub to: CallHierarchyItem,
+    pub from_ranges: Vec<Range>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct WorkspaceSymbolParams {
+    pub query: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SymbolInformation {
+    pub name: String,
+    pub kind: u8,
+    pub location: Location,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_name: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+struct CallHierarchyData {
+    file_name: String,
+    declaration_start: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -388,6 +478,21 @@ impl Server {
         if method == "textDocument/completion" {
             return vec![self.completion(id, message.params)];
         }
+        if method == "textDocument/signatureHelp" {
+            return vec![self.signature_help(id, message.params)];
+        }
+        if method == "textDocument/prepareCallHierarchy" {
+            return vec![self.prepare_call_hierarchy(id, message.params)];
+        }
+        if method == "callHierarchy/incomingCalls" {
+            return vec![self.incoming_calls(id, message.params)];
+        }
+        if method == "callHierarchy/outgoingCalls" {
+            return vec![self.outgoing_calls(id, message.params)];
+        }
+        if method == "workspace/symbol" {
+            return vec![self.workspace_symbol(id, message.params)];
+        }
         vec![failure(id, CODE_METHOD_NOT_FOUND, "method not found")]
     }
 
@@ -414,6 +519,12 @@ impl Server {
                 references_provider: true,
                 rename_provider: true,
                 document_symbol_provider: true,
+                workspace_symbol_provider: true,
+                call_hierarchy_provider: true,
+                signature_help_provider: SignatureHelpOptions {
+                    trigger_characters: vec!["(".to_owned(), ",".to_owned()],
+                    retrigger_characters: vec![")".to_owned()],
+                },
                 completion_provider: CompletionOptions {
                     resolve_provider: false,
                 },
@@ -790,6 +901,230 @@ impl Server {
         completion_items(&program, source, offset)
     }
 
+    fn signature_help(&self, id: Id, params: Option<Value>) -> OutgoingMessage {
+        let Ok(params) = deserialize_params::<SignatureHelpParams>(params) else {
+            return failure(id, CODE_INVALID_PARAMS, "invalid signature help parameters");
+        };
+        let result = self.signature_help_at(&params);
+        OutgoingMessage::Response(Response::success(
+            id,
+            serde_json::to_value(result).unwrap_or(Value::Null),
+        ))
+    }
+
+    fn signature_help_at(&self, params: &SignatureHelpParams) -> Option<SignatureHelp> {
+        let document = self.documents.get(&params.text_document.uri)?;
+        let offset = u32::try_from(byte_offset(&document.text, params.position).ok()?).ok()?;
+        let program = self.build_program();
+        let source = program.source_file(&document.file_name)?;
+        signature_help_at(&program, &self.workspace, source, offset)
+    }
+
+    fn prepare_call_hierarchy(&self, id: Id, params: Option<Value>) -> OutgoingMessage {
+        let Ok(params) = deserialize_params::<TextDocumentPositionParams>(params) else {
+            return failure(id, CODE_INVALID_PARAMS, "invalid call hierarchy parameters");
+        };
+        let result = self.prepare_call_hierarchy_at(&params);
+        OutgoingMessage::Response(Response::success(
+            id,
+            serde_json::to_value(result).unwrap_or(Value::Null),
+        ))
+    }
+
+    fn prepare_call_hierarchy_at(
+        &self,
+        params: &TextDocumentPositionParams,
+    ) -> Option<Vec<CallHierarchyItem>> {
+        let document = self.documents.get(&params.text_document.uri)?;
+        let offset = u32::try_from(byte_offset(&document.text, params.position).ok()?).ok()?;
+        let program = self.build_program();
+        let source = program.source_file(&document.file_name)?;
+        let node = identifier_at(source, offset)?;
+        let name = identifier_text(source, node)?;
+        let (target_source, symbol) =
+            semantic_target(&program, &self.workspace, source, node, name)?;
+        Some(vec![
+            self.call_hierarchy_item_for_symbol(target_source, symbol)?,
+        ])
+    }
+
+    fn incoming_calls(&self, id: Id, params: Option<Value>) -> OutgoingMessage {
+        let Ok(params) = deserialize_params::<CallHierarchyCallsParams>(params) else {
+            return failure(id, CODE_INVALID_PARAMS, "invalid incoming calls parameters");
+        };
+        let result = self.incoming_calls_for(&params.item);
+        OutgoingMessage::Response(Response::success(
+            id,
+            serde_json::to_value(result).unwrap_or(Value::Null),
+        ))
+    }
+
+    fn incoming_calls_for(&self, item: &CallHierarchyItem) -> Vec<CallHierarchyIncomingCall> {
+        let Ok(data) = serde_json::from_value::<CallHierarchyData>(item.data.clone()) else {
+            return Vec::new();
+        };
+        let program = self.build_program();
+        let Some(source) = program.source_file(&data.file_name) else {
+            return Vec::new();
+        };
+        let Some(declaration) = call_hierarchy_declaration_at(source, data.declaration_start)
+        else {
+            return Vec::new();
+        };
+        let Some(symbol) = symbol_for_declaration(source, declaration) else {
+            return Vec::new();
+        };
+        let mut grouped = BTreeMap::<(String, u32), CallHierarchyIncomingCall>::new();
+        for (caller_source, node) in
+            semantic_occurrences(&program, &self.workspace, &data.file_name, symbol)
+        {
+            if call_expression_for_target(caller_source, node).is_none() {
+                continue;
+            }
+            let caller = enclosing_call_hierarchy(caller_source, node);
+            let Some(caller_item) = self.call_hierarchy_item_for_declaration(caller_source, caller)
+            else {
+                continue;
+            };
+            let start = caller_source
+                .parse
+                .arena
+                .get(caller)
+                .map(|node| node.range.start.get())
+                .unwrap_or_default();
+            let Some(range) = node_range(caller_source, node) else {
+                continue;
+            };
+            grouped
+                .entry((caller_source.file_name.clone(), start))
+                .and_modify(|call| call.from_ranges.push(range))
+                .or_insert(CallHierarchyIncomingCall {
+                    from: caller_item,
+                    from_ranges: vec![range],
+                });
+        }
+        grouped.into_values().collect()
+    }
+
+    fn outgoing_calls(&self, id: Id, params: Option<Value>) -> OutgoingMessage {
+        let Ok(params) = deserialize_params::<CallHierarchyCallsParams>(params) else {
+            return failure(id, CODE_INVALID_PARAMS, "invalid outgoing calls parameters");
+        };
+        let result = self.outgoing_calls_for(&params.item);
+        OutgoingMessage::Response(Response::success(
+            id,
+            serde_json::to_value(result).unwrap_or(Value::Null),
+        ))
+    }
+
+    fn outgoing_calls_for(&self, item: &CallHierarchyItem) -> Vec<CallHierarchyOutgoingCall> {
+        let Ok(data) = serde_json::from_value::<CallHierarchyData>(item.data.clone()) else {
+            return Vec::new();
+        };
+        let program = self.build_program();
+        let Some(source) = program.source_file(&data.file_name) else {
+            return Vec::new();
+        };
+        let Some(declaration) = call_hierarchy_declaration_at(source, data.declaration_start)
+        else {
+            return Vec::new();
+        };
+        let mut grouped = BTreeMap::<(String, u32), CallHierarchyOutgoingCall>::new();
+        for (_, target) in calls_in_declaration(source, declaration) {
+            let Some(name) = identifier_text(source, target) else {
+                continue;
+            };
+            let Some((target_source, symbol)) =
+                semantic_target(&program, &self.workspace, source, target, name)
+            else {
+                continue;
+            };
+            let Some(target_item) = self.call_hierarchy_item_for_symbol(target_source, symbol)
+            else {
+                continue;
+            };
+            let Some(target_declaration) = declaration_for_symbol(target_source, symbol) else {
+                continue;
+            };
+            let target_start = target_source
+                .parse
+                .arena
+                .get(target_declaration)
+                .map(|node| node.range.start.get())
+                .unwrap_or_default();
+            let Some(range) = node_range(source, target) else {
+                continue;
+            };
+            grouped
+                .entry((target_source.file_name.clone(), target_start))
+                .and_modify(|entry| entry.from_ranges.push(range))
+                .or_insert(CallHierarchyOutgoingCall {
+                    to: target_item,
+                    from_ranges: vec![range],
+                });
+        }
+        grouped.into_values().collect()
+    }
+
+    fn workspace_symbol(&self, id: Id, params: Option<Value>) -> OutgoingMessage {
+        let Ok(params) = deserialize_params::<WorkspaceSymbolParams>(params) else {
+            return failure(
+                id,
+                CODE_INVALID_PARAMS,
+                "invalid workspace symbol parameters",
+            );
+        };
+        let result = self.workspace_symbols(&params.query);
+        OutgoingMessage::Response(Response::success(
+            id,
+            serde_json::to_value(result).unwrap_or(Value::Null),
+        ))
+    }
+
+    fn workspace_symbols(&self, query: &str) -> Vec<SymbolInformation> {
+        let mut symbols = self
+            .documents
+            .iter()
+            .flat_map(|(uri, _)| {
+                self.document_symbols(uri)
+                    .into_iter()
+                    .flat_map(|symbol| workspace_symbols_for_document(uri, symbol, None))
+            })
+            .filter(|symbol| workspace_symbol_matches(&symbol.name, query))
+            .collect::<Vec<_>>();
+        symbols.truncate(256);
+        symbols
+    }
+
+    fn call_hierarchy_item_for_symbol(
+        &self,
+        source: &SourceFile,
+        symbol: SymbolId,
+    ) -> Option<CallHierarchyItem> {
+        self.call_hierarchy_item_for_declaration(source, declaration_for_symbol(source, symbol)?)
+    }
+
+    fn call_hierarchy_item_for_declaration(
+        &self,
+        source: &SourceFile,
+        declaration: NodeId,
+    ) -> Option<CallHierarchyItem> {
+        let (name, name_node, kind) = call_hierarchy_name(source, declaration)?;
+        let declaration_start = source.parse.arena.get(declaration)?.range.start.get();
+        Some(CallHierarchyItem {
+            name,
+            kind,
+            uri: self.uri_for_file(&source.file_name)?,
+            range: node_range(source, declaration)?,
+            selection_range: node_range(source, name_node)?,
+            data: serde_json::to_value(CallHierarchyData {
+                file_name: source.file_name.clone(),
+                declaration_start,
+            })
+            .ok()?,
+        })
+    }
+
     fn build_program(&self) -> Program {
         let roots = self
             .documents
@@ -947,6 +1282,365 @@ fn make_document_symbol(
         selection_range: node_range(source, name_node)?,
         children: children.filter(|children| !children.is_empty()),
     })
+}
+
+fn workspace_symbols_for_document(
+    uri: &DocumentUri,
+    symbol: DocumentSymbol,
+    container_name: Option<&str>,
+) -> Vec<SymbolInformation> {
+    let mut result = vec![SymbolInformation {
+        name: symbol.name.clone(),
+        kind: symbol.kind,
+        location: Location {
+            uri: uri.clone(),
+            range: symbol.selection_range,
+        },
+        container_name: container_name.map(str::to_owned),
+    }];
+    if let Some(children) = symbol.children {
+        for child in children {
+            result.extend(workspace_symbols_for_document(
+                uri,
+                child,
+                Some(&symbol.name),
+            ));
+        }
+    }
+    result
+}
+
+fn workspace_symbol_matches(name: &str, query: &str) -> bool {
+    let name = name.to_lowercase();
+    let query = query.to_lowercase();
+    if name.contains(&query) {
+        return true;
+    }
+    let mut characters = name.chars();
+    query
+        .chars()
+        .all(|expected| characters.by_ref().any(|actual| actual == expected))
+}
+
+fn signature_help_at(
+    program: &Program,
+    workspace: &MemoryFileSystem,
+    source: &SourceFile,
+    offset: u32,
+) -> Option<SignatureHelp> {
+    let (expression, arguments) = source
+        .parse
+        .arena
+        .iter()
+        .filter_map(|(_, value)| match &value.data {
+            NodeData::CallExpression(call)
+                if value.range.start.get() <= offset && offset <= value.range.end.get() =>
+            {
+                Some((
+                    call.expression,
+                    call.arguments.nodes.as_slice(),
+                    value.range.len(),
+                ))
+            }
+            NodeData::NewExpression(call)
+                if value.range.start.get() <= offset && offset <= value.range.end.get() =>
+            {
+                Some((
+                    call.expression,
+                    call.arguments
+                        .as_ref()
+                        .map_or(&[] as &[NodeId], |args| args.nodes.as_slice()),
+                    value.range.len(),
+                ))
+            }
+            _ => None,
+        })
+        .min_by_key(|(_, _, length)| *length)
+        .map(|(expression, arguments, _)| (expression, arguments))?;
+    let target = rightmost_identifier(source, expression)?;
+    let name = identifier_text(source, target)?;
+    let (target_source, symbol) = semantic_target(program, workspace, source, target, name)?;
+    let symbol = target_source.binding.symbols.get(symbol)?;
+    let mut signatures = symbol
+        .declarations
+        .iter()
+        .filter_map(|declaration| signature_information(target_source, *declaration, &symbol.name))
+        .collect::<Vec<_>>();
+    if signatures.is_empty() {
+        let declaration = declaration_for_symbol(target_source, symbol.id)?;
+        signatures.push(signature_information(
+            target_source,
+            declaration,
+            &symbol.name,
+        )?);
+    }
+    let active_parameter = arguments
+        .iter()
+        .filter(|argument| {
+            source
+                .parse
+                .arena
+                .get(**argument)
+                .is_some_and(|argument| argument.range.end.get() < offset)
+        })
+        .count();
+    let active_signature = signatures
+        .iter()
+        .position(|signature| active_parameter < signature.parameters.len())
+        .unwrap_or(0);
+    Some(SignatureHelp {
+        signatures,
+        active_signature: u32::try_from(active_signature).unwrap_or_default(),
+        active_parameter: u32::try_from(active_parameter).unwrap_or(u32::MAX),
+    })
+}
+
+fn signature_information(
+    source: &SourceFile,
+    declaration: NodeId,
+    name: &str,
+) -> Option<SignatureInformation> {
+    let value = source.parse.arena.get(declaration)?;
+    if let NodeData::VariableDeclaration(variable) = &value.data
+        && let Some(initializer) = variable.initializer
+    {
+        return signature_information(source, initializer, name);
+    }
+    if let NodeData::ClassDeclaration(class) = &value.data {
+        return class.members.nodes.iter().find_map(|member| {
+            matches!(
+                source.parse.arena.get(*member).map(|node| &node.data),
+                Some(NodeData::ConstructorDeclaration(_))
+            )
+            .then(|| signature_information(source, *member, name))
+            .flatten()
+        });
+    }
+    let (parameters, return_type) = match &value.data {
+        NodeData::FunctionDeclaration(function) => (&function.parameters.nodes, function.type_),
+        NodeData::FunctionExpression(function) => (&function.parameters.nodes, function.type_),
+        NodeData::ArrowFunction(function) => (&function.parameters.nodes, function.type_),
+        NodeData::MethodDeclaration(method) => (&method.parameters.nodes, method.type_),
+        NodeData::MethodSignatureDeclaration(method) => (&method.parameters.nodes, method.type_),
+        NodeData::CallSignatureDeclaration(signature) => {
+            (&signature.parameters.nodes, signature.type_)
+        }
+        NodeData::ConstructorDeclaration(constructor) => (&constructor.parameters.nodes, None),
+        _ => return None,
+    };
+    let parameters = parameters
+        .iter()
+        .filter_map(|parameter| {
+            Some(ParameterInformation {
+                label: node_text(source, *parameter)?.trim().to_owned(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut label = format!(
+        "{name}({})",
+        parameters
+            .iter()
+            .map(|parameter| parameter.label.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    if let Some(return_type) = return_type {
+        label.push_str(": ");
+        label.push_str(node_text(source, return_type)?.trim());
+    }
+    Some(SignatureInformation { label, parameters })
+}
+
+fn node_text(source: &SourceFile, node: NodeId) -> Option<&str> {
+    let range = source.parse.arena.get(node)?.range;
+    source
+        .source_text
+        .get(usize::try_from(range.start.get()).ok()?..usize::try_from(range.end.get()).ok()?)
+}
+
+fn rightmost_identifier(source: &SourceFile, node: NodeId) -> Option<NodeId> {
+    match &source.parse.arena.get(node)?.data {
+        NodeData::Identifier(_) => Some(node),
+        NodeData::PropertyAccessExpression(access) => rightmost_identifier(source, access.name),
+        NodeData::ParenthesizedExpression(expression) => {
+            rightmost_identifier(source, expression.expression)
+        }
+        NodeData::NonNullExpression(expression) => {
+            rightmost_identifier(source, expression.expression)
+        }
+        _ => None,
+    }
+}
+
+fn declaration_for_symbol(source: &SourceFile, symbol: SymbolId) -> Option<NodeId> {
+    let symbol = source.binding.symbols.get(symbol)?;
+    symbol
+        .declarations
+        .iter()
+        .copied()
+        .find_map(|declaration| callable_from_declaration(source, declaration))
+        .or_else(|| {
+            symbol
+                .declarations
+                .iter()
+                .find_map(|declaration| enclosing_callable(source, *declaration))
+        })
+}
+
+fn callable_from_declaration(source: &SourceFile, declaration: NodeId) -> Option<NodeId> {
+    if is_callable_declaration(source, declaration) {
+        return Some(declaration);
+    }
+    let NodeData::VariableDeclaration(variable) = &source.parse.arena.get(declaration)?.data else {
+        return None;
+    };
+    variable
+        .initializer
+        .filter(|initializer| is_callable_declaration(source, *initializer))
+}
+
+fn symbol_for_declaration(source: &SourceFile, declaration: NodeId) -> Option<SymbolId> {
+    let binding_declaration = match source.parse.arena.get(declaration)?.data {
+        NodeData::ArrowFunction(_) | NodeData::FunctionExpression(_) => source
+            .parse
+            .arena
+            .get(declaration)?
+            .parent
+            .filter(|parent| {
+                matches!(
+                    source.parse.arena.get(*parent).map(|node| &node.data),
+                    Some(NodeData::VariableDeclaration(_))
+                )
+            })
+            .unwrap_or(declaration),
+        _ => declaration,
+    };
+    source
+        .binding
+        .symbols
+        .iter()
+        .find(|symbol| symbol.declarations.contains(&binding_declaration))
+        .map(|symbol| symbol.target.unwrap_or(symbol.id))
+}
+
+fn is_callable_declaration(source: &SourceFile, declaration: NodeId) -> bool {
+    matches!(
+        source.parse.arena.get(declaration).map(|node| &node.data),
+        Some(
+            NodeData::FunctionDeclaration(_)
+                | NodeData::FunctionExpression(_)
+                | NodeData::ArrowFunction(_)
+                | NodeData::MethodDeclaration(_)
+                | NodeData::ConstructorDeclaration(_)
+        )
+    )
+}
+
+fn call_hierarchy_declaration_at(source: &SourceFile, start: u32) -> Option<NodeId> {
+    source
+        .parse
+        .arena
+        .iter()
+        .find(|(node, value)| {
+            value.range.start.get() == start
+                && (is_callable_declaration(source, *node) || *node == source.parse.source_file)
+        })
+        .map(|(node, _)| node)
+}
+
+fn enclosing_callable(source: &SourceFile, mut node: NodeId) -> Option<NodeId> {
+    while let Some(parent) = source.parse.arena.get(node)?.parent {
+        if is_callable_declaration(source, parent) {
+            return Some(parent);
+        }
+        node = parent;
+    }
+    None
+}
+
+fn enclosing_call_hierarchy(source: &SourceFile, node: NodeId) -> NodeId {
+    enclosing_callable(source, node).unwrap_or(source.parse.source_file)
+}
+
+fn call_hierarchy_name(source: &SourceFile, declaration: NodeId) -> Option<(String, NodeId, u8)> {
+    match &source.parse.arena.get(declaration)?.data {
+        NodeData::FunctionDeclaration(function) => {
+            let name = function.name?;
+            Some((identifier_text(source, name)?.to_owned(), name, 12))
+        }
+        NodeData::FunctionExpression(function) => {
+            let name = function.name?;
+            Some((identifier_text(source, name)?.to_owned(), name, 12))
+        }
+        NodeData::MethodDeclaration(method) => Some((
+            declaration_name_text(source, method.name)?.to_owned(),
+            method.name,
+            6,
+        )),
+        NodeData::ConstructorDeclaration(_) => Some(("constructor".to_owned(), declaration, 9)),
+        NodeData::ArrowFunction(_) => {
+            let parent = source.parse.arena.get(declaration)?.parent?;
+            let NodeData::VariableDeclaration(variable) = &source.parse.arena.get(parent)?.data
+            else {
+                return None;
+            };
+            Some((
+                declaration_name_text(source, variable.name)?.to_owned(),
+                variable.name,
+                12,
+            ))
+        }
+        NodeData::SourceFile(_) => Some((
+            source
+                .file_name
+                .rsplit('/')
+                .next()
+                .unwrap_or(&source.file_name)
+                .to_owned(),
+            declaration,
+            1,
+        )),
+        _ => None,
+    }
+}
+
+fn call_expression_for_target(source: &SourceFile, node: NodeId) -> Option<NodeId> {
+    let parent = source.parse.arena.get(node)?.parent?;
+    match &source.parse.arena.get(parent)?.data {
+        NodeData::CallExpression(call) if call.expression == node => Some(parent),
+        NodeData::NewExpression(call) if call.expression == node => Some(parent),
+        NodeData::PropertyAccessExpression(access) if access.name == node => {
+            let call = source.parse.arena.get(parent)?.parent?;
+            match &source.parse.arena.get(call)?.data {
+                NodeData::CallExpression(expression) if expression.expression == parent => {
+                    Some(call)
+                }
+                NodeData::NewExpression(expression) if expression.expression == parent => {
+                    Some(call)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn calls_in_declaration(source: &SourceFile, declaration: NodeId) -> Vec<(NodeId, NodeId)> {
+    source
+        .parse
+        .arena
+        .iter()
+        .filter_map(|(node, value)| {
+            let expression = match &value.data {
+                NodeData::CallExpression(call) => call.expression,
+                NodeData::NewExpression(call) => call.expression,
+                _ => return None,
+            };
+            (enclosing_call_hierarchy(source, node) == declaration)
+                .then(|| rightmost_identifier(source, expression).map(|target| (node, target)))
+                .flatten()
+        })
+        .collect()
 }
 
 fn declaration_name_text(source: &SourceFile, node: NodeId) -> Option<&str> {
@@ -2153,5 +2847,117 @@ mod tests {
         };
         assert_eq!(completion("count")["kind"], 18);
         assert_eq!(completion("test")["kind"], 3);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn framed_session_serves_signature_help_call_hierarchy_and_workspace_symbols() {
+        let uri = DocumentUri("file:///workspace/calls.ts".to_owned());
+        let source = concat!(
+            "function leaf(value: number): number { return value; }\n",
+            "function middle(input: number): number { return leaf(input); }\n",
+            "function top(): number { return middle(1) + leaf(2); }\n",
+            "top();"
+        );
+        let position = |needle: &str, adjustment: usize| {
+            position_at(
+                source,
+                u32::try_from(source.find(needle).unwrap() + adjustment).unwrap(),
+            )
+        };
+        let hierarchy_item = |name: &str, declaration_start: usize| CallHierarchyItem {
+            name: name.to_owned(),
+            kind: 12,
+            uri: uri.clone(),
+            range: Range::default(),
+            selection_range: Range::default(),
+            data: serde_json::to_value(CallHierarchyData {
+                file_name: "/workspace/calls.ts".to_owned(),
+                declaration_start: u32::try_from(declaration_start).unwrap(),
+            })
+            .unwrap(),
+        };
+
+        let mut input = begin_framed_session();
+        write_open(&mut input, uri.clone(), source);
+        write(
+            &mut input,
+            &Request::new(
+                40_i64,
+                "textDocument/signatureHelp",
+                Some(SignatureHelpParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    position: position("leaf(input)", 8),
+                    context: None,
+                }),
+            ),
+        );
+        write_position_request(
+            &mut input,
+            41,
+            "textDocument/prepareCallHierarchy",
+            uri.clone(),
+            position("middle(input", 1),
+        );
+        write(
+            &mut input,
+            &Request::new(
+                42_i64,
+                "callHierarchy/incomingCalls",
+                Some(CallHierarchyCallsParams {
+                    item: hierarchy_item("leaf", 0),
+                }),
+            ),
+        );
+        write(
+            &mut input,
+            &Request::new(
+                43_i64,
+                "callHierarchy/outgoingCalls",
+                Some(CallHierarchyCallsParams {
+                    item: hierarchy_item("top", source.find("function top").unwrap()),
+                }),
+            ),
+        );
+        write(
+            &mut input,
+            &Request::new(
+                44_i64,
+                "workspace/symbol",
+                Some(WorkspaceSymbolParams {
+                    query: "lea".to_owned(),
+                }),
+            ),
+        );
+
+        let output = finish_framed_session(input);
+        let response = |id| output.iter().find(|message| message["id"] == id).unwrap();
+        assert_eq!(
+            response(40)["result"]["signatures"][0]["label"],
+            "leaf(value: number): number"
+        );
+        assert_eq!(response(40)["result"]["activeParameter"], 0);
+        assert_eq!(response(41)["result"][0]["name"], "middle");
+
+        let incoming = response(42)["result"].as_array().unwrap();
+        assert_eq!(incoming.len(), 2);
+        assert_eq!(
+            incoming
+                .iter()
+                .map(|call| call["from"]["name"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["middle", "top"]
+        );
+        let outgoing = response(43)["result"].as_array().unwrap();
+        assert_eq!(outgoing.len(), 2);
+        assert_eq!(
+            outgoing
+                .iter()
+                .map(|call| call["to"]["name"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["leaf", "middle"]
+        );
+        assert_eq!(response(44)["result"][0]["name"], "leaf");
+        assert_eq!(response(44)["result"][0]["location"]["uri"], uri.0);
     }
 }
