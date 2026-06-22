@@ -1367,6 +1367,7 @@ impl<'a> Checker<'a> {
             }
             NodeData::ClassDeclaration(data) => {
                 self.check_class_members(&data.members.nodes);
+                self.check_class_abstract_members(data);
             }
             NodeData::IfStatement(data) => {
                 self.type_of_expression(data.expression);
@@ -1966,11 +1967,7 @@ impl<'a> Checker<'a> {
                 }
                 NodeData::GetAccessorDeclaration(data) => {
                     if let Some(name) = self.property_name(data.name) {
-                        let property_type = if let Some(type_node) = data.type_ {
-                            self.type_from_type_node(type_node)
-                        } else {
-                            self.result.types.any()
-                        };
+                        let property_type = self.getter_property_type(data.type_, data.body);
                         properties.insert(name.clone(), property_type);
                         getter_properties.insert(name);
                     }
@@ -2237,6 +2234,345 @@ impl<'a> Checker<'a> {
         };
         self.alias_stack.pop();
         Some(result)
+    }
+
+    fn getter_property_type(&mut self, annotation: Option<NodeId>, body: Option<NodeId>) -> TypeId {
+        if let Some(annotation) = annotation {
+            return self.type_from_type_node(annotation);
+        }
+        let Some(NodeData::Block(block)) = body
+            .and_then(|body| self.arena.get(body))
+            .map(|node| &node.data)
+        else {
+            return self.result.types.any();
+        };
+        let expressions = block
+            .statements
+            .nodes
+            .iter()
+            .filter_map(|statement| {
+                let NodeData::ReturnStatement(statement) = &self.arena.get(*statement)?.data else {
+                    return None;
+                };
+                statement.expression
+            })
+            .collect::<Vec<_>>();
+        if expressions.is_empty() {
+            return self.result.types.any();
+        }
+        let types = expressions
+            .into_iter()
+            .map(|expression| {
+                let type_id = self.type_of_expression(expression);
+                self.widen_literal(type_id)
+            })
+            .collect::<Vec<_>>();
+        self.result.types.union(types)
+    }
+
+    fn check_class_abstract_members(&mut self, class: &ts_ast::ClassDeclarationData) {
+        let class_is_abstract =
+            self.has_ast_modifier(class.modifiers.as_ref(), SyntaxKind::AbstractKeyword);
+        let class_name = class
+            .name
+            .and_then(|name| self.property_name(name))
+            .unwrap_or_else(|| "class".into());
+        if let Some((base_name, base)) = self.direct_base_class(class) {
+            self.check_base_member_types(
+                &class_name,
+                &base_name,
+                &base.members.nodes,
+                &class.members.nodes,
+            );
+            if !class_is_abstract {
+                self.check_missing_abstract_members(class, &class_name, &base_name, &base);
+            }
+        }
+        if !class_is_abstract {
+            for member in &class.members.nodes {
+                let Some(node) = self.arena.get(*member) else {
+                    continue;
+                };
+                if matches!(node.data, NodeData::PropertyDeclaration(_))
+                    && self.member_is_abstract(*member)
+                {
+                    self.error(
+                        self.member_modifier(*member, SyntaxKind::AbstractKeyword)
+                            .unwrap_or(*member),
+                        1253,
+                        std::iter::empty(),
+                    );
+                }
+            }
+        }
+        self.check_accessor_abstract_consistency(&class.members.nodes);
+    }
+
+    fn check_missing_abstract_members(
+        &mut self,
+        class: &ts_ast::ClassDeclarationData,
+        class_name: &str,
+        base_name: &str,
+        base: &ts_ast::ClassDeclarationData,
+    ) {
+        let concrete = class
+            .members
+            .nodes
+            .iter()
+            .filter(|member| !self.member_is_abstract(**member))
+            .filter_map(|member| self.class_member_name(*member))
+            .collect::<BTreeSet<_>>();
+        let mut missing = Vec::new();
+        for member in &base.members.nodes {
+            if self.member_is_abstract(*member)
+                && let Some(name) = self.class_member_name(*member)
+                && !concrete.contains(&name)
+                && !missing.contains(&name)
+            {
+                missing.push(name);
+            }
+        }
+        if missing.is_empty() {
+            return;
+        }
+        let Some(location) = class.name.or_else(|| class.members.nodes.first().copied()) else {
+            return;
+        };
+        if missing.len() == 1 {
+            self.error(
+                location,
+                2515,
+                [
+                    class_name.to_owned(),
+                    format!("'{}'", missing[0]),
+                    base_name.to_owned(),
+                ],
+            );
+        } else {
+            self.error(
+                location,
+                2654,
+                [
+                    class_name.to_owned(),
+                    base_name.to_owned(),
+                    missing
+                        .iter()
+                        .map(|name| format!("'{name}'"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ],
+            );
+        }
+    }
+
+    fn direct_base_class(
+        &self,
+        class: &ts_ast::ClassDeclarationData,
+    ) -> Option<(String, ts_ast::ClassDeclarationData)> {
+        let clauses = class.heritage_clauses.as_ref()?;
+        for clause in &clauses.nodes {
+            let NodeData::HeritageClause(clause) = &self.arena.get(*clause)?.data else {
+                continue;
+            };
+            if clause.token != SyntaxKind::ExtendsKeyword {
+                continue;
+            }
+            let heritage = clause.types.nodes.first()?;
+            let NodeData::ExpressionWithTypeArguments(heritage) = &self.arena.get(*heritage)?.data
+            else {
+                continue;
+            };
+            let name = self.property_name(heritage.expression)?;
+            let symbol = self.resolve_identifier(heritage.expression, &name)?;
+            let declaration = self
+                .bindings
+                .symbols
+                .get(symbol)?
+                .declarations
+                .iter()
+                .find_map(|declaration| {
+                    let NodeData::ClassDeclaration(class) = &self.arena.get(*declaration)?.data
+                    else {
+                        return None;
+                    };
+                    Some(class.as_ref().clone())
+                })?;
+            return Some((name, declaration));
+        }
+        None
+    }
+
+    fn check_base_member_types(
+        &mut self,
+        class_name: &str,
+        base_name: &str,
+        base_members: &[NodeId],
+        members: &[NodeId],
+    ) {
+        let base_types = self.class_member_types(base_members);
+        let member_types = self.class_member_types(members);
+        for member in members {
+            let Some(name) = self.class_member_name(*member) else {
+                continue;
+            };
+            let (Some(actual), Some(expected)) = (
+                member_types.get(&name).copied(),
+                base_types.get(&name).copied(),
+            ) else {
+                continue;
+            };
+            if !self.is_assignable(actual, expected) {
+                let location = self.class_member_name_node(*member).unwrap_or(*member);
+                self.error(
+                    location,
+                    2416,
+                    [name, class_name.to_owned(), base_name.to_owned()],
+                );
+            }
+        }
+    }
+
+    fn class_member_types(&mut self, members: &[NodeId]) -> BTreeMap<String, TypeId> {
+        let mut properties = BTreeMap::new();
+        for member in members {
+            let Some(node) = self.arena.get(*member).cloned() else {
+                continue;
+            };
+            match &node.data {
+                NodeData::PropertyDeclaration(property) => {
+                    let Some(name) = self.property_name(property.name) else {
+                        continue;
+                    };
+                    let inferred = property
+                        .type_
+                        .map(|type_node| self.type_from_type_node(type_node))
+                        .or_else(|| {
+                            property
+                                .initializer
+                                .map(|value| self.type_of_expression(value))
+                        });
+                    let type_id = match inferred {
+                        Some(type_id) => self.widen_literal(type_id),
+                        None => self.result.types.any(),
+                    };
+                    properties.insert(name, type_id);
+                }
+                NodeData::MethodDeclaration(method) => {
+                    if let Some(name) = self.property_name(method.name) {
+                        let type_id = self.signature_type(
+                            &method.parameters.nodes,
+                            method.type_,
+                            method.type_parameters.as_ref(),
+                        );
+                        properties.insert(name, type_id);
+                    }
+                }
+                NodeData::GetAccessorDeclaration(accessor) => {
+                    if let Some(name) = self.property_name(accessor.name) {
+                        let type_id = self.getter_property_type(accessor.type_, accessor.body);
+                        properties.insert(name, type_id);
+                    }
+                }
+                NodeData::SetAccessorDeclaration(accessor) => {
+                    let Some(name) = self.property_name(accessor.name) else {
+                        continue;
+                    };
+                    if properties.contains_key(&name) {
+                        continue;
+                    }
+                    let annotation = accessor
+                        .parameters
+                        .nodes
+                        .first()
+                        .and_then(|parameter| self.arena.get(*parameter))
+                        .and_then(|parameter| match &parameter.data {
+                            NodeData::ParameterDeclaration(parameter) => parameter.type_,
+                            _ => None,
+                        });
+                    let type_id = match annotation {
+                        Some(type_node) => self.type_from_type_node(type_node),
+                        None => self.result.types.any(),
+                    };
+                    properties.insert(name, type_id);
+                }
+                _ => {}
+            }
+        }
+        properties
+    }
+
+    fn check_accessor_abstract_consistency(&mut self, members: &[NodeId]) {
+        let mut accessors = BTreeMap::<String, Vec<(NodeId, bool)>>::new();
+        for member in members {
+            let Some(node) = self.arena.get(*member) else {
+                continue;
+            };
+            let name = match &node.data {
+                NodeData::GetAccessorDeclaration(accessor) => self.property_name(accessor.name),
+                NodeData::SetAccessorDeclaration(accessor) => self.property_name(accessor.name),
+                _ => None,
+            };
+            if let Some(name) = name {
+                accessors
+                    .entry(name)
+                    .or_default()
+                    .push((*member, self.member_is_abstract(*member)));
+            }
+        }
+        for declarations in accessors.values() {
+            let has_abstract = declarations.iter().any(|(_, abstract_)| *abstract_);
+            let has_concrete = declarations.iter().any(|(_, abstract_)| !abstract_);
+            if has_abstract && has_concrete {
+                for (member, _) in declarations {
+                    self.error(
+                        self.class_member_name_node(*member).unwrap_or(*member),
+                        2676,
+                        std::iter::empty(),
+                    );
+                }
+            }
+        }
+    }
+
+    fn member_is_abstract(&self, member: NodeId) -> bool {
+        let modifiers = match &self.arena.get(member).map(|node| &node.data) {
+            Some(NodeData::PropertyDeclaration(member)) => member.modifiers.as_ref(),
+            Some(NodeData::MethodDeclaration(member)) => member.modifiers.as_ref(),
+            Some(NodeData::GetAccessorDeclaration(member)) => member.modifiers.as_ref(),
+            Some(NodeData::SetAccessorDeclaration(member)) => member.modifiers.as_ref(),
+            _ => None,
+        };
+        self.has_ast_modifier(modifiers, SyntaxKind::AbstractKeyword)
+    }
+
+    fn member_modifier(&self, member: NodeId, kind: SyntaxKind) -> Option<NodeId> {
+        let modifiers = match &self.arena.get(member)?.data {
+            NodeData::PropertyDeclaration(member) => member.modifiers.as_ref(),
+            NodeData::MethodDeclaration(member) => member.modifiers.as_ref(),
+            NodeData::GetAccessorDeclaration(member) => member.modifiers.as_ref(),
+            NodeData::SetAccessorDeclaration(member) => member.modifiers.as_ref(),
+            _ => None,
+        }?;
+        modifiers.list.nodes.iter().copied().find(|modifier| {
+            self.arena
+                .get(*modifier)
+                .is_some_and(|modifier| modifier.kind == kind)
+        })
+    }
+
+    fn class_member_name_node(&self, member: NodeId) -> Option<NodeId> {
+        match &self.arena.get(member)?.data {
+            NodeData::PropertyDeclaration(member) => Some(member.name),
+            NodeData::MethodDeclaration(member) => Some(member.name),
+            NodeData::GetAccessorDeclaration(member) => Some(member.name),
+            NodeData::SetAccessorDeclaration(member) => Some(member.name),
+            _ => None,
+        }
+    }
+
+    fn class_member_name(&self, member: NodeId) -> Option<String> {
+        self.class_member_name_node(member)
+            .and_then(|name| self.property_name(name))
     }
 
     fn check_class_members(&mut self, members: &[NodeId]) {
@@ -7076,6 +7412,93 @@ mod tests {
                 .iter()
                 .map(|diagnostic| diagnostic.diagnostic.render().unwrap())
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn models_abstract_properties_and_accessors_without_runtime_bodies() {
+        let parsed = parse_source_file(
+            r#"
+                interface A {
+                    prop: string;
+                    raw: string;
+                    m(): void;
+                }
+                abstract class B implements A {
+                    abstract prop: string;
+                    abstract raw: string;
+                    abstract readonly ro: string;
+                    abstract get readonlyProp(): string;
+                    abstract set readonlyProp(value: string);
+                    abstract m(): void;
+                }
+                class C extends B {
+                    get prop() { return "foo"; }
+                    set prop(value) {}
+                    raw = "edge";
+                    readonly ro = "readonly";
+                    readonlyProp: string;
+                    m() {}
+                }
+            "#,
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    }
+
+    #[test]
+    fn reports_abstract_property_inheritance_and_accessor_diagnostics() {
+        let parsed = parse_source_file(
+            r#"
+                abstract class B {
+                    abstract prop: string;
+                    public abstract readonly ro: string;
+                    abstract get readonlyProp(): string;
+                    abstract m(): string;
+                    abstract get mismatch(): string;
+                    abstract set mismatch(value: number);
+                }
+                class C extends B {
+                    readonly ro = "readonly";
+                    abstract notAllowed: string;
+                }
+                let c = new C();
+                c.ro = "error";
+
+                abstract class WrongTypeProperty { abstract num: number; }
+                class WrongTypePropertyImpl extends WrongTypeProperty {
+                    num = "wrong";
+                }
+                abstract class WrongTypeAccessor { abstract get num(): number; }
+                class WrongTypeAccessorImpl extends WrongTypeAccessor {
+                    get num() { return "wrong"; }
+                }
+                class WrongTypeAccessorImpl2 extends WrongTypeAccessor {
+                    num = "wrong";
+                }
+
+                abstract class AbstractAccessorMismatch {
+                    abstract get p1(): string;
+                    set p1(value: string) {}
+                    get p2(): string { return "ok"; }
+                    abstract set p2(value: string);
+                }
+            "#,
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2654, 1253, 2540, 2416, 2416, 2416, 2676, 2676, 2676, 2676]
         );
     }
 
