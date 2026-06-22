@@ -86,11 +86,13 @@ pub fn emit_source_file_with_settings(
         this_alias: None,
         namespace_containers: Vec::new(),
         namespace_declarations: vec![HashSet::new()],
+        runtime_identifier_uses: HashSet::new(),
     };
     let node = printer.node(source_file)?.clone();
     let NodeData::SourceFile(data) = &node.data else {
         return Err(Printer::unsupported(source_file, node.kind));
     };
+    printer.runtime_identifier_uses = runtime_identifier_uses(arena, source_file);
     let is_external_module = data.statements.nodes.iter().any(|statement| {
         arena
             .get(*statement)
@@ -120,7 +122,11 @@ pub fn emit_source_file_with_settings(
         printer.emit_leading_source_comments(node.range.start.get());
     }
     if settings.module == ModuleKind::CommonJs && is_external_module {
-        if source_needs_import_star_helper(arena, &data.statements) {
+        if source_needs_import_star_helper(
+            arena,
+            &data.statements,
+            &printer.runtime_identifier_uses,
+        ) {
             printer.emit_import_star_helper();
         }
         printer
@@ -206,7 +212,11 @@ fn source_needs_extends_helper(arena: &NodeArena) -> bool {
     })
 }
 
-fn source_needs_import_star_helper(arena: &NodeArena, statements: &NodeList) -> bool {
+fn source_needs_import_star_helper(
+    arena: &NodeArena,
+    statements: &NodeList,
+    runtime_identifier_uses: &HashSet<String>,
+) -> bool {
     statements.nodes.iter().any(|statement| {
         let Some(NodeData::ImportDeclaration(import)) =
             arena.get(*statement).map(|node| &node.data)
@@ -222,10 +232,13 @@ fn source_needs_import_star_helper(arena: &NodeArena, statements: &NodeList) -> 
         };
         clause.phase_modifier != Some(SyntaxKind::TypeKeyword)
             && clause.named_bindings.is_some_and(|bindings| {
-                matches!(
-                    arena.get(bindings).map(|node| &node.data),
-                    Some(NodeData::NamespaceImport(_))
-                )
+                let Some(NodeData::NamespaceImport(namespace)) =
+                    arena.get(bindings).map(|node| &node.data)
+                else {
+                    return false;
+                };
+                declaration_name_text(arena, namespace.name)
+                    .is_some_and(|name| runtime_identifier_uses.contains(name))
             })
     })
 }
@@ -297,6 +310,109 @@ fn statement_emits_javascript(arena: &NodeArena, node: &Node) -> bool {
         NodeData::InterfaceDeclaration(_) | NodeData::TypeAliasDeclaration(_) => false,
         NodeData::FunctionDeclaration(function) => function.body.is_some(),
         _ => true,
+    }
+}
+
+fn runtime_identifier_uses(arena: &NodeArena, source_file: NodeId) -> HashSet<String> {
+    arena
+        .iter()
+        .filter_map(|(id, node)| {
+            let NodeData::Identifier(identifier) = &node.data else {
+                return None;
+            };
+            identifier_is_runtime_use(arena, id, source_file).then(|| identifier.text.clone())
+        })
+        .collect()
+}
+
+fn identifier_is_runtime_use(arena: &NodeArena, id: NodeId, source_file: NodeId) -> bool {
+    let mut child = id;
+    while let Some(parent_id) = arena.get(child).and_then(|node| node.parent) {
+        if parent_id == source_file {
+            return true;
+        }
+        let Some(parent) = arena.get(parent_id) else {
+            return false;
+        };
+        if node_is_erased_type_context(parent)
+            || declaration_has_modifier(arena, parent, SyntaxKind::DeclareKeyword)
+            || identifier_is_declaration_name(child, parent)
+        {
+            return false;
+        }
+        child = parent_id;
+    }
+    false
+}
+
+fn node_is_erased_type_context(node: &Node) -> bool {
+    matches!(
+        node.data,
+        NodeData::ImportDeclaration(_)
+            | NodeData::ImportEqualsDeclaration(_)
+            | NodeData::ImportClause(_)
+            | NodeData::NamespaceImport(_)
+            | NodeData::NamedImports(_)
+            | NodeData::ImportSpecifier(_)
+            | NodeData::InterfaceDeclaration(_)
+            | NodeData::TypeAliasDeclaration(_)
+            | NodeData::PropertySignatureDeclaration(_)
+            | NodeData::MethodSignatureDeclaration(_)
+            | NodeData::CallSignatureDeclaration(_)
+            | NodeData::ConstructSignatureDeclaration(_)
+            | NodeData::IndexSignatureDeclaration(_)
+            | NodeData::TypeParameterDeclaration(_)
+            | NodeData::KeywordTypeNode(_)
+            | NodeData::TypeReferenceNode(_)
+            | NodeData::ArrayTypeNode(_)
+            | NodeData::UnionTypeNode(_)
+            | NodeData::IntersectionTypeNode(_)
+            | NodeData::TupleTypeNode(_)
+            | NodeData::ParenthesizedTypeNode(_)
+            | NodeData::LiteralTypeNode(_)
+            | NodeData::TypeLiteralNode(_)
+            | NodeData::FunctionTypeNode(_)
+            | NodeData::ConstructorTypeNode(_)
+            | NodeData::IndexedAccessTypeNode(_)
+            | NodeData::TypeOperatorNode(_)
+            | NodeData::OptionalTypeNode(_)
+            | NodeData::RestTypeNode(_)
+            | NodeData::NamedTupleMember(_)
+            | NodeData::TypeQueryNode(_)
+            | NodeData::ThisTypeNode(_)
+            | NodeData::ConditionalTypeNode(_)
+            | NodeData::InferTypeNode(_)
+            | NodeData::MappedTypeNode(_)
+            | NodeData::ImportTypeNode(_)
+            | NodeData::TypePredicateNode(_)
+            | NodeData::TemplateLiteralTypeNode(_)
+            | NodeData::TemplateLiteralTypeSpan(_)
+    ) || matches!(
+        &node.data,
+        NodeData::FunctionDeclaration(function) if function.body.is_none()
+    ) || matches!(
+        &node.data,
+        NodeData::MethodDeclaration(method) if method.body.is_none()
+    )
+}
+
+fn identifier_is_declaration_name(child: NodeId, parent: &Node) -> bool {
+    match &parent.data {
+        NodeData::VariableDeclaration(declaration) => declaration.name == child,
+        NodeData::ParameterDeclaration(declaration) => declaration.name == child,
+        NodeData::PropertyDeclaration(declaration) => declaration.name == child,
+        NodeData::MethodDeclaration(declaration) => declaration.name == child,
+        NodeData::GetAccessorDeclaration(declaration) => declaration.name == child,
+        NodeData::SetAccessorDeclaration(declaration) => declaration.name == child,
+        NodeData::FunctionDeclaration(declaration) => declaration.name == Some(child),
+        NodeData::FunctionExpression(declaration) => declaration.name == Some(child),
+        NodeData::ClassDeclaration(declaration) => declaration.name == Some(child),
+        NodeData::EnumDeclaration(declaration) => declaration.name == child,
+        NodeData::EnumMember(declaration) => declaration.name == child,
+        NodeData::ModuleDeclaration(declaration) => declaration.name == child,
+        NodeData::BindingElement(declaration) => declaration.name == Some(child),
+        NodeData::ImportSpecifier(_) => true,
+        _ => false,
     }
 }
 
@@ -1301,6 +1417,7 @@ struct Printer<'a> {
     this_alias: Option<&'static str>,
     namespace_containers: Vec<String>,
     namespace_declarations: Vec<HashSet<String>>,
+    runtime_identifier_uses: HashSet<String>,
 }
 
 impl Printer<'_> {
@@ -1553,6 +1670,17 @@ impl Printer<'_> {
         let node = self.node(id)?.clone();
         if declaration_has_modifier(self.arena, &node, SyntaxKind::DeclareKeyword) {
             return Ok(());
+        }
+        match &node.data {
+            NodeData::ImportDeclaration(import) if !self.import_has_runtime_use(import) => {
+                return Ok(());
+            }
+            NodeData::ImportEqualsDeclaration(import)
+                if import.is_type_only || !self.import_binding_is_used(import.name) =>
+            {
+                return Ok(());
+            }
+            _ => {}
         }
         if self.settings.module == ModuleKind::CommonJs
             && declaration_has_modifier(self.arena, &node, SyntaxKind::ExportKeyword)
@@ -3119,6 +3247,60 @@ impl Printer<'_> {
                         if declaration.initializer.is_none()
                 )
             })
+    }
+
+    fn import_binding_is_used(&self, name: NodeId) -> bool {
+        self.identifier_text(name)
+            .is_ok_and(|name| self.runtime_identifier_uses.contains(name))
+    }
+
+    fn import_has_runtime_use(&self, import: &ts_ast::ImportDeclarationData) -> bool {
+        if import.attributes.is_some() {
+            return true;
+        }
+        let Some(clause_id) = import.import_clause else {
+            return true;
+        };
+        let Some(NodeData::ImportClause(clause)) = self.arena.get(clause_id).map(|node| &node.data)
+        else {
+            return true;
+        };
+        if clause.phase_modifier == Some(SyntaxKind::TypeKeyword) {
+            return false;
+        }
+        let mut saw_binding = false;
+        if let Some(name) = clause.name {
+            saw_binding = true;
+            if self.import_binding_is_used(name) {
+                return true;
+            }
+        }
+        let Some(bindings) = clause.named_bindings else {
+            return !saw_binding;
+        };
+        match self.arena.get(bindings).map(|node| &node.data) {
+            Some(NodeData::NamespaceImport(namespace)) => {
+                saw_binding = true;
+                if self.import_binding_is_used(namespace.name) {
+                    return true;
+                }
+            }
+            Some(NodeData::NamedImports(imports)) => {
+                for specifier in &imports.elements.nodes {
+                    let Some(NodeData::ImportSpecifier(specifier)) =
+                        self.arena.get(*specifier).map(|node| &node.data)
+                    else {
+                        continue;
+                    };
+                    saw_binding = true;
+                    if !specifier.is_type_only && self.import_binding_is_used(specifier.name) {
+                        return true;
+                    }
+                }
+            }
+            _ => return true,
+        }
+        !saw_binding
     }
 
     fn declaration_names(&self, nodes: &[NodeId]) -> Vec<String> {
@@ -5247,6 +5429,33 @@ class Board {
             es_module.code,
             "const ts = require('typescript');\nts.version;\n"
         );
+    }
+
+    #[test]
+    fn elides_imports_used_only_in_type_positions() {
+        let source = "import Types = require('types'); import Runtime = require('runtime'); import 'side'; interface Box { value: Types.Value; } class Derived extends Runtime.Base {}";
+        let result = emit_with(source, ScriptTarget::Es2015, ModuleKind::CommonJs);
+        assert!(!result.code.contains("require('types')"), "{}", result.code);
+        assert!(result.code.contains("const Runtime = require('runtime');"));
+        assert!(result.code.contains("require('side');"));
+        assert!(result.code.contains("class Derived extends Runtime.Base"));
+
+        let namespace_source = "import * as Types from 'types'; import * as Runtime from 'runtime'; type Value = Types.Value; Runtime.run();";
+        let namespace = emit_with(namespace_source, ScriptTarget::Es2015, ModuleKind::CommonJs);
+        assert!(!namespace.code.contains("require('types')"));
+        assert!(
+            namespace
+                .code
+                .contains("const Runtime = __importStar(require('runtime'));")
+        );
+
+        let type_only_namespace = emit_with(
+            "import * as Types from 'types'; type Value = Types.Value;",
+            ScriptTarget::Es2015,
+            ModuleKind::CommonJs,
+        );
+        assert!(!type_only_namespace.code.contains("__importStar"));
+        assert!(!type_only_namespace.code.contains("require('types')"));
     }
 
     #[test]
