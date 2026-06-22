@@ -209,6 +209,7 @@ pub fn emit_source_file_with_context(
         namespace_declarations: vec![HashSet::new()],
         runtime_identifier_uses: HashSet::new(),
         commonjs_default_imports: HashMap::new(),
+        commonjs_named_import_temps: HashMap::new(),
         has_runtime_export_equals: false,
         bindings: context.bindings,
         identifier_rewrites: HashMap::new(),
@@ -236,6 +237,15 @@ pub fn emit_source_file_with_context(
             &printer.runtime_identifier_uses,
             context.import_runtime_meanings,
         );
+        let (temps, rewrites) = commonjs_single_named_imports(
+            arena,
+            &data.statements,
+            context.bindings,
+            &printer.runtime_identifier_uses,
+            context.import_runtime_meanings,
+        );
+        printer.commonjs_named_import_temps = temps;
+        printer.identifier_rewrites.extend(rewrites);
     }
     let is_external_module = data.statements.nodes.iter().any(|statement| {
         arena
@@ -557,6 +567,85 @@ fn commonjs_module_temp_base(arena: &NodeArena, module_specifier: NodeId) -> Str
     } else {
         base
     }
+}
+
+fn commonjs_single_named_imports(
+    arena: &NodeArena,
+    statements: &NodeList,
+    bindings: &BindResult,
+    runtime_identifier_uses: &HashSet<String>,
+    import_runtime_meanings: &BTreeMap<NodeId, bool>,
+) -> (HashMap<NodeId, String>, HashMap<SymbolId, String>) {
+    let mut temps = HashMap::new();
+    let mut rewrites = HashMap::new();
+    let mut module_name_counts = HashMap::<String, usize>::new();
+    for statement in &statements.nodes {
+        if import_runtime_meanings.get(statement) == Some(&false) {
+            continue;
+        }
+        let Some(NodeData::ImportDeclaration(import)) =
+            arena.get(*statement).map(|node| &node.data)
+        else {
+            continue;
+        };
+        if import.attributes.is_some() {
+            continue;
+        }
+        let Some(clause_id) = import.import_clause else {
+            continue;
+        };
+        let Some(NodeData::ImportClause(clause)) = arena.get(clause_id).map(|node| &node.data)
+        else {
+            continue;
+        };
+        if clause.name.is_some() || clause.phase_modifier == Some(SyntaxKind::TypeKeyword) {
+            continue;
+        }
+        let Some(NodeData::NamedImports(imports)) = clause
+            .named_bindings
+            .and_then(|named| arena.get(named))
+            .map(|node| &node.data)
+        else {
+            continue;
+        };
+        let [specifier_id] = imports.elements.nodes.as_slice() else {
+            continue;
+        };
+        let Some(NodeData::ImportSpecifier(specifier)) =
+            arena.get(*specifier_id).map(|node| &node.data)
+        else {
+            continue;
+        };
+        if specifier.is_type_only {
+            continue;
+        }
+        if specifier
+            .property_name
+            .is_some_and(|name| declaration_name_text(arena, name) == Some("default"))
+        {
+            continue;
+        }
+        let Some(local) = declaration_name_text(arena, specifier.name) else {
+            continue;
+        };
+        if !runtime_identifier_uses.contains(local) {
+            continue;
+        }
+        let imported = specifier
+            .property_name
+            .and_then(|name| declaration_name_text(arena, name))
+            .unwrap_or(local);
+        let Some(symbol) = bindings.node_symbols.get(&specifier.name) else {
+            continue;
+        };
+        let base = commonjs_module_temp_base(arena, import.module_specifier);
+        let count = module_name_counts.entry(base.clone()).or_default();
+        *count += 1;
+        let temp = format!("{base}_{count}");
+        temps.insert(clause_id, temp.clone());
+        rewrites.insert(*symbol, format!("{temp}.{imported}"));
+    }
+    (temps, rewrites)
 }
 
 fn runtime_export_equals_expression(arena: &NodeArena, statements: &NodeList) -> Option<NodeId> {
@@ -2215,6 +2304,7 @@ struct Printer<'a> {
     namespace_declarations: Vec<HashSet<String>>,
     runtime_identifier_uses: HashSet<String>,
     commonjs_default_imports: HashMap<String, String>,
+    commonjs_named_import_temps: HashMap<NodeId, String>,
     has_runtime_export_equals: bool,
     bindings: &'a BindResult,
     identifier_rewrites: HashMap<ts_ast::SymbolId, String>,
@@ -4446,18 +4536,20 @@ impl Printer<'_> {
 
     fn emit_parameter_names(&mut self, parameters: &NodeList) -> Result<(), EmitError> {
         self.writer.write("(");
-        for (index, parameter) in parameters.nodes.iter().enumerate() {
-            if index != 0 {
-                self.writer.write(", ");
-            }
+        let mut emitted = false;
+        for parameter in &parameters.nodes {
             let node = self.node(*parameter)?.clone();
             let NodeData::ParameterDeclaration(parameter) = &node.data else {
                 return Err(Self::unsupported(*parameter, node.kind));
             };
             if parameter.dot_dot_dot_token.is_some() {
-                self.writer.write("...");
+                continue;
+            }
+            if emitted {
+                self.writer.write(", ");
             }
             self.emit_expression(parameter.name, 0)?;
+            emitted = true;
         }
         self.writer.write(")");
         Ok(())
@@ -4474,7 +4566,13 @@ impl Printer<'_> {
                 Some(NodeData::ParameterDeclaration(parameter)) if parameter.initializer.is_some()
             )
         });
-        if !has_defaults {
+        let has_rest = parameters.nodes.iter().any(|parameter| {
+            matches!(
+                self.arena.get(*parameter).map(|node| &node.data),
+                Some(NodeData::ParameterDeclaration(parameter)) if parameter.dot_dot_dot_token.is_some()
+            )
+        });
+        if !has_defaults && !has_rest {
             return self.emit_accessor_body(body);
         }
         self.writer.write("{");
@@ -4495,6 +4593,29 @@ impl Printer<'_> {
             self.writer.write(" = ");
             self.emit_expression(initializer, 1)?;
             self.writer.write("; }");
+            self.writer.newline();
+        }
+        for parameter in &parameters.nodes {
+            let node = self.node(*parameter)?.clone();
+            let NodeData::ParameterDeclaration(parameter) = &node.data else {
+                return Err(Self::unsupported(*parameter, node.kind));
+            };
+            if parameter.dot_dot_dot_token.is_none() {
+                continue;
+            }
+            self.writer.write("var ");
+            self.emit_expression(parameter.name, 0)?;
+            self.writer.write(" = [];");
+            self.writer.newline();
+            self.writer
+                .write("for (var _i = 0; _i < arguments.length; _i++) {");
+            self.writer.newline();
+            self.writer.indent += 1;
+            self.emit_expression(parameter.name, 0)?;
+            self.writer.write("[_i] = arguments[_i];");
+            self.writer.newline();
+            self.writer.indent -= 1;
+            self.writer.write("}");
             self.writer.newline();
         }
         if let Some(body) = body {
@@ -4959,6 +5080,19 @@ impl Printer<'_> {
         let NodeData::ImportClause(clause) = &clause_node.data else {
             return Err(Self::unsupported(clause_id, clause_node.kind));
         };
+        if let Some(temp) = self.commonjs_named_import_temps.get(&clause_id).cloned() {
+            self.writer.write(self.variable_keyword());
+            self.writer.write(" ");
+            self.writer.write(&temp);
+            self.writer.write(" = require(");
+            if let Some(module) = string_literal_text(self.arena, data.module_specifier) {
+                write_quoted(&mut self.writer, module);
+            } else {
+                self.emit_expression(data.module_specifier, 0)?;
+            }
+            self.writer.write(");");
+            return Ok(());
+        }
         let default_local = clause
             .name
             .and_then(|name| self.identifier_text(name).ok())
@@ -5786,7 +5920,12 @@ impl Printer<'_> {
                         self.writer.indent += 1;
                         self.writer.newline();
                     }
-                    self.emit_expression(data.name, 18)?;
+                    let name = self.node(data.name)?.clone();
+                    match &name.data {
+                        NodeData::Identifier(name) => self.writer.write(&name.text),
+                        NodeData::PrivateIdentifier(name) => self.writer.write(&name.text),
+                        _ => self.emit_expression(data.name, 18)?,
+                    }
                     if break_after_dot {
                         self.writer.indent -= 1;
                     }
@@ -7532,6 +7671,41 @@ mod tests {
     }
 
     #[test]
+    fn downlevels_rest_setter_parameters_into_the_accessor_body() {
+        let source = "class C { set X(...v) { } static set X(...v2) { } }";
+        assert_eq!(
+            emit_with(source, ScriptTarget::Es5, ModuleKind::EsNext).code,
+            concat!(
+                "var C = /** @class */ (function () {\n",
+                "    function C() {\n",
+                "    }\n",
+                "    Object.defineProperty(C.prototype, \"X\", {\n",
+                "        set: function () {\n",
+                "            var v = [];\n",
+                "            for (var _i = 0; _i < arguments.length; _i++) {\n",
+                "                v[_i] = arguments[_i];\n",
+                "            }\n",
+                "        },\n",
+                "        enumerable: false,\n",
+                "        configurable: true\n",
+                "    });\n",
+                "    Object.defineProperty(C, \"X\", {\n",
+                "        set: function () {\n",
+                "            var v2 = [];\n",
+                "            for (var _i = 0; _i < arguments.length; _i++) {\n",
+                "                v2[_i] = arguments[_i];\n",
+                "            }\n",
+                "        },\n",
+                "        enumerable: false,\n",
+                "        configurable: true\n",
+                "    });\n",
+                "    return C;\n",
+                "}());\n",
+            )
+        );
+    }
+
+    #[test]
     fn erases_abstract_members_and_preserves_concrete_accessor_halves() {
         let source = "abstract class A { abstract prop: string; abstract get erased(): number; abstract get mixed(): number; set mixed(v: number) {} get recovered(): number; get paired() { return 1; } abstract set paired(v: number); }";
         assert_eq!(
@@ -8479,6 +8653,27 @@ class Board {
         assert_eq!(
             result.code,
             "\"use strict\";\nvar __importDefault = (this && this.__importDefault) || function (mod) {\n    return (mod && mod.__esModule) ? mod : { \"default\": mod };\n};\nObject.defineProperty(exports, \"__esModule\", { value: true });\nexports.result = void 0;\nconst pkg_1 = __importDefault(require('pkg'));\nconst { read: load, write } = require('pkg');\nrequire('side');\nexports.result = load;\nObject.assign(exports, require('other'));\nexports.default = pkg_1.default;\n"
+        );
+    }
+
+    #[test]
+    fn emits_single_commonjs_named_imports_through_a_module_temp() {
+        let source = concat!(
+            "import { f } from 'demoModule';\n",
+            "// keep comment\n",
+            "let x1: string = demoNS.f;\n",
+            "let x2: string = f;\n",
+        );
+        assert_eq!(
+            emit_with(source, ScriptTarget::Es2015, ModuleKind::CommonJs).code,
+            concat!(
+                "\"use strict\";\n",
+                "Object.defineProperty(exports, \"__esModule\", { value: true });\n",
+                "const demoModule_1 = require(\"demoModule\");\n",
+                "// keep comment\n",
+                "let x1 = demoNS.f;\n",
+                "let x2 = demoModule_1.f;\n",
+            )
         );
     }
 
