@@ -111,6 +111,9 @@ pub struct ServerCapabilities {
     pub semantic_tokens_provider: SemanticTokensOptions,
     pub folding_range_provider: bool,
     pub selection_range_provider: bool,
+    pub document_highlight_provider: bool,
+    pub linked_editing_range_provider: bool,
+    pub code_action_provider: bool,
     pub completion_provider: CompletionOptions,
 }
 
@@ -369,6 +372,45 @@ pub struct SelectionRange {
     pub parent: Option<Box<SelectionRange>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct DocumentHighlight {
+    pub range: Range,
+    /// `1` text, `2` read, `3` write.
+    pub kind: u8,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkedEditingRanges {
+    pub ranges: Vec<Range>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub word_pattern: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodeActionParams {
+    pub text_document: TextDocumentIdentifier,
+    pub range: Range,
+    pub context: CodeActionContext,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodeActionContext {
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodeAction {
+    pub title: String,
+    pub kind: String,
+    pub diagnostics: Vec<Diagnostic>,
+    pub edit: WorkspaceEdit,
+    pub is_preferred: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 struct CallHierarchyData {
     file_name: String,
@@ -559,6 +601,15 @@ impl Server {
         if method == "textDocument/selectionRange" {
             return vec![self.selection_range(id, message.params)];
         }
+        if method == "textDocument/documentHighlight" {
+            return vec![self.document_highlight(id, message.params)];
+        }
+        if method == "textDocument/linkedEditingRange" {
+            return vec![self.linked_editing_range(id, message.params)];
+        }
+        if method == "textDocument/codeAction" {
+            return vec![self.code_action(id, message.params)];
+        }
         vec![failure(id, CODE_METHOD_NOT_FOUND, "method not found")]
     }
 
@@ -604,6 +655,9 @@ impl Server {
                 },
                 folding_range_provider: true,
                 selection_range_provider: true,
+                document_highlight_provider: true,
+                linked_editing_range_provider: true,
+                code_action_provider: true,
                 completion_provider: CompletionOptions {
                     resolve_provider: false,
                 },
@@ -1237,6 +1291,149 @@ impl Server {
         ))
     }
 
+    fn document_highlight(&self, id: Id, params: Option<Value>) -> OutgoingMessage {
+        let Ok(params) = deserialize_params::<TextDocumentPositionParams>(params) else {
+            return failure(
+                id,
+                CODE_INVALID_PARAMS,
+                "invalid document highlight parameters",
+            );
+        };
+        let result = self.document_highlights_at(&params);
+        OutgoingMessage::Response(Response::success(
+            id,
+            serde_json::to_value(result).unwrap_or(Value::Null),
+        ))
+    }
+
+    fn document_highlights_at(
+        &self,
+        params: &TextDocumentPositionParams,
+    ) -> Vec<DocumentHighlight> {
+        let Some(document) = self.documents.get(&params.text_document.uri) else {
+            return Vec::new();
+        };
+        let Ok(offset) = byte_offset(&document.text, params.position) else {
+            return Vec::new();
+        };
+        let Ok(offset) = u32::try_from(offset) else {
+            return Vec::new();
+        };
+        let program = self.build_program();
+        let Some(source) = program.source_file(&document.file_name) else {
+            return Vec::new();
+        };
+        let Some(node) = identifier_at(source, offset) else {
+            return Vec::new();
+        };
+        let Some(name) = identifier_text(source, node) else {
+            return Vec::new();
+        };
+        let Some((target_source, symbol)) =
+            semantic_target(&program, &self.workspace, source, node, name)
+        else {
+            return Vec::new();
+        };
+        semantic_occurrences(&program, &self.workspace, &target_source.file_name, symbol)
+            .into_iter()
+            .filter(|(occurrence_source, _)| occurrence_source.file_name == source.file_name)
+            .filter_map(|(occurrence_source, occurrence)| {
+                Some(DocumentHighlight {
+                    range: node_range(occurrence_source, occurrence)?,
+                    kind: if is_write_occurrence(occurrence_source, occurrence) {
+                        3
+                    } else {
+                        2
+                    },
+                })
+            })
+            .collect()
+    }
+
+    fn linked_editing_range(&self, id: Id, params: Option<Value>) -> OutgoingMessage {
+        let Ok(params) = deserialize_params::<TextDocumentPositionParams>(params) else {
+            return failure(id, CODE_INVALID_PARAMS, "invalid linked editing parameters");
+        };
+        let result = self
+            .documents
+            .get(&params.text_document.uri)
+            .and_then(|document| {
+                let offset =
+                    u32::try_from(byte_offset(&document.text, params.position).ok()?).ok()?;
+                let program = self.build_program();
+                let source = program.source_file(&document.file_name)?;
+                linked_editing_ranges_at(source, offset)
+            });
+        OutgoingMessage::Response(Response::success(
+            id,
+            serde_json::to_value(result).unwrap_or(Value::Null),
+        ))
+    }
+
+    fn code_action(&self, id: Id, params: Option<Value>) -> OutgoingMessage {
+        let Ok(params) = deserialize_params::<CodeActionParams>(params) else {
+            return failure(id, CODE_INVALID_PARAMS, "invalid code action parameters");
+        };
+        let actions = self.code_actions(&params);
+        OutgoingMessage::Response(Response::success(
+            id,
+            serde_json::to_value(actions).unwrap_or(Value::Null),
+        ))
+    }
+
+    fn code_actions(&self, params: &CodeActionParams) -> Vec<CodeAction> {
+        let Some(document) = self.documents.get(&params.text_document.uri) else {
+            return Vec::new();
+        };
+        let program = self.build_program();
+        let Some(source) = program.source_file(&document.file_name) else {
+            return Vec::new();
+        };
+        let mut actions = Vec::new();
+        for diagnostic in &params.context.diagnostics {
+            let action = match diagnostic.code {
+                Some(2304 | 2552) => Self::missing_import_action(
+                    &program,
+                    source,
+                    &params.text_document.uri,
+                    diagnostic,
+                ),
+                Some(6133 | 6138 | 6192 | 6196 | 6198) => {
+                    unused_declaration_action(source, &params.text_document.uri, diagnostic)
+                }
+                _ => None,
+            };
+            actions.extend(action);
+        }
+        actions
+    }
+
+    fn missing_import_action(
+        program: &Program,
+        source: &SourceFile,
+        uri: &DocumentUri,
+        diagnostic: &Diagnostic,
+    ) -> Option<CodeAction> {
+        let offset =
+            u32::try_from(byte_offset(&source.source_text, diagnostic.range.start).ok()?).ok()?;
+        let node = identifier_at(source, offset)?;
+        let name = identifier_text(source, node)?;
+        let target = program.source_files().iter().find(|candidate| {
+            candidate.file_name != source.file_name && candidate.binding.exports.get(name).is_some()
+        })?;
+        let module = relative_module_specifier(&source.file_name, &target.file_name)?;
+        let edit = TextEdit {
+            range: Range::default(),
+            new_text: format!("import {{ {name} }} from \"{module}\";\n"),
+        };
+        Some(quick_fix(
+            format!("Add import from '{module}'"),
+            uri,
+            diagnostic,
+            edit,
+        ))
+    }
+
     fn call_hierarchy_item_for_symbol(
         &self,
         source: &SourceFile,
@@ -1476,6 +1673,211 @@ fn selection_range_at(source: &SourceFile, position: Position) -> Option<Selecti
         });
     }
     result
+}
+
+fn is_write_occurrence(source: &SourceFile, node: NodeId) -> bool {
+    let Some(parent) = source.parse.arena.get(node).and_then(|node| node.parent) else {
+        return false;
+    };
+    match &source.parse.arena.get(parent).map(|node| &node.data) {
+        Some(NodeData::VariableDeclaration(declaration)) => declaration.name == node,
+        Some(NodeData::ParameterDeclaration(parameter)) => parameter.name == node,
+        Some(NodeData::FunctionDeclaration(function)) => function.name == Some(node),
+        Some(NodeData::ClassDeclaration(class)) => class.name == Some(node),
+        Some(NodeData::InterfaceDeclaration(interface)) => interface.name == node,
+        Some(NodeData::TypeAliasDeclaration(alias)) => alias.name == node,
+        Some(NodeData::EnumDeclaration(enumeration)) => enumeration.name == node,
+        Some(NodeData::MethodDeclaration(method)) => method.name == node,
+        Some(NodeData::PropertyDeclaration(property)) => property.name == node,
+        Some(NodeData::BinaryExpression(binary)) => {
+            binary.left == node
+                && source
+                    .parse
+                    .arena
+                    .get(binary.operator_token)
+                    .is_some_and(|op| {
+                        matches!(
+                            op.kind,
+                            ts_ast::SyntaxKind::EqualsToken
+                                | ts_ast::SyntaxKind::PlusEqualsToken
+                                | ts_ast::SyntaxKind::MinusEqualsToken
+                                | ts_ast::SyntaxKind::AsteriskEqualsToken
+                                | ts_ast::SyntaxKind::SlashEqualsToken
+                        )
+                    })
+        }
+        _ => false,
+    }
+}
+
+fn linked_editing_ranges_at(source: &SourceFile, offset: u32) -> Option<LinkedEditingRanges> {
+    let identifier = identifier_at(source, offset)?;
+    let tag = ancestor_of_kind(source, identifier, |data| {
+        matches!(
+            data,
+            NodeData::JsxOpeningElement(_) | NodeData::JsxClosingElement(_)
+        )
+    })?;
+    let element = ancestor_of_kind(source, tag, |data| matches!(data, NodeData::JsxElement(_)))?;
+    let NodeData::JsxElement(element) = &source.parse.arena.get(element)?.data else {
+        return None;
+    };
+    let NodeData::JsxOpeningElement(opening) =
+        &source.parse.arena.get(element.opening_element)?.data
+    else {
+        return None;
+    };
+    let NodeData::JsxClosingElement(closing) =
+        &source.parse.arena.get(element.closing_element)?.data
+    else {
+        return None;
+    };
+    (node_text(source, opening.tag_name)? == node_text(source, closing.tag_name)?).then(|| {
+        Some(LinkedEditingRanges {
+            ranges: vec![
+                node_range(source, opening.tag_name)?,
+                node_range(source, closing.tag_name)?,
+            ],
+            word_pattern: Some("[-._$a-zA-Z0-9]+".to_owned()),
+        })
+    })?
+}
+
+fn unused_declaration_action(
+    source: &SourceFile,
+    uri: &DocumentUri,
+    diagnostic: &Diagnostic,
+) -> Option<CodeAction> {
+    let offset =
+        u32::try_from(byte_offset(&source.source_text, diagnostic.range.start).ok()?).ok()?;
+    let identifier = identifier_at(source, offset)?;
+    let name = identifier_text(source, identifier)?;
+    if let Some(parent) = source.parse.arena.get(identifier)?.parent
+        && matches!(
+            source.parse.arena.get(parent).map(|node| &node.data),
+            Some(NodeData::ParameterDeclaration(parameter)) if parameter.name == identifier
+        )
+    {
+        return (!name.starts_with('_')).then(|| {
+            quick_fix(
+                format!("Rename unused parameter to '_{name}'"),
+                uri,
+                diagnostic,
+                TextEdit {
+                    range: node_range(source, identifier).unwrap_or(diagnostic.range),
+                    new_text: format!("_{name}"),
+                },
+            )
+        });
+    }
+    let removal = removable_declaration(source, identifier, diagnostic.code?)?;
+    Some(quick_fix(
+        format!("Remove unused declaration '{name}'"),
+        uri,
+        diagnostic,
+        TextEdit {
+            range: removal_range(source, removal)?,
+            new_text: String::new(),
+        },
+    ))
+}
+
+fn removable_declaration(source: &SourceFile, mut node: NodeId, code: u32) -> Option<NodeId> {
+    loop {
+        let current = source.parse.arena.get(node)?;
+        match &current.data {
+            NodeData::VariableDeclaration(_) => {
+                let list = current.parent?;
+                let NodeData::VariableDeclarationList(list_data) =
+                    &source.parse.arena.get(list)?.data
+                else {
+                    return None;
+                };
+                if list_data.declarations.nodes.len() != 1 {
+                    return None;
+                }
+                return source.parse.arena.get(list)?.parent;
+            }
+            NodeData::FunctionDeclaration(_)
+            | NodeData::ClassDeclaration(_)
+            | NodeData::InterfaceDeclaration(_)
+            | NodeData::TypeAliasDeclaration(_)
+            | NodeData::EnumDeclaration(_)
+            | NodeData::PropertyDeclaration(_) => return Some(node),
+            NodeData::ImportDeclaration(_) if code == 6192 => return Some(node),
+            NodeData::SourceFile(_) => return None,
+            _ => node = current.parent?,
+        }
+    }
+}
+
+fn removal_range(source: &SourceFile, node: NodeId) -> Option<Range> {
+    let range = source.parse.arena.get(node)?.range;
+    let mut end = usize::try_from(range.end.get()).ok()?;
+    if source.source_text.as_bytes().get(end) == Some(&b'\r') {
+        end += 1;
+    }
+    if source.source_text.as_bytes().get(end) == Some(&b'\n') {
+        end += 1;
+    }
+    Some(Range {
+        start: position_at(&source.source_text, range.start.get()),
+        end: position_at(&source.source_text, u32::try_from(end).ok()?),
+    })
+}
+
+fn quick_fix(
+    title: String,
+    uri: &DocumentUri,
+    diagnostic: &Diagnostic,
+    edit: TextEdit,
+) -> CodeAction {
+    CodeAction {
+        title,
+        kind: "quickfix".to_owned(),
+        diagnostics: vec![diagnostic.clone()],
+        edit: WorkspaceEdit {
+            changes: BTreeMap::from([(uri.clone(), vec![edit])]),
+        },
+        is_preferred: true,
+    }
+}
+
+fn relative_module_specifier(from: &str, to: &str) -> Option<String> {
+    let from = from.rsplit_once('/').map_or("", |(directory, _)| directory);
+    let mut target = to.to_owned();
+    for extension in [".d.ts", ".tsx", ".ts", ".jsx", ".js"] {
+        if target.ends_with(extension) {
+            target.truncate(target.len() - extension.len());
+            break;
+        }
+    }
+    if target.ends_with("/index") {
+        target.truncate(target.len() - "/index".len());
+    }
+    let from = from
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    let to = target
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    let common = from
+        .iter()
+        .zip(&to)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let mut parts = vec![".."; from.len().saturating_sub(common)];
+    parts.extend(to[common..].iter().copied());
+    let path = parts.join("/");
+    (!path.is_empty()).then(|| {
+        if path.starts_with('.') {
+            path
+        } else {
+            format!("./{path}")
+        }
+    })
 }
 
 fn document_symbols_for_node(source: &SourceFile, node: NodeId) -> Vec<DocumentSymbol> {
@@ -2909,6 +3311,9 @@ mod tests {
         assert_eq!(capabilities["semanticTokensProvider"]["full"], true);
         assert_eq!(capabilities["foldingRangeProvider"], true);
         assert_eq!(capabilities["selectionRangeProvider"], true);
+        assert_eq!(capabilities["documentHighlightProvider"], true);
+        assert_eq!(capabilities["linkedEditingRangeProvider"], true);
+        assert_eq!(capabilities["codeActionProvider"], true);
 
         let opened = reader.read_message::<Value>().unwrap().unwrap();
         assert_eq!(opened["method"], "textDocument/publishDiagnostics");
@@ -3385,5 +3790,103 @@ mod tests {
         assert_eq!(selection["range"]["start"]["line"], 3);
         assert_eq!(selection["range"]["start"]["character"], 11);
         assert!(selection["parent"]["parent"].is_object());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn framed_session_serves_highlights_linked_editing_and_quick_fixes() {
+        let dependency_uri = DocumentUri("file:///workspace/dep.ts".to_owned());
+        let main_uri = DocumentUri("file:///workspace/main.tsx".to_owned());
+        let source = concat!(
+            "const unused = 1;\n",
+            "function greet(unusedParam: string) {\n",
+            "  const face = \"😀\"; return face + missing;\n",
+            "}\n",
+            "const icon = \"😀\"; const view = <UI.Panel>{missing}</UI.Panel>;"
+        );
+        let position = |offset: usize| position_at(source, u32::try_from(offset).unwrap());
+        let diagnostic = |code, needle: &str, offset: usize| Diagnostic {
+            range: Range {
+                start: position(offset),
+                end: position(offset + needle.len()),
+            },
+            severity: Some(1),
+            code: Some(code),
+            source: Some("ts-rust".to_owned()),
+            message: format!("diagnostic for {needle}"),
+        };
+        let face_reference = source.find("return face").unwrap() + "return ".len();
+        let panel = source.find("<UI.Panel>").unwrap() + 4;
+        let missing = source.find("missing").unwrap();
+        let unused = source.find("unused").unwrap();
+        let unused_parameter = source.find("unusedParam").unwrap();
+
+        let mut input = begin_framed_session();
+        write_open(&mut input, dependency_uri, "export const missing = 1;");
+        write_open(&mut input, main_uri.clone(), source);
+        write_position_request(
+            &mut input,
+            60,
+            "textDocument/documentHighlight",
+            main_uri.clone(),
+            position(face_reference),
+        );
+        write_position_request(
+            &mut input,
+            61,
+            "textDocument/linkedEditingRange",
+            main_uri.clone(),
+            position(panel),
+        );
+        write(
+            &mut input,
+            &Request::new(
+                62_i64,
+                "textDocument/codeAction",
+                Some(CodeActionParams {
+                    text_document: TextDocumentIdentifier {
+                        uri: main_uri.clone(),
+                    },
+                    range: Range::default(),
+                    context: CodeActionContext {
+                        diagnostics: vec![
+                            diagnostic(2304, "missing", missing),
+                            diagnostic(6133, "unused", unused),
+                            diagnostic(6133, "unusedParam", unused_parameter),
+                        ],
+                    },
+                }),
+            ),
+        );
+
+        let output = finish_framed_session(input);
+        let response = |id| output.iter().find(|message| message["id"] == id).unwrap();
+        let highlights = response(60)["result"].as_array().unwrap();
+        assert_eq!(highlights.len(), 2);
+        assert_eq!(highlights[0]["kind"], 3);
+        assert_eq!(highlights[1]["kind"], 2);
+
+        let linked = response(61)["result"]["ranges"].as_array().unwrap();
+        assert_eq!(linked.len(), 2);
+        let opening = position(source.find("UI.Panel").unwrap());
+        assert_eq!(linked[0]["start"]["character"], opening.character);
+        assert_eq!(linked[0]["end"]["character"], opening.character + 8);
+
+        let actions = response(62)["result"].as_array().unwrap();
+        assert_eq!(actions.len(), 3);
+        assert_eq!(actions[0]["title"], "Add import from './dep'");
+        assert_eq!(
+            actions[0]["edit"]["changes"][main_uri.0.as_str()][0]["newText"],
+            "import { missing } from \"./dep\";\n"
+        );
+        assert_eq!(actions[1]["title"], "Remove unused declaration 'unused'");
+        assert_eq!(
+            actions[2]["title"],
+            "Rename unused parameter to '_unusedParam'"
+        );
+        assert_eq!(
+            actions[2]["edit"]["changes"][main_uri.0.as_str()][0]["newText"],
+            "_unusedParam"
+        );
     }
 }
