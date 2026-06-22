@@ -563,6 +563,18 @@ impl<'a> ProgramChecker<'a> {
                 let Some(symbol) = source.bindings.symbols.get(symbol_id) else {
                     continue;
                 };
+                if symbol.declarations.iter().all(|declaration| {
+                    matches!(
+                        source.arena.get(*declaration).map(|node| &node.data),
+                        Some(NodeData::ModuleDeclaration(module))
+                            if matches!(
+                                source.arena.get(module.name).map(|node| &node.data),
+                                Some(NodeData::StringLiteral(_))
+                            )
+                    )
+                }) {
+                    continue;
+                }
                 if let Some((existing_file, existing_flags)) = declarations.get(name) {
                     let both_default_libraries = source.is_default_library
                         && self.sources[*existing_file].is_default_library;
@@ -841,6 +853,7 @@ struct Checker<'a> {
     enum_types: BTreeSet<TypeId>,
     const_enum_types: BTreeSet<TypeId>,
     checked_overload_symbols: HashSet<SymbolId>,
+    reported_unresolved_type_names: HashSet<NodeId>,
 }
 
 enum DeclaredObject {
@@ -883,6 +896,7 @@ impl<'a> Checker<'a> {
             enum_types: BTreeSet::new(),
             const_enum_types: BTreeSet::new(),
             checked_overload_symbols: HashSet::new(),
+            reported_unresolved_type_names: HashSet::new(),
         }
     }
 
@@ -1087,6 +1101,57 @@ impl<'a> Checker<'a> {
             }
             _ => None,
         }
+    }
+
+    fn entity_name_text(&self, node: NodeId) -> Option<String> {
+        match &self.arena.get(node)?.data {
+            NodeData::Identifier(identifier) => Some(identifier.text.clone()),
+            NodeData::QualifiedName(name) => Some(format!(
+                "{}.{}",
+                self.entity_name_text(name.left)?,
+                self.property_name(name.right)?
+            )),
+            _ => None,
+        }
+    }
+
+    fn type_entity_name_type(&mut self, node: NodeId) -> Option<TypeId> {
+        match self.arena.get(node)?.data.clone() {
+            NodeData::Identifier(identifier) => {
+                for scope in self.type_parameter_scopes.iter().rev() {
+                    if let Some(type_id) = scope.get(&identifier.text) {
+                        return Some(*type_id);
+                    }
+                }
+                if let Some(symbol) = self.resolve_identifier(node, &identifier.text) {
+                    if let Some(descriptor) = self.external_aliases.get(&symbol).cloned() {
+                        return Some(self.import_alias(&descriptor, &[]));
+                    }
+                    return Some(
+                        self.result
+                            .symbol_types
+                            .get(&symbol)
+                            .copied()
+                            .unwrap_or_else(|| self.result.types.any()),
+                    );
+                }
+                let descriptor = self.external_names.get(&identifier.text)?.clone();
+                Some(self.import_type(&descriptor))
+            }
+            NodeData::QualifiedName(name) => {
+                let receiver = self.type_entity_name_type(name.left)?;
+                let property = self.property_name(name.right)?;
+                self.lookup_property_type(receiver, &property)
+            }
+            _ => None,
+        }
+    }
+
+    fn unresolved_type_name(&mut self, node: NodeId, name: String) -> TypeId {
+        if self.reported_unresolved_type_names.insert(node) {
+            self.error(node, 2304, [name]);
+        }
+        self.result.types.unknown()
     }
 
     fn enum_type(&mut self, data: &ts_ast::EnumDeclarationData) -> TypeId {
@@ -4271,6 +4336,23 @@ impl<'a> Checker<'a> {
                 self.result.types.alloc(TypeKind::Array(element))
             }
             NodeData::TypeReferenceNode(data) => {
+                if matches!(
+                    self.arena.get(data.type_name).map(|node| &node.data),
+                    Some(NodeData::QualifiedName(_))
+                ) {
+                    if let Some(arguments) = &data.type_arguments {
+                        for argument in &arguments.nodes {
+                            self.type_from_type_node(*argument);
+                        }
+                    }
+                    if let Some(type_id) = self.type_entity_name_type(data.type_name) {
+                        return type_id;
+                    }
+                    let name = self
+                        .entity_name_text(data.type_name)
+                        .unwrap_or_else(|| "type".into());
+                    return self.unresolved_type_name(data.type_name, name);
+                }
                 let Some(name) = self.property_name(data.type_name) else {
                     return self.result.types.unknown();
                 };
@@ -4303,7 +4385,7 @@ impl<'a> Checker<'a> {
                     if let Some(descriptor) = self.external_names.get(&name).cloned() {
                         return self.import_alias(&descriptor, &arguments);
                     }
-                    return self.result.types.unknown();
+                    return self.unresolved_type_name(data.type_name, name);
                 };
                 if let Some(descriptor) = self.external_aliases.get(&symbol).cloned() {
                     return self.import_alias(&descriptor, &arguments);
@@ -7499,6 +7581,95 @@ mod tests {
                 .map(|diagnostic| diagnostic.diagnostic.code())
                 .collect::<Vec<_>>(),
             [2654, 1253, 2540, 2416, 2416, 2416, 2676, 2676, 2676, 2676]
+        );
+    }
+
+    #[test]
+    fn reports_unresolved_type_references_once_in_annotated_declarations() {
+        let parsed = parse_source_file(
+            r"
+                export class Q {
+                    set bet(argument: DoesNotExist) {}
+                }
+                let value: MissingVariable;
+                declare function take(argument: MissingParameter): MissingReturn;
+                type MissingAliasUse = MissingAlias;
+            ",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2304, 2304, 2304, 2304, 2304]
+        );
+        assert_eq!(
+            result.diagnostics[0].diagnostic.render().unwrap(),
+            "Cannot find name 'DoesNotExist'."
+        );
+    }
+
+    #[test]
+    fn resolves_local_namespace_generic_and_imported_type_references() {
+        let dependency = parse_source_file("export interface Imported { value: string }");
+        let consumer = parse_source_file(
+            r#"
+                import { Imported } from "./dependency";
+                interface Local { value: string }
+                namespace N { export interface Member { value: string } }
+                class Valid<T> {
+                    local: Local;
+                    namespaced: N.Member;
+                    values: Array<Local>;
+                    set imported(value: Imported) {}
+                    method(value: T): T { return value; }
+                }
+            "#,
+        );
+        assert!(
+            dependency.diagnostics.is_empty(),
+            "{:?}",
+            dependency.diagnostics
+        );
+        assert!(
+            consumer.diagnostics.is_empty(),
+            "{:?}",
+            consumer.diagnostics
+        );
+        let dependency_bindings = bind_source_file(&dependency.arena, dependency.source_file);
+        let consumer_bindings = bind_source_file(&consumer.arena, consumer.source_file);
+        let dependency_modules = BTreeMap::new();
+        let consumer_modules = BTreeMap::from([("./dependency".into(), 0)]);
+        let checked = check_program(&[
+            ProgramSource {
+                arena: &dependency.arena,
+                source_file: dependency.source_file,
+                bindings: &dependency_bindings,
+                resolved_modules: &dependency_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+            ProgramSource {
+                arena: &consumer.arena,
+                source_file: consumer.source_file,
+                bindings: &consumer_bindings,
+                resolved_modules: &consumer_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+        ]);
+
+        assert!(
+            checked.files[1].diagnostics.is_empty(),
+            "{:?}",
+            checked.files[1].diagnostics
         );
     }
 
