@@ -2751,7 +2751,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             declaration.text,
-            "export declare const version: number;\nexport declare function identity<T>(value: T): T;\nexport interface Box<T> {\n    value: T;\n}\nexport type Maybe<T> = T | undefined;\nexport declare enum Color {\n    Red,\n    Blue = 2,\n}\n//# sourceMappingURL=api.d.mts.map\n"
+            "export declare const version: number;\nexport declare function identity<T>(value: T): T;\nexport interface Box<T> {\n    value: T;\n}\nexport type Maybe<T> = T | undefined;\nexport declare enum Color {\n    Red = 0,\n    Blue = 2\n}\n//# sourceMappingURL=api.d.mts.map\n"
         );
         assert!(
             emitted
@@ -3574,6 +3574,80 @@ mod tests {
         assert_eq!(
             declaration.text,
             "export declare var basePrototype: {\n    readonly primaryPath: any;\n};\n"
+        );
+    }
+
+    #[test]
+    fn declaration_emit_serializes_ambient_const_literals() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/main.ts",
+            concat!(
+                "function f<T>(x: T): T { return x; }\n",
+                "enum E { A, B, C, \"non identifier\" }\n",
+                "const c1 = \"abc\";\n",
+                "const c2 = 123;\n",
+                "const c3 = c1;\n",
+                "const c4 = c2;\n",
+                "const c5 = f(123);\n",
+                "const c6 = f(-123);\n",
+                "const c7 = true;\n",
+                "const c8 = E.A;\n",
+                "const c8b = E[\"non identifier\"];\n",
+                "const c9 = { x: \"abc\" };\n",
+                "const c10 = [123];\n",
+                "const c11 = \"abc\" + \"def\";\n",
+                "const c12 = 123 + 456;\n",
+                "const c13 = Math.random() > 0.5 ? \"abc\" : \"def\";\n",
+                "const c14 = Math.random() > 0.5 ? 123 : 456;\n",
+            ),
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["main.ts".to_owned()],
+            CompilerOptions {
+                declaration: true,
+                no_lib: true,
+                target: ScriptTarget::Es2015,
+                ..CompilerOptions::default()
+            },
+        );
+        let emitted = program.emit();
+        let declaration = emitted
+            .files
+            .iter()
+            .find(|file| file.file_name == "/project/main.d.ts")
+            .unwrap();
+        assert_eq!(
+            declaration.text,
+            concat!(
+                "declare function f<T>(x: T): T;\n",
+                "declare enum E {\n",
+                "    A = 0,\n",
+                "    B = 1,\n",
+                "    C = 2,\n",
+                "    \"non identifier\" = 3\n",
+                "}\n",
+                "declare const c1 = \"abc\";\n",
+                "declare const c2 = 123;\n",
+                "declare const c3 = \"abc\";\n",
+                "declare const c4 = 123;\n",
+                "declare const c5 = 123;\n",
+                "declare const c6 = -123;\n",
+                "declare const c7 = true;\n",
+                "declare const c8 = E.A;\n",
+                "declare const c8b = E[\"non identifier\"];\n",
+                "declare const c9: {\n",
+                "    x: string;\n",
+                "};\n",
+                "declare const c10: number[];\n",
+                "declare const c11: string;\n",
+                "declare const c12: number;\n",
+                "declare const c13: string;\n",
+                "declare const c14: number;\n",
+            )
         );
     }
 

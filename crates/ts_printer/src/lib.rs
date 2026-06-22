@@ -1321,11 +1321,92 @@ impl DeclarationPrinter<'_> {
                 .node_types
                 .and_then(|types| types.get(&declaration_id).copied())
             {
-                self.writer.write(": ");
-                self.emit_semantic_type(type_id)?;
+                if keyword != "const"
+                    || !self.emit_semantic_const_initializer(type_id, declaration.initializer)?
+                {
+                    self.writer.write(": ");
+                    self.emit_semantic_type(type_id)?;
+                }
             } else {
                 self.writer.write(": any");
             }
+        }
+        Ok(())
+    }
+
+    fn emit_semantic_const_initializer(
+        &mut self,
+        type_id: TypeId,
+        initializer: Option<NodeId>,
+    ) -> Result<bool, EmitError> {
+        let Some(kind) = self
+            .semantic_types
+            .and_then(|types| types.get(type_id))
+            .map(|type_| type_.kind.clone())
+        else {
+            return Ok(false);
+        };
+        if !matches!(
+            kind,
+            TypeKind::BooleanLiteral(_)
+                | TypeKind::NumberLiteral(_)
+                | TypeKind::StringLiteral(_)
+                | TypeKind::BigIntLiteral(_)
+        ) {
+            return Ok(false);
+        }
+        self.writer.write(" = ");
+        if let Some(initializer) = initializer
+            && self.is_enum_member_initializer(initializer)
+        {
+            self.emit_enum_member_initializer(initializer)?;
+        } else {
+            match kind {
+                TypeKind::BooleanLiteral(value) => {
+                    self.writer.write(if value { "true" } else { "false" });
+                }
+                TypeKind::NumberLiteral(value) | TypeKind::BigIntLiteral(value) => {
+                    self.writer.write(&value);
+                }
+                TypeKind::StringLiteral(value) => write_quoted(&mut self.writer, &value),
+                _ => unreachable!("literal kind checked above"),
+            }
+        }
+        Ok(true)
+    }
+
+    fn is_enum_member_initializer(&self, id: NodeId) -> bool {
+        let receiver = match self.arena.get(id).map(|node| &node.data) {
+            Some(NodeData::PropertyAccessExpression(access)) => access.expression,
+            Some(NodeData::ElementAccessExpression(access)) => access.expression,
+            _ => return false,
+        };
+        let Some(name) = declaration_name_text(self.arena, receiver) else {
+            return false;
+        };
+        self.arena.iter().any(|(_, node)| {
+            let NodeData::EnumDeclaration(enumeration) = &node.data else {
+                return false;
+            };
+            declaration_name_text(self.arena, enumeration.name) == Some(name)
+        })
+    }
+
+    fn emit_enum_member_initializer(&mut self, id: NodeId) -> Result<(), EmitError> {
+        let node = self.node(id)?.clone();
+        match &node.data {
+            NodeData::PropertyAccessExpression(access) => {
+                self.emit_name(access.expression)?;
+                self.writer.write(".");
+                self.emit_name(access.name)?;
+            }
+            NodeData::ElementAccessExpression(access) => {
+                self.emit_name(access.expression)?;
+                self.writer.write("[");
+                self.emit_literal_expression(access.argument_expression)?;
+                self.writer.write("]");
+            }
+            _ => return Err(Self::unsupported(id, node.kind)),
         }
         Ok(())
     }
