@@ -14,7 +14,9 @@ against the upstream TypeScript fixtures independently:
 - `ts_binder` / `ts_checker`: symbols, scopes, and semantic types
 - `ts_module` / `ts_glob`: module resolution and project file discovery
 - `ts_project`: project-reference graph loading and ordered builds
+- `ts_incremental`: deterministic build information and project invalidation
 - `ts_fswatch`: portable recursive file watching and event coalescing
+- `ts_watch`: watch-mode compilation orchestration
 - `ts_options`: normalized compiler options
 - `ts_outputpaths`: JavaScript/declaration output path calculation
 - `ts_semver`: npm-style semantic versions and package range matching
@@ -46,5 +48,7 @@ Or run the complete local gate, including generated-source checks:
 
 `tsgo file.ts` and `tsgo --project tsconfig.json` run the standard compilation
 pipeline, including default libraries, checking, JavaScript/declaration emit,
-and source maps. `tsgo --lsp` runs the editor protocol server. Development-only
-`--tokenize`, `--parse`, and `--compile-dev` modes expose individual layers.
+and source maps. Project-reference builds support incremental `.tsbuildinfo`
+state, and `--watch` works for file and build invocations. `tsgo --lsp` runs the
+editor protocol server. Development-only `--tokenize`, `--parse`, and
+`--compile-dev` modes expose individual layers.
