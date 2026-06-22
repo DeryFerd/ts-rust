@@ -1209,13 +1209,18 @@ impl DeclarationPrinter<'_> {
 }
 
 fn declaration_is_module_indicator(arena: &NodeArena, node: &Node) -> bool {
-    matches!(
-        node.data,
+    match &node.data {
         NodeData::ImportDeclaration(_)
-            | NodeData::ImportEqualsDeclaration(_)
-            | NodeData::ExportDeclaration(_)
-            | NodeData::ExportAssignment(_)
-    ) || declaration_has_modifier(arena, node, SyntaxKind::ExportKeyword)
+        | NodeData::ExportDeclaration(_)
+        | NodeData::ExportAssignment(_) => true,
+        NodeData::ImportEqualsDeclaration(import) => matches!(
+            arena
+                .get(import.module_reference)
+                .map(|reference| &reference.data),
+            Some(NodeData::ExternalModuleReference(_))
+        ),
+        _ => declaration_has_modifier(arena, node, SyntaxKind::ExportKeyword),
+    }
 }
 
 fn declaration_has_modifier(arena: &NodeArena, node: &Node, kind: SyntaxKind) -> bool {
@@ -1720,7 +1725,7 @@ impl Printer<'_> {
                 }
                 self.emit_parameters(&data.parameters)?;
                 self.writer.write(" ");
-                self.emit_block(data.body.expect("body checked above"))?;
+                self.emit_function_body(data.body.expect("body checked above"))?;
             }
             NodeData::ClassDeclaration(data) => {
                 self.emit_runtime_declaration_modifiers(data.modifiers.as_ref());
@@ -1955,7 +1960,8 @@ impl Printer<'_> {
         let NodeData::Block(data) = &node.data else {
             return Err(Self::unsupported(id, node.kind));
         };
-        if data.statements.nodes.is_empty() && !data.multi_line {
+        let source_multiline = self.node_source_is_multiline(id);
+        if data.statements.nodes.is_empty() && !source_multiline {
             self.writer.write("{ }");
             return Ok(());
         }
@@ -1974,6 +1980,20 @@ impl Printer<'_> {
         Ok(())
     }
 
+    fn emit_function_body(&mut self, body: NodeId) -> Result<(), EmitError> {
+        if self.settings.module == ModuleKind::CommonJs
+            && let Some(statement) = self.single_line_body_statement(body)?
+        {
+            self.writer.write("{ ");
+            self.emit_statement(statement)?;
+            self.writer.remove_trailing_newline();
+            self.writer.write(" }");
+            Ok(())
+        } else {
+            self.emit_block(body)
+        }
+    }
+
     fn emit_accessor_body(&mut self, body: Option<NodeId>) -> Result<(), EmitError> {
         let Some(body) = body else {
             self.writer.write("{ }");
@@ -1983,6 +2003,11 @@ impl Printer<'_> {
             self.writer.write("{ return ");
             self.emit_expression(expression, 0)?;
             self.writer.write("; }");
+        } else if let Some(statement) = self.single_line_body_statement(body)? {
+            self.writer.write("{ ");
+            self.emit_statement(statement)?;
+            self.writer.remove_trailing_newline();
+            self.writer.write(" }");
         } else {
             self.emit_block(body)?;
         }
@@ -2215,8 +2240,9 @@ impl Printer<'_> {
         self.writer.write("constructor");
         self.emit_parameters(&method.parameters)?;
         if body.statements.nodes.is_empty()
-            && !body.multi_line
+            && !self.node_source_is_multiline(body_id)
             && !self.has_instance_field_initializers(data)
+            && !self.has_parameter_properties(&method.parameters)
         {
             self.writer.write(" { }");
             self.writer.newline();
@@ -2227,21 +2253,69 @@ impl Printer<'_> {
         self.writer.indent += 1;
         if !has_base {
             self.emit_instance_fields(data, "this")?;
+            self.emit_parameter_properties(&method.parameters, "this")?;
         }
         let mut emitted_fields = !has_base;
         for statement in &body.statements.nodes {
             self.emit_statement(*statement)?;
             if has_base && !emitted_fields && self.is_super_call_statement(*statement)? {
                 self.emit_instance_fields(data, "this")?;
+                self.emit_parameter_properties(&method.parameters, "this")?;
                 emitted_fields = true;
             }
         }
         if !emitted_fields {
             self.emit_instance_fields(data, "this")?;
+            self.emit_parameter_properties(&method.parameters, "this")?;
         }
         self.writer.indent -= 1;
         self.writer.write("}");
         self.writer.newline();
+        Ok(())
+    }
+
+    fn has_parameter_properties(&self, parameters: &NodeList) -> bool {
+        parameters.nodes.iter().any(|parameter| {
+            let Some(NodeData::ParameterDeclaration(parameter)) =
+                self.arena.get(*parameter).map(|node| &node.data)
+            else {
+                return false;
+            };
+            self.parameter_is_property(parameter)
+        })
+    }
+
+    fn parameter_is_property(&self, parameter: &ts_ast::ParameterDeclarationData) -> bool {
+        [
+            SyntaxKind::PublicKeyword,
+            SyntaxKind::PrivateKeyword,
+            SyntaxKind::ProtectedKeyword,
+            SyntaxKind::ReadonlyKeyword,
+        ]
+        .into_iter()
+        .any(|kind| self.has_modifier(parameter.modifiers.as_ref(), kind))
+    }
+
+    fn emit_parameter_properties(
+        &mut self,
+        parameters: &NodeList,
+        receiver: &str,
+    ) -> Result<(), EmitError> {
+        for parameter in &parameters.nodes {
+            let node = self.node(*parameter)?.clone();
+            let NodeData::ParameterDeclaration(parameter) = &node.data else {
+                return Err(Self::unsupported(*parameter, node.kind));
+            };
+            if !self.parameter_is_property(parameter) {
+                continue;
+            }
+            self.writer.write(receiver);
+            self.emit_downlevel_member_access(parameter.name)?;
+            self.writer.write(" = ");
+            self.emit_expression(parameter.name, 0)?;
+            self.writer.write(";");
+            self.writer.newline();
+        }
         Ok(())
     }
 
@@ -4633,6 +4707,29 @@ impl Printer<'_> {
         })
     }
 
+    fn single_line_body_statement(&self, block: NodeId) -> Result<Option<NodeId>, EmitError> {
+        if self.source_text.is_empty() {
+            return Ok(None);
+        }
+        let node = self.node(block)?;
+        let NodeData::Block(data) = &node.data else {
+            return Err(Self::unsupported(block, node.kind));
+        };
+        let [statement] = data.statements.nodes.as_slice() else {
+            return Ok(None);
+        };
+        if self.node_source_is_multiline(block) {
+            return Ok(None);
+        }
+        Ok(matches!(
+            &self.node(*statement)?.data,
+            NodeData::ExpressionStatement(_)
+                | NodeData::ReturnStatement(_)
+                | NodeData::ThrowStatement(_)
+        )
+        .then_some(*statement))
+    }
+
     fn node_source_is_multiline(&self, id: NodeId) -> bool {
         let Some(node) = self.arena.get(id) else {
             return false;
@@ -5102,6 +5199,15 @@ mod tests {
     }
 
     #[test]
+    fn preserves_compact_and_multiline_function_bodies() {
+        let source = "function compact() { return 1; }\nfunction multiline() {\n}\nclass Box { constructor(public value: number) {} set item(next) { next = 1; } }";
+        assert_eq!(
+            emit_with(source, ScriptTarget::Es2015, ModuleKind::CommonJs).code,
+            "function compact() { return 1; }\nfunction multiline() {\n}\nclass Box {\n    constructor(value) {\n        this.value = value;\n    }\n    set item(next) { next = 1; }\n}\n"
+        );
+    }
+
+    #[test]
     fn emits_and_recovers_object_literal_accessors() {
         let source = "var value = { get item(), set item(next: number) };";
         let parsed = parse_source_file(source);
@@ -5429,6 +5535,18 @@ class Board {
             es_module.code,
             "const ts = require('typescript');\nts.version;\n"
         );
+    }
+
+    #[test]
+    fn internal_import_equals_aliases_do_not_make_scripts_external_modules() {
+        let result = emit_with(
+            "namespace Models { export class Model {} } import Model = Models.Model; new Model();",
+            ScriptTarget::Es2015,
+            ModuleKind::CommonJs,
+        );
+        assert!(!result.code.contains("__esModule"), "{}", result.code);
+        assert!(!result.code.starts_with("\"use strict\";"));
+        assert!(result.code.contains("const Model = Models.Model;"));
     }
 
     #[test]
