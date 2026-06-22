@@ -761,6 +761,8 @@ struct Checker<'a> {
     imported_type_parameters: HashMap<String, TypeId>,
     options: CheckerOptions,
     symbol_reads: HashMap<SymbolId, usize>,
+    enum_member_owners: HashMap<TypeId, TypeId>,
+    enum_types: BTreeSet<TypeId>,
 }
 
 enum DeclaredObject {
@@ -797,6 +799,8 @@ impl<'a> Checker<'a> {
             imported_type_parameters: HashMap::new(),
             options: CheckerOptions::default(),
             symbol_reads: HashMap::new(),
+            enum_member_owners: HashMap::new(),
+            enum_types: BTreeSet::new(),
         }
     }
 
@@ -832,6 +836,9 @@ impl<'a> Checker<'a> {
 
     fn seed_symbol_types(&mut self) {
         for symbol in self.bindings.symbols.iter() {
+            if self.result.symbol_types.contains_key(&symbol.id) {
+                continue;
+            }
             let function_declarations = symbol
                 .declarations
                 .iter()
@@ -902,6 +909,10 @@ impl<'a> Checker<'a> {
                         symbol_type = Some(self.type_alias_type(data, &[]));
                         break;
                     }
+                    NodeData::EnumDeclaration(data) => {
+                        symbol_type = Some(self.enum_type(data));
+                        break;
+                    }
                     _ => {}
                 }
             }
@@ -910,6 +921,53 @@ impl<'a> Checker<'a> {
                 symbol_type.unwrap_or_else(|| self.result.types.any()),
             );
         }
+    }
+
+    fn enum_type(&mut self, data: &ts_ast::EnumDeclarationData) -> TypeId {
+        let mut properties = BTreeMap::new();
+        let mut next_numeric_value = Some(0_i64);
+        for member_id in &data.members.nodes {
+            let Some(NodeData::EnumMember(member)) =
+                self.arena.get(*member_id).map(|node| &node.data)
+            else {
+                continue;
+            };
+            let Some(name) = self.property_name(member.name) else {
+                continue;
+            };
+            let member_type = if let Some(initializer) = member.initializer {
+                let value = self.type_of_expression(initializer);
+                next_numeric_value = match &self.result.types.get(value).unwrap().kind {
+                    TypeKind::NumberLiteral(value) => value
+                        .parse::<i64>()
+                        .ok()
+                        .and_then(|value| value.checked_add(1)),
+                    _ => None,
+                };
+                value
+            } else if let Some(value) = next_numeric_value {
+                next_numeric_value = value.checked_add(1);
+                self.result
+                    .types
+                    .alloc(TypeKind::NumberLiteral(value.to_string()))
+            } else {
+                self.result.types.number()
+            };
+            if let Some(symbol) = self.bindings.node_symbols.get(member_id).copied() {
+                self.result.symbol_types.insert(symbol, member_type);
+            }
+            properties.insert(name, member_type);
+        }
+        let enum_type = self.result.types.alloc(TypeKind::Object(ObjectType {
+            properties: properties.clone(),
+            optional_properties: BTreeSet::new(),
+            readonly_properties: properties.keys().cloned().collect(),
+        }));
+        for member_type in properties.values() {
+            self.enum_member_owners.insert(*member_type, enum_type);
+        }
+        self.enum_types.insert(enum_type);
+        enum_type
     }
 
     #[allow(clippy::too_many_lines)]
@@ -2562,6 +2620,10 @@ impl<'a> Checker<'a> {
                 }
                 _ => None,
             },
+            TypeKind::TypeParameter {
+                constraint: Some(constraint),
+                ..
+            } => self.lookup_indexed_type(constraint, index),
             TypeKind::String | TypeKind::StringLiteral(_) if self.is_number_like(index) => {
                 Some(self.result.types.string())
             }
@@ -3069,6 +3131,7 @@ impl<'a> Checker<'a> {
                             .unwrap_or_else(|| self.result.types.unknown())
                     })
             }
+            NodeData::TypeQueryNode(data) => self.type_of_expression(data.expr_name),
             NodeData::UnionTypeNode(data) => {
                 let members = data
                     .types
@@ -3095,14 +3158,21 @@ impl<'a> Checker<'a> {
                     operand
                 }
             }
-            NodeData::ConditionalTypeNode(data) => {
-                let check = self.type_from_type_node(data.check_type);
-                let extends = self.type_from_type_node(data.extends_type);
-                if self.is_assignable(check, extends) {
-                    self.type_from_type_node(data.true_type)
-                } else {
-                    self.type_from_type_node(data.false_type)
-                }
+            NodeData::ConditionalTypeNode(data) => self.conditional_type(data),
+            NodeData::InferTypeNode(data) => {
+                let Some(NodeData::TypeParameterDeclaration(parameter)) =
+                    self.arena.get(data.type_parameter).map(|node| &node.data)
+                else {
+                    return self.result.types.unknown();
+                };
+                let Some(name) = self.property_name(parameter.name) else {
+                    return self.result.types.unknown();
+                };
+                self.type_parameter_scopes
+                    .iter()
+                    .rev()
+                    .find_map(|scope| scope.get(&name).copied())
+                    .unwrap_or_else(|| self.result.types.unknown())
             }
             NodeData::MappedTypeNode(data) => self.mapped_type(data),
             NodeData::TupleTypeNode(data) => {
@@ -3180,6 +3250,169 @@ impl<'a> Checker<'a> {
         }
     }
 
+    fn conditional_type(&mut self, data: &ts_ast::ConditionalTypeNodeData) -> TypeId {
+        let check = self.type_from_type_node(data.check_type);
+        if let Some(name) = self.type_reference_name(data.check_type)
+            && self
+                .type_parameter_scopes
+                .iter()
+                .rev()
+                .any(|scope| scope.contains_key(&name))
+            && let TypeKind::Union(members) = self.result.types.get(check).unwrap().kind.clone()
+        {
+            let results = members
+                .into_iter()
+                .map(|member| {
+                    self.type_parameter_scopes
+                        .push(HashMap::from([(name.clone(), member)]));
+                    let result = self.conditional_type_branch(data, member);
+                    self.type_parameter_scopes.pop();
+                    result
+                })
+                .collect::<Vec<_>>();
+            return self.result.types.union(results);
+        }
+        self.conditional_type_branch(data, check)
+    }
+
+    fn conditional_type_branch(
+        &mut self,
+        data: &ts_ast::ConditionalTypeNodeData,
+        check: TypeId,
+    ) -> TypeId {
+        let mut inference = HashMap::new();
+        if self.infer_conditional_type(data.extends_type, check, &mut inference) {
+            self.type_parameter_scopes.push(inference);
+            let result = self.type_from_type_node(data.true_type);
+            self.type_parameter_scopes.pop();
+            result
+        } else {
+            self.type_from_type_node(data.false_type)
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn infer_conditional_type(
+        &mut self,
+        pattern: NodeId,
+        actual: TypeId,
+        inference: &mut HashMap<String, TypeId>,
+    ) -> bool {
+        let Some(node) = self.arena.get(pattern) else {
+            return false;
+        };
+        match &node.data {
+            NodeData::InferTypeNode(data) => {
+                let Some(NodeData::TypeParameterDeclaration(parameter)) =
+                    self.arena.get(data.type_parameter).map(|node| &node.data)
+                else {
+                    return false;
+                };
+                let Some(name) = self.property_name(parameter.name) else {
+                    return false;
+                };
+                inference
+                    .entry(name)
+                    .and_modify(|current| *current = self.result.types.union([*current, actual]))
+                    .or_insert(actual);
+                true
+            }
+            NodeData::ParenthesizedTypeNode(data) => {
+                self.infer_conditional_type(data.type_, actual, inference)
+            }
+            NodeData::TypeOperatorNode(data) if data.operator == SyntaxKind::ReadonlyKeyword => {
+                self.infer_conditional_type(data.type_, actual, inference)
+            }
+            NodeData::ArrayTypeNode(data) => {
+                let element = match self.result.types.get(actual).unwrap().kind.clone() {
+                    TypeKind::Array(element) => element,
+                    TypeKind::Tuple(elements) => self.result.types.union(elements),
+                    _ => return false,
+                };
+                self.infer_conditional_type(data.element_type, element, inference)
+            }
+            NodeData::TypeReferenceNode(data)
+                if self.property_name(data.type_name).as_deref() == Some("Array")
+                    || self.property_name(data.type_name).as_deref() == Some("ReadonlyArray") =>
+            {
+                let Some(argument) = data
+                    .type_arguments
+                    .as_ref()
+                    .and_then(|arguments| arguments.nodes.first())
+                else {
+                    return false;
+                };
+                let element = match self.result.types.get(actual).unwrap().kind.clone() {
+                    TypeKind::Array(element) => element,
+                    TypeKind::Tuple(elements) => self.result.types.union(elements),
+                    _ => return false,
+                };
+                self.infer_conditional_type(*argument, element, inference)
+            }
+            NodeData::TupleTypeNode(data) => {
+                let TypeKind::Tuple(elements) = self.result.types.get(actual).unwrap().kind.clone()
+                else {
+                    return false;
+                };
+                data.elements.nodes.len() == elements.len()
+                    && data
+                        .elements
+                        .nodes
+                        .iter()
+                        .zip(elements)
+                        .all(|(pattern, actual)| {
+                            self.infer_conditional_type(*pattern, actual, inference)
+                        })
+            }
+            NodeData::FunctionTypeNode(data) => {
+                let TypeKind::Function(signature) =
+                    self.result.types.get(actual).unwrap().kind.clone()
+                else {
+                    return false;
+                };
+                data.type_.is_none_or(|return_type| {
+                    self.infer_conditional_type(return_type, signature.return_type, inference)
+                })
+            }
+            NodeData::TypeLiteralNode(data) => data.members.nodes.iter().all(|member| {
+                let Some(NodeData::PropertySignatureDeclaration(property)) =
+                    self.arena.get(*member).map(|node| &node.data)
+                else {
+                    return true;
+                };
+                let Some(name) = self.property_name(property.name) else {
+                    return false;
+                };
+                let Some(actual_property) = self.lookup_property_type(actual, &name) else {
+                    return false;
+                };
+                self.infer_conditional_type(property.type_, actual_property, inference)
+            }),
+            NodeData::UnionTypeNode(data) => data.types.nodes.iter().any(|candidate| {
+                let mut candidate_inference = inference.clone();
+                if self.infer_conditional_type(*candidate, actual, &mut candidate_inference) {
+                    *inference = candidate_inference;
+                    true
+                } else {
+                    false
+                }
+            }),
+            _ => {
+                self.type_parameter_scopes.push(inference.clone());
+                let expected = self.type_from_type_node(pattern);
+                self.type_parameter_scopes.pop();
+                self.is_assignable(actual, expected)
+            }
+        }
+    }
+
+    fn type_reference_name(&self, node: NodeId) -> Option<String> {
+        let NodeData::TypeReferenceNode(reference) = &self.arena.get(node)?.data else {
+            return None;
+        };
+        self.property_name(reference.type_name)
+    }
+
     fn type_keys(&self, type_id: TypeId) -> Vec<String> {
         match &self.result.types.get(type_id).unwrap().kind {
             TypeKind::Object(object) => object.properties.keys().cloned().collect(),
@@ -3216,39 +3449,96 @@ impl<'a> Checker<'a> {
         };
         let constraint = self.type_from_type_node(constraint);
         let keys = self.literal_keys(constraint);
+        let homomorphic_object = self.mapped_source_object(parameter.constraint.unwrap());
         let mut properties = BTreeMap::new();
         let mut optional_properties = BTreeSet::new();
         let mut readonly_properties = BTreeSet::new();
         for (property_name, key_type) in keys {
             self.type_parameter_scopes
                 .push(HashMap::from([(name.clone(), key_type)]));
-            let output_name = data
-                .name_type
-                .and_then(|node| {
+            let output_names = data.name_type.map_or_else(
+                || vec![property_name.clone()],
+                |node| {
                     let mapped = self.type_from_type_node(node);
-                    self.literal_key_name(mapped)
-                })
-                .unwrap_or(property_name);
+                    self.literal_keys(mapped)
+                        .into_iter()
+                        .map(|(name, _)| name)
+                        .collect()
+                },
+            );
             let mut property_type = match data.type_ {
                 Some(node) => self.type_from_type_node(node),
                 None => self.result.types.any(),
             };
-            if data.question_token.is_some() {
-                optional_properties.insert(output_name.clone());
+            let preserve_optional = homomorphic_object
+                .as_ref()
+                .is_some_and(|object| object.optional_properties.contains(&property_name));
+            let optional_modifier = self.mapped_modifier(data.question_token);
+            let is_optional = match optional_modifier {
+                Some(true) => true,
+                Some(false) => false,
+                None => preserve_optional,
+            };
+            if optional_modifier == Some(false) && preserve_optional {
+                property_type = self.without_undefined(property_type);
+            }
+            if is_optional && !self.type_includes_undefined(property_type) {
                 let undefined = self.result.types.undefined();
                 property_type = self.result.types.union([property_type, undefined]);
             }
-            if data.readonly_token.is_some() {
-                readonly_properties.insert(output_name.clone());
-            }
+            let preserve_readonly = homomorphic_object
+                .as_ref()
+                .is_some_and(|object| object.readonly_properties.contains(&property_name));
+            let readonly_modifier = self.mapped_modifier(data.readonly_token);
+            let is_readonly = match readonly_modifier {
+                Some(true) => true,
+                Some(false) => false,
+                None => preserve_readonly,
+            };
             self.type_parameter_scopes.pop();
-            properties.insert(output_name, property_type);
+            for output_name in output_names {
+                if is_optional {
+                    optional_properties.insert(output_name.clone());
+                }
+                if is_readonly {
+                    readonly_properties.insert(output_name.clone());
+                }
+                properties.insert(output_name, property_type);
+            }
         }
         self.result.types.alloc(TypeKind::Object(ObjectType {
             properties,
             optional_properties,
             readonly_properties,
         }))
+    }
+
+    fn mapped_source_object(&mut self, constraint: NodeId) -> Option<ObjectType> {
+        let NodeData::TypeOperatorNode(operator) = &self.arena.get(constraint)?.data else {
+            return None;
+        };
+        if operator.operator != SyntaxKind::KeyOfKeyword {
+            return None;
+        }
+        let source = self.type_from_type_node(operator.type_);
+        let TypeKind::Object(object) = self.result.types.get(source)?.kind.clone() else {
+            return None;
+        };
+        Some(object)
+    }
+
+    fn mapped_modifier(&self, token: Option<NodeId>) -> Option<bool> {
+        token.map(|token| self.arena.get(token).unwrap().kind != SyntaxKind::MinusToken)
+    }
+
+    fn without_undefined(&mut self, type_id: TypeId) -> TypeId {
+        let TypeKind::Union(members) = self.result.types.get(type_id).unwrap().kind.clone() else {
+            return type_id;
+        };
+        let undefined = self.result.types.undefined();
+        self.result
+            .types
+            .union(members.into_iter().filter(|member| *member != undefined))
     }
 
     fn literal_keys(&self, type_id: TypeId) -> Vec<(String, TypeId)> {
@@ -3261,13 +3551,6 @@ impl<'a> Checker<'a> {
                 .flat_map(|member| self.literal_keys(*member))
                 .collect(),
             _ => Vec::new(),
-        }
-    }
-
-    fn literal_key_name(&self, type_id: TypeId) -> Option<String> {
-        match &self.result.types.get(type_id)?.kind {
-            TypeKind::StringLiteral(name) | TypeKind::NumberLiteral(name) => Some(name.clone()),
-            _ => None,
         }
     }
 
@@ -3333,6 +3616,12 @@ impl<'a> Checker<'a> {
     fn is_assignable(&self, source: TypeId, target: TypeId) -> bool {
         if source == target || source == self.result.types.never() {
             return true;
+        }
+        if self.enum_member_owners.get(&source) == Some(&target) {
+            return true;
+        }
+        if self.enum_types.contains(&target) {
+            return false;
         }
         let source_kind = &self.result.types.get(source).unwrap().kind;
         let target_kind = &self.result.types.get(target).unwrap().kind;
@@ -5147,6 +5436,71 @@ mod tests {
                 .map(|diagnostic| diagnostic.diagnostic.code())
                 .collect::<Vec<_>>(),
             [2322, 2322, 2322],
+            "{:?}",
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.render().unwrap())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn evaluates_enums_structural_operators_mapped_types_and_conditional_infer() {
+        let parsed = parse_source_file(
+            r#"
+                enum Direction { Up, Down = 4, Next, Label = "label" }
+                const direction: Direction = Direction.Next;
+                const nextValue: 5 = Direction.Next;
+                type DirectionKey = keyof typeof Direction;
+                const directionKey: DirectionKey = "Label";
+                const badDirectionKey: DirectionKey = "Missing";
+                const badDirection: Direction = "label";
+                const badMember: 4 = Direction.Next;
+
+                type Model = { readonly id: number; name?: string; active: boolean };
+                type ModelKey = keyof Model;
+                type ModelValue = Model[ModelKey];
+                type MutableRequired<T> = { -readonly [K in keyof T]-?: T[K] };
+                type WithoutId<T> = {
+                    [K in keyof T as K extends "id" ? never : K]: T[K]
+                };
+                const key: ModelKey = "name";
+                const badKey: ModelKey = "missing";
+                const value: ModelValue = true;
+                const required: MutableRequired<Model> = {
+                    id: 1, name: "model", active: true
+                };
+                const missingRequired: MutableRequired<Model> = { id: 1, active: true };
+                const withoutId: WithoutId<Model> = { name: "model", active: true };
+                const badWithoutId: WithoutId<Model> = { active: true, id: 1 };
+
+                type Element<T> = T extends readonly (infer U)[] ? U : never;
+                type Result<T> = T extends (...inputs: any[]) => infer R ? R : never;
+                type Strings<T> = T extends string ? T : never;
+                const element: Element<readonly number[]> = 1;
+                const badElement: Element<string[]> = 1;
+                const result: Result<(input: number) => string> = "ok";
+                const badResult: Result<() => boolean> = "wrong";
+                const distributed: Strings<string | number> = "ok";
+                const badDistributed: Strings<string | number> = 1;
+            "#,
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        assert!(
+            bindings.diagnostics.is_empty(),
+            "{:?}",
+            bindings.diagnostics
+        );
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2322, 2322, 2322, 2322, 2322, 2353, 2322, 2322, 2322],
             "{:?}",
             result
                 .diagnostics
