@@ -5,7 +5,7 @@ use std::error::Error;
 use std::fmt;
 
 use ts_ast::{Node, NodeArena, NodeData, NodeId, NodeList, SyntaxKind};
-use ts_options::{ModuleKind, PrinterSettings, ScriptTarget};
+use ts_options::{JsxEmit, ModuleKind, PrinterSettings, ScriptTarget};
 use ts_sourcemap::{SourceMap, SourceMapBuilder};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -2172,6 +2172,177 @@ impl Printer<'_> {
                     self.emit_template(data)?;
                 }
             }
+            NodeData::JsxElement(data) => self.emit_jsx_element(data)?,
+            NodeData::JsxSelfClosingElement(data) => self.emit_jsx_self_closing(data)?,
+            _ => return Err(Self::unsupported(id, node.kind)),
+        }
+        Ok(())
+    }
+
+    fn emit_jsx_element(&mut self, data: &ts_ast::JsxElementData) -> Result<(), EmitError> {
+        let opening_node = self.node(data.opening_element)?.clone();
+        let NodeData::JsxOpeningElement(opening) = &opening_node.data else {
+            return Err(Self::unsupported(data.opening_element, opening_node.kind));
+        };
+        if matches!(self.settings.jsx, JsxEmit::Preserve | JsxEmit::ReactNative) {
+            self.writer.write("<");
+            self.emit_expression(opening.tag_name, 0)?;
+            self.emit_jsx_attributes(opening.attributes, true)?;
+            self.writer.write(">");
+            for child in &data.children.nodes {
+                self.emit_jsx_child(*child, true)?;
+            }
+            let closing_node = self.node(data.closing_element)?.clone();
+            let NodeData::JsxClosingElement(closing) = &closing_node.data else {
+                return Err(Self::unsupported(data.closing_element, closing_node.kind));
+            };
+            self.writer.write("</");
+            self.emit_expression(closing.tag_name, 0)?;
+            self.writer.write(">");
+            return Ok(());
+        }
+        self.emit_react_create_element(
+            opening.tag_name,
+            opening.attributes,
+            Some(&data.children),
+        )
+    }
+
+    fn emit_jsx_self_closing(
+        &mut self,
+        data: &ts_ast::JsxSelfClosingElementData,
+    ) -> Result<(), EmitError> {
+        if matches!(self.settings.jsx, JsxEmit::Preserve | JsxEmit::ReactNative) {
+            self.writer.write("<");
+            self.emit_expression(data.tag_name, 0)?;
+            self.emit_jsx_attributes(data.attributes, true)?;
+            self.writer.write(" />");
+            return Ok(());
+        }
+        self.emit_react_create_element(data.tag_name, data.attributes, None)
+    }
+
+    fn emit_react_create_element(
+        &mut self,
+        tag_name: NodeId,
+        attributes: NodeId,
+        children: Option<&NodeList>,
+    ) -> Result<(), EmitError> {
+        self.writer.write("React.createElement(");
+        let tag = self.node(tag_name)?.clone();
+        if let NodeData::Identifier(identifier) = &tag.data
+            && identifier
+                .text
+                .chars()
+                .next()
+                .is_some_and(char::is_lowercase)
+        {
+            write_quoted(&mut self.writer, &identifier.text);
+        } else {
+            self.emit_expression(tag_name, 0)?;
+        }
+        self.writer.write(", ");
+        self.emit_jsx_attributes(attributes, false)?;
+        if let Some(children) = children {
+            for child in &children.nodes {
+                self.writer.write(", ");
+                self.emit_jsx_child(*child, false)?;
+            }
+        }
+        self.writer.write(")");
+        Ok(())
+    }
+
+    fn emit_jsx_attributes(&mut self, id: NodeId, preserve: bool) -> Result<(), EmitError> {
+        let node = self.node(id)?.clone();
+        let NodeData::JsxAttributes(attributes) = &node.data else {
+            return Err(Self::unsupported(id, node.kind));
+        };
+        if preserve {
+            for attribute in &attributes.properties.nodes {
+                let node = self.node(*attribute)?.clone();
+                let NodeData::JsxAttribute(attribute) = &node.data else {
+                    return Err(Self::unsupported(*attribute, node.kind));
+                };
+                self.writer.write(" ");
+                self.emit_expression(attribute.name, 0)?;
+                if let Some(initializer) = attribute.initializer {
+                    self.writer.write("=");
+                    let initializer_node = self.node(initializer)?.clone();
+                    match &initializer_node.data {
+                        NodeData::StringLiteral(value) => {
+                            write_quoted(&mut self.writer, &value.text);
+                        }
+                        NodeData::JsxExpression(value) => {
+                            self.writer.write("{");
+                            if let Some(expression) = value.expression {
+                                self.emit_expression(expression, 0)?;
+                            }
+                            self.writer.write("}");
+                        }
+                        _ => return Err(Self::unsupported(initializer, initializer_node.kind)),
+                    }
+                }
+            }
+            return Ok(());
+        }
+        if attributes.properties.nodes.is_empty() {
+            self.writer.write("null");
+            return Ok(());
+        }
+        self.writer.write("{");
+        for (index, attribute) in attributes.properties.nodes.iter().enumerate() {
+            if index != 0 {
+                self.writer.write(", ");
+            }
+            let node = self.node(*attribute)?.clone();
+            let NodeData::JsxAttribute(attribute) = &node.data else {
+                return Err(Self::unsupported(*attribute, node.kind));
+            };
+            self.emit_expression(attribute.name, 0)?;
+            self.writer.write(": ");
+            if let Some(initializer) = attribute.initializer {
+                let initializer_node = self.node(initializer)?.clone();
+                match &initializer_node.data {
+                    NodeData::StringLiteral(value) => write_quoted(&mut self.writer, &value.text),
+                    NodeData::JsxExpression(value) => {
+                        if let Some(expression) = value.expression {
+                            self.emit_expression(expression, 0)?;
+                        } else {
+                            self.writer.write("undefined");
+                        }
+                    }
+                    _ => return Err(Self::unsupported(initializer, initializer_node.kind)),
+                }
+            } else {
+                self.writer.write("true");
+            }
+        }
+        self.writer.write("}");
+        Ok(())
+    }
+
+    fn emit_jsx_child(&mut self, id: NodeId, preserve: bool) -> Result<(), EmitError> {
+        let node = self.node(id)?.clone();
+        match &node.data {
+            NodeData::JsxText(text) if preserve => self.writer.write(&text.text),
+            NodeData::JsxText(text) => write_quoted(&mut self.writer, &text.text),
+            NodeData::JsxExpression(expression) if preserve => {
+                self.writer.write("{");
+                if let Some(expression) = expression.expression {
+                    self.emit_expression(expression, 0)?;
+                }
+                self.writer.write("}");
+            }
+            NodeData::JsxExpression(expression) => {
+                if let Some(expression) = expression.expression {
+                    self.emit_expression(expression, 0)?;
+                } else {
+                    self.writer.write("undefined");
+                }
+            }
+            NodeData::JsxElement(element) => self.emit_jsx_element(element)?,
+            NodeData::JsxSelfClosingElement(element) => self.emit_jsx_self_closing(element)?,
             _ => return Err(Self::unsupported(id, node.kind)),
         }
         Ok(())
@@ -2587,7 +2758,7 @@ fn binary_precedence(kind: SyntaxKind) -> Option<(u8, bool)> {
 #[cfg(test)]
 mod tests {
     use ts_options::{JsxEmit, ModuleKind, PrinterSettings, ScriptTarget};
-    use ts_parser::parse_source_file;
+    use ts_parser::{parse_jsx_source_file, parse_source_file};
 
     use super::{
         emit_declaration_file, emit_source_file, emit_source_file_with_settings, original_position,
@@ -2620,6 +2791,28 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    fn emit_jsx(source: &str, jsx: JsxEmit) -> String {
+        let parsed = parse_jsx_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        emit_source_file_with_settings(
+            &parsed.arena,
+            parsed.source_file,
+            "input.tsx",
+            source,
+            PrinterSettings {
+                target: ScriptTarget::EsNext,
+                module: ModuleKind::EsNext,
+                jsx,
+                emit_javascript: true,
+                emit_declarations: false,
+                source_map: false,
+                inline_source_map: false,
+            },
+        )
+        .unwrap()
+        .code
     }
 
     #[test]
@@ -2659,6 +2852,20 @@ mod tests {
                 "import main, { read as load, write } from 'pkg'; import 'side'; const value = load({ x: 1 }, [2, 3]); const message = `value=${value}`; export { value as result }; export * from 'other'; export default value;"
             ),
             "import main, { read as load, write } from \"pkg\";\nimport \"side\";\nconst value = load({ x: 1 }, [2, 3]);\nconst message = `value=${value}`;\nexport { value as result };\nexport * from \"other\";\nexport default value;\n"
+        );
+    }
+
+    #[test]
+    fn preserves_and_transforms_jsx_elements() {
+        let source =
+            "const view = <Panel enabled title='hello'><span>{value}</span><Icon /></Panel>;";
+        assert_eq!(
+            emit_jsx(source, JsxEmit::Preserve),
+            "const view = <Panel enabled title=\"hello\"><span>{value}</span><Icon /></Panel>;\n"
+        );
+        assert_eq!(
+            emit_jsx(source, JsxEmit::React),
+            "const view = React.createElement(Panel, {enabled: true, title: \"hello\"}, React.createElement(\"span\", null, value), React.createElement(Icon, null));\n"
         );
     }
 
