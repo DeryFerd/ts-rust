@@ -355,6 +355,9 @@ pub fn emit_source_file_with_context(
                 let NodeData::FunctionDeclaration(function) = &node.data else {
                     continue;
                 };
+                if function.body.is_none() {
+                    continue;
+                }
                 if !declaration_has_modifier(arena, node, SyntaxKind::ExportKeyword) {
                     continue;
                 }
@@ -385,11 +388,13 @@ pub fn emit_source_file_with_context(
         .map_or(0, |node| node.range.start.get());
     let mut reference_owner_start = 0;
     let mut previous_emitted = false;
+    let mut emitted_runtime_statement = false;
     let mut pending_commonjs_imports = Vec::new();
     for statement in &data.statements.nodes {
         let current_emitted = arena
             .get(*statement)
             .is_some_and(|node| printer.statement_emits_runtime(*statement, node));
+        emitted_runtime_statement |= current_emitted;
         let current_is_import = matches!(
             arena.get(*statement).map(|node| &node.data),
             Some(NodeData::ImportDeclaration(_))
@@ -436,6 +441,10 @@ pub fn emit_source_file_with_context(
         printer.writer.write("module.exports = ");
         printer.emit_expression(expression, 0)?;
         printer.writer.write(";");
+        printer.writer.newline();
+    }
+    if settings.module == ModuleKind::None && is_external_module && !emitted_runtime_statement {
+        printer.writer.write("export {};");
         printer.writer.newline();
     }
     let source_map = printer
@@ -2123,6 +2132,14 @@ impl DeclarationPrinter<'_> {
         else {
             return false;
         };
+        if retained.iter().any(|statement| {
+            matches!(
+                self.arena.get(*statement).map(|node| &node.data),
+                Some(NodeData::ExportAssignment(_))
+            )
+        }) {
+            return false;
+        }
         let has_export = retained.iter().any(|statement| {
             self.arena.get(*statement).is_some_and(|node| {
                 declaration_has_modifier(self.arena, node, SyntaxKind::ExportKeyword)
@@ -3755,6 +3772,9 @@ impl Printer<'_> {
                 }
             }
             NodeData::InterfaceDeclaration(_) | NodeData::TypeAliasDeclaration(_) => false,
+            NodeData::ExportAssignment(assignment) => {
+                self.entity_has_runtime_value(assignment.expression, &mut HashSet::new())
+            }
             NodeData::FunctionDeclaration(function) => function.body.is_some(),
             NodeData::ModuleDeclaration(module) => {
                 self.namespace_containers.is_empty()
@@ -4014,6 +4034,11 @@ impl Printer<'_> {
             &node.data,
             NodeData::ExportAssignment(assignment) if assignment.is_export_equals
         ) {
+            return Ok(());
+        }
+        if let NodeData::ExportAssignment(assignment) = &node.data
+            && !self.entity_has_runtime_value(assignment.expression, &mut HashSet::new())
+        {
             return Ok(());
         }
         match &node.data {
@@ -6420,23 +6445,20 @@ impl Printer<'_> {
     }
 
     fn commonjs_export_initializer_can_be_direct(&self, initializer: NodeId) -> bool {
-        let simple_literal = matches!(
-            self.arena.get(initializer).map(|node| &node.data),
-            Some(
-                NodeData::NumericLiteral(_)
-                    | NodeData::BigIntLiteral(_)
-                    | NodeData::StringLiteral(_)
-                    | NodeData::NoSubstitutionTemplateLiteral(_)
-                    | NodeData::KeywordExpression(_)
-            )
-        );
-        let object_literal = matches!(
-            self.arena.get(initializer).map(|node| &node.data),
-            Some(NodeData::ObjectLiteralExpression(_))
-        );
         self.expression_uses_commonjs_default_import(initializer)
-            || object_literal
-            || simple_literal
+            || matches!(
+                self.arena.get(initializer).map(|node| &node.data),
+                Some(
+                    NodeData::Identifier(_)
+                        | NodeData::CallExpression(_)
+                        | NodeData::ObjectLiteralExpression(_)
+                        | NodeData::NumericLiteral(_)
+                        | NodeData::BigIntLiteral(_)
+                        | NodeData::StringLiteral(_)
+                        | NodeData::NoSubstitutionTemplateLiteral(_)
+                        | NodeData::KeywordExpression(_)
+                )
+            )
     }
 
     fn expression_uses_commonjs_default_import(&self, expression: NodeId) -> bool {
@@ -6456,6 +6478,28 @@ impl Printer<'_> {
             }
             false
         })
+    }
+
+    fn commonjs_call_requires_unbound_receiver(&self, expression: NodeId) -> bool {
+        let Some(NodeData::Identifier(identifier)) =
+            self.arena.get(expression).map(|node| &node.data)
+        else {
+            return false;
+        };
+        let Some(symbol) = self.bindings.resolve_name_at(expression, &identifier.text) else {
+            return false;
+        };
+        self.identifier_rewrites.contains_key(&symbol)
+            && self.bindings.symbols.get(symbol).is_some_and(|symbol| {
+                symbol.declarations.iter().any(|declaration| {
+                    matches!(
+                        self.arena.get(*declaration).map(|node| &node.data),
+                        Some(NodeData::ImportSpecifier(specifier))
+                            if !specifier.is_type_only
+                                && !self.commonjs_import_specifier_is_default(*declaration)
+                    )
+                })
+            })
     }
 
     fn import_binding_is_used(&self, name: NodeId) -> bool {
@@ -6819,7 +6863,15 @@ impl Printer<'_> {
                         parent_precedence,
                     )?;
                 } else {
+                    let unbound_receiver = self.commonjs_module_transform
+                        && self.commonjs_call_requires_unbound_receiver(data.expression);
+                    if unbound_receiver {
+                        self.writer.write("(0, ");
+                    }
                     self.emit_expression(data.expression, 18)?;
+                    if unbound_receiver {
+                        self.writer.write(")");
+                    }
                     if data.question_dot_token.is_some() {
                         self.writer.write("?.");
                     }
@@ -9818,6 +9870,24 @@ class Board {
     }
 
     #[test]
+    fn emits_unbound_named_import_calls_directly_to_commonjs_exports() {
+        let source = "import { vextend } from './func';\nexport var a = vextend({ watch: {} });";
+        assert_eq!(
+            emit_with(source, ScriptTarget::Es2015, ModuleKind::CommonJs).code,
+            "\"use strict\";\nObject.defineProperty(exports, \"__esModule\", { value: true });\nexports.a = void 0;\nconst func_1 = require(\"./func\");\nexports.a = (0, func_1.vextend)({ watch: {} });\n"
+        );
+    }
+
+    #[test]
+    fn preserves_an_erased_external_module_with_an_empty_export() {
+        let source = "export declare namespace Foo { export var static: any; }";
+        assert_eq!(
+            emit_with(source, ScriptTarget::Es2015, ModuleKind::None).code,
+            "export {};\n"
+        );
+    }
+
+    #[test]
     fn preinitializes_local_named_exports_by_their_exported_runtime_name() {
         let runtime = emit_with(
             "import value from './dep'; export { value as result };",
@@ -10331,6 +10401,37 @@ class Board {
                 "}\n",
                 "export {};\n",
             )
+        );
+    }
+
+    #[test]
+    fn export_assignment_prevents_a_redundant_declaration_scope_seal() {
+        let source = "interface Color { c: string; }\nexport default Color;";
+        let parsed = parse_source_file(source);
+        let NodeData::SourceFile(file) = &parsed.arena.get(parsed.source_file).unwrap().data else {
+            panic!("expected source file");
+        };
+        let reachability = BTreeMap::from([(
+            parsed.source_file,
+            file.statements
+                .nodes
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>(),
+        )]);
+        assert_eq!(
+            emit_declaration_file_with_reachability(
+                &parsed.arena,
+                parsed.source_file,
+                "input.ts",
+                source,
+                false,
+                Some(&reachability),
+                None,
+            )
+            .unwrap()
+            .code,
+            "interface Color {\n    c: string;\n}\nexport default Color;\n"
         );
     }
 }
