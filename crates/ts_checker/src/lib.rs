@@ -7044,32 +7044,6 @@ fn describe_declaration_symbol(
     }) {
         return Some(describe_alias(source, alias));
     }
-    if let Some(variable) = declarations.iter().find_map(|node| {
-        let NodeData::VariableDeclaration(variable) = &node.data else {
-            return None;
-        };
-        Some(variable.as_ref())
-    }) {
-        let type_id = if let Some(result) = result
-            && let Some(type_id) = result.type_of_symbol(symbol_id)
-        {
-            type_id
-        } else {
-            let annotation = variable.type_?;
-            if let Some(NodeData::TypeReferenceNode(reference)) =
-                source.arena.get(annotation).map(|node| &node.data)
-                && let Some(target) =
-                    ProgramChecker::resolve_entity_symbol(source, reference.type_name)
-                && target != symbol_id
-            {
-                return describe_declaration_symbol(source, None, target);
-            }
-            let mut checker = Checker::new(source.arena, source.bindings);
-            let type_id = checker.type_from_type_node(annotation);
-            return Some(describe_type(&checker.result.types, type_id));
-        };
-        return result.map(|result| describe_checked_type(result, type_id));
-    }
     let function_declarations = declarations
         .iter()
         .filter_map(|node| {
@@ -7111,7 +7085,7 @@ fn describe_declaration_symbol(
         let (parameters, arguments) =
             descriptor_parameters(&mut checker, first.type_parameters.as_ref());
         let mut properties = BTreeMap::new();
-        for declaration in declarations {
+        for declaration in &declarations {
             let NodeData::InterfaceDeclaration(data) = &declaration.data else {
                 continue;
             };
@@ -7130,14 +7104,56 @@ fn describe_declaration_symbol(
             ..ObjectType::default()
         }));
         let body = describe_type(&checker.result.types, body);
-        return Some(if parameters.is_empty() {
+        let mut descriptor = if parameters.is_empty() {
             body
         } else {
             TypeDescriptor::Alias {
                 parameters,
                 body: Box::new(body),
             }
-        });
+        };
+        if let Some(variable) = declarations.iter().find_map(|node| {
+            let NodeData::VariableDeclaration(variable) = &node.data else {
+                return None;
+            };
+            Some(variable.as_ref())
+        }) && let Some(NodeData::TypeReferenceNode(reference)) = variable
+            .type_
+            .and_then(|annotation| source.arena.get(annotation))
+            .map(|node| &node.data)
+            && let Some(target) = ProgramChecker::resolve_entity_symbol(source, reference.type_name)
+            && target != symbol_id
+            && let Some(static_descriptor) = describe_declaration_symbol(source, None, target)
+        {
+            merge_global_descriptor(&mut descriptor, static_descriptor);
+        }
+        return Some(descriptor);
+    }
+    if let Some(variable) = declarations.iter().find_map(|node| {
+        let NodeData::VariableDeclaration(variable) = &node.data else {
+            return None;
+        };
+        Some(variable.as_ref())
+    }) {
+        let type_id = if let Some(result) = result
+            && let Some(type_id) = result.type_of_symbol(symbol_id)
+        {
+            type_id
+        } else {
+            let annotation = variable.type_?;
+            if let Some(NodeData::TypeReferenceNode(reference)) =
+                source.arena.get(annotation).map(|node| &node.data)
+                && let Some(target) =
+                    ProgramChecker::resolve_entity_symbol(source, reference.type_name)
+                && target != symbol_id
+            {
+                return describe_declaration_symbol(source, None, target);
+            }
+            let mut checker = Checker::new(source.arena, source.bindings);
+            let type_id = checker.type_from_type_node(annotation);
+            return Some(describe_type(&checker.result.types, type_id));
+        };
+        return result.map(|result| describe_checked_type(result, type_id));
     }
     let class = declarations.iter().find_map(|node| {
         let NodeData::ClassDeclaration(data) = &node.data else {
@@ -7496,6 +7512,34 @@ fn merge_global_descriptor(existing: &mut TypeDescriptor, new: TypeDescriptor) {
             existing_optional.extend(new_optional);
             existing_readonly.extend(new_readonly);
             existing_getters.extend(new_getters);
+        }
+        (
+            TypeDescriptor::Alias { body, .. },
+            TypeDescriptor::Object {
+                properties: new,
+                optional_properties: new_optional,
+                readonly_properties: new_readonly,
+                getter_properties: new_getters,
+            },
+        ) => {
+            if let TypeDescriptor::Object {
+                properties: existing,
+                optional_properties: existing_optional,
+                readonly_properties: existing_readonly,
+                getter_properties: existing_getters,
+            } = body.as_mut()
+            {
+                for (name, descriptor) in new {
+                    if let Some(existing) = existing.get_mut(&name) {
+                        merge_global_descriptor(existing, descriptor);
+                    } else {
+                        existing.insert(name, descriptor);
+                    }
+                }
+                existing_optional.extend(new_optional);
+                existing_readonly.extend(new_readonly);
+                existing_getters.extend(new_getters);
+            }
         }
         (
             TypeDescriptor::Alias {
@@ -8972,12 +9016,18 @@ mod tests {
             r"
                 interface DateConstructor { now(): number; }
                 declare var Date: DateConstructor;
+                interface Collection<T> { item: T; }
+                interface CollectionConstructor { create(): Collection<number>; }
+                declare var Collection: CollectionConstructor;
             ",
         );
         let consumer = parse_source_file(
             r"
                 class Clock { static now(): number { return 1; } }
                 const clockNow = Clock.now();
+                declare const collection: Collection<number>;
+                const collectionItem = collection.item;
+                Collection.create();
                 export function makeTimestamped() {
                     return class {
                         timestamp = Date.now();
@@ -9037,6 +9087,16 @@ mod tests {
             .unwrap();
         assert_eq!(
             checked.files[1].type_of_symbol(clock_now),
+            Some(checked.files[1].types.number())
+        );
+        let collection_item = consumer_bindings
+            .root_scope()
+            .unwrap()
+            .symbols
+            .get("collectionItem")
+            .unwrap();
+        assert_eq!(
+            checked.files[1].type_of_symbol(collection_item),
             Some(checked.files[1].types.number())
         );
         let make = consumer_bindings
