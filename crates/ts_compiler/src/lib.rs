@@ -474,6 +474,7 @@ impl Program {
                 }
             }
             if settings.emit_declarations {
+                let declaration_node_types = declaration_node_types_for_emit(source_file);
                 match emit_declaration_file_with_semantics(
                     &source_file.parse.arena,
                     source_file.parse.source_file,
@@ -483,7 +484,7 @@ impl Program {
                     Some(&source_file.checking.declaration_reachability),
                     Some(&enum_member_values),
                     Some(&source_file.checking.types),
-                    Some(&source_file.checking.node_types),
+                    Some(&declaration_node_types),
                     Some(&source_file.checking.import_type_references),
                 ) {
                     Ok(mut emitted) => {
@@ -630,6 +631,7 @@ impl Program {
                     u32::try_from(code.bytes().filter(|byte| *byte == b'\n').count())
                         .unwrap_or(u32::MAX);
                 let enum_member_values = enum_values_for_emit(&source.checking.enum_member_values);
+                let declaration_node_types = declaration_node_types_for_emit(source);
                 match emit_declaration_file_with_semantics(
                     &source.parse.arena,
                     source.parse.source_file,
@@ -639,7 +641,7 @@ impl Program {
                     Some(&source.checking.declaration_reachability),
                     Some(&enum_member_values),
                     Some(&source.checking.types),
-                    Some(&source.checking.node_types),
+                    Some(&declaration_node_types),
                     Some(&source.checking.import_type_references),
                 ) {
                     Ok(emitted) => {
@@ -1063,6 +1065,25 @@ fn enum_values_for_emit(
             (*node, value)
         })
         .collect()
+}
+
+fn declaration_node_types_for_emit(source: &SourceFile) -> BTreeMap<NodeId, ts_checker::TypeId> {
+    let mut node_types = source.checking.node_types.clone();
+    for (id, node) in source.parse.arena.iter() {
+        if !matches!(node.data, NodeData::FunctionDeclaration(_)) || node_types.contains_key(&id) {
+            continue;
+        }
+        let Some(type_id) = source
+            .binding
+            .node_symbols
+            .get(&id)
+            .and_then(|symbol| source.checking.type_of_symbol(*symbol))
+        else {
+            continue;
+        };
+        node_types.insert(id, type_id);
+    }
+    node_types
 }
 
 fn base64_encode(bytes: &[u8]) -> String {
@@ -3761,6 +3782,40 @@ mod tests {
                 "export namespace t2 {\n    let v: string;\n    let setter: any;\n}\n",
                 "export namespace t3 {\n    let p_1: string;\n    export { p_1 as p };\n    export let value: string;\n}\n",
             )
+        );
+    }
+
+    #[test]
+    fn javascript_declaration_emit_hoists_functions_before_object_namespaces() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/a.js",
+            "const foo = { f1: (params) => { } };\nfunction f2(x) { foo.f1({ x }); }",
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["a.js".to_owned()],
+            CompilerOptions {
+                allow_js: true,
+                check_js: true,
+                declaration: true,
+                emit_declaration_only: true,
+                no_lib: true,
+                target: ScriptTarget::Es2015,
+                ..CompilerOptions::default()
+            },
+        );
+        let declaration = program
+            .emit()
+            .files
+            .into_iter()
+            .find(|file| file.file_name == "/project/a.d.ts")
+            .unwrap();
+        assert_eq!(
+            declaration.text,
+            "declare function f2(x: any): void;\ndeclare namespace foo {\n    function f1(params: any): void;\n}\n"
         );
     }
 

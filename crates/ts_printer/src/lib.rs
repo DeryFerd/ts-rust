@@ -6,7 +6,7 @@ use std::fmt;
 
 use ts_ast::{Node, NodeArena, NodeData, NodeId, NodeList, SymbolId, SyntaxKind};
 use ts_binder::{BindResult, bind_source_file};
-use ts_checker::{ImportTypeReference, ObjectType, TypeArena, TypeId, TypeKind};
+use ts_checker::{FunctionType, ImportTypeReference, ObjectType, TypeArena, TypeId, TypeKind};
 use ts_options::{JsxEmit, ModuleKind, PrinterSettings, ScriptTarget};
 use ts_sourcemap::{SourceMap, SourceMapBuilder};
 
@@ -1054,8 +1054,16 @@ pub fn emit_declaration_file_with_semantics(
             .node(*statement)
             .is_ok_and(|node| declaration_is_module_indicator(printer.arena, node))
     });
+    let mut deferred_javascript_namespaces = Vec::new();
     for statement in &data.statements.nodes {
-        printer.emit_statement(*statement, false, source_file)?;
+        if printer.is_javascript_object_namespace_statement(*statement) {
+            deferred_javascript_namespaces.push(*statement);
+        } else {
+            printer.emit_statement(*statement, false, source_file)?;
+        }
+    }
+    for statement in deferred_javascript_namespaces {
+        printer.emit_statement(statement, false, source_file)?;
     }
     if printer.scope_needs_seal(source_file) {
         printer.writer.write("export {};");
@@ -1168,7 +1176,25 @@ impl DeclarationPrinter<'_> {
                 }
                 self.emit_type_parameters(data.type_parameters.as_ref())?;
                 self.emit_parameters(&data.parameters)?;
-                self.emit_return_type(data.type_)?;
+                if data.type_.is_none()
+                    && self.javascript_source
+                    && let Some(return_type) = self
+                        .node_types
+                        .and_then(|types| types.get(&id).copied())
+                        .and_then(|type_id| self.semantic_types?.get(type_id))
+                        .and_then(|type_| match &type_.kind {
+                            TypeKind::Function(signature) => Some(signature.return_type),
+                            TypeKind::Overload(signatures) => {
+                                signatures.first().map(|signature| signature.return_type)
+                            }
+                            _ => None,
+                        })
+                {
+                    self.writer.write(": ");
+                    self.emit_semantic_type(return_type)?;
+                } else {
+                    self.emit_return_type(data.type_)?;
+                }
                 self.writer.write(";");
             }
             NodeData::ClassDeclaration(data) => {
@@ -1446,9 +1472,7 @@ impl DeclarationPrinter<'_> {
         statement: &Node,
         list: NodeId,
     ) -> Result<bool, EmitError> {
-        if !self.javascript_source
-            || !declaration_has_modifier(self.arena, statement, SyntaxKind::ExportKeyword)
-        {
+        if !self.javascript_source {
             return Ok(false);
         }
         let Some(NodeData::VariableDeclarationList(list)) =
@@ -1478,14 +1502,51 @@ impl DeclarationPrinter<'_> {
             if index != 0 {
                 self.writer.newline();
             }
-            self.emit_javascript_object_namespace(*declaration_id)?;
+            self.emit_javascript_object_namespace(
+                *declaration_id,
+                declaration_has_modifier(self.arena, statement, SyntaxKind::ExportKeyword),
+            )?;
         }
         Ok(true)
     }
 
+    fn is_javascript_object_namespace_statement(&self, statement: NodeId) -> bool {
+        if !self.javascript_source {
+            return false;
+        }
+        let Some(NodeData::VariableStatement(statement)) =
+            self.arena.get(statement).map(|node| &node.data)
+        else {
+            return false;
+        };
+        let Some(NodeData::VariableDeclarationList(list)) = self
+            .arena
+            .get(statement.declaration_list)
+            .map(|node| &node.data)
+        else {
+            return false;
+        };
+        !list.declarations.nodes.is_empty()
+            && list.declarations.nodes.iter().all(|declaration| {
+                matches!(
+                    self.arena.get(*declaration).map(|node| &node.data),
+                    Some(NodeData::VariableDeclaration(declaration))
+                        if matches!(
+                            declaration
+                                .initializer
+                                .and_then(|initializer| self.arena.get(initializer))
+                                .map(|node| &node.data),
+                            Some(NodeData::ObjectLiteralExpression(_))
+                        )
+                )
+            })
+    }
+
+    #[allow(clippy::too_many_lines)]
     fn emit_javascript_object_namespace(
         &mut self,
         declaration_id: NodeId,
+        exported: bool,
     ) -> Result<(), EmitError> {
         let declaration_node = self.node(declaration_id)?.clone();
         let NodeData::VariableDeclaration(declaration) = &declaration_node.data else {
@@ -1507,7 +1568,11 @@ impl DeclarationPrinter<'_> {
                 _ => None,
             })
             .unwrap_or_default();
-        self.writer.write("export namespace ");
+        self.writer.write(if exported {
+            "export namespace "
+        } else {
+            "declare namespace "
+        });
         self.emit_name(declaration.name)?;
         self.writer.write(" {");
         self.writer.newline();
@@ -1536,17 +1601,24 @@ impl DeclarationPrinter<'_> {
             let Some(node) = self.arena.get(*property) else {
                 continue;
             };
-            let (name_node, getter_only) = match &node.data {
-                NodeData::PropertyAssignment(property) => (property.name, false),
-                NodeData::ShorthandPropertyAssignment(property) => (property.name, false),
+            let (name_node, getter_only, function_initializer) = match &node.data {
+                NodeData::PropertyAssignment(property) => {
+                    let function_initializer = matches!(
+                        self.arena.get(property.initializer).map(|node| &node.data),
+                        Some(NodeData::ArrowFunction(_) | NodeData::FunctionExpression(_))
+                    )
+                    .then_some(property.initializer);
+                    (property.name, false, function_initializer)
+                }
+                NodeData::ShorthandPropertyAssignment(property) => (property.name, false, None),
                 NodeData::GetAccessorDeclaration(accessor) => {
                     let Some(name) = declaration_name_text(self.arena, accessor.name) else {
                         continue;
                     };
                     let halves = accessor_halves.get(name).copied().unwrap_or_default();
-                    (accessor.name, halves.0 && !halves.1)
+                    (accessor.name, halves.0 && !halves.1, None)
                 }
-                NodeData::SetAccessorDeclaration(accessor) => (accessor.name, false),
+                NodeData::SetAccessorDeclaration(accessor) => (accessor.name, false, None),
                 _ => continue,
             };
             let Some(exported_name) = declaration_name_text(self.arena, name_node) else {
@@ -1557,6 +1629,26 @@ impl DeclarationPrinter<'_> {
             }
             let local_name = self.generate_declaration_name(exported_name);
             let renamed = local_name != exported_name;
+            let semantic_type = semantic_object
+                .properties
+                .get(exported_name)
+                .copied()
+                .and_then(|type_id| self.semantic_types?.get(type_id))
+                .map(|type_| type_.kind.clone());
+            if let (Some(initializer), Some(TypeKind::Function(signature))) =
+                (function_initializer, semantic_type.as_ref())
+            {
+                self.emit_javascript_namespace_function(&local_name, initializer, signature)?;
+                if renamed {
+                    self.writer.write("export { ");
+                    self.writer.write(&local_name);
+                    self.writer.write(" as ");
+                    self.emit_semantic_property_name(exported_name);
+                    self.writer.write(" };");
+                    self.writer.newline();
+                }
+                continue;
+            }
             let paired_accessor = accessor_halves
                 .get(exported_name)
                 .is_some_and(|(getter, setter)| *getter && *setter);
@@ -1585,6 +1677,44 @@ impl DeclarationPrinter<'_> {
         }
         self.writer.indent -= 1;
         self.writer.write("}");
+        Ok(())
+    }
+
+    fn emit_javascript_namespace_function(
+        &mut self,
+        name: &str,
+        initializer: NodeId,
+        signature: &FunctionType,
+    ) -> Result<(), EmitError> {
+        let initializer_node = self.node(initializer)?.clone();
+        let parameters = match &initializer_node.data {
+            NodeData::ArrowFunction(function) => function.parameters.clone(),
+            NodeData::FunctionExpression(function) => function.parameters.clone(),
+            _ => return Err(Self::unsupported(initializer, initializer_node.kind)),
+        };
+        self.writer.write("function ");
+        self.writer.write(name);
+        self.writer.write("(");
+        for (index, parameter) in parameters.nodes.iter().enumerate() {
+            if index != 0 {
+                self.writer.write(", ");
+            }
+            let node = self.node(*parameter)?.clone();
+            let NodeData::ParameterDeclaration(parameter) = &node.data else {
+                return Err(Self::unsupported(*parameter, node.kind));
+            };
+            self.emit_name(parameter.name)?;
+            self.writer.write(": ");
+            if let Some(type_id) = signature.parameters.get(index) {
+                self.emit_semantic_type(*type_id)?;
+            } else {
+                self.writer.write("any");
+            }
+        }
+        self.writer.write("): ");
+        self.emit_semantic_type(signature.return_type)?;
+        self.writer.write(";");
+        self.writer.newline();
         Ok(())
     }
 
