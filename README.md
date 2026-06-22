@@ -16,6 +16,7 @@ against the upstream TypeScript fixtures independently:
 - `ts_options`: normalized compiler options
 - `ts_outputpaths`: JavaScript/declaration output path calculation
 - `ts_semver`: npm-style semantic versions and package range matching
+- `ts_jsnum`: JavaScript number operations, formatting, and pseudo-bigints
 - `ts_compiler`: Program graph, diagnostics, checking, and emit orchestration
 - `ts_printer` / `ts_sourcemap`: target-aware JavaScript and source-map emission
 - `ts_bundled`: the pinned TypeScript default-library declarations
