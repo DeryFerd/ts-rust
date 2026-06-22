@@ -133,15 +133,30 @@ impl Program {
         resolution_options: ResolutionOptions,
     ) {
         let resolver = Resolver::new(file_system, resolution_options);
+        let mut ambient_modules = BTreeMap::new();
+        for source_file in &self.source_files {
+            register_ambient_external_modules(
+                source_file,
+                &self.current_directory,
+                self.case_sensitivity,
+                &mut ambient_modules,
+            );
+        }
         let mut file_index = 0;
         while file_index < self.source_files.len() {
             if self.source_files[file_index].is_default_library {
                 file_index += 1;
                 continue;
             }
+            register_ambient_external_modules(
+                &self.source_files[file_index],
+                &self.current_directory,
+                self.case_sensitivity,
+                &mut ambient_modules,
+            );
             let containing_file = self.source_files[file_index].file_name.clone();
             let specifiers = module_specifiers(&self.source_files[file_index].parse);
-            for (specifier, range) in specifiers {
+            for (specifier, range, is_import_equals) in specifiers {
                 let result = resolver.resolve(&specifier, &containing_file);
                 if let Some(resolved) = result.resolved {
                     let containing = canonicalize(
@@ -157,6 +172,17 @@ impl Program {
                     self.resolved_modules
                         .insert((containing, specifier.clone()), target);
                     self.load_file(file_system, &resolved.resolved_file_name, false);
+                } else if is_import_equals
+                    && !module_name_is_relative(&specifier)
+                    && let Some(target) = ambient_modules.get(&specifier)
+                {
+                    let containing = canonicalize(
+                        &containing_file,
+                        &self.current_directory,
+                        self.case_sensitivity,
+                    );
+                    self.resolved_modules
+                        .insert((containing, specifier.clone()), target.clone());
                 } else if !self.options.no_check {
                     self.diagnostics.push(module_not_found_diagnostic(
                         &containing_file,
@@ -975,13 +1001,14 @@ fn base64_encode(bytes: &[u8]) -> String {
     encoded
 }
 
-fn module_specifiers(parse: &ParseResult) -> Vec<(String, TextRange)> {
+fn module_specifiers(parse: &ParseResult) -> Vec<(String, TextRange, bool)> {
     parse
         .arena
         .iter()
         .filter_map(|(_, node)| match &node.data {
             NodeData::ImportDeclaration(data) => {
                 string_literal(&parse.arena, data.module_specifier)
+                    .map(|(specifier, range)| (specifier, range, false))
             }
             NodeData::ImportEqualsDeclaration(data) => parse
                 .arena
@@ -991,13 +1018,117 @@ fn module_specifiers(parse: &ParseResult) -> Vec<(String, TextRange)> {
                         string_literal(&parse.arena, reference.expression)
                     }
                     _ => None,
-                }),
+                })
+                .map(|(specifier, range)| (specifier, range, true)),
             NodeData::ExportDeclaration(data) => data
                 .module_specifier
-                .and_then(|specifier| string_literal(&parse.arena, specifier)),
+                .and_then(|specifier| string_literal(&parse.arena, specifier))
+                .map(|(specifier, range)| (specifier, range, false)),
             _ => None,
         })
         .collect()
+}
+
+fn register_ambient_external_modules(
+    source_file: &SourceFile,
+    current_directory: &str,
+    case_sensitivity: CaseSensitivity,
+    modules: &mut BTreeMap<String, String>,
+) {
+    if source_file.is_default_library || source_file_is_external_module(&source_file.parse) {
+        return;
+    }
+    let Some(NodeData::SourceFile(source)) = source_file
+        .parse
+        .arena
+        .get(source_file.parse.source_file)
+        .map(|node| &node.data)
+    else {
+        return;
+    };
+    let target = canonicalize(&source_file.file_name, current_directory, case_sensitivity);
+    for statement in &source.statements.nodes {
+        let Some(node) = source_file.parse.arena.get(*statement) else {
+            continue;
+        };
+        let NodeData::ModuleDeclaration(module) = &node.data else {
+            continue;
+        };
+        if !node_has_modifier(
+            &source_file.parse.arena,
+            module.modifiers.as_ref(),
+            ts_ast::SyntaxKind::DeclareKeyword,
+        ) {
+            continue;
+        }
+        let Some((name, _)) = string_literal(&source_file.parse.arena, module.name) else {
+            continue;
+        };
+        if !module_name_is_relative(&name) {
+            modules.entry(name).or_insert_with(|| target.clone());
+        }
+    }
+}
+
+fn source_file_is_external_module(parse: &ParseResult) -> bool {
+    let Some(NodeData::SourceFile(source)) =
+        parse.arena.get(parse.source_file).map(|node| &node.data)
+    else {
+        return false;
+    };
+    source.statements.nodes.iter().any(|statement| {
+        let Some(node) = parse.arena.get(*statement) else {
+            return false;
+        };
+        matches!(
+            node.data,
+            NodeData::ImportDeclaration(_)
+                | NodeData::ImportEqualsDeclaration(_)
+                | NodeData::ExportDeclaration(_)
+                | NodeData::ExportAssignment(_)
+        ) || declaration_modifiers(node).is_some_and(|modifiers| {
+            node_has_modifier(
+                &parse.arena,
+                Some(modifiers),
+                ts_ast::SyntaxKind::ExportKeyword,
+            )
+        })
+    })
+}
+
+fn declaration_modifiers(node: &ts_ast::Node) -> Option<&ts_ast::ModifierList> {
+    match &node.data {
+        NodeData::VariableStatement(data) => data.modifiers.as_ref(),
+        NodeData::FunctionDeclaration(data) => data.modifiers.as_ref(),
+        NodeData::ClassDeclaration(data) => data.modifiers.as_ref(),
+        NodeData::InterfaceDeclaration(data) => data.modifiers.as_ref(),
+        NodeData::TypeAliasDeclaration(data) => data.modifiers.as_ref(),
+        NodeData::EnumDeclaration(data) => data.modifiers.as_ref(),
+        NodeData::ModuleDeclaration(data) => data.modifiers.as_ref(),
+        NodeData::ImportEqualsDeclaration(data) => data.modifiers.as_ref(),
+        _ => None,
+    }
+}
+
+fn node_has_modifier(
+    arena: &ts_ast::NodeArena,
+    modifiers: Option<&ts_ast::ModifierList>,
+    kind: ts_ast::SyntaxKind,
+) -> bool {
+    modifiers.is_some_and(|modifiers| {
+        modifiers
+            .list
+            .nodes
+            .iter()
+            .any(|modifier| arena.get(*modifier).is_some_and(|node| node.kind == kind))
+    })
+}
+
+fn module_name_is_relative(name: &str) -> bool {
+    name.starts_with("./")
+        || name.starts_with("../")
+        || name.starts_with(".\\")
+        || name.starts_with("..\\")
 }
 
 fn string_literal(arena: &ts_ast::NodeArena, id: NodeId) -> Option<(String, TextRange)> {
@@ -1532,6 +1663,94 @@ mod tests {
                 .filter(|diagnostic| diagnostic.code == Some(2307))
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn resolves_import_equals_against_top_level_ambient_modules() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/ambient.ts",
+            r#"declare module "M" { const value: number; }"#,
+        )
+        .unwrap();
+        fs.write_file("/project/main.ts", r#"import M = require("M"); M.value;"#)
+            .unwrap();
+
+        let program = Program::new_with_module_resolution(
+            &fs,
+            "/project",
+            &["main.ts".to_owned(), "ambient.ts".to_owned()],
+            ts_module::ResolutionOptions::default(),
+        );
+        assert!(
+            !program
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code == Some(2307)),
+            "{:?}",
+            program.diagnostics()
+        );
+        assert_eq!(
+            program
+                .resolved_modules
+                .get(&("/project/main.ts".to_owned(), "M".to_owned()))
+                .map(String::as_str),
+            Some("/project/ambient.ts")
+        );
+    }
+
+    #[test]
+    fn relative_ambient_module_names_do_not_satisfy_resolution() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/ambient.ts",
+            r#"declare module "./M" { const value: number; }"#,
+        )
+        .unwrap();
+        fs.write_file("/project/main.ts", r#"import M = require("./M"); M.value;"#)
+            .unwrap();
+
+        let program = Program::new_with_module_resolution(
+            &fs,
+            "/project",
+            &["main.ts".to_owned(), "ambient.ts".to_owned()],
+            ts_module::ResolutionOptions::default(),
+        );
+        assert!(
+            program
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code == Some(2307)),
+            "{:?}",
+            program.diagnostics()
+        );
+    }
+
+    #[test]
+    fn module_augmentations_do_not_satisfy_ambient_resolution() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/augmentation.ts",
+            r#"export {}; declare module "M" { const value: number; }"#,
+        )
+        .unwrap();
+        fs.write_file("/project/main.ts", r#"import M = require("M"); M.value;"#)
+            .unwrap();
+
+        let program = Program::new_with_module_resolution(
+            &fs,
+            "/project",
+            &["main.ts".to_owned(), "augmentation.ts".to_owned()],
+            ts_module::ResolutionOptions::default(),
+        );
+        assert!(
+            program
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code == Some(2307)),
+            "{:?}",
+            program.diagnostics()
         );
     }
 
