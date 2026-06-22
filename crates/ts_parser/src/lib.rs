@@ -18,9 +18,9 @@ use ts_ast::{
     InferTypeNodeData, InterfaceDeclarationData, IntersectionTypeNodeData, JsDocData,
     JsDocTextData, JsDocUnknownTagData, JsxAttributeData, JsxAttributesData, JsxClosingElementData,
     JsxElementData, JsxExpressionData, JsxOpeningElementData, JsxSelfClosingElementData,
-    JsxTextData, KeywordExpressionData, KeywordTypeNodeData, LiteralTypeNodeData,
-    MappedTypeNodeData, MethodDeclarationData, MethodSignatureDeclarationData, ModifierList,
-    ModuleBlockData, ModuleDeclarationData, NamedExportsData, NamedImportsData,
+    JsxSpreadAttributeData, JsxTextData, KeywordExpressionData, KeywordTypeNodeData,
+    LiteralTypeNodeData, MappedTypeNodeData, MethodDeclarationData, MethodSignatureDeclarationData,
+    ModifierList, ModuleBlockData, ModuleDeclarationData, NamedExportsData, NamedImportsData,
     NamespaceImportData, NewExpressionData, NoSubstitutionTemplateLiteralData, Node, NodeArena,
     NodeData, NodeFlags, NodeId, NodeList, NonNullExpressionData, NumericLiteralData,
     ObjectLiteralExpressionData, ParameterDeclarationData, ParenthesizedExpressionData,
@@ -3703,8 +3703,29 @@ impl<'a> Parser<'a> {
     fn parse_jsx_attributes(&mut self) -> NodeId {
         let start = self.current.full_start;
         let mut attributes = Vec::new();
-        while self.current.kind == SyntaxKind::Identifier {
+        while matches!(
+            self.current.kind,
+            SyntaxKind::Identifier | SyntaxKind::OpenBraceToken
+        ) {
             let attribute_start = self.current.range.start;
+            if self.current.kind == SyntaxKind::OpenBraceToken {
+                self.bump();
+                self.expect_and_bump(SyntaxKind::DotDotDotToken, "Expected '...'.");
+                let expression = self.parse_binary_expression(0);
+                let end = if self.current.kind == SyntaxKind::CloseBraceToken {
+                    self.consume().range.end
+                } else {
+                    self.error_current("Expected '}'.");
+                    self.node_end(expression)
+                };
+                attributes.push(self.alloc_node(
+                    SyntaxKind::JsxSpreadAttribute,
+                    TextRange::new(attribute_start, end),
+                    NodeData::JsxSpreadAttribute(Box::new(JsxSpreadAttributeData { expression })),
+                    &[expression],
+                ));
+                continue;
+            }
             let name = self.parse_identifier("Expected a JSX attribute name.");
             let initializer = if self.current.kind == SyntaxKind::EqualsToken {
                 self.bump();

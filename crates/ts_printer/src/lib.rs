@@ -2201,11 +2201,7 @@ impl Printer<'_> {
             self.writer.write(">");
             return Ok(());
         }
-        self.emit_react_create_element(
-            opening.tag_name,
-            opening.attributes,
-            Some(&data.children),
-        )
+        self.emit_react_create_element(opening.tag_name, opening.attributes, Some(&data.children))
     }
 
     fn emit_jsx_self_closing(
@@ -2261,27 +2257,39 @@ impl Printer<'_> {
         if preserve {
             for attribute in &attributes.properties.nodes {
                 let node = self.node(*attribute)?.clone();
-                let NodeData::JsxAttribute(attribute) = &node.data else {
-                    return Err(Self::unsupported(*attribute, node.kind));
-                };
-                self.writer.write(" ");
-                self.emit_expression(attribute.name, 0)?;
-                if let Some(initializer) = attribute.initializer {
-                    self.writer.write("=");
-                    let initializer_node = self.node(initializer)?.clone();
-                    match &initializer_node.data {
-                        NodeData::StringLiteral(value) => {
-                            write_quoted(&mut self.writer, &value.text);
-                        }
-                        NodeData::JsxExpression(value) => {
-                            self.writer.write("{");
-                            if let Some(expression) = value.expression {
-                                self.emit_expression(expression, 0)?;
+                match &node.data {
+                    NodeData::JsxAttribute(attribute) => {
+                        self.writer.write(" ");
+                        self.emit_expression(attribute.name, 0)?;
+                        if let Some(initializer) = attribute.initializer {
+                            self.writer.write("=");
+                            let initializer_node = self.node(initializer)?.clone();
+                            match &initializer_node.data {
+                                NodeData::StringLiteral(value) => {
+                                    write_quoted(&mut self.writer, &value.text);
+                                }
+                                NodeData::JsxExpression(value) => {
+                                    self.writer.write("{");
+                                    if let Some(expression) = value.expression {
+                                        self.emit_expression(expression, 0)?;
+                                    }
+                                    self.writer.write("}");
+                                }
+                                _ => {
+                                    return Err(Self::unsupported(
+                                        initializer,
+                                        initializer_node.kind,
+                                    ));
+                                }
                             }
-                            self.writer.write("}");
                         }
-                        _ => return Err(Self::unsupported(initializer, initializer_node.kind)),
                     }
+                    NodeData::JsxSpreadAttribute(attribute) => {
+                        self.writer.write(" {...");
+                        self.emit_expression(attribute.expression, 0)?;
+                        self.writer.write("}");
+                    }
+                    _ => return Err(Self::unsupported(*attribute, node.kind)),
                 }
             }
             return Ok(());
@@ -2296,6 +2304,11 @@ impl Printer<'_> {
                 self.writer.write(", ");
             }
             let node = self.node(*attribute)?.clone();
+            if let NodeData::JsxSpreadAttribute(attribute) = &node.data {
+                self.writer.write("...");
+                self.emit_expression(attribute.expression, 0)?;
+                continue;
+            }
             let NodeData::JsxAttribute(attribute) = &node.data else {
                 return Err(Self::unsupported(*attribute, node.kind));
             };
@@ -2857,15 +2870,14 @@ mod tests {
 
     #[test]
     fn preserves_and_transforms_jsx_elements() {
-        let source =
-            "const view = <Panel enabled title='hello'><span>{value}</span><Icon /></Panel>;";
+        let source = "const view = <Panel enabled {...props} title='hello'><span>{value}</span><Icon /></Panel>;";
         assert_eq!(
             emit_jsx(source, JsxEmit::Preserve),
-            "const view = <Panel enabled title=\"hello\"><span>{value}</span><Icon /></Panel>;\n"
+            "const view = <Panel enabled {...props} title=\"hello\"><span>{value}</span><Icon /></Panel>;\n"
         );
         assert_eq!(
             emit_jsx(source, JsxEmit::React),
-            "const view = React.createElement(Panel, {enabled: true, title: \"hello\"}, React.createElement(\"span\", null, value), React.createElement(Icon, null));\n"
+            "const view = React.createElement(Panel, {enabled: true, ...props, title: \"hello\"}, React.createElement(\"span\", null, value), React.createElement(Icon, null));\n"
         );
     }
 
