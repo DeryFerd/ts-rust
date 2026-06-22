@@ -15,7 +15,7 @@ use ts_glob::{DiscoveryOptions, discover_files};
 use ts_module::{ResolutionOptions, Resolver, automatic_type_directive_names};
 use ts_options::{CompilerOptions, parse_project_options};
 use ts_parser::{ParseResult, parse_jsx_source_file, parse_source_file};
-use ts_path::{CaseSensitivity, canonicalize, is_absolute, resolve_path};
+use ts_path::{CaseSensitivity, canonicalize, directory_path, is_absolute, resolve_path};
 use ts_printer::{emit_declaration_file, emit_source_file_with_settings};
 use ts_sourcemap::SourceMap;
 use ts_vfs::FileSystem;
@@ -180,8 +180,16 @@ impl Program {
     ) -> Self {
         let mut program = Self::new_unchecked(file_system, current_directory, root_names);
         program.options = options;
+        if program
+            .source_files
+            .iter()
+            .any(|source| has_no_default_lib_directive(&source.source_text))
+        {
+            program.options.no_lib = true;
+        }
         program.load_default_libraries();
         let resolution_options = program.options.module_resolution_options();
+        program.load_reference_directives(file_system, &resolution_options);
         program.load_automatic_type_directives(file_system, &resolution_options);
         program.load_module_graph(file_system, resolution_options);
         program.check_program();
@@ -623,6 +631,52 @@ impl Program {
         }
     }
 
+    fn load_reference_directives(
+        &mut self,
+        file_system: &dyn FileSystem,
+        resolution_options: &ResolutionOptions,
+    ) {
+        let resolver = Resolver::new(file_system, resolution_options.clone());
+        let mut file_index = 0;
+        while file_index < self.source_files.len() {
+            if self.source_files[file_index].is_default_library {
+                file_index += 1;
+                continue;
+            }
+            let containing_file = self.source_files[file_index].file_name.clone();
+            let directives = reference_directives(&self.source_files[file_index].source_text);
+            for directive in directives {
+                match directive.kind {
+                    ReferenceKind::Path => {
+                        let file_name = resolve_path(
+                            &directory_path(&containing_file),
+                            &[directive.value.as_str()],
+                        );
+                        self.load_file(file_system, &file_name, true);
+                    }
+                    ReferenceKind::Types => {
+                        if let Some(resolved) = resolver
+                            .resolve_type_reference(&directive.value, &containing_file)
+                            .resolved
+                        {
+                            self.load_file(file_system, &resolved.resolved_file_name, false);
+                        } else {
+                            self.diagnostics
+                                .push(type_definition_not_found(&directive.value));
+                        }
+                    }
+                    ReferenceKind::Lib => {
+                        let library_name = bundled_library_name(&directive.value);
+                        for dependency in ts_bundled::library_closure(&library_name) {
+                            self.load_bundled_library(dependency);
+                        }
+                    }
+                }
+            }
+            file_index += 1;
+        }
+    }
+
     fn load_bundled_library(&mut self, library_name: &str) {
         let file_name = format!("/__typescript/lib/{library_name}");
         let canonical = canonicalize(&file_name, &self.current_directory, self.case_sensitivity);
@@ -647,6 +701,71 @@ impl Program {
             is_default_library: true,
         });
     }
+}
+
+#[derive(Clone, Copy)]
+enum ReferenceKind {
+    Path,
+    Types,
+    Lib,
+}
+
+struct ReferenceDirective {
+    kind: ReferenceKind,
+    value: String,
+}
+
+fn reference_directives(source: &str) -> Vec<ReferenceDirective> {
+    source
+        .lines()
+        .filter_map(|line| {
+            let reference = line
+                .trim_start()
+                .strip_prefix("///")?
+                .trim_start()
+                .strip_prefix("<reference")?;
+            [
+                (ReferenceKind::Types, "types"),
+                (ReferenceKind::Lib, "lib"),
+                (ReferenceKind::Path, "path"),
+            ]
+            .into_iter()
+            .find_map(|(kind, name)| {
+                reference_attribute(reference, name).map(|value| ReferenceDirective { kind, value })
+            })
+        })
+        .collect()
+}
+
+fn has_no_default_lib_directive(source: &str) -> bool {
+    source.lines().any(|line| {
+        line.trim_start()
+            .strip_prefix("///")
+            .and_then(|line| line.trim_start().strip_prefix("<reference"))
+            .and_then(|reference| reference_attribute(reference, "no-default-lib"))
+            .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+    })
+}
+
+fn reference_attribute(reference: &str, name: &str) -> Option<String> {
+    let mut rest = reference;
+    while let Some(index) = rest.find(name) {
+        let candidate = &rest[index + name.len()..];
+        let candidate = candidate.trim_start();
+        if let Some(candidate) = candidate.strip_prefix('=') {
+            let candidate = candidate.trim_start();
+            let quote = candidate.chars().next()?;
+            if matches!(quote, '\'' | '"') {
+                let value = &candidate[quote.len_utf8()..];
+                return value.find(quote).map(|end| value[..end].to_owned());
+            }
+        }
+        rest = &candidate[candidate
+            .char_indices()
+            .nth(1)
+            .map_or(candidate.len(), |(i, _)| i)..];
+    }
+    None
 }
 
 fn bundled_library_name(name: &str) -> String {
@@ -932,6 +1051,74 @@ mod tests {
             automatic
                 .source_file("/project/node_modules/@types/auto/index.d.ts")
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn follows_triple_slash_path_type_and_lib_references() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/main.ts",
+            concat!(
+                "/// <reference path='./globals.d.ts' />\n",
+                "/// <reference types=\"pkg\" />\n",
+                "/// <reference lib='es2015.promise' />\n",
+                "GLOBAL; NESTED; PACKAGE_GLOBAL; Promise;\n",
+            ),
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/globals.d.ts",
+            "/// <reference path='./nested.d.ts' />\ndeclare const GLOBAL: string;",
+        )
+        .unwrap();
+        fs.write_file("/project/nested.d.ts", "declare const NESTED: number;")
+            .unwrap();
+        fs.write_file(
+            "/project/node_modules/@types/pkg/index.d.ts",
+            "declare const PACKAGE_GLOBAL: boolean;",
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["main.ts".to_owned()],
+            CompilerOptions {
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        assert!(
+            program.diagnostics().is_empty(),
+            "{:?}",
+            program.diagnostics()
+        );
+        for file in [
+            "/project/globals.d.ts",
+            "/project/nested.d.ts",
+            "/project/node_modules/@types/pkg/index.d.ts",
+            "/__typescript/lib/lib.es2015.promise.d.ts",
+        ] {
+            assert!(program.source_file(file).is_some(), "missing {file}");
+        }
+
+        fs.write_file(
+            "/project/no-default.ts",
+            "/// <reference no-default-lib='true' />\nArray;",
+        )
+        .unwrap();
+        let no_default = Program::new_with_options(
+            &fs,
+            "/project",
+            &["no-default.ts".to_owned()],
+            CompilerOptions::default(),
+        );
+        assert!(no_default.options().no_lib);
+        assert!(
+            no_default
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code == Some(2304))
         );
     }
 
