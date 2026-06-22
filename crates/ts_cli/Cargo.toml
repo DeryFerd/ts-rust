@@ -16,6 +16,7 @@ ts_lsp = { path = "../ts_lsp" }
 ts_module = { path = "../ts_module" }
 ts_options = { path = "../ts_options" }
 ts_parser = { path = "../ts_parser" }
+ts_project = { path = "../ts_project" }
 ts_scanner = { path = "../ts_scanner" }
 ts_vfs = { path = "../ts_vfs" }
 

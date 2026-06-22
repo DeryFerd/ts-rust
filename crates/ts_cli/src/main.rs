@@ -4,11 +4,14 @@ use std::{
     process::ExitCode,
 };
 
-use ts_cli::{Command, CompilerOptions as CliOptions, ExitStatus, VERSION, parse_command_line};
+use ts_cli::{
+    BuildOptions, Command, CompilerOptions as CliOptions, ExitStatus, VERSION, parse_command_line,
+};
 use ts_compiler::{Program, ProgramDiagnostic, ProgramOptionsOverride};
 use ts_diagnostic_writer::{Diagnostic, DiagnosticCategory, FormattingOptions, format_diagnostics};
 use ts_module::ResolutionOptions;
 use ts_options::CompilerOptions;
+use ts_project::{CompiledProject, ProjectDiagnostic, build_projects};
 use ts_scanner::Scanner;
 use ts_vfs::OsFileSystem;
 
@@ -34,6 +37,7 @@ fn main() -> ExitCode {
             println!("Version {VERSION}");
             ExitCode::SUCCESS
         }
+        Ok(Command::Build(options)) => build(&options),
         Ok(Command::Help) => {
             print_help();
             if args.is_empty() {
@@ -49,6 +53,60 @@ fn main() -> ExitCode {
             ExitCode::from(ExitStatus::DiagnosticsPresentOutputsSkipped as u8)
         }
     }
+}
+
+fn build(options: &BuildOptions) -> ExitCode {
+    let Ok(current_directory) = env::current_dir() else {
+        eprintln!("error: could not determine the current directory");
+        return exit(ExitStatus::DiagnosticsPresentOutputsSkipped);
+    };
+    let current_directory_text = current_directory.to_string_lossy();
+    let roots = if options.projects.is_empty() {
+        vec!["tsconfig.json".to_owned()]
+    } else {
+        options.projects.clone()
+    };
+    let file_system = OsFileSystem::default();
+    let result = build_projects(
+        &file_system,
+        &current_directory_text,
+        &roots,
+        ProgramOptionsOverride {
+            no_emit: options.no_emit.then_some(true),
+            ..ProgramOptionsOverride::default()
+        },
+    );
+    let pretty = options.pretty.unwrap_or(false);
+    print_project_diagnostics(&result.graph.diagnostics, &current_directory_text, pretty);
+    if !result.graph.diagnostics.is_empty() {
+        return if result.graph.has_cycle {
+            exit(ExitStatus::ProjectReferenceCycleOutputsSkipped)
+        } else {
+            exit(ExitStatus::DiagnosticsPresentOutputsSkipped)
+        };
+    }
+
+    let mut had_diagnostics = false;
+    let mut generated_output = false;
+    for project in result.projects {
+        let CompiledProject { program, emit, .. } = project;
+        print_diagnostics(
+            &program,
+            program.diagnostics(),
+            &current_directory_text,
+            pretty,
+        );
+        print_diagnostics(&program, &emit.diagnostics, &current_directory_text, pretty);
+        had_diagnostics |= !program.diagnostics().is_empty() || !emit.diagnostics.is_empty();
+        for output in emit.files {
+            if let Err(error) = write_output(&output.file_name, output.text) {
+                eprintln!("{error}");
+                return exit(ExitStatus::DiagnosticsPresentOutputsSkipped);
+            }
+            generated_output = true;
+        }
+    }
+    diagnostic_exit(had_diagnostics, generated_output)
 }
 
 fn compile(options: &CliOptions) -> ExitCode {
@@ -129,21 +187,16 @@ fn compile(options: &CliOptions) -> ExitCode {
     let had_diagnostics = !program.diagnostics().is_empty() || !emitted.diagnostics.is_empty();
     let mut generated_output = false;
     for output in emitted.files {
-        let output_path = Path::new(&output.file_name);
-        if let Some(parent) = output_path.parent()
-            && !parent.as_os_str().is_empty()
-            && let Err(error) = fs::create_dir_all(parent)
-        {
-            eprintln!("error: could not create '{}': {error}", parent.display());
-            return exit(ExitStatus::DiagnosticsPresentOutputsSkipped);
-        }
-        if let Err(error) = fs::write(output_path, output.text) {
-            eprintln!("error: could not write '{}': {error}", output.file_name);
+        if let Err(error) = write_output(&output.file_name, output.text) {
+            eprintln!("{error}");
             return exit(ExitStatus::DiagnosticsPresentOutputsSkipped);
         }
         generated_output = true;
     }
+    diagnostic_exit(had_diagnostics, generated_output)
+}
 
+fn diagnostic_exit(had_diagnostics: bool, generated_output: bool) -> ExitCode {
     if had_diagnostics {
         if generated_output {
             exit(ExitStatus::DiagnosticsPresentOutputsGenerated)
@@ -153,6 +206,18 @@ fn compile(options: &CliOptions) -> ExitCode {
     } else {
         ExitCode::SUCCESS
     }
+}
+
+fn write_output(file_name: &str, text: String) -> Result<(), String> {
+    let output_path = Path::new(file_name);
+    if let Some(parent) = output_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("error: could not create '{}': {error}", parent.display()))?;
+    }
+    fs::write(output_path, text)
+        .map_err(|error| format!("error: could not write '{file_name}': {error}"))
 }
 
 fn find_config_file(start: &Path) -> Option<PathBuf> {
@@ -186,6 +251,35 @@ fn print_command_line_diagnostic(code: u32, message: &str, current_directory: &P
             &[diagnostic],
             FormattingOptions {
                 current_directory: &current_directory.to_string_lossy(),
+                pretty,
+                ..FormattingOptions::default()
+            }
+        )
+    );
+}
+
+fn print_project_diagnostics(
+    project_diagnostics: &[ProjectDiagnostic],
+    current_directory: &str,
+    pretty: bool,
+) {
+    let diagnostics = project_diagnostics
+        .iter()
+        .map(|diagnostic| Diagnostic {
+            file_name: diagnostic.file_name.as_deref(),
+            source_text: None,
+            range: diagnostic.range,
+            code: Some(diagnostic.code),
+            category: DiagnosticCategory::Error,
+            message: &diagnostic.message,
+        })
+        .collect::<Vec<_>>();
+    print!(
+        "{}",
+        format_diagnostics(
+            &diagnostics,
+            FormattingOptions {
+                current_directory,
                 pretty,
                 ..FormattingOptions::default()
             }
@@ -381,6 +475,7 @@ fn print_help() {
     println!("  -h, --help         Print this message");
     println!("  -v, --version      Print the compiler version");
     println!("  -p, --project PATH Compile the project at PATH");
+    println!("  -b, --build PATH   Build a project and its references");
     println!("      --ignoreConfig Ignore tsconfig.json when compiling files");
     println!("      --noCheck      Skip semantic type checking");
     println!("      --noEmit       Do not write output files");

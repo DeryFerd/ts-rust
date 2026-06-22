@@ -16,10 +16,18 @@ pub enum ExitStatus {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Command {
+    Build(BuildOptions),
     Help,
     Lsp,
     Version,
     Compile(CompilerOptions),
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct BuildOptions {
+    pub projects: Vec<String>,
+    pub no_emit: bool,
+    pub pretty: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -66,6 +74,9 @@ fn parse_expanded(args: &[String]) -> Result<Command, CommandLineError> {
     if args.is_empty() {
         return Ok(Command::Help);
     }
+    if matches!(args[0].to_ascii_lowercase().as_str(), "--build" | "-b") {
+        return parse_build_options(&args[1..]).map(Command::Build);
+    }
     let mut options = CompilerOptions::default();
     let mut index = 0;
     while index < args.len() {
@@ -106,6 +117,39 @@ fn parse_expanded(args: &[String]) -> Result<Command, CommandLineError> {
         index += 1;
     }
     Ok(Command::Compile(options))
+}
+
+fn parse_build_options(args: &[String]) -> Result<BuildOptions, CommandLineError> {
+    let mut options = BuildOptions::default();
+    let mut index = 0;
+    while index < args.len() {
+        let argument = &args[index];
+        let lower = argument.to_ascii_lowercase();
+        match lower.as_str() {
+            "--noemit" => options.no_emit = true,
+            "--pretty" => {
+                let explicit_value = args
+                    .get(index + 1)
+                    .and_then(|value| parse_bool_value(value));
+                options.pretty = Some(explicit_value.unwrap_or(true));
+                if explicit_value.is_some() {
+                    index += 1;
+                }
+            }
+            _ if lower.starts_with("--pretty=") => {
+                options.pretty = Some(parse_bool_option(argument, "pretty")?);
+            }
+            _ if argument.starts_with('-') => {
+                return Err(CommandLineError {
+                    code: 5023,
+                    message: format!("Unknown build option '{argument}'."),
+                });
+            }
+            _ => options.projects.push(argument.clone()),
+        }
+        index += 1;
+    }
+    Ok(options)
 }
 
 fn required_option_value(
@@ -207,7 +251,7 @@ fn tokenize_response_file(source: &str) -> Result<Vec<String>, CommandLineError>
 mod tests {
     use std::{io, path::Path};
 
-    use super::{Command, CompilerOptions, parse_command_line};
+    use super::{BuildOptions, Command, CompilerOptions, parse_command_line};
 
     fn parse(args: &[&str]) -> Result<Command, super::CommandLineError> {
         parse_command_line(
@@ -269,6 +313,25 @@ mod tests {
         };
         assert_eq!(options.pretty, Some(false));
         assert_eq!(options.files, ["main.ts"]);
+    }
+
+    #[test]
+    fn parses_build_projects_and_options() {
+        assert_eq!(
+            parse(&[
+                "-b",
+                "packages/a",
+                "packages/b",
+                "--noEmit",
+                "--pretty",
+                "false"
+            ]),
+            Ok(Command::Build(BuildOptions {
+                projects: vec!["packages/a".into(), "packages/b".into()],
+                no_emit: true,
+                pretty: Some(false),
+            }))
+        );
     }
 
     #[test]

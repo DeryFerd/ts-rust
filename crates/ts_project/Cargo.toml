@@ -1,0 +1,16 @@
+[package]
+name = "ts_project"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ts_compiler = { path = "../ts_compiler" }
+ts_config = { path = "../ts_config" }
+ts_core = { path = "../ts_core" }
+ts_diagnostics = { path = "../ts_diagnostics" }
+ts_path = { path = "../ts_path" }
+ts_vfs = { path = "../ts_vfs" }
+
+[lints]
+workspace = true

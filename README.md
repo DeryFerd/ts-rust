@@ -13,6 +13,8 @@ against the upstream TypeScript fixtures independently:
 - `ts_parser`: the TypeScript grammar and error recovery
 - `ts_binder` / `ts_checker`: symbols, scopes, and semantic types
 - `ts_module` / `ts_glob`: module resolution and project file discovery
+- `ts_project`: project-reference graph loading and ordered builds
+- `ts_fswatch`: portable recursive file watching and event coalescing
 - `ts_options`: normalized compiler options
 - `ts_outputpaths`: JavaScript/declaration output path calculation
 - `ts_semver`: npm-style semantic versions and package range matching
