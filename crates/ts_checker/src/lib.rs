@@ -320,6 +320,26 @@ pub struct CheckResult {
     pub diagnostics: Vec<CheckDiagnostic>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct CheckerOptions {
+    pub strict_null_checks: bool,
+    pub no_implicit_any: bool,
+    pub no_unused_locals: bool,
+    pub no_unused_parameters: bool,
+}
+
+impl Default for CheckerOptions {
+    fn default() -> Self {
+        Self {
+            strict_null_checks: true,
+            no_implicit_any: false,
+            no_unused_locals: false,
+            no_unused_parameters: false,
+        }
+    }
+}
+
 impl CheckResult {
     #[must_use]
     pub fn type_of_symbol(&self, symbol: SymbolId) -> Option<TypeId> {
@@ -338,7 +358,19 @@ pub fn check_source_file(
     source_file: NodeId,
     bindings: &BindResult,
 ) -> CheckResult {
-    Checker::new(arena, bindings).check(source_file)
+    check_source_file_with_options(arena, source_file, bindings, CheckerOptions::default())
+}
+
+#[must_use]
+pub fn check_source_file_with_options(
+    arena: &NodeArena,
+    source_file: NodeId,
+    bindings: &BindResult,
+    options: CheckerOptions,
+) -> CheckResult {
+    Checker::new(arena, bindings)
+        .with_options(options)
+        .check(source_file)
 }
 
 #[must_use]
@@ -357,6 +389,8 @@ pub struct ProgramSource<'a> {
     pub bindings: &'a BindResult,
     pub resolved_modules: &'a BTreeMap<String, usize>,
     pub is_default_library: bool,
+    pub skip_diagnostics: bool,
+    pub checker_options: CheckerOptions,
 }
 
 #[derive(Debug)]
@@ -422,7 +456,12 @@ impl<'a> ProgramChecker<'a> {
                 if source.is_default_library {
                     empty_check_result()
                 } else {
-                    check_source_file(source.arena, source.source_file, source.bindings)
+                    check_source_file_with_options(
+                        source.arena,
+                        source.source_file,
+                        source.bindings,
+                        source.checker_options,
+                    )
                 }
             })
             .collect::<Vec<_>>();
@@ -440,10 +479,11 @@ impl<'a> ProgramChecker<'a> {
                 preliminary[file_index].clone()
             } else {
                 Checker::new(source.arena, source.bindings)
+                    .with_options(source.checker_options)
                     .with_environment(external_symbols, globals.clone())
                     .check(source.source_file)
             };
-            if source.is_default_library {
+            if source.is_default_library || source.skip_diagnostics {
                 result.diagnostics.clear();
             }
             result.diagnostics.append(&mut import_diagnostics);
@@ -705,6 +745,8 @@ struct Checker<'a> {
     external_names: BTreeMap<String, TypeDescriptor>,
     external_aliases: HashMap<SymbolId, TypeDescriptor>,
     imported_type_parameters: HashMap<String, TypeId>,
+    options: CheckerOptions,
+    symbol_reads: HashMap<SymbolId, usize>,
 }
 
 enum DeclaredObject {
@@ -739,6 +781,8 @@ impl<'a> Checker<'a> {
             external_names: BTreeMap::new(),
             external_aliases: HashMap::new(),
             imported_type_parameters: HashMap::new(),
+            options: CheckerOptions::default(),
+            symbol_reads: HashMap::new(),
         }
     }
 
@@ -749,6 +793,11 @@ impl<'a> Checker<'a> {
     ) -> Self {
         self.external_symbols = symbols;
         self.external_names = names;
+        self
+    }
+
+    const fn with_options(mut self, options: CheckerOptions) -> Self {
+        self.options = options;
         self
     }
 
@@ -763,6 +812,7 @@ impl<'a> Checker<'a> {
         }
         let mut saw_return = false;
         self.check_node(source_file, None, &mut saw_return);
+        self.check_unused_symbols();
         self.result
     }
 
@@ -1278,6 +1328,12 @@ impl<'a> Checker<'a> {
         else {
             return;
         };
+        if self.options.no_implicit_any && data.type_.is_none() {
+            let name = self
+                .property_name(data.name)
+                .unwrap_or_else(|| "parameter".into());
+            self.error(parameter, 7006, [name, "any".into()]);
+        }
         if let Some(initializer) = data.initializer {
             let actual = self.type_of_expression(initializer);
             let expected = match data.type_ {
@@ -1316,6 +1372,9 @@ impl<'a> Checker<'a> {
                     }
                 }
                 NodeData::MethodDeclaration(data) => {
+                    for parameter in &data.parameters.nodes {
+                        self.check_parameter(*parameter);
+                    }
                     if let Some(name) = self.property_name(data.name) {
                         let method_type = self.signature_type(
                             &data.parameters.nodes,
@@ -2033,6 +2092,7 @@ impl<'a> Checker<'a> {
         }
         let symbol = self.resolve_identifier(node, name);
         if let Some(symbol) = symbol {
+            *self.symbol_reads.entry(symbol).or_default() += 1;
             for narrowing in self.narrowings.iter().rev() {
                 if let Some(type_id) = narrowing.get(&symbol) {
                     return *type_id;
@@ -2082,6 +2142,15 @@ impl<'a> Checker<'a> {
                 parameters.push(self.result.types.any());
                 continue;
             };
+            if self.options.no_implicit_any
+                && parameter_data.type_.is_none()
+                && contextual_signature.is_none()
+            {
+                let name = self
+                    .property_name(parameter_data.name)
+                    .unwrap_or_else(|| "parameter".into());
+                self.error(*parameter, 7006, [name, "any".into()]);
+            }
             let parameter_type = parameter_data
                 .type_
                 .map(|node| self.type_from_type_node(node))
@@ -2472,6 +2541,31 @@ impl<'a> Checker<'a> {
         left: TypeId,
         right: TypeId,
     ) -> TypeId {
+        if matches!(
+            self.result.types.get(left).map(|type_| &type_.kind),
+            Some(TypeKind::Any)
+        ) || matches!(
+            self.result.types.get(right).map(|type_| &type_.kind),
+            Some(TypeKind::Any)
+        ) {
+            return if matches!(
+                operator,
+                SyntaxKind::LessThanToken
+                    | SyntaxKind::LessThanEqualsToken
+                    | SyntaxKind::GreaterThanToken
+                    | SyntaxKind::GreaterThanEqualsToken
+                    | SyntaxKind::EqualsEqualsToken
+                    | SyntaxKind::EqualsEqualsEqualsToken
+                    | SyntaxKind::ExclamationEqualsToken
+                    | SyntaxKind::ExclamationEqualsEqualsToken
+                    | SyntaxKind::InKeyword
+                    | SyntaxKind::InstanceOfKeyword
+            ) {
+                self.result.types.boolean()
+            } else {
+                self.result.types.any()
+            };
+        }
         match operator {
             SyntaxKind::PlusToken => {
                 if self.is_string_like(left) || self.is_string_like(right) {
@@ -2962,6 +3056,11 @@ impl<'a> Checker<'a> {
         }
         let source_kind = &self.result.types.get(source).unwrap().kind;
         let target_kind = &self.result.types.get(target).unwrap().kind;
+        if !self.options.strict_null_checks
+            && matches!(source_kind, TypeKind::Null | TypeKind::Undefined)
+        {
+            return true;
+        }
         if matches!(source_kind, TypeKind::Any)
             || matches!(target_kind, TypeKind::Any | TypeKind::Unknown)
         {
@@ -3366,6 +3465,63 @@ impl<'a> Checker<'a> {
             node,
             diagnostic: Diagnostic::with_arguments(message, arguments),
         });
+    }
+
+    fn check_unused_symbols(&mut self) {
+        if !self.options.no_unused_locals && !self.options.no_unused_parameters {
+            return;
+        }
+        let diagnostics = self
+            .bindings
+            .symbols
+            .iter()
+            .filter(|symbol| self.symbol_reads.get(&symbol.id).copied().unwrap_or(0) == 0)
+            .filter(|symbol| {
+                !self
+                    .bindings
+                    .exports
+                    .iter()
+                    .any(|(_, export)| export == symbol.id)
+            })
+            .filter_map(|symbol| {
+                let declaration = *symbol.declarations.first()?;
+                let node = self.arena.get(declaration)?;
+                let is_parameter = matches!(node.data, NodeData::ParameterDeclaration(_));
+                if is_parameter {
+                    if !self.options.no_unused_parameters || symbol.name.starts_with('_') {
+                        return None;
+                    }
+                } else if !self.options.no_unused_locals
+                    || !matches!(node.data, NodeData::VariableDeclaration(_))
+                    || !self.is_local_declaration(declaration)
+                {
+                    return None;
+                }
+                Some((declaration, symbol.name.clone()))
+            })
+            .collect::<Vec<_>>();
+        for (node, name) in diagnostics {
+            self.error(node, 6133, [name]);
+        }
+    }
+
+    fn is_local_declaration(&self, declaration: NodeId) -> bool {
+        let mut parent = self.arena.get(declaration).and_then(|node| node.parent);
+        while let Some(node_id) = parent {
+            let Some(node) = self.arena.get(node_id) else {
+                break;
+            };
+            if matches!(
+                node.data,
+                NodeData::FunctionDeclaration(_)
+                    | NodeData::MethodDeclaration(_)
+                    | NodeData::ArrowFunction(_)
+            ) {
+                return true;
+            }
+            parent = node.parent;
+        }
+        false
     }
 }
 

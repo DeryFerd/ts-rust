@@ -1,17 +1,20 @@
 //! Compiler Program and source-file graph foundations.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
 
 use ts_ast::{NodeData, NodeId};
 use ts_binder::{BindResult, bind_source_file};
-use ts_checker::{CheckResult, ProgramSource, check_program, empty_check_result};
+use ts_checker::{CheckResult, CheckerOptions, ProgramSource, check_program, empty_check_result};
 use ts_config::{ConfigDiagnostic, resolve_config_file};
 use ts_core::TextRange;
 use ts_diagnostics::message_by_code;
 use ts_glob::{DiscoveryOptions, discover_files};
 use ts_module::{ResolutionOptions, Resolver};
 use ts_options::{CompilerOptions, parse_project_options};
-use ts_parser::{ParseResult, parse_source_file};
+use ts_parser::{ParseResult, parse_jsx_source_file, parse_source_file};
 use ts_path::{CaseSensitivity, canonicalize, is_absolute, resolve_path};
 use ts_printer::{emit_declaration_file, emit_source_file_with_settings};
 use ts_sourcemap::SourceMap;
@@ -472,6 +475,14 @@ impl Program {
                     bindings: &source_file.binding,
                     resolved_modules,
                     is_default_library: source_file.is_default_library,
+                    skip_diagnostics: self.options.skip_lib_check
+                        && ts_path::is_declaration_file(&source_file.file_name),
+                    checker_options: CheckerOptions {
+                        strict_null_checks: self.options.strict_null_checks,
+                        no_implicit_any: self.options.no_implicit_any,
+                        no_unused_locals: self.options.no_unused_locals,
+                        no_unused_parameters: self.options.no_unused_parameters,
+                    },
                 })
                 .collect::<Vec<_>>();
             check_program(&inputs)
@@ -508,7 +519,14 @@ impl Program {
             }
             return;
         };
-        let parse = parse_source_file(&source_text);
+        let is_jsx = Path::new(file_name).extension().is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("tsx") || extension.eq_ignore_ascii_case("jsx")
+        });
+        let parse = if is_jsx {
+            parse_jsx_source_file(&source_text)
+        } else {
+            parse_source_file(&source_text)
+        };
         for diagnostic in &parse.diagnostics {
             self.diagnostics.push(ProgramDiagnostic {
                 file_name: Some(file_name.to_owned()),
@@ -1055,6 +1073,32 @@ mod tests {
     }
 
     #[test]
+    fn parses_and_emits_tsx_roots() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/view.tsx", "const view = <Box label=\"ok\" />;")
+            .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["view.tsx".to_owned()],
+            CompilerOptions {
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        assert!(
+            program.diagnostics().is_empty(),
+            "{:?}",
+            program.diagnostics()
+        );
+        let emitted = program.emit();
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        assert_eq!(emitted.files.len(), 1);
+        assert_eq!(emitted.files[0].file_name, "/project/view.jsx");
+        assert_eq!(emitted.files[0].text, "var view = <Box label=\"ok\" />;\n");
+    }
+
+    #[test]
     fn checks_annotated_variable_assignability() {
         let fs = MemoryFileSystem::new(true);
         fs.write_file(
@@ -1487,6 +1531,126 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(2),
             "cold debug default-library check took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn enforces_strict_null_checks() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/tsconfig.json",
+            r#"{
+                "files": ["main.ts"],
+                "compilerOptions": { "noLib": true, "strictNullChecks": true }
+            }"#,
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/main.ts",
+            "const text: string = null; const count: number = null;",
+        )
+        .unwrap();
+        let strict = Program::from_config(&fs, "/project/tsconfig.json");
+        assert_eq!(
+            strict
+                .diagnostics()
+                .iter()
+                .filter_map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [2322, 2322]
+        );
+
+        fs.write_file(
+            "/project/tsconfig.json",
+            r#"{
+                "files": ["main.ts"],
+                "compilerOptions": { "noLib": true, "strictNullChecks": false }
+            }"#,
+        )
+        .unwrap();
+        let loose = Program::from_config(&fs, "/project/tsconfig.json");
+        assert!(loose.diagnostics().is_empty(), "{:?}", loose.diagnostics());
+    }
+
+    #[test]
+    fn reports_implicit_any_and_unused_bindings() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/tsconfig.json",
+            r#"{
+                "files": ["main.ts"],
+                "compilerOptions": {
+                    "noLib": true,
+                    "noImplicitAny": true,
+                    "noUnusedLocals": true,
+                    "noUnusedParameters": true
+                }
+            }"#,
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/main.ts",
+            r"
+                function work(used, unused, _ignored) {
+                    const local = 1;
+                    const read = 2;
+                    return used + read;
+                }
+            ",
+        )
+        .unwrap();
+        let program = Program::from_config(&fs, "/project/tsconfig.json");
+        assert_eq!(
+            program
+                .diagnostics()
+                .iter()
+                .filter_map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [7006, 7006, 7006, 6133, 6133]
+        );
+    }
+
+    #[test]
+    fn skip_lib_check_suppresses_declaration_file_semantics() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/main.ts", "const value: Broken = { text: 'ok' };")
+            .unwrap();
+        fs.write_file(
+            "/project/broken.d.ts",
+            "interface Broken { text: string; } declare const invalid: string = 1;",
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/tsconfig.json",
+            r#"{
+                "files": ["main.ts", "broken.d.ts"],
+                "compilerOptions": { "noLib": true, "skipLibCheck": false }
+            }"#,
+        )
+        .unwrap();
+        let checked = Program::from_config(&fs, "/project/tsconfig.json");
+        assert_eq!(
+            checked
+                .diagnostics()
+                .iter()
+                .filter_map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [2322]
+        );
+
+        fs.write_file(
+            "/project/tsconfig.json",
+            r#"{
+                "files": ["main.ts", "broken.d.ts"],
+                "compilerOptions": { "noLib": true, "skipLibCheck": true }
+            }"#,
+        )
+        .unwrap();
+        let skipped = Program::from_config(&fs, "/project/tsconfig.json");
+        assert!(
+            skipped.diagnostics().is_empty(),
+            "{:?}",
+            skipped.diagnostics()
         );
     }
 }
