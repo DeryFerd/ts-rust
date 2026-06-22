@@ -394,23 +394,59 @@ fn compare_case_emitted_output_sections(
     case: &Case,
     variant: &OptionVariant,
 ) -> BaselineComparison {
-    let mut excluded_expected = case
+    let baseline_sections = parse_baseline_sections(baseline)
+        .into_iter()
+        .map(|(name, text)| {
+            (
+                normalize_section_name(&name),
+                normalize_emitted_section(&text),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let declaration_unit_basename_counts = case
         .units
         .iter()
         .filter_map(|unit| {
             let path = unit.path.to_string_lossy().replace('\\', "/");
-            ts_path::is_declaration_file(&path).then(|| normalize_section_name(&path))
+            ts_path::is_declaration_file(&path)
+                .then(|| section_basename(&normalize_section_name(&path)).to_owned())
         })
-        .collect::<BTreeSet<_>>();
+        .fold(BTreeMap::<String, usize>::new(), |mut counts, name| {
+            *counts.entry(name).or_default() += 1;
+            counts
+        });
+    let mut excluded_expected = BTreeSet::new();
+    for unit in &case.units {
+        let path = unit.path.to_string_lossy().replace('\\', "/");
+        if !ts_path::is_declaration_file(&path) {
+            continue;
+        }
+        let name = normalize_section_name(&path);
+        let basename = section_basename(&name);
+        let source = normalize_emitted_section(unit.source_text.as_scannable_str());
+        let candidates = [
+            baseline_sections
+                .contains_key(&name)
+                .then_some(name.as_str()),
+            (declaration_unit_basename_counts.get(basename) == Some(&1)
+                && baseline_sections.contains_key(basename))
+            .then_some(basename),
+        ];
+        for candidate in candidates.into_iter().flatten() {
+            if baseline_sections.get(candidate) == Some(&source) {
+                excluded_expected.insert(candidate.to_owned());
+            }
+        }
+    }
     let emit_declaration_only = variant.values.iter().any(|(name, value)| {
         name.eq_ignore_ascii_case("emitDeclarationOnly") && value.eq_ignore_ascii_case("true")
     });
     if emit_declaration_only {
         excluded_expected.extend(
-            parse_baseline_sections(baseline)
-                .into_keys()
-                .map(|name| normalize_section_name(&name))
-                .filter(|name| is_javascript_output_section(name)),
+            baseline_sections
+                .keys()
+                .filter(|name| is_javascript_output_section(name))
+                .cloned(),
         );
     }
     compare_emitted_output_sections_excluding(outputs, baseline, &excluded_expected)
@@ -1250,10 +1286,7 @@ mod tests {
         .unwrap();
         let commonjs = compile_case(&commonjs).unwrap();
         let javascript = &commonjs.outputs["/case/commonjs.js"];
-        assert!(
-            javascript.contains("exports.value = value;"),
-            "{javascript}"
-        );
+        assert!(javascript.contains("exports.value = 1;"), "{javascript}");
         assert!(!javascript.contains("export const value"), "{javascript}");
     }
 
@@ -1566,6 +1599,104 @@ mod tests {
             )
             .is_match()
         );
+    }
+
+    #[test]
+    fn ignores_basename_markers_for_nested_declaration_inputs() {
+        let case = Case::parse(
+            "amdLike.ts",
+            concat!(
+                "// @emitDeclarationOnly: true\n",
+                "// @filename: typing.d.ts\n",
+                "declare function define(): void;\n",
+                "// @filename: deps/BaseClass.d.ts\n",
+                "declare class BaseClass {}\n",
+                "// @filename: ExtendedClass.js\n",
+                "define();\n",
+            ),
+        )
+        .unwrap();
+        let outputs = BTreeMap::from([(
+            "/case/definitions/ExtendedClass.d.ts".into(),
+            "export declare const value: number;\n".into(),
+        )]);
+        let baseline = concat!(
+            "//// [typing.d.ts] ////\n",
+            "declare function define(): void;\n",
+            "//// [BaseClass.d.ts] ////\n",
+            "declare class BaseClass {}\n",
+            "//// [ExtendedClass.js] ////\n",
+            "define();\n",
+            "//// [ExtendedClass.d.ts] ////\n",
+            "export declare const value: number;\n",
+        );
+        let variant = OptionVariant {
+            values: BTreeMap::from([("emitDeclarationOnly".into(), "true".into())]),
+        };
+        assert!(
+            compare_case_emitted_output_sections(&outputs, baseline, &case, &variant).is_match()
+        );
+    }
+
+    #[test]
+    fn still_compares_genuinely_emitted_declaration_sections() {
+        let case = Case::parse(
+            "declarations.ts",
+            concat!(
+                "// @filename: support/ambient.d.ts\n",
+                "declare const ambient: string;\n",
+                "// @filename: main.ts\n",
+                "export const value = 1;\n",
+            ),
+        )
+        .unwrap();
+        let outputs = BTreeMap::from([(
+            "/case/types/main.d.ts".into(),
+            "export declare const value = 2;\n".into(),
+        )]);
+        let baseline = concat!(
+            "//// [ambient.d.ts] ////\n",
+            "declare const ambient: string;\n",
+            "//// [main.d.ts] ////\n",
+            "export declare const value = 1;\n",
+        );
+        let comparison = compare_case_emitted_output_sections(
+            &outputs,
+            baseline,
+            &case,
+            &OptionVariant::default(),
+        );
+        assert_eq!(comparison.differences.len(), 1);
+        assert_eq!(comparison.differences[0].section, "main.d.ts");
+        assert!(matches!(
+            comparison.differences[0].kind,
+            OutputDifferenceKind::Content { .. }
+        ));
+    }
+
+    #[test]
+    fn compares_source_named_declaration_sections_when_baseline_is_emitted_output() {
+        let case = Case::parse(
+            "input.ts",
+            "// @filename: deps/BaseClass.d.ts\ndeclare class BaseClass {}\n",
+        )
+        .unwrap();
+        let outputs = BTreeMap::from([(
+            "/case/types/BaseClass.d.ts".into(),
+            "declare class Different {}\n".into(),
+        )]);
+        let baseline = "//// [BaseClass.d.ts] ////\ndeclare class Generated {}\n";
+        let comparison = compare_case_emitted_output_sections(
+            &outputs,
+            baseline,
+            &case,
+            &OptionVariant::default(),
+        );
+        assert_eq!(comparison.differences.len(), 1);
+        assert!(matches!(
+            comparison.differences[0].kind,
+            OutputDifferenceKind::Content { .. }
+        ));
     }
 
     #[test]
