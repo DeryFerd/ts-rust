@@ -111,11 +111,55 @@ pub fn emit_source_file_with_settings(
         printer.writer.write("\"use strict\";");
         printer.writer.newline();
     }
+    if let Some(first_statement) = data.statements.nodes.first()
+        && let Some(node) = arena.get(*first_statement)
+    {
+        printer.emit_leading_source_comments(node.range.start.get());
+    }
+    if settings.module == ModuleKind::CommonJs && is_external_module {
+        printer
+            .writer
+            .write("Object.defineProperty(exports, \"__esModule\", { value: true });");
+        printer.writer.newline();
+        for statement in &data.statements.nodes {
+            let Some(node) = arena.get(*statement) else {
+                continue;
+            };
+            let NodeData::FunctionDeclaration(function) = &node.data else {
+                continue;
+            };
+            if !declaration_has_modifier(arena, node, SyntaxKind::ExportKeyword) {
+                continue;
+            }
+            let Some(name) = function
+                .name
+                .and_then(|name| declaration_name_text(arena, name))
+            else {
+                continue;
+            };
+            printer.writer.write("exports.");
+            printer.writer.write(name);
+            printer.writer.write(" = ");
+            printer.writer.write(name);
+            printer.writer.write(";");
+            printer.writer.newline();
+        }
+    }
     if settings.target < ScriptTarget::Es2015 && source_needs_extends_helper(arena) {
         printer.emit_extends_helper();
     }
     printer.emit_automatic_jsx_prelude();
+    let mut previous_end = data
+        .statements
+        .nodes
+        .first()
+        .and_then(|statement| arena.get(*statement))
+        .map_or(0, |node| node.range.start.get());
     for statement in &data.statements.nodes {
+        if let Some(node) = arena.get(*statement) {
+            printer.emit_source_comments_between(previous_end, node.range.start.get());
+            previous_end = node.range.end.get();
+        }
         printer.emit_statement(*statement)?;
     }
     let source_map = printer
@@ -1131,6 +1175,79 @@ struct Printer<'a> {
 }
 
 impl Printer<'_> {
+    fn emit_source_comments_between(&mut self, start: u32, end: u32) {
+        let start = usize::try_from(start).unwrap_or(usize::MAX);
+        let end = usize::try_from(end).unwrap_or(usize::MAX);
+        let Some(trivia) = self.source_text.get(start..end) else {
+            return;
+        };
+        let bytes = trivia.as_bytes();
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index..].starts_with(b"//") {
+                let comment_end = bytes[index..]
+                    .iter()
+                    .position(|byte| *byte == b'\n' || *byte == b'\r')
+                    .map_or(bytes.len(), |offset| index + offset);
+                self.writer.write(&trivia[index..comment_end]);
+                self.writer.newline();
+                index = comment_end;
+            } else if bytes[index..].starts_with(b"/*") {
+                let comment_end = bytes[index + 2..]
+                    .windows(2)
+                    .position(|window| window == b"*/")
+                    .map_or(bytes.len(), |offset| index + 2 + offset + 2);
+                for line in trivia[index..comment_end]
+                    .replace("\r\n", "\n")
+                    .replace('\r', "\n")
+                    .split('\n')
+                {
+                    self.writer.write(line);
+                    self.writer.newline();
+                }
+                index = comment_end;
+            } else {
+                index += 1;
+            }
+        }
+    }
+
+    fn emit_leading_source_comments(&mut self, end: u32) {
+        let end = usize::try_from(end).unwrap_or(usize::MAX);
+        let Some(prefix) = self.source_text.get(..end) else {
+            return;
+        };
+        let bytes = prefix.as_bytes();
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index..].starts_with(b"//") {
+                let comment_end = bytes[index..]
+                    .iter()
+                    .position(|byte| *byte == b'\n' || *byte == b'\r')
+                    .map_or(bytes.len(), |offset| index + offset);
+                self.writer.write(&prefix[index..comment_end]);
+                self.writer.newline();
+                index = comment_end;
+            } else if bytes[index..].starts_with(b"/*") {
+                let comment_end = bytes[index + 2..]
+                    .windows(2)
+                    .position(|window| window == b"*/")
+                    .map_or(bytes.len(), |offset| index + 2 + offset + 2);
+                for line in prefix[index..comment_end]
+                    .replace("\r\n", "\n")
+                    .replace('\r', "\n")
+                    .split('\n')
+                {
+                    self.writer.write(line);
+                    self.writer.newline();
+                }
+                index = comment_end;
+            } else {
+                index += 1;
+            }
+        }
+    }
+
     fn emit_extends_helper(&mut self) {
         self.writer
             .write("var __extends = (this && this.__extends) || (function () {");
@@ -1264,6 +1381,9 @@ impl Printer<'_> {
     #[allow(clippy::too_many_lines)]
     fn emit_statement(&mut self, id: NodeId) -> Result<(), EmitError> {
         let node = self.node(id)?.clone();
+        if declaration_has_modifier(self.arena, &node, SyntaxKind::DeclareKeyword) {
+            return Ok(());
+        }
         match &node.data {
             NodeData::InterfaceDeclaration(_) | NodeData::TypeAliasDeclaration(_) => return Ok(()),
             NodeData::FunctionDeclaration(data) if data.body.is_none() => return Ok(()),
@@ -1296,10 +1416,6 @@ impl Printer<'_> {
                 self.emit_parameters(&data.parameters)?;
                 self.writer.write(" ");
                 self.emit_block(data.body.expect("body checked above"))?;
-                if let Some(name) = data.name {
-                    let names = self.declaration_names(&[name]);
-                    self.emit_commonjs_declaration_exports(data.modifiers.as_ref(), &names);
-                }
             }
             NodeData::ClassDeclaration(data) => {
                 self.emit_runtime_declaration_modifiers(data.modifiers.as_ref());
@@ -1525,8 +1641,12 @@ impl Printer<'_> {
         self.writer.write("{");
         self.writer.newline();
         self.writer.indent += 1;
+        let mut previous_end = node.range.start.get().saturating_add(1);
         for statement in &data.statements.nodes {
+            let statement_node = self.node(*statement)?.clone();
+            self.emit_source_comments_between(previous_end, statement_node.range.start.get());
             self.emit_statement(*statement)?;
+            previous_end = statement_node.range.end.get();
         }
         self.writer.indent -= 1;
         self.writer.write("}");
@@ -2535,7 +2655,7 @@ impl Printer<'_> {
             NodeData::PrivateIdentifier(data) => self.writer.write(&data.text),
             NodeData::NumericLiteral(data) => self.writer.write(&data.text),
             NodeData::BigIntLiteral(data) => self.writer.write(&data.text),
-            NodeData::StringLiteral(data) => write_quoted(&mut self.writer, &data.text),
+            NodeData::StringLiteral(data) => self.write_source_quoted_string(id, &data.text),
             NodeData::RegularExpressionLiteral(data) => self.writer.write(&data.text),
             NodeData::KeywordExpression(_) => {
                 if node.kind == SyntaxKind::ThisKeyword
@@ -2547,6 +2667,7 @@ impl Printer<'_> {
                         SyntaxKind::NullKeyword => "null",
                         SyntaxKind::TrueKeyword => "true",
                         SyntaxKind::FalseKeyword => "false",
+                        SyntaxKind::UndefinedKeyword => "undefined",
                         SyntaxKind::ThisKeyword => "this",
                         SyntaxKind::SuperKeyword => "super",
                         _ => return Err(Self::unsupported(id, node.kind)),
@@ -2554,19 +2675,16 @@ impl Printer<'_> {
                 }
             }
             NodeData::BindingPattern(data) => {
-                self.writer
-                    .write(if node.kind == SyntaxKind::ArrayBindingPattern {
-                        "["
-                    } else {
-                        "{"
-                    });
+                let object = node.kind != SyntaxKind::ArrayBindingPattern;
+                self.writer.write(if object { "{" } else { "[" });
+                if object && !data.elements.nodes.is_empty() {
+                    self.writer.write(" ");
+                }
                 self.emit_expression_list(&data.elements)?;
-                self.writer
-                    .write(if node.kind == SyntaxKind::ArrayBindingPattern {
-                        "]"
-                    } else {
-                        "}"
-                    });
+                if object && !data.elements.nodes.is_empty() {
+                    self.writer.write(" ");
+                }
+                self.writer.write(if object { "}" } else { "]" });
             }
             NodeData::BindingElement(data) => {
                 if data.dot_dot_dot_token.is_some() {
@@ -2772,10 +2890,30 @@ impl Printer<'_> {
                     self.emit_downlevel_object_spread(data)?;
                     return Ok(());
                 }
-                self.writer.write("{ ");
+                if data.properties.nodes.is_empty() {
+                    self.writer.write("{}");
+                    return Ok(());
+                }
+                let multiline = self.node_source_is_multiline(id);
+                self.writer.write("{");
+                if multiline {
+                    self.writer.newline();
+                    self.writer.indent += 1;
+                } else {
+                    self.writer.write(" ");
+                }
                 for (index, property) in data.properties.nodes.iter().enumerate() {
                     if index != 0 {
-                        self.writer.write(", ");
+                        if multiline {
+                            let previous = data.properties.nodes[index - 1];
+                            if self.source_has_line_break_between(previous, *property) {
+                                self.writer.newline();
+                            } else {
+                                self.writer.write(" ");
+                            }
+                        } else {
+                            self.writer.write(", ");
+                        }
                     }
                     let node = self.node(*property)?.clone();
                     match &node.data {
@@ -2807,13 +2945,25 @@ impl Printer<'_> {
                         }
                         _ => return Err(Self::unsupported(*property, node.kind)),
                     }
+                    if multiline
+                        && (index + 1 < data.properties.nodes.len()
+                            || data.properties.has_trailing_comma)
+                    {
+                        self.writer.write(",");
+                    }
                 }
-                self.writer.write(" }");
+                if multiline {
+                    self.writer.newline();
+                    self.writer.indent -= 1;
+                    self.writer.write("}");
+                } else {
+                    self.writer.write(" }");
+                }
             }
             NodeData::ArrowFunction(data) => {
                 let is_async = self.has_modifier(data.modifiers.as_ref(), SyntaxKind::AsyncKeyword);
                 if self.settings.target < ScriptTarget::Es2015 && !is_async {
-                    let wrap = parent_precedence > 1;
+                    let wrap = parent_precedence > 2;
                     if wrap {
                         self.writer.write("(");
                     }
@@ -2832,14 +2982,23 @@ impl Printer<'_> {
                     }
                     return Ok(());
                 }
-                let wrap = parent_precedence > 1;
+                let wrap = parent_precedence > 2;
                 if wrap {
                     self.writer.write("(");
                 }
                 if is_async {
                     self.writer.write("async ");
                 }
-                self.emit_parameters(&data.parameters)?;
+                if self.arrow_uses_bare_parameter(id, data) {
+                    let parameter_id = data.parameters.nodes[0];
+                    let parameter_node = self.node(parameter_id)?.clone();
+                    let NodeData::ParameterDeclaration(parameter) = &parameter_node.data else {
+                        return Err(Self::unsupported(parameter_id, parameter_node.kind));
+                    };
+                    self.emit_expression(parameter.name, 0)?;
+                } else {
+                    self.emit_parameters(&data.parameters)?;
+                }
                 self.writer.write(" => ");
                 if matches!(&self.node(data.body)?.data, NodeData::Block(_)) {
                     self.emit_block(data.body)?;
@@ -3640,16 +3799,40 @@ impl Printer<'_> {
     }
 
     fn emit_expression_list(&mut self, list: &NodeList) -> Result<(), EmitError> {
+        let mut previous_end = list.range.start.get();
         for (index, expression) in list.nodes.iter().enumerate() {
             if index != 0 {
                 self.writer.write(", ");
             }
+            let expression_start = self.node(*expression)?.range.start.get();
+            self.emit_inline_block_comments(previous_end, expression_start);
             self.emit_expression(*expression, 1)?;
-        }
-        if list.has_trailing_comma && !list.nodes.is_empty() {
-            self.writer.write(",");
+            previous_end = self.node(*expression)?.range.end.get();
         }
         Ok(())
+    }
+
+    fn emit_inline_block_comments(&mut self, start: u32, end: u32) {
+        let start = usize::try_from(start).unwrap_or(usize::MAX);
+        let end = usize::try_from(end).unwrap_or(usize::MAX);
+        let Some(trivia) = self.source_text.get(start..end) else {
+            return;
+        };
+        let bytes = trivia.as_bytes();
+        let mut index = 0;
+        while index + 1 < bytes.len() {
+            if bytes[index..].starts_with(b"/*") {
+                let comment_end = bytes[index + 2..]
+                    .windows(2)
+                    .position(|window| window == b"*/")
+                    .map_or(bytes.len(), |offset| index + 2 + offset + 2);
+                self.writer.write(&trivia[index..comment_end]);
+                self.writer.write(" ");
+                index = comment_end;
+            } else {
+                index += 1;
+            }
+        }
     }
 
     fn single_line_return_expression(&self, block: NodeId) -> Result<Option<NodeId>, EmitError> {
@@ -3674,6 +3857,61 @@ impl Printer<'_> {
             NodeData::ReturnStatement(data) => data.expression,
             _ => None,
         })
+    }
+
+    fn node_source_is_multiline(&self, id: NodeId) -> bool {
+        let Some(node) = self.arena.get(id) else {
+            return false;
+        };
+        let start = usize::try_from(node.range.start.get()).unwrap_or(usize::MAX);
+        let end = usize::try_from(node.range.end.get()).unwrap_or(usize::MAX);
+        self.source_text
+            .get(start..end)
+            .is_some_and(|text| text.contains('\n') || text.contains('\r'))
+    }
+
+    fn source_has_line_break_between(&self, left: NodeId, right: NodeId) -> bool {
+        let Some(left) = self.arena.get(left) else {
+            return true;
+        };
+        let Some(right) = self.arena.get(right) else {
+            return true;
+        };
+        let start = usize::try_from(left.range.end.get()).unwrap_or(usize::MAX);
+        let end = usize::try_from(right.range.start.get()).unwrap_or(usize::MAX);
+        self.source_text
+            .get(start..end)
+            .is_none_or(|text| text.contains('\n') || text.contains('\r'))
+    }
+
+    fn write_source_quoted_string(&mut self, id: NodeId, text: &str) {
+        let quote = self
+            .arena
+            .get(id)
+            .and_then(|node| {
+                let start = usize::try_from(node.range.start.get()).ok()?;
+                self.source_text.as_bytes().get(start).copied()
+            })
+            .filter(|quote| matches!(quote, b'\'' | b'"'))
+            .unwrap_or(b'"');
+        write_quoted_with(&mut self.writer, text, char::from(quote));
+    }
+
+    fn arrow_uses_bare_parameter(&self, id: NodeId, data: &ts_ast::ArrowFunctionData) -> bool {
+        if self.source_text.is_empty() || data.parameters.nodes.len() != 1 {
+            return false;
+        }
+        let Some(node) = self.arena.get(id) else {
+            return false;
+        };
+        let Some(arrow) = self.arena.get(data.equals_greater_than_token) else {
+            return false;
+        };
+        let start = usize::try_from(node.range.start.get()).unwrap_or(usize::MAX);
+        let end = usize::try_from(arrow.range.start.get()).unwrap_or(usize::MAX);
+        self.source_text
+            .get(start..end)
+            .is_some_and(|parameters| !parameters.contains('('))
     }
 
     fn identifier_text(&self, id: NodeId) -> Result<&str, EmitError> {
@@ -3731,11 +3969,18 @@ fn normalize_jsx_text(text: &str) -> String {
 }
 
 fn write_quoted(writer: &mut Writer, text: &str) {
-    writer.write("\"");
+    write_quoted_with(writer, text, '"');
+}
+
+fn write_quoted_with(writer: &mut Writer, text: &str, quote: char) {
+    writer.write(&quote.to_string());
     for ch in text.chars() {
         match ch {
             '\\' => writer.write("\\\\"),
-            '"' => writer.write("\\\""),
+            ch if ch == quote => {
+                writer.write("\\");
+                writer.write(&ch.to_string());
+            }
             '\n' => writer.write("\\n"),
             '\r' => writer.write("\\r"),
             '\t' => writer.write("\\t"),
@@ -3743,7 +3988,7 @@ fn write_quoted(writer: &mut Writer, text: &str) {
             ch => writer.write(&ch.to_string()),
         }
     }
-    writer.write("\"");
+    writer.write(&quote.to_string());
 }
 
 fn write_template_text(writer: &mut Writer, text: &str) {
@@ -4058,7 +4303,7 @@ mod tests {
             emit(
                 "async function* stream(source) { await source?.next?.(); yield* source?.[0]!; } class Box { #value = 1; static count = 0; *values() { yield this.#value; } async read() { return await this.#value; } static { this.count++; } } for await (const item of items) { item; } const { first, ...rest } = input; const [head, ...tail] = items; const copy = { first, ...rest, async run() { await task; }, *iter() { yield 1; } }; const values = [0, ...items]; const typed = (value as number)! satisfies number; const run = async (value) => await value; import data from 'pkg' with { type: 'json' }; export { data } from 'pkg' with { type: 'json' };"
             ),
-            "async function* stream(source) {\n    await source?.next?.();\n    yield* source?.[0];\n}\nclass Box {\n    #value = 1;\n    static count = 0;\n    *values() {\n        yield this.#value;\n    }\n    async read() {\n        return await this.#value;\n    }\n    static {\n        this.count++;\n    }\n}\nfor await (const item of items) {\n    item;\n}\nconst {first, ...rest} = input;\nconst [head, ...tail] = items;\nconst copy = { first, ...rest, async run() {\n    await task;\n}, *iter() {\n    yield 1;\n} };\nconst values = [0, ...items];\nconst typed = (value);\nconst run = async (value) => await value;\nimport data from \"pkg\" with { type: \"json\" };\nexport { data } from \"pkg\" with { type: \"json\" };\n"
+            "async function* stream(source) {\n    await source?.next?.();\n    yield* source?.[0];\n}\nclass Box {\n    #value = 1;\n    static count = 0;\n    *values() {\n        yield this.#value;\n    }\n    async read() {\n        return await this.#value;\n    }\n    static {\n        this.count++;\n    }\n}\nfor await (const item of items) {\n    item;\n}\nconst { first, ...rest } = input;\nconst [head, ...tail] = items;\nconst copy = { first, ...rest, async run() {\n    await task;\n}, *iter() {\n    yield 1;\n} };\nconst values = [0, ...items];\nconst typed = (value);\nconst run = async (value) => await value;\nimport data from \"pkg\" with { type: \"json\" };\nexport { data } from \"pkg\" with { type: \"json\" };\n"
         );
     }
 
@@ -4084,7 +4329,7 @@ mod tests {
         );
         assert_eq!(
             result.code,
-            "var __extends = (this && this.__extends) || (function () {\n    var extendStatics = function (d, b) {\n        extendStatics = Object.setPrototypeOf ||\n            ({ __proto__: [] } instanceof Array && function (d, b) { d.__proto__ = b; }) ||\n            function (d, b) { for (var p in b) if (Object.prototype.hasOwnProperty.call(b, p)) d[p] = b[p]; };\n        return extendStatics(d, b);\n    };\n    return function (d, b) {\n        if (typeof b !== \"function\" && b !== null)\n            throw new TypeError(\"Class extends value \" + String(b) + \" is not a constructor or null\");\n        extendStatics(d, b);\n        function __() { this.constructor = d; }\n        d.prototype = b === null ? Object.create(b) : (__.prototype = b.prototype, new __());\n    };\n})();\nvar Point = /** @class */ (function () {\n    function Point(y) {\n        this.x = 1;\n        this.y = y;\n    }\n    Point.prototype.move = function (d) {\n        this.x = this.x + d;\n    };\n    Point.make = function () {\n        return new Point(0);\n    };\n    Point.origin = 0;\n    return Point;\n}());\nvar ColoredPoint = /** @class */ (function (_super) {\n    __extends(ColoredPoint, _super);\n    function ColoredPoint(y) {\n        var _this = _super.call(this, y) || this;\n        _this.color = \"red\";\n        _this.color = \"blue\";\n        return _this;\n    }\n    ColoredPoint.prototype.paint = function () {\n        return this.color;\n    };\n    return ColoredPoint;\n}(Point));\n"
+            "var __extends = (this && this.__extends) || (function () {\n    var extendStatics = function (d, b) {\n        extendStatics = Object.setPrototypeOf ||\n            ({ __proto__: [] } instanceof Array && function (d, b) { d.__proto__ = b; }) ||\n            function (d, b) { for (var p in b) if (Object.prototype.hasOwnProperty.call(b, p)) d[p] = b[p]; };\n        return extendStatics(d, b);\n    };\n    return function (d, b) {\n        if (typeof b !== \"function\" && b !== null)\n            throw new TypeError(\"Class extends value \" + String(b) + \" is not a constructor or null\");\n        extendStatics(d, b);\n        function __() { this.constructor = d; }\n        d.prototype = b === null ? Object.create(b) : (__.prototype = b.prototype, new __());\n    };\n})();\nvar Point = /** @class */ (function () {\n    function Point(y) {\n        this.x = 1;\n        this.y = y;\n    }\n    Point.prototype.move = function (d) {\n        this.x = this.x + d;\n    };\n    Point.make = function () {\n        return new Point(0);\n    };\n    Point.origin = 0;\n    return Point;\n}());\nvar ColoredPoint = /** @class */ (function (_super) {\n    __extends(ColoredPoint, _super);\n    function ColoredPoint(y) {\n        var _this = _super.call(this, y) || this;\n        _this.color = 'red';\n        _this.color = 'blue';\n        return _this;\n    }\n    ColoredPoint.prototype.paint = function () {\n        return this.color;\n    };\n    return ColoredPoint;\n}(Point));\n"
         );
     }
 
@@ -4231,7 +4476,7 @@ class Board {
         );
         assert_eq!(
             result.code,
-            "\"use strict\";\nconst main = require(\"pkg\").default;\nconst { read: load, write } = require(\"pkg\");\nrequire(\"side\");\nexports.result = load;\nObject.assign(exports, require(\"other\"));\nexports.default = main;\n"
+            "\"use strict\";\nObject.defineProperty(exports, \"__esModule\", { value: true });\nconst main = require('pkg').default;\nconst { read: load, write } = require('pkg');\nrequire('side');\nexports.result = load;\nObject.assign(exports, require('other'));\nexports.default = main;\n"
         );
     }
 
@@ -4244,7 +4489,7 @@ class Board {
         );
         assert_eq!(
             commonjs.code,
-            "\"use strict\";\nconst ts = require(\"typescript\");\nts.version;\n"
+            "\"use strict\";\nObject.defineProperty(exports, \"__esModule\", { value: true });\nconst ts = require('typescript');\nts.version;\n"
         );
 
         let es_module = emit_with(
@@ -4254,7 +4499,7 @@ class Board {
         );
         assert_eq!(
             es_module.code,
-            "const ts = require(\"typescript\");\nts.version;\n"
+            "const ts = require('typescript');\nts.version;\n"
         );
     }
 
@@ -4267,7 +4512,7 @@ class Board {
         );
         assert_eq!(
             es_module.code,
-            "import * as ts from \"typescript\";\nts.version;\n"
+            "import * as ts from 'typescript';\nts.version;\n"
         );
 
         let commonjs = emit_with(
@@ -4277,7 +4522,7 @@ class Board {
         );
         assert_eq!(
             commonjs.code,
-            "\"use strict\";\nconst ts = require(\"typescript\");\nts.version;\n"
+            "\"use strict\";\nObject.defineProperty(exports, \"__esModule\", { value: true });\nconst ts = require('typescript');\nts.version;\n"
         );
     }
 
@@ -4290,7 +4535,7 @@ class Board {
         );
         assert_eq!(
             result.code,
-            "class Numeric {\n    1() { }\n}\nclass StringNamed {\n    \"bar\"() { }\n}\n"
+            "class Numeric {\n    1() { }\n}\nclass StringNamed {\n    'bar'() { }\n}\n"
         );
     }
 

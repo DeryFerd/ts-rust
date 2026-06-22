@@ -937,7 +937,11 @@ fn strip_line_ending(line: &[u8]) -> &[u8] {
 }
 
 fn parse_directive_line(line: &str) -> Option<(&str, &str)> {
-    let comment = line.trim_start().strip_prefix("//")?.trim_start();
+    let comment = line
+        .trim_start_matches('\u{feff}')
+        .trim_start()
+        .strip_prefix("//")?
+        .trim_start();
     let directive = comment.strip_prefix('@')?;
     let (name, value) = directive.split_once(':')?;
     let name = name.trim();
@@ -1059,6 +1063,19 @@ mod tests {
         assert_eq!(
             case.directive_values("target").collect::<Vec<_>>(),
             ["esnext"]
+        );
+    }
+
+    #[test]
+    fn parses_a_directive_after_a_utf8_bom() {
+        let case = Case::parse("bom.ts", "\u{feff}// @target: es2015\nconst value = 1;").unwrap();
+        assert_eq!(
+            case.directive_values("target").collect::<Vec<_>>(),
+            ["es2015"]
+        );
+        assert_eq!(
+            case.units[0].source_text.as_scannable_str(),
+            "const value = 1;"
         );
     }
 

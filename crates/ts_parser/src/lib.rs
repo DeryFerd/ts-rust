@@ -3341,6 +3341,7 @@ impl<'a> Parser<'a> {
             SyntaxKind::NullKeyword
             | SyntaxKind::TrueKeyword
             | SyntaxKind::FalseKeyword
+            | SyntaxKind::UndefinedKeyword
             | SyntaxKind::ThisKeyword
             | SyntaxKind::SuperKeyword => self.parse_keyword_expression(),
             SyntaxKind::OpenParenToken => self.parse_parenthesized_expression(),
@@ -3435,6 +3436,7 @@ impl<'a> Parser<'a> {
     fn parse_object_literal(&mut self) -> NodeId {
         let start = self.consume().range.start;
         let mut properties = Vec::new();
+        let mut trailing = false;
         while self.current.kind != SyntaxKind::CloseBraceToken
             && self.current.kind != SyntaxKind::EndOfFile
         {
@@ -3565,6 +3567,7 @@ impl<'a> Parser<'a> {
                 break;
             }
             self.bump();
+            trailing = self.current.kind == SyntaxKind::CloseBraceToken;
         }
         let end = if self.current.kind == SyntaxKind::CloseBraceToken {
             self.consume().range.end
@@ -3580,7 +3583,7 @@ impl<'a> Parser<'a> {
                 properties: NodeList {
                     range: TextRange::new(start, end),
                     nodes: properties.clone(),
-                    has_trailing_comma: false,
+                    has_trailing_comma: trailing,
                 },
                 symbol: None,
                 facts: 0,
