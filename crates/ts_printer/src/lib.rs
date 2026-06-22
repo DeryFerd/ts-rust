@@ -45,6 +45,7 @@ pub fn emit_source_file(arena: &NodeArena, source_file: NodeId) -> Result<EmitRe
         "source.ts",
         "",
         PrinterSettings {
+            always_strict: false,
             target: ScriptTarget::EsNext,
             module: ModuleKind::EsNext,
             jsx: ts_options::JsxEmit::Preserve,
@@ -92,7 +93,21 @@ pub fn emit_source_file_with_settings(
             .get(*statement)
             .is_some_and(|statement| declaration_is_module_indicator(arena, statement))
     });
-    if settings.module == ModuleKind::CommonJs && is_external_module {
+    let has_use_strict = data.statements.nodes.first().is_some_and(|statement| {
+        let Some(NodeData::ExpressionStatement(statement)) =
+            arena.get(*statement).map(|node| &node.data)
+        else {
+            return false;
+        };
+        matches!(
+            arena.get(statement.expression).map(|node| &node.data),
+            Some(NodeData::StringLiteral(literal)) if literal.text == "use strict"
+        )
+    });
+    if !has_use_strict
+        && (settings.always_strict
+            || (settings.module == ModuleKind::CommonJs && is_external_module))
+    {
         printer.writer.write("\"use strict\";");
         printer.writer.newline();
     }
@@ -1400,6 +1415,19 @@ impl Printer<'_> {
                 }
                 self.writer.write(";");
             }
+            NodeData::DebuggerStatement(_) => self.writer.write("debugger;"),
+            NodeData::LabeledStatement(data) => {
+                self.emit_expression(data.label, 0)?;
+                self.writer.write(": ");
+                self.emit_statement(data.statement)?;
+                return Ok(());
+            }
+            NodeData::WithStatement(data) => {
+                self.writer.write("with (");
+                self.emit_expression(data.expression, 0)?;
+                self.writer.write(") ");
+                self.emit_embedded(data.statement)?;
+            }
             NodeData::ImportDeclaration(data) => self.emit_import(data)?,
             NodeData::ExportAssignment(data) => {
                 if self.settings.module == ModuleKind::CommonJs {
@@ -1568,10 +1596,13 @@ impl Printer<'_> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     fn emit_class(&mut self, data: &ts_ast::ClassDeclarationData) -> Result<(), EmitError> {
         if self.settings.target < ScriptTarget::Es2015 {
             return self.emit_downlevel_class(data);
         }
+        let lower_fields = self.settings.target < ScriptTarget::Es2022;
+        let has_base = self.class_base_expression(data)?.is_some();
         self.writer.write("class");
         if let Some(name) = data.name {
             self.writer.write(" ");
@@ -1595,10 +1626,28 @@ impl Printer<'_> {
         self.writer.write(" {");
         self.writer.newline();
         self.writer.indent += 1;
+        let has_constructor = data.members.nodes.iter().any(|member| {
+            let Some(NodeData::MethodDeclaration(method)) =
+                self.arena.get(*member).map(|node| &node.data)
+            else {
+                return false;
+            };
+            method.body.is_some()
+                && self
+                    .identifier_text(method.name)
+                    .is_ok_and(|name| name == "constructor")
+        });
+        if lower_fields && self.has_instance_field_initializers(data) && !has_constructor {
+            self.emit_synthesized_native_constructor(data, has_base)?;
+        }
         for member in &data.members.nodes {
             let node = self.node(*member)?.clone();
             match &node.data {
                 NodeData::MethodDeclaration(method) if method.body.is_some() => {
+                    if lower_fields && self.identifier_text(method.name)? == "constructor" {
+                        self.emit_native_constructor(method, data, has_base)?;
+                        continue;
+                    }
                     if self.has_modifier(method.modifiers.as_ref(), SyntaxKind::StaticKeyword) {
                         self.writer.write("static ");
                     }
@@ -1615,6 +1664,7 @@ impl Printer<'_> {
                     self.writer.newline();
                 }
                 NodeData::MethodDeclaration(_) => {}
+                NodeData::PropertyDeclaration(_) if lower_fields => {}
                 NodeData::PropertyDeclaration(property) => {
                     if self.has_modifier(property.modifiers.as_ref(), SyntaxKind::StaticKeyword) {
                         self.writer.write("static ");
@@ -1659,6 +1709,96 @@ impl Printer<'_> {
         }
         self.writer.indent -= 1;
         self.writer.write("}");
+        if lower_fields {
+            self.emit_native_static_fields(data)?;
+        }
+        Ok(())
+    }
+
+    fn emit_synthesized_native_constructor(
+        &mut self,
+        data: &ts_ast::ClassDeclarationData,
+        has_base: bool,
+    ) -> Result<(), EmitError> {
+        if has_base {
+            self.writer.write("constructor(...args) {");
+            self.writer.newline();
+            self.writer.indent += 1;
+            self.writer.write("super(...args);");
+            self.writer.newline();
+        } else {
+            self.writer.write("constructor() {");
+            self.writer.newline();
+            self.writer.indent += 1;
+        }
+        self.emit_instance_fields(data, "this")?;
+        self.writer.indent -= 1;
+        self.writer.write("}");
+        self.writer.newline();
+        Ok(())
+    }
+
+    fn emit_native_constructor(
+        &mut self,
+        method: &ts_ast::MethodDeclarationData,
+        data: &ts_ast::ClassDeclarationData,
+        has_base: bool,
+    ) -> Result<(), EmitError> {
+        self.writer.write("constructor");
+        self.emit_parameters(&method.parameters)?;
+        self.writer.write(" {");
+        self.writer.newline();
+        self.writer.indent += 1;
+        let body_id = method.body.expect("constructor body checked");
+        let body = self.node(body_id)?.clone();
+        let NodeData::Block(body) = &body.data else {
+            return Err(Self::unsupported(body_id, body.kind));
+        };
+        if !has_base {
+            self.emit_instance_fields(data, "this")?;
+        }
+        let mut emitted_fields = !has_base;
+        for statement in &body.statements.nodes {
+            self.emit_statement(*statement)?;
+            if has_base && !emitted_fields && self.is_super_call_statement(*statement)? {
+                self.emit_instance_fields(data, "this")?;
+                emitted_fields = true;
+            }
+        }
+        if !emitted_fields {
+            self.emit_instance_fields(data, "this")?;
+        }
+        self.writer.indent -= 1;
+        self.writer.write("}");
+        self.writer.newline();
+        Ok(())
+    }
+
+    fn emit_native_static_fields(
+        &mut self,
+        data: &ts_ast::ClassDeclarationData,
+    ) -> Result<(), EmitError> {
+        let Some(name) = data.name else {
+            return Ok(());
+        };
+        for member in &data.members.nodes {
+            let node = self.node(*member)?.clone();
+            let NodeData::PropertyDeclaration(property) = &node.data else {
+                continue;
+            };
+            if !self.has_modifier(property.modifiers.as_ref(), SyntaxKind::StaticKeyword) {
+                continue;
+            }
+            let Some(initializer) = property.initializer else {
+                continue;
+            };
+            self.writer.newline();
+            self.emit_expression(name, 0)?;
+            self.emit_downlevel_member_access(property.name)?;
+            self.writer.write(" = ");
+            self.emit_expression(initializer, 1)?;
+            self.writer.write(";");
+        }
         Ok(())
     }
 
@@ -1944,6 +2084,18 @@ impl Printer<'_> {
         self.writer.write(") || this;");
         self.writer.newline();
         Ok(true)
+    }
+
+    fn is_super_call_statement(&self, statement: NodeId) -> Result<bool, EmitError> {
+        let statement_node = self.node(statement)?;
+        let NodeData::ExpressionStatement(expression) = &statement_node.data else {
+            return Ok(false);
+        };
+        let call_node = self.node(expression.expression)?;
+        let NodeData::CallExpression(call) = &call_node.data else {
+            return Ok(false);
+        };
+        Ok(self.node(call.expression)?.kind == SyntaxKind::SuperKeyword)
     }
 
     fn emit_enum(&mut self, data: &ts_ast::EnumDeclarationData) -> Result<(), EmitError> {
@@ -3613,6 +3765,7 @@ mod tests {
             "input.ts",
             source,
             PrinterSettings {
+                always_strict: false,
                 target,
                 module,
                 jsx: JsxEmit::Preserve,
@@ -3634,6 +3787,7 @@ mod tests {
             "input.tsx",
             source,
             PrinterSettings {
+                always_strict: false,
                 target: ScriptTarget::EsNext,
                 module: ModuleKind::EsNext,
                 jsx,
@@ -3674,6 +3828,14 @@ mod tests {
                 "let i = 0; do { i++; if (i === 1) continue; } while (i < 2); switch (i) { case 2: i = 3; break; default: i = 4; } try { throw i; } catch (error: unknown) { i = 5; } finally { i = 6; }"
             ),
             "let i = 0;\ndo {\n  i++;\n  if (i === 1) {\n    continue;\n  }\n} while (i < 2);\nswitch (i) {\n  case 2:\n    i = 3;\n    break;\n  default:\n    i = 4;\n}\ntry {\n  throw i;\n} catch (error) {\n  i = 5;\n} finally {\n  i = 6;\n}\n"
+        );
+    }
+
+    #[test]
+    fn prints_labeled_debugger_and_with_statements() {
+        assert_eq!(
+            emit("outer: while (value) { debugger; break outer; } with (obj) value;"),
+            "outer: while (value) {\n  debugger;\n  break outer;\n}\nwith (obj) {\n  value;\n}\n"
         );
     }
 
@@ -3789,7 +3951,7 @@ mod tests {
     }
 
     #[test]
-    fn preserves_class_syntax_for_es2015_and_newer() {
+    fn lowers_fields_but_preserves_class_syntax_before_es2022() {
         let result = emit_with(
             "class Box { value = 1; read() { return this.value; } }",
             ScriptTarget::Es2015,
@@ -3797,8 +3959,116 @@ mod tests {
         );
         assert_eq!(
             result.code,
-            "class Box {\n  value = 1;\n  read() {\n    return this.value;\n  }\n}\n"
+            "class Box {\n  constructor() {\n    this.value = 1;\n  }\n  read() {\n    return this.value;\n  }\n}\n"
         );
+    }
+
+    #[test]
+    fn lowers_derived_and_static_fields_before_es2022() {
+        let result = emit_with(
+            "class Box extends Base { value = 1; static count = 2; constructor(name: string) { super(name); this.ready = true; } }",
+            ScriptTarget::Es2021,
+            ModuleKind::EsNext,
+        );
+        assert_eq!(
+            result.code,
+            "class Box extends Base {\n  constructor(name) {\n    super(name);\n    this.value = 1;\n    this.ready = true;\n  }\n}\nBox.count = 2;\n"
+        );
+    }
+
+    #[test]
+    fn preserves_native_fields_for_es2022_and_newer() {
+        let result = emit_with(
+            "class Box { value = 1; static count = 2; }",
+            ScriptTarget::Es2022,
+            ModuleKind::EsNext,
+        );
+        assert_eq!(
+            result.code,
+            "class Box {\n  value = 1;\n  static count = 2;\n}\n"
+        );
+    }
+
+    #[test]
+    fn matches_2d_arrays_strict_and_class_field_shape() {
+        let source = r"class Cell {}
+class Ship {
+    isSunk: boolean = false;
+}
+class Board {
+    ships: Ship[] = [];
+    cells: Cell[] = [];
+}";
+        let parsed = parse_source_file(source);
+        let result = emit_source_file_with_settings(
+            &parsed.arena,
+            parsed.source_file,
+            "input.ts",
+            source,
+            PrinterSettings {
+                always_strict: true,
+                target: ScriptTarget::Es2015,
+                module: ModuleKind::EsNext,
+                jsx: JsxEmit::Preserve,
+                emit_javascript: true,
+                emit_declarations: false,
+                source_map: false,
+                inline_source_map: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            result.code,
+            "\"use strict\";\nclass Cell {\n}\nclass Ship {\n  constructor() {\n    this.isSunk = false;\n  }\n}\nclass Board {\n  constructor() {\n    this.ships = [];\n    this.cells = [];\n  }\n}\n"
+        );
+    }
+
+    #[test]
+    fn matches_class_declaration_overload_erasure_baseline() {
+        let source = "class C { constructor(); foo(); }";
+        let parsed = parse_source_file(source);
+        let result = emit_source_file_with_settings(
+            &parsed.arena,
+            parsed.source_file,
+            "input.ts",
+            source,
+            PrinterSettings {
+                always_strict: true,
+                target: ScriptTarget::Es2015,
+                module: ModuleKind::EsNext,
+                jsx: JsxEmit::Preserve,
+                emit_javascript: true,
+                emit_declarations: false,
+                source_map: false,
+                inline_source_map: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(result.code, "\"use strict\";\nclass C {\n}\n");
+    }
+
+    #[test]
+    fn does_not_duplicate_an_existing_use_strict_directive() {
+        let source = "\"use strict\"; const value = 1;";
+        let parsed = parse_source_file(source);
+        let result = emit_source_file_with_settings(
+            &parsed.arena,
+            parsed.source_file,
+            "input.ts",
+            source,
+            PrinterSettings {
+                always_strict: true,
+                target: ScriptTarget::Es2015,
+                module: ModuleKind::EsNext,
+                jsx: JsxEmit::Preserve,
+                emit_javascript: true,
+                emit_declarations: false,
+                source_map: false,
+                inline_source_map: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(result.code, "\"use strict\";\nconst value = 1;\n");
     }
 
     #[test]

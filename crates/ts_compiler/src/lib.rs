@@ -1350,7 +1350,10 @@ mod tests {
         let emitted = program.emit();
         assert!(emitted.diagnostics.is_empty());
         assert_eq!(emitted.files[0].file_name, "/project/main.js");
-        assert_eq!(emitted.files[0].text, "var point = { x: 1 };\n");
+        assert_eq!(
+            emitted.files[0].text,
+            "\"use strict\";\nvar point = { x: 1 };\n"
+        );
     }
 
     #[test]
@@ -1398,7 +1401,10 @@ mod tests {
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert_eq!(emitted.files.len(), 1);
         assert_eq!(emitted.files[0].file_name, "/project/view.jsx");
-        assert_eq!(emitted.files[0].text, "var view = <Box label=\"ok\" />;\n");
+        assert_eq!(
+            emitted.files[0].text,
+            "\"use strict\";\nvar view = <Box label=\"ok\" />;\n"
+        );
     }
 
     #[test]

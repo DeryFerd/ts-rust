@@ -80,6 +80,7 @@ pub enum ModuleDetectionKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct CompilerOptions {
+    pub always_strict: bool,
     pub allow_js: bool,
     pub allow_unreachable_code: Option<bool>,
     pub allow_synthetic_default_imports: bool,
@@ -129,6 +130,7 @@ pub struct CompilerOptions {
 impl Default for CompilerOptions {
     fn default() -> Self {
         Self {
+            always_strict: true,
             allow_js: false,
             allow_unreachable_code: None,
             allow_synthetic_default_imports: false,
@@ -181,6 +183,7 @@ impl Default for CompilerOptions {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct PrinterSettings {
+    pub always_strict: bool,
     pub target: ScriptTarget,
     pub module: ModuleKind,
     pub jsx: JsxEmit,
@@ -208,6 +211,7 @@ impl CompilerOptions {
     pub fn apply_overrides(&mut self, overrides: &Self, names: &BTreeSet<String>) {
         for name in names {
             match name.as_str() {
+                "alwaysstrict" => self.always_strict = overrides.always_strict,
                 "allowjs" => self.allow_js = overrides.allow_js,
                 "allowunreachablecode" => {
                     self.allow_unreachable_code = overrides.allow_unreachable_code;
@@ -311,6 +315,7 @@ impl CompilerOptions {
     #[must_use]
     pub const fn printer_settings(&self) -> PrinterSettings {
         PrinterSettings {
+            always_strict: self.always_strict,
             target: self.target,
             module: self.module,
             jsx: self.jsx,
@@ -382,6 +387,9 @@ pub fn parse_compiler_options_map(options: &BTreeMap<String, JsonValue>) -> Pars
     for (original_name, value) in options {
         let name = original_name.to_ascii_lowercase();
         match name.as_str() {
+            "alwaysstrict" => {
+                parsed.always_strict = boolean(original_name, value, &mut diagnostics);
+            }
             "allowjs" => parsed.allow_js = boolean(original_name, value, &mut diagnostics),
             "allowunreachablecode" => {
                 parsed.allow_unreachable_code = boolean(original_name, value, &mut diagnostics);
@@ -494,6 +502,7 @@ pub fn parse_compiler_options_map(options: &BTreeMap<String, JsonValue>) -> Pars
 
 #[derive(Default)]
 struct PartialOptions {
+    always_strict: Option<bool>,
     allow_js: Option<bool>,
     allow_unreachable_code: Option<bool>,
     allow_synthetic_default_imports: Option<bool>,
@@ -551,6 +560,7 @@ impl PartialOptions {
             .unwrap_or_else(|| default_module_resolution(module));
         let es_module_interop = self.es_module_interop.unwrap_or(false);
         CompilerOptions {
+            always_strict: self.always_strict.unwrap_or(true),
             allow_js: self.allow_js.unwrap_or(check_js),
             allow_unreachable_code: self.allow_unreachable_code,
             allow_synthetic_default_imports: self.allow_synthetic_default_imports.unwrap_or(
@@ -943,6 +953,7 @@ mod tests {
         ]));
         assert!(result.is_ok());
         assert!(result.options.strict);
+        assert!(result.options.always_strict);
         assert!(result.options.no_implicit_any);
         assert!(!result.options.strict_null_checks);
         assert_eq!(result.options.allow_unreachable_code, Some(false));
@@ -958,6 +969,18 @@ mod tests {
         assert!(result.options.isolated_modules);
         assert!(result.options.force_consistent_casing_in_file_names);
         assert_eq!(result.options.module_detection, ModuleDetectionKind::Force);
+    }
+
+    #[test]
+    fn always_strict_defaults_true_and_accepts_an_explicit_false() {
+        let defaults = parse_compiler_options(&object([]));
+        assert!(defaults.is_ok());
+        assert!(defaults.options.always_strict);
+        assert!(defaults.options.printer_settings().always_strict);
+
+        let disabled = parse_compiler_options(&object([("alwaysStrict", JsonValue::Bool(false))]));
+        assert!(disabled.is_ok());
+        assert!(!disabled.options.always_strict);
     }
 
     #[test]

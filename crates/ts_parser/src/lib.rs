@@ -7,36 +7,38 @@ use ts_ast::{
     CallSignatureDeclarationData, CaseBlockData, CaseOrDefaultClauseData, CatchClauseData,
     ClassDeclarationData, ClassStaticBlockDeclarationData, ComputedPropertyNameData,
     ConditionalExpressionData, ConditionalTypeNodeData, ConstructSignatureDeclarationData,
-    ConstructorTypeNodeData, ContinueStatementData, DecoratorData, DoStatementData,
-    ElementAccessExpressionData, EmptyStatementData, EnumDeclarationData, EnumMemberData,
-    ExportAssignmentData, ExportDeclarationData, ExportSpecifierData, ExpressionStatementData,
-    ExpressionWithTypeArgumentsData, ExternalModuleReferenceData, ForInOrOfStatementData,
-    ForStatementData, FunctionDeclarationData, FunctionTypeNodeData, GetAccessorDeclarationData,
-    HeritageClauseData, IdentifierData, IfStatementData, ImportAttributeData, ImportAttributesData,
-    ImportClauseData, ImportDeclarationData, ImportEqualsDeclarationData, ImportSpecifierData,
-    ImportTypeNodeData, IndexSignatureDeclarationData, IndexedAccessTypeNodeData,
-    InferTypeNodeData, InterfaceDeclarationData, IntersectionTypeNodeData, JsDocData,
-    JsDocTextData, JsDocUnknownTagData, JsxAttributeData, JsxAttributesData, JsxClosingElementData,
+    ConstructorTypeNodeData, ContinueStatementData, DebuggerStatementData, DecoratorData,
+    DoStatementData, ElementAccessExpressionData, EmptyStatementData, EnumDeclarationData,
+    EnumMemberData, ExportAssignmentData, ExportDeclarationData, ExportSpecifierData,
+    ExpressionStatementData, ExpressionWithTypeArgumentsData, ExternalModuleReferenceData,
+    ForInOrOfStatementData, ForStatementData, FunctionDeclarationData, FunctionTypeNodeData,
+    GetAccessorDeclarationData, HeritageClauseData, IdentifierData, IfStatementData,
+    ImportAttributeData, ImportAttributesData, ImportClauseData, ImportDeclarationData,
+    ImportEqualsDeclarationData, ImportSpecifierData, ImportTypeNodeData,
+    IndexSignatureDeclarationData, IndexedAccessTypeNodeData, InferTypeNodeData,
+    InterfaceDeclarationData, IntersectionTypeNodeData, JsDocData, JsDocTextData,
+    JsDocUnknownTagData, JsxAttributeData, JsxAttributesData, JsxClosingElementData,
     JsxClosingFragmentData, JsxElementData, JsxExpressionData, JsxFragmentData,
     JsxOpeningElementData, JsxOpeningFragmentData, JsxSelfClosingElementData,
     JsxSpreadAttributeData, JsxTextData, KeywordExpressionData, KeywordTypeNodeData,
-    LiteralTypeNodeData, MappedTypeNodeData, MethodDeclarationData, MethodSignatureDeclarationData,
-    ModifierList, ModuleBlockData, ModuleDeclarationData, NamedExportsData, NamedImportsData,
-    NamespaceImportData, NewExpressionData, NoSubstitutionTemplateLiteralData, Node, NodeArena,
-    NodeData, NodeFlags, NodeId, NodeList, NonNullExpressionData, NumericLiteralData,
-    ObjectLiteralExpressionData, ParameterDeclarationData, ParenthesizedExpressionData,
-    ParenthesizedTypeNodeData, PostfixUnaryExpressionData, PrefixUnaryExpressionData,
-    PrivateIdentifierData, PropertyAccessExpressionData, PropertyAssignmentData,
-    PropertyDeclarationData, QualifiedNameData, RestTypeNodeData, ReturnStatementData,
-    SatisfiesExpressionData, SetAccessorDeclarationData, ShorthandPropertyAssignmentData,
-    SourceFileData, SpreadAssignmentData, SpreadElementData, StringLiteralData,
-    SwitchStatementData, SymbolTable, SyntaxKind, TemplateExpressionData, TemplateHeadData,
-    TemplateLiteralTypeNodeData, TemplateLiteralTypeSpanData, TemplateMiddleData, TemplateSpanData,
-    TemplateTailData, ThisTypeNodeData, ThrowStatementData, TokenData, TokenFlags,
-    TryStatementData, TupleTypeNodeData, TypeAliasDeclarationData, TypeAssertionData,
-    TypeLiteralNodeData, TypeOperatorNodeData, TypeParameterDeclarationData, TypePredicateNodeData,
-    TypeQueryNodeData, TypeReferenceNodeData, UnionTypeNodeData, VariableDeclarationData,
-    VariableDeclarationListData, VariableStatementData, WhileStatementData, YieldExpressionData,
+    LabeledStatementData, LiteralTypeNodeData, MappedTypeNodeData, MethodDeclarationData,
+    MethodSignatureDeclarationData, ModifierList, ModuleBlockData, ModuleDeclarationData,
+    NamedExportsData, NamedImportsData, NamespaceImportData, NewExpressionData,
+    NoSubstitutionTemplateLiteralData, Node, NodeArena, NodeData, NodeFlags, NodeId, NodeList,
+    NonNullExpressionData, NumericLiteralData, ObjectLiteralExpressionData,
+    ParameterDeclarationData, ParenthesizedExpressionData, ParenthesizedTypeNodeData,
+    PostfixUnaryExpressionData, PrefixUnaryExpressionData, PrivateIdentifierData,
+    PropertyAccessExpressionData, PropertyAssignmentData, PropertyDeclarationData,
+    QualifiedNameData, RestTypeNodeData, ReturnStatementData, SatisfiesExpressionData,
+    SetAccessorDeclarationData, ShorthandPropertyAssignmentData, SourceFileData,
+    SpreadAssignmentData, SpreadElementData, StringLiteralData, SwitchStatementData, SymbolTable,
+    SyntaxKind, TemplateExpressionData, TemplateHeadData, TemplateLiteralTypeNodeData,
+    TemplateLiteralTypeSpanData, TemplateMiddleData, TemplateSpanData, TemplateTailData,
+    ThisTypeNodeData, ThrowStatementData, TokenData, TokenFlags, TryStatementData,
+    TupleTypeNodeData, TypeAliasDeclarationData, TypeAssertionData, TypeLiteralNodeData,
+    TypeOperatorNodeData, TypeParameterDeclarationData, TypePredicateNodeData, TypeQueryNodeData,
+    TypeReferenceNodeData, UnionTypeNodeData, VariableDeclarationData, VariableDeclarationListData,
+    VariableStatementData, WhileStatementData, WithStatementData, YieldExpressionData,
 };
 use ts_core::{Diagnostic, DiagnosticCategory, TextPos, TextRange};
 use ts_diagnostics::{Category, message_by_code};
@@ -245,6 +247,8 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_statement(&mut self) -> NodeId {
+        let is_labeled_statement = self.current.kind == SyntaxKind::Identifier
+            && self.next_token_kind() == SyntaxKind::ColonToken;
         match self.current.kind {
             SyntaxKind::OpenBraceToken => self.parse_block(),
             SyntaxKind::VarKeyword | SyntaxKind::LetKeyword | SyntaxKind::ConstKeyword => {
@@ -268,6 +272,8 @@ impl<'a> Parser<'a> {
             SyntaxKind::BreakKeyword | SyntaxKind::ContinueKeyword => {
                 self.parse_break_or_continue_statement()
             }
+            SyntaxKind::DebuggerKeyword => self.parse_debugger_statement(),
+            SyntaxKind::WithKeyword => self.parse_with_statement(),
             SyntaxKind::NamespaceKeyword
             | SyntaxKind::ModuleKeyword
             | SyntaxKind::GlobalKeyword => self.parse_module_declaration(),
@@ -278,6 +284,7 @@ impl<'a> Parser<'a> {
             SyntaxKind::ImportKeyword => self.parse_import_declaration(),
             SyntaxKind::ExportKeyword => self.parse_export_declaration(),
             SyntaxKind::SemicolonToken => self.parse_empty_statement(),
+            SyntaxKind::Identifier if is_labeled_statement => self.parse_labeled_statement(),
             _ => self.parse_expression_statement(),
         }
     }
@@ -315,6 +322,51 @@ impl<'a> Parser<'a> {
             range,
             NodeData::EmptyStatement(Box::new(EmptyStatementData { flow_node: None })),
             &[],
+        )
+    }
+
+    fn parse_debugger_statement(&mut self) -> NodeId {
+        let start = self.consume().range.start;
+        let end = self.parse_semicolon(self.current.full_start);
+        self.alloc_node(
+            SyntaxKind::DebuggerStatement,
+            TextRange::new(start, end),
+            NodeData::DebuggerStatement(Box::new(DebuggerStatementData { flow_node: None })),
+            &[],
+        )
+    }
+
+    fn parse_with_statement(&mut self) -> NodeId {
+        let start = self.consume().range.start;
+        let expression = self.parse_parenthesized_condition();
+        let statement = self.parse_statement();
+        self.alloc_node(
+            SyntaxKind::WithStatement,
+            TextRange::new(start, self.node_end(statement)),
+            NodeData::WithStatement(Box::new(WithStatementData {
+                expression,
+                flow_node: None,
+                statement,
+                facts: 0,
+            })),
+            &[expression, statement],
+        )
+    }
+
+    fn parse_labeled_statement(&mut self) -> NodeId {
+        let start = self.current.range.start;
+        let label = self.parse_identifier("Expected a label.");
+        self.expect_and_bump(SyntaxKind::ColonToken, "Expected ':'.");
+        let statement = self.parse_statement();
+        self.alloc_node(
+            SyntaxKind::LabeledStatement,
+            TextRange::new(start, self.node_end(statement)),
+            NodeData::LabeledStatement(Box::new(LabeledStatementData {
+                flow_node: None,
+                label,
+                statement,
+            })),
+            &[label, statement],
         )
     }
 
@@ -5438,6 +5490,38 @@ mod tests {
             panic!("expected decorated class");
         };
         assert_eq!(class_data.modifiers.as_ref().unwrap().list.nodes.len(), 1);
+    }
+
+    #[test]
+    fn parses_labeled_debugger_and_with_statements() {
+        let result =
+            parse_source_file("outer: while (value) { debugger; break outer; } with (obj) value;");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let statements = source_statements(&result);
+        assert_eq!(statements.len(), 2);
+        assert_eq!(
+            result.arena.get(statements[0]).unwrap().kind,
+            SyntaxKind::LabeledStatement
+        );
+        assert_eq!(
+            result.arena.get(statements[1]).unwrap().kind,
+            SyntaxKind::WithStatement
+        );
+        let NodeData::LabeledStatement(label) = &result.arena.get(statements[0]).unwrap().data
+        else {
+            panic!("expected labeled statement");
+        };
+        let NodeData::WhileStatement(loop_) = &result.arena.get(label.statement).unwrap().data
+        else {
+            panic!("expected labeled loop");
+        };
+        let NodeData::Block(block) = &result.arena.get(loop_.statement).unwrap().data else {
+            panic!("expected loop block");
+        };
+        assert_eq!(
+            result.arena.get(block.statements.nodes[0]).unwrap().kind,
+            SyntaxKind::DebuggerStatement
+        );
     }
 
     #[test]

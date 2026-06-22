@@ -166,6 +166,7 @@ fn parse_expanded(args: &[String]) -> Result<Command, CommandLineError> {
 
 fn compiler_boolean_name(argument: &str) -> Option<&'static str> {
     Some(match argument {
+        "--alwaysstrict" => "alwaysstrict",
         "--allowjs" => "allowjs",
         "--allowunreachablecode" => "allowunreachablecode",
         "--allowsyntheticdefaultimports" => "allowsyntheticdefaultimports",
@@ -399,6 +400,16 @@ mod tests {
         };
         assert_eq!(options.pretty, Some(false));
         assert_eq!(options.files, ["main.ts"]);
+    }
+
+    #[test]
+    fn parses_always_strict() {
+        let Command::Compile(options) = parse(&["--alwaysStrict", "false", "main.ts"]).unwrap()
+        else {
+            panic!("expected compile command");
+        };
+        assert!(!options.compiler_options.always_strict);
+        assert!(options.specified_options.contains("alwaysstrict"));
     }
 
     #[test]
