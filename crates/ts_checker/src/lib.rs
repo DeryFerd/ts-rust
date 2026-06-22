@@ -931,6 +931,19 @@ impl<'a> ProgramChecker<'a> {
         let mut globals = BTreeMap::new();
         let mut declarations = BTreeMap::<String, (usize, ts_binder::SymbolFlags)>::new();
         let mut duplicates = Vec::new();
+        let referenced_names = self
+            .sources
+            .iter()
+            .filter(|source| !source.is_default_library)
+            .flat_map(|source| {
+                source.arena.iter().filter_map(|(_, node)| {
+                    let NodeData::Identifier(identifier) = &node.data else {
+                        return None;
+                    };
+                    Some(identifier.text.clone())
+                })
+            })
+            .collect::<BTreeSet<_>>();
         for (file_index, (source, result)) in self.sources.iter().zip(results).enumerate() {
             if is_external_module(source) {
                 continue;
@@ -981,7 +994,11 @@ impl<'a> ProgramChecker<'a> {
                                 .flags
                                 .contains(ts_binder::SymbolFlags::NAMESPACE_MODULE)))
                         && let Some(descriptor) = if source.is_default_library {
-                            Self::describe_default_library_symbol(source, symbol_id)
+                            Self::describe_default_library_symbol(
+                                source,
+                                symbol_id,
+                                referenced_names.contains(name),
+                            )
                         } else {
                             Self::describe_symbol(source, result, symbol_id)
                         }
@@ -992,7 +1009,11 @@ impl<'a> ProgramChecker<'a> {
                     continue;
                 }
                 let descriptor = if source.is_default_library {
-                    Self::describe_default_library_symbol(source, symbol_id)
+                    Self::describe_default_library_symbol(
+                        source,
+                        symbol_id,
+                        referenced_names.contains(name),
+                    )
                 } else {
                     Self::describe_symbol(source, result, symbol_id)
                 };
@@ -1008,6 +1029,7 @@ impl<'a> ProgramChecker<'a> {
     fn describe_default_library_symbol(
         source: &ProgramSource<'_>,
         symbol_id: SymbolId,
+        value_is_referenced: bool,
     ) -> Option<TypeDescriptor> {
         let symbol = source.bindings.symbols.get(symbol_id)?;
         let core_name = is_core_library_name(&symbol.name);
@@ -1019,6 +1041,29 @@ impl<'a> ProgramChecker<'a> {
                 }
                 Some(NodeData::FunctionDeclaration(_)) => {
                     core_name && symbol.declarations.len() > 1
+                }
+                Some(NodeData::VariableDeclaration(variable)) => {
+                    value_is_referenced
+                        && variable.type_.is_some_and(|type_node| {
+                            let Some(NodeData::TypeReferenceNode(reference)) =
+                                source.arena.get(type_node).map(|node| &node.data)
+                            else {
+                                return false;
+                            };
+                            let Some(target) =
+                                Self::resolve_entity_symbol(source, reference.type_name)
+                            else {
+                                return false;
+                            };
+                            source.bindings.symbols.get(target).is_some_and(|symbol| {
+                                symbol.declarations.iter().any(|declaration| {
+                                    matches!(
+                                        source.arena.get(*declaration).map(|node| &node.data),
+                                        Some(NodeData::InterfaceDeclaration(_))
+                                    )
+                                })
+                            })
+                        })
                 }
                 _ => false,
             }
@@ -2418,6 +2463,7 @@ impl<'a> Checker<'a> {
                         {
                             readonly_properties.insert(name.clone());
                         }
+                        self.result.node_types.insert(*member, property_type);
                         properties.insert(name, property_type);
                     }
                 }
@@ -4344,7 +4390,22 @@ impl<'a> Checker<'a> {
                 })
             }) {
                 let signature = self.class_constructor_signature(&class.members.nodes, type_id);
-                return self.result.types.alloc(TypeKind::Constructor(signature));
+                let constructor = self.result.types.alloc(TypeKind::Constructor(signature));
+                let static_members = class
+                    .members
+                    .nodes
+                    .iter()
+                    .filter(|member| {
+                        self.member_modifier(**member, SyntaxKind::StaticKeyword)
+                            .is_some()
+                    })
+                    .copied()
+                    .collect::<Vec<_>>();
+                if static_members.is_empty() {
+                    return constructor;
+                }
+                let static_type = self.object_type_from_members(&static_members);
+                return self.result.types.intersection([constructor, static_type]);
             }
             return type_id;
         }
@@ -6983,6 +7044,32 @@ fn describe_declaration_symbol(
     }) {
         return Some(describe_alias(source, alias));
     }
+    if let Some(variable) = declarations.iter().find_map(|node| {
+        let NodeData::VariableDeclaration(variable) = &node.data else {
+            return None;
+        };
+        Some(variable.as_ref())
+    }) {
+        let type_id = if let Some(result) = result
+            && let Some(type_id) = result.type_of_symbol(symbol_id)
+        {
+            type_id
+        } else {
+            let annotation = variable.type_?;
+            if let Some(NodeData::TypeReferenceNode(reference)) =
+                source.arena.get(annotation).map(|node| &node.data)
+                && let Some(target) =
+                    ProgramChecker::resolve_entity_symbol(source, reference.type_name)
+                && target != symbol_id
+            {
+                return describe_declaration_symbol(source, None, target);
+            }
+            let mut checker = Checker::new(source.arena, source.bindings);
+            let type_id = checker.type_from_type_node(annotation);
+            return Some(describe_type(&checker.result.types, type_id));
+        };
+        return result.map(|result| describe_checked_type(result, type_id));
+    }
     let function_declarations = declarations
         .iter()
         .filter_map(|node| {
@@ -7629,6 +7716,7 @@ mod tests {
     use super::{
         Checker, CheckerOptions, EnumConstantValue, ImportTypeReference, ObjectType, ProgramSource,
         TypeKind, check_program, check_source_file, check_source_file_with_options,
+        identifier_text,
     };
 
     struct Builder {
@@ -8874,6 +8962,128 @@ mod tests {
             instance_properties
                 .iter()
                 .any(|properties| properties.contains("name"))
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn infers_default_library_and_class_static_method_return_types() {
+        let default_library = parse_source_file(
+            r"
+                interface DateConstructor { now(): number; }
+                declare var Date: DateConstructor;
+            ",
+        );
+        let consumer = parse_source_file(
+            r"
+                class Clock { static now(): number { return 1; } }
+                const clockNow = Clock.now();
+                export function makeTimestamped() {
+                    return class {
+                        timestamp = Date.now();
+                        localTimestamp = Clock.now();
+                    };
+                }
+            ",
+        );
+        assert!(
+            default_library.diagnostics.is_empty(),
+            "{:?}",
+            default_library.diagnostics
+        );
+        assert!(
+            consumer.diagnostics.is_empty(),
+            "{:?}",
+            consumer.diagnostics
+        );
+        let default_bindings =
+            bind_source_file(&default_library.arena, default_library.source_file);
+        let consumer_bindings = bind_source_file(&consumer.arena, consumer.source_file);
+        let no_modules = BTreeMap::new();
+        let checked = check_program(&[
+            ProgramSource {
+                arena: &default_library.arena,
+                source_file: default_library.source_file,
+                bindings: &default_bindings,
+                resolved_modules: &no_modules,
+                is_default_library: true,
+                skip_diagnostics: true,
+                checker_options: CheckerOptions {
+                    is_declaration_file: true,
+                    ..CheckerOptions::default()
+                },
+            },
+            ProgramSource {
+                arena: &consumer.arena,
+                source_file: consumer.source_file,
+                bindings: &consumer_bindings,
+                resolved_modules: &no_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+        ]);
+        assert!(
+            checked.files[1].diagnostics.is_empty(),
+            "{:?}",
+            checked.files[1].diagnostics
+        );
+
+        let clock_now = consumer_bindings
+            .root_scope()
+            .unwrap()
+            .symbols
+            .get("clockNow")
+            .unwrap();
+        assert_eq!(
+            checked.files[1].type_of_symbol(clock_now),
+            Some(checked.files[1].types.number())
+        );
+        let make = consumer_bindings
+            .root_scope()
+            .unwrap()
+            .symbols
+            .get("makeTimestamped")
+            .unwrap();
+        let make_type = checked.files[1].type_of_symbol(make).unwrap();
+        let TypeKind::Function(make) = &checked.files[1].types.get(make_type).unwrap().kind else {
+            panic!("expected function type");
+        };
+        let TypeKind::Constructor(returned_class) =
+            &checked.files[1].types.get(make.return_type).unwrap().kind
+        else {
+            panic!("expected returned class constructor");
+        };
+        let TypeKind::Object(instance) = &checked.files[1]
+            .types
+            .get(returned_class.return_type)
+            .unwrap()
+            .kind
+        else {
+            panic!("expected returned class instance");
+        };
+        assert_eq!(
+            instance.properties.get("timestamp"),
+            Some(&checked.files[1].types.number())
+        );
+        assert_eq!(
+            instance.properties.get("localTimestamp"),
+            Some(&checked.files[1].types.number())
+        );
+        let timestamp_property = consumer
+            .arena
+            .iter()
+            .find_map(|(node_id, node)| {
+                let NodeData::PropertyDeclaration(property) = &node.data else {
+                    return None;
+                };
+                (identifier_text(&consumer.arena, property.name) == Some("timestamp"))
+                    .then_some(node_id)
+            })
+            .unwrap();
+        assert_eq!(
+            checked.files[1].type_of_node(timestamp_property),
+            Some(checked.files[1].types.number())
         );
     }
 
