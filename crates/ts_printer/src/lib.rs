@@ -291,10 +291,18 @@ pub fn emit_source_file_with_context(
         printer.writer.write("\"use strict\";");
         printer.writer.newline();
     }
-    if let Some(first_statement) = data.statements.nodes.first()
-        && let Some(node) = arena.get(*first_statement)
-    {
-        printer.emit_leading_source_comments(node.range.start.get());
+    let first_statement_start = data
+        .statements
+        .nodes
+        .first()
+        .and_then(|statement| arena.get(*statement))
+        .map(|node| node.range.start.get());
+    if let Some(start) = first_statement_start {
+        if settings.module == ModuleKind::CommonJs && is_external_module {
+            printer.emit_leading_pinned_source_comments(start);
+        } else {
+            printer.emit_leading_source_comments(start);
+        }
     }
     if settings.target < ScriptTarget::Es2015 && source_needs_extends_helper(arena) {
         printer.emit_extends_helper();
@@ -363,6 +371,9 @@ pub fn emit_source_file_with_context(
                 printer.writer.write(";");
                 printer.writer.newline();
             }
+        }
+        if let Some(start) = first_statement_start {
+            printer.emit_leading_source_comments(start);
         }
     }
     printer.emit_automatic_jsx_prelude();
@@ -3365,10 +3376,23 @@ impl Printer<'_> {
     }
 
     fn emit_leading_source_comments(&mut self, end: u32) {
-        self.emit_leading_source_comments_excluding(end, &[]);
+        self.emit_leading_source_comments_excluding_with_mode(end, &[], false);
+    }
+
+    fn emit_leading_pinned_source_comments(&mut self, end: u32) {
+        self.emit_leading_source_comments_excluding_with_mode(end, &[], true);
     }
 
     fn emit_leading_source_comments_excluding(&mut self, end: u32, excluded: &[(u32, u32)]) {
+        self.emit_leading_source_comments_excluding_with_mode(end, excluded, false);
+    }
+
+    fn emit_leading_source_comments_excluding_with_mode(
+        &mut self,
+        end: u32,
+        excluded: &[(u32, u32)],
+        pinned_only: bool,
+    ) {
         let end = usize::try_from(end).unwrap_or(usize::MAX);
         let Some(prefix) = self.source_text.get(..end) else {
             return;
@@ -3382,11 +3406,15 @@ impl Printer<'_> {
                     .position(|byte| *byte == b'\n' || *byte == b'\r')
                     .map_or(bytes.len(), |offset| index + offset);
                 let comment = &prefix[index..comment_end];
-                if !is_reference_directive(comment)
+                let comment_range = (index, comment_end);
+                let pinned = comment.starts_with("//!") || comment.contains("@license");
+                if (!pinned_only || pinned)
+                    && !is_reference_directive(comment)
                     && !excluded.iter().any(|(start, end)| {
                         usize::try_from(*start) == Ok(index)
                             && usize::try_from(*end) == Ok(comment_end)
                     })
+                    && self.emitted_source_comments.insert(comment_range)
                 {
                     self.writer.write(comment);
                     self.writer.newline();
@@ -3397,13 +3425,18 @@ impl Printer<'_> {
                     .windows(2)
                     .position(|window| window == b"*/")
                     .map_or(bytes.len(), |offset| index + 2 + offset + 2);
-                for line in prefix[index..comment_end]
-                    .replace("\r\n", "\n")
-                    .replace('\r', "\n")
-                    .split('\n')
-                {
-                    self.writer.write(line);
-                    self.writer.newline();
+                let comment = &prefix[index..comment_end];
+                let comment_range = (index, comment_end);
+                let pinned = comment.starts_with("/*!") || comment.contains("@license");
+                if (!pinned_only || pinned) && self.emitted_source_comments.insert(comment_range) {
+                    for line in comment
+                        .replace("\r\n", "\n")
+                        .replace('\r', "\n")
+                        .split('\n')
+                    {
+                        self.writer.write(line);
+                        self.writer.newline();
+                    }
                 }
                 index = comment_end;
             } else {
@@ -4070,6 +4103,21 @@ impl Printer<'_> {
                 self.emit_parameters(&data.parameters)?;
                 self.writer.write(" ");
                 self.emit_function_body(data.body.expect("body checked above"))?;
+                if let Some(container) = self.namespace_containers.last().cloned()
+                    && self.has_modifier(data.modifiers.as_ref(), SyntaxKind::ExportKeyword)
+                    && let Some(name) = data
+                        .name
+                        .and_then(|name| declaration_name_text(self.arena, name))
+                        .map(str::to_owned)
+                {
+                    self.writer.newline();
+                    self.writer.write(&container);
+                    self.writer.write(".");
+                    self.writer.write(&name);
+                    self.writer.write(" = ");
+                    self.writer.write(&name);
+                    self.writer.write(";");
+                }
             }
             NodeData::ClassDeclaration(data) => {
                 self.emit_runtime_declaration_modifiers(data.modifiers.as_ref());
@@ -6356,7 +6404,7 @@ impl Printer<'_> {
             return Ok(false);
         };
         let symbol = self.bindings.node_symbols.get(&declaration.name).copied();
-        if !self.commonjs_export_initializer_can_be_direct(initializer, symbol) {
+        if !self.commonjs_export_initializer_can_be_direct(initializer) {
             return Ok(false);
         }
         if let Some(symbol) = symbol {
@@ -6371,11 +6419,7 @@ impl Printer<'_> {
         Ok(true)
     }
 
-    fn commonjs_export_initializer_can_be_direct(
-        &self,
-        initializer: NodeId,
-        symbol: Option<SymbolId>,
-    ) -> bool {
+    fn commonjs_export_initializer_can_be_direct(&self, initializer: NodeId) -> bool {
         let simple_literal = matches!(
             self.arena.get(initializer).map(|node| &node.data),
             Some(
@@ -6392,23 +6436,7 @@ impl Printer<'_> {
         );
         self.expression_uses_commonjs_default_import(initializer)
             || object_literal
-            || (simple_literal
-                && symbol.is_some_and(|symbol| self.symbol_is_default_exported(symbol)))
-    }
-
-    fn symbol_is_default_exported(&self, symbol: SymbolId) -> bool {
-        self.arena.iter().any(|(_, node)| {
-            let NodeData::ExportAssignment(assignment) = &node.data else {
-                return false;
-            };
-            if assignment.is_export_equals {
-                return false;
-            }
-            let Some(name) = declaration_name_text(self.arena, assignment.expression) else {
-                return false;
-            };
-            self.bindings.resolve_name_at(assignment.expression, name) == Some(symbol)
-        })
+            || simple_literal
     }
 
     fn expression_uses_commonjs_default_import(&self, expression: NodeId) -> bool {
@@ -8371,6 +8399,32 @@ mod tests {
         .unwrap()
     }
 
+    fn emit_always_strict(
+        source: &str,
+        target: ScriptTarget,
+        module: ModuleKind,
+    ) -> super::EmitResult {
+        let parsed = parse_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        emit_source_file_with_settings(
+            &parsed.arena,
+            parsed.source_file,
+            "input.ts",
+            source,
+            PrinterSettings {
+                always_strict: true,
+                target,
+                module,
+                jsx: JsxEmit::Preserve,
+                emit_javascript: true,
+                emit_declarations: false,
+                source_map: false,
+                inline_source_map: false,
+            },
+        )
+        .unwrap()
+    }
+
     fn emit_amd(source: &str) -> super::EmitResult {
         let parsed = parse_source_file(source);
         let bindings = bind_source_file(&parsed.arena, parsed.source_file);
@@ -9570,8 +9624,7 @@ class Board {
                 "\"use strict\";\n",
                 "Object.defineProperty(exports, \"__esModule\", { value: true });\n",
                 "exports.value = void 0;\n",
-                "const value = 1;\n",
-                "exports.value = value;\n",
+                "exports.value = 1;\n",
             )
         );
         assert!(!output.contains("<reference"));
@@ -10094,6 +10147,25 @@ class Board {
     }
 
     #[test]
+    fn always_strict_exports_namespace_functions_on_the_namespace_object() {
+        let source =
+            "namespace M {\n    export function f() {\n        var arguments = [];\n    }\n}";
+        assert_eq!(
+            emit_always_strict(source, ScriptTarget::Es2015, ModuleKind::CommonJs).code,
+            "\"use strict\";\nvar M;\n(function (M) {\n    function f() {\n        var arguments = [];\n    }\n    M.f = f;\n})(M || (M = {}));\n"
+        );
+    }
+
+    #[test]
+    fn commonjs_prologue_precedes_an_exported_initializer_leading_comment() {
+        let source = "// Module commonjs\nexport const a = 1;";
+        assert_eq!(
+            emit_always_strict(source, ScriptTarget::Es2015, ModuleKind::CommonJs).code,
+            "\"use strict\";\nObject.defineProperty(exports, \"__esModule\", { value: true });\nexports.a = void 0;\n// Module commonjs\nexports.a = 1;\n"
+        );
+    }
+
+    #[test]
     fn transforms_exported_declarations_to_commonjs() {
         let result = emit_with(
             "export const value = 1; export function read() { return value; } export class Box {} export enum Color { Red }",
@@ -10101,7 +10173,7 @@ class Board {
             ModuleKind::CommonJs,
         );
         for assignment in [
-            "exports.value = value;",
+            "exports.value = 1;",
             "exports.read = read;",
             "exports.Box = Box;",
             "exports.Color = Color;",
@@ -10158,7 +10230,7 @@ class Board {
         assert_eq!(result.code.matches(" = void 0;").count(), 1);
         for assignment in [
             "exports.First = First;",
-            "exports.value = value;",
+            "exports.value = 1;",
             "exports.State = State;",
             "exports.default = Last;",
         ] {
