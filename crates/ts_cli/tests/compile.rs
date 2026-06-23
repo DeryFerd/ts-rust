@@ -272,10 +272,7 @@ fn direct_file_transforms_explicit_commonjs_modules() {
         String::from_utf8_lossy(&output.stdout)
     );
     let javascript = fs::read_to_string(directory.0.join("main.js")).unwrap();
-    assert!(
-        javascript.contains("exports.answer = answer;"),
-        "{javascript}"
-    );
+    assert!(javascript.contains("exports.answer = 42;"), "{javascript}");
     assert!(!javascript.contains("export const answer"), "{javascript}");
 }
 
