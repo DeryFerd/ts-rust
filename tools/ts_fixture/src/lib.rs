@@ -312,7 +312,11 @@ fn read_baseline_files(paths: &[&PathBuf]) -> io::Result<String> {
 /// contents exactly apart from the marker line itself.
 #[must_use]
 pub fn parse_baseline_sections(baseline: &str) -> BTreeMap<String, String> {
-    let mut sections = BTreeMap::new();
+    parse_baseline_section_list(baseline).into_iter().collect()
+}
+
+fn parse_baseline_section_list(baseline: &str) -> Vec<(String, String)> {
+    let mut sections = Vec::new();
     let mut current_name: Option<String> = None;
     let mut current_text = String::new();
     for line in baseline.split_inclusive('\n') {
@@ -322,14 +326,14 @@ pub fn parse_baseline_sections(baseline: &str) -> BTreeMap<String, String> {
             .and_then(|marker| marker.split_once(']').map(|(name, _)| name))
         {
             if let Some(name) = current_name.replace(name.to_owned()) {
-                sections.insert(name, std::mem::take(&mut current_text));
+                sections.push((name, std::mem::take(&mut current_text)));
             }
         } else if current_name.is_some() {
             current_text.push_str(line);
         }
     }
     if let Some(name) = current_name {
-        sections.insert(name, current_text);
+        sections.push((name, current_text));
     }
     sections
 }
@@ -457,7 +461,7 @@ fn compare_emitted_output_sections_excluding(
     baseline: &str,
     excluded_expected: &BTreeSet<String>,
 ) -> BaselineComparison {
-    let expected = parse_baseline_sections(baseline)
+    let expected = parse_baseline_section_list(baseline)
         .into_iter()
         .filter(|(name, _)| is_emitted_section(name))
         .map(|(name, text)| {
@@ -467,8 +471,8 @@ fn compare_emitted_output_sections_excluding(
             )
         })
         .filter(|(name, _)| !excluded_expected.contains(name))
-        .collect::<BTreeMap<_, _>>();
-    let actual_sections = outputs
+        .collect::<Vec<_>>();
+    let actual = outputs
         .iter()
         .filter(|(name, _)| is_emitted_section(name))
         .map(|(name, text)| {
@@ -478,55 +482,87 @@ fn compare_emitted_output_sections_excluding(
             )
         })
         .collect::<Vec<_>>();
-    let basename_counts =
-        actual_sections
-            .iter()
-            .fold(BTreeMap::<String, usize>::new(), |mut counts, (name, _)| {
-                *counts.entry(section_basename(name).to_owned()).or_default() += 1;
-                counts
-            });
-    let actual = actual_sections
-        .into_iter()
-        .map(|(name, text)| {
-            let basename = section_basename(&name);
-            let name = if !expected.contains_key(&name)
-                && expected.contains_key(basename)
-                && basename_counts.get(basename) == Some(&1)
-            {
-                basename.to_owned()
-            } else {
-                name
-            };
-            (name, text)
-        })
-        .collect::<BTreeMap<_, _>>();
-    let names = expected
-        .keys()
-        .chain(actual.keys())
-        .cloned()
-        .collect::<std::collections::BTreeSet<_>>();
-    let differences = names
-        .into_iter()
-        .filter_map(|section| {
-            let kind = match (expected.get(&section), actual.get(&section)) {
-                (Some(expected), Some(actual)) if expected != actual => {
-                    OutputDifferenceKind::Content {
-                        expected: expected.clone(),
-                        actual: actual.clone(),
-                    }
-                }
-                (Some(expected), None) => OutputDifferenceKind::Missing {
-                    expected: expected.clone(),
+    let differences = compare_section_multisets(&expected, &actual);
+    BaselineComparison { differences }
+}
+
+fn compare_section_multisets(
+    expected: &[(String, String)],
+    actual: &[(String, String)],
+) -> Vec<OutputDifference> {
+    let mut expected_match = vec![None; expected.len()];
+    let mut actual_matched = vec![false; actual.len()];
+
+    for (expected_index, (expected_name, _)) in expected.iter().enumerate() {
+        if let Some(actual_index) = actual.iter().enumerate().find_map(|(index, (name, _))| {
+            (!actual_matched[index] && name == expected_name).then_some(index)
+        }) {
+            expected_match[expected_index] = Some(actual_index);
+            actual_matched[actual_index] = true;
+        }
+    }
+
+    for (expected_index, (expected_name, expected_text)) in expected.iter().enumerate() {
+        if expected_match[expected_index].is_some() {
+            continue;
+        }
+        let basename = section_basename(expected_name);
+        if let Some(actual_index) = actual.iter().enumerate().find_map(|(index, (name, text))| {
+            (!actual_matched[index] && section_basename(name) == basename && text == expected_text)
+                .then_some(index)
+        }) {
+            expected_match[expected_index] = Some(actual_index);
+            actual_matched[actual_index] = true;
+        }
+    }
+
+    for (expected_index, (expected_name, _)) in expected.iter().enumerate() {
+        if expected_match[expected_index].is_some() {
+            continue;
+        }
+        let basename = section_basename(expected_name);
+        if let Some(actual_index) = actual.iter().enumerate().find_map(|(index, (name, _))| {
+            (!actual_matched[index] && section_basename(name) == basename).then_some(index)
+        }) {
+            expected_match[expected_index] = Some(actual_index);
+            actual_matched[actual_index] = true;
+        }
+    }
+
+    let mut differences = Vec::new();
+    for (expected_index, (section, expected_text)) in expected.iter().enumerate() {
+        match expected_match[expected_index] {
+            Some(actual_index) if expected_text != &actual[actual_index].1 => {
+                differences.push(OutputDifference {
+                    section: section.clone(),
+                    kind: OutputDifferenceKind::Content {
+                        expected: expected_text.clone(),
+                        actual: actual[actual_index].1.clone(),
+                    },
+                });
+            }
+            Some(_) => {}
+            None => differences.push(OutputDifference {
+                section: section.clone(),
+                kind: OutputDifferenceKind::Missing {
+                    expected: expected_text.clone(),
                 },
-                (None, Some(actual)) => OutputDifferenceKind::Unexpected {
+            }),
+        }
+    }
+    differences.extend(
+        actual
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !actual_matched[*index])
+            .map(|(_, (section, actual))| OutputDifference {
+                section: section.clone(),
+                kind: OutputDifferenceKind::Unexpected {
                     actual: actual.clone(),
                 },
-                _ => return None,
-            };
-            Some(OutputDifference { section, kind })
-        })
-        .collect();
-    BaselineComparison { differences }
+            }),
+    );
+    differences
 }
 
 /// Compiles a fixture using its first value for each compiler-option directive.
@@ -1607,6 +1643,79 @@ mod tests {
         )]);
         let baseline = "//// [cc.js] ////\nexport const value = 1;\n";
         assert!(compare_emitted_output_sections(&outputs, baseline).is_match());
+    }
+
+    #[test]
+    fn matches_duplicate_basenames_by_content_across_virtual_paths() {
+        let outputs = BTreeMap::from([
+            (
+                "/case/src/compiler/_namespaces/ts.js".into(),
+                "compiler namespace\n".into(),
+            ),
+            (
+                "/case/src/core/_namespaces/ts.js".into(),
+                "core namespace\n".into(),
+            ),
+        ]);
+        let baseline = concat!(
+            "//// [ts.js] ////\n",
+            "core namespace\n",
+            "//// [ts.js] ////\n",
+            "compiler namespace\n",
+        );
+        assert!(compare_emitted_output_sections(&outputs, baseline).is_match());
+    }
+
+    #[test]
+    fn duplicate_basename_content_mismatches_remain_actionable() {
+        let outputs = BTreeMap::from([
+            ("/case/a/ts.js".into(), "first\n".into()),
+            ("/case/b/ts.js".into(), "changed\n".into()),
+        ]);
+        let baseline = concat!(
+            "//// [ts.js] ////\n",
+            "first\n",
+            "//// [ts.js] ////\n",
+            "second\n",
+        );
+        let comparison = compare_emitted_output_sections(&outputs, baseline);
+        assert_eq!(comparison.differences.len(), 1);
+        assert_eq!(comparison.differences[0].section, "ts.js");
+        assert!(matches!(
+            comparison.differences[0].kind,
+            OutputDifferenceKind::Content { .. }
+        ));
+    }
+
+    #[test]
+    fn duplicate_basename_extras_and_missing_sections_are_not_hidden() {
+        let extra_outputs = BTreeMap::from([
+            ("/case/a/ts.js".into(), "first\n".into()),
+            ("/case/b/ts.js".into(), "second\n".into()),
+            ("/case/c/ts.js".into(), "third\n".into()),
+        ]);
+        let baseline = concat!(
+            "//// [ts.js] ////\n",
+            "first\n",
+            "//// [ts.js] ////\n",
+            "second\n",
+        );
+        let comparison = compare_emitted_output_sections(&extra_outputs, baseline);
+        assert_eq!(comparison.differences.len(), 1);
+        assert_eq!(comparison.differences[0].section, "c/ts.js");
+        assert!(matches!(
+            comparison.differences[0].kind,
+            OutputDifferenceKind::Unexpected { .. }
+        ));
+
+        let missing_outputs = BTreeMap::from([("/case/a/ts.js".into(), "first\n".into())]);
+        let comparison = compare_emitted_output_sections(&missing_outputs, baseline);
+        assert_eq!(comparison.differences.len(), 1);
+        assert_eq!(comparison.differences[0].section, "ts.js");
+        assert!(matches!(
+            comparison.differences[0].kind,
+            OutputDifferenceKind::Missing { .. }
+        ));
     }
 
     #[test]
