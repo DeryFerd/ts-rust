@@ -9953,8 +9953,10 @@ impl DeclarationPrinter<'_> {
             .and_then(|references| references.get(&id))
             && let Some(encoded) = reference.name.strip_prefix("__mapped:")
             && let [name, question, readonly] = encoded.split(':').collect::<Vec<_>>().as_slice()
-            && let [constraint, value] = reference.type_arguments.as_slice()
+            && reference.type_arguments.len() >= 2
         {
+            let constraint = reference.type_arguments[0];
+            let value = reference.type_arguments[1];
             self.writer.write("{");
             self.writer.write(" ");
             if *readonly == "1" {
@@ -9963,13 +9965,13 @@ impl DeclarationPrinter<'_> {
             self.writer.write("[");
             self.writer.write(name);
             self.writer.write(" in ");
-            self.emit_semantic_type(*constraint)?;
+            self.emit_semantic_type(constraint)?;
             self.writer.write("]");
             if *question == "1" {
                 self.writer.write("?");
             }
             self.writer.write(": ");
-            self.emit_semantic_type(*value)?;
+            self.emit_semantic_type(value)?;
             self.writer.write("; }");
             return Ok(());
         }
