@@ -195,14 +195,18 @@ fn prioritizes_emit_diagnostic_for_unsupported_output() {
     let repository = TestRepository::new();
     repository.write_case(
         "unsupported",
-        "// @noLib: true\nmodule \"pkg\" {}\n",
+        concat!(
+            "// @noLib: true\n",
+            "// @target: es2015\n",
+            "const Value = class Inner { static value = 1; };\n",
+        ),
         Some("//// [unsupported.js] ////\nvar N;\n"),
     );
     let output = run(&repository.0, &[]);
     assert_eq!(output.status.code(), Some(1));
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("diagnostic no code /case/unsupported.ts"));
-    assert!(stdout.contains("unsupported StringLiteral node"));
+    assert!(stdout.contains("unsupported ClassExpression node"));
     assert!(stdout.contains("diagnostics=1"));
 }
 
