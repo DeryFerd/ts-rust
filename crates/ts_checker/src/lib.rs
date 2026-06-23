@@ -60,6 +60,7 @@ pub struct ObjectType {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct FunctionType {
     pub parameters: Vec<TypeId>,
+    pub rest_parameter: Option<TypeId>,
     pub return_type: TypeId,
     pub parameters_optional: bool,
 }
@@ -507,11 +508,13 @@ enum TypeDescriptor {
     },
     Function {
         parameters: Vec<Self>,
+        rest_parameter: Option<Box<Self>>,
         return_type: Box<Self>,
         parameters_optional: bool,
     },
     Constructor {
         parameters: Vec<Self>,
+        rest_parameter: Option<Box<Self>>,
         return_type: Box<Self>,
         parameters_optional: bool,
     },
@@ -1386,6 +1389,12 @@ struct Checker<'a> {
 enum DeclaredObject {
     Class(ts_ast::ClassDeclarationData),
     Interface(ts_ast::InterfaceDeclarationData),
+}
+
+#[derive(Default)]
+struct JsDocSignatureTypes {
+    parameters: HashMap<String, (TypeId, bool)>,
+    return_type: Option<TypeId>,
 }
 
 impl<'a> Checker<'a> {
@@ -2565,13 +2574,24 @@ impl<'a> Checker<'a> {
                                 &mut optional_properties,
                                 &mut readonly_properties,
                             );
+                            let constructor_type = self.declaration_signature_type(
+                                *member,
+                                &data.parameters.nodes,
+                                None,
+                                None,
+                                data.body,
+                            );
+                            self.result.node_types.insert(*member, constructor_type);
                             continue;
                         }
-                        let method_type = self.signature_type(
+                        let method_type = self.declaration_signature_type(
+                            *member,
                             &data.parameters.nodes,
                             data.type_,
                             data.type_parameters.as_ref(),
+                            data.body,
                         );
+                        self.result.node_types.insert(*member, method_type);
                         let optional = self.is_question_token(data.postfix_token);
                         if optional {
                             optional_properties.insert(name.clone());
@@ -2591,6 +2611,14 @@ impl<'a> Checker<'a> {
                         &mut optional_properties,
                         &mut readonly_properties,
                     );
+                    let constructor_type = self.declaration_signature_type(
+                        *member,
+                        &data.parameters.nodes,
+                        None,
+                        None,
+                        data.body,
+                    );
+                    self.result.node_types.insert(*member, constructor_type);
                 }
                 NodeData::MethodSignatureDeclaration(data) => {
                     if let Some(name) = self.property_name(data.name) {
@@ -2599,6 +2627,7 @@ impl<'a> Checker<'a> {
                             data.type_,
                             data.type_parameters.as_ref(),
                         );
+                        self.result.node_types.insert(*member, method_type);
                         let optional = self.is_question_token(data.postfix_token);
                         if optional {
                             optional_properties.insert(name.clone());
@@ -2645,6 +2674,17 @@ impl<'a> Checker<'a> {
                 _ => {}
             }
         }
+        if self.options.is_javascript_file {
+            for (name, type_id, optional) in self.javascript_instance_properties(members) {
+                if properties.contains_key(&name) {
+                    continue;
+                }
+                properties.insert(name.clone(), type_id);
+                if optional {
+                    optional_properties.insert(name);
+                }
+            }
+        }
         self.result.types.alloc(TypeKind::Object(ObjectType {
             properties,
             optional_properties,
@@ -2652,6 +2692,91 @@ impl<'a> Checker<'a> {
             getter_properties,
             setter_properties,
         }))
+    }
+
+    fn javascript_instance_properties(
+        &mut self,
+        members: &[NodeId],
+    ) -> Vec<(String, TypeId, bool)> {
+        let mut properties = BTreeMap::<String, (TypeId, bool)>::new();
+        for member in members {
+            let Some(node) = self.arena.get(*member) else {
+                continue;
+            };
+            let (body, optional) = match &node.data {
+                NodeData::ConstructorDeclaration(constructor) => (constructor.body, false),
+                NodeData::MethodDeclaration(method)
+                    if self.property_name(method.name).as_deref() == Some("constructor") =>
+                {
+                    (method.body, false)
+                }
+                NodeData::MethodDeclaration(method) => (method.body, true),
+                _ => continue,
+            };
+            let Some(body) = body else {
+                continue;
+            };
+            let mut pending = vec![body];
+            while let Some(node_id) = pending.pop() {
+                let Some(node) = self.arena.get(node_id) else {
+                    continue;
+                };
+                if node_id != body
+                    && matches!(
+                        node.data,
+                        NodeData::FunctionDeclaration(_)
+                            | NodeData::FunctionExpression(_)
+                            | NodeData::MethodDeclaration(_)
+                            | NodeData::ClassDeclaration(_)
+                            | NodeData::ClassExpression(_)
+                    )
+                {
+                    continue;
+                }
+                if let NodeData::BinaryExpression(assignment) = &node.data
+                    && self
+                        .arena
+                        .get(assignment.operator_token)
+                        .is_some_and(|operator| operator.kind == SyntaxKind::EqualsToken)
+                    && let Some(name) = self.this_property_name(assignment.left)
+                    && let Some(type_id) = self.jsdoc_type_annotation(node_id)
+                {
+                    properties
+                        .entry(name)
+                        .and_modify(|property| property.1 &= optional)
+                        .or_insert((type_id, optional));
+                }
+                if let Some(children) = self.children.get(&node_id) {
+                    pending.extend(children.iter().copied());
+                }
+            }
+        }
+        properties
+            .into_iter()
+            .map(|(name, (type_id, optional))| (name, type_id, optional))
+            .collect()
+    }
+
+    fn this_property_name(&self, expression: NodeId) -> Option<String> {
+        match &self.arena.get(expression)?.data {
+            NodeData::PropertyAccessExpression(access)
+                if self
+                    .arena
+                    .get(access.expression)
+                    .is_some_and(|node| node.kind == SyntaxKind::ThisKeyword) =>
+            {
+                self.property_name(access.name)
+            }
+            NodeData::ElementAccessExpression(access)
+                if self
+                    .arena
+                    .get(access.expression)
+                    .is_some_and(|node| node.kind == SyntaxKind::ThisKeyword) =>
+            {
+                string_literal_text(self.arena, access.argument_expression).map(str::to_owned)
+            }
+            _ => None,
+        }
     }
 
     fn add_parameter_properties(
@@ -3223,19 +3348,22 @@ impl<'a> Checker<'a> {
             let Some(node) = self.arena.get(*member).cloned() else {
                 continue;
             };
-            let parameters = match &node.data {
-                NodeData::ConstructorDeclaration(constructor) => Some(&constructor.parameters),
+            let signature_parts = match &node.data {
+                NodeData::ConstructorDeclaration(constructor) => {
+                    Some((&constructor.parameters, constructor.body))
+                }
                 NodeData::MethodDeclaration(method)
                     if self.property_name(method.name).as_deref() == Some("constructor") =>
                 {
-                    Some(&method.parameters)
+                    Some((&method.parameters, method.body))
                 }
                 _ => None,
             };
-            let Some(parameters) = parameters else {
+            let Some((parameters, body)) = signature_parts else {
                 continue;
             };
-            let signature_type = self.signature_type(&parameters.nodes, None, None);
+            let signature_type =
+                self.declaration_signature_type(*member, &parameters.nodes, None, None, body);
             let Some(TypeKind::Function(mut signature)) = self
                 .result
                 .types
@@ -3249,6 +3377,7 @@ impl<'a> Checker<'a> {
         }
         FunctionType {
             parameters: Vec::new(),
+            rest_parameter: None,
             return_type: instance_type,
             parameters_optional: false,
         }
@@ -3473,10 +3602,12 @@ impl<'a> Checker<'a> {
                 }
                 NodeData::MethodDeclaration(method) => {
                     if let Some(name) = self.property_name(method.name) {
-                        let type_id = self.signature_type(
+                        let type_id = self.declaration_signature_type(
+                            *member,
                             &method.parameters.nodes,
                             method.type_,
                             method.type_parameters.as_ref(),
+                            method.body,
                         );
                         properties.insert(name, type_id);
                     }
@@ -4511,48 +4642,75 @@ impl<'a> Checker<'a> {
         readonly.then_some(name)
     }
 
-    fn jsdoc_parameter_types(&mut self, function: NodeId) -> HashMap<String, TypeId> {
-        let Some(source) = self.arena.source_text() else {
-            return HashMap::new();
-        };
-        let Some(start) = self
+    fn leading_jsdoc_comment(&self, node: NodeId) -> Option<&str> {
+        let source = self.arena.source_text()?;
+        let start = self
             .arena
-            .get(function)
+            .get(node)
             .map(|node| node.range.start.get() as usize)
-            .filter(|start| *start <= source.len())
-        else {
-            return HashMap::new();
-        };
+            .filter(|start| *start <= source.len())?;
         let prefix = source[..start].trim_end_matches(char::is_whitespace);
         if !prefix.ends_with("*/") {
-            return HashMap::new();
+            return None;
         }
-        let Some(comment_start) = prefix.rfind("/**") else {
-            return HashMap::new();
+        let comment_start = prefix.rfind("/**")?;
+        Some(&prefix[comment_start + 3..prefix.len() - 2])
+    }
+
+    fn jsdoc_signature_types(&mut self, function: NodeId) -> JsDocSignatureTypes {
+        let Some(comment) = self.leading_jsdoc_comment(function).map(str::to_owned) else {
+            return JsDocSignatureTypes::default();
         };
-        let comment = &prefix[comment_start + 3..prefix.len() - 2];
-        let mut parameters = HashMap::new();
+        let mut signature = JsDocSignatureTypes::default();
         for line in comment.lines() {
             let line = line.trim().trim_start_matches('*').trim();
-            let Some(tag) = line.strip_prefix("@param") else {
+            if let Some(tag) = line.strip_prefix("@param") {
+                let tag = tag.trim_start();
+                let Some((type_text, remainder)) = jsdoc_tag_type_and_remainder(tag) else {
+                    continue;
+                };
+                let Some(type_id) = self.jsdoc_type_from_text(type_text) else {
+                    continue;
+                };
+                let Some(raw_name) = remainder.split_whitespace().next() else {
+                    continue;
+                };
+                let optional = raw_name.starts_with('[') && raw_name.ends_with(']');
+                let name = raw_name
+                    .trim_matches(['[', ']'])
+                    .split_once('=')
+                    .map_or_else(|| raw_name.trim_matches(['[', ']']), |(name, _)| name);
+                signature
+                    .parameters
+                    .insert(name.to_owned(), (type_id, optional));
                 continue;
-            };
-            let tag = tag.trim_start();
-            let Some(type_end) = tag.find('}') else {
-                continue;
-            };
-            let Some(type_text) = tag.get(1..type_end).filter(|_| tag.starts_with('{')) else {
-                continue;
-            };
-            let Some(specifier) = jsdoc_typeof_import_specifier(type_text.trim()) else {
-                continue;
-            };
-            let Some(name) = tag[type_end + 1..].split_whitespace().next() else {
-                continue;
-            };
-            let Some(descriptor) = self.external_names.get(specifier).cloned() else {
-                continue;
-            };
+            }
+            if let Some(tag) = line
+                .strip_prefix("@returns")
+                .or_else(|| line.strip_prefix("@return"))
+                && let Some((type_text, _)) = jsdoc_tag_type_and_remainder(tag.trim_start())
+            {
+                signature.return_type = self.jsdoc_type_from_text(type_text);
+            }
+        }
+        signature
+    }
+
+    fn jsdoc_type_annotation(&mut self, node: NodeId) -> Option<TypeId> {
+        let comment = self.leading_jsdoc_comment(node)?.to_owned();
+        comment.lines().find_map(|line| {
+            let line = line.trim().trim_start_matches('*').trim();
+            let tag = line.strip_prefix("@type")?.trim();
+            let type_text =
+                jsdoc_tag_type_and_remainder(tag).map_or(tag, |(type_text, _)| type_text);
+            self.jsdoc_type_from_text(type_text)
+        })
+    }
+
+    fn jsdoc_type_from_text(&mut self, type_text: &str) -> Option<TypeId> {
+        let type_text = type_text.trim();
+        if let Some(specifier) = jsdoc_typeof_import_specifier(type_text) {
+            let descriptor = self.external_names.get(specifier)?.clone();
             let type_id = self.import_type(&descriptor);
             self.result.import_type_references.insert(
                 type_id,
@@ -4561,9 +4719,27 @@ impl<'a> Checker<'a> {
                     qualifier: "export=".into(),
                 },
             );
-            parameters.insert(name.to_owned(), type_id);
+            return Some(type_id);
         }
-        parameters
+        Some(match type_text {
+            "any" | "*" => self.result.types.any(),
+            "unknown" => self.result.types.unknown(),
+            "void" => self.result.types.void(),
+            "undefined" => self.result.types.undefined(),
+            "null" => self.result.types.null(),
+            "boolean" | "Boolean" => self.result.types.boolean(),
+            "number" | "Number" => self.result.types.number(),
+            "string" | "String" => self.result.types.string(),
+            "bigint" | "BigInt" => self.result.types.bigint(),
+            "object" | "Object" | "{}" => self
+                .result
+                .types
+                .alloc(TypeKind::Object(ObjectType::default())),
+            name => {
+                let descriptor = self.external_names.get(name)?.clone();
+                self.import_type(&descriptor)
+            }
+        })
     }
 
     #[allow(clippy::too_many_lines)]
@@ -4579,7 +4755,7 @@ impl<'a> Checker<'a> {
                 TypeKind::Overload(signatures) => signatures.first().cloned(),
                 _ => None,
             });
-        let jsdoc_parameters = self.jsdoc_parameter_types(node_id);
+        let jsdoc = self.jsdoc_signature_types(node_id);
         let mut parameters = Vec::with_capacity(data.parameters.nodes.len());
         let mut local_scope = HashMap::new();
         for (index, parameter) in data.parameters.nodes.iter().enumerate() {
@@ -4594,7 +4770,7 @@ impl<'a> Checker<'a> {
                 && contextual_signature.is_none()
                 && self
                     .property_name(parameter_data.name)
-                    .is_none_or(|name| !jsdoc_parameters.contains_key(&name))
+                    .is_none_or(|name| !jsdoc.parameters.contains_key(&name))
             {
                 let name = self
                     .property_name(parameter_data.name)
@@ -4606,7 +4782,7 @@ impl<'a> Checker<'a> {
                 .map(|node| self.type_from_type_node(node))
                 .or_else(|| {
                     self.property_name(parameter_data.name)
-                        .and_then(|name| jsdoc_parameters.get(&name).copied())
+                        .and_then(|name| jsdoc.parameters.get(&name).map(|(type_id, _)| *type_id))
                 })
                 .or_else(|| {
                     contextual_signature
@@ -4672,11 +4848,20 @@ impl<'a> Checker<'a> {
             }
         };
         self.local_scopes.pop();
-        self.result.types.alloc(TypeKind::Function(FunctionType {
+        let function = self.result.types.alloc(TypeKind::Function(FunctionType {
             parameters,
+            rest_parameter: None,
             return_type,
             parameters_optional: self.options.is_javascript_file,
-        }))
+        }));
+        self.apply_javascript_signature_metadata(
+            node_id,
+            function,
+            &data.parameters.nodes,
+            data.type_,
+            Some(data.body),
+        );
+        function
     }
 
     fn function_expression_type(
@@ -4691,7 +4876,7 @@ impl<'a> Checker<'a> {
                 TypeKind::Overload(signatures) => signatures.first().cloned(),
                 _ => None,
             });
-        let jsdoc_parameters = self.jsdoc_parameter_types(node_id);
+        let jsdoc = self.jsdoc_signature_types(node_id);
         let mut parameters = Vec::with_capacity(data.parameters.nodes.len());
         let mut local_scope = HashMap::new();
         for (index, parameter) in data.parameters.nodes.iter().enumerate() {
@@ -4706,7 +4891,7 @@ impl<'a> Checker<'a> {
                 && contextual_signature.is_none()
                 && self
                     .property_name(parameter_data.name)
-                    .is_none_or(|name| !jsdoc_parameters.contains_key(&name))
+                    .is_none_or(|name| !jsdoc.parameters.contains_key(&name))
             {
                 let name = self
                     .property_name(parameter_data.name)
@@ -4718,7 +4903,7 @@ impl<'a> Checker<'a> {
                 .map(|node| self.type_from_type_node(node))
                 .or_else(|| {
                     self.property_name(parameter_data.name)
-                        .and_then(|name| jsdoc_parameters.get(&name).copied())
+                        .and_then(|name| jsdoc.parameters.get(&name).map(|(type_id, _)| *type_id))
                 })
                 .or_else(|| {
                     contextual_signature
@@ -4764,11 +4949,20 @@ impl<'a> Checker<'a> {
         let mut saw_return = false;
         self.check_node(data.body, Some(return_type), &mut saw_return);
         self.local_scopes.pop();
-        self.result.types.alloc(TypeKind::Function(FunctionType {
+        let function = self.result.types.alloc(TypeKind::Function(FunctionType {
             parameters,
+            rest_parameter: None,
             return_type,
             parameters_optional: self.options.is_javascript_file,
-        }))
+        }));
+        self.apply_javascript_signature_metadata(
+            node_id,
+            function,
+            &data.parameters.nodes,
+            data.type_,
+            Some(data.body),
+        );
+        function
     }
 
     fn property_access_type(&mut self, node: NodeId, receiver: TypeId, name: &str) -> TypeId {
@@ -5193,14 +5387,16 @@ impl<'a> Checker<'a> {
                 .collect::<Vec<_>>();
             if let Some((signature, inference)) = signatures.iter().find_map(|signature| {
                 if actuals.len() < self.minimum_parameter_count(signature)
-                    || actuals.len() > signature.parameters.len()
+                    || (signature.rest_parameter.is_none()
+                        && actuals.len() > signature.parameters.len())
                 {
                     return None;
                 }
                 let mut inference = HashMap::new();
-                for (actual, parameter) in actuals.iter().zip(&signature.parameters) {
-                    self.infer_type_parameters(*parameter, *actual, &mut inference);
-                    let expected = self.substitute_type(*parameter, &inference);
+                for (index, actual) in actuals.iter().enumerate() {
+                    let parameter = self.signature_parameter_at(signature, index)?;
+                    self.infer_type_parameters(parameter, *actual, &mut inference);
+                    let expected = self.substitute_type(parameter, &inference);
                     if !self.is_assignable(*actual, expected) {
                         return None;
                     }
@@ -5219,7 +5415,9 @@ impl<'a> Checker<'a> {
             return self.result.types.any();
         };
         let minimum_parameters = self.minimum_parameter_count(signature);
-        if arguments.len() < minimum_parameters || arguments.len() > signature.parameters.len() {
+        if arguments.len() < minimum_parameters
+            || (signature.rest_parameter.is_none() && arguments.len() > signature.parameters.len())
+        {
             let expected = if minimum_parameters == signature.parameters.len() {
                 minimum_parameters.to_string()
             } else {
@@ -5228,10 +5426,14 @@ impl<'a> Checker<'a> {
             self.error(node, 2554, [expected, arguments.len().to_string()]);
         }
         let mut inference = HashMap::new();
-        for (argument, parameter) in arguments.iter().zip(&signature.parameters) {
-            let actual = self.type_of_expression_context(*argument, Some(*parameter));
-            self.infer_type_parameters(*parameter, actual, &mut inference);
-            let expected = self.substitute_type(*parameter, &inference);
+        for (index, argument) in arguments.iter().enumerate() {
+            let Some(parameter) = self.signature_parameter_at(signature, index) else {
+                self.type_of_expression(*argument);
+                continue;
+            };
+            let actual = self.type_of_expression_context(*argument, Some(parameter));
+            self.infer_type_parameters(parameter, actual, &mut inference);
+            let expected = self.substitute_type(parameter, &inference);
             if !self.is_assignable(actual, expected) {
                 let code = if self.exact_optional_property_mismatch(actual, expected) {
                     2379
@@ -5249,6 +5451,16 @@ impl<'a> Checker<'a> {
             }
         }
         self.substitute_type(signature.return_type, &inference)
+    }
+
+    fn signature_parameter_at(&self, signature: &FunctionType, index: usize) -> Option<TypeId> {
+        signature.parameters.get(index).copied().or_else(|| {
+            let rest = signature.rest_parameter?;
+            let TypeKind::Array(element) = &self.result.types.get(rest)?.kind else {
+                return None;
+            };
+            Some(*element)
+        })
     }
 
     fn minimum_parameter_count(&self, signature: &FunctionType) -> usize {
@@ -5396,8 +5608,12 @@ impl<'a> Checker<'a> {
                     .map(|parameter| self.substitute_type(parameter, inference))
                     .collect();
                 let return_type = self.substitute_type(signature.return_type, inference);
+                let rest_parameter = signature
+                    .rest_parameter
+                    .map(|parameter| self.substitute_type(parameter, inference));
                 self.result.types.alloc(TypeKind::Function(FunctionType {
                     parameters,
+                    rest_parameter,
                     return_type,
                     parameters_optional: signature.parameters_optional,
                 }))
@@ -5409,8 +5625,12 @@ impl<'a> Checker<'a> {
                     .map(|parameter| self.substitute_type(parameter, inference))
                     .collect();
                 let return_type = self.substitute_type(signature.return_type, inference);
+                let rest_parameter = signature
+                    .rest_parameter
+                    .map(|parameter| self.substitute_type(parameter, inference));
                 self.result.types.alloc(TypeKind::Constructor(FunctionType {
                     parameters,
+                    rest_parameter,
                     return_type,
                     parameters_optional: signature.parameters_optional,
                 }))
@@ -5565,7 +5785,174 @@ impl<'a> Checker<'a> {
                 signature.return_type = inferred;
             }
         }
+        if let Some(node_id) = data
+            .body
+            .and_then(|body| self.arena.get(body)?.parent)
+            .or_else(|| data.name.and_then(|name| self.arena.get(name)?.parent))
+        {
+            self.apply_javascript_signature_metadata(
+                node_id,
+                function,
+                &data.parameters.nodes,
+                data.type_,
+                data.body,
+            );
+        }
         function
+    }
+
+    fn declaration_signature_type(
+        &mut self,
+        node_id: NodeId,
+        parameters: &[NodeId],
+        return_annotation: Option<NodeId>,
+        type_parameters: Option<&ts_ast::NodeList>,
+        body: Option<NodeId>,
+    ) -> TypeId {
+        let signature = self.signature_type(parameters, return_annotation, type_parameters);
+        self.apply_javascript_signature_metadata(
+            node_id,
+            signature,
+            parameters,
+            return_annotation,
+            body,
+        );
+        signature
+    }
+
+    fn apply_javascript_signature_metadata(
+        &mut self,
+        node_id: NodeId,
+        signature_id: TypeId,
+        parameters: &[NodeId],
+        return_annotation: Option<NodeId>,
+        body: Option<NodeId>,
+    ) {
+        if !self.options.is_javascript_file {
+            return;
+        }
+        let jsdoc = self.jsdoc_signature_types(node_id);
+        let mut parameter_types = self
+            .result
+            .types
+            .get(signature_id)
+            .and_then(|type_| match &type_.kind {
+                TypeKind::Function(signature) => Some(signature.parameters.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        for (index, parameter) in parameters.iter().enumerate() {
+            let Some(NodeData::ParameterDeclaration(parameter_data)) =
+                self.arena.get(*parameter).map(|node| &node.data)
+            else {
+                continue;
+            };
+            let Some((type_id, optional)) = self
+                .property_name(parameter_data.name)
+                .and_then(|name| jsdoc.parameters.get(&name).copied())
+            else {
+                continue;
+            };
+            let type_id = if optional {
+                let undefined = self.result.types.undefined();
+                self.result.types.union([type_id, undefined])
+            } else {
+                type_id
+            };
+            if let Some(parameter_type) = parameter_types.get_mut(index) {
+                *parameter_type = type_id;
+            }
+            self.result.node_types.insert(*parameter, type_id);
+        }
+        let rest_parameter = body
+            .filter(|body| self.function_body_uses_arguments(*body))
+            .map(|_| {
+                let any = self.result.types.any();
+                self.result.types.alloc(TypeKind::Array(any))
+            });
+        let inferred_void = body
+            .filter(|body| {
+                matches!(
+                    self.arena.get(*body).map(|node| &node.data),
+                    Some(NodeData::Block(_))
+                ) && !self.function_body_has_return(*body)
+            })
+            .map(|_| self.result.types.void());
+        if let Some(TypeKind::Function(signature)) = self
+            .result
+            .types
+            .types
+            .get_mut(signature_id.index())
+            .map(|type_| &mut type_.kind)
+        {
+            signature.parameters = parameter_types;
+            signature.rest_parameter = rest_parameter;
+            if return_annotation.is_none()
+                && let Some(return_type) = jsdoc.return_type.or(inferred_void)
+            {
+                signature.return_type = return_type;
+            }
+        }
+        self.result.node_types.insert(node_id, signature_id);
+    }
+
+    fn function_body_uses_arguments(&self, body: NodeId) -> bool {
+        let mut pending = vec![body];
+        while let Some(node_id) = pending.pop() {
+            let Some(node) = self.arena.get(node_id) else {
+                continue;
+            };
+            if node_id != body
+                && matches!(
+                    node.data,
+                    NodeData::FunctionDeclaration(_)
+                        | NodeData::FunctionExpression(_)
+                        | NodeData::MethodDeclaration(_)
+                        | NodeData::ConstructorDeclaration(_)
+                        | NodeData::GetAccessorDeclaration(_)
+                        | NodeData::SetAccessorDeclaration(_)
+                        | NodeData::ClassDeclaration(_)
+                        | NodeData::ClassExpression(_)
+                )
+            {
+                continue;
+            }
+            if matches!(&node.data, NodeData::Identifier(identifier) if identifier.text == "arguments")
+                && self.identifier_is_arguments_value(node_id)
+            {
+                return true;
+            }
+            if let Some(children) = self.children.get(&node_id) {
+                pending.extend(children.iter().copied());
+            }
+        }
+        false
+    }
+
+    fn identifier_is_arguments_value(&self, identifier: NodeId) -> bool {
+        if self
+            .bindings
+            .resolve_name_at(identifier, "arguments")
+            .is_some()
+        {
+            return false;
+        }
+        let Some(parent) = self.arena.get(identifier).and_then(|node| node.parent) else {
+            return true;
+        };
+        !matches!(
+            self.arena.get(parent).map(|node| &node.data),
+            Some(NodeData::PropertyAccessExpression(access)) if access.name == identifier
+        ) && !matches!(
+            self.arena.get(parent).map(|node| &node.data),
+            Some(NodeData::VariableDeclaration(declaration)) if declaration.name == identifier
+        ) && !matches!(
+            self.arena.get(parent).map(|node| &node.data),
+            Some(NodeData::ParameterDeclaration(parameter)) if parameter.name == identifier
+        ) && !matches!(
+            self.arena.get(parent).map(|node| &node.data),
+            Some(NodeData::PropertyAssignment(property)) if property.name == identifier
+        )
     }
 
     fn infer_function_return_type(
@@ -5733,6 +6120,7 @@ impl<'a> Checker<'a> {
         self.type_parameter_scopes.pop();
         self.result.types.alloc(TypeKind::Function(FunctionType {
             parameters: parameter_types,
+            rest_parameter: None,
             return_type,
             parameters_optional: self.options.is_javascript_file,
         }))
@@ -6631,6 +7019,7 @@ impl<'a> Checker<'a> {
             }
             TypeDescriptor::Function {
                 parameters,
+                rest_parameter,
                 return_type,
                 parameters_optional,
             } => {
@@ -6639,14 +7028,19 @@ impl<'a> Checker<'a> {
                     .map(|parameter| self.import_type(parameter))
                     .collect();
                 let return_type = self.import_type(return_type);
+                let rest_parameter = rest_parameter
+                    .as_deref()
+                    .map(|parameter| self.import_type(parameter));
                 self.result.types.alloc(TypeKind::Function(FunctionType {
                     parameters,
+                    rest_parameter,
                     return_type,
                     parameters_optional: *parameters_optional,
                 }))
             }
             TypeDescriptor::Constructor {
                 parameters,
+                rest_parameter,
                 return_type,
                 parameters_optional,
             } => {
@@ -6655,8 +7049,12 @@ impl<'a> Checker<'a> {
                     .map(|parameter| self.import_type(parameter))
                     .collect();
                 let return_type = self.import_type(return_type);
+                let rest_parameter = rest_parameter
+                    .as_deref()
+                    .map(|parameter| self.import_type(parameter));
                 self.result.types.alloc(TypeKind::Constructor(FunctionType {
                     parameters,
+                    rest_parameter,
                     return_type,
                     parameters_optional: *parameters_optional,
                 }))
@@ -6667,6 +7065,7 @@ impl<'a> Checker<'a> {
                     .filter_map(|signature| {
                         let TypeDescriptor::Function {
                             parameters,
+                            rest_parameter,
                             return_type,
                             parameters_optional,
                         } = signature
@@ -6678,6 +7077,9 @@ impl<'a> Checker<'a> {
                                 .iter()
                                 .map(|parameter| self.import_type(parameter))
                                 .collect(),
+                            rest_parameter: rest_parameter
+                                .as_deref()
+                                .map(|parameter| self.import_type(parameter)),
                             return_type: self.import_type(return_type),
                             parameters_optional: *parameters_optional,
                         })
@@ -7531,6 +7933,9 @@ fn describe_type_with_imports(
                 .iter()
                 .map(|parameter| describe_type_with_imports(types, imports, *parameter))
                 .collect(),
+            rest_parameter: function
+                .rest_parameter
+                .map(|parameter| Box::new(describe_type_with_imports(types, imports, parameter))),
             return_type: Box::new(describe_type_with_imports(
                 types,
                 imports,
@@ -7544,6 +7949,9 @@ fn describe_type_with_imports(
                 .iter()
                 .map(|parameter| describe_type_with_imports(types, imports, *parameter))
                 .collect(),
+            rest_parameter: constructor
+                .rest_parameter
+                .map(|parameter| Box::new(describe_type_with_imports(types, imports, parameter))),
             return_type: Box::new(describe_type_with_imports(
                 types,
                 imports,
@@ -7560,6 +7968,9 @@ fn describe_type_with_imports(
                         .iter()
                         .map(|parameter| describe_type_with_imports(types, imports, *parameter))
                         .collect(),
+                    rest_parameter: signature.rest_parameter.map(|parameter| {
+                        Box::new(describe_type_with_imports(types, imports, parameter))
+                    }),
                     return_type: Box::new(describe_type_with_imports(
                         types,
                         imports,
@@ -7635,6 +8046,7 @@ fn substitute_descriptor(
         },
         TypeDescriptor::Function {
             parameters,
+            rest_parameter,
             return_type,
             parameters_optional,
         } => TypeDescriptor::Function {
@@ -7642,11 +8054,15 @@ fn substitute_descriptor(
                 .iter()
                 .map(|parameter| substitute_descriptor(parameter, substitutions))
                 .collect(),
+            rest_parameter: rest_parameter
+                .as_ref()
+                .map(|parameter| Box::new(substitute_descriptor(parameter, substitutions))),
             return_type: Box::new(substitute_descriptor(return_type, substitutions)),
             parameters_optional: *parameters_optional,
         },
         TypeDescriptor::Constructor {
             parameters,
+            rest_parameter,
             return_type,
             parameters_optional,
         } => TypeDescriptor::Constructor {
@@ -7654,6 +8070,9 @@ fn substitute_descriptor(
                 .iter()
                 .map(|parameter| substitute_descriptor(parameter, substitutions))
                 .collect(),
+            rest_parameter: rest_parameter
+                .as_ref()
+                .map(|parameter| Box::new(substitute_descriptor(parameter, substitutions))),
             return_type: Box::new(substitute_descriptor(return_type, substitutions)),
             parameters_optional: *parameters_optional,
         },
@@ -7808,6 +8227,16 @@ fn identifier_text(arena: &NodeArena, node: NodeId) -> Option<&str> {
         NodeData::Identifier(identifier) => Some(&identifier.text),
         _ => None,
     }
+}
+
+fn jsdoc_tag_type_and_remainder(tag: &str) -> Option<(&str, &str)> {
+    let tag = tag.trim_start();
+    if let Some(tag) = tag.strip_prefix('{') {
+        let type_end = tag.find('}')?;
+        return Some((tag[..type_end].trim(), tag[type_end + 1..].trim_start()));
+    }
+    let type_end = tag.find(char::is_whitespace).unwrap_or(tag.len());
+    Some((tag[..type_end].trim(), tag[type_end..].trim_start()))
 }
 
 fn jsdoc_typeof_import_specifier(type_text: &str) -> Option<&str> {
@@ -9607,6 +10036,160 @@ mod tests {
                 .collect::<Vec<_>>(),
             source.statements.nodes[..2]
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn javascript_arguments_and_jsdoc_shape_function_and_class_metadata() {
+        let parsed = parse_source_file(
+            r"
+                function f(x) { arguments; }
+                f(1, 2, 3);
+                class Constructed {
+                    /** @param {object} [foo={}] */
+                    constructor(foo = {}) {
+                        /** @type object */
+                        this.value = foo;
+                    }
+                }
+                class MethodAssigned {
+                    /** @param {object} [foo={}] */
+                    m(foo = {}) {
+                        /** @type object */
+                        this.arguments = foo;
+                    }
+                }
+                class UsesArguments { m() { arguments.callee; } }
+                class ConstructorArguments {
+                    constructor() {
+                        /** @type object */
+                        this.value = arguments;
+                    }
+                }
+                class PropertyNamedArguments { m() { this.arguments = {}; } }
+                class GetterArguments { get arguments() { return { bar: {} }; } }
+            ",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file_with_options(
+            &parsed.arena,
+            parsed.source_file,
+            &bindings,
+            CheckerOptions {
+                is_javascript_file: true,
+                ..CheckerOptions::default()
+            },
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let root = bindings.root_scope().unwrap();
+
+        let f = result
+            .type_of_symbol(root.symbols.get("f").unwrap())
+            .unwrap();
+        let TypeKind::Function(f) = &result.types.get(f).unwrap().kind else {
+            panic!("expected f function");
+        };
+        assert_eq!(f.parameters, [result.types.any()]);
+        let rest = f.rest_parameter.expect("arguments adds an implicit rest");
+        assert!(matches!(
+            result.types.get(rest).unwrap().kind,
+            TypeKind::Array(element) if element == result.types.any()
+        ));
+        assert_eq!(f.return_type, result.types.void());
+
+        let class_object = |name: &str| {
+            let type_id = result
+                .type_of_symbol(root.symbols.get(name).unwrap())
+                .unwrap();
+            let TypeKind::Object(object) = &result.types.get(type_id).unwrap().kind else {
+                panic!("expected {name} instance object");
+            };
+            object
+        };
+        let constructed = class_object("Constructed");
+        assert!(constructed.properties.contains_key("value"));
+        assert!(!constructed.optional_properties.contains("value"));
+
+        let method_assigned = class_object("MethodAssigned");
+        assert!(method_assigned.properties.contains_key("arguments"));
+        assert!(method_assigned.optional_properties.contains("arguments"));
+        let TypeKind::Function(method) = &result
+            .types
+            .get(method_assigned.properties["m"])
+            .unwrap()
+            .kind
+        else {
+            panic!("expected m function");
+        };
+        assert!(
+            result
+                .types
+                .display(method.parameters[0])
+                .contains("undefined")
+        );
+        assert_eq!(method.return_type, result.types.void());
+        assert!(method.rest_parameter.is_none());
+
+        let uses_arguments = class_object("UsesArguments");
+        let TypeKind::Function(method) = &result
+            .types
+            .get(uses_arguments.properties["m"])
+            .unwrap()
+            .kind
+        else {
+            panic!("expected arguments method");
+        };
+        assert!(method.rest_parameter.is_some());
+
+        let constructor = parsed
+            .arena
+            .iter()
+            .find_map(|(id, node)| match &node.data {
+                NodeData::ConstructorDeclaration(constructor)
+                    if constructor.parameters.nodes.is_empty() =>
+                {
+                    Some(id)
+                }
+                NodeData::MethodDeclaration(method)
+                    if method.parameters.nodes.is_empty()
+                        && identifier_text(&parsed.arena, method.name) == Some("constructor") =>
+                {
+                    Some(id)
+                }
+                _ => None,
+            })
+            .unwrap();
+        let constructor = result.type_of_node(constructor).unwrap();
+        let TypeKind::Function(constructor) = &result.types.get(constructor).unwrap().kind else {
+            panic!("expected constructor signature metadata");
+        };
+        assert!(constructor.rest_parameter.is_some());
+
+        let property_named = class_object("PropertyNamedArguments");
+        let TypeKind::Function(method) = &result
+            .types
+            .get(property_named.properties["m"])
+            .unwrap()
+            .kind
+        else {
+            panic!("expected property-name method");
+        };
+        assert!(method.rest_parameter.is_none());
+
+        let getter = class_object("GetterArguments");
+        let TypeKind::Object(arguments) = &result
+            .types
+            .get(getter.properties["arguments"])
+            .unwrap()
+            .kind
+        else {
+            panic!("expected arguments getter object");
+        };
+        assert!(matches!(
+            result.types.get(arguments.properties["bar"]).unwrap().kind,
+            TypeKind::Object(_)
+        ));
     }
 
     #[test]
