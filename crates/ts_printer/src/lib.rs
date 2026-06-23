@@ -10975,7 +10975,10 @@ impl DeclarationPrinter<'_> {
                     initializer,
                     preserve_nullish_literals,
                 )?;
-            } else if computed_name && !object.readonly_properties.contains(&name) {
+            } else if !object.readonly_properties.contains(&name)
+                && !initializer
+                    .is_some_and(|initializer| self.initializer_has_const_assertion(initializer))
+            {
                 self.emit_widened_semantic_type(type_id)?;
             } else {
                 self.emit_semantic_parameter_type(type_id, optional)?;
@@ -36170,6 +36173,18 @@ class Board {
             output.contains("export declare const obj: {\n    comp: any;\n};"),
             "{output}"
         );
+    }
+
+    #[test]
+    fn declaration_emit_widens_mutable_default_object_properties() {
+        let output = emit_declarations_with_semantics(concat!(
+            "export default {\n",
+            "    release: '1.0.0',\n",
+            "    fixed: '2.0.0' as const,\n",
+            "};\n",
+        ));
+        assert!(output.contains("release: string;"), "{output}");
+        assert!(output.contains("fixed: \"2.0.0\";"), "{output}");
     }
 
     #[test]

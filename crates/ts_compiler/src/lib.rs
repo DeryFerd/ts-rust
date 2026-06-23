@@ -834,6 +834,7 @@ impl Program {
                                 );
                                 emitted.code =
                                     remove_unused_named_declaration_imports(&emitted.code);
+                                emitted.code = defer_export_only_bundle_imports(&emitted.code);
                                 append_bundle_declaration_module(
                                     &mut code,
                                     source,
@@ -2933,6 +2934,100 @@ fn append_bundle_declaration_module(
     code.push_str("}\n");
 }
 
+fn defer_export_only_bundle_imports(declaration: &str) -> String {
+    let lines = declaration.lines().collect::<Vec<_>>();
+    let mut deferred = BTreeMap::<usize, Vec<usize>>::new();
+    for (import_index, line) in lines.iter().enumerate() {
+        let names = declaration_import_local_names(line);
+        if names.is_empty() {
+            continue;
+        }
+        let mut last_export = None;
+        let mut used_elsewhere = false;
+        for (index, candidate) in lines.iter().enumerate() {
+            if index == import_index
+                || !names
+                    .iter()
+                    .any(|name| text_contains_identifier(candidate, name))
+            {
+                continue;
+            }
+            if candidate.trim_start().starts_with("export {") {
+                last_export = Some(index);
+            } else {
+                used_elsewhere = true;
+                break;
+            }
+        }
+        if !used_elsewhere && let Some(export_index) = last_export {
+            deferred.entry(export_index).or_default().push(import_index);
+        }
+    }
+    if deferred.is_empty() {
+        return declaration.to_owned();
+    }
+    let deferred_indices = deferred
+        .values()
+        .flatten()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let mut output = String::new();
+    for (index, line) in lines.iter().enumerate() {
+        if !deferred_indices.contains(&index) {
+            output.push_str(line);
+            output.push('\n');
+        }
+        if let Some(imports) = deferred.get(&index) {
+            for import in imports {
+                output.push_str(lines[*import]);
+                output.push('\n');
+            }
+        }
+    }
+    output
+}
+
+fn declaration_import_local_names(line: &str) -> Vec<String> {
+    let line = line.trim();
+    let Some(clause) = line.strip_prefix("import ") else {
+        return Vec::new();
+    };
+    let Some((clause, _)) = clause.rsplit_once(" from ") else {
+        return Vec::new();
+    };
+    if let Some(namespace) = clause.strip_prefix("* as ") {
+        return vec![namespace.trim().to_owned()];
+    }
+    if let Some(named) = clause
+        .strip_prefix('{')
+        .and_then(|value| value.strip_suffix('}'))
+    {
+        return named
+            .split(',')
+            .filter_map(|specifier| {
+                let specifier = specifier
+                    .trim()
+                    .strip_prefix("type ")
+                    .unwrap_or(specifier.trim());
+                specifier
+                    .split_once(" as ")
+                    .map_or(specifier, |(_, local)| local)
+                    .split_whitespace()
+                    .next()
+                    .map(str::to_owned)
+            })
+            .collect();
+    }
+    clause
+        .split_once(',')
+        .map_or(clause, |(default, _)| default)
+        .split_whitespace()
+        .next()
+        .map(str::to_owned)
+        .into_iter()
+        .collect()
+}
+
 fn bundle_declaration_module_name(
     source: &SourceFile,
     bundle_root: &str,
@@ -3376,7 +3471,7 @@ mod tests {
     use ts_options::{CompilerOptions, ModuleKind, ScriptTarget};
     use ts_vfs::{FileSystem, MemoryFileSystem};
 
-    use super::Program;
+    use super::{Program, defer_export_only_bundle_imports};
 
     #[test]
     fn parses_and_indexes_explicit_roots() {
@@ -5182,6 +5277,30 @@ mod tests {
                 "declare module \"index\" {\n",
                 "    export * from \"nested/index\";\n",
                 "}\n",
+            )
+        );
+    }
+
+    #[test]
+    fn bundled_export_only_imports_follow_the_export_alias() {
+        assert_eq!(
+            defer_export_only_bundle_imports(concat!(
+                "import versions from \"versions.static\";\n",
+                "export { versions };\n",
+            )),
+            concat!(
+                "export { versions };\n",
+                "import versions from \"versions.static\";\n",
+            )
+        );
+        assert_eq!(
+            defer_export_only_bundle_imports(concat!(
+                "import { B } from \"shared\";\n",
+                "export function make(): B;\n",
+            )),
+            concat!(
+                "import { B } from \"shared\";\n",
+                "export function make(): B;\n",
             )
         );
     }
