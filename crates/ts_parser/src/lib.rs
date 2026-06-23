@@ -731,6 +731,11 @@ impl<'a> Parser<'a> {
     fn parse_variable_declaration(&mut self) -> NodeId {
         let start = self.current.range.start;
         let name = self.parse_binding_name("Expected a variable name.");
+        let exclamation_token = if self.current.kind == SyntaxKind::ExclamationToken {
+            Some(self.consume_token_node())
+        } else {
+            None
+        };
         let type_node = if self.current.kind == SyntaxKind::ColonToken {
             self.bump();
             Some(self.parse_type())
@@ -785,16 +790,18 @@ impl<'a> Parser<'a> {
         }
         let end = initializer
             .or(type_node)
+            .or(exclamation_token)
             .and_then(|id| self.arena.get(id))
             .map_or_else(|| self.node_end(name), |node| node.range.end);
         let mut children = vec![name];
+        children.extend(exclamation_token);
         children.extend(type_node);
         children.extend(initializer);
         self.alloc_node(
             SyntaxKind::VariableDeclaration,
             TextRange::new(start, end),
             NodeData::VariableDeclaration(Box::new(VariableDeclarationData {
-                exclamation_token: None,
+                exclamation_token,
                 initializer,
                 local_symbol: None,
                 symbol: None,
@@ -3777,6 +3784,45 @@ impl<'a> Parser<'a> {
                         &children,
                     );
                 }
+                SyntaxKind::LessThanToken => {
+                    if !self.is_type_argument_expression_suffix() {
+                        break;
+                    }
+                    let type_arguments = self
+                        .parse_type_arguments()
+                        .expect("type argument suffix starts with '<'");
+                    if self.current.kind == SyntaxKind::OpenParenToken {
+                        let arguments = self.parse_argument_list();
+                        let end = arguments.range.end;
+                        let mut children = vec![expression];
+                        children.extend(type_arguments.nodes.iter().copied());
+                        children.extend(arguments.nodes.iter().copied());
+                        expression = self.alloc_node(
+                            SyntaxKind::CallExpression,
+                            TextRange::new(self.node_start(expression), end),
+                            NodeData::CallExpression(Box::new(CallExpressionData {
+                                arguments,
+                                expression,
+                                question_dot_token: None,
+                                symbol: None,
+                                type_arguments: Some(type_arguments),
+                                facts: 0,
+                            })),
+                            &children,
+                        );
+                    } else {
+                        let start = self.node_start(expression);
+                        let end = type_arguments.range.end;
+                        expression = self.alloc_node(
+                            SyntaxKind::ParenthesizedExpression,
+                            TextRange::new(start, end),
+                            NodeData::ParenthesizedExpression(Box::new(
+                                ParenthesizedExpressionData { expression },
+                            )),
+                            &[expression],
+                        );
+                    }
+                }
                 SyntaxKind::OpenBracketToken => {
                     self.bump();
                     let argument_expression = self.parse_binary_expression(0);
@@ -3849,6 +3895,29 @@ impl<'a> Parser<'a> {
             }
         }
         expression
+    }
+
+    fn is_type_argument_expression_suffix(&mut self) -> bool {
+        let checkpoint = self.scanner.mark();
+        let mut depth = 1_u32;
+        let mut token = self.scanner.scan();
+        while token.kind != SyntaxKind::EndOfFile {
+            match token.kind {
+                SyntaxKind::LessThanToken => depth += 1,
+                SyntaxKind::GreaterThanToken => {
+                    depth -= 1;
+                    if depth == 0 {
+                        token = self.scanner.scan();
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            token = self.scanner.scan();
+        }
+        self.scanner.rewind(checkpoint);
+        depth == 0
+            && (token.kind == SyntaxKind::OpenParenToken || token.kind.is_assignment_operator())
     }
 
     fn parse_await_expression(&mut self) -> NodeId {
@@ -9260,6 +9329,58 @@ mod tests {
             assert_eq!(diagnostic.message, message);
             assert_eq!(diagnostic.category, DiagnosticCategory::Error);
         }
+    }
+
+    #[test]
+    fn parses_type_argument_expression_suffixes_and_definite_assignment_declarations() {
+        let result = parse_source_file(concat!(
+            "Object.create<Object>(\"\");\n",
+            "obj.fn<number> = value;\n",
+            "let getValue!: <T>() => T;\n",
+            "getValue<number> = value;\n",
+        ));
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+
+        let statements = source_statements(&result);
+        assert_eq!(statements.len(), 4);
+
+        let NodeData::ExpressionStatement(call_statement) =
+            &result.arena.get(statements[0]).unwrap().data
+        else {
+            panic!("expected call expression statement");
+        };
+        let NodeData::CallExpression(call) =
+            &result.arena.get(call_statement.expression).unwrap().data
+        else {
+            panic!("expected generic call expression");
+        };
+        assert_eq!(call.type_arguments.as_ref().unwrap().nodes.len(), 1);
+
+        for statement in [statements[1], statements[3]] {
+            let NodeData::ExpressionStatement(statement) =
+                &result.arena.get(statement).unwrap().data
+            else {
+                panic!("expected assignment statement");
+            };
+            let NodeData::BinaryExpression(assignment) =
+                &result.arena.get(statement.expression).unwrap().data
+            else {
+                panic!("expected assignment expression");
+            };
+            assert_eq!(
+                result.arena.get(assignment.left).unwrap().kind,
+                SyntaxKind::ParenthesizedExpression
+            );
+        }
+
+        let (list, _) = variable_list(&result, statements[2]);
+        let declaration = declaration_nodes(&result, list)[0];
+        let NodeData::VariableDeclaration(declaration) =
+            &result.arena.get(declaration).unwrap().data
+        else {
+            panic!("expected variable declaration");
+        };
+        assert!(declaration.exclamation_token.is_some());
     }
 
     fn source_statements(result: &ParseResult) -> &[NodeId] {
