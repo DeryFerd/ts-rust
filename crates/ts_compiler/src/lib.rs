@@ -815,7 +815,7 @@ impl Program {
                 |declaration, (specifier, target)| {
                     declaration
                         .replace(&format!("\"{specifier}\""), &format!("\"{target}\""))
-                        .replace(&format!("'{specifier}'"), &format!("'{target}'"))
+                        .replace(&format!("'{specifier}'"), &format!("\"{target}\""))
                 },
             )
     }

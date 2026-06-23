@@ -2684,6 +2684,7 @@ impl<'a> Checker<'a> {
         let mut readonly_properties = BTreeSet::new();
         let mut getter_properties = BTreeSet::new();
         let mut setter_properties = BTreeSet::new();
+        let constructor_assignment_types = self.constructor_assignment_types(members);
         for member in members {
             let Some(node) = self.arena.get(*member) else {
                 continue;
@@ -2697,6 +2698,7 @@ impl<'a> Checker<'a> {
                             .or_else(|| {
                                 data.initializer.map(|value| self.type_of_expression(value))
                             })
+                            .or_else(|| constructor_assignment_types.get(&name).copied())
                             .unwrap_or_else(|| self.result.types.any());
                         if self.is_question_token(data.postfix_token) {
                             optional_properties.insert(name.clone());
@@ -2864,6 +2866,79 @@ impl<'a> Checker<'a> {
         }))
     }
 
+    fn constructor_assignment_types(&mut self, members: &[NodeId]) -> BTreeMap<String, TypeId> {
+        let mut assignments = BTreeMap::new();
+        for member in members {
+            let (body, parameters) = match self.arena.get(*member).map(|node| &node.data) {
+                Some(NodeData::ConstructorDeclaration(constructor)) => {
+                    (constructor.body, constructor.parameters.nodes.clone())
+                }
+                Some(NodeData::MethodDeclaration(method))
+                    if self.property_name(method.name).as_deref() == Some("constructor") =>
+                {
+                    (method.body, method.parameters.nodes.clone())
+                }
+                _ => (None, Vec::new()),
+            };
+            let Some(body) = body else {
+                continue;
+            };
+            let mut constructor_scope = HashMap::new();
+            for parameter in parameters {
+                let Some(NodeData::ParameterDeclaration(parameter)) =
+                    self.arena.get(parameter).map(|node| &node.data)
+                else {
+                    continue;
+                };
+                let Some(name) = self.property_name(parameter.name) else {
+                    continue;
+                };
+                let type_id = if let Some(type_node) = parameter.type_ {
+                    self.type_from_type_node(type_node)
+                } else {
+                    self.result.types.any()
+                };
+                constructor_scope.insert(name, type_id);
+            }
+            self.local_scopes.push(constructor_scope);
+            let mut pending = vec![body];
+            while let Some(node_id) = pending.pop() {
+                let Some(node) = self.arena.get(node_id) else {
+                    continue;
+                };
+                if node_id != body
+                    && matches!(
+                        node.data,
+                        NodeData::FunctionDeclaration(_)
+                            | NodeData::FunctionExpression(_)
+                            | NodeData::ArrowFunction(_)
+                            | NodeData::MethodDeclaration(_)
+                            | NodeData::ClassDeclaration(_)
+                            | NodeData::ClassExpression(_)
+                    )
+                {
+                    continue;
+                }
+                if let NodeData::BinaryExpression(assignment) = &node.data
+                    && self
+                        .arena
+                        .get(assignment.operator_token)
+                        .is_some_and(|operator| operator.kind == SyntaxKind::EqualsToken)
+                    && let Some(name) = self.this_property_name(assignment.left)
+                {
+                    let type_id = self.type_of_expression(assignment.right);
+                    let type_id = self.widen_literal(type_id);
+                    assignments.entry(name).or_insert(type_id);
+                }
+                if let Some(children) = self.children.get(&node_id) {
+                    pending.extend(children.iter().copied());
+                }
+            }
+            self.local_scopes.pop();
+        }
+        assignments
+    }
+
     fn javascript_instance_properties(
         &mut self,
         members: &[NodeId],
@@ -2943,7 +3018,11 @@ impl<'a> Checker<'a> {
                     .get(access.expression)
                     .is_some_and(|node| node.kind == SyntaxKind::ThisKeyword) =>
             {
-                string_literal_text(self.arena, access.argument_expression).map(str::to_owned)
+                match &self.arena.get(access.argument_expression)?.data {
+                    NodeData::StringLiteral(literal) => Some(literal.text.clone()),
+                    NodeData::NumericLiteral(literal) => Some(literal.text.clone()),
+                    _ => None,
+                }
             }
             _ => None,
         }
@@ -3315,6 +3394,13 @@ impl<'a> Checker<'a> {
                     }
                     properties.insert(name, actual);
                 }
+                NodeData::ShorthandPropertyAssignment(data) => {
+                    let Some(name) = self.property_name(data.name) else {
+                        continue;
+                    };
+                    let actual = self.type_of_expression(data.name);
+                    properties.insert(name, actual);
+                }
                 NodeData::GetAccessorDeclaration(data) => {
                     let Some(name) = self.property_name(data.name) else {
                         continue;
@@ -3334,6 +3420,14 @@ impl<'a> Checker<'a> {
                     properties.entry(name.clone()).or_insert(type_id);
                     setter_properties.insert(name);
                 }
+                NodeData::MethodDeclaration(data) => {
+                    let Some(name) = self.property_name(data.name) else {
+                        continue;
+                    };
+                    let signature = self.inferred_method_type(data);
+                    self.result.node_types.insert(*property, signature);
+                    self.insert_callable_property(&mut properties, name, signature);
+                }
                 _ => {}
             }
         }
@@ -3347,6 +3441,59 @@ impl<'a> Checker<'a> {
             setter_properties,
             ..ObjectType::default()
         }
+    }
+
+    fn inferred_method_type(&mut self, method: &ts_ast::MethodDeclarationData) -> TypeId {
+        let signature = self.signature_type(
+            &method.parameters.nodes,
+            method.type_,
+            method.type_parameters.as_ref(),
+        );
+        if method.type_.is_none()
+            && let Some(body) = method.body
+            && let Some(TypeKind::Function(current)) = self
+                .result
+                .types
+                .get(signature)
+                .map(|type_| type_.kind.clone())
+        {
+            let mut scope = HashMap::new();
+            for (index, parameter) in method.parameters.nodes.iter().enumerate() {
+                let Some(NodeData::ParameterDeclaration(parameter)) =
+                    self.arena.get(*parameter).map(|node| &node.data)
+                else {
+                    continue;
+                };
+                if let Some(name) = self.property_name(parameter.name)
+                    && let Some(type_id) = current.parameters.get(index)
+                {
+                    scope.insert(name, *type_id);
+                }
+            }
+            self.local_scopes.push(scope);
+            let returns = self
+                .function_return_expressions(body)
+                .into_iter()
+                .map(|expression| {
+                    let type_id = self.type_of_expression(expression);
+                    self.widen_literal(type_id)
+                })
+                .collect::<Vec<_>>();
+            self.local_scopes.pop();
+            if !returns.is_empty() {
+                let return_type = self.result.types.union(returns);
+                if let Some(TypeKind::Function(current)) = self
+                    .result
+                    .types
+                    .types
+                    .get_mut(signature.index())
+                    .map(|type_| &mut type_.kind)
+                {
+                    current.return_type = return_type;
+                }
+            }
+        }
+        signature
     }
 
     fn check_object_literal_getter(
@@ -4713,7 +4860,9 @@ impl<'a> Checker<'a> {
                 self.check_delete_expression(data.expression, operand);
                 self.result.types.boolean()
             }
-            NodeData::TypeOfExpression(_) => self.result.types.string(),
+            NodeData::TemplateExpression(_) | NodeData::TypeOfExpression(_) => {
+                self.result.types.string()
+            }
             NodeData::FunctionDeclaration(data) => self.function_type(data),
             _ => self.result.types.unknown(),
         };
@@ -6477,7 +6626,7 @@ impl<'a> Checker<'a> {
         let TypeKind::Function(signature) = self.result.types.get(function)?.kind.clone() else {
             return None;
         };
-        let local_scope = data
+        let local_scope: HashMap<String, TypeId> = data
             .parameters
             .nodes
             .iter()
@@ -6494,6 +6643,48 @@ impl<'a> Checker<'a> {
             })
             .collect();
         self.local_scopes.push(local_scope);
+        if let Some(NodeData::Block(block)) = self.arena.get(body).map(|node| &node.data) {
+            let statements = block.statements.nodes.clone();
+            for statement in statements {
+                let Some(NodeData::VariableStatement(statement)) =
+                    self.arena.get(statement).map(|node| &node.data)
+                else {
+                    continue;
+                };
+                let Some(NodeData::VariableDeclarationList(list)) = self
+                    .arena
+                    .get(statement.declaration_list)
+                    .map(|node| &node.data)
+                else {
+                    continue;
+                };
+                let declarations = list.declarations.nodes.clone();
+                for declaration in declarations {
+                    let Some(NodeData::VariableDeclaration(variable)) =
+                        self.arena.get(declaration).map(|node| &node.data)
+                    else {
+                        continue;
+                    };
+                    let Some(name) = self.property_name(variable.name) else {
+                        continue;
+                    };
+                    let type_id = variable
+                        .type_
+                        .map(|type_| self.type_from_type_node(type_))
+                        .or_else(|| {
+                            variable
+                                .initializer
+                                .map(|initializer| self.type_of_expression(initializer))
+                        })
+                        .unwrap_or_else(|| self.result.types.any());
+                    self.local_scopes
+                        .last_mut()
+                        .expect("local scope exists")
+                        .insert(name, type_id);
+                    self.result.node_types.insert(declaration, type_id);
+                }
+            }
+        }
         let returns = self.function_return_expressions(body);
         let return_types = returns
             .into_iter()
@@ -6608,6 +6799,15 @@ impl<'a> Checker<'a> {
                     let base = match data.type_ {
                         Some(node) => self.type_from_type_node(node),
                         None => self.result.types.any(),
+                    };
+                    let base = if data.dot_dot_dot_token.is_some()
+                        && !matches!(
+                            self.result.types.get(base).map(|type_| &type_.kind),
+                            Some(TypeKind::Array(_))
+                        ) {
+                        self.result.types.alloc(TypeKind::Array(base))
+                    } else {
+                        base
                     };
                     if data.question_token.is_some() {
                         let undefined = self.result.types.undefined();
