@@ -27,16 +27,16 @@ use ts_ast::{
     NamedExportsData, NamedImportsData, NamespaceExportDeclarationData, NamespaceImportData,
     NewExpressionData, NoSubstitutionTemplateLiteralData, Node, NodeArena, NodeData, NodeFlags,
     NodeId, NodeList, NonNullExpressionData, NumericLiteralData, ObjectLiteralExpressionData,
-    ParameterDeclarationData, ParenthesizedExpressionData, ParenthesizedTypeNodeData,
-    PostfixUnaryExpressionData, PrefixUnaryExpressionData, PrivateIdentifierData,
-    PropertyAccessExpressionData, PropertyAssignmentData, PropertyDeclarationData,
-    QualifiedNameData, RegularExpressionLiteralData, RestTypeNodeData, ReturnStatementData,
-    SatisfiesExpressionData, SetAccessorDeclarationData, ShorthandPropertyAssignmentData,
-    SourceFileData, SpreadAssignmentData, SpreadElementData, StringLiteralData,
-    SwitchStatementData, SymbolTable, SyntaxKind, TemplateExpressionData, TemplateHeadData,
-    TemplateLiteralTypeNodeData, TemplateLiteralTypeSpanData, TemplateMiddleData, TemplateSpanData,
-    TemplateTailData, ThisTypeNodeData, ThrowStatementData, TokenData, TokenFlags,
-    TryStatementData, TupleTypeNodeData, TypeAliasDeclarationData, TypeAssertionData,
+    OmittedExpressionData, ParameterDeclarationData, ParenthesizedExpressionData,
+    ParenthesizedTypeNodeData, PostfixUnaryExpressionData, PrefixUnaryExpressionData,
+    PrivateIdentifierData, PropertyAccessExpressionData, PropertyAssignmentData,
+    PropertyDeclarationData, QualifiedNameData, RegularExpressionLiteralData, RestTypeNodeData,
+    ReturnStatementData, SatisfiesExpressionData, SetAccessorDeclarationData,
+    ShorthandPropertyAssignmentData, SourceFileData, SpreadAssignmentData, SpreadElementData,
+    StringLiteralData, SwitchStatementData, SymbolTable, SyntaxKind, TemplateExpressionData,
+    TemplateHeadData, TemplateLiteralTypeNodeData, TemplateLiteralTypeSpanData, TemplateMiddleData,
+    TemplateSpanData, TemplateTailData, ThisTypeNodeData, ThrowStatementData, TokenData,
+    TokenFlags, TryStatementData, TupleTypeNodeData, TypeAliasDeclarationData, TypeAssertionData,
     TypeLiteralNodeData, TypeOfExpressionData, TypeOperatorNodeData, TypeParameterDeclarationData,
     TypePredicateNodeData, TypeQueryNodeData, TypeReferenceNodeData, UnionTypeNodeData,
     VariableDeclarationData, VariableDeclarationListData, VariableStatementData,
@@ -497,6 +497,8 @@ impl<'a> Parser<'a> {
             ),
             _ => false,
         };
+        let abstract_starts_expression = self.current.kind == SyntaxKind::AbstractKeyword
+            && self.next_token_preceded_by_line_break();
         match self.current.kind {
             SyntaxKind::OpenBraceToken => self.parse_block(),
             SyntaxKind::ConstKeyword if is_const_enum => self.parse_const_enum_declaration(),
@@ -531,6 +533,9 @@ impl<'a> Parser<'a> {
                 self.parse_module_declaration()
             }
             SyntaxKind::AtToken => self.parse_decorated_statement(),
+            SyntaxKind::AbstractKeyword if abstract_starts_expression => {
+                self.parse_expression_statement()
+            }
             SyntaxKind::DeclareKeyword | SyntaxKind::AbstractKeyword | SyntaxKind::AsyncKeyword => {
                 self.parse_modified_statement()
             }
@@ -660,6 +665,17 @@ impl<'a> Parser<'a> {
         let kind = self.scanner.scan().kind;
         self.scanner.rewind(checkpoint);
         kind
+    }
+
+    fn next_token_preceded_by_line_break(&mut self) -> bool {
+        let checkpoint = self.scanner.mark();
+        let has_line_break = self
+            .scanner
+            .scan()
+            .flags
+            .contains(ScannerTokenFlags::PRECEDING_LINE_BREAK);
+        self.scanner.rewind(checkpoint);
+        has_line_break
     }
 
     fn parse_variable_statement_tail(
@@ -971,12 +987,21 @@ impl<'a> Parser<'a> {
     fn parse_array_binding_pattern(&mut self) -> NodeId {
         let start = self.consume().range.start;
         let mut elements = Vec::new();
+        let mut has_trailing_comma = false;
         while !matches!(
             self.current.kind,
             SyntaxKind::CloseBracketToken | SyntaxKind::EndOfFile
         ) {
             if self.current.kind == SyntaxKind::CommaToken {
+                let position = self.current.range.start;
+                elements.push(self.alloc_node(
+                    SyntaxKind::OmittedExpression,
+                    TextRange::new(position, position),
+                    NodeData::OmittedExpression(Box::new(OmittedExpressionData)),
+                    &[],
+                ));
                 self.bump();
+                has_trailing_comma = self.current.kind == SyntaxKind::CloseBracketToken;
                 continue;
             }
             let before = (self.current.kind, self.current.range);
@@ -1014,6 +1039,7 @@ impl<'a> Parser<'a> {
             ));
             if self.current.kind == SyntaxKind::CommaToken {
                 self.bump();
+                has_trailing_comma = self.current.kind == SyntaxKind::CloseBracketToken;
             }
             if before == (self.current.kind, self.current.range) {
                 self.error_current("Parser made no progress while parsing a binding element.");
@@ -1033,7 +1059,7 @@ impl<'a> Parser<'a> {
                 elements: NodeList {
                     range: TextRange::new(start, end),
                     nodes: elements.clone(),
-                    has_trailing_comma: false,
+                    has_trailing_comma,
                 },
                 facts: 0,
             })),
@@ -1561,6 +1587,9 @@ impl<'a> Parser<'a> {
     fn current_modifier_is_member_name(&mut self) -> bool {
         if !self.current.kind.is_modifier() {
             return false;
+        }
+        if self.next_token_preceded_by_line_break() {
+            return true;
         }
         matches!(
             self.next_token_kind(),
@@ -6055,7 +6084,10 @@ fn is_expression_terminator(kind: SyntaxKind) -> bool {
 }
 
 fn is_contextual_keyword(kind: SyntaxKind) -> bool {
-    (kind as u16) >= (SyntaxKind::AbstractKeyword as u16)
+    matches!(
+        kind,
+        SyntaxKind::PrivateKeyword | SyntaxKind::ProtectedKeyword | SyntaxKind::PublicKeyword
+    ) || (kind as u16) >= (SyntaxKind::AbstractKeyword as u16)
         && (kind as u16) <= (SyntaxKind::DeferKeyword as u16)
 }
 
@@ -8683,6 +8715,185 @@ mod tests {
         assert!(source_statements(&result).iter().any(|statement| {
             result.arena.get(*statement).unwrap().kind == SyntaxKind::VariableStatement
         }));
+    }
+
+    #[test]
+    fn preserves_omitted_array_binding_elements_and_their_comma_positions() {
+        let source = concat!(
+            "let [, b, , a] = results;\n",
+            "function f([, a, , b, , , ] = results) {}\n",
+        );
+        let result = parse_source_file(source);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let statements = source_statements(&result);
+
+        let (list, _) = variable_list(&result, statements[0]);
+        let declaration = declaration_nodes(&result, list)[0];
+        let NodeData::VariableDeclaration(declaration) =
+            &result.arena.get(declaration).unwrap().data
+        else {
+            panic!("expected variable declaration");
+        };
+        let NodeData::BindingPattern(pattern) = &result.arena.get(declaration.name).unwrap().data
+        else {
+            panic!("expected array binding pattern");
+        };
+        assert_eq!(pattern.elements.nodes.len(), 4);
+        assert_eq!(
+            pattern
+                .elements
+                .nodes
+                .iter()
+                .map(|element| result.arena.get(*element).unwrap().kind)
+                .collect::<Vec<_>>(),
+            [
+                SyntaxKind::OmittedExpression,
+                SyntaxKind::BindingElement,
+                SyntaxKind::OmittedExpression,
+                SyntaxKind::BindingElement,
+            ]
+        );
+        for omitted in [pattern.elements.nodes[0], pattern.elements.nodes[2]] {
+            let node = result.arena.get(omitted).unwrap();
+            assert_eq!(node.range.start, node.range.end);
+            assert_eq!(source.as_bytes()[node.range.start.get() as usize], b',');
+            assert_eq!(node.parent, Some(declaration.name));
+        }
+
+        let NodeData::FunctionDeclaration(function) =
+            &result.arena.get(statements[1]).unwrap().data
+        else {
+            panic!("expected function declaration");
+        };
+        let NodeData::ParameterDeclaration(parameter) =
+            &result.arena.get(function.parameters.nodes[0]).unwrap().data
+        else {
+            panic!("expected parameter");
+        };
+        let NodeData::BindingPattern(pattern) = &result.arena.get(parameter.name).unwrap().data
+        else {
+            panic!("expected array binding pattern");
+        };
+        assert_eq!(
+            pattern
+                .elements
+                .nodes
+                .iter()
+                .filter(|element| {
+                    result.arena.get(**element).unwrap().kind == SyntaxKind::OmittedExpression
+                })
+                .count(),
+            4
+        );
+        assert!(pattern.elements.has_trailing_comma);
+    }
+
+    #[test]
+    fn applies_asi_to_line_broken_contextual_declaration_and_member_keywords() {
+        let source = concat!(
+            "abstract\nclass A {}\n",
+            "public\nclass B {}\n",
+            "private\nclass D {}\n",
+            "protected\nclass E {}\n",
+            "class C { abstract\nmethod() {} public\nprivate other() {} }\n",
+        );
+        let result = parse_source_file(source);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let statements = source_statements(&result);
+        assert_eq!(statements.len(), 9);
+        for (index, keyword) in ["abstract", "public", "private", "protected"]
+            .into_iter()
+            .enumerate()
+        {
+            let statement = statements[index * 2];
+            let NodeData::ExpressionStatement(expression) =
+                &result.arena.get(statement).unwrap().data
+            else {
+                panic!("expected contextual keyword expression");
+            };
+            let NodeData::Identifier(identifier) =
+                &result.arena.get(expression.expression).unwrap().data
+            else {
+                panic!("expected contextual keyword identifier");
+            };
+            assert_eq!(identifier.text, keyword);
+            let range = result.arena.get(statement).unwrap().range;
+            assert_eq!(
+                &source[range.start.get() as usize..range.end.get() as usize],
+                keyword
+            );
+        }
+
+        let NodeData::ClassDeclaration(class) = &result.arena.get(statements[8]).unwrap().data
+        else {
+            panic!("expected class declaration");
+        };
+        assert_eq!(class.members.nodes.len(), 4);
+        assert_eq!(
+            class
+                .members
+                .nodes
+                .iter()
+                .map(|member| result.arena.get(*member).unwrap().kind)
+                .collect::<Vec<_>>(),
+            [
+                SyntaxKind::PropertyDeclaration,
+                SyntaxKind::MethodDeclaration,
+                SyntaxKind::PropertyDeclaration,
+                SyntaxKind::MethodDeclaration,
+            ]
+        );
+    }
+
+    #[test]
+    fn keeps_line_broken_arithmetic_as_one_binary_with_nested_prefix_operands() {
+        let source = "var z =\nx\n+\n+\n+\ny;\nvar c =\nx\n-\n-\n-\ny;";
+        let result = parse_source_file(source);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let statements = source_statements(&result);
+        assert_eq!(statements.len(), 2);
+
+        for (statement, operator) in statements
+            .iter()
+            .copied()
+            .zip([SyntaxKind::PlusToken, SyntaxKind::MinusToken])
+        {
+            let (list, _) = variable_list(&result, statement);
+            let declaration = declaration_nodes(&result, list)[0];
+            let NodeData::VariableDeclaration(declaration) =
+                &result.arena.get(declaration).unwrap().data
+            else {
+                panic!("expected variable declaration");
+            };
+            let initializer = declaration.initializer.unwrap();
+            let NodeData::BinaryExpression(binary) = &result.arena.get(initializer).unwrap().data
+            else {
+                panic!("expected binary expression");
+            };
+            assert_eq!(
+                result.arena.get(binary.operator_token).unwrap().kind,
+                operator
+            );
+            let NodeData::PrefixUnaryExpression(first_prefix) =
+                &result.arena.get(binary.right).unwrap().data
+            else {
+                panic!("expected first prefix expression");
+            };
+            assert_eq!(first_prefix.operator, operator);
+            let NodeData::PrefixUnaryExpression(second_prefix) =
+                &result.arena.get(first_prefix.operand).unwrap().data
+            else {
+                panic!("expected second prefix expression");
+            };
+            assert_eq!(second_prefix.operator, operator);
+            assert_eq!(
+                result.arena.get(second_prefix.operand).unwrap().kind,
+                SyntaxKind::Identifier
+            );
+            let range = result.arena.get(initializer).unwrap().range;
+            assert_eq!(source.as_bytes()[range.start.get() as usize], b'x');
+            assert_eq!(source.as_bytes()[range.end.get() as usize - 1], b'y');
+        }
     }
 
     #[test]
