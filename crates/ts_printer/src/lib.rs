@@ -6,7 +6,9 @@ use std::fmt;
 
 use ts_ast::{Node, NodeArena, NodeData, NodeId, NodeList, SymbolId, SyntaxKind};
 use ts_binder::{BindResult, SymbolFlags, bind_source_file};
-use ts_checker::{FunctionType, ImportTypeReference, ObjectType, TypeArena, TypeId, TypeKind};
+use ts_checker::{
+    FunctionType, ImportTypeReference, NamedTypeReference, ObjectType, TypeArena, TypeId, TypeKind,
+};
 use ts_options::{JsxEmit, ModuleDetectionKind, ModuleKind, PrinterSettings, ScriptTarget};
 use ts_sourcemap::{SourceMap, SourceMapBuilder};
 
@@ -742,7 +744,11 @@ fn source_needs_awaiter_helper(arena: &NodeArena) -> bool {
         NodeData::MethodDeclaration(method) => {
             method.body.is_some()
                 && method.asterisk_token.is_none()
-                && declaration_has_modifier(arena, node, SyntaxKind::AsyncKeyword)
+                && declaration_has_modifier_in_list(
+                    arena,
+                    method.modifiers.as_ref(),
+                    SyntaxKind::AsyncKeyword,
+                )
         }
         _ => false,
     })
@@ -1687,6 +1693,7 @@ pub fn emit_declaration_file_with_reachability(
         None,
         None,
         None,
+        None,
         false,
     )
 }
@@ -1708,6 +1715,7 @@ pub fn emit_declaration_file_with_semantics(
     semantic_types: Option<&TypeArena>,
     node_types: Option<&BTreeMap<NodeId, TypeId>>,
     import_type_references: Option<&BTreeMap<TypeId, ImportTypeReference>>,
+    named_type_references: Option<&BTreeMap<TypeId, NamedTypeReference>>,
     remove_comments: bool,
 ) -> Result<EmitResult, EmitError> {
     // Declaration transforms occasionally need to distinguish same-spelled names in
@@ -1728,6 +1736,7 @@ pub fn emit_declaration_file_with_semantics(
         semantic_types,
         node_types,
         import_type_references,
+        named_type_references,
         javascript_source: [".js", ".jsx", ".mjs", ".cjs"]
             .iter()
             .any(|extension| source_name.to_ascii_lowercase().ends_with(extension)),
@@ -1796,6 +1805,7 @@ struct DeclarationPrinter<'a> {
     semantic_types: Option<&'a TypeArena>,
     node_types: Option<&'a BTreeMap<NodeId, TypeId>>,
     import_type_references: Option<&'a BTreeMap<TypeId, ImportTypeReference>>,
+    named_type_references: Option<&'a BTreeMap<TypeId, NamedTypeReference>>,
     javascript_source: bool,
     generated_names: HashSet<String>,
     emitted_javascript_class_properties: HashSet<(NodeId, String)>,
@@ -4046,7 +4056,9 @@ impl DeclarationPrinter<'_> {
             let type_id = signature.parameters.get(index).copied();
             let optional = parameter.question_token.is_some()
                 || parameter.initializer.is_some()
-                || type_id.is_some_and(|type_id| self.semantic_type_includes_undefined(type_id));
+                || (parameter.type_.is_none()
+                    && type_id
+                        .is_some_and(|type_id| self.semantic_type_includes_undefined(type_id)));
             if optional && parameter.dot_dot_dot_token.is_none() {
                 self.writer.write("?");
             }
@@ -4509,7 +4521,14 @@ impl DeclarationPrinter<'_> {
                     } else if let Some(type_id) =
                         self.node_types.and_then(|types| types.get(&id).copied())
                     {
-                        self.emit_widened_semantic_type(type_id)?;
+                        if self.member_has_modifier(
+                            data.modifiers.as_ref(),
+                            SyntaxKind::AccessorKeyword,
+                        ) {
+                            self.emit_widened_auto_accessor_type(type_id)?;
+                        } else {
+                            self.emit_widened_semantic_type(type_id)?;
+                        }
                     } else {
                         self.writer.write("any");
                     }
@@ -4939,6 +4958,36 @@ impl DeclarationPrinter<'_> {
         Ok(())
     }
 
+    fn emit_widened_auto_accessor_type(&mut self, type_id: TypeId) -> Result<(), EmitError> {
+        let Some(TypeKind::Union(members)) = self
+            .semantic_types
+            .and_then(|types| types.get(type_id))
+            .map(|type_| type_.kind.clone())
+        else {
+            return self.emit_widened_semantic_type(type_id);
+        };
+        let mut members = members.into_iter().enumerate().collect::<Vec<_>>();
+        members.sort_by_key(|(index, member)| {
+            let nullish_order = match self
+                .semantic_types
+                .and_then(|types| types.get(*member))
+                .map(|type_| &type_.kind)
+            {
+                Some(TypeKind::Null) => 1,
+                Some(TypeKind::Undefined) => 2,
+                _ => 0,
+            };
+            (nullish_order, *index)
+        });
+        for (index, (_, member)) in members.into_iter().enumerate() {
+            if index != 0 {
+                self.writer.write(" | ");
+            }
+            self.emit_widened_semantic_type(member)?;
+        }
+        Ok(())
+    }
+
     fn emit_declaration_member_modifiers(&mut self, modifiers: Option<&ts_ast::ModifierList>) {
         let Some(modifiers) = modifiers else {
             return;
@@ -5065,6 +5114,18 @@ impl DeclarationPrinter<'_> {
             if reference.qualifier != "export=" && !reference.qualifier.is_empty() {
                 self.writer.write(".");
                 self.writer.write(&reference.qualifier);
+            }
+            return Ok(());
+        }
+        if let Some(reference) = self
+            .named_type_references
+            .and_then(|references| references.get(&id))
+        {
+            self.writer.write(&reference.name);
+            if !reference.type_arguments.is_empty() {
+                self.writer.write("<");
+                self.emit_semantic_type_list(&reference.type_arguments, ", ")?;
+                self.writer.write(">");
             }
             return Ok(());
         }
@@ -13924,10 +13985,15 @@ impl Printer<'_> {
                         self.emit_native_constructor(method, data, has_base)?;
                         continue;
                     }
+                    let is_async =
+                        self.has_modifier(method.modifiers.as_ref(), SyntaxKind::AsyncKeyword);
+                    let downlevel_async = method.asterisk_token.is_none()
+                        && is_async
+                        && self.settings.target < ScriptTarget::Es2017;
                     if self.has_modifier(method.modifiers.as_ref(), SyntaxKind::StaticKeyword) {
                         self.writer.write("static ");
                     }
-                    if self.has_modifier(method.modifiers.as_ref(), SyntaxKind::AsyncKeyword) {
+                    if !downlevel_async && is_async {
                         self.writer.write("async ");
                     }
                     if method.asterisk_token.is_some() {
@@ -13936,7 +14002,14 @@ impl Printer<'_> {
                     self.emit_class_member_name(data, member_index, method.name)?;
                     self.emit_parameters(&method.parameters)?;
                     self.writer.write(" ");
-                    self.emit_function_body(method.body.expect("body checked above"))?;
+                    if downlevel_async {
+                        self.emit_downlevel_async_function_body(
+                            method.body.expect("body checked above"),
+                            "this",
+                        )?;
+                    } else {
+                        self.emit_function_body(method.body.expect("body checked above"))?;
+                    }
                     self.writer.newline();
                 }
                 NodeData::MethodDeclaration(_) => {}
@@ -13944,6 +14017,10 @@ impl Printer<'_> {
                     if self.property_is_auto_accessor(property) =>
                 {
                     if self.settings.target >= ScriptTarget::EsNext {
+                        if self.has_modifier(property.modifiers.as_ref(), SyntaxKind::StaticKeyword)
+                        {
+                            self.writer.write("static ");
+                        }
                         self.writer.write("accessor ");
                         self.emit_expression(property.name, 0)?;
                         if let Some(initializer) = property.initializer {
@@ -18126,14 +18203,20 @@ impl Printer<'_> {
                     self.writer.write(" ");
                 }
                 self.emit_expression_list(&data.elements)?;
-                if !object && data.elements.has_trailing_comma {
-                    let last_is_omitted = data
-                        .elements
-                        .nodes
-                        .last()
-                        .and_then(|last| self.arena.get(*last))
-                        .is_some_and(|last| matches!(last.data, NodeData::OmittedExpression(_)));
-                    self.writer.write(if last_is_omitted { " ," } else { "," });
+                if data.elements.has_trailing_comma {
+                    if object {
+                        self.writer.write(",");
+                    } else {
+                        let last_is_omitted = data
+                            .elements
+                            .nodes
+                            .last()
+                            .and_then(|last| self.arena.get(*last))
+                            .is_some_and(|last| {
+                                matches!(last.data, NodeData::OmittedExpression(_))
+                            });
+                        self.writer.write(if last_is_omitted { " ," } else { "," });
+                    }
                 }
                 if object && !data.elements.nodes.is_empty() {
                     self.writer.write(" ");
@@ -21491,10 +21574,84 @@ mod tests {
             Some(&checked.types),
             Some(&checked.node_types),
             Some(&checked.import_type_references),
+            Some(&checked.named_type_references),
             remove_comments,
         )
         .unwrap()
         .code
+    }
+
+    #[test]
+    fn declaration_emit_preserves_inferred_local_generic_identities() {
+        let box_output = emit_declarations_with_semantics(
+            "type Box<T> = { get: () => T; set: (value: T) => void }; declare function box<T>(value: T): Box<T>; const bn1 = box(0);",
+        );
+        assert!(
+            box_output.contains("declare const bn1: Box<number>;"),
+            "{box_output}"
+        );
+
+        let promise_output = emit_declarations_with_semantics(
+            "interface Promise<T> { then(value: T): void; } declare function execute(script: Function): Promise<string>; export function executeSomething() { return execute(() => {}); }",
+        );
+        assert!(
+            promise_output.contains("export declare function executeSomething(): Promise<string>;"),
+            "{promise_output}"
+        );
+    }
+
+    #[test]
+    fn declaration_emit_infers_auto_accessors_from_owning_class_writes() {
+        let output = emit_declarations_with_semantics(
+            r"
+                class Example {
+                    accessor test;
+                    constructor(test: number) { this.test = test; }
+                    getTest() { return this.test; }
+                }
+                class Example2 {
+                    accessor test;
+                    constructor(test: number | undefined) { this.test = test; }
+                    getTest() { if (this.test) return this.test; return 0; }
+                }
+                class Example3 {
+                    accessor value;
+                    constructor(n: number) {
+                        this.value = n;
+                        if (n < 0) this.value = null;
+                    }
+                }
+                declare var n: number;
+                class Example4 {
+                    static accessor value;
+                    static {
+                        this.value = n;
+                        if (n < 0) this.value = null;
+                    }
+                }
+                class Example5 { static accessor value; }
+                Example5.value = 123;
+                Example5.value++;
+            ",
+        );
+        for expected in [
+            "declare class Example {\n    accessor test: number;",
+            concat!(
+                "declare class Example2 {\n",
+                "    accessor test: number | undefined;\n",
+                "    constructor(test: number | undefined);\n",
+                "    getTest(): number;\n",
+                "}",
+            ),
+            "declare class Example3 {\n    accessor value: number | null;",
+            "declare class Example4 {\n    static accessor value: number | null;",
+            "declare class Example5 {\n    static accessor value: any;",
+        ] {
+            assert!(
+                output.contains(expected),
+                "missing {expected:?} in:\n{output}"
+            );
+        }
     }
 
     fn emit_with(source: &str, target: ScriptTarget, module: ModuleKind) -> super::EmitResult {
@@ -22298,6 +22455,40 @@ mod tests {
     }
 
     #[test]
+    fn downlevels_instance_and_static_async_class_methods_for_es2015() {
+        let output = emit_with(
+            concat!(
+                "class C {\n",
+                "    async instance(value: Promise<number>) {\n",
+                "        return await value;\n",
+                "    }\n",
+                "    static async load() {\n",
+                "        await task();\n",
+                "    }\n",
+                "}",
+            ),
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(output.starts_with("var __awaiter = "), "{output}");
+        assert!(
+            output.contains(
+                "instance(value) {\n        return __awaiter(this, void 0, void 0, function* () {\n            return yield value;\n        });\n    }"
+            ),
+            "{output}"
+        );
+        assert!(
+            output.contains(
+                "static load() {\n        return __awaiter(this, void 0, void 0, function* () {\n            yield task();\n        });\n    }"
+            ),
+            "{output}"
+        );
+        assert!(!output.contains("async instance"), "{output}");
+        assert!(!output.contains("static async load"), "{output}");
+    }
+
+    #[test]
     fn lowers_es2015_async_object_rest_parameters_and_static_fields() {
         let object_rest = emit_with(
             "async ({ foo, bar, ...rest }) => bar(await foo);",
@@ -22379,6 +22570,19 @@ mod tests {
             )
             .code,
             "let [, b, , a] = results;\n"
+        );
+    }
+
+    #[test]
+    fn preserves_object_binding_pattern_trailing_commas() {
+        assert_eq!(
+            emit_with(
+                "const { a = \"0\", b = +a, } = obj;",
+                ScriptTarget::Es2015,
+                ModuleKind::None,
+            )
+            .code,
+            "const { a = \"0\", b = +a, } = obj;\n"
         );
     }
 
@@ -25622,6 +25826,7 @@ class Board {
             Some(&checked.types),
             Some(&checked.node_types),
             Some(&checked.import_type_references),
+            Some(&checked.named_type_references),
             false,
         )
         .unwrap()

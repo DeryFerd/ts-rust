@@ -1257,6 +1257,7 @@ impl<'a> Parser<'a> {
     fn parse_object_binding_pattern(&mut self) -> NodeId {
         let start = self.consume().range.start;
         let mut elements = Vec::new();
+        let mut has_trailing_comma = false;
         while !matches!(
             self.current.kind,
             SyntaxKind::CloseBraceToken | SyntaxKind::EndOfFile
@@ -1308,6 +1309,7 @@ impl<'a> Parser<'a> {
                 break;
             }
             self.bump();
+            has_trailing_comma = self.current.kind == SyntaxKind::CloseBraceToken;
         }
         let end = if self.current.kind == SyntaxKind::CloseBraceToken {
             self.consume().range.end
@@ -1322,7 +1324,7 @@ impl<'a> Parser<'a> {
                 elements: NodeList {
                     range: TextRange::new(start, end),
                     nodes: elements.clone(),
-                    has_trailing_comma: false,
+                    has_trailing_comma,
                 },
                 facts: 0,
             })),
@@ -4728,12 +4730,34 @@ impl<'a> Parser<'a> {
                     parenthesis_depth -= 1;
                     if parenthesis_depth == 0 {
                         token = self.scanner.scan();
-                        let result = matches!(
-                            token.kind,
-                            SyntaxKind::EqualsGreaterThanToken
-                                | SyntaxKind::OpenBraceToken
-                                | SyntaxKind::ColonToken
-                        ) || typed_parameter;
+                        let result = if token.kind == SyntaxKind::ColonToken {
+                            let mut delimiter_depth = 0_i32;
+                            loop {
+                                token = self.scanner.scan();
+                                match token.kind {
+                                    SyntaxKind::OpenParenToken
+                                    | SyntaxKind::OpenBracketToken
+                                    | SyntaxKind::OpenBraceToken
+                                    | SyntaxKind::LessThanToken => delimiter_depth += 1,
+                                    SyntaxKind::CloseParenToken
+                                    | SyntaxKind::CloseBracketToken
+                                    | SyntaxKind::CloseBraceToken
+                                    | SyntaxKind::GreaterThanToken => delimiter_depth -= 1,
+                                    SyntaxKind::EqualsGreaterThanToken if delimiter_depth == 0 => {
+                                        break true;
+                                    }
+                                    SyntaxKind::EndOfFile | SyntaxKind::SemicolonToken => {
+                                        break false;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        } else {
+                            matches!(
+                                token.kind,
+                                SyntaxKind::EqualsGreaterThanToken | SyntaxKind::OpenBraceToken
+                            ) || typed_parameter
+                        };
                         self.scanner.rewind(checkpoint);
                         return result;
                     }
@@ -10916,6 +10940,33 @@ mod tests {
             result.arena.get(initializer).map(|node| &node.data),
             Some(NodeData::CallExpression(_))
         ));
+    }
+
+    #[test]
+    fn parses_parenthesized_comma_expression_before_ternary_colon() {
+        let result = parse_source_file("const result = flag ? (assert(value), value) : null;");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert!(
+            result
+                .arena
+                .iter()
+                .any(|(_, node)| matches!(node.data, NodeData::ConditionalExpression(_)))
+        );
+        assert!(result.arena.iter().any(|(_, node)| {
+            let NodeData::BinaryExpression(binary) = &node.data else {
+                return false;
+            };
+            result
+                .arena
+                .get(binary.operator_token)
+                .is_some_and(|token| token.kind == SyntaxKind::CommaToken)
+        }));
+        assert!(
+            !result
+                .arena
+                .iter()
+                .any(|(_, node)| matches!(node.data, NodeData::ArrowFunction(_)))
+        );
     }
 
     fn find_descendant_kind(

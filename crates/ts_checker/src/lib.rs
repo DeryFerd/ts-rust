@@ -76,6 +76,12 @@ pub struct ImportTypeReference {
     pub qualifier: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NamedTypeReference {
+    pub name: String,
+    pub type_arguments: Vec<TypeId>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Type {
     pub id: TypeId,
@@ -358,6 +364,8 @@ pub struct CheckResult {
     pub node_types: BTreeMap<NodeId, TypeId>,
     /// Imported type identities retained for declaration serialization.
     pub import_type_references: BTreeMap<TypeId, ImportTypeReference>,
+    /// Local generic identities retained alongside their structural representations.
+    pub named_type_references: BTreeMap<TypeId, NamedTypeReference>,
     pub enum_member_values: BTreeMap<NodeId, EnumConstantValue>,
     pub enum_access_values: BTreeMap<NodeId, EnumConstantValue>,
     /// Resolved import declarations and whether their target has runtime value meaning.
@@ -447,6 +455,7 @@ pub fn empty_check_result() -> CheckResult {
         symbol_types: HashMap::new(),
         node_types: BTreeMap::new(),
         import_type_references: BTreeMap::new(),
+        named_type_references: BTreeMap::new(),
         enum_member_values: BTreeMap::new(),
         enum_access_values: BTreeMap::new(),
         import_runtime_meanings: BTreeMap::new(),
@@ -1846,6 +1855,7 @@ impl<'a> Checker<'a> {
                 symbol_types: HashMap::new(),
                 node_types: BTreeMap::new(),
                 import_type_references: BTreeMap::new(),
+                named_type_references: BTreeMap::new(),
                 enum_member_values: BTreeMap::new(),
                 enum_access_values: BTreeMap::new(),
                 import_runtime_meanings: BTreeMap::new(),
@@ -1975,12 +1985,13 @@ impl<'a> Checker<'a> {
                             .symbol_types
                             .insert(symbol.id, self.result.types.any());
                         self.class_value_stack.push(symbol.id);
-                        symbol_type = Some(self.declared_object_type(
+                        let instance_type = self.declared_object_type(
                             data.type_parameters.as_ref(),
                             data.heritage_clauses.as_ref(),
                             &data.members.nodes,
                             &[],
-                        ));
+                        );
+                        symbol_type = Some(instance_type);
                         self.class_value_stack.pop();
                         break;
                     }
@@ -2596,11 +2607,6 @@ impl<'a> Checker<'a> {
             }
             NodeData::ExpressionStatement(data) => {
                 self.type_of_expression(data.expression);
-                if let Some(NodeData::CallExpression(call)) =
-                    self.arena.get(data.expression).map(|node| &node.data)
-                {
-                    self.apply_assertion_call(call.expression, &call.arguments.nodes);
-                }
             }
             NodeData::ExportAssignment(data) => {
                 self.type_of_expression(data.expression);
@@ -3040,6 +3046,7 @@ impl<'a> Checker<'a> {
         let mut call_signatures = Vec::new();
         let mut construct_signatures = Vec::new();
         let constructor_assignment_types = self.constructor_assignment_types(members);
+        let static_block_assignment_types = self.static_block_assignment_types(members);
         for member in members {
             let Some(node) = self.arena.get(*member) else {
                 continue;
@@ -3047,13 +3054,28 @@ impl<'a> Checker<'a> {
             match &node.data {
                 NodeData::PropertyDeclaration(data) => {
                     if let Some(name) = self.property_name(data.name) {
+                        let is_auto_accessor = self
+                            .has_ast_modifier(data.modifiers.as_ref(), SyntaxKind::AccessorKeyword);
+                        let is_static = self
+                            .has_ast_modifier(data.modifiers.as_ref(), SyntaxKind::StaticKeyword);
+                        let assignment_type = (is_auto_accessor
+                            && data.type_.is_none()
+                            && data.initializer.is_none())
+                        .then(|| {
+                            if is_static {
+                                static_block_assignment_types.get(&name).copied()
+                            } else {
+                                constructor_assignment_types.get(&name).copied()
+                            }
+                        })
+                        .flatten();
                         let mut property_type = data
                             .type_
                             .map(|type_node| self.type_from_type_node(type_node))
                             .or_else(|| {
                                 data.initializer.map(|value| self.type_of_expression(value))
                             })
-                            .or_else(|| constructor_assignment_types.get(&name).copied())
+                            .or(assignment_type)
                             .unwrap_or_else(|| self.result.types.any());
                         if self.is_question_token(data.postfix_token) {
                             optional_properties.insert(name.clone());
@@ -3414,7 +3436,7 @@ impl<'a> Checker<'a> {
                 {
                     let type_id = self.type_of_expression(assignment.right);
                     let type_id = self.widen_literal(type_id);
-                    assignments.entry(name).or_insert(type_id);
+                    self.add_assignment_type(&mut assignments, name, type_id);
                 }
                 if let Some(children) = self.children.get(&node_id) {
                     pending.extend(children.iter().copied());
@@ -3423,6 +3445,75 @@ impl<'a> Checker<'a> {
             self.local_scopes.pop();
         }
         assignments
+    }
+
+    fn static_block_assignment_types(&mut self, members: &[NodeId]) -> BTreeMap<String, TypeId> {
+        let class_members = members.iter().find_map(|member| {
+            let parent = self.arena.get(*member)?.parent?;
+            match &self.arena.get(parent)?.data {
+                NodeData::ClassDeclaration(class) => Some(class.members.nodes.clone()),
+                NodeData::ClassExpression(class) => Some(class.members.nodes.clone()),
+                _ => None,
+            }
+        });
+        let Some(class_members) = class_members else {
+            return BTreeMap::new();
+        };
+        let mut assignments = BTreeMap::new();
+        for member in class_members {
+            let Some(NodeData::ClassStaticBlockDeclaration(block)) =
+                self.arena.get(member).map(|node| &node.data)
+            else {
+                continue;
+            };
+            let body = block.body;
+            let mut pending = vec![body];
+            while let Some(node_id) = pending.pop() {
+                let Some(node) = self.arena.get(node_id) else {
+                    continue;
+                };
+                if node_id != body
+                    && matches!(
+                        node.data,
+                        NodeData::FunctionDeclaration(_)
+                            | NodeData::FunctionExpression(_)
+                            | NodeData::ArrowFunction(_)
+                            | NodeData::MethodDeclaration(_)
+                            | NodeData::ClassDeclaration(_)
+                            | NodeData::ClassExpression(_)
+                    )
+                {
+                    continue;
+                }
+                if let NodeData::BinaryExpression(assignment) = &node.data
+                    && self
+                        .arena
+                        .get(assignment.operator_token)
+                        .is_some_and(|operator| operator.kind == SyntaxKind::EqualsToken)
+                    && let Some(name) = self.this_property_name(assignment.left)
+                {
+                    let type_id = self.type_of_expression(assignment.right);
+                    let type_id = self.widen_literal(type_id);
+                    self.add_assignment_type(&mut assignments, name, type_id);
+                }
+                if let Some(children) = self.children.get(&node_id) {
+                    pending.extend(children.iter().copied());
+                }
+            }
+        }
+        assignments
+    }
+
+    fn add_assignment_type(
+        &mut self,
+        assignments: &mut BTreeMap<String, TypeId>,
+        name: String,
+        type_id: TypeId,
+    ) {
+        let type_id = assignments.get(&name).copied().map_or(type_id, |previous| {
+            self.result.types.union([previous, type_id])
+        });
+        assignments.insert(name, type_id);
     }
 
     fn javascript_instance_properties(
@@ -3977,10 +4068,7 @@ impl<'a> Checker<'a> {
             let returns = self
                 .function_return_expressions(body)
                 .into_iter()
-                .map(|expression| {
-                    let type_id = self.type_of_expression(expression);
-                    self.widen_literal(type_id)
-                })
+                .map(|expression| self.inferred_method_return_expression_type(expression, body))
                 .collect::<Vec<_>>();
             self.local_scopes.pop();
             if !returns.is_empty() {
@@ -3997,6 +4085,32 @@ impl<'a> Checker<'a> {
             }
         }
         signature
+    }
+
+    fn inferred_method_return_expression_type(
+        &mut self,
+        expression: NodeId,
+        body: NodeId,
+    ) -> TypeId {
+        let mut type_id = self.type_of_expression(expression);
+        let Some(name) = self.this_property_name(expression) else {
+            return self.widen_literal(type_id);
+        };
+        let mut child = expression;
+        while let Some(parent) = self.arena.get(child).and_then(|node| node.parent) {
+            if parent == body {
+                break;
+            }
+            if let Some(NodeData::IfStatement(if_statement)) =
+                self.arena.get(parent).map(|node| &node.data)
+                && child == if_statement.then_statement
+                && self.this_property_name(if_statement.expression).as_deref() == Some(&name)
+            {
+                type_id = self.narrow_truthiness(type_id, true);
+            }
+            child = parent;
+        }
+        self.widen_literal(type_id)
     }
 
     fn check_object_literal_getter(
@@ -4541,6 +4655,7 @@ impl<'a> Checker<'a> {
             .and_then(|name| self.property_name(name))
     }
 
+    #[allow(clippy::too_many_lines)]
     fn check_class_members(&mut self, members: &[NodeId]) {
         for member in members {
             let Some(node) = self.arena.get(*member) else {
@@ -4556,6 +4671,15 @@ impl<'a> Checker<'a> {
                         {
                             self.assignability_error(*member, actual, expected);
                         }
+                    } else if self.options.no_implicit_any
+                        && data.type_.is_none()
+                        && self
+                            .has_ast_modifier(data.modifiers.as_ref(), SyntaxKind::AccessorKeyword)
+                        && self.result.node_types.get(member).copied()
+                            == Some(self.result.types.any())
+                        && let Some(name) = self.property_name(data.name)
+                    {
+                        self.error(data.name, 7008, [name, "any".into()]);
                     }
                 }
                 NodeData::MethodDeclaration(data) => {
@@ -4808,6 +4932,11 @@ impl<'a> Checker<'a> {
         let asserted_type = predicate
             .type_
             .map(|type_node| self.asserted_type_from_call(type_node, &parameters, arguments));
+        if asserted_type.is_none() {
+            let narrowing = self.condition_narrowing(argument, true);
+            self.flow_types.extend(narrowing);
+            return;
+        }
         if let Some((subject, property)) = self.property_narrowing_subject(argument) {
             if let Some(asserted_type) = asserted_type {
                 let narrowed = self.narrow_discriminant(subject, &property, asserted_type, true);
@@ -5073,9 +5202,11 @@ impl<'a> Checker<'a> {
     fn narrowing_comparison(&self, node: NodeId) -> Option<NarrowingComparison> {
         let node = self.arena.get(node)?;
         match &node.data {
-            NodeData::KeywordExpression(_) if node.kind == SyntaxKind::NullKeyword => {
-                Some(NarrowingComparison::Null)
-            }
+            NodeData::KeywordExpression(_) => match node.kind {
+                SyntaxKind::NullKeyword => Some(NarrowingComparison::Null),
+                SyntaxKind::UndefinedKeyword => Some(NarrowingComparison::Undefined),
+                _ => None,
+            },
             NodeData::Identifier(data) if data.text == "undefined" => {
                 Some(NarrowingComparison::Undefined)
             }
@@ -5198,8 +5329,19 @@ impl<'a> Checker<'a> {
             }
             NodeData::ConditionalExpression(data) => {
                 self.type_of_expression(data.condition);
+                let before = self.flow_types.clone();
+                let when_true_narrowing = self.condition_narrowing(data.condition, true);
+                self.narrowings.push(when_true_narrowing);
                 let when_true = self.type_of_expression_context(data.when_true, contextual_type);
+                self.narrowings.pop();
+                let when_true_flow = self.flow_types.clone();
+                self.flow_types.clone_from(&before);
+                let when_false_narrowing = self.condition_narrowing(data.condition, false);
+                self.narrowings.push(when_false_narrowing);
                 let when_false = self.type_of_expression_context(data.when_false, contextual_type);
+                self.narrowings.pop();
+                let when_false_flow = self.flow_types.clone();
+                self.flow_types = self.join_flow_types(&when_true_flow, &when_false_flow);
                 self.result.types.union([when_true, when_false])
             }
             NodeData::ObjectLiteralExpression(data) => {
@@ -5328,6 +5470,7 @@ impl<'a> Checker<'a> {
                     let result =
                         self.call_expression_type(node_id, callee, &data.arguments.nodes, false);
                     self.preserve_literal_inference = previous;
+                    self.apply_assertion_call(data.expression, &data.arguments.nodes);
                     result
                 }
             }
@@ -6749,6 +6892,7 @@ impl<'a> Checker<'a> {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn substitute_type(&mut self, type_id: TypeId, inference: &HashMap<TypeId, TypeId>) -> TypeId {
         if let Some(inferred) = inference.get(&type_id) {
             return *inferred;
@@ -6848,6 +6992,18 @@ impl<'a> Checker<'a> {
                 .import_type_references
                 .insert(substituted, reference);
         }
+        if substituted != type_id
+            && let Some(mut reference) = self.result.named_type_references.get(&type_id).cloned()
+        {
+            reference.type_arguments = reference
+                .type_arguments
+                .into_iter()
+                .map(|argument| self.substitute_type(argument, inference))
+                .collect();
+            self.result
+                .named_type_references
+                .insert(substituted, reference);
+        }
         substituted
     }
 
@@ -6916,6 +7072,7 @@ impl<'a> Checker<'a> {
             SyntaxKind::AmpersandAmpersandToken
             | SyntaxKind::BarBarToken
             | SyntaxKind::QuestionQuestionToken => self.result.types.union([left, right]),
+            SyntaxKind::CommaToken => right,
             SyntaxKind::EqualsToken => {
                 if !self.is_assignable(right, left) {
                     self.assignability_error(node, right, left);
@@ -7492,31 +7649,58 @@ impl<'a> Checker<'a> {
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default();
-                let Some(symbol) = self.resolve_identifier(data.type_name, &name) else {
-                    if let Some(descriptor) = self.external_names.get(&name).cloned() {
-                        return self.import_alias(&descriptor, &arguments);
+                let symbol = self.resolve_identifier(data.type_name, &name);
+                let cyclic_alias =
+                    symbol.is_some_and(|symbol| self.type_alias_is_recursive(symbol, &name));
+                let mut type_id = if let Some(symbol) = symbol {
+                    let type_id =
+                        if let Some(descriptor) = self.external_aliases.get(&symbol).cloned() {
+                            self.import_alias(&descriptor, &arguments)
+                        } else {
+                            self.instantiate_alias(symbol, &arguments)
+                                .or_else(|| self.instantiate_declared_object(symbol, &arguments))
+                                .unwrap_or_else(|| {
+                                    self.result
+                                        .symbol_types
+                                        .get(&symbol)
+                                        .copied()
+                                        .unwrap_or_else(|| self.result.types.unknown())
+                                })
+                        };
+                    if let Some(reference) = self.external_imports.get(&symbol).cloned() {
+                        self.result
+                            .import_type_references
+                            .insert(type_id, reference);
                     }
-                    return self.unresolved_type_name(data.type_name, name);
-                };
-                let cyclic_alias = self.type_alias_is_recursive(symbol, &name);
-                let type_id = if let Some(descriptor) = self.external_aliases.get(&symbol).cloned()
-                {
+                    type_id
+                } else if let Some(descriptor) = self.external_names.get(&name).cloned() {
                     self.import_alias(&descriptor, &arguments)
                 } else {
-                    self.instantiate_alias(symbol, &arguments)
-                        .or_else(|| self.instantiate_declared_object(symbol, &arguments))
-                        .unwrap_or_else(|| {
-                            self.result
-                                .symbol_types
-                                .get(&symbol)
-                                .copied()
-                                .unwrap_or_else(|| self.result.types.unknown())
-                        })
+                    self.unresolved_type_name(data.type_name, name.clone())
                 };
-                if let Some(reference) = self.external_imports.get(&symbol).cloned() {
-                    self.result
-                        .import_type_references
-                        .insert(type_id, reference);
+                if !arguments.is_empty()
+                    && let Some(TypeKind::Object(object)) = self
+                        .result
+                        .types
+                        .get(type_id)
+                        .map(|type_| type_.kind.clone())
+                {
+                    let referenced_type = self.result.types.alloc(TypeKind::Object(object));
+                    if let Some(reference) =
+                        self.result.import_type_references.get(&type_id).cloned()
+                    {
+                        self.result
+                            .import_type_references
+                            .insert(referenced_type, reference);
+                    }
+                    self.result.named_type_references.insert(
+                        referenced_type,
+                        NamedTypeReference {
+                            name: name.clone(),
+                            type_arguments: arguments,
+                        },
+                    );
+                    type_id = referenced_type;
                 }
                 if cyclic_alias {
                     self.result.types.alloc(TypeKind::TypeParameter {
@@ -8512,6 +8696,16 @@ impl<'a> Checker<'a> {
             self.result
                 .import_type_references
                 .insert(widened, reference);
+        }
+        if widened != type_id
+            && let Some(mut reference) = self.result.named_type_references.get(&type_id).cloned()
+        {
+            reference.type_arguments = reference
+                .type_arguments
+                .into_iter()
+                .map(|argument| self.widen_literal(argument))
+                .collect();
+            self.result.named_type_references.insert(widened, reference);
         }
         widened
     }
@@ -10412,6 +10606,76 @@ mod tests {
     }
 
     #[test]
+    fn assertion_conditions_narrow_later_comma_operands_in_ternaries() {
+        let parsed = parse_source_file(
+            r"
+                declare function assert(value: any): asserts value;
+                function foo(param: number | null | undefined): number | null {
+                    const val = param !== undefined;
+                    return val ? (assert(param !== undefined), param) : null;
+                }
+            ",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+
+        let mut checked_expressions = 0;
+        for (id, node) in parsed.arena.iter() {
+            let relevant = match &node.data {
+                NodeData::ConditionalExpression(_) => true,
+                NodeData::BinaryExpression(binary) => parsed
+                    .arena
+                    .get(binary.operator_token)
+                    .is_some_and(|token| token.kind == SyntaxKind::CommaToken),
+                _ => false,
+            };
+            if !relevant {
+                continue;
+            }
+            let type_id = result.type_of_node(id).expect("expression was checked");
+            let TypeKind::Union(members) = &result.types.get(type_id).unwrap().kind else {
+                panic!(
+                    "expected number | null, got {}",
+                    result.types.display(type_id)
+                );
+            };
+            assert_eq!(members.len(), 2);
+            assert!(members.contains(&result.types.number()));
+            assert!(members.contains(&result.types.null()));
+            assert!(!members.contains(&result.types.undefined()));
+            checked_expressions += 1;
+        }
+        assert_eq!(checked_expressions, 2);
+    }
+
+    #[test]
+    fn ternary_assertion_flow_is_isolated_to_its_branch() {
+        let parsed = parse_source_file(
+            r"
+                declare function assert(value: any): asserts value;
+                function branch(value: string | undefined, flag: boolean) {
+                    flag ? (assert(value), value.length) : value.length;
+                    value.length;
+                }
+            ",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        assert_eq!(result.diagnostics.len(), 2, "{:?}", result.diagnostics);
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.diagnostic.code() == 2339),
+            "{:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
     fn narrows_typeof_checks_inside_if_branches() {
         let mut builder = Builder::new();
         let string_type = builder.keyword_type(SyntaxKind::StringKeyword);
@@ -11004,6 +11268,105 @@ mod tests {
         assert_eq!(
             result.type_of_node(return_statement.expression.unwrap()),
             Some(y_signature.return_type)
+        );
+    }
+
+    #[test]
+    fn infers_auto_accessor_types_from_owning_class_writes() {
+        let parsed = parse_source_file(
+            r"
+                class Example {
+                    accessor test;
+                    constructor(test: number) { this.test = test; }
+                }
+                class Example2 {
+                    accessor test;
+                    constructor(test: number | undefined) { this.test = test; }
+                }
+                class Example3 {
+                    accessor value;
+                    constructor(n: number) {
+                        this.value = n;
+                        if (n < 0) this.value = null;
+                    }
+                }
+                declare var n: number;
+                class Example4 {
+                    static accessor value;
+                    static {
+                        this.value = n;
+                        if (n < 0) this.value = null;
+                    }
+                }
+                class Example5 { static accessor value; }
+                Example5.value = 123;
+                Example5.value++;
+            ",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file_with_options(
+            &parsed.arena,
+            parsed.source_file,
+            &bindings,
+            CheckerOptions {
+                no_implicit_any: true,
+                ..CheckerOptions::default()
+            },
+        );
+
+        let accessor_type = |class_name: &str, property_name: &str| {
+            parsed
+                .arena
+                .iter()
+                .find_map(|(node_id, node)| {
+                    let NodeData::PropertyDeclaration(property) = &node.data else {
+                        return None;
+                    };
+                    if identifier_text(&parsed.arena, property.name) != Some(property_name) {
+                        return None;
+                    }
+                    let parent = node.parent?;
+                    let NodeData::ClassDeclaration(class) = &parsed.arena.get(parent)?.data else {
+                        return None;
+                    };
+                    (class
+                        .name
+                        .and_then(|name| identifier_text(&parsed.arena, name))
+                        == Some(class_name))
+                    .then(|| result.type_of_node(node_id).unwrap())
+                })
+                .unwrap()
+        };
+        let assert_union = |type_id, expected: &[super::TypeId]| {
+            let TypeKind::Union(members) = &result.types.get(type_id).unwrap().kind else {
+                panic!("expected union type");
+            };
+            assert_eq!(members.len(), expected.len());
+            assert!(expected.iter().all(|expected| members.contains(expected)));
+        };
+
+        assert_eq!(accessor_type("Example", "test"), result.types.number());
+        assert_union(
+            accessor_type("Example2", "test"),
+            &[result.types.number(), result.types.undefined()],
+        );
+        assert_union(
+            accessor_type("Example3", "value"),
+            &[result.types.number(), result.types.null()],
+        );
+        assert_union(
+            accessor_type("Example4", "value"),
+            &[result.types.number(), result.types.null()],
+        );
+        assert_eq!(accessor_type("Example5", "value"), result.types.any());
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [7008]
         );
     }
 

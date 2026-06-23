@@ -530,6 +530,7 @@ impl Program {
                     Some(&source_file.checking.types),
                     Some(&declaration_node_types),
                     Some(&source_file.checking.import_type_references),
+                    Some(&source_file.checking.named_type_references),
                     settings.remove_comments,
                 ) {
                     Ok(mut emitted) => {
@@ -723,6 +724,7 @@ impl Program {
                     Some(&source.checking.types),
                     Some(&declaration_node_types),
                     Some(&source.checking.import_type_references),
+                    Some(&source.checking.named_type_references),
                     settings.remove_comments,
                 ) {
                     Ok(mut emitted) => {
