@@ -233,6 +233,8 @@ pub fn emit_source_file_with_context(
         emitted_source_comments: HashSet::new(),
         class_expression_temps: HashMap::new(),
         await_as_yield: false,
+        async_loop_counter: 0,
+        async_control_counter: 0,
     };
     let node = printer.node(source_file)?.clone();
     let NodeData::SourceFile(data) = &node.data else {
@@ -323,11 +325,17 @@ pub fn emit_source_file_with_context(
             printer.emit_leading_pinned_source_comments(start);
         }
     }
-    if (ScriptTarget::Es2015..ScriptTarget::Es2017).contains(&settings.target)
+    if settings.target < ScriptTarget::Es2017
         && source_needs_awaiter_helper(arena)
         && !settings.no_emit_helpers
     {
         printer.emit_awaiter_helper();
+    }
+    if settings.target < ScriptTarget::Es2015
+        && source_needs_awaiter_helper(arena)
+        && !settings.no_emit_helpers
+    {
+        printer.emit_generator_helper();
     }
     if settings.target < ScriptTarget::Es2018
         && source_needs_object_rest_helper(arena)
@@ -4216,6 +4224,26 @@ struct SystemModulePlan {
     exported_bindings: HashMap<ts_ast::SymbolId, String>,
 }
 
+#[derive(Clone)]
+struct Es5AsyncCapturedLoop {
+    prelude: Vec<NodeId>,
+    loop_variable: String,
+    initializer: NodeId,
+    condition: NodeId,
+    incrementor: NodeId,
+    awaited: NodeId,
+    after_await: Vec<NodeId>,
+    control: Es5AsyncLoopControl,
+}
+
+#[derive(Clone, Copy)]
+enum Es5AsyncLoopControl {
+    None,
+    Break,
+    Continue,
+    Return(NodeId),
+}
+
 struct GeneratedNames {
     used: HashSet<String>,
 }
@@ -4601,6 +4629,8 @@ struct Printer<'a> {
     emitted_source_comments: HashSet<(usize, usize)>,
     class_expression_temps: HashMap<NodeId, String>,
     await_as_yield: bool,
+    async_loop_counter: u32,
+    async_control_counter: u32,
 }
 
 impl Printer<'_> {
@@ -5479,6 +5509,41 @@ impl Printer<'_> {
         }
     }
 
+    fn emit_generator_helper(&mut self) {
+        for line in [
+            "var __generator = (this && this.__generator) || function (thisArg, body) {",
+            "    var _ = { label: 0, sent: function() { if (t[0] & 1) throw t[1]; return t[1]; }, trys: [], ops: [] }, f, y, t, g = Object.create((typeof Iterator === \"function\" ? Iterator : Object).prototype);",
+            "    return g.next = verb(0), g[\"throw\"] = verb(1), g[\"return\"] = verb(2), typeof Symbol === \"function\" && (g[Symbol.iterator] = function() { return this; }), g;",
+            "    function verb(n) { return function (v) { return step([n, v]); }; }",
+            "    function step(op) {",
+            "        if (f) throw new TypeError(\"Generator is already executing.\");",
+            "        while (g && (g = 0, op[0] && (_ = 0)), _) try {",
+            "            if (f = 1, y && (t = op[0] & 2 ? y[\"return\"] : op[0] ? y[\"throw\"] || ((t = y[\"return\"]) && t.call(y), 0) : y.next) && !(t = t.call(y, op[1])).done) return t;",
+            "            if (y = 0, t) op = [op[0] & 2, t.value];",
+            "            switch (op[0]) {",
+            "                case 0: case 1: t = op; break;",
+            "                case 4: _.label++; return { value: op[1], done: false };",
+            "                case 5: _.label++; y = op[1]; op = [0]; continue;",
+            "                case 7: op = _.ops.pop(); _.trys.pop(); continue;",
+            "                default:",
+            "                    if (!(t = _.trys, t = t.length > 0 && t[t.length - 1]) && (op[0] === 6 || op[0] === 2)) { _ = 0; continue; }",
+            "                    if (op[0] === 3 && (!t || (op[1] > t[0] && op[1] < t[3]))) { _.label = op[1]; break; }",
+            "                    if (op[0] === 6 && _.label < t[1]) { _.label = t[1]; t = op; break; }",
+            "                    if (t && _.label < t[2]) { _.label = t[2]; _.ops.push(op); break; }",
+            "                    if (t[2]) _.ops.pop();",
+            "                    _.trys.pop(); continue;",
+            "            }",
+            "            op = body.call(thisArg, _);",
+            "        } catch (e) { op = [6, e]; y = 0; } finally { f = t = 0; }",
+            "        if (op[0] & 5) throw op[1]; return { value: op[0] ? op[1] : void 0, done: true };",
+            "    }",
+            "};",
+        ] {
+            self.writer.write(line);
+            self.writer.newline();
+        }
+    }
+
     fn emit_object_rest_helper(&mut self) {
         for line in [
             "var __rest = (this && this.__rest) || function (s, e) {",
@@ -6127,8 +6192,7 @@ impl Printer<'_> {
             }
             NodeData::FunctionDeclaration(data) => {
                 self.emit_runtime_declaration_modifiers(data.modifiers.as_ref());
-                let downlevel_async = (ScriptTarget::Es2015..ScriptTarget::Es2017)
-                    .contains(&self.settings.target)
+                let downlevel_async = self.settings.target < ScriptTarget::Es2017
                     && data.asterisk_token.is_none()
                     && self.has_modifier(data.modifiers.as_ref(), SyntaxKind::AsyncKeyword);
                 if !downlevel_async
@@ -6861,6 +6925,17 @@ impl Printer<'_> {
         body: NodeId,
         this_argument: &str,
     ) -> Result<(), EmitError> {
+        if self.settings.target < ScriptTarget::Es2015 {
+            return self.emit_es5_async_function_body(
+                body,
+                None,
+                this_argument,
+                "this",
+                "_a",
+                None,
+                false,
+            );
+        }
         self.writer.write("{");
         self.writer.newline();
         self.writer.indent += 1;
@@ -6870,6 +6945,553 @@ impl Printer<'_> {
         self.writer.newline();
         self.writer.indent -= 1;
         self.writer.write("}");
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_es5_async_function_body(
+        &mut self,
+        body: NodeId,
+        expression_body: Option<NodeId>,
+        this_argument: &str,
+        generator_this: &str,
+        state_parameter: &str,
+        object_rest: Option<(NodeId, &str, Option<&str>)>,
+        compact_outer: bool,
+    ) -> Result<(), EmitError> {
+        self.writer.write("{");
+        if compact_outer {
+            self.writer.write(" return ");
+        } else {
+            self.writer.newline();
+        }
+        if !compact_outer {
+            self.writer.indent += 1;
+        }
+        if !compact_outer {
+            self.writer.write("return ");
+        }
+        self.writer.write("__awaiter(");
+        self.writer.write(this_argument);
+        self.writer.write(", void 0, void 0, function () {");
+        if object_rest.is_some() || !compact_outer {
+            self.writer.newline();
+        } else {
+            self.writer.write(" ");
+        }
+        let callback_is_indented = !compact_outer || object_rest.is_some();
+        if callback_is_indented {
+            self.writer.indent += 1;
+        }
+
+        if let Some((pattern, parameter, expression_temp)) = object_rest {
+            if let Some(temp) = expression_temp {
+                self.writer.write("var ");
+                self.writer.write(temp);
+                self.writer.write(";");
+                self.writer.newline();
+            }
+            self.emit_object_rest_parameter_prologue(pattern, parameter)?;
+        } else if expression_body.is_none()
+            && let Some(loop_info) = self.es5_async_captured_for_loop(body)?
+        {
+            self.emit_es5_async_captured_loop_hoists(&loop_info)?;
+        }
+
+        self.writer.write("return __generator(");
+        self.writer.write(generator_this);
+        self.writer.write(", function (");
+        self.writer.write(state_parameter);
+        self.writer.write(") {");
+        self.writer.newline();
+        self.writer.indent += 1;
+
+        if let Some(expression) = expression_body {
+            self.emit_es5_async_expression_state_machine(
+                expression,
+                state_parameter,
+                object_rest.and_then(|(_, _, temp)| temp),
+            )?;
+        } else if let Some(loop_info) = self.es5_async_captured_for_loop(body)? {
+            self.emit_es5_async_captured_loop_state_machine(&loop_info, state_parameter)?;
+        } else {
+            self.emit_es5_async_block_state_machine(body, state_parameter)?;
+        }
+
+        self.writer.indent -= 1;
+        self.writer.write("});");
+        if compact_outer && !callback_is_indented {
+            self.writer.write(" });");
+        } else {
+            self.writer.newline();
+        }
+        if callback_is_indented {
+            self.writer.indent -= 1;
+        }
+        if !compact_outer {
+            self.writer.write("});");
+            self.writer.newline();
+            self.writer.indent -= 1;
+            self.writer.write("}");
+        } else if callback_is_indented {
+            self.writer.write("}); }");
+        } else {
+            self.writer.write(" }");
+        }
+        Ok(())
+    }
+
+    fn emit_es5_async_expression_state_machine(
+        &mut self,
+        expression: NodeId,
+        state: &str,
+        call_temp: Option<&str>,
+    ) -> Result<(), EmitError> {
+        let node = self.node(expression)?.clone();
+        if let NodeData::CallExpression(call) = &node.data
+            && call.arguments.nodes.len() == 1
+            && let Some(NodeData::AwaitExpression(awaited)) = self
+                .arena
+                .get(call.arguments.nodes[0])
+                .map(|node| &node.data)
+            && let Some(temp) = call_temp
+        {
+            self.writer.write("switch (");
+            self.writer.write(state);
+            self.writer.write(".label) {");
+            self.writer.newline();
+            self.writer.indent += 1;
+            self.writer.write("case 0:");
+            self.writer.newline();
+            self.writer.indent += 1;
+            self.writer.write(temp);
+            self.writer.write(" = ");
+            self.emit_expression(call.expression, 0)?;
+            self.writer.write(";");
+            self.writer.newline();
+            self.writer.write("return [4 /*yield*/, ");
+            self.emit_expression(awaited.expression, 0)?;
+            self.writer.write("];");
+            self.writer.newline();
+            self.writer.indent -= 1;
+            self.writer.write("case 1: return [2 /*return*/, ");
+            self.writer.write(temp);
+            self.writer.write(".apply(void 0, [");
+            self.writer.write(state);
+            self.writer.write(".sent()])];");
+            self.writer.newline();
+            self.writer.indent -= 1;
+            self.writer.write("}");
+            self.writer.newline();
+            return Ok(());
+        }
+        self.writer.write("return [2 /*return*/, ");
+        self.emit_expression(expression, 0)?;
+        self.writer.write("];");
+        self.writer.newline();
+        Ok(())
+    }
+
+    fn emit_es5_async_block_state_machine(
+        &mut self,
+        body: NodeId,
+        state: &str,
+    ) -> Result<(), EmitError> {
+        let node = self.node(body)?.clone();
+        let NodeData::Block(block) = &node.data else {
+            return Err(Self::unsupported(body, node.kind));
+        };
+        if block.statements.nodes.is_empty() {
+            self.writer.write("return [2 /*return*/];");
+            self.writer.newline();
+            return Ok(());
+        }
+        // The general sequential form covers ordinary statements and direct awaits.
+        let await_index = block.statements.nodes.iter().position(|statement| {
+            matches!(
+                self.arena.get(*statement).map(|node| &node.data),
+                Some(NodeData::ExpressionStatement(expression))
+                    if matches!(self.arena.get(expression.expression).map(|node| &node.data), Some(NodeData::AwaitExpression(_)))
+            )
+        });
+        let Some(await_index) = await_index else {
+            for statement in &block.statements.nodes {
+                if let Some(NodeData::ReturnStatement(return_statement)) =
+                    self.arena.get(*statement).map(|node| &node.data)
+                {
+                    self.writer.write("return [2 /*return*/");
+                    if let Some(expression) = return_statement.expression {
+                        self.writer.write(", ");
+                        self.emit_expression(expression, 0)?;
+                    }
+                    self.writer.write("];");
+                    self.writer.newline();
+                } else {
+                    self.emit_statement(*statement)?;
+                }
+            }
+            self.writer.write("return [2 /*return*/];");
+            self.writer.newline();
+            return Ok(());
+        };
+        self.writer.write("switch (");
+        self.writer.write(state);
+        self.writer.write(".label) {");
+        self.writer.newline();
+        self.writer.indent += 1;
+        self.writer.write("case 0:");
+        self.writer.newline();
+        self.writer.indent += 1;
+        for statement in &block.statements.nodes[..await_index] {
+            self.emit_statement(*statement)?;
+        }
+        let statement = self.node(block.statements.nodes[await_index])?.clone();
+        let NodeData::ExpressionStatement(expression) = &statement.data else {
+            unreachable!()
+        };
+        let awaited = self.node(expression.expression)?.clone();
+        let NodeData::AwaitExpression(awaited) = &awaited.data else {
+            unreachable!()
+        };
+        self.writer.write("return [4 /*yield*/, ");
+        self.emit_expression(awaited.expression, 0)?;
+        self.writer.write("];");
+        self.writer.newline();
+        self.writer.indent -= 1;
+        self.writer.write("case 1:");
+        self.writer.newline();
+        self.writer.indent += 1;
+        self.writer.write(state);
+        self.writer.write(".sent();");
+        self.writer.newline();
+        for statement in &block.statements.nodes[await_index + 1..] {
+            self.emit_statement(*statement)?;
+        }
+        self.writer.write("return [2 /*return*/];");
+        self.writer.newline();
+        self.writer.indent -= 2;
+        self.writer.write("}");
+        self.writer.newline();
+        Ok(())
+    }
+
+    fn es5_async_captured_for_loop(
+        &self,
+        body: NodeId,
+    ) -> Result<Option<Es5AsyncCapturedLoop>, EmitError> {
+        let body_node = self.node(body)?.clone();
+        let NodeData::Block(block) = &body_node.data else {
+            return Ok(None);
+        };
+        let Some((for_index, for_id)) =
+            block
+                .statements
+                .nodes
+                .iter()
+                .enumerate()
+                .find(|(_, statement)| {
+                    matches!(
+                        self.arena.get(**statement).map(|node| &node.data),
+                        Some(NodeData::ForStatement(_))
+                    )
+                })
+        else {
+            return Ok(None);
+        };
+        let for_node = self.node(*for_id)?.clone();
+        let NodeData::ForStatement(for_statement) = &for_node.data else {
+            return Ok(None);
+        };
+        let (Some(initializer), Some(condition), Some(incrementor)) = (
+            for_statement.initializer,
+            for_statement.condition,
+            for_statement.incrementor,
+        ) else {
+            return Ok(None);
+        };
+        let initializer_node = self.node(initializer)?.clone();
+        let NodeData::VariableDeclarationList(declarations) = &initializer_node.data else {
+            return Ok(None);
+        };
+        let Some(declaration_id) = declarations.declarations.nodes.first().copied() else {
+            return Ok(None);
+        };
+        let declaration_node = self.node(declaration_id)?.clone();
+        let NodeData::VariableDeclaration(declaration) = &declaration_node.data else {
+            return Ok(None);
+        };
+        let Some(initial_value) = declaration.initializer else {
+            return Ok(None);
+        };
+        let loop_variable = self.identifier_text(declaration.name)?.to_owned();
+        let loop_body_node = self.node(for_statement.statement)?.clone();
+        let NodeData::Block(loop_body) = &loop_body_node.data else {
+            return Ok(None);
+        };
+        let Some((await_index, awaited)) =
+            loop_body
+                .statements
+                .nodes
+                .iter()
+                .enumerate()
+                .find_map(|(index, statement)| {
+                    let NodeData::ExpressionStatement(expression) =
+                        self.arena.get(*statement).map(|node| &node.data)?
+                    else {
+                        return None;
+                    };
+                    let NodeData::AwaitExpression(awaited) = self
+                        .arena
+                        .get(expression.expression)
+                        .map(|node| &node.data)?
+                    else {
+                        return None;
+                    };
+                    Some((index, awaited.expression))
+                })
+        else {
+            return Ok(None);
+        };
+        let mut after_await = loop_body.statements.nodes[await_index + 1..].to_vec();
+        let control = after_await
+            .last()
+            .and_then(|statement| self.arena.get(*statement))
+            .map_or(Es5AsyncLoopControl::None, |node| match &node.data {
+                NodeData::BreakStatement(_) => Es5AsyncLoopControl::Break,
+                NodeData::ContinueStatement(_) => Es5AsyncLoopControl::Continue,
+                NodeData::ReturnStatement(statement) => statement
+                    .expression
+                    .map_or(Es5AsyncLoopControl::None, Es5AsyncLoopControl::Return),
+                _ => Es5AsyncLoopControl::None,
+            });
+        if !matches!(control, Es5AsyncLoopControl::None) {
+            after_await.pop();
+        }
+        Ok(Some(Es5AsyncCapturedLoop {
+            prelude: block.statements.nodes[..for_index].to_vec(),
+            loop_variable,
+            initializer: initial_value,
+            condition,
+            incrementor,
+            awaited,
+            after_await,
+            control,
+        }))
+    }
+
+    fn emit_es5_async_captured_loop_hoists(
+        &mut self,
+        info: &Es5AsyncCapturedLoop,
+    ) -> Result<(), EmitError> {
+        let loop_number = self.async_loop_counter + 1;
+        self.writer.write("var ");
+        let mut names = Vec::new();
+        for statement in &info.prelude {
+            let Some(NodeData::VariableStatement(variable)) =
+                self.arena.get(*statement).map(|node| &node.data)
+            else {
+                continue;
+            };
+            let list_node = self.node(variable.declaration_list)?.clone();
+            let NodeData::VariableDeclarationList(list) = &list_node.data else {
+                continue;
+            };
+            for declaration in &list.declarations.nodes {
+                let declaration_node = self.node(*declaration)?.clone();
+                let NodeData::VariableDeclaration(declaration) = &declaration_node.data else {
+                    continue;
+                };
+                names.push(self.identifier_text(declaration.name)?.to_owned());
+            }
+        }
+        names.push(format!("_loop_{loop_number}"));
+        names.push(info.loop_variable.clone());
+        if matches!(
+            info.control,
+            Es5AsyncLoopControl::Break | Es5AsyncLoopControl::Return(_)
+        ) {
+            names.push(format!("state_{}", self.async_control_counter + 1));
+        }
+        self.writer.write(&names.join(", "));
+        self.writer.write(";");
+        self.writer.newline();
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn emit_es5_async_captured_loop_state_machine(
+        &mut self,
+        info: &Es5AsyncCapturedLoop,
+        state: &str,
+    ) -> Result<(), EmitError> {
+        let loop_number = self.async_loop_counter + 1;
+        let loop_name = format!("_loop_{loop_number}");
+        let control_name = matches!(
+            info.control,
+            Es5AsyncLoopControl::Break | Es5AsyncLoopControl::Return(_)
+        )
+        .then(|| format!("state_{}", self.async_control_counter + 1));
+        self.writer.write("switch (");
+        self.writer.write(state);
+        self.writer.write(".label) {");
+        self.writer.newline();
+        self.writer.indent += 1;
+        self.writer.write("case 0:");
+        self.writer.newline();
+        self.writer.indent += 1;
+        for statement in &info.prelude {
+            let Some(NodeData::VariableStatement(variable)) =
+                self.arena.get(*statement).map(|node| &node.data)
+            else {
+                continue;
+            };
+            let list_node = self.node(variable.declaration_list)?.clone();
+            let NodeData::VariableDeclarationList(list) = &list_node.data else {
+                continue;
+            };
+            for declaration in &list.declarations.nodes {
+                let declaration_node = self.node(*declaration)?.clone();
+                let NodeData::VariableDeclaration(declaration) = &declaration_node.data else {
+                    continue;
+                };
+                self.emit_expression(declaration.name, 0)?;
+                if let Some(initializer) = declaration.initializer {
+                    self.writer.write(" = ");
+                    self.emit_expression(initializer, 0)?;
+                }
+                self.writer.write(";");
+                self.writer.newline();
+            }
+        }
+        self.writer.write(&loop_name);
+        self.writer.write(" = function (");
+        self.writer.write(&info.loop_variable);
+        self.writer.write(") {");
+        self.writer.newline();
+        self.writer.indent += 1;
+        self.writer
+            .write("return __generator(this, function (_b) {");
+        self.writer.newline();
+        self.writer.indent += 1;
+        self.writer.write("switch (_b.label) {");
+        self.writer.newline();
+        self.writer.indent += 1;
+        self.writer.write("case 0: return [4 /*yield*/, ");
+        self.emit_expression(info.awaited, 0)?;
+        self.writer.write("];");
+        self.writer.newline();
+        self.writer.write("case 1:");
+        self.writer.newline();
+        self.writer.indent += 1;
+        self.writer.write("_b.sent();");
+        self.writer.newline();
+        for statement in &info.after_await {
+            self.emit_statement(*statement)?;
+        }
+        self.writer.write("return [2 /*return*/");
+        match info.control {
+            Es5AsyncLoopControl::None => {}
+            Es5AsyncLoopControl::Break => self.writer.write(", \"break\""),
+            Es5AsyncLoopControl::Continue => self.writer.write(", \"continue\""),
+            Es5AsyncLoopControl::Return(expression) => {
+                self.writer.write(", { value: ");
+                self.emit_expression(expression, 0)?;
+                self.writer.write(" }");
+            }
+        }
+        self.writer.write("];");
+        self.writer.newline();
+        self.writer.indent -= 2;
+        self.writer.write("}");
+        self.writer.newline();
+        self.writer.indent -= 1;
+        self.writer.write("});");
+        self.writer.newline();
+        self.writer.indent -= 1;
+        self.writer.write("};");
+        self.writer.newline();
+        self.writer.write(&info.loop_variable);
+        self.writer.write(" = ");
+        self.emit_expression(info.initializer, 0)?;
+        self.writer.write(";");
+        self.writer.newline();
+        self.writer.write(state);
+        self.writer.write(".label = 1;");
+        self.writer.newline();
+        self.writer.indent -= 1;
+        self.writer.write("case 1:");
+        self.writer.newline();
+        self.writer.indent += 1;
+        self.writer.write("if (!(");
+        self.emit_expression(info.condition, 0)?;
+        self.writer.write(")) return [3 /*break*/, 4];");
+        self.writer.newline();
+        self.writer.write("return [5 /*yield**/, ");
+        self.writer.write(&loop_name);
+        self.writer.write("(");
+        self.writer.write(&info.loop_variable);
+        self.writer.write(")];");
+        self.writer.newline();
+        self.writer.indent -= 1;
+        self.writer.write("case 2:");
+        self.writer.newline();
+        self.writer.indent += 1;
+        if let Some(control_name) = &control_name {
+            self.writer.write(control_name);
+            self.writer.write(" = ");
+        }
+        self.writer.write(state);
+        self.writer.write(".sent();");
+        self.writer.newline();
+        if let Some(control_name) = &control_name {
+            match info.control {
+                Es5AsyncLoopControl::Break => {
+                    self.writer.write("if (");
+                    self.writer.write(control_name);
+                    self.writer.write(" === \"break\")");
+                    self.writer.newline();
+                    self.writer.indent += 1;
+                    self.writer.write("return [3 /*break*/, 4];");
+                    self.writer.newline();
+                    self.writer.indent -= 1;
+                }
+                Es5AsyncLoopControl::Return(_) => {
+                    self.writer.write("if (typeof ");
+                    self.writer.write(control_name);
+                    self.writer.write(" === \"object\")");
+                    self.writer.newline();
+                    self.writer.indent += 1;
+                    self.writer.write("return [2 /*return*/, ");
+                    self.writer.write(control_name);
+                    self.writer.write(".value];");
+                    self.writer.newline();
+                    self.writer.indent -= 1;
+                }
+                _ => {}
+            }
+        }
+        self.writer.write(state);
+        self.writer.write(".label = 3;");
+        self.writer.newline();
+        self.writer.indent -= 1;
+        self.writer.write("case 3:");
+        self.writer.newline();
+        self.writer.indent += 1;
+        self.emit_expression(info.incrementor, 0)?;
+        self.writer.write(";");
+        self.writer.newline();
+        self.writer.write("return [3 /*break*/, 1];");
+        self.writer.newline();
+        self.writer.indent -= 1;
+        self.writer.write("case 4: return [2 /*return*/];");
+        self.writer.newline();
+        self.writer.indent -= 1;
+        self.writer.write("}");
+        self.writer.newline();
+        self.async_loop_counter += 1;
+        if control_name.is_some() {
+            self.async_control_counter += 1;
+        }
         Ok(())
     }
 
@@ -6979,15 +7601,35 @@ impl Printer<'_> {
                 ordinary.push(*element_id);
             }
         }
-        self.writer.write("var { ");
-        for (index, element) in ordinary.iter().enumerate() {
-            if index != 0 {
-                self.writer.write(", ");
+        self.writer.write("var ");
+        if self.settings.target < ScriptTarget::Es2015 {
+            for (index, element_id) in ordinary.iter().enumerate() {
+                if index != 0 {
+                    self.writer.write(", ");
+                }
+                let element_node = self.node(*element_id)?.clone();
+                let NodeData::BindingElement(element) = &element_node.data else {
+                    return Err(Self::unsupported(*element_id, element_node.kind));
+                };
+                let name = element
+                    .name
+                    .ok_or_else(|| Self::unsupported(*element_id, SyntaxKind::BindingElement))?;
+                self.emit_expression(name, 0)?;
+                self.writer.write(" = ");
+                self.writer.write(parameter_temp);
+                self.emit_downlevel_member_access(element.property_name.unwrap_or(name))?;
             }
-            self.emit_expression(*element, 0)?;
+        } else {
+            self.writer.write("{ ");
+            for (index, element) in ordinary.iter().enumerate() {
+                if index != 0 {
+                    self.writer.write(", ");
+                }
+                self.emit_expression(*element, 0)?;
+            }
+            self.writer.write(" } = ");
+            self.writer.write(parameter_temp);
         }
-        self.writer.write(" } = ");
-        self.writer.write(parameter_temp);
         if let Some(rest) = rest {
             self.writer.write(", ");
             self.emit_expression(rest, 0)?;
@@ -7917,7 +8559,21 @@ impl Printer<'_> {
         if previous_emitted {
             self.emit_class_empty_elements_between(previous_end, data.members.range.end.get());
         }
+        let captures_static_this = class_has_async_static_field(self.arena, data);
+        if captures_static_this {
+            self.writer.write("var _a;");
+            self.writer.newline();
+            self.writer.write("_a = ");
+            self.writer.write(name);
+            self.writer.write(";");
+            self.writer.newline();
+        }
+        let previous_this_alias = self.this_alias;
+        if captures_static_this {
+            self.this_alias = Some("_a");
+        }
         self.emit_static_fields(data, name)?;
+        self.this_alias = previous_this_alias;
         self.writer.write("return ");
         self.writer.write(name);
         self.writer.write(";");
@@ -10092,8 +10748,7 @@ impl Printer<'_> {
             }
             NodeData::ArrowFunction(data) => {
                 let is_async = self.has_modifier(data.modifiers.as_ref(), SyntaxKind::AsyncKeyword);
-                let downlevel_async = is_async
-                    && (ScriptTarget::Es2015..ScriptTarget::Es2017).contains(&self.settings.target);
+                let downlevel_async = is_async && self.settings.target < ScriptTarget::Es2017;
                 if self.settings.target < ScriptTarget::Es2015 && !is_async {
                     let wrap = parent_precedence > 2;
                     if wrap {
@@ -10114,7 +10769,18 @@ impl Printer<'_> {
                     }
                     return Ok(());
                 }
-                let wrap = parent_precedence > 2;
+                let wrap =
+                    parent_precedence > 2
+                        || (downlevel_async
+                            && self.settings.target < ScriptTarget::Es2015
+                            && self.arena.get(id).and_then(|node| node.parent).is_some_and(
+                                |parent| {
+                                    matches!(
+                                        self.arena.get(parent).map(|node| &node.data),
+                                        Some(NodeData::ExpressionStatement(_))
+                                    )
+                                },
+                            ));
                 if wrap {
                     self.writer.write("(");
                 }
@@ -10124,6 +10790,9 @@ impl Printer<'_> {
                 let object_rest_parameter = downlevel_async
                     .then(|| self.async_arrow_object_rest_parameter(data))
                     .flatten();
+                if self.settings.target < ScriptTarget::Es2015 && downlevel_async {
+                    self.writer.write("function ");
+                }
                 if object_rest_parameter.is_some() {
                     self.writer.write("(_a)");
                 } else if !downlevel_async && self.arrow_uses_bare_parameter(id, data) {
@@ -10136,14 +10805,45 @@ impl Printer<'_> {
                 } else {
                     self.emit_parameters(&data.parameters)?;
                 }
-                self.writer.write(" => ");
+                if self.settings.target < ScriptTarget::Es2015 && downlevel_async {
+                    self.writer.write(" ");
+                } else {
+                    self.writer.write(" => ");
+                }
                 if downlevel_async {
                     let this_argument = if self.arrow_is_nested_in_function(id) {
                         "this"
                     } else {
                         "void 0"
                     };
-                    if let Some(pattern) = object_rest_parameter {
+                    if self.settings.target < ScriptTarget::Es2015 {
+                        let expression_body =
+                            (!matches!(&self.node(data.body)?.data, NodeData::Block(_)))
+                                .then_some(data.body);
+                        let object_rest = object_rest_parameter.map(|pattern| {
+                            let temp = expression_body.map(|_| "_b");
+                            (pattern, "_a", temp)
+                        });
+                        let state = if object_rest.is_some() || self.this_alias == Some("_a") {
+                            if object_rest.is_some() { "_c" } else { "_b" }
+                        } else {
+                            "_a"
+                        };
+                        let generator_this = if self.this_alias == Some("_a") {
+                            "_a"
+                        } else {
+                            "this"
+                        };
+                        self.emit_es5_async_function_body(
+                            data.body,
+                            expression_body,
+                            this_argument,
+                            generator_this,
+                            state,
+                            object_rest,
+                            true,
+                        )?;
+                    } else if let Some(pattern) = object_rest_parameter {
                         self.emit_awaiter_call_with_object_rest_parameter(
                             data.body,
                             pattern,
@@ -10172,7 +10872,7 @@ impl Printer<'_> {
                 }
                 let downlevel_async = data.asterisk_token.is_none()
                     && self.has_modifier(data.modifiers.as_ref(), SyntaxKind::AsyncKeyword)
-                    && (ScriptTarget::Es2015..ScriptTarget::Es2017).contains(&self.settings.target);
+                    && self.settings.target < ScriptTarget::Es2017;
                 if !downlevel_async
                     && self.has_modifier(data.modifiers.as_ref(), SyntaxKind::AsyncKeyword)
                 {
