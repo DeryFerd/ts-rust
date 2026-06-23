@@ -829,6 +829,7 @@ const SCALAR_OPTION_NAMES: &[&str] = &[
     "moduleResolution",
     "noCheck",
     "noEmit",
+    "noEmitHelpers",
     "noEmitOnError",
     "noImplicitAny",
     "noLib",

@@ -96,6 +96,7 @@ pub struct CompilerOptions {
     pub module_detection: ModuleDetectionKind,
     pub no_check: bool,
     pub no_emit: bool,
+    pub no_emit_helpers: bool,
     pub no_emit_on_error: bool,
     pub no_implicit_any: bool,
     pub no_implicit_returns: bool,
@@ -149,6 +150,7 @@ impl Default for CompilerOptions {
             module_detection: ModuleDetectionKind::Auto,
             no_check: false,
             no_emit: false,
+            no_emit_helpers: false,
             no_emit_on_error: false,
             no_implicit_any: false,
             no_implicit_returns: false,
@@ -197,6 +199,7 @@ pub struct PrinterSettings {
     pub emit_declarations: bool,
     pub source_map: bool,
     pub inline_source_map: bool,
+    pub no_emit_helpers: bool,
 }
 
 /// Result of parsing a `compilerOptions` JSON object.
@@ -259,6 +262,7 @@ impl CompilerOptions {
                 "moduleresolution" => self.module_resolution = overrides.module_resolution,
                 "nocheck" => self.no_check = overrides.no_check,
                 "noemit" => self.no_emit = overrides.no_emit,
+                "noemithelpers" => self.no_emit_helpers = overrides.no_emit_helpers,
                 "noemitonerror" => self.no_emit_on_error = overrides.no_emit_on_error,
                 "noimplicitany" => self.no_implicit_any = overrides.no_implicit_any,
                 "noimplicitreturns" => self.no_implicit_returns = overrides.no_implicit_returns,
@@ -338,6 +342,7 @@ impl CompilerOptions {
                 && !self.no_emit
                 && !self.emit_declaration_only,
             inline_source_map: self.inline_source_map,
+            no_emit_helpers: self.no_emit_helpers,
         }
     }
 }
@@ -443,6 +448,9 @@ pub fn parse_compiler_options_map(options: &BTreeMap<String, JsonValue>) -> Pars
             }
             "nocheck" => parsed.no_check = boolean(original_name, value, &mut diagnostics),
             "noemit" => parsed.no_emit = boolean(original_name, value, &mut diagnostics),
+            "noemithelpers" => {
+                parsed.no_emit_helpers = boolean(original_name, value, &mut diagnostics);
+            }
             "noemitonerror" => {
                 parsed.no_emit_on_error = boolean(original_name, value, &mut diagnostics);
             }
@@ -540,6 +548,7 @@ struct PartialOptions {
     module_detection: Option<ModuleDetectionKind>,
     no_check: Option<bool>,
     no_emit: Option<bool>,
+    no_emit_helpers: Option<bool>,
     no_emit_on_error: Option<bool>,
     no_implicit_any: Option<bool>,
     no_implicit_returns: Option<bool>,
@@ -611,6 +620,7 @@ impl PartialOptions {
             module_detection: self.module_detection.unwrap_or_default(),
             no_check: self.no_check.unwrap_or(false),
             no_emit: self.no_emit.unwrap_or(false),
+            no_emit_helpers: self.no_emit_helpers.unwrap_or(false),
             no_emit_on_error: self.no_emit_on_error.unwrap_or(false),
             no_implicit_any: self.no_implicit_any.unwrap_or(strict),
             no_implicit_returns: self.no_implicit_returns.unwrap_or(false),
@@ -1000,6 +1010,14 @@ mod tests {
         .printer_settings();
         assert!(!no_emit.emit_javascript);
         assert!(!no_emit.emit_declarations);
+    }
+
+    #[test]
+    fn threads_no_emit_helpers_to_the_printer() {
+        let result = parse_compiler_options(&object([("noEmitHelpers", JsonValue::Bool(true))]));
+        assert!(result.is_ok(), "{:?}", result.diagnostics);
+        assert!(result.options.no_emit_helpers);
+        assert!(result.options.printer_settings().no_emit_helpers);
     }
 
     #[test]
