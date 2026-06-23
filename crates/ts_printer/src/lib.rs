@@ -5908,15 +5908,7 @@ impl Printer<'_> {
                 self.writer.write(";");
             }
             NodeData::IfStatement(data) => {
-                self.writer.write("if (");
-                self.emit_expression(data.expression, 0)?;
-                self.writer.write(") ");
-                self.emit_embedded(data.then_statement)?;
-                if let Some(otherwise) = data.else_statement {
-                    self.writer.newline();
-                    self.writer.write("else ");
-                    self.emit_embedded(otherwise)?;
-                }
+                self.emit_if_statement(data)?;
             }
             NodeData::WhileStatement(data) => {
                 self.writer.write("while (");
@@ -6068,15 +6060,40 @@ impl Printer<'_> {
                 self.emit_expression(clause.expression, 0)?;
                 self.writer.write(":");
             }
-            self.writer.newline();
-            self.writer.indent += 1;
-            for statement in &clause.statements.nodes {
+            if let [statement] = clause.statements.nodes.as_slice()
+                && matches!(self.node(*statement)?.data, NodeData::Block(_))
+            {
+                self.writer.write(" ");
                 self.emit_statement(*statement)?;
+            } else {
+                self.writer.newline();
+                self.writer.indent += 1;
+                for statement in &clause.statements.nodes {
+                    self.emit_statement(*statement)?;
+                }
+                self.writer.indent -= 1;
             }
-            self.writer.indent -= 1;
         }
         self.writer.indent -= 1;
         self.writer.write("}");
+        Ok(())
+    }
+
+    fn emit_if_statement(&mut self, data: &ts_ast::IfStatementData) -> Result<(), EmitError> {
+        self.writer.write("if (");
+        self.emit_expression(data.expression, 0)?;
+        self.writer.write(") ");
+        self.emit_embedded(data.then_statement)?;
+        if let Some(otherwise) = data.else_statement {
+            self.writer.newline();
+            self.writer.write("else ");
+            let otherwise_node = self.node(otherwise)?.clone();
+            if let NodeData::IfStatement(otherwise) = &otherwise_node.data {
+                self.emit_if_statement(otherwise)?;
+            } else {
+                self.emit_embedded(otherwise)?;
+            }
+        }
         Ok(())
     }
 
@@ -6394,6 +6411,15 @@ impl Printer<'_> {
         let mut previous_emitted = false;
         for statement in &data.statements.nodes {
             let statement_node = self.node(*statement)?.clone();
+            if !previous_emitted
+                && previous_end == node.range.start.get().saturating_add(1)
+                && self.is_object_property_arrow_body(id)
+            {
+                previous_end = self.position_after_immediate_line_comment(
+                    previous_end,
+                    statement_node.range.start.get(),
+                );
+            }
             self.emit_source_comments_between_with_trailing(
                 previous_end,
                 statement_node.range.start.get(),
@@ -6411,6 +6437,38 @@ impl Printer<'_> {
         self.writer.indent -= 1;
         self.writer.write("}");
         Ok(())
+    }
+
+    fn is_object_property_arrow_body(&self, block: NodeId) -> bool {
+        let Some(arrow) = self.arena.get(block).and_then(|block| block.parent) else {
+            return false;
+        };
+        if !matches!(
+            self.arena.get(arrow).map(|node| &node.data),
+            Some(NodeData::ArrowFunction(_))
+        ) {
+            return false;
+        }
+        self.arena
+            .get(arrow)
+            .and_then(|arrow| arrow.parent)
+            .and_then(|parent| self.arena.get(parent))
+            .is_some_and(|parent| matches!(parent.data, NodeData::PropertyAssignment(_)))
+    }
+
+    fn position_after_immediate_line_comment(&self, start: u32, end: u32) -> u32 {
+        let start_index = usize::try_from(start).unwrap_or(usize::MAX);
+        let end_index = usize::try_from(end).unwrap_or(usize::MAX);
+        let Some(trivia) = self.source_text.get(start_index..end_index) else {
+            return start;
+        };
+        let comment = trivia.trim_start_matches([' ', '\t']);
+        if !comment.starts_with("//") {
+            return start;
+        }
+        let leading = trivia.len() - comment.len();
+        let comment_end = comment.find(['\n', '\r']).map_or(comment.len(), |end| end);
+        u32::try_from(start_index + leading + comment_end).unwrap_or(end)
     }
 
     fn emit_function_body(&mut self, body: NodeId) -> Result<(), EmitError> {
@@ -8779,6 +8837,9 @@ impl Printer<'_> {
                     self.writer.write(" ");
                 }
                 self.emit_expression_list(&data.elements)?;
+                if !object && data.elements.has_trailing_comma {
+                    self.writer.write(",");
+                }
                 if object && !data.elements.nodes.is_empty() {
                     self.writer.write(" ");
                 }
@@ -8800,6 +8861,7 @@ impl Printer<'_> {
                     self.emit_expression(initializer, 1)?;
                 }
             }
+            NodeData::OmittedExpression(_) => {}
             NodeData::ComputedPropertyName(data) => {
                 self.writer.write("[");
                 self.emit_expression(data.expression, 0)?;
@@ -8842,7 +8904,12 @@ impl Printer<'_> {
                     self.writer.write("(");
                 }
                 self.emit_expression(data.left, precedence)?;
-                if operator != SyntaxKind::CommaToken {
+                let line_break_before_operator = operator != SyntaxKind::CommaToken
+                    && self.source_has_known_line_break_between(data.left, data.operator_token);
+                if line_break_before_operator {
+                    self.writer.indent += 1;
+                    self.writer.newline();
+                } else if operator != SyntaxKind::CommaToken {
                     self.writer.write(" ");
                 }
                 self.writer.write(
@@ -8866,6 +8933,9 @@ impl Printer<'_> {
                     },
                 )?;
                 if line_break_after_operator {
+                    self.writer.indent -= 1;
+                }
+                if line_break_before_operator {
                     self.writer.indent -= 1;
                 }
                 if wrap {
@@ -9058,6 +9128,27 @@ impl Printer<'_> {
                 self.writer.write(
                     operator_text(data.operator).ok_or_else(|| Self::unsupported(id, node.kind))?,
                 );
+                if matches!(
+                    data.operator,
+                    SyntaxKind::PlusToken | SyntaxKind::MinusToken
+                ) && self.node(data.operand).is_ok_and(|operand| {
+                    matches!(
+                        &operand.data,
+                        NodeData::PrefixUnaryExpression(operand)
+                            if matches!(
+                                (data.operator, operand.operator),
+                                (
+                                    SyntaxKind::PlusToken,
+                                    SyntaxKind::PlusToken | SyntaxKind::PlusPlusToken
+                                ) | (
+                                    SyntaxKind::MinusToken,
+                                    SyntaxKind::MinusToken | SyntaxKind::MinusMinusToken
+                                )
+                            )
+                    )
+                }) {
+                    self.writer.write(" ");
+                }
                 self.emit_expression(data.operand, 16)?;
                 if system_export.is_some() {
                     self.writer.write(")");
@@ -9107,6 +9198,7 @@ impl Printer<'_> {
                 } else {
                     self.writer.write(" ");
                 }
+                let mut previous_end = node.range.start.get().saturating_add(1);
                 for (index, property) in data.properties.nodes.iter().enumerate() {
                     if index != 0 {
                         if multiline {
@@ -9121,6 +9213,13 @@ impl Printer<'_> {
                         }
                     }
                     let node = self.node(*property)?.clone();
+                    if multiline {
+                        self.emit_source_comments_between_with_trailing(
+                            previous_end,
+                            node.range.start.get(),
+                            index != 0,
+                        );
+                    }
                     match &node.data {
                         NodeData::PropertyAssignment(property) => {
                             self.emit_expression(property.name, 0)?;
@@ -9170,9 +9269,17 @@ impl Printer<'_> {
                     {
                         self.writer.write(",");
                     }
+                    previous_end = node.range.end.get();
                 }
                 if multiline {
-                    self.writer.newline();
+                    self.emit_source_comments_between_with_trailing(
+                        previous_end,
+                        self.node(id)?.range.end.get().saturating_sub(1),
+                        true,
+                    );
+                    if !self.writer.line_start {
+                        self.writer.newline();
+                    }
                     self.writer.indent -= 1;
                     self.writer.write("}");
                 } else {
@@ -10207,29 +10314,38 @@ impl Printer<'_> {
         let [statement] = data.statements.nodes.as_slice() else {
             return Ok(None);
         };
-        if self.node_source_is_multiline(block) {
+        let start = usize::try_from(node.range.start.get()).unwrap_or(usize::MAX);
+        let end = usize::try_from(node.range.end.get()).unwrap_or(usize::MAX);
+        let source_has_braces = self.source_text.get(start..end).is_some_and(|text| {
+            let text = text.trim();
+            text.starts_with('{') && text.ends_with('}')
+        });
+        if source_has_braces && self.node_source_is_multiline(block) {
             return Ok(None);
         }
         let statement_node = self.node(*statement)?;
         if self.statement_contains_class_expression(*statement)? {
             return Ok(None);
         }
-        if self.source_range_contains_comment(
-            node.range.start.get().saturating_add(1),
-            statement_node.range.start.get(),
-        ) || self.source_range_contains_comment(
-            statement_node.range.end.get(),
-            node.range.end.get().saturating_sub(1),
-        ) {
+        if source_has_braces
+            && (self.source_range_contains_comment(
+                node.range.start.get().saturating_add(1),
+                statement_node.range.start.get(),
+            ) || self.source_range_contains_comment(
+                statement_node.range.end.get(),
+                node.range.end.get().saturating_sub(1),
+            ))
+        {
             return Ok(None);
         }
-        Ok(matches!(
-            &self.node(*statement)?.data,
+        let compact = match &self.node(*statement)?.data {
             NodeData::ExpressionStatement(_)
-                | NodeData::ReturnStatement(_)
-                | NodeData::ThrowStatement(_)
-        )
-        .then_some(*statement))
+            | NodeData::ReturnStatement(_)
+            | NodeData::ThrowStatement(_) => true,
+            NodeData::VariableStatement(_) => !source_has_braces,
+            _ => false,
+        };
+        Ok(compact.then_some(*statement))
     }
 
     fn source_range_contains_comment(&self, start: u32, end: u32) -> bool {
@@ -11033,6 +11149,99 @@ mod tests {
             )
             .code,
             "// trailing space \nclass Value {\n}\n"
+        );
+    }
+
+    #[test]
+    fn preserves_omitted_array_binding_slots() {
+        assert_eq!(
+            emit_with(
+                "let [, b, , a] = results;",
+                ScriptTarget::Es2015,
+                ModuleKind::None,
+            )
+            .code,
+            "let [, b, , a] = results;\n"
+        );
+    }
+
+    #[test]
+    fn preserves_lexical_blocks_inside_switch_clauses() {
+        assert_eq!(
+            emit_with(
+                "switch (kind) { case \"x\": { const [value] = items; use(value); } }",
+                ScriptTarget::Es2015,
+                ModuleKind::None,
+            )
+            .code,
+            "switch (kind) {\n    case \"x\": {\n        const [value] = items;\n        use(value);\n    }\n}\n"
+        );
+    }
+
+    #[test]
+    fn keeps_else_if_on_one_line() {
+        assert_eq!(
+            emit_with(
+                "if (first) { a(); } else if (second) { b(); } else { c(); }",
+                ScriptTarget::Es2015,
+                ModuleKind::None,
+            )
+            .code,
+            "if (first) {\n    a();\n}\nelse if (second) {\n    b();\n}\nelse {\n    c();\n}\n"
+        );
+    }
+
+    #[test]
+    fn preserves_object_property_leading_comments_without_reassigning_arrow_comments() {
+        assert_eq!(
+            emit_with(
+                "const value = () => ({\n    // property\n    item: true,\n    run: () => { // arrow\n        // body\n        return 1;\n    }\n});",
+                ScriptTarget::Es2015,
+                ModuleKind::None,
+            )
+            .code,
+            "const value = () => ({\n    // property\n    item: true,\n    run: () => {\n        // body\n        return 1;\n    }\n});\n"
+        );
+    }
+
+    #[test]
+    fn compacts_recovered_single_statement_arrow_blocks() {
+        let source = "namespace M { namespace N { var value = () => var result = 1;}; } }";
+        let parsed = parse_source_file(source);
+        assert!(!parsed.diagnostics.is_empty());
+        let result = emit_source_file_with_settings(
+            &parsed.arena,
+            parsed.source_file,
+            "input.ts",
+            source,
+            PrinterSettings {
+                always_strict: false,
+                target: ScriptTarget::Es2015,
+                module: ModuleKind::None,
+                jsx: JsxEmit::Preserve,
+                emit_javascript: true,
+                emit_declarations: false,
+                source_map: false,
+                inline_source_map: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            result.code,
+            "var M;\n(function (M) {\n    let N;\n    (function (N) {\n        var value = () => { var result = 1; };\n    })(N || (N = {}));\n})(M || (M = {}));\n"
+        );
+    }
+
+    #[test]
+    fn preserves_asi_sensitive_binary_operator_line_breaks() {
+        assert_eq!(
+            emit_with(
+                "var value =\n\nleft\n\n+\n\n+\n\n+\n\nright;",
+                ScriptTarget::Es2015,
+                ModuleKind::None,
+            )
+            .code,
+            "var value = left\n    +\n        + +right;\n"
         );
     }
 
