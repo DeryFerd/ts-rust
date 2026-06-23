@@ -8006,13 +8006,23 @@ impl<'a> Checker<'a> {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        if parameter_names.is_empty() {
-            return callee;
-        }
         let arguments = argument_nodes
             .iter()
             .map(|argument| self.type_from_type_node(*argument))
             .collect::<Vec<_>>();
+        if parameter_names.is_empty() {
+            let mut parameters = Vec::new();
+            self.collect_type_parameters_in_order(callee, &mut parameters, &mut HashSet::new());
+            let substitutions = parameters
+                .into_iter()
+                .zip(arguments)
+                .collect::<HashMap<_, _>>();
+            return if substitutions.is_empty() {
+                callee
+            } else {
+                self.substitute_type(callee, &substitutions)
+            };
+        }
         let wanted = parameter_names.iter().cloned().collect::<HashSet<_>>();
         let mut parameters = HashMap::<String, Vec<TypeId>>::new();
         self.collect_named_type_parameters(callee, &wanted, &mut parameters, &mut HashSet::new());
@@ -8030,6 +8040,87 @@ impl<'a> Checker<'a> {
             callee
         } else {
             self.substitute_type(callee, &substitutions)
+        }
+    }
+
+    fn collect_type_parameters_in_order(
+        &self,
+        type_id: TypeId,
+        parameters: &mut Vec<TypeId>,
+        visited: &mut HashSet<TypeId>,
+    ) {
+        if !visited.insert(type_id) {
+            return;
+        }
+        if let Some(reference) = self.result.named_type_references.get(&type_id) {
+            for argument in &reference.type_arguments {
+                self.collect_type_parameters_in_order(*argument, parameters, visited);
+            }
+        }
+        match self.result.types.get(type_id).map(|type_| &type_.kind) {
+            Some(TypeKind::TypeParameter { constraint, .. }) => {
+                parameters.push(type_id);
+                if let Some(constraint) = constraint {
+                    self.collect_type_parameters_in_order(*constraint, parameters, visited);
+                }
+            }
+            Some(TypeKind::Array(element)) => {
+                self.collect_type_parameters_in_order(*element, parameters, visited);
+            }
+            Some(
+                TypeKind::Tuple(members)
+                | TypeKind::ReadonlyTuple(members)
+                | TypeKind::Union(members)
+                | TypeKind::Intersection(members),
+            ) => {
+                for member in members {
+                    self.collect_type_parameters_in_order(*member, parameters, visited);
+                }
+            }
+            Some(TypeKind::Object(object)) => {
+                for member in object
+                    .properties
+                    .values()
+                    .copied()
+                    .chain(object.string_index_type)
+                    .chain(object.number_index_type)
+                {
+                    self.collect_type_parameters_in_order(member, parameters, visited);
+                }
+                for signature in object
+                    .call_signatures
+                    .iter()
+                    .chain(&object.construct_signatures)
+                {
+                    self.collect_signature_type_parameters_in_order(signature, parameters, visited);
+                }
+            }
+            Some(TypeKind::Function(signature) | TypeKind::Constructor(signature)) => {
+                self.collect_signature_type_parameters_in_order(signature, parameters, visited);
+            }
+            Some(TypeKind::Overload(signatures)) => {
+                for signature in signatures {
+                    self.collect_signature_type_parameters_in_order(signature, parameters, visited);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_signature_type_parameters_in_order(
+        &self,
+        signature: &FunctionType,
+        parameters: &mut Vec<TypeId>,
+        visited: &mut HashSet<TypeId>,
+    ) {
+        for type_id in signature
+            .parameters
+            .iter()
+            .copied()
+            .chain(signature.rest_parameter)
+            .chain(std::iter::once(signature.return_type))
+        {
+            self.collect_type_parameters_in_order(type_id, parameters, visited);
         }
     }
 
@@ -19133,6 +19224,61 @@ mod tests {
                 .map(|type_| &type_.kind),
             Some(TypeKind::Never)
         ));
+    }
+
+    #[test]
+    fn applies_explicit_type_arguments_to_imported_generic_calls() {
+        let provider = parse_source_file("export declare function create<T>(): () => T;");
+        let consumer = parse_source_file(
+            r#"
+                import { create } from "./provider";
+                type A = { a: string };
+                type B = { b: number };
+                export const one = create<A>();
+                export const two = create<B>();
+            "#,
+        );
+        let provider_bindings = bind_source_file(&provider.arena, provider.source_file);
+        let consumer_bindings = bind_source_file(&consumer.arena, consumer.source_file);
+        let no_modules = BTreeMap::new();
+        let consumer_modules = BTreeMap::from([("./provider".into(), 0)]);
+        let checked = check_program(&[
+            ProgramSource {
+                arena: &provider.arena,
+                source_file: provider.source_file,
+                bindings: &provider_bindings,
+                resolved_modules: &no_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+            ProgramSource {
+                arena: &consumer.arena,
+                source_file: consumer.source_file,
+                bindings: &consumer_bindings,
+                resolved_modules: &consumer_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+        ]);
+        for (symbol_name, alias_name) in [("one", "A"), ("two", "B")] {
+            let symbol = consumer_bindings
+                .root_scope()
+                .unwrap()
+                .symbols
+                .get(symbol_name)
+                .unwrap();
+            let outer = checked.files[1].type_of_symbol(symbol).unwrap();
+            let TypeKind::Function(outer) = &checked.files[1].types.get(outer).unwrap().kind else {
+                panic!("expected imported call result");
+            };
+            let reference = checked.files[1]
+                .named_type_references
+                .get(&outer.return_type)
+                .unwrap();
+            assert_eq!(reference.name, alias_name);
+        }
     }
 
     #[test]
