@@ -244,6 +244,10 @@ impl<'a> Scanner<'a> {
         let start = self.byte_pos;
         let ch = self.peek()?;
         let mut flags = TokenFlags::NONE;
+        if self.is_conflict_marker_at(start) {
+            self.scan_conflict_marker();
+            return Some((SyntaxKind::ConflictMarkerTrivia, flags, start));
+        }
         if is_line_break(ch) {
             flags.insert(TokenFlags::PRECEDING_LINE_BREAK);
             self.bump();
@@ -353,6 +357,12 @@ impl<'a> Scanner<'a> {
             } else if self.byte_pos == 0 && self.starts_with("#!") {
                 while self.peek().is_some_and(|ch| !is_line_break(ch)) {
                     self.bump();
+                }
+            } else if self.is_conflict_marker_at(self.byte_pos) {
+                let marker_start = self.byte_pos;
+                self.scan_conflict_marker();
+                if self.source[marker_start..self.byte_pos].contains(['\n', '\r']) {
+                    flags.insert(TokenFlags::PRECEDING_LINE_BREAK);
                 }
             }
             if before == self.byte_pos {
@@ -532,6 +542,10 @@ impl<'a> Scanner<'a> {
         self.last_value = None;
         let kind = match self.peek() {
             None => SyntaxKind::EndOfFile,
+            Some('<') if self.is_conflict_marker_at(start) => {
+                self.scan_conflict_marker();
+                SyntaxKind::ConflictMarkerTrivia
+            }
             Some('<') if self.peek_next() == Some('/') => {
                 self.bump_ascii(2);
                 SyntaxKind::LessThanSlashToken
@@ -1273,6 +1287,57 @@ impl<'a> Scanner<'a> {
         self.byte_pos += count;
     }
 
+    fn is_conflict_marker_at(&self, pos: usize) -> bool {
+        const MARKER_LENGTH: usize = 7;
+        if pos >= self.source.len()
+            || (pos != 0
+                && !self.source[..pos]
+                    .chars()
+                    .next_back()
+                    .is_some_and(is_line_break))
+        {
+            return false;
+        }
+        let bytes = self.source.as_bytes();
+        let Some(&marker) = bytes.get(pos) else {
+            return false;
+        };
+        if !matches!(marker, b'<' | b'|' | b'=' | b'>')
+            || bytes.get(pos..pos.saturating_add(MARKER_LENGTH))
+                != Some([marker; MARKER_LENGTH].as_slice())
+        {
+            return false;
+        }
+        marker == b'=' || bytes.get(pos + MARKER_LENGTH) == Some(&b' ')
+    }
+
+    fn scan_conflict_marker(&mut self) {
+        const MARKER_LENGTH: usize = 7;
+        let start = self.byte_pos;
+        let marker = self.source.as_bytes()[start];
+        self.error(
+            start,
+            start.saturating_add(MARKER_LENGTH),
+            "Merge conflict marker encountered.",
+        );
+        if matches!(marker, b'<' | b'>') {
+            while self.peek().is_some_and(|ch| !is_line_break(ch)) {
+                self.bump();
+            }
+            return;
+        }
+        while self.byte_pos < self.source.len() {
+            let current = self.source.as_bytes()[self.byte_pos];
+            if matches!(current, b'=' | b'>')
+                && current != marker
+                && self.is_conflict_marker_at(self.byte_pos)
+            {
+                break;
+            }
+            self.bump();
+        }
+    }
+
     fn error(&mut self, start: usize, end: usize, message: &str) {
         let range = TextRange::new(
             TextPos::new(u32::try_from(start).expect("source exceeds 4 GiB")),
@@ -1301,6 +1366,7 @@ fn scanner_diagnostic_code(message: &str) -> Option<u32> {
         "Digit expected." => Some(1124),
         "Hexadecimal digit expected." => Some(1125),
         "Invalid character." => Some(1127),
+        "Merge conflict marker encountered." => Some(1185),
         "Unterminated template literal." => Some(1160),
         "Unterminated regular expression literal." => Some(1161),
         "Binary digit expected." => Some(1177),
@@ -1791,6 +1857,54 @@ mod tests {
                 .contains(TokenFlags::PRECEDING_JSDOC_WITH_DEPRECATED)
         );
         assert_eq!(scanner.scan().kind, SyntaxKind::Identifier);
+    }
+
+    #[test]
+    fn skips_conflict_markers_and_discarded_merge_sections() {
+        let mut scanner = Scanner::new(concat!(
+            "left\n",
+            "<<<<<<< HEAD\n",
+            "head\n",
+            "||||||| merged common ancestors\n",
+            "base\n",
+            "=======\n",
+            "branch\n",
+            ">>>>>>> topic\n",
+            "right",
+        ));
+        assert_eq!(scanner.scan().text, "left");
+        assert_eq!(scanner.scan().text, "head");
+        assert_eq!(scanner.scan().text, "right");
+        assert_eq!(scanner.scan().kind, SyntaxKind::EndOfFile);
+        assert_eq!(scanner.diagnostics().len(), 4);
+        assert!(
+            scanner
+                .diagnostics()
+                .iter()
+                .all(|diagnostic| diagnostic.code == Some(1185))
+        );
+    }
+
+    #[test]
+    fn exposes_conflict_markers_as_trivia_tokens_when_requested() {
+        let mut scanner = Scanner::new("<<<<<<< HEAD\nvalue");
+        scanner.set_skip_trivia(false);
+        let marker = scanner.scan();
+        assert_eq!(marker.kind, SyntaxKind::ConflictMarkerTrivia);
+        assert_eq!(marker.text, "<<<<<<< HEAD");
+        assert_eq!(scanner.scan().kind, SyntaxKind::NewLineTrivia);
+        assert_eq!(scanner.scan().text, "value");
+    }
+
+    #[test]
+    fn reports_conflict_marker_tokens_while_scanning_jsx_text() {
+        let mut scanner = Scanner::new("<<<<<<< HEAD");
+        scanner.set_language_variant(LanguageVariant::Jsx);
+        assert_eq!(
+            scanner.scan_jsx_token().kind,
+            SyntaxKind::ConflictMarkerTrivia
+        );
+        assert_eq!(scanner.scan_jsx_token().kind, SyntaxKind::EndOfFile);
     }
 
     #[test]

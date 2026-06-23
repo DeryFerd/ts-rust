@@ -94,6 +94,7 @@ pub struct CompilerOptions {
     pub exact_optional_property_types: bool,
     pub force_consistent_casing_in_file_names: bool,
     pub isolated_modules: bool,
+    pub isolated_declarations: bool,
     pub module_detection: ModuleDetectionKind,
     pub no_check: bool,
     pub no_emit: bool,
@@ -121,6 +122,8 @@ pub struct CompilerOptions {
     pub resolve_json_module: bool,
     pub source_map: bool,
     pub inline_source_map: bool,
+    pub map_root: Option<String>,
+    pub source_root: Option<String>,
     pub incremental: bool,
     pub out_file: Option<String>,
     pub out_dir: Option<String>,
@@ -150,6 +153,7 @@ impl Default for CompilerOptions {
             exact_optional_property_types: false,
             force_consistent_casing_in_file_names: false,
             isolated_modules: false,
+            isolated_declarations: false,
             module_detection: ModuleDetectionKind::Auto,
             no_check: false,
             no_emit: false,
@@ -177,6 +181,8 @@ impl Default for CompilerOptions {
             resolve_json_module: false,
             source_map: false,
             inline_source_map: false,
+            map_root: None,
+            source_root: None,
             incremental: false,
             out_file: None,
             out_dir: None,
@@ -258,6 +264,9 @@ impl CompilerOptions {
                         overrides.force_consistent_casing_in_file_names;
                 }
                 "isolatedmodules" => self.isolated_modules = overrides.isolated_modules,
+                "isolateddeclarations" => {
+                    self.isolated_declarations = overrides.isolated_declarations;
+                }
                 "jsx" => self.jsx = overrides.jsx,
                 "module" => {
                     self.module = overrides.module;
@@ -288,6 +297,8 @@ impl CompilerOptions {
                 "rootdir" => self.root_dir.clone_from(&overrides.root_dir),
                 "skiplibcheck" => self.skip_lib_check = overrides.skip_lib_check,
                 "sourcemap" => self.source_map = overrides.source_map,
+                "maproot" => self.map_root.clone_from(&overrides.map_root),
+                "sourceroot" => self.source_root.clone_from(&overrides.source_root),
                 "strict" => {
                     self.strict = overrides.strict;
                     if !names.contains("noimplicitany") {
@@ -382,6 +393,11 @@ pub fn parse_project_options(config: &ProjectConfig) -> ParseOptionsResult {
     {
         *base_url = ts_path::resolve_path(directory, &[base_url]);
     }
+    if let Some(map_root) = &mut result.options.map_root
+        && !ts_path::is_absolute(map_root)
+    {
+        *map_root = ts_path::resolve_path(directory, &[map_root]);
+    }
     for root_dir in &mut result.options.root_dirs {
         if !ts_path::is_absolute(root_dir) {
             *root_dir = ts_path::resolve_path(directory, &[root_dir]);
@@ -455,6 +471,9 @@ pub fn parse_compiler_options_map(options: &BTreeMap<String, JsonValue>) -> Pars
             "isolatedmodules" => {
                 parsed.isolated_modules = boolean(original_name, value, &mut diagnostics);
             }
+            "isolateddeclarations" => {
+                parsed.isolated_declarations = boolean(original_name, value, &mut diagnostics);
+            }
             "moduledetection" => {
                 parsed.module_detection =
                     enum_value(original_name, value, &mut diagnostics, module_detection);
@@ -516,6 +535,8 @@ pub fn parse_compiler_options_map(options: &BTreeMap<String, JsonValue>) -> Pars
             "inlinesourcemap" => {
                 parsed.inline_source_map = boolean(original_name, value, &mut diagnostics);
             }
+            "maproot" => parsed.map_root = string(original_name, value, &mut diagnostics),
+            "sourceroot" => parsed.source_root = string(original_name, value, &mut diagnostics),
             "incremental" => parsed.incremental = boolean(original_name, value, &mut diagnostics),
             "outfile" => parsed.out_file = string(original_name, value, &mut diagnostics),
             "outdir" => parsed.out_dir = string(original_name, value, &mut diagnostics),
@@ -565,6 +586,7 @@ struct PartialOptions {
     exact_optional_property_types: Option<bool>,
     force_consistent_casing_in_file_names: Option<bool>,
     isolated_modules: Option<bool>,
+    isolated_declarations: Option<bool>,
     module_detection: Option<ModuleDetectionKind>,
     no_check: Option<bool>,
     no_emit: Option<bool>,
@@ -592,6 +614,8 @@ struct PartialOptions {
     resolve_json_module: Option<bool>,
     source_map: Option<bool>,
     inline_source_map: Option<bool>,
+    map_root: Option<String>,
+    source_root: Option<String>,
     incremental: Option<bool>,
     out_file: Option<String>,
     out_dir: Option<String>,
@@ -610,6 +634,7 @@ impl PartialOptions {
         let check_js = self.check_js.unwrap_or(false);
         let strict = self.strict.unwrap_or(false);
         let emit_declaration_only = self.emit_declaration_only.unwrap_or(false);
+        let composite = self.composite.unwrap_or(false);
         let module = self.module.unwrap_or(if self.out_file.is_some() {
             ModuleKind::None
         } else {
@@ -629,8 +654,10 @@ impl PartialOptions {
                     || module_resolution == ModuleResolutionKind::Bundler,
             ),
             check_js,
-            composite: self.composite.unwrap_or(false),
-            declaration: self.declaration.unwrap_or(emit_declaration_only),
+            composite,
+            declaration: self
+                .declaration
+                .unwrap_or(emit_declaration_only || composite),
             declaration_map: self.declaration_map.unwrap_or(false),
             emit_declaration_only,
             es_module_interop,
@@ -639,6 +666,7 @@ impl PartialOptions {
                 .force_consistent_casing_in_file_names
                 .unwrap_or(false),
             isolated_modules: self.isolated_modules.unwrap_or(false),
+            isolated_declarations: self.isolated_declarations.unwrap_or(false),
             module_detection: self.module_detection.unwrap_or_default(),
             no_check: self.no_check.unwrap_or(false),
             no_emit: self.no_emit.unwrap_or(false),
@@ -666,6 +694,8 @@ impl PartialOptions {
             resolve_json_module: self.resolve_json_module.unwrap_or(false),
             source_map: self.source_map.unwrap_or(false),
             inline_source_map: self.inline_source_map.unwrap_or(false),
+            map_root: self.map_root,
+            source_root: self.source_root,
             incremental: self.incremental.unwrap_or(false),
             out_file: self.out_file,
             out_dir: self.out_dir,
@@ -1283,6 +1313,29 @@ mod tests {
             Some("/repo/.cache/project.tsbuildinfo")
         );
         assert!(result.options.printer_settings().source_map);
+    }
+
+    #[test]
+    fn normalizes_map_roots_and_declaration_selection_options() {
+        let config = parse_config_text(
+            "/repo/tsconfig.json",
+            r#"{
+                "compilerOptions": {
+                    "composite": true,
+                    "isolatedDeclarations": true,
+                    "mapRoot": "maps",
+                    "sourceRoot": "sources"
+                }
+            }"#,
+        )
+        .value
+        .unwrap();
+        let result = parse_project_options(&config);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert!(result.options.declaration);
+        assert!(result.options.isolated_declarations);
+        assert_eq!(result.options.map_root.as_deref(), Some("/repo/maps"));
+        assert_eq!(result.options.source_root.as_deref(), Some("sources"));
     }
 
     #[test]

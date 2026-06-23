@@ -71,6 +71,7 @@ pub struct EmitOutput {
 pub struct Program {
     source_files: Vec<SourceFile>,
     file_index: BTreeMap<String, usize>,
+    root_file_names: BTreeSet<String>,
     resolved_modules: BTreeMap<(String, String), String>,
     diagnostics: Vec<ProgramDiagnostic>,
     current_directory: String,
@@ -113,6 +114,11 @@ impl Program {
             } else {
                 resolve_path(&current_directory, &[root_name])
             };
+            program.root_file_names.insert(canonicalize(
+                &file_name,
+                &program.current_directory,
+                program.case_sensitivity,
+            ));
             program.load_file(file_system, &file_name, true);
         }
         program
@@ -374,6 +380,15 @@ impl Program {
         if !settings.emit_javascript && !settings.emit_declarations {
             return output;
         }
+        if self.options.out_file.is_some()
+            && settings.emit_javascript
+            && !matches!(
+                self.options.module,
+                ModuleKind::None | ModuleKind::Amd | ModuleKind::System
+            )
+        {
+            return output;
+        }
         if self.options.out_file.is_some() {
             return self.emit_bundle(settings);
         }
@@ -382,7 +397,13 @@ impl Program {
             .iter()
             .filter(|source_file| {
                 !source_file.is_default_library
-                    && !ts_path::is_declaration_file(&source_file.file_name)
+                    && self.source_should_emit(source_file)
+                    && (!ts_path::is_declaration_file(&source_file.file_name)
+                        || self.root_file_names.contains(&canonicalize(
+                            &source_file.file_name,
+                            &self.current_directory,
+                            self.case_sensitivity,
+                        )))
             })
             .map(|source_file| source_file.file_name.clone())
             .collect::<Vec<_>>();
@@ -394,6 +415,7 @@ impl Program {
         for source_file in &self.source_files {
             if source_file.is_default_library
                 || ts_path::is_declaration_file(&source_file.file_name)
+                || !self.source_should_emit(source_file)
             {
                 continue;
             }
@@ -423,6 +445,8 @@ impl Program {
                     amd_module_name: source_file.parse.amd_module_name.as_deref(),
                     amd_bundle: false,
                     amd_dependencies: &amd_dependencies,
+                    amd_module_specifier_rewrites: &BTreeMap::new(),
+                    amd_generated_name_offsets: &BTreeMap::new(),
                     enum_member_values: &enum_member_values,
                     enum_access_values: &enum_access_values,
                     import_runtime_meanings: &source_file.checking.import_runtime_meanings,
@@ -447,7 +471,14 @@ impl Program {
                         };
                         if let Some(mut source_map) = emitted.source_map {
                             source_map.file = file_name.rsplit('/').next().map(str::to_owned);
-                            let serialized = serialize_source_map(&source_map);
+                            make_source_map_sources_relative(
+                                &mut source_map,
+                                &common_source_directory,
+                            );
+                            let serialized = serialize_source_map(
+                                &source_map,
+                                self.options.source_root.as_deref(),
+                            );
                             if settings.inline_source_map {
                                 emitted
                                     .code
@@ -456,9 +487,9 @@ impl Program {
                                 emitted.code.push('\n');
                             } else if let Some(map_file_name) = paths.source_map.clone() {
                                 emitted.code.push_str("//# sourceMappingURL=");
-                                emitted.code.push_str(
-                                    map_file_name.rsplit('/').next().unwrap_or(&map_file_name),
-                                );
+                                emitted
+                                    .code
+                                    .push_str(&self.source_map_url(&file_name, &map_file_name));
                                 emitted.code.push('\n');
                                 output.files.push(OutputFile {
                                     file_name: map_file_name,
@@ -477,11 +508,13 @@ impl Program {
                 }
             }
             if settings.emit_declarations {
-                if source_file
-                    .checking
-                    .diagnostics
-                    .iter()
-                    .any(|diagnostic| diagnostic.diagnostic.code() == 5088)
+                if (self.options.isolated_declarations
+                    && has_unserializable_isolated_declaration_name(source_file))
+                    || source_file
+                        .checking
+                        .diagnostics
+                        .iter()
+                        .any(|diagnostic| diagnostic.diagnostic.code() == 5088)
                 {
                     continue;
                 }
@@ -497,11 +530,17 @@ impl Program {
                     Some(&source_file.checking.types),
                     Some(&declaration_node_types),
                     Some(&source_file.checking.import_type_references),
+                    settings.remove_comments,
                 ) {
                     Ok(mut emitted) => {
                         let Some(file_name) = paths.declaration.clone() else {
                             continue;
                         };
+                        let reference_directives =
+                            preserved_reference_directives(source_file, &file_name);
+                        if !reference_directives.is_empty() {
+                            emitted.code.insert_str(0, &reference_directives);
+                        }
                         if let Some(mut source_map) = emitted.source_map {
                             source_map.file = file_name.rsplit('/').next().map(str::to_owned);
                             if let Some(map_file_name) = paths.declaration_map.clone() {
@@ -512,7 +551,10 @@ impl Program {
                                 emitted.code.push('\n');
                                 output.files.push(OutputFile {
                                     file_name: map_file_name,
-                                    text: serialize_source_map(&source_map),
+                                    text: serialize_source_map(
+                                        &source_map,
+                                        self.options.source_root.as_deref(),
+                                    ),
                                 });
                             }
                         }
@@ -539,11 +581,21 @@ impl Program {
         let paths = ts_outputpaths::bundle_output_paths(&self.options, &self.current_directory)
             .expect("outFile was checked before bundle emission");
         let sources = self.bundle_sources();
+        let bundle_source_names = sources
+            .iter()
+            .map(|source| source.file_name.clone())
+            .collect::<Vec<_>>();
+        let bundle_root = ts_outputpaths::common_source_directory(
+            &bundle_source_names,
+            &self.current_directory,
+            self.case_sensitivity,
+        );
 
         if settings.emit_javascript {
             let mut code = String::new();
             let mut map_builder = settings.source_map.then(SourceMapBuilder::new);
             let mut map_sources = Vec::new();
+            let mut amd_generated_name_offsets = BTreeMap::new();
             for source in &sources {
                 let generated_line =
                     u32::try_from(code.bytes().filter(|byte| *byte == b'\n').count())
@@ -567,12 +619,16 @@ impl Program {
                     .collect::<Vec<_>>();
                 let amd_module_name = (settings.module == ModuleKind::Amd
                     && source_is_external_module(source))
-                .then(|| amd_bundle_module_name(source));
+                .then(|| amd_bundle_module_name(source, &bundle_root));
+                let amd_module_specifier_rewrites =
+                    self.amd_bundle_specifier_rewrites(source, &bundle_root);
                 let emit_context = EmitContext {
                     bindings: &source.binding,
                     amd_module_name: amd_module_name.as_deref(),
                     amd_bundle: true,
                     amd_dependencies: &amd_dependencies,
+                    amd_module_specifier_rewrites: &amd_module_specifier_rewrites,
+                    amd_generated_name_offsets: &amd_generated_name_offsets,
                     enum_member_values: &enum_member_values,
                     enum_access_values: &enum_access_values,
                     import_runtime_meanings: &source.checking.import_runtime_meanings,
@@ -604,20 +660,23 @@ impl Program {
                     }
                     Err(error) => output.diagnostics.push(emit_diagnostic(source, &error)),
                 }
+                for base in amd_generated_dependency_bases(source) {
+                    *amd_generated_name_offsets.entry(base).or_default() += 1;
+                }
             }
             if let Some(mut map) = map_builder.map(|builder| builder.finish(None, map_sources)) {
                 let Some(file_name) = paths.javascript.as_ref() else {
                     return output;
                 };
                 map.file = file_name.rsplit('/').next().map(str::to_owned);
-                let serialized = serialize_source_map(&map);
+                let serialized = serialize_source_map(&map, self.options.source_root.as_deref());
                 if settings.inline_source_map {
                     code.push_str("//# sourceMappingURL=data:application/json;base64,");
                     code.push_str(&base64_encode(serialized.as_bytes()));
                     code.push('\n');
                 } else if let Some(map_file_name) = paths.source_map.clone() {
                     code.push_str("//# sourceMappingURL=");
-                    code.push_str(map_file_name.rsplit('/').next().unwrap_or(&map_file_name));
+                    code.push_str(&self.source_map_url(file_name, &map_file_name));
                     code.push('\n');
                     output.files.push(OutputFile {
                         file_name: map_file_name,
@@ -637,21 +696,14 @@ impl Program {
             let mut code = String::new();
             let mut map_builder = self.options.declaration_map.then(SourceMapBuilder::new);
             let mut map_sources = Vec::new();
-            let bundle_source_names = sources
-                .iter()
-                .map(|source| source.file_name.clone())
-                .collect::<Vec<_>>();
-            let bundle_root = ts_outputpaths::common_source_directory(
-                &bundle_source_names,
-                &self.current_directory,
-                self.case_sensitivity,
-            );
             for source in &sources {
-                if source
-                    .checking
-                    .diagnostics
-                    .iter()
-                    .any(|diagnostic| diagnostic.diagnostic.code() == 5088)
+                if (self.options.isolated_declarations
+                    && has_unserializable_isolated_declaration_name(source))
+                    || source
+                        .checking
+                        .diagnostics
+                        .iter()
+                        .any(|diagnostic| diagnostic.diagnostic.code() == 5088)
                 {
                     continue;
                 }
@@ -671,6 +723,7 @@ impl Program {
                     Some(&source.checking.types),
                     Some(&declaration_node_types),
                     Some(&source.checking.import_type_references),
+                    settings.remove_comments,
                 ) {
                     Ok(mut emitted) => {
                         if !emitted.code.is_empty() {
@@ -729,7 +782,7 @@ impl Program {
                     code.push('\n');
                     output.files.push(OutputFile {
                         file_name: map_file_name,
-                        text: serialize_source_map(&map),
+                        text: serialize_source_map(&map, self.options.source_root.as_deref()),
                     });
                 }
             }
@@ -771,7 +824,10 @@ impl Program {
                     visit(program, *target, visited, ordered);
                 }
             }
-            if !source.is_default_library && !ts_path::is_declaration_file(&source.file_name) {
+            if !source.is_default_library
+                && !ts_path::is_declaration_file(&source.file_name)
+                && program.source_should_emit(source)
+            {
                 ordered.push(index);
             }
         }
@@ -785,6 +841,63 @@ impl Program {
             .into_iter()
             .map(|index| &self.source_files[index])
             .collect()
+    }
+
+    fn source_should_emit(&self, source: &SourceFile) -> bool {
+        let canonical = canonicalize(
+            &source.file_name,
+            &self.current_directory,
+            self.case_sensitivity,
+        );
+        self.root_file_names.contains(&canonical)
+            || !canonical
+                .split('/')
+                .any(|component| component.eq_ignore_ascii_case("node_modules"))
+    }
+
+    fn amd_bundle_specifier_rewrites(
+        &self,
+        source: &SourceFile,
+        bundle_root: &str,
+    ) -> BTreeMap<String, String> {
+        let containing = canonicalize(
+            &source.file_name,
+            &self.current_directory,
+            self.case_sensitivity,
+        );
+        self.resolved_modules
+            .iter()
+            .filter(|((source, _), _)| source == &containing)
+            .filter_map(|((_, specifier), target)| {
+                let target = self
+                    .file_index
+                    .get(target)
+                    .and_then(|index| self.source_files.get(*index))?;
+                Some((
+                    specifier.clone(),
+                    amd_bundle_module_name(target, bundle_root),
+                ))
+            })
+            .collect()
+    }
+
+    fn source_map_url(&self, generated_file: &str, map_file: &str) -> String {
+        let Some(map_root) = self.options.map_root.as_deref() else {
+            return map_file.rsplit('/').next().unwrap_or(map_file).to_owned();
+        };
+        let map_root = if is_absolute(map_root) {
+            ts_path::normalize_path(map_root)
+        } else {
+            resolve_path(&self.current_directory, &[map_root])
+        };
+        let relative_map = self
+            .options
+            .out_dir
+            .as_deref()
+            .and_then(|out_dir| strip_directory_prefix(map_file, out_dir))
+            .unwrap_or_else(|| map_file.rsplit('/').next().unwrap_or(map_file).to_owned());
+        let logical_map = resolve_path(&map_root, &[&relative_map]);
+        relative_path(&directory_path(generated_file), &logical_map)
     }
 
     fn rewrite_bundle_declaration_specifiers(
@@ -1338,27 +1451,137 @@ fn bundled_library_name(name: &str) -> String {
     }
 }
 
-fn serialize_source_map(source_map: &SourceMap) -> String {
+fn serialize_source_map(source_map: &SourceMap, source_root: Option<&str>) -> String {
     #[derive(serde::Serialize)]
     #[serde(rename_all = "camelCase")]
     struct SerializedSourceMap<'a> {
         version: u8,
         file: &'a Option<String>,
-        source_root: &'static str,
+        source_root: &'a str,
         sources: &'a [String],
         names: &'a [String],
         mappings: &'a str,
     }
 
+    let source_root = source_root.map_or_else(String::new, |source_root| {
+        if source_root.is_empty() || source_root.ends_with('/') {
+            source_root.to_owned()
+        } else {
+            format!("{source_root}/")
+        }
+    });
     serde_json::to_string(&SerializedSourceMap {
         version: source_map.version,
         file: &source_map.file,
-        source_root: "",
+        source_root: &source_root,
         sources: &source_map.sources,
         names: &source_map.names,
         mappings: &source_map.mappings,
     })
     .expect("source map fields are JSON-serializable")
+}
+
+fn make_source_map_sources_relative(source_map: &mut SourceMap, source_directory: &str) {
+    for source in &mut source_map.sources {
+        *source =
+            strip_directory_prefix(source, source_directory).unwrap_or_else(|| source.clone());
+    }
+}
+
+fn strip_directory_prefix(path: &str, directory: &str) -> Option<String> {
+    let path = ts_path::normalize_path(path);
+    let directory = ts_path::normalize_path(directory);
+    let remainder = path.strip_prefix(&directory)?;
+    if remainder.is_empty() {
+        Some(String::new())
+    } else {
+        remainder.strip_prefix('/').map(str::to_owned)
+    }
+}
+
+fn relative_path(from_directory: &str, target: &str) -> String {
+    let from = ts_path::normalize_path(from_directory);
+    let target = ts_path::normalize_path(target);
+    let from_parts = from.trim_start_matches('/').split('/').collect::<Vec<_>>();
+    let target_parts = target
+        .trim_start_matches('/')
+        .split('/')
+        .collect::<Vec<_>>();
+    let common = from_parts
+        .iter()
+        .zip(&target_parts)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let mut parts = vec![".."; from_parts.len().saturating_sub(common)];
+    parts.extend(target_parts[common..].iter().copied());
+    if parts.is_empty() {
+        ".".to_owned()
+    } else {
+        parts.join("/")
+    }
+}
+
+fn preserved_reference_directives(source: &SourceFile, declaration_file: &str) -> String {
+    let source_directory = directory_path(&source.file_name);
+    let declaration_directory = directory_path(declaration_file);
+    let mut output = String::new();
+    for line in source.source_text.lines() {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with("///")
+            || !trimmed.contains("<reference")
+            || !(trimmed.contains("preserve=\"true\"") || trimmed.contains("preserve='true'"))
+        {
+            continue;
+        }
+        let Some(path_start) = trimmed.find("path=").map(|index| index + "path=".len()) else {
+            continue;
+        };
+        let Some(quote) = trimmed.as_bytes().get(path_start).copied().map(char::from) else {
+            continue;
+        };
+        if !matches!(quote, '\'' | '"') {
+            continue;
+        }
+        let value_start = path_start + 1;
+        let Some(value_end) = trimmed[value_start..]
+            .find(quote)
+            .map(|end| value_start + end)
+        else {
+            continue;
+        };
+        let target = resolve_path(&source_directory, &[&trimmed[value_start..value_end]]);
+        let rewritten = relative_path(&declaration_directory, &target);
+        output.push_str(&trimmed[..value_start]);
+        output.push_str(&rewritten);
+        output.push_str(&trimmed[value_end..]);
+        output.push('\n');
+    }
+    output
+}
+
+fn has_unserializable_isolated_declaration_name(source: &SourceFile) -> bool {
+    source.parse.arena.iter().any(|(_, node)| {
+        let NodeData::ComputedPropertyName(name) = &node.data else {
+            return false;
+        };
+        let Some(expression) = source.parse.arena.get(name.expression) else {
+            return true;
+        };
+        match &expression.data {
+            NodeData::NumericLiteral(_)
+            | NodeData::StringLiteral(_)
+            | NodeData::NoSubstitutionTemplateLiteral(_) => false,
+            NodeData::PrefixUnaryExpression(prefix) => !matches!(
+                source
+                    .parse
+                    .arena
+                    .get(prefix.operand)
+                    .map(|operand| &operand.data),
+                Some(NodeData::NumericLiteral(_))
+            ),
+            _ => true,
+        }
+    })
 }
 
 fn emit_diagnostic(source_file: &SourceFile, error: &ts_printer::EmitError) -> ProgramDiagnostic {
@@ -1480,7 +1703,7 @@ fn bundle_declaration_module_name(
     module: ModuleKind,
 ) -> String {
     if module == ModuleKind::Amd {
-        return amd_bundle_module_name(source);
+        return amd_bundle_module_name(source, bundle_root);
     }
     let relative = source
         .file_name
@@ -1511,13 +1734,14 @@ fn replace_import_type_reference(
     true
 }
 
-fn amd_bundle_module_name(source: &SourceFile) -> String {
+fn amd_bundle_module_name(source: &SourceFile, bundle_root: &str) -> String {
     source.parse.amd_module_name.clone().unwrap_or_else(|| {
-        Path::new(&source.file_name)
-            .file_stem()
-            .and_then(|name| name.to_str())
-            .unwrap_or("module")
-            .to_owned()
+        let relative = source
+            .file_name
+            .strip_prefix(bundle_root)
+            .unwrap_or(&source.file_name)
+            .trim_start_matches('/');
+        ts_path::remove_file_extension(relative).to_owned()
     })
 }
 
@@ -1691,6 +1915,58 @@ fn source_file_is_external_module(parse: &ParseResult) -> bool {
             )
         })
     })
+}
+
+fn amd_generated_dependency_bases(source: &SourceFile) -> Vec<String> {
+    let Some(NodeData::SourceFile(file)) = source
+        .parse
+        .arena
+        .get(source.parse.source_file)
+        .map(|node| &node.data)
+    else {
+        return Vec::new();
+    };
+    file.statements
+        .nodes
+        .iter()
+        .filter_map(|statement| {
+            if source.checking.import_runtime_meanings.get(statement) == Some(&false) {
+                return None;
+            }
+            let Some(NodeData::ImportDeclaration(import)) =
+                source.parse.arena.get(*statement).map(|node| &node.data)
+            else {
+                return None;
+            };
+            import.import_clause?;
+            let (specifier, _) = string_literal(&source.parse.arena, import.module_specifier)?;
+            Some(module_temp_base(&specifier))
+        })
+        .collect()
+}
+
+fn module_temp_base(specifier: &str) -> String {
+    let segment = specifier
+        .rsplit('/')
+        .find(|segment| !segment.is_empty())
+        .unwrap_or("module");
+    let stem = segment.split('.').next().unwrap_or(segment);
+    let mut base = String::new();
+    for (index, character) in stem.chars().enumerate() {
+        if character == '_' || character == '$' || character.is_ascii_alphanumeric() {
+            if index == 0 && character.is_ascii_digit() {
+                base.push('_');
+            }
+            base.push(character);
+        } else if !base.ends_with('_') {
+            base.push('_');
+        }
+    }
+    if base.is_empty() {
+        "module".to_owned()
+    } else {
+        base
+    }
 }
 
 fn declaration_modifiers(node: &ts_ast::Node) -> Option<&ts_ast::ModifierList> {
@@ -3029,7 +3305,7 @@ mod tests {
         let javascript = &program.emit().files[0].text;
         assert!(!javascript.contains("exports.E"), "{javascript}");
         assert!(
-            javascript.contains("const value = 1 /* E.A */;"),
+            javascript.contains("exports.value = 1 /* E.A */;"),
             "{javascript}"
         );
     }
@@ -4752,5 +5028,92 @@ mod tests {
             program.diagnostics()
         );
         assert!(program.source_file("/proj/defs/cc.ts").is_some());
+    }
+
+    #[test]
+    fn invalid_out_file_module_kind_does_not_emit() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/main.ts", "export const value = 1;")
+            .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["main.ts".to_owned()],
+            CompilerOptions {
+                module: ModuleKind::EsNext,
+                out_file: Some("/project/bundle.js".into()),
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        assert!(program.emit().files.is_empty());
+    }
+
+    #[test]
+    fn resolved_node_modules_sources_are_not_emit_roots() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/main.ts", "import { value } from 'pkg'; value;")
+            .unwrap();
+        fs.write_file(
+            "/project/node_modules/pkg/index.ts",
+            "export const value = 1;",
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["main.ts".to_owned()],
+            CompilerOptions {
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        let emitted = program.emit();
+        assert!(
+            emitted
+                .files
+                .iter()
+                .any(|file| file.file_name == "/project/main.js")
+        );
+        assert!(
+            emitted
+                .files
+                .iter()
+                .all(|file| !file.file_name.contains("node_modules"))
+        );
+    }
+
+    #[test]
+    fn isolated_declaration_errors_suppress_declaration_output() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/main.ts",
+            "const key: 0 = 0; export const value = { [key]: 1 };",
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["main.ts".to_owned()],
+            CompilerOptions {
+                declaration: true,
+                isolated_declarations: true,
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        let emitted = program.emit();
+        assert!(
+            emitted
+                .files
+                .iter()
+                .any(|file| file.file_name == "/project/main.js")
+        );
+        assert!(
+            emitted
+                .files
+                .iter()
+                .all(|file| file.file_name != "/project/main.d.ts")
+        );
     }
 }

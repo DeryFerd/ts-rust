@@ -664,11 +664,22 @@ pub fn run_case_against_baseline(case: &Case, baseline: &str) -> std::io::Result
 
 fn compile_case_variant(case: &Case, variant: &OptionVariant) -> std::io::Result<Compilation> {
     let file_system = MemoryFileSystem::new(true);
+    let project_directory = project_config_unit(case).and_then(|(path, _)| {
+        path.rsplit_once('/')
+            .map(|(directory, _)| directory.to_owned())
+    });
     let mut roots = Vec::with_capacity(case.units.len());
     for (index, unit) in case.units.iter().enumerate() {
         let path = virtual_unit_path(case, unit, index);
         file_system.write_file(&path, unit.source_text.as_scannable_str())?;
-        if is_compilation_unit(&path) {
+        if is_compilation_unit(&path)
+            && project_directory.as_ref().is_none_or(|directory| {
+                path_is_within_directory(&path, directory)
+                    && !path
+                        .split('/')
+                        .any(|component| component.eq_ignore_ascii_case("node_modules"))
+            })
+        {
             roots.push(path);
         }
     }
@@ -680,8 +691,13 @@ fn compile_case_variant(case: &Case, variant: &OptionVariant) -> std::io::Result
     if project_config_unit(case).is_none() && case.directive_values("noLib").next().is_none() {
         compiler_options.no_lib = false;
     }
-    let program =
-        ts_compiler::Program::new_with_options(&file_system, "/case", &roots, compiler_options);
+    let current_directory = project_directory.as_deref().unwrap_or("/case");
+    let program = ts_compiler::Program::new_with_options(
+        &file_system,
+        current_directory,
+        &roots,
+        compiler_options,
+    );
     let emit = program.emit();
     let diagnostics = emit
         .diagnostics
@@ -831,11 +847,13 @@ const SCALAR_OPTION_NAMES: &[&str] = &[
     "forceConsistentCasingInFileNames",
     "incremental",
     "inlineSourceMap",
+    "isolatedDeclarations",
     "isolatedModules",
     "jsx",
     "module",
     "moduleDetection",
     "moduleResolution",
+    "mapRoot",
     "noCheck",
     "noEmit",
     "noEmitHelpers",
@@ -852,6 +870,7 @@ const SCALAR_OPTION_NAMES: &[&str] = &[
     "rootDir",
     "skipLibCheck",
     "sourceMap",
+    "sourceRoot",
     "strict",
     "strictNullChecks",
     "target",

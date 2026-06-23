@@ -667,6 +667,7 @@ impl<'a> ProgramChecker<'a> {
         )
     }
 
+    #[allow(clippy::too_many_lines)]
     fn resolved_module_exports_inner(
         &self,
         target: usize,
@@ -698,13 +699,155 @@ impl<'a> ProgramChecker<'a> {
         else {
             return exports;
         };
+        let mut imported = BTreeMap::<String, TypeDescriptor>::new();
         for statement in &file.statements.nodes {
-            let Some(NodeData::ExportDeclaration(export)) =
+            let Some(NodeData::ImportDeclaration(import)) =
                 source.arena.get(*statement).map(|node| &node.data)
             else {
                 continue;
             };
-            if export.is_type_only || export.export_clause.is_some() {
+            let Some(import_specifier) = string_literal_text(source.arena, import.module_specifier)
+            else {
+                continue;
+            };
+            let Some(import_target) = source.resolved_modules.get(import_specifier).copied() else {
+                continue;
+            };
+            let Some(import_result) = completed
+                .get(import_target)
+                .or_else(|| preliminary.get(import_target))
+            else {
+                continue;
+            };
+            let mut branch = visited.clone();
+            let target_exports = self.resolved_module_exports_inner(
+                import_target,
+                import_specifier,
+                import_result,
+                preliminary,
+                completed,
+                &mut branch,
+            );
+            let Some(NodeData::ImportClause(clause)) = import
+                .import_clause
+                .and_then(|clause| source.arena.get(clause))
+                .map(|node| &node.data)
+            else {
+                continue;
+            };
+            if let Some(local) = clause
+                .name
+                .and_then(|name| identifier_text(source.arena, name))
+                && let Some(descriptor) = target_exports.get("default")
+            {
+                imported.insert(local.to_owned(), descriptor.clone());
+            }
+            if let Some(NodeData::NamedImports(names)) = clause
+                .named_bindings
+                .and_then(|bindings| source.arena.get(bindings))
+                .map(|node| &node.data)
+            {
+                for specifier in &names.elements.nodes {
+                    let Some(NodeData::ImportSpecifier(specifier)) =
+                        source.arena.get(*specifier).map(|node| &node.data)
+                    else {
+                        continue;
+                    };
+                    let imported_name = specifier.property_name.unwrap_or(specifier.name);
+                    let Some(imported_name) = identifier_text(source.arena, imported_name) else {
+                        continue;
+                    };
+                    let Some(local_name) = identifier_text(source.arena, specifier.name) else {
+                        continue;
+                    };
+                    if let Some(descriptor) = target_exports.get(imported_name) {
+                        imported.insert(local_name.to_owned(), descriptor.clone());
+                    }
+                }
+            }
+            if let Some(NodeData::NamespaceImport(namespace)) = clause
+                .named_bindings
+                .and_then(|bindings| source.arena.get(bindings))
+                .map(|node| &node.data)
+                && let Some(local) = identifier_text(source.arena, namespace.name)
+            {
+                imported.insert(
+                    local.to_owned(),
+                    TypeDescriptor::Object {
+                        properties: target_exports,
+                        optional_properties: BTreeSet::new(),
+                        readonly_properties: BTreeSet::new(),
+                        getter_properties: BTreeSet::new(),
+                    },
+                );
+            }
+        }
+        for statement in &file.statements.nodes {
+            let Some(NodeData::ExportDeclaration(export)) =
+                source.arena.get(*statement).map(|node| &node.data)
+            else {
+                if let Some(NodeData::ExportAssignment(assignment)) =
+                    source.arena.get(*statement).map(|node| &node.data)
+                    && let Some(descriptor) = descriptor_for_import_expression(
+                        source.arena,
+                        assignment.expression,
+                        &imported,
+                    )
+                {
+                    exports.insert(
+                        if assignment.is_export_equals {
+                            "export=".to_owned()
+                        } else {
+                            "default".to_owned()
+                        },
+                        descriptor,
+                    );
+                }
+                continue;
+            };
+            if export.is_type_only {
+                continue;
+            }
+            if let Some(NodeData::NamedExports(named)) = export
+                .export_clause
+                .and_then(|clause| source.arena.get(clause))
+                .map(|node| &node.data)
+            {
+                let direct = export.module_specifier.and_then(|module| {
+                    let specifier = string_literal_text(source.arena, module)?;
+                    let target = source.resolved_modules.get(specifier).copied()?;
+                    let result = completed.get(target).or_else(|| preliminary.get(target))?;
+                    let mut branch = visited.clone();
+                    Some(self.resolved_module_exports_inner(
+                        target,
+                        specifier,
+                        result,
+                        preliminary,
+                        completed,
+                        &mut branch,
+                    ))
+                });
+                for specifier in &named.elements.nodes {
+                    let Some(NodeData::ExportSpecifier(specifier)) =
+                        source.arena.get(*specifier).map(|node| &node.data)
+                    else {
+                        continue;
+                    };
+                    let local = specifier.property_name.unwrap_or(specifier.name);
+                    let Some(local) = identifier_text(source.arena, local) else {
+                        continue;
+                    };
+                    let Some(exported) = identifier_text(source.arena, specifier.name) else {
+                        continue;
+                    };
+                    if let Some(descriptor) = direct
+                        .as_ref()
+                        .and_then(|descriptors| descriptors.get(local))
+                        .or_else(|| imported.get(local))
+                    {
+                        exports.insert(exported.to_owned(), descriptor.clone());
+                    }
+                }
                 continue;
             }
             let Some(module_specifier) = export.module_specifier else {
@@ -786,6 +929,7 @@ impl<'a> ProgramChecker<'a> {
         Some(describe_type(&checker.result.types, value_type))
     }
 
+    #[allow(clippy::too_many_lines)]
     fn import_runtime_meaning(
         &self,
         source: &ProgramSource<'_>,
@@ -865,6 +1009,34 @@ impl<'a> ProgramChecker<'a> {
                     ));
                 }
                 None
+            }
+            NodeData::ExportDeclaration(export) => {
+                if export.is_type_only {
+                    return Some(false);
+                }
+                let specifier = string_literal_text(source.arena, export.module_specifier?)?;
+                let target = source.resolved_modules.get(specifier).copied()?;
+                let Some(clause) = export.export_clause else {
+                    return Some(self.module_has_runtime_export(target, &mut HashSet::new()));
+                };
+                let NodeData::NamedExports(named) = &source.arena.get(clause)?.data else {
+                    return Some(true);
+                };
+                Some(named.elements.nodes.iter().any(|specifier| {
+                    let Some(NodeData::ExportSpecifier(specifier)) =
+                        source.arena.get(*specifier).map(|node| &node.data)
+                    else {
+                        return false;
+                    };
+                    if specifier.is_type_only {
+                        return false;
+                    }
+                    let imported = specifier.property_name.unwrap_or(specifier.name);
+                    let Some(name) = identifier_text(source.arena, imported) else {
+                        return false;
+                    };
+                    self.module_export_name_has_runtime_value(target, name, &mut HashSet::new())
+                }))
             }
             _ => None,
         }
@@ -1308,6 +1480,33 @@ impl<'a> ProgramChecker<'a> {
         };
         runtime_meanings = self.collect_import_runtime_meanings(source, &file.statements.nodes);
         for statement in &file.statements.nodes {
+            if let Some(NodeData::ImportEqualsDeclaration(import)) =
+                source.arena.get(*statement).map(|node| &node.data)
+                && let Some(specifier) =
+                    Self::external_module_reference_text(source.arena, import.module_reference)
+                && let Some(target) = source.resolved_modules.get(specifier).copied()
+                && let Some(target_result) =
+                    completed.get(target).or_else(|| preliminary.get(target))
+                && let Some(symbol) = source.bindings.node_symbols.get(&import.name).copied()
+            {
+                let module_exports = self.resolved_module_exports(
+                    target,
+                    specifier,
+                    target_result,
+                    preliminary,
+                    completed,
+                );
+                let descriptor = module_exports.get("export=").cloned().unwrap_or_else(|| {
+                    TypeDescriptor::Object {
+                        properties: module_exports,
+                        optional_properties: BTreeSet::new(),
+                        readonly_properties: BTreeSet::new(),
+                        getter_properties: BTreeSet::new(),
+                    }
+                });
+                symbols.insert(symbol, descriptor);
+                continue;
+            }
             let Some(NodeData::ImportDeclaration(import)) =
                 source.arena.get(*statement).map(|node| &node.data)
             else {
@@ -1555,6 +1754,32 @@ impl<'a> ProgramChecker<'a> {
     }
 }
 
+fn descriptor_for_import_expression(
+    arena: &NodeArena,
+    expression: NodeId,
+    imported: &BTreeMap<String, TypeDescriptor>,
+) -> Option<TypeDescriptor> {
+    match &arena.get(expression)?.data {
+        NodeData::Identifier(identifier) => imported.get(&identifier.text).cloned(),
+        NodeData::PropertyAccessExpression(access) => {
+            let receiver = descriptor_for_import_expression(arena, access.expression, imported)?;
+            let property = identifier_text(arena, access.name)?;
+            descriptor_property(&receiver, property)
+        }
+        _ => None,
+    }
+}
+
+fn descriptor_property(descriptor: &TypeDescriptor, property: &str) -> Option<TypeDescriptor> {
+    match descriptor {
+        TypeDescriptor::Object { properties, .. } => properties.get(property).cloned(),
+        TypeDescriptor::Import { target, .. } | TypeDescriptor::ConstEnum(target) => {
+            descriptor_property(target, property)
+        }
+        _ => None,
+    }
+}
+
 struct Checker<'a> {
     arena: &'a NodeArena,
     bindings: &'a BindResult,
@@ -1565,6 +1790,7 @@ struct Checker<'a> {
     narrowings: Vec<HashMap<SymbolId, TypeId>>,
     flow_types: HashMap<SymbolId, TypeId>,
     alias_stack: Vec<SymbolId>,
+    alias_instantiations: HashMap<(SymbolId, Vec<TypeId>), TypeId>,
     external_symbols: HashMap<SymbolId, TypeDescriptor>,
     external_names: BTreeMap<String, TypeDescriptor>,
     external_aliases: HashMap<SymbolId, TypeDescriptor>,
@@ -1621,6 +1847,7 @@ impl<'a> Checker<'a> {
             narrowings: Vec::new(),
             flow_types: HashMap::new(),
             alias_stack: Vec::new(),
+            alias_instantiations: HashMap::new(),
             external_symbols: HashMap::new(),
             external_names: BTreeMap::new(),
             external_aliases: HashMap::new(),
@@ -1677,6 +1904,7 @@ impl<'a> Checker<'a> {
         self.result
     }
 
+    #[allow(clippy::too_many_lines)]
     fn seed_symbol_types(&mut self) {
         for symbol in self.bindings.symbols.iter() {
             if self.result.symbol_types.contains_key(&symbol.id) {
@@ -1753,8 +1981,8 @@ impl<'a> Checker<'a> {
                         ));
                         break;
                     }
-                    NodeData::TypeAliasDeclaration(data) => {
-                        symbol_type = Some(self.type_alias_type(data, &[]));
+                    NodeData::TypeAliasDeclaration(_) => {
+                        symbol_type = self.instantiate_alias(symbol.id, &[]);
                         break;
                     }
                     NodeData::EnumDeclaration(data) => {
@@ -1768,6 +1996,29 @@ impl<'a> Checker<'a> {
                 symbol.id,
                 symbol_type.unwrap_or_else(|| self.result.types.any()),
             );
+        }
+        let remaining_enums = self
+            .arena
+            .iter()
+            .filter_map(|(_, node)| {
+                let NodeData::EnumDeclaration(enumeration) = &node.data else {
+                    return None;
+                };
+                enumeration
+                    .members
+                    .nodes
+                    .iter()
+                    .any(|member| {
+                        self.bindings
+                            .node_symbols
+                            .get(member)
+                            .is_some_and(|symbol| !self.result.symbol_types.contains_key(symbol))
+                    })
+                    .then(|| enumeration.as_ref().clone())
+            })
+            .collect::<Vec<_>>();
+        for enumeration in &remaining_enums {
+            self.enum_type(enumeration);
         }
         self.seed_namespace_types();
         self.seed_import_equals_types();
@@ -2016,16 +2267,18 @@ impl<'a> Checker<'a> {
         }
         let mut forward_reference = false;
         let evaluation = evaluate_with(self.arena, initializer, &mut |reference| {
-            let Some(reference_name) = enum_member_reference_name(self.arena, reference, enum_name)
-            else {
-                return Evaluation::unknown(UnknownReason::UnresolvedEntity(reference));
-            };
-            if let Some(value) = resolved_values.get(&reference_name) {
-                Evaluation::known(value.clone())
-            } else {
+            if let Some(reference_name) =
+                enum_member_reference_name(self.arena, reference, enum_name)
+            {
+                if let Some(value) = resolved_values.get(&reference_name) {
+                    return Evaluation::known(value.clone());
+                }
                 forward_reference |= member_names.contains(&reference_name);
-                Evaluation::unknown(UnknownReason::UnresolvedEntity(reference))
             }
+            if let Some(value) = self.enum_external_constant(reference) {
+                return Evaluation::known(value);
+            }
+            Evaluation::unknown(UnknownReason::UnresolvedEntity(reference))
         });
         match evaluation.outcome {
             EvaluationOutcome::Value(Value::Number(value)) if value.is_nan() => {
@@ -2051,6 +2304,48 @@ impl<'a> Checker<'a> {
             }
             _ => None,
         }
+    }
+
+    fn enum_external_constant(&self, reference: NodeId) -> Option<Value> {
+        let (name_node, name) = match &self.arena.get(reference)?.data {
+            NodeData::Identifier(identifier) => (reference, identifier.text.as_str()),
+            NodeData::PropertyAccessExpression(access) => {
+                (access.name, identifier_text(self.arena, access.name)?)
+            }
+            NodeData::ElementAccessExpression(access) => (
+                access.argument_expression,
+                string_literal_text(self.arena, access.argument_expression)?,
+            ),
+            _ => return None,
+        };
+        let symbol = self.resolve_identifier(name_node, name).or_else(|| {
+            self.bindings.symbols.iter().find_map(|symbol| {
+                (symbol.name == name && symbol.flags.contains(ts_binder::SymbolFlags::ENUM_MEMBER))
+                    .then_some(symbol.id)
+            })
+        })?;
+        if let Some(descriptor) = self.external_aliases.get(&symbol)
+            && let Some(value) = enum_constant_from_descriptor(descriptor)
+        {
+            return Some(value);
+        }
+        if let Some(type_id) = self.result.symbol_types.get(&symbol)
+            && let Some(value) = enum_constant_from_type(&self.result.types, *type_id)
+        {
+            return Some(value);
+        }
+        self.bindings
+            .symbols
+            .get(symbol)?
+            .declarations
+            .iter()
+            .find_map(|declaration| {
+                let NodeData::VariableDeclaration(variable) = &self.arena.get(*declaration)?.data
+                else {
+                    return None;
+                };
+                enum_constant_literal(self.arena, variable.initializer?)
+            })
     }
 
     fn enum_constant_type(&mut self, value: &Value) -> TypeId {
@@ -7676,6 +7971,10 @@ impl<'a> Checker<'a> {
         if self.alias_stack.contains(&symbol) {
             return Some(self.result.types.any());
         }
+        let cache_key = (symbol, arguments.to_vec());
+        if let Some(type_id) = self.alias_instantiations.get(&cache_key) {
+            return Some(*type_id);
+        }
         let declaration = self
             .bindings
             .symbols
@@ -7689,6 +7988,7 @@ impl<'a> Checker<'a> {
         self.alias_stack.push(symbol);
         let result = self.type_alias_type(declaration, arguments);
         self.alias_stack.pop();
+        self.alias_instantiations.insert(cache_key, result);
         Some(result)
     }
 
@@ -9412,14 +9712,64 @@ fn enum_member_reference_name(
     match &arena.get(reference)?.data {
         NodeData::Identifier(identifier) => Some(identifier.text.clone()),
         NodeData::PropertyAccessExpression(access)
-            if identifier_text(arena, access.expression) == Some(enum_name) =>
+            if enum_reference_receiver_name(arena, access.expression) == Some(enum_name) =>
         {
             property_name_text(arena, access.name)
         }
         NodeData::ElementAccessExpression(access)
-            if identifier_text(arena, access.expression) == Some(enum_name) =>
+            if enum_reference_receiver_name(arena, access.expression) == Some(enum_name) =>
         {
             property_name_text(arena, access.argument_expression)
+        }
+        _ => None,
+    }
+}
+
+fn enum_reference_receiver_name(arena: &NodeArena, receiver: NodeId) -> Option<&str> {
+    match &arena.get(receiver)?.data {
+        NodeData::Identifier(identifier) => Some(&identifier.text),
+        NodeData::PropertyAccessExpression(access) => identifier_text(arena, access.name),
+        NodeData::ElementAccessExpression(access) => {
+            string_literal_text(arena, access.argument_expression)
+        }
+        _ => None,
+    }
+}
+
+fn enum_constant_from_descriptor(descriptor: &TypeDescriptor) -> Option<Value> {
+    match descriptor {
+        TypeDescriptor::NumberLiteral(value) => {
+            Some(Value::Number(Number::new(value.parse::<f64>().ok()?)))
+        }
+        TypeDescriptor::StringLiteral(value) => Some(Value::String(value.clone())),
+        TypeDescriptor::Import { target, .. } | TypeDescriptor::ConstEnum(target) => {
+            enum_constant_from_descriptor(target)
+        }
+        _ => None,
+    }
+}
+
+fn enum_constant_from_type(types: &TypeArena, type_id: TypeId) -> Option<Value> {
+    match &types.get(type_id)?.kind {
+        TypeKind::NumberLiteral(value) => {
+            Some(Value::Number(Number::new(value.parse::<f64>().ok()?)))
+        }
+        TypeKind::StringLiteral(value) => Some(Value::String(value.clone())),
+        _ => None,
+    }
+}
+
+fn enum_constant_literal(arena: &NodeArena, expression: NodeId) -> Option<Value> {
+    match &arena.get(expression)?.data {
+        NodeData::NumericLiteral(literal) => Some(Value::Number(Number::new(
+            literal.text.parse::<f64>().ok()?,
+        ))),
+        NodeData::StringLiteral(literal) => Some(Value::String(literal.text.clone())),
+        NodeData::NoSubstitutionTemplateLiteral(literal) => {
+            Some(Value::String(literal.text.clone()))
+        }
+        NodeData::ParenthesizedExpression(parenthesized) => {
+            enum_constant_literal(arena, parenthesized.expression)
         }
         _ => None,
     }
@@ -11411,6 +11761,28 @@ mod tests {
             result.diagnostics[0].diagnostic.render().unwrap(),
             "The inferred type of 'bad' references a type with a cyclic structure which cannot be trivially serialized. A type annotation is necessary."
         );
+    }
+
+    #[test]
+    fn memoizes_type_alias_instantiations() {
+        let parsed =
+            parse_source_file("type Recursive = { child: Recursive }; type Alias = Recursive;");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let symbol = bindings
+            .root_scope()
+            .unwrap()
+            .symbols
+            .get("Recursive")
+            .unwrap();
+        let mut checker = Checker::new(&parsed.arena, &bindings);
+
+        let first = checker.instantiate_alias(symbol, &[]).unwrap();
+        let type_count = checker.result.types.len();
+        let second = checker.instantiate_alias(symbol, &[]).unwrap();
+
+        assert_eq!(second, first);
+        assert_eq!(checker.result.types.len(), type_count);
     }
 
     #[test]

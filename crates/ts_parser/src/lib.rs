@@ -432,7 +432,7 @@ impl<'a> Parser<'a> {
         let start = self.current.full_start;
         let mut statements = Vec::new();
         while self.current.kind != terminator && self.current.kind != SyntaxKind::EndOfFile {
-            if recover_static_member && self.static_starts_recovered_class_member() {
+            if recover_static_member && self.starts_recovered_class_member() {
                 break;
             }
             if self.current.kind == SyntaxKind::Unknown
@@ -450,6 +450,14 @@ impl<'a> Parser<'a> {
                 && self.current.kind == SyntaxKind::CloseBraceToken
             {
                 self.error_code_at(self.current.range, 1128, std::iter::empty::<String>());
+                self.bump();
+                continue;
+            }
+            if matches!(
+                self.current.kind,
+                SyntaxKind::CloseParenToken | SyntaxKind::CloseBracketToken
+            ) {
+                self.error_current("Declaration or statement expected.");
                 self.bump();
                 continue;
             }
@@ -545,6 +553,7 @@ impl<'a> Parser<'a> {
             SyntaxKind::ForKeyword => self.parse_for_statement(),
             SyntaxKind::SwitchKeyword => self.parse_switch_statement(),
             SyntaxKind::TryKeyword => self.parse_try_statement(),
+            SyntaxKind::CatchKeyword => self.parse_recovered_catch_statement(),
             SyntaxKind::ThrowKeyword => self.parse_throw_statement(),
             SyntaxKind::DoKeyword => self.parse_do_statement(),
             SyntaxKind::BreakKeyword | SyntaxKind::ContinueKeyword => {
@@ -646,7 +655,7 @@ impl<'a> Parser<'a> {
             SyntaxKind::CloseBraceToken,
             recover_static_member,
         );
-        let end = if recover_static_member && self.static_starts_recovered_class_member() {
+        let end = if recover_static_member && self.starts_recovered_class_member() {
             self.error_code_at(self.current.range, 1128, std::iter::empty::<String>());
             self.current.full_start
         } else if self.current.kind == SyntaxKind::CloseBraceToken {
@@ -671,22 +680,33 @@ impl<'a> Parser<'a> {
         )
     }
 
-    fn static_starts_recovered_class_member(&mut self) -> bool {
-        if self.current.kind != SyntaxKind::StaticKeyword {
-            return false;
-        }
+    fn starts_recovered_class_member(&mut self) -> bool {
         let next = self.next_token_kind();
-        next == SyntaxKind::Identifier
-            || next.is_keyword()
-            || matches!(
-                next,
-                SyntaxKind::StringLiteral
-                    | SyntaxKind::NumericLiteral
-                    | SyntaxKind::BigIntLiteral
-                    | SyntaxKind::PrivateIdentifier
-                    | SyntaxKind::OpenBracketToken
-                    | SyntaxKind::AsteriskToken
-            )
+        if self.current.kind == SyntaxKind::StaticKeyword {
+            return next == SyntaxKind::Identifier
+                || next.is_keyword()
+                || matches!(
+                    next,
+                    SyntaxKind::StringLiteral
+                        | SyntaxKind::NumericLiteral
+                        | SyntaxKind::BigIntLiteral
+                        | SyntaxKind::PrivateIdentifier
+                        | SyntaxKind::OpenBracketToken
+                        | SyntaxKind::AsteriskToken
+                );
+        }
+        matches!(
+            self.current.kind,
+            SyntaxKind::CaseKeyword | SyntaxKind::DefaultKeyword
+        ) && matches!(
+            next,
+            SyntaxKind::OpenParenToken
+                | SyntaxKind::QuestionToken
+                | SyntaxKind::ColonToken
+                | SyntaxKind::EqualsToken
+                | SyntaxKind::SemicolonToken
+                | SyntaxKind::CloseBraceToken
+        )
     }
 
     fn parse_empty_statement(&mut self) -> NodeId {
@@ -1082,14 +1102,7 @@ impl<'a> Parser<'a> {
     }
 
     fn current_token_is_parameter_modifier(&mut self) -> bool {
-        if !matches!(
-            self.current.kind,
-            SyntaxKind::OverrideKeyword
-                | SyntaxKind::PrivateKeyword
-                | SyntaxKind::ProtectedKeyword
-                | SyntaxKind::PublicKeyword
-                | SyntaxKind::ReadonlyKeyword
-        ) {
+        if !self.current.kind.is_modifier() {
             return false;
         }
         let next = self.next_token_kind();
@@ -1669,6 +1682,11 @@ impl<'a> Parser<'a> {
                 self.bump();
                 continue;
             }
+            if !signature_only && !self.current_token_can_start_class_member() {
+                self.error_current("Declaration expected.");
+                recovered_at_statement = true;
+                break;
+            }
             members.push(if signature_only {
                 self.parse_type_member()
             } else {
@@ -1692,6 +1710,21 @@ impl<'a> Parser<'a> {
             nodes: members,
             has_trailing_comma: false,
         }
+    }
+
+    fn current_token_can_start_class_member(&self) -> bool {
+        self.current.kind == SyntaxKind::Identifier
+            || self.current.kind.is_keyword()
+            || matches!(
+                self.current.kind,
+                SyntaxKind::StringLiteral
+                    | SyntaxKind::NumericLiteral
+                    | SyntaxKind::BigIntLiteral
+                    | SyntaxKind::PrivateIdentifier
+                    | SyntaxKind::OpenBracketToken
+                    | SyntaxKind::AsteriskToken
+                    | SyntaxKind::AtToken
+            )
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1726,12 +1759,48 @@ impl<'a> Parser<'a> {
             None
         };
         let name = self.parse_property_name("Expected a member name.");
+        let postfix_token = if matches!(
+            self.current.kind,
+            SyntaxKind::QuestionToken | SyntaxKind::ExclamationToken
+        ) {
+            Some(self.consume_token_node())
+        } else {
+            None
+        };
         let type_parameters = self.parse_type_parameters();
         if type_parameters.is_some() || self.current.kind == SyntaxKind::OpenParenToken {
             let parameters = self.parse_parameter_list();
             let return_type = self.parse_optional_type_annotation();
             let body = if !signature_only && self.current.kind == SyntaxKind::OpenBraceToken {
                 Some(self.parse_class_member_block())
+            } else if !signature_only
+                && !matches!(
+                    self.current.kind,
+                    SyntaxKind::SemicolonToken
+                        | SyntaxKind::CloseBraceToken
+                        | SyntaxKind::EndOfFile
+                )
+                && !self.current_token_can_start_class_member()
+            {
+                self.error_current("Expected '{'.");
+                let position = self.current.full_start;
+                Some(self.alloc_node(
+                    SyntaxKind::Block,
+                    TextRange::new(position, position),
+                    NodeData::Block(Box::new(BlockData {
+                        flow_node: None,
+                        locals: SymbolTable,
+                        multi_line: false,
+                        next_container: None,
+                        statements: NodeList {
+                            range: TextRange::new(position, position),
+                            nodes: Vec::new(),
+                            has_trailing_comma: false,
+                        },
+                        facts: 0,
+                    })),
+                    &[],
+                ))
             } else {
                 self.parse_semicolon(parameters.range.end);
                 None
@@ -1742,6 +1811,7 @@ impl<'a> Parser<'a> {
             let mut children = modifier_nodes.clone();
             children.extend(asterisk_token);
             children.push(name);
+            children.extend(postfix_token);
             extend_list_children(&mut children, type_parameters.as_ref());
             children.extend(parameters.nodes.iter().copied());
             children.extend(return_type);
@@ -1758,7 +1828,7 @@ impl<'a> Parser<'a> {
                     locals: SymbolTable,
                     next_container: None,
                     parameters,
-                    postfix_token: None,
+                    postfix_token,
                     symbol: None,
                     type_: return_type,
                     type_parameters,
@@ -1776,10 +1846,14 @@ impl<'a> Parser<'a> {
             } else {
                 None
             };
-            let fallback = type_node.map_or_else(|| self.node_end(name), |id| self.node_end(id));
+            let fallback = type_node.map_or_else(
+                || postfix_token.map_or_else(|| self.node_end(name), |id| self.node_end(id)),
+                |id| self.node_end(id),
+            );
             let end = self.parse_semicolon(initializer.map_or(fallback, |id| self.node_end(id)));
             let mut children = modifier_nodes;
             children.push(name);
+            children.extend(postfix_token);
             children.extend(type_node);
             children.extend(initializer);
             self.alloc_node(
@@ -1787,7 +1861,7 @@ impl<'a> Parser<'a> {
                 TextRange::new(start, end),
                 NodeData::PropertyDeclaration(Box::new(PropertyDeclarationData {
                     initializer,
-                    postfix_token: None,
+                    postfix_token,
                     symbol: None,
                     type_: type_node,
                     facts: 0,
@@ -2671,6 +2745,35 @@ impl<'a> Parser<'a> {
     fn parse_try_statement(&mut self) -> NodeId {
         let start = self.consume().range.start;
         let try_block = self.parse_block();
+        self.parse_try_statement_tail(start, try_block)
+    }
+
+    fn parse_recovered_catch_statement(&mut self) -> NodeId {
+        let start = self.current.range.start;
+        self.error_current("'try' expected.");
+        let block_start = self.current.full_start;
+        let block_end = self.current.range.start;
+        let try_block = self.alloc_node(
+            SyntaxKind::Block,
+            TextRange::new(block_start, block_end),
+            NodeData::Block(Box::new(BlockData {
+                flow_node: None,
+                locals: SymbolTable,
+                multi_line: false,
+                next_container: None,
+                statements: NodeList {
+                    range: TextRange::new(block_start, block_end),
+                    nodes: Vec::new(),
+                    has_trailing_comma: false,
+                },
+                facts: 0,
+            })),
+            &[],
+        );
+        self.parse_try_statement_tail(start, try_block)
+    }
+
+    fn parse_try_statement_tail(&mut self, start: TextPos, try_block: NodeId) -> NodeId {
         let catch_clause = if self.current.kind == SyntaxKind::CatchKeyword {
             let catch_start = self.consume().range.start;
             let variable_declaration = if self.current.kind == SyntaxKind::OpenParenToken {
@@ -2699,7 +2802,7 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        let finally_block = if self.current.kind == SyntaxKind::FinallyKeyword {
+        let mut finally_block = if self.current.kind == SyntaxKind::FinallyKeyword {
             self.bump();
             Some(self.parse_block())
         } else {
@@ -2707,6 +2810,25 @@ impl<'a> Parser<'a> {
         };
         if catch_clause.is_none() && finally_block.is_none() {
             self.error_current("Expected 'catch' or 'finally'.");
+            let start = self.node_end(try_block);
+            let end = self.current.range.start;
+            finally_block = Some(self.alloc_node(
+                SyntaxKind::Block,
+                TextRange::new(start, end),
+                NodeData::Block(Box::new(BlockData {
+                    flow_node: None,
+                    locals: SymbolTable,
+                    multi_line: false,
+                    next_container: None,
+                    statements: NodeList {
+                        range: TextRange::new(start, end),
+                        nodes: Vec::new(),
+                        has_trailing_comma: false,
+                    },
+                    facts: 0,
+                })),
+                &[],
+            ));
         }
         let end = finally_block
             .or(catch_clause)
@@ -3208,7 +3330,9 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_entity_name(&mut self) -> NodeId {
-        let mut entity = if self.current.kind == SyntaxKind::UndefinedKeyword {
+        let mut entity = if self.current.kind == SyntaxKind::UndefinedKeyword
+            || is_contextual_keyword(self.current.kind)
+        {
             self.parse_identifier_name("Expected a module reference.")
         } else {
             self.parse_identifier("Expected a module reference.")
@@ -3583,6 +3707,11 @@ impl<'a> Parser<'a> {
             if precedence < minimum_precedence {
                 break;
             }
+            if self.current.kind.is_assignment_operator()
+                && !self.expression_can_precede_assignment(left, self.current.kind)
+            {
+                break;
+            }
             let operator = self.consume();
             let operator_node = self.alloc_node(
                 operator.kind,
@@ -3657,6 +3786,28 @@ impl<'a> Parser<'a> {
             );
         }
         left
+    }
+
+    fn expression_can_precede_assignment(&self, expression: NodeId, operator: SyntaxKind) -> bool {
+        let Some(node) = self.arena.get(expression) else {
+            return false;
+        };
+        match &node.data {
+            NodeData::Identifier(_)
+            | NodeData::PropertyAccessExpression(_)
+            | NodeData::ElementAccessExpression(_)
+            | NodeData::CallExpression(_) => true,
+            NodeData::ParenthesizedExpression(parenthesized) => {
+                self.expression_can_precede_assignment(parenthesized.expression, operator)
+            }
+            NodeData::NonNullExpression(non_null) => {
+                self.expression_can_precede_assignment(non_null.expression, operator)
+            }
+            NodeData::ArrayLiteralExpression(_) | NodeData::ObjectLiteralExpression(_) => {
+                operator == SyntaxKind::EqualsToken
+            }
+            _ => false,
+        }
     }
 
     fn is_async_arrow_function(&mut self) -> bool {
@@ -4450,6 +4601,29 @@ impl<'a> Parser<'a> {
         false
     }
 
+    fn is_parenthesized_function_type(&mut self) -> bool {
+        let checkpoint = self.scanner.mark();
+        let mut depth = 1_u32;
+        let mut token = self.scanner.scan();
+        while token.kind != SyntaxKind::EndOfFile {
+            match token.kind {
+                SyntaxKind::OpenParenToken => depth += 1,
+                SyntaxKind::CloseParenToken => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let result = self.scanner.scan().kind == SyntaxKind::EqualsGreaterThanToken;
+                        self.scanner.rewind(checkpoint);
+                        return result;
+                    }
+                }
+                _ => {}
+            }
+            token = self.scanner.scan();
+        }
+        self.scanner.rewind(checkpoint);
+        false
+    }
+
     fn parse_parenthesized_arrow_function(&mut self) -> NodeId {
         let start = self.current.range.start;
         let parameters = self.parse_parameter_list();
@@ -4811,6 +4985,7 @@ impl<'a> Parser<'a> {
         let start = self.consume().range.start;
         let mut properties = Vec::new();
         let mut trailing = false;
+        let mut has_recovered_missing_colon = false;
         while self.current.kind != SyntaxKind::CloseBraceToken
             && self.current.kind != SyntaxKind::EndOfFile
         {
@@ -4914,8 +5089,15 @@ impl<'a> Parser<'a> {
                     })),
                     &children,
                 ));
-            } else if self.current.kind == SyntaxKind::ColonToken {
-                self.bump();
+            } else if self.current.kind == SyntaxKind::ColonToken
+                || self.current_token_starts_recovered_object_property_initializer()
+            {
+                if self.current.kind == SyntaxKind::ColonToken {
+                    self.bump();
+                } else {
+                    self.error_current("Expected ':'.");
+                    has_recovered_missing_colon = true;
+                }
                 let initializer = self.parse_binary_expression(2);
                 properties.push(self.alloc_node(
                     SyntaxKind::PropertyAssignment,
@@ -4950,18 +5132,24 @@ impl<'a> Parser<'a> {
                     &[name],
                 ));
             }
-            if self.current.kind != SyntaxKind::CommaToken {
+            if !matches!(
+                self.current.kind,
+                SyntaxKind::CommaToken | SyntaxKind::SemicolonToken
+            ) {
                 break;
             }
+            let separator = self.current.kind;
             self.bump();
-            trailing = self.current.kind == SyntaxKind::CloseBraceToken;
+            trailing = separator == SyntaxKind::CommaToken
+                && self.current.kind == SyntaxKind::CloseBraceToken;
         }
-        let end = if self.current.kind == SyntaxKind::CloseBraceToken {
-            self.consume().range.end
-        } else {
-            self.error_current("Expected '}'.");
-            properties.last().map_or(start, |id| self.node_end(*id))
-        };
+        let end =
+            if self.current.kind == SyntaxKind::CloseBraceToken && !has_recovered_missing_colon {
+                self.consume().range.end
+            } else {
+                self.error_current("Expected '}'.");
+                properties.last().map_or(start, |id| self.node_end(*id))
+            };
         self.alloc_node(
             SyntaxKind::ObjectLiteralExpression,
             TextRange::new(start, end),
@@ -4976,6 +5164,30 @@ impl<'a> Parser<'a> {
                 facts: 0,
             })),
             &properties,
+        )
+    }
+
+    fn current_token_starts_recovered_object_property_initializer(&self) -> bool {
+        matches!(
+            self.current.kind,
+            SyntaxKind::Identifier
+                | SyntaxKind::PrivateIdentifier
+                | SyntaxKind::NumericLiteral
+                | SyntaxKind::BigIntLiteral
+                | SyntaxKind::StringLiteral
+                | SyntaxKind::NoSubstitutionTemplateLiteral
+                | SyntaxKind::NullKeyword
+                | SyntaxKind::TrueKeyword
+                | SyntaxKind::FalseKeyword
+                | SyntaxKind::UndefinedKeyword
+                | SyntaxKind::ThisKeyword
+                | SyntaxKind::SuperKeyword
+                | SyntaxKind::NewKeyword
+                | SyntaxKind::FunctionKeyword
+                | SyntaxKind::ClassKeyword
+                | SyntaxKind::OpenParenToken
+                | SyntaxKind::OpenBracketToken
+                | SyntaxKind::OpenBraceToken
         )
     }
 
@@ -5117,6 +5329,19 @@ impl<'a> Parser<'a> {
             })),
             &[closing_name],
         );
+        if self.current.kind == SyntaxKind::ConflictMarkerTrivia {
+            let checkpoint = self.scanner.mark();
+            let next = if resume_jsx {
+                self.scanner.scan_jsx_token()
+            } else {
+                self.scanner.scan()
+            };
+            if next.kind == SyntaxKind::EndOfFile {
+                self.current = next;
+            } else {
+                self.scanner.rewind(checkpoint);
+            }
+        }
         let mut all_children = vec![opening];
         all_children.extend(children.iter().copied());
         all_children.push(closing);
@@ -5141,7 +5366,9 @@ impl<'a> Parser<'a> {
         let mut children = Vec::new();
         while !matches!(
             self.current.kind,
-            SyntaxKind::LessThanSlashToken | SyntaxKind::EndOfFile
+            SyntaxKind::LessThanSlashToken
+                | SyntaxKind::ConflictMarkerTrivia
+                | SyntaxKind::EndOfFile
         ) {
             match self.current.kind {
                 SyntaxKind::JsxText | SyntaxKind::JsxTextAllWhiteSpaces => {
@@ -5191,6 +5418,15 @@ impl<'a> Parser<'a> {
                     self.error_current("Unexpected token in JSX children.");
                     self.current = self.scanner.scan_jsx_token();
                 }
+            }
+        }
+        if self.current.kind == SyntaxKind::ConflictMarkerTrivia {
+            while children.last().is_some_and(|child| {
+                self.arena
+                    .get(*child)
+                    .is_some_and(|node| node.kind == SyntaxKind::JsxTextAllWhiteSpaces)
+            }) {
+                children.pop();
             }
         }
         children
@@ -5498,6 +5734,11 @@ impl<'a> Parser<'a> {
 
     fn parse_string_literal(&mut self) -> NodeId {
         let token = self.consume();
+        let token_flags = TokenFlags(if token.flags.contains(ScannerTokenFlags::UNTERMINATED) {
+            1 << 2
+        } else {
+            0
+        });
         let text = token
             .value
             .as_ref()
@@ -5505,10 +5746,7 @@ impl<'a> Parser<'a> {
         self.alloc_node(
             SyntaxKind::StringLiteral,
             token.range,
-            NodeData::StringLiteral(Box::new(StringLiteralData {
-                text,
-                token_flags: TokenFlags::default(),
-            })),
+            NodeData::StringLiteral(Box::new(StringLiteralData { text, token_flags })),
             &[],
         )
     }
@@ -5633,7 +5871,9 @@ impl<'a> Parser<'a> {
             return self.parse_type_predicate();
         }
         let check_type = self.parse_union_type();
-        if self.current.kind != SyntaxKind::ExtendsKeyword {
+        if self.current.kind != SyntaxKind::ExtendsKeyword
+            || self.next_token_kind() == SyntaxKind::QuestionToken
+        {
             return check_type;
         }
         self.bump();
@@ -5827,8 +6067,8 @@ impl<'a> Parser<'a> {
 
     #[allow(clippy::too_many_lines)]
     fn parse_primary_type(&mut self) -> NodeId {
-        let parenthesized_function =
-            self.current.kind == SyntaxKind::OpenParenToken && self.is_parenthesized_arrow();
+        let parenthesized_function = self.current.kind == SyntaxKind::OpenParenToken
+            && self.is_parenthesized_function_type();
         let mapped_type = self.current.kind == SyntaxKind::OpenBraceToken && self.is_mapped_type();
         match self.current.kind {
             SyntaxKind::OpenBraceToken if mapped_type => self.parse_mapped_type(),
@@ -7725,6 +7965,113 @@ mod tests {
     }
 
     #[test]
+    fn invalid_parameter_modifiers_do_not_detach_constructor_bodies() {
+        let result = parse_source_file(concat!(
+            "class Static { constructor(static a: number) {} }\n",
+            "class Mixed { constructor(public static a: number) {} }\n",
+            "class Exported { constructor(export a: number) {} }",
+        ));
+        let statements = source_statements(&result);
+        assert_eq!(statements.len(), 3);
+        for statement in statements {
+            let NodeData::ClassDeclaration(class) = &result.arena.get(*statement).unwrap().data
+            else {
+                panic!("expected class declaration");
+            };
+            let NodeData::MethodDeclaration(constructor) =
+                &result.arena.get(class.members.nodes[0]).unwrap().data
+            else {
+                panic!("expected constructor method");
+            };
+            assert!(constructor.body.is_some());
+            let NodeData::ParameterDeclaration(parameter) = &result
+                .arena
+                .get(constructor.parameters.nodes[0])
+                .unwrap()
+                .data
+            else {
+                panic!("expected constructor parameter");
+            };
+            let NodeData::Identifier(name) = &result.arena.get(parameter.name).unwrap().data else {
+                panic!("expected parameter name");
+            };
+            assert_eq!(name.text, "a");
+        }
+    }
+
+    #[test]
+    fn conflict_marker_recovery_keeps_selected_class_members() {
+        let source = concat!(
+            "class C {\n",
+            "  foo() {\n",
+            "<<<<<<< B\n",
+            "    a();\n",
+            "  }\n",
+            "=======\n",
+            "    b();\n",
+            "  }\n",
+            ">>>>>>> A\n",
+            "  public bar() {}\n",
+            "}\n",
+        );
+        let result = parse_source_file(source);
+        let statements = source_statements(&result);
+        let NodeData::ClassDeclaration(class) = &result.arena.get(statements[0]).unwrap().data
+        else {
+            panic!("expected class declaration");
+        };
+        assert_eq!(class.members.nodes.len(), 2, "{:?}", result.diagnostics);
+        let names = class
+            .members
+            .nodes
+            .iter()
+            .map(|member| {
+                let NodeData::MethodDeclaration(method) = &result.arena.get(*member).unwrap().data
+                else {
+                    panic!("expected method declaration");
+                };
+                let NodeData::Identifier(name) = &result.arena.get(method.name).unwrap().data
+                else {
+                    panic!("expected method name");
+                };
+                name.text.as_str()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["foo", "bar"]);
+    }
+
+    #[test]
+    fn conflict_marker_terminates_unclosed_jsx_children() {
+        let result = parse_jsx_source_file("const x = <div>\n<<<<<<< HEAD");
+        let statements = source_statements(&result);
+        assert_eq!(statements.len(), 1, "{:?}", result.diagnostics);
+        let (list, _) = variable_list(&result, statements[0]);
+        let declaration = declaration_nodes(&result, list)[0];
+        let NodeData::VariableDeclaration(declaration) =
+            &result.arena.get(declaration).unwrap().data
+        else {
+            panic!("expected variable declaration");
+        };
+        let NodeData::JsxElement(element) = &result
+            .arena
+            .get(declaration.initializer.unwrap())
+            .unwrap()
+            .data
+        else {
+            panic!("expected JSX element");
+        };
+        let NodeData::JsxClosingElement(closing) =
+            &result.arena.get(element.closing_element).unwrap().data
+        else {
+            panic!("expected synthetic JSX closing element");
+        };
+        let NodeData::Identifier(name) = &result.arena.get(closing.tag_name).unwrap().data else {
+            panic!("expected synthetic closing tag name");
+        };
+        assert!(name.text.is_empty());
+    }
+
+    #[test]
     fn parses_imports_and_exports() {
         let source = r#"
             import base, {x as y, z} from "m";
@@ -8688,6 +9035,57 @@ mod tests {
     }
 
     #[test]
+    fn separates_conditional_types_from_following_declaration_tokens() {
+        let result = parse_source_file(
+            r"
+                interface Schema {
+                    a?: number
+                    extends?: string | string[]
+                }
+                function test<T>(x: unknown) {
+                    const value: [T] extends [number]
+                        ? ([T] extends [string] ? { y: number } : { a: number })
+                        : ([T] extends [string] ? { y: number } : { b: number }) = x;
+                }
+            ",
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+
+        let interface = result
+            .arena
+            .iter()
+            .find_map(|(_, node)| {
+                let NodeData::InterfaceDeclaration(interface) = &node.data else {
+                    return None;
+                };
+                Some(interface)
+            })
+            .unwrap();
+        assert_eq!(interface.members.nodes.len(), 2);
+
+        let value = result
+            .arena
+            .iter()
+            .find_map(|(_, node)| {
+                let NodeData::VariableDeclaration(variable) = &node.data else {
+                    return None;
+                };
+                let NodeData::Identifier(name) = &result.arena.get(variable.name)?.data else {
+                    return None;
+                };
+                (name.text == "value").then_some(variable)
+            })
+            .unwrap();
+        let initializer = value
+            .initializer
+            .expect("initializer after conditional type");
+        assert!(matches!(
+            result.arena.get(initializer).map(|node| &node.data),
+            Some(NodeData::Identifier(identifier)) if identifier.text == "x"
+        ));
+    }
+
+    #[test]
     fn parses_assertion_predicates_in_functions_methods_and_properties() {
         let result = parse_source_file(
             r"
@@ -9013,6 +9411,28 @@ mod tests {
             panic!("expected identifier module reference");
         };
         assert_eq!(reference.text, "undefined");
+    }
+
+    #[test]
+    fn recovers_contextual_keyword_import_equals_entity_names() {
+        let result = parse_source_file("import fs = module(\"fs\");");
+        let statements = source_statements(&result);
+        assert_eq!(statements.len(), 2);
+        let NodeData::ImportEqualsDeclaration(import) =
+            &result.arena.get(statements[0]).unwrap().data
+        else {
+            panic!("expected import-equals declaration");
+        };
+        let NodeData::Identifier(reference) =
+            &result.arena.get(import.module_reference).unwrap().data
+        else {
+            panic!("expected identifier module reference");
+        };
+        assert_eq!(reference.text, "module");
+        assert_eq!(
+            result.arena.get(statements[1]).unwrap().kind,
+            SyntaxKind::ExpressionStatement
+        );
     }
 
     #[test]
