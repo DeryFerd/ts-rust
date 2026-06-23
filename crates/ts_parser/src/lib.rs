@@ -1342,7 +1342,11 @@ impl<'a> Parser<'a> {
 
     fn parse_class_declaration(&mut self) -> NodeId {
         let start = self.consume().range.start;
-        let name = if self.current.kind == SyntaxKind::Identifier || self.current.kind.is_keyword()
+        let name = if !matches!(
+            self.current.kind,
+            SyntaxKind::ExtendsKeyword | SyntaxKind::ImplementsKeyword
+        ) && (self.current.kind == SyntaxKind::Identifier
+            || self.current.kind.is_keyword())
         {
             Some(self.parse_identifier_name("Expected a class name."))
         } else {
@@ -1380,8 +1384,11 @@ impl<'a> Parser<'a> {
 
     fn parse_class_expression(&mut self) -> NodeId {
         let start = self.consume().range.start;
-        let name = if self.current.kind != SyntaxKind::ExtendsKeyword
-            && (self.current.kind == SyntaxKind::Identifier || self.current.kind.is_keyword())
+        let name = if !matches!(
+            self.current.kind,
+            SyntaxKind::ExtendsKeyword | SyntaxKind::ImplementsKeyword
+        ) && (self.current.kind == SyntaxKind::Identifier
+            || self.current.kind.is_keyword())
         {
             Some(self.parse_identifier_name("Expected a class name."))
         } else {
@@ -1413,6 +1420,31 @@ impl<'a> Parser<'a> {
             })),
             &children,
         )
+    }
+
+    fn parse_decorated_class_expression(&mut self) -> NodeId {
+        let start = self.current.range.start;
+        let mut decorators = Vec::new();
+        while self.current.kind == SyntaxKind::AtToken {
+            let decorator_start = self.consume().range.start;
+            let expression = self.parse_postfix_expression();
+            decorators.push(self.alloc_node(
+                SyntaxKind::Decorator,
+                TextRange::new(decorator_start, self.node_end(expression)),
+                NodeData::Decorator(Box::new(DecoratorData {
+                    expression,
+                    facts: 0,
+                })),
+                &[expression],
+            ));
+        }
+        if self.current.kind != SyntaxKind::ClassKeyword {
+            self.error_current("Expected 'class' after decorators.");
+            return self.missing_identifier(self.current.range.start);
+        }
+        let expression = self.parse_class_expression();
+        self.attach_modifiers(expression, decorators, start);
+        expression
     }
 
     fn parse_interface_declaration(&mut self) -> NodeId {
@@ -1462,6 +1494,7 @@ impl<'a> Parser<'a> {
         ) {
             let keyword = self.consume();
             let mut types = Vec::new();
+            let mut has_trailing_comma = false;
             loop {
                 let mut expression = self.parse_heritage_expression();
                 let mut type_arguments = self.parse_type_arguments();
@@ -1506,7 +1539,18 @@ impl<'a> Parser<'a> {
                 if self.current.kind != SyntaxKind::CommaToken {
                     break;
                 }
-                self.bump();
+                let comma = self.consume();
+                if matches!(
+                    self.current.kind,
+                    SyntaxKind::OpenBraceToken
+                        | SyntaxKind::ExtendsKeyword
+                        | SyntaxKind::ImplementsKeyword
+                        | SyntaxKind::EndOfFile
+                ) {
+                    has_trailing_comma = true;
+                    self.error_code_at(comma.range, 1009, std::iter::empty::<String>());
+                    break;
+                }
             }
             let end = types
                 .last()
@@ -1519,7 +1563,7 @@ impl<'a> Parser<'a> {
                     types: NodeList {
                         range: TextRange::new(keyword.range.end, end),
                         nodes: types.clone(),
-                        has_trailing_comma: false,
+                        has_trailing_comma,
                     },
                     facts: 0,
                 })),
@@ -1535,7 +1579,30 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_heritage_expression(&mut self) -> NodeId {
-        let mut expression = self.parse_entity_name();
+        // A class heritage expression is not restricted to an entity name.
+        // In particular, field initializers can contain anonymous classes such
+        // as `class extends this.base {}`.  `parse_entity_name` recovers `this`
+        // as a missing identifier and leaves the property access behind, which
+        // then prematurely terminates the containing class member.
+        let mut expression = if matches!(
+            self.current.kind,
+            SyntaxKind::ThisKeyword
+                | SyntaxKind::SuperKeyword
+                | SyntaxKind::StringLiteral
+                | SyntaxKind::NumericLiteral
+                | SyntaxKind::NullKeyword
+                | SyntaxKind::OpenParenToken
+                | SyntaxKind::ClassKeyword
+        ) {
+            self.parse_postfix_expression()
+        } else if is_keyword_type(self.current.kind) {
+            // Invalid primitive heritage names still belong to the clause. Consuming the token
+            // here lets semantic checking report the invalid implementation without losing the
+            // class body and following declarations during parser recovery.
+            self.parse_identifier_name("Expected a heritage name.")
+        } else {
+            self.parse_entity_name()
+        };
         while self.current.kind == SyntaxKind::OpenParenToken {
             let arguments = self.parse_argument_list();
             let end = arguments.range.end;
@@ -1576,6 +1643,19 @@ impl<'a> Parser<'a> {
         {
             if !signature_only && self.current.kind == SyntaxKind::VarKeyword {
                 self.error_code_at(self.current.range, 1068, std::iter::empty::<String>());
+                recovered_at_statement = true;
+                break;
+            }
+            // A modifier followed directly by a block cannot form a member. Consume the orphaned
+            // modifier and leave the block for statement parsing instead of treating its closing
+            // brace as the class terminator.
+            if !signature_only
+                && self.current.kind.is_modifier()
+                && self.current.kind != SyntaxKind::StaticKeyword
+                && self.next_token_kind() == SyntaxKind::OpenBraceToken
+            {
+                self.error_current("Declaration expected.");
+                self.bump();
                 recovered_at_statement = true;
                 break;
             }
@@ -2861,6 +2941,7 @@ impl<'a> Parser<'a> {
             .get(declaration)
             .and_then(|node| match &node.data {
                 NodeData::ClassDeclaration(data) => data.modifiers.clone(),
+                NodeData::ClassExpression(data) => data.modifiers.clone(),
                 NodeData::FunctionDeclaration(data) => data.modifiers.clone(),
                 NodeData::FunctionExpression(data) => data.modifiers.clone(),
                 NodeData::InterfaceDeclaration(data) => data.modifiers.clone(),
@@ -2885,6 +2966,7 @@ impl<'a> Parser<'a> {
         if let Some(node) = self.arena.get_mut(declaration) {
             match &mut node.data {
                 NodeData::ClassDeclaration(data) => data.modifiers = Some(modifiers.clone()),
+                NodeData::ClassExpression(data) => data.modifiers = Some(modifiers.clone()),
                 NodeData::FunctionDeclaration(data) => data.modifiers = Some(modifiers.clone()),
                 NodeData::FunctionExpression(data) => data.modifiers = Some(modifiers.clone()),
                 NodeData::InterfaceDeclaration(data) => data.modifiers = Some(modifiers.clone()),
@@ -4540,6 +4622,7 @@ impl<'a> Parser<'a> {
             }
             SyntaxKind::FunctionKeyword => self.parse_function_expression(),
             SyntaxKind::ClassKeyword => self.parse_class_expression(),
+            SyntaxKind::AtToken => self.parse_decorated_class_expression(),
             SyntaxKind::NoSubstitutionTemplateLiteral => self.parse_template_literal(),
             SyntaxKind::NullKeyword
             | SyntaxKind::TrueKeyword
@@ -4632,6 +4715,15 @@ impl<'a> Parser<'a> {
             && self.current.kind != SyntaxKind::EndOfFile
         {
             elements.push(self.parse_spread_element_or_expression());
+            if self.current.kind == SyntaxKind::ColonToken {
+                // Recover an object/type-like `name: value` fragment inside an array as two
+                // elements. This is the same statement-level recovery used after a malformed
+                // class member such as `{ [name: string]: T }`.
+                self.error_current("Expected ','.");
+                self.bump();
+                trailing = false;
+                continue;
+            }
             if self.current.kind != SyntaxKind::CommaToken {
                 break;
             }
@@ -6563,7 +6655,7 @@ mod tests {
 
     use super::{
         NODE_FLAG_AWAIT_USING, NODE_FLAG_HAS_ERROR, NODE_FLAG_USING, ParseResult,
-        parse_jsdoc_comment, parse_jsx_source_file, parse_source_file,
+        parse_jsdoc_comment, parse_jsx_source_file, parse_source_file, text_range,
     };
 
     #[test]
@@ -9114,6 +9206,35 @@ mod tests {
     }
 
     #[test]
+    fn parses_decorated_class_expression() {
+        let result = parse_source_file("const value = @first @factory(arg) class Inner {};");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let statement = source_statements(&result)[0];
+        let (list, _) = variable_list(&result, statement);
+        let declaration = declaration_nodes(&result, list)[0];
+        let NodeData::VariableDeclaration(declaration) =
+            &result.arena.get(declaration).unwrap().data
+        else {
+            panic!("expected variable declaration");
+        };
+        let class_id = declaration.initializer.unwrap();
+        let class_node = result.arena.get(class_id).unwrap();
+        let NodeData::ClassExpression(class) = &class_node.data else {
+            panic!("expected class expression");
+        };
+        let modifiers = class.modifiers.as_ref().unwrap();
+        assert_eq!(modifiers.list.nodes.len(), 2);
+        assert_eq!(class_node.range.start.get(), 14);
+        assert!(
+            modifiers
+                .list
+                .nodes
+                .iter()
+                .all(|modifier| { result.arena.get(*modifier).unwrap().parent == Some(class_id) })
+        );
+    }
+
+    #[test]
     fn parses_call_expressions_in_class_heritage() {
         let source = "class User {} class TimestampedUser extends Timestamped(User) { constructor() { super(); } }";
         let result = parse_source_file(source);
@@ -9214,6 +9335,83 @@ mod tests {
         };
         assert_eq!(call.type_arguments.as_ref().unwrap().nodes.len(), 1);
         assert!(call.arguments.nodes.is_empty());
+    }
+
+    #[test]
+    fn recovers_trailing_commas_in_heritage_clauses() {
+        let source = "class Derived extends Base, { value = 1; }";
+        let result = parse_source_file(source);
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .filter_map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [1009]
+        );
+        let comma = source.find(',').unwrap();
+        assert_eq!(result.diagnostics[0].range, text_range(comma, comma + 1));
+
+        let statement = source_statements(&result)[0];
+        let NodeData::ClassDeclaration(class) = &result.arena.get(statement).unwrap().data else {
+            panic!("expected class declaration");
+        };
+        assert_eq!(class.members.nodes.len(), 1);
+        let clause_id = class.heritage_clauses.as_ref().unwrap().nodes[0];
+        let NodeData::HeritageClause(clause) = &result.arena.get(clause_id).unwrap().data else {
+            panic!("expected heritage clause");
+        };
+        assert_eq!(clause.types.nodes.len(), 1);
+        assert!(clause.types.has_trailing_comma);
+        let NodeData::ExpressionWithTypeArguments(heritage) =
+            &result.arena.get(clause.types.nodes[0]).unwrap().data
+        else {
+            panic!("expected heritage expression");
+        };
+        let NodeData::Identifier(base) = &result.arena.get(heritage.expression).unwrap().data
+        else {
+            panic!("expected heritage identifier");
+        };
+        assert_eq!(base.text, "Base");
+    }
+
+    #[test]
+    fn consumes_primitive_implements_names_without_losing_class_bodies() {
+        let result = parse_source_file(
+            "class C implements number {} const D = class implements string {}; class E {}",
+        );
+        let statements = source_statements(&result);
+        assert_eq!(statements.len(), 3, "{:?}", result.diagnostics);
+        for statement in [statements[0], statements[2]] {
+            assert!(matches!(
+                result.arena.get(statement).unwrap().data,
+                NodeData::ClassDeclaration(_)
+            ));
+        }
+        assert!(matches!(
+            result.arena.get(statements[1]).unwrap().data,
+            NodeData::VariableStatement(_)
+        ));
+    }
+
+    #[test]
+    fn recovers_modifier_without_member_name_at_following_block() {
+        let result = parse_source_file("class C { public {}; }");
+        let statements = source_statements(&result);
+        assert_eq!(statements.len(), 3, "{:?}", result.diagnostics);
+        let NodeData::ClassDeclaration(class) = &result.arena.get(statements[0]).unwrap().data
+        else {
+            panic!("expected class declaration");
+        };
+        assert!(class.members.nodes.is_empty());
+        assert!(matches!(
+            result.arena.get(statements[1]).unwrap().data,
+            NodeData::Block(_)
+        ));
+        assert!(matches!(
+            result.arena.get(statements[2]).unwrap().data,
+            NodeData::EmptyStatement(_)
+        ));
     }
 
     #[test]

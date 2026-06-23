@@ -738,12 +738,21 @@ fn fixture_compiler_options(case: &Case, variant: &OptionVariant) -> ts_options:
         values.retain(|configured_name, _| !configured_name.eq_ignore_ascii_case(name));
         values.insert(name.to_owned(), directive_json_value(name, value));
     }
-    if let Some(mut config) = project_config {
+    let has_explicit_target = values
+        .keys()
+        .any(|name| name.eq_ignore_ascii_case("target"));
+    let mut options = if let Some(mut config) = project_config {
         config.compiler_options = values;
         ts_options::parse_project_options(&config).options
     } else {
         ts_options::parse_compiler_options(&ts_config::JsonValue::Object(values)).options
+    };
+    // The current ts-go compiler treats an omitted target as the latest
+    // standard language version rather than the historical ES5 default.
+    if !has_explicit_target {
+        options.target = ts_options::ScriptTarget::Es2025;
     }
+    options
 }
 
 fn project_config_unit(case: &Case) -> Option<(String, &Unit)> {
@@ -1266,8 +1275,8 @@ mod tests {
     use super::{
         Case, OptionVariant, OutputDifferenceKind, ParseError,
         compare_case_emitted_output_sections, compare_emitted_output_sections, compile_case,
-        compile_case_matrix, expand_option_matrix, first_different_line, parse_baseline_sections,
-        run_case_against_baseline,
+        compile_case_matrix, expand_option_matrix, first_different_line, fixture_compiler_options,
+        parse_baseline_sections, run_case_against_baseline,
     };
 
     #[test]
@@ -1286,6 +1295,22 @@ mod tests {
         );
         assert_eq!(case.directives[1].line, 2);
         assert_eq!(case.directives[1].raw_text, "// @strict: true");
+    }
+
+    #[test]
+    fn omitted_fixture_target_uses_the_current_upstream_default() {
+        let case = Case::parse("defaultTarget.ts", "const answer = 42;\n").unwrap();
+        let options = fixture_compiler_options(&case, &OptionVariant::default());
+        assert_eq!(options.target, ts_options::ScriptTarget::Es2025);
+
+        let case = Case::parse(
+            "explicitTarget.ts",
+            "// @target: es2015\nconst answer = 42;\n",
+        )
+        .unwrap();
+        let variant = expand_option_matrix(&case).remove(0);
+        let options = fixture_compiler_options(&case, &variant);
+        assert_eq!(options.target, ts_options::ScriptTarget::Es2015);
     }
 
     #[test]

@@ -380,6 +380,37 @@ impl<'a> Binder<'a> {
                     }
                 }
             }
+            NodeData::ClassExpression(data) => {
+                // A named class expression introduces its name only in the class's own
+                // lexical scope. Binding it in the enclosing scope would incorrectly
+                // expose the name after the expression, while omitting it leaves static
+                // field initializers and methods unable to resolve self references.
+                let class_scope = self.create_scope(ScopeKind::Class, node_id, Some(scope));
+                self.result.node_scopes.insert(node_id, class_scope);
+                let symbol = data.name.and_then(|name| {
+                    self.declare_named(
+                        class_scope,
+                        node_id,
+                        name,
+                        SymbolFlags::CLASS,
+                        parent_symbol,
+                    )
+                });
+                self.bind_type_parameters(
+                    data.type_parameters.as_ref(),
+                    class_scope,
+                    node_id,
+                    symbol,
+                );
+                for member in &data.members.nodes {
+                    self.bind_node(*member, class_scope, node_id, symbol);
+                }
+                if let Some(heritage) = &data.heritage_clauses {
+                    for clause in &heritage.nodes {
+                        self.bind_node(*clause, class_scope, node_id, symbol);
+                    }
+                }
+            }
             NodeData::InterfaceDeclaration(data) => {
                 let symbol = self.declare_and_export(
                     scope,
@@ -2216,6 +2247,62 @@ mod tests {
             result.resolve_name_at(initializer, "cls"),
             Some(namespace_alias)
         );
+    }
+
+    #[test]
+    fn binds_named_class_expression_in_its_own_scope() {
+        let parsed =
+            parse_source_file("const value = class Inner { static self = Inner; }; Inner;");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let result = bind_source_file(&parsed.arena, parsed.source_file);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert_eq!(result.root_scope().unwrap().symbols.get("Inner"), None);
+
+        let NodeData::SourceFile(source) = &parsed.arena.get(parsed.source_file).unwrap().data
+        else {
+            panic!("expected source file");
+        };
+        let NodeData::VariableStatement(statement) =
+            &parsed.arena.get(source.statements.nodes[0]).unwrap().data
+        else {
+            panic!("expected variable statement");
+        };
+        let NodeData::VariableDeclarationList(list) =
+            &parsed.arena.get(statement.declaration_list).unwrap().data
+        else {
+            panic!("expected declaration list");
+        };
+        let NodeData::VariableDeclaration(variable) =
+            &parsed.arena.get(list.declarations.nodes[0]).unwrap().data
+        else {
+            panic!("expected variable declaration");
+        };
+        let class_id = variable.initializer.unwrap();
+        let NodeData::ClassExpression(class) = &parsed.arena.get(class_id).unwrap().data else {
+            panic!("expected class expression");
+        };
+        let class_symbol = result.node_symbols[&class_id];
+        assert_eq!(
+            result.node_symbols.get(&class.name.unwrap()),
+            Some(&class_symbol)
+        );
+        let NodeData::PropertyDeclaration(property) =
+            &parsed.arena.get(class.members.nodes[0]).unwrap().data
+        else {
+            panic!("expected property declaration");
+        };
+        let self_reference = property.initializer.unwrap();
+        assert_eq!(
+            result.resolve_name_at(self_reference, "Inner"),
+            Some(class_symbol)
+        );
+        let outside_reference = source.statements.nodes[1];
+        let NodeData::ExpressionStatement(outside) =
+            &parsed.arena.get(outside_reference).unwrap().data
+        else {
+            panic!("expected expression statement");
+        };
+        assert_eq!(result.resolve_name_at(outside.expression, "Inner"), None);
     }
 
     #[test]

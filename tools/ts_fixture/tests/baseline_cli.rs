@@ -198,7 +198,8 @@ fn prioritizes_emit_diagnostic_for_unsupported_output() {
         concat!(
             "// @noLib: true\n",
             "// @target: es2015\n",
-            "const Value = class Inner { static value = 1; };\n",
+            "const value = {};\n",
+            "delete value.missing;\n",
         ),
         Some("//// [unsupported.js] ////\nvar N;\n"),
     );
@@ -206,7 +207,7 @@ fn prioritizes_emit_diagnostic_for_unsupported_output() {
     assert_eq!(output.status.code(), Some(1));
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("diagnostic no code /case/unsupported.ts"));
-    assert!(stdout.contains("unsupported ClassExpression node"));
+    assert!(stdout.contains("unsupported DeleteExpression node"));
     assert!(stdout.contains("diagnostics=1"));
 }
 
@@ -228,7 +229,7 @@ fn counts_missing_and_unexpected_output_sections() {
 
     repository.write_case(
         "unexpectedSection",
-        "// @declaration: true\nconst value = 1;\n",
+        "// @declaration: true\n// @target: es5\nconst value = 1;\n",
         Some("//// [unexpectedSection.js] ////\n\"use strict\";\nvar value = 1;\n"),
     );
     let unexpected = run(&repository.0, &["--filter", "unexpectedSection"]);

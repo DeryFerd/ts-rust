@@ -8005,6 +8005,10 @@ impl<'a> Checker<'a> {
             NodeData::ParenthesizedExpression(parenthesized) => {
                 self.computed_property_name(parenthesized.expression)
             }
+            // Preserve a dynamic symbol-like key in inferred object types. The bracket marker is
+            // intentionally retained for declaration serialization and cannot collide with an
+            // ordinary identifier property.
+            NodeData::Identifier(identifier) => Some(format!("[{}]", identifier.text)),
             _ => None,
         }
     }
@@ -8237,6 +8241,20 @@ impl<'a> DeclarationReachability<'a> {
                     NodeData::ExpressionWithTypeArguments(expression) => {
                         self.retain_entity(expression.expression);
                     }
+                    NodeData::ComputedPropertyName(computed) => {
+                        self.retain_expression_root(computed.expression);
+                    }
+                    NodeData::CallExpression(call) if self.node_is_in_heritage(node_id) => {
+                        self.retain_expression_root(call.expression);
+                    }
+                    NodeData::PropertyAssignment(property) if self.node_is_in_heritage(node_id) => {
+                        self.retain_expression_root(property.initializer);
+                    }
+                    NodeData::ShorthandPropertyAssignment(property)
+                        if self.node_is_in_heritage(node_id) =>
+                    {
+                        self.retain_entity(property.name);
+                    }
                     NodeData::ImportEqualsDeclaration(import) => {
                         self.retain_entity(import.module_reference);
                     }
@@ -8260,7 +8278,15 @@ impl<'a> DeclarationReachability<'a> {
         let Some((identifier, name)) = self.leftmost_entity_name(entity) else {
             return;
         };
-        let Some(symbol) = self.bindings.resolve_name_at(identifier, &name) else {
+        let Some(symbol) = self
+            .bindings
+            .resolve_name_at(identifier, &name)
+            .or_else(|| {
+                self.bindings
+                    .root_scope()
+                    .and_then(|scope| scope.symbols.get(&name))
+            })
+        else {
             return;
         };
         let target = self
@@ -8280,6 +8306,37 @@ impl<'a> DeclarationReachability<'a> {
                 self.retain(statement);
             }
         }
+    }
+
+    fn retain_expression_root(&mut self, expression: NodeId) {
+        match &self.arena.get(expression).map(|node| &node.data) {
+            Some(NodeData::CallExpression(call)) => {
+                self.retain_expression_root(call.expression);
+            }
+            Some(NodeData::ParenthesizedExpression(parenthesized)) => {
+                self.retain_expression_root(parenthesized.expression);
+            }
+            _ => self.retain_entity(expression),
+        }
+    }
+
+    fn node_is_in_heritage(&self, mut node: NodeId) -> bool {
+        while let Some(parent) = self.arena.get(node).and_then(|node| node.parent) {
+            if matches!(
+                self.arena.get(parent).map(|node| &node.data),
+                Some(NodeData::HeritageClause(_))
+            ) {
+                return true;
+            }
+            if matches!(
+                self.arena.get(parent).map(|node| &node.data),
+                Some(NodeData::ClassDeclaration(_) | NodeData::ClassExpression(_))
+            ) {
+                return false;
+            }
+            node = parent;
+        }
+        false
     }
 
     fn retain(&mut self, statement: NodeId) {
@@ -12637,6 +12694,24 @@ mod tests {
         assert!(retained.contains(&source.statements.nodes[0]));
         assert!(!retained.contains(&source.statements.nodes[1]));
         assert!(retained.contains(&source.statements.nodes[2]));
+    }
+
+    #[test]
+    fn retains_private_values_used_as_exported_computed_member_names() {
+        let parsed = parse_source_file(
+            "declare const key: symbol; export class C { [key](): number { return 1; } }",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        let NodeData::SourceFile(source) = &parsed.arena.get(parsed.source_file).unwrap().data
+        else {
+            panic!("expected source file");
+        };
+        let retained = result.declarations_to_emit(parsed.source_file).unwrap();
+        assert_eq!(retained.len(), 2, "{retained:?}");
+        assert!(retained.contains(&source.statements.nodes[0]));
+        assert!(retained.contains(&source.statements.nodes[1]));
     }
 
     #[test]
