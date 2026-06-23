@@ -1075,6 +1075,7 @@ pub fn emit_declaration_file_with_semantics(
             .iter()
             .any(|extension| source_name.to_ascii_lowercase().ends_with(extension)),
         generated_names: HashSet::new(),
+        emitted_javascript_class_properties: HashSet::new(),
     };
     let node = printer.node(source_file)?.clone();
     let NodeData::SourceFile(data) = &node.data else {
@@ -1099,7 +1100,7 @@ pub fn emit_declaration_file_with_semantics(
     }
     let mut deferred_javascript_namespaces = Vec::new();
     for statement in &data.statements.nodes {
-        if printer.is_javascript_object_namespace_statement(*statement) {
+        if printer.javascript_object_namespace_requires_deferral(*statement) {
             deferred_javascript_namespaces.push(*statement);
         } else {
             printer.emit_statement(*statement, false, source_file)?;
@@ -1136,6 +1137,7 @@ struct DeclarationPrinter<'a> {
     import_type_references: Option<&'a BTreeMap<TypeId, ImportTypeReference>>,
     javascript_source: bool,
     generated_names: HashSet<String>,
+    emitted_javascript_class_properties: HashSet<(NodeId, String)>,
 }
 
 impl DeclarationPrinter<'_> {
@@ -1392,22 +1394,17 @@ impl DeclarationPrinter<'_> {
                     self.emit_name(name)?;
                 }
                 self.emit_type_parameters(data.type_parameters.as_ref())?;
-                self.emit_parameters(&data.parameters)?;
+                let semantic_signature = self.semantic_function_signature(id);
+                if let Some(signature) = &semantic_signature {
+                    self.emit_declaration_parameters(&data.parameters, signature, id)?;
+                } else {
+                    self.emit_parameters(&data.parameters)?;
+                }
                 if data.type_.is_none()
-                    && let Some(return_type) = self
-                        .node_types
-                        .and_then(|types| types.get(&id).copied())
-                        .and_then(|type_id| self.semantic_types?.get(type_id))
-                        .and_then(|type_| match &type_.kind {
-                            TypeKind::Function(signature) => Some(signature.return_type),
-                            TypeKind::Overload(signatures) => {
-                                signatures.first().map(|signature| signature.return_type)
-                            }
-                            _ => None,
-                        })
+                    && let Some(signature) = semantic_signature
                 {
                     self.writer.write(": ");
-                    self.emit_function_semantic_return_type(data, return_type)?;
+                    self.emit_function_semantic_return_type(data, signature.return_type)?;
                 } else {
                     self.emit_return_type(data.type_)?;
                 }
@@ -1444,6 +1441,7 @@ impl DeclarationPrinter<'_> {
                 self.emit_constructor_parameter_properties(&data.members)?;
                 for member in &data.members.nodes {
                     self.emit_member(*member)?;
+                    self.emit_javascript_instance_properties(id, *member)?;
                 }
                 if self.class_has_recovered_constructor(data) {
                     self.writer.write("constructor();");
@@ -2273,6 +2271,49 @@ impl DeclarationPrinter<'_> {
             })
     }
 
+    fn javascript_object_namespace_requires_deferral(&self, statement: NodeId) -> bool {
+        if !self.is_javascript_object_namespace_statement(statement) {
+            return false;
+        }
+        let Some(NodeData::VariableStatement(statement)) =
+            self.arena.get(statement).map(|node| &node.data)
+        else {
+            return false;
+        };
+        let Some(NodeData::VariableDeclarationList(list)) = self
+            .arena
+            .get(statement.declaration_list)
+            .map(|node| &node.data)
+        else {
+            return false;
+        };
+        list.declarations.nodes.iter().any(|declaration| {
+            let Some(NodeData::VariableDeclaration(declaration)) =
+                self.arena.get(*declaration).map(|node| &node.data)
+            else {
+                return false;
+            };
+            let Some(NodeData::ObjectLiteralExpression(object)) = declaration
+                .initializer
+                .and_then(|initializer| self.arena.get(initializer))
+                .map(|node| &node.data)
+            else {
+                return false;
+            };
+            object.properties.nodes.iter().any(|property| {
+                let Some(NodeData::PropertyAssignment(property)) =
+                    self.arena.get(*property).map(|node| &node.data)
+                else {
+                    return false;
+                };
+                matches!(
+                    self.arena.get(property.initializer).map(|node| &node.data),
+                    Some(NodeData::ArrowFunction(_) | NodeData::FunctionExpression(_))
+                )
+            })
+        })
+    }
+
     #[allow(clippy::too_many_lines)]
     fn emit_javascript_object_namespace(
         &mut self,
@@ -2463,6 +2504,169 @@ impl DeclarationPrinter<'_> {
         }
     }
 
+    fn semantic_function_signature(&self, declaration: NodeId) -> Option<FunctionType> {
+        let type_id = self.node_types?.get(&declaration)?;
+        match &self.semantic_types?.get(*type_id)?.kind {
+            TypeKind::Function(signature) => Some(signature.clone()),
+            TypeKind::Overload(signatures) => signatures.first().cloned(),
+            _ => None,
+        }
+    }
+
+    fn emit_declaration_parameters(
+        &mut self,
+        parameters: &NodeList,
+        signature: &FunctionType,
+        declaration: NodeId,
+    ) -> Result<(), EmitError> {
+        self.writer.write("(");
+        for (index, parameter_id) in parameters.nodes.iter().enumerate() {
+            if index != 0 {
+                self.writer.write(", ");
+            }
+            let node = self.node(*parameter_id)?.clone();
+            let NodeData::ParameterDeclaration(parameter) = &node.data else {
+                return Err(Self::unsupported(*parameter_id, node.kind));
+            };
+            if parameter.dot_dot_dot_token.is_some() {
+                self.writer.write("...");
+            }
+            self.emit_name(parameter.name)?;
+            let type_id = signature.parameters.get(index).copied();
+            let optional = parameter.question_token.is_some()
+                || parameter.initializer.is_some()
+                || type_id.is_some_and(|type_id| self.semantic_type_includes_undefined(type_id));
+            if optional && parameter.dot_dot_dot_token.is_none() {
+                self.writer.write("?");
+            }
+            self.writer.write(": ");
+            if let Some(hint) = self.jsdoc_parameter_type_hint(declaration, parameter.name) {
+                self.writer.write(&hint);
+            } else if let Some(type_id) = type_id {
+                self.emit_semantic_parameter_type(type_id, optional)?;
+            } else if let Some(type_) = parameter.type_ {
+                self.emit_type(type_)?;
+            } else {
+                self.writer.write("any");
+            }
+        }
+        if let Some(rest) = signature.rest_parameter
+            && !parameters.nodes.iter().any(|parameter| {
+                matches!(
+                    self.arena.get(*parameter).map(|node| &node.data),
+                    Some(NodeData::ParameterDeclaration(parameter))
+                        if parameter.dot_dot_dot_token.is_some()
+                )
+            })
+        {
+            if !parameters.nodes.is_empty() {
+                self.writer.write(", ");
+            }
+            self.writer.write("...args: ");
+            self.emit_semantic_type(rest)?;
+        }
+        self.writer.write(")");
+        Ok(())
+    }
+
+    fn emit_semantic_parameter_type(
+        &mut self,
+        type_id: TypeId,
+        omit_undefined: bool,
+    ) -> Result<(), EmitError> {
+        let members = self
+            .semantic_types
+            .and_then(|types| types.get(type_id))
+            .and_then(|type_| match &type_.kind {
+                TypeKind::Union(members) if omit_undefined => Some(members.clone()),
+                _ => None,
+            });
+        let Some(members) = members else {
+            return self.emit_semantic_type(type_id);
+        };
+        let members = members
+            .into_iter()
+            .filter(|member| !self.semantic_type_is_undefined(*member))
+            .collect::<Vec<_>>();
+        if members.is_empty() {
+            self.writer.write("undefined");
+            Ok(())
+        } else {
+            self.emit_semantic_type_list(&members, " | ")
+        }
+    }
+
+    fn semantic_type_includes_undefined(&self, type_id: TypeId) -> bool {
+        self.semantic_type_is_undefined(type_id)
+            || matches!(
+                self.semantic_types
+                    .and_then(|types| types.get(type_id))
+                    .map(|type_| &type_.kind),
+                Some(TypeKind::Union(members))
+                    if members.iter().any(|member| self.semantic_type_is_undefined(*member))
+            )
+    }
+
+    fn semantic_type_is_undefined(&self, type_id: TypeId) -> bool {
+        matches!(
+            self.semantic_types
+                .and_then(|types| types.get(type_id))
+                .map(|type_| &type_.kind),
+            Some(TypeKind::Undefined)
+        )
+    }
+
+    fn leading_jsdoc_comment(&self, node: NodeId) -> Option<&str> {
+        if !self.javascript_source {
+            return None;
+        }
+        let start = usize::try_from(self.arena.get(node)?.range.start.get()).ok()?;
+        let prefix = self.source_text.get(..start)?.trim_end();
+        if !prefix.ends_with("*/") {
+            return None;
+        }
+        let start = prefix.rfind("/**")?;
+        Some(&prefix[start..])
+    }
+
+    fn emit_leading_jsdoc(&mut self, node: NodeId) {
+        let Some(comment) = self.leading_jsdoc_comment(node).map(str::to_owned) else {
+            return;
+        };
+        for (index, line) in comment.lines().enumerate() {
+            if index != 0 {
+                self.writer.write(" ");
+            }
+            self.writer.write(line.trim_start());
+            self.writer.newline();
+        }
+    }
+
+    fn jsdoc_parameter_type_hint(&self, declaration: NodeId, name: NodeId) -> Option<String> {
+        let name = declaration_name_text(self.arena, name)?;
+        let comment = self.leading_jsdoc_comment(declaration)?;
+        comment.lines().find_map(|line| {
+            let tag = line
+                .trim()
+                .trim_start_matches("/**")
+                .trim_start_matches('*')
+                .trim()
+                .trim_end_matches("*/")
+                .trim()
+                .strip_prefix("@param")?
+                .trim_start();
+            let tag = tag.strip_prefix('{')?;
+            let end = tag.find('}')?;
+            let type_name = tag[..end].trim();
+            let raw_name = tag[end + 1..].split_whitespace().next()?;
+            let parameter_name = raw_name
+                .trim_matches(['[', ']'])
+                .split_once('=')
+                .map_or_else(|| raw_name.trim_matches(['[', ']']), |(name, _)| name);
+            (parameter_name == name).then(|| type_name.to_owned())
+        })
+    }
+
     fn emit_parameters(&mut self, parameters: &NodeList) -> Result<(), EmitError> {
         self.writer.write("(");
         for (index, parameter) in parameters.nodes.iter().enumerate() {
@@ -2504,6 +2708,7 @@ impl DeclarationPrinter<'_> {
     #[allow(clippy::too_many_lines)]
     fn emit_member(&mut self, id: NodeId) -> Result<(), EmitError> {
         let node = self.node(id)?.clone();
+        self.emit_leading_jsdoc(id);
         match &node.data {
             NodeData::PropertyDeclaration(data) => {
                 self.emit_declaration_member_modifiers(data.modifiers.as_ref());
@@ -2538,7 +2743,11 @@ impl DeclarationPrinter<'_> {
             NodeData::MethodDeclaration(data) => {
                 if declaration_name_text(self.arena, data.name) == Some("constructor") {
                     self.writer.write("constructor");
-                    self.emit_parameters(&data.parameters)?;
+                    if let Some(signature) = self.semantic_function_signature(id) {
+                        self.emit_declaration_parameters(&data.parameters, &signature, id)?;
+                    } else {
+                        self.emit_parameters(&data.parameters)?;
+                    }
                     self.writer.write(";");
                     self.writer.newline();
                     return Ok(());
@@ -2548,8 +2757,14 @@ impl DeclarationPrinter<'_> {
                     self.writer.write("?");
                 }
                 self.emit_type_parameters(data.type_parameters.as_ref())?;
-                self.emit_parameters(&data.parameters)?;
-                self.emit_return_type(data.type_)?;
+                if let Some(signature) = self.semantic_function_signature(id) {
+                    self.emit_declaration_parameters(&data.parameters, &signature, id)?;
+                    self.writer.write(": ");
+                    self.emit_semantic_type(signature.return_type)?;
+                } else {
+                    self.emit_parameters(&data.parameters)?;
+                    self.emit_return_type(data.type_)?;
+                }
                 self.writer.write(";");
             }
             NodeData::MethodSignatureDeclaration(data) => {
@@ -2564,14 +2779,25 @@ impl DeclarationPrinter<'_> {
             }
             NodeData::ConstructorDeclaration(data) => {
                 self.writer.write("constructor");
-                self.emit_parameters(&data.parameters)?;
+                if let Some(signature) = self.semantic_function_signature(id) {
+                    self.emit_declaration_parameters(&data.parameters, &signature, id)?;
+                } else {
+                    self.emit_parameters(&data.parameters)?;
+                }
                 self.writer.write(";");
             }
             NodeData::GetAccessorDeclaration(data) => {
                 self.writer.write("get ");
                 self.emit_name(data.name)?;
                 self.emit_parameters(&data.parameters)?;
-                self.emit_return_type(data.type_)?;
+                if data.type_.is_none()
+                    && let Some(type_id) = self.node_types.and_then(|types| types.get(&id).copied())
+                {
+                    self.writer.write(": ");
+                    self.emit_semantic_type(type_id)?;
+                } else {
+                    self.emit_return_type(data.type_)?;
+                }
                 self.writer.write(";");
             }
             NodeData::SetAccessorDeclaration(data) => {
@@ -2621,6 +2847,121 @@ impl DeclarationPrinter<'_> {
         }
         self.writer.newline();
         Ok(())
+    }
+
+    fn emit_javascript_instance_properties(
+        &mut self,
+        class_id: NodeId,
+        member_id: NodeId,
+    ) -> Result<(), EmitError> {
+        if !self.javascript_source {
+            return Ok(());
+        }
+        let class_type = self
+            .node_types
+            .and_then(|types| types.get(&class_id).copied())
+            .and_then(|type_id| self.semantic_types?.get(type_id))
+            .and_then(|type_| match &type_.kind {
+                TypeKind::Object(object) => Some(object.clone()),
+                _ => None,
+            });
+        let Some(class_type) = class_type else {
+            return Ok(());
+        };
+        let body = match self.arena.get(member_id).map(|node| &node.data) {
+            Some(NodeData::ConstructorDeclaration(constructor)) => constructor.body,
+            Some(NodeData::MethodDeclaration(method)) => method.body,
+            _ => None,
+        };
+        let Some(body) = body else {
+            return Ok(());
+        };
+        let mut assignments = self
+            .arena
+            .iter()
+            .filter_map(|(id, node)| {
+                self.node_is_within(id, body)
+                    .then_some((id, node.range.start.get(), &node.data))
+            })
+            .filter_map(|(id, start, data)| {
+                let NodeData::BinaryExpression(assignment) = data else {
+                    return None;
+                };
+                (self.arena.get(assignment.operator_token)?.kind == SyntaxKind::EqualsToken)
+                    .then(|| self.javascript_this_property_name(assignment.left))
+                    .flatten()
+                    .map(|name| (id, start, name))
+            })
+            .collect::<Vec<_>>();
+        assignments.sort_by_key(|(_, start, _)| *start);
+        for (assignment, _, name) in assignments {
+            if !self
+                .emitted_javascript_class_properties
+                .insert((class_id, name.clone()))
+            {
+                continue;
+            }
+            let Some(type_id) = class_type.properties.get(&name).copied() else {
+                continue;
+            };
+            self.emit_leading_jsdoc(assignment);
+            self.emit_semantic_property_name(&name);
+            self.writer.write(": ");
+            if let Some(hint) = self.jsdoc_type_hint(assignment) {
+                self.writer.write(&hint);
+            } else {
+                self.emit_semantic_type(type_id)?;
+            }
+            if class_type.optional_properties.contains(&name) {
+                self.writer.write(" | undefined");
+            }
+            self.writer.write(";");
+            self.writer.newline();
+        }
+        Ok(())
+    }
+
+    fn javascript_this_property_name(&self, expression: NodeId) -> Option<String> {
+        match &self.arena.get(expression)?.data {
+            NodeData::PropertyAccessExpression(access)
+                if self
+                    .arena
+                    .get(access.expression)
+                    .is_some_and(|node| node.kind == SyntaxKind::ThisKeyword) =>
+            {
+                declaration_name_text(self.arena, access.name).map(str::to_owned)
+            }
+            NodeData::ElementAccessExpression(access)
+                if self
+                    .arena
+                    .get(access.expression)
+                    .is_some_and(|node| node.kind == SyntaxKind::ThisKeyword) =>
+            {
+                declaration_name_text(self.arena, access.argument_expression).map(str::to_owned)
+            }
+            _ => None,
+        }
+    }
+
+    fn jsdoc_type_hint(&self, node: NodeId) -> Option<String> {
+        self.leading_jsdoc_comment(node)?.lines().find_map(|line| {
+            let tag = line
+                .trim()
+                .trim_start_matches("/**")
+                .trim_start_matches('*')
+                .trim()
+                .trim_end_matches("*/")
+                .trim()
+                .strip_prefix("@type")?
+                .trim();
+            Some(
+                tag.strip_prefix('{')
+                    .and_then(|tag| tag.strip_suffix('}'))
+                    .unwrap_or(tag)
+                    .trim()
+                    .to_owned(),
+            )
+        })
     }
 
     fn emit_constructor_parameter_properties(

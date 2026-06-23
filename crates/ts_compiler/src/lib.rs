@@ -4188,6 +4188,71 @@ mod tests {
     }
 
     #[test]
+    fn javascript_declaration_emit_consumes_arguments_and_jsdoc_metadata() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/a.js",
+            concat!(
+                "function f(x) { arguments; }\n",
+                "const bar = { arguments: {} };\n",
+                "class A {\n",
+                "    /** @param {object} [foo={}] */\n",
+                "    constructor(foo = {}) {\n",
+                "        /** @type object */\n",
+                "        this.arguments = foo;\n",
+                "    }\n",
+                "    get info() { return { bar: {} }; }\n",
+                "}\n",
+                "class B {\n",
+                "    m() {\n",
+                "        /** @type object */\n",
+                "        this.foo = arguments;\n",
+                "    }\n",
+                "}\n",
+            ),
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["a.js".to_owned()],
+            CompilerOptions {
+                allow_js: true,
+                check_js: true,
+                declaration: true,
+                emit_declaration_only: true,
+                target: ScriptTarget::Es2015,
+                ..CompilerOptions::default()
+            },
+        );
+        let declaration = program
+            .emit()
+            .files
+            .into_iter()
+            .find(|file| file.file_name == "/project/a.d.ts")
+            .unwrap();
+        assert_eq!(
+            declaration.text,
+            concat!(
+                "declare function f(x: any, ...args: any[]): void;\n",
+                "declare namespace bar {\n    let arguments: {};\n}\n",
+                "declare class A {\n",
+                "    /** @param {object} [foo={}] */\n",
+                "    constructor(foo?: object);\n",
+                "    /** @type object */\n",
+                "    arguments: object;\n",
+                "    get info(): {\n        bar: {};\n    };\n",
+                "}\n",
+                "declare class B {\n",
+                "    m(...args: any[]): void;\n",
+                "    /** @type object */\n",
+                "    foo: object | undefined;\n",
+                "}\n",
+            )
+        );
+    }
+
+    #[test]
     fn declaration_emit_preserves_ambient_auto_accessors() {
         let source = concat!(
             "declare class AmbientClass { accessor prop1: string; static accessor prop2: number; private accessor prop3: boolean; private static accessor prop4: symbol; }\n",
