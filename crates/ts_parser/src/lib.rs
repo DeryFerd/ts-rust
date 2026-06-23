@@ -3494,6 +3494,14 @@ impl<'a> Parser<'a> {
             && self.current.kind != SyntaxKind::EndOfFile
         {
             let specifier_start = self.current.range.start;
+            let is_type_only = self.current.kind == SyntaxKind::TypeKeyword
+                && !matches!(
+                    self.next_token_kind(),
+                    SyntaxKind::AsKeyword | SyntaxKind::CommaToken | SyntaxKind::CloseBraceToken
+                );
+            if is_type_only {
+                self.bump();
+            }
             let first = self.parse_module_export_name("Expected an import name.");
             let (property_name, name) = if self.current.kind == SyntaxKind::AsKeyword {
                 self.bump();
@@ -3510,7 +3518,7 @@ impl<'a> Parser<'a> {
                 SyntaxKind::ImportSpecifier,
                 TextRange::new(specifier_start, self.node_end(name)),
                 NodeData::ImportSpecifier(Box::new(ImportSpecifierData {
-                    is_type_only: false,
+                    is_type_only,
                     local_symbol: None,
                     property_name,
                     symbol: None,

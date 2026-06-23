@@ -662,6 +662,7 @@ pub fn run_case_against_baseline(case: &Case, baseline: &str) -> std::io::Result
         .collect()
 }
 
+#[allow(clippy::too_many_lines)]
 fn compile_case_variant(case: &Case, variant: &OptionVariant) -> std::io::Result<Compilation> {
     let file_system = MemoryFileSystem::new(true);
     let project_directory = project_config_unit(case).and_then(|(path, _)| {
@@ -670,12 +671,11 @@ fn compile_case_variant(case: &Case, variant: &OptionVariant) -> std::io::Result
     });
     let links = case
         .directive_values("link")
-        .chain(case.directive_values("symlink"))
         .filter_map(|value| value.split_once("->"))
         .map(|(source, target)| {
             (
-                ts_path::normalize_path(source.trim()),
-                ts_path::normalize_path(target.trim()),
+                virtual_harness_path(source.trim()),
+                virtual_harness_path(target.trim()),
             )
         })
         .collect::<Vec<_>>();
@@ -692,6 +692,27 @@ fn compile_case_variant(case: &Case, variant: &OptionVariant) -> std::io::Result
                 let alias = format!("{target}{}", &path[source.len()..]);
                 file_system.write_file(&alias, unit.source_text.as_scannable_str())?;
             }
+        }
+        let next_unit_line = case
+            .units
+            .get(index + 1)
+            .map_or(usize::MAX, |next| next.start_line);
+        for alias in case
+            .directives
+            .iter()
+            .filter(|directive| {
+                directive.name.eq_ignore_ascii_case("symlink")
+                    && directive.line >= unit.start_line
+                    && directive.line < next_unit_line
+            })
+            .flat_map(|directive| directive.value.split(','))
+            .map(str::trim)
+            .filter(|alias| !alias.is_empty())
+        {
+            file_system.write_file(
+                &virtual_harness_path(alias),
+                unit.source_text.as_scannable_str(),
+            )?;
         }
         if is_compilation_unit(&path)
             && project_directory.as_ref().is_none_or(|directory| {
@@ -752,6 +773,14 @@ fn compile_case_variant(case: &Case, variant: &OptionVariant) -> std::io::Result
         diagnostics,
         outputs,
     })
+}
+
+fn virtual_harness_path(path: &str) -> String {
+    if path.starts_with('/') {
+        ts_path::normalize_path(path)
+    } else {
+        ts_path::resolve_path("/case", &[path])
+    }
 }
 
 fn virtual_unit_path(case: &Case, unit: &Unit, index: usize) -> String {
@@ -1545,6 +1574,57 @@ mod tests {
             !declaration.contains("declare module \"package/index\""),
             "{declaration}"
         );
+    }
+
+    #[test]
+    fn materializes_unit_symlink_directives_and_relative_links() {
+        let symlink = Case::parse(
+            "symlink.ts",
+            concat!(
+                "// @module: commonjs\n",
+                "// @target: es2015\n",
+                "// @noLib: true\n",
+                "// @noImplicitReferences: true\n",
+                "// @filename: /shared/index.ts\n",
+                "// @symlink: /app/node_modules/pkg/index.ts\n",
+                "export const value = 1;\n",
+                "// @filename: /app/index.ts\n",
+                "import { value } from 'pkg';\n",
+                "export const result = value;\n",
+            ),
+        )
+        .unwrap();
+        let compilation = compile_case(&symlink).unwrap();
+        assert!(
+            compilation.diagnostics.is_empty(),
+            "{:?}",
+            compilation.diagnostics
+        );
+        assert!(compilation.outputs.contains_key("/app/index.js"));
+
+        let relative_link = Case::parse(
+            "relativeLink.ts",
+            concat!(
+                "// @module: commonjs\n",
+                "// @target: es2015\n",
+                "// @noLib: true\n",
+                "// @noImplicitReferences: true\n",
+                "// @filename: packages/pkg/index.ts\n",
+                "export const value = 1;\n",
+                "// @filename: app/index.ts\n",
+                "import { value } from 'pkg';\n",
+                "export const result = value;\n",
+                "// @link: packages/pkg -> app/node_modules/pkg\n",
+            ),
+        )
+        .unwrap();
+        let compilation = compile_case(&relative_link).unwrap();
+        assert!(
+            compilation.diagnostics.is_empty(),
+            "{:?}",
+            compilation.diagnostics
+        );
+        assert!(compilation.outputs.contains_key("/case/app/index.js"));
     }
 
     #[test]

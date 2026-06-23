@@ -528,11 +528,9 @@ impl Program {
             if settings.emit_declarations {
                 if (self.options.isolated_declarations
                     && has_unserializable_isolated_declaration_name(source_file))
-                    || source_file
-                        .checking
-                        .diagnostics
-                        .iter()
-                        .any(|diagnostic| matches!(diagnostic.diagnostic.code(), 2883 | 5088))
+                    || source_file.checking.diagnostics.iter().any(|diagnostic| {
+                        matches!(diagnostic.diagnostic.code(), 2883 | 4023 | 5088)
+                    })
                 {
                     continue;
                 }
@@ -637,9 +635,16 @@ impl Program {
                         comment_end: dependency.range.end.get(),
                     })
                     .collect::<Vec<_>>();
-                let amd_module_name = (settings.module == ModuleKind::Amd
-                    && source_is_external_module(source))
-                .then(|| amd_bundle_module_name(source, &bundle_root));
+                let amd_module_name =
+                    (matches!(settings.module, ModuleKind::Amd | ModuleKind::System)
+                        && source_is_external_module(source))
+                    .then(|| {
+                        if settings.module == ModuleKind::Amd {
+                            amd_bundle_module_name(source, &bundle_root)
+                        } else {
+                            bundle_declaration_module_name(source, &bundle_root, settings.module)
+                        }
+                    });
                 let amd_module_specifier_rewrites =
                     self.amd_bundle_specifier_rewrites(source, &bundle_root);
                 let import_runtime_meanings = if settings.module == ModuleKind::Amd {
@@ -751,11 +756,9 @@ impl Program {
                 }
                 if (self.options.isolated_declarations
                     && has_unserializable_isolated_declaration_name(source))
-                    || source
-                        .checking
-                        .diagnostics
-                        .iter()
-                        .any(|diagnostic| matches!(diagnostic.diagnostic.code(), 2883 | 5088))
+                    || source.checking.diagnostics.iter().any(|diagnostic| {
+                        matches!(diagnostic.diagnostic.code(), 2883 | 4023 | 5088)
+                    })
                 {
                     continue;
                 }
@@ -1772,6 +1775,7 @@ fn emit_diagnostic(source_file: &SourceFile, error: &ts_printer::EmitError) -> P
 }
 
 fn add_nonportable_inferred_type_diagnostics(source: &SourceFile, checking: &mut CheckResult) {
+    let imports = source_import_bindings(source);
     let Some(NodeData::SourceFile(file)) = source
         .parse
         .arena
@@ -1820,6 +1824,27 @@ fn add_nonportable_inferred_type_diagnostics(source: &SourceFile, checking: &mut
             }) else {
                 continue;
             };
+            if let Some(qualifier) =
+                inaccessible_computed_symbol_name(checking, type_id, &mut BTreeSet::new())
+                && !imports.iter().any(|(local, _, _)| local == &qualifier)
+                && let Some((_, _, module)) = imports.first()
+                && let Some(name) = identifier_text(&source.parse.arena, declaration.name)
+            {
+                let message =
+                    message_by_code(4023).expect("TS4023 must be in the diagnostic catalog");
+                checking.diagnostics.push(CheckDiagnostic {
+                    node: declaration.name,
+                    diagnostic: Diagnostic::with_arguments(
+                        message,
+                        [
+                            name.to_owned(),
+                            qualifier,
+                            format!("\"{}\"", module.trim_start_matches("./")),
+                        ],
+                    ),
+                });
+                continue;
+            }
             let Some((qualifier, module)) =
                 nonportable_import_type_reference(checking, type_id, &mut BTreeSet::new())
             else {
@@ -2024,6 +2049,55 @@ fn nonportable_import_type_reference(
     children
         .into_iter()
         .find_map(|child| nonportable_import_type_reference(checking, child, visited))
+}
+
+fn inaccessible_computed_symbol_name(
+    checking: &CheckResult,
+    type_id: TypeId,
+    visited: &mut BTreeSet<TypeId>,
+) -> Option<String> {
+    if !visited.insert(type_id) {
+        return None;
+    }
+    let kind = &checking.types.get(type_id)?.kind;
+    let mut children = Vec::new();
+    match kind {
+        TypeKind::TypeParameter { constraint, .. } => children.extend(constraint),
+        TypeKind::Array(element) => children.push(*element),
+        TypeKind::Tuple(elements)
+        | TypeKind::ReadonlyTuple(elements)
+        | TypeKind::Union(elements)
+        | TypeKind::Intersection(elements) => children.extend(elements),
+        TypeKind::Object(object) => {
+            if let Some(name) = object.properties.keys().find_map(|name| {
+                name.strip_prefix("[#")
+                    .and_then(|name| name.strip_suffix(']'))
+                    .and_then(|name| name.split('.').next())
+                    .map(str::to_owned)
+            }) {
+                return Some(name);
+            }
+            children.extend(object.properties.values());
+            children.extend(object.string_index_type);
+            children.extend(object.number_index_type);
+        }
+        TypeKind::Function(signature) | TypeKind::Constructor(signature) => {
+            children.extend(&signature.parameters);
+            children.extend(signature.rest_parameter);
+            children.push(signature.return_type);
+        }
+        TypeKind::Overload(signatures) => {
+            for signature in signatures {
+                children.extend(&signature.parameters);
+                children.extend(signature.rest_parameter);
+                children.push(signature.return_type);
+            }
+        }
+        _ => {}
+    }
+    children
+        .into_iter()
+        .find_map(|child| inaccessible_computed_symbol_name(checking, child, visited))
 }
 
 fn enum_values_for_emit(
@@ -4670,6 +4744,67 @@ mod tests {
                 .unwrap();
             assert_eq!(declaration.text, expected);
         }
+    }
+
+    #[test]
+    fn declaration_emit_spreads_imported_type_only_alias_shape() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/type.ts",
+            "export type Type = { x?: { [Enum.A]: 0 } };",
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/index.ts",
+            "import { type Type } from './type'; export const foo = { ...({} as Type) };",
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["type.ts".to_owned(), "index.ts".to_owned()],
+            CompilerOptions {
+                declaration: true,
+                emit_declaration_only: true,
+                target: ScriptTarget::Es2015,
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        let index = program
+            .source_files
+            .iter()
+            .find(|source| source.file_name == "/project/index.ts")
+            .unwrap();
+        let symbol = index
+            .binding
+            .root_scope()
+            .unwrap()
+            .symbols
+            .get("foo")
+            .unwrap();
+        let type_id = index.checking.type_of_symbol(symbol).unwrap();
+        assert_eq!(
+            index
+                .checking
+                .type_of_node(index.binding.symbols.get(symbol).unwrap().declarations[0]),
+            Some(type_id)
+        );
+        assert!(
+            matches!(
+                index.checking.types.get(type_id).map(|type_| &type_.kind),
+                Some(ts_checker::TypeKind::Object(object)) if object.properties.contains_key("x")
+            ),
+            "{}",
+            index.checking.types.display(type_id)
+        );
+        let emitted = program.emit();
+        let declaration = emitted
+            .files
+            .iter()
+            .find(|file| file.file_name == "/project/index.d.ts")
+            .unwrap();
+        assert!(declaration.text.contains("x?:"), "{}", declaration.text);
     }
 
     #[test]
