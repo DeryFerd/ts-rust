@@ -793,6 +793,17 @@ impl<'a> ProgramChecker<'a> {
                         assignment.expression,
                         &imported,
                     )
+                    .or_else(|| {
+                        let name = identifier_text(source.arena, assignment.expression)?;
+                        let symbol = source
+                            .bindings
+                            .root_scope()
+                            .and_then(|scope| scope.symbols.get(name))
+                            .or_else(|| {
+                                source.bindings.resolve_name_at(assignment.expression, name)
+                            })?;
+                        Self::describe_symbol(source, result, symbol)
+                    })
                 {
                     exports.insert(
                         if assignment.is_export_equals {
@@ -1906,6 +1917,7 @@ impl<'a> Checker<'a> {
 
     #[allow(clippy::too_many_lines)]
     fn seed_symbol_types(&mut self) {
+        let mut seeded_enum_declarations = HashSet::new();
         for symbol in self.bindings.symbols.iter() {
             if self.result.symbol_types.contains_key(&symbol.id) {
                 continue;
@@ -1986,6 +1998,7 @@ impl<'a> Checker<'a> {
                         break;
                     }
                     NodeData::EnumDeclaration(data) => {
+                        seeded_enum_declarations.insert(*declaration);
                         symbol_type = Some(self.enum_type(data));
                         break;
                     }
@@ -2000,21 +2013,11 @@ impl<'a> Checker<'a> {
         let remaining_enums = self
             .arena
             .iter()
-            .filter_map(|(_, node)| {
+            .filter_map(|(id, node)| {
                 let NodeData::EnumDeclaration(enumeration) = &node.data else {
                     return None;
                 };
-                enumeration
-                    .members
-                    .nodes
-                    .iter()
-                    .any(|member| {
-                        self.bindings
-                            .node_symbols
-                            .get(member)
-                            .is_some_and(|symbol| !self.result.symbol_types.contains_key(symbol))
-                    })
-                    .then(|| enumeration.as_ref().clone())
+                (!seeded_enum_declarations.contains(&id)).then(|| enumeration.as_ref().clone())
             })
             .collect::<Vec<_>>();
         for enumeration in &remaining_enums {

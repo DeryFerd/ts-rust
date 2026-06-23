@@ -757,6 +757,9 @@ fn fixture_compiler_options(case: &Case, variant: &OptionVariant) -> ts_options:
     let has_explicit_target = values
         .keys()
         .any(|name| name.eq_ignore_ascii_case("target"));
+    let has_explicit_module = values
+        .keys()
+        .any(|name| name.eq_ignore_ascii_case("module"));
     let mut options = if let Some(mut config) = project_config {
         config.compiler_options = values;
         ts_options::parse_project_options(&config).options
@@ -767,6 +770,9 @@ fn fixture_compiler_options(case: &Case, variant: &OptionVariant) -> ts_options:
     // standard language version rather than the historical ES5 default.
     if !has_explicit_target {
         options.target = ts_options::ScriptTarget::Es2025;
+    }
+    if !has_explicit_module && options.target < ts_options::ScriptTarget::Es2015 {
+        options.module = ts_options::ModuleKind::CommonJs;
     }
     options
 }

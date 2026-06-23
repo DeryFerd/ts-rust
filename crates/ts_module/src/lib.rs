@@ -135,7 +135,14 @@ impl<'a, F: FileSystem + ?Sized> Resolver<'a, F> {
                 }
             })
         } else if self.options.mode == ResolutionMode::Classic {
-            state.resolve_paths_or_base_url(specifier)
+            state.resolve_paths_or_base_url(specifier).or_else(|| {
+                ancestors(&containing_directory)
+                    .into_iter()
+                    .find_map(|directory| {
+                        let candidate = resolve_path(&directory, &[specifier]);
+                        state.resolve_candidate(&candidate, false)
+                    })
+            })
         } else {
             state
                 .resolve_paths_or_base_url(specifier)

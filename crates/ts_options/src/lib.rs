@@ -713,6 +713,7 @@ impl PartialOptions {
 
 const fn default_module_resolution(module: ModuleKind) -> ModuleResolutionKind {
     match module {
+        ModuleKind::Amd => ModuleResolutionKind::Classic,
         ModuleKind::Node16 | ModuleKind::Node18 | ModuleKind::Node20 => {
             ModuleResolutionKind::Node16
         }

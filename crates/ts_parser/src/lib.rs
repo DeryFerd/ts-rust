@@ -24,21 +24,22 @@ use ts_ast::{
     JsxSpreadAttributeData, JsxTextData, KeywordExpressionData, KeywordTypeNodeData,
     LabeledStatementData, LiteralTypeNodeData, MappedTypeNodeData, MethodDeclarationData,
     MethodSignatureDeclarationData, ModifierList, ModuleBlockData, ModuleDeclarationData,
-    NamedExportsData, NamedImportsData, NamespaceExportDeclarationData, NamespaceImportData,
-    NewExpressionData, NoSubstitutionTemplateLiteralData, Node, NodeArena, NodeData, NodeFlags,
-    NodeId, NodeList, NonNullExpressionData, NotEmittedStatementData, NumericLiteralData,
-    ObjectLiteralExpressionData, OmittedExpressionData, ParameterDeclarationData,
-    ParenthesizedExpressionData, ParenthesizedTypeNodeData, PostfixUnaryExpressionData,
-    PrefixUnaryExpressionData, PrivateIdentifierData, PropertyAccessExpressionData,
-    PropertyAssignmentData, PropertyDeclarationData, QualifiedNameData,
-    RegularExpressionLiteralData, RestTypeNodeData, ReturnStatementData, SatisfiesExpressionData,
-    SetAccessorDeclarationData, ShorthandPropertyAssignmentData, SourceFileData,
-    SpreadAssignmentData, SpreadElementData, StringLiteralData, SwitchStatementData, SymbolTable,
-    SyntaxKind, TaggedTemplateExpressionData, TemplateExpressionData, TemplateHeadData,
-    TemplateLiteralTypeNodeData, TemplateLiteralTypeSpanData, TemplateMiddleData, TemplateSpanData,
-    TemplateTailData, ThisTypeNodeData, ThrowStatementData, TokenData, TokenFlags,
-    TryStatementData, TupleTypeNodeData, TypeAliasDeclarationData, TypeAssertionData,
-    TypeLiteralNodeData, TypeOfExpressionData, TypeOperatorNodeData, TypeParameterDeclarationData,
+    NamedExportsData, NamedImportsData, NamedTupleMemberData, NamespaceExportDeclarationData,
+    NamespaceImportData, NewExpressionData, NoSubstitutionTemplateLiteralData, Node, NodeArena,
+    NodeData, NodeFlags, NodeId, NodeList, NonNullExpressionData, NotEmittedStatementData,
+    NumericLiteralData, ObjectLiteralExpressionData, OmittedExpressionData, OptionalTypeNodeData,
+    ParameterDeclarationData, ParenthesizedExpressionData, ParenthesizedTypeNodeData,
+    PostfixUnaryExpressionData, PrefixUnaryExpressionData, PrivateIdentifierData,
+    PropertyAccessExpressionData, PropertyAssignmentData, PropertyDeclarationData,
+    QualifiedNameData, RegularExpressionLiteralData, RestTypeNodeData, ReturnStatementData,
+    SatisfiesExpressionData, SetAccessorDeclarationData, ShorthandPropertyAssignmentData,
+    SourceFileData, SpreadAssignmentData, SpreadElementData, StringLiteralData,
+    SwitchStatementData, SymbolTable, SyntaxKind, TaggedTemplateExpressionData,
+    TemplateExpressionData, TemplateHeadData, TemplateLiteralTypeNodeData,
+    TemplateLiteralTypeSpanData, TemplateMiddleData, TemplateSpanData, TemplateTailData,
+    ThisTypeNodeData, ThrowStatementData, TokenData, TokenFlags, TryStatementData,
+    TupleTypeNodeData, TypeAliasDeclarationData, TypeAssertionData, TypeLiteralNodeData,
+    TypeOfExpressionData, TypeOperatorNodeData, TypeParameterDeclarationData,
     TypePredicateNodeData, TypeQueryNodeData, TypeReferenceNodeData, UnionTypeNodeData,
     VariableDeclarationData, VariableDeclarationListData, VariableStatementData,
     VoidExpressionData, WhileStatementData, WithStatementData, YieldExpressionData,
@@ -455,8 +456,22 @@ impl<'a> Parser<'a> {
             }
             if matches!(
                 self.current.kind,
-                SyntaxKind::CloseParenToken | SyntaxKind::CloseBracketToken
+                SyntaxKind::CloseParenToken
+                    | SyntaxKind::CloseBracketToken
+                    | SyntaxKind::QuestionToken
+                    | SyntaxKind::DotToken
             ) {
+                self.error_current("Declaration or statement expected.");
+                self.bump();
+                continue;
+            }
+            if matches!(
+                self.current.kind,
+                SyntaxKind::PublicKeyword
+                    | SyntaxKind::PrivateKeyword
+                    | SyntaxKind::ProtectedKeyword
+            ) && !self.next_token_preceded_by_line_break()
+            {
                 self.error_current("Declaration or statement expected.");
                 self.bump();
                 continue;
@@ -554,6 +569,7 @@ impl<'a> Parser<'a> {
             SyntaxKind::SwitchKeyword => self.parse_switch_statement(),
             SyntaxKind::TryKeyword => self.parse_try_statement(),
             SyntaxKind::CatchKeyword => self.parse_recovered_catch_statement(),
+            SyntaxKind::FinallyKeyword => self.parse_recovered_finally_statement(),
             SyntaxKind::ThrowKeyword => self.parse_throw_statement(),
             SyntaxKind::DoKeyword => self.parse_do_statement(),
             SyntaxKind::BreakKeyword | SyntaxKind::ContinueKeyword => {
@@ -585,6 +601,7 @@ impl<'a> Parser<'a> {
                 self.parse_recovered_bigint_module_clause(true)
             }
             SyntaxKind::ExportKeyword => self.parse_export_declaration(),
+            SyntaxKind::ColonToken => self.parse_recovered_labeled_statement(),
             SyntaxKind::SemicolonToken => self.parse_empty_statement(),
             SyntaxKind::Identifier if is_labeled_statement => self.parse_labeled_statement(),
             _ => self.parse_expression_statement(),
@@ -764,6 +781,24 @@ impl<'a> Parser<'a> {
         )
     }
 
+    fn parse_recovered_labeled_statement(&mut self) -> NodeId {
+        let start = self.current.range.start;
+        let label = self.missing_identifier(start);
+        self.error_current("Expected a label.");
+        self.bump();
+        let statement = self.parse_statement();
+        self.alloc_node(
+            SyntaxKind::LabeledStatement,
+            TextRange::new(start, self.node_end(statement)),
+            NodeData::LabeledStatement(Box::new(LabeledStatementData {
+                flow_node: None,
+                label,
+                statement,
+            })),
+            &[label, statement],
+        )
+    }
+
     fn parse_variable_statement(&mut self) -> NodeId {
         let keyword = self.consume();
         let declaration_flags = match keyword.kind {
@@ -824,6 +859,14 @@ impl<'a> Parser<'a> {
         loop {
             declarations.push(self.parse_variable_declaration());
             if self.current.kind != SyntaxKind::CommaToken {
+                if self.current.kind == SyntaxKind::Unknown
+                    && self.current.text == "\\"
+                    && self.next_token_kind() == SyntaxKind::Identifier
+                {
+                    self.error_current("Expected ','.");
+                    self.bump();
+                    continue;
+                }
                 break;
             }
             self.bump();
@@ -2633,6 +2676,10 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_parenthesized_condition(&mut self) -> NodeId {
+        if self.current.kind != SyntaxKind::OpenParenToken {
+            self.error_current("Expected '('.");
+            return self.missing_identifier(self.current.range.start);
+        }
         self.expect_and_bump(SyntaxKind::OpenParenToken, "Expected '('.");
         let expression = self.parse_binary_expression(0);
         self.expect_and_bump(SyntaxKind::CloseParenToken, "Expected ')'.");
@@ -2773,6 +2820,31 @@ impl<'a> Parser<'a> {
         self.parse_try_statement_tail(start, try_block)
     }
 
+    fn parse_recovered_finally_statement(&mut self) -> NodeId {
+        let start = self.current.range.start;
+        self.error_current("'try' expected.");
+        let block_start = self.current.full_start;
+        let block_end = self.current.range.start;
+        let try_block = self.alloc_node(
+            SyntaxKind::Block,
+            TextRange::new(block_start, block_end),
+            NodeData::Block(Box::new(BlockData {
+                flow_node: None,
+                locals: SymbolTable,
+                multi_line: false,
+                next_container: None,
+                statements: NodeList {
+                    range: TextRange::new(block_start, block_end),
+                    nodes: Vec::new(),
+                    has_trailing_comma: false,
+                },
+                facts: 0,
+            })),
+            &[],
+        );
+        self.parse_try_statement_tail(start, try_block)
+    }
+
     fn parse_try_statement_tail(&mut self, start: TextPos, try_block: NodeId) -> NodeId {
         let catch_clause = if self.current.kind == SyntaxKind::CatchKeyword {
             let catch_start = self.consume().range.start;
@@ -2784,7 +2856,29 @@ impl<'a> Parser<'a> {
             } else {
                 None
             };
-            let block = self.parse_block();
+            let block = if self.current.kind == SyntaxKind::OpenBraceToken {
+                self.parse_block()
+            } else {
+                self.error_current("Expected '{'.");
+                let position = self.current.range.start;
+                self.alloc_node(
+                    SyntaxKind::Block,
+                    TextRange::new(position, position),
+                    NodeData::Block(Box::new(BlockData {
+                        flow_node: None,
+                        locals: SymbolTable,
+                        multi_line: false,
+                        next_container: None,
+                        statements: NodeList {
+                            range: TextRange::new(position, position),
+                            nodes: Vec::new(),
+                            has_trailing_comma: false,
+                        },
+                        facts: 0,
+                    })),
+                    &[],
+                )
+            };
             let mut children = vec![block];
             children.extend(variable_declaration);
             Some(self.alloc_node(
@@ -3719,11 +3813,28 @@ impl<'a> Parser<'a> {
                 NodeData::Token(Box::new(TokenData)),
                 &[],
             );
-            let right = self.parse_binary_expression(if right_associative {
+            let right_precedence = if right_associative {
                 precedence
             } else {
                 precedence + 1
-            });
+            };
+            let right = if (self
+                .current
+                .flags
+                .contains(ScannerTokenFlags::PRECEDING_LINE_BREAK)
+                && matches!(
+                    self.current.kind,
+                    SyntaxKind::VarKeyword | SyntaxKind::LetKeyword | SyntaxKind::ConstKeyword
+                ))
+                || matches!(
+                    self.current.kind,
+                    SyntaxKind::CatchKeyword | SyntaxKind::FinallyKeyword
+                ) {
+                self.error_current("Expected an expression.");
+                self.missing_identifier(self.current.range.start)
+            } else {
+                self.parse_binary_expression(right_precedence)
+            };
             let range = TextRange::new(self.node_start(left), self.node_end(right));
             left = self.alloc_node(
                 SyntaxKind::BinaryExpression,
@@ -3742,10 +3853,21 @@ impl<'a> Parser<'a> {
         }
         if minimum_precedence <= 2 && self.current.kind == SyntaxKind::QuestionToken {
             let question_token = self.consume_token_node();
-            let when_true = self.parse_binary_expression(2);
+            let before_else = self.current.kind == SyntaxKind::ElseKeyword;
+            let when_true = if before_else {
+                self.error_current("Expected an expression.");
+                self.missing_identifier(self.current.range.start)
+            } else {
+                self.parse_binary_expression(2)
+            };
             let colon_token =
                 self.parse_expected_token_node(SyntaxKind::ColonToken, "Expected ':'.");
-            let when_false = self.parse_binary_expression(2);
+            let when_false = if before_else && self.current.kind == SyntaxKind::ElseKeyword {
+                self.error_current("Expected an expression.");
+                self.missing_identifier(self.current.range.start)
+            } else {
+                self.parse_binary_expression(2)
+            };
             left = self.alloc_node(
                 SyntaxKind::ConditionalExpression,
                 TextRange::new(self.node_start(left), self.node_end(when_false)),
@@ -3796,7 +3918,11 @@ impl<'a> Parser<'a> {
             NodeData::Identifier(_)
             | NodeData::PropertyAccessExpression(_)
             | NodeData::ElementAccessExpression(_)
-            | NodeData::CallExpression(_) => true,
+            | NodeData::CallExpression(_)
+            | NodeData::NumericLiteral(_)
+            | NodeData::BigIntLiteral(_)
+            | NodeData::StringLiteral(_)
+            | NodeData::KeywordExpression(_) => true,
             NodeData::ParenthesizedExpression(parenthesized) => {
                 self.expression_can_precede_assignment(parenthesized.expression, operator)
             }
@@ -4110,7 +4236,27 @@ impl<'a> Parser<'a> {
         if is_prefix_operator(self.current.kind) {
             let operator_token = self.consume();
             let operator = operator_token.kind;
-            let operand = self.parse_postfix_expression();
+            let operand = if self
+                .current
+                .flags
+                .contains(ScannerTokenFlags::PRECEDING_LINE_BREAK)
+                && matches!(
+                    self.current.kind,
+                    SyntaxKind::TryKeyword
+                        | SyntaxKind::ReturnKeyword
+                        | SyntaxKind::ThrowKeyword
+                        | SyntaxKind::IfKeyword
+                        | SyntaxKind::ForKeyword
+                        | SyntaxKind::WhileKeyword
+                        | SyntaxKind::SwitchKeyword
+                        | SyntaxKind::VarKeyword
+                        | SyntaxKind::ConstKeyword
+                ) {
+                self.error_current("Expected an expression.");
+                self.missing_identifier(self.current.range.start)
+            } else {
+                self.parse_postfix_expression()
+            };
             return self.alloc_node(
                 SyntaxKind::PrefixUnaryExpression,
                 TextRange::new(operator_token.range.start, self.node_end(operand)),
@@ -4513,7 +4659,26 @@ impl<'a> Parser<'a> {
         while self.current.kind != SyntaxKind::CloseParenToken
             && self.current.kind != SyntaxKind::EndOfFile
         {
+            if arguments.is_empty()
+                && matches!(
+                    self.current.kind,
+                    SyntaxKind::WhileKeyword
+                        | SyntaxKind::ForKeyword
+                        | SyntaxKind::IfKeyword
+                        | SyntaxKind::SwitchKeyword
+                        | SyntaxKind::TryKeyword
+                )
+            {
+                self.error_current("Expected ')'.");
+                break;
+            }
             arguments.push(self.parse_spread_element_or_expression());
+            if self.current.kind == SyntaxKind::ColonToken {
+                self.error_current("Expected ','.");
+                self.bump();
+                trailing = false;
+                continue;
+            }
             if self.current.kind != SyntaxKind::CommaToken {
                 break;
             }
@@ -4862,6 +5027,11 @@ impl<'a> Parser<'a> {
             kind if is_contextual_keyword(kind) => {
                 self.parse_identifier_name("Expected an expression.")
             }
+            SyntaxKind::ImplementsKeyword
+            | SyntaxKind::InterfaceKeyword
+            | SyntaxKind::LetKeyword
+            | SyntaxKind::PackageKeyword
+            | SyntaxKind::StaticKeyword => self.parse_identifier_name("Expected an expression."),
             SyntaxKind::OpenParenToken => self.parse_parenthesized_expression(),
             SyntaxKind::OpenBracketToken => self.parse_array_literal(),
             SyntaxKind::OpenBraceToken => self.parse_object_literal(),
@@ -5284,7 +5454,11 @@ impl<'a> Parser<'a> {
             return self.parse_jsx_fragment(start, resume_jsx);
         }
         let tag_name = self.parse_jsx_tag_name("Expected a JSX tag name.");
+        let type_arguments = self.parse_type_arguments();
         let attributes = self.parse_jsx_attributes();
+        let mut element_children = vec![tag_name];
+        extend_list_children(&mut element_children, type_arguments.as_ref());
+        element_children.push(attributes);
         if self.current.kind == SyntaxKind::SlashToken {
             self.bump();
             let end = self.finish_jsx_tag(resume_jsx);
@@ -5294,10 +5468,10 @@ impl<'a> Parser<'a> {
                 NodeData::JsxSelfClosingElement(Box::new(JsxSelfClosingElementData {
                     attributes,
                     tag_name,
-                    type_arguments: None,
+                    type_arguments,
                     facts: 0,
                 })),
-                &[tag_name, attributes],
+                &element_children,
             );
         }
         let opening_end = self.finish_jsx_tag(true);
@@ -5307,10 +5481,10 @@ impl<'a> Parser<'a> {
             NodeData::JsxOpeningElement(Box::new(JsxOpeningElementData {
                 attributes,
                 tag_name,
-                type_arguments: None,
+                type_arguments,
                 facts: 0,
             })),
-            &[tag_name, attributes],
+            &element_children,
         );
         let children = self.parse_jsx_children();
         let closing_start = self.current.range.start;
@@ -5480,7 +5654,8 @@ impl<'a> Parser<'a> {
         while matches!(
             self.current.kind,
             SyntaxKind::Identifier | SyntaxKind::OpenBraceToken
-        ) {
+        ) || self.current.kind.is_keyword()
+        {
             let attribute_start = self.current.range.start;
             if self.current.kind == SyntaxKind::OpenBraceToken {
                 self.bump();
@@ -5501,7 +5676,7 @@ impl<'a> Parser<'a> {
                 continue;
             }
             self.current = self.scanner.scan_jsx_identifier();
-            let name = self.parse_identifier("Expected a JSX attribute name.");
+            let name = self.parse_identifier_name("Expected a JSX attribute name.");
             let initializer = if self.current.kind == SyntaxKind::EqualsToken {
                 self.bump();
                 if self.current.kind == SyntaxKind::StringLiteral {
@@ -6579,17 +6754,62 @@ impl<'a> Parser<'a> {
             self.current.kind,
             SyntaxKind::CloseBracketToken | SyntaxKind::EndOfFile
         ) {
-            if self.current.kind == SyntaxKind::DotDotDotToken {
-                let rest_start = self.consume().range.start;
+            let dot_dot_dot_token = (self.current.kind == SyntaxKind::DotDotDotToken)
+                .then(|| self.consume_token_node());
+            let named = self.current.kind == SyntaxKind::Identifier
+                && matches!(
+                    self.next_token_kind(),
+                    SyntaxKind::ColonToken | SyntaxKind::QuestionToken
+                );
+            if named {
+                let name = self.parse_identifier("Expected a tuple element name.");
+                let question_token = (self.current.kind == SyntaxKind::QuestionToken)
+                    .then(|| self.consume_token_node());
+                self.expect_and_bump(SyntaxKind::ColonToken, "Expected ':'.");
+                let type_node = self.parse_type();
+                let member_start = dot_dot_dot_token
+                    .map_or_else(|| self.node_start(name), |token| self.node_start(token));
+                let mut children = Vec::new();
+                children.extend(dot_dot_dot_token);
+                children.push(name);
+                children.extend(question_token);
+                children.push(type_node);
+                elements.push(self.alloc_node(
+                    SyntaxKind::NamedTupleMember,
+                    TextRange::new(member_start, self.node_end(type_node)),
+                    NodeData::NamedTupleMember(Box::new(NamedTupleMemberData {
+                        dot_dot_dot_token,
+                        question_token,
+                        symbol: None,
+                        type_: type_node,
+                        name,
+                    })),
+                    &children,
+                ));
+            } else if let Some(dot_dot_dot_token) = dot_dot_dot_token {
+                let rest_start = self.node_start(dot_dot_dot_token);
                 let type_node = self.parse_type();
                 elements.push(self.alloc_node(
                     SyntaxKind::RestType,
                     TextRange::new(rest_start, self.node_end(type_node)),
                     NodeData::RestTypeNode(Box::new(RestTypeNodeData { type_: type_node })),
-                    &[type_node],
+                    &[dot_dot_dot_token, type_node],
                 ));
             } else {
-                elements.push(self.parse_type());
+                let type_node = self.parse_type();
+                if self.current.kind == SyntaxKind::QuestionToken {
+                    let end = self.consume().range.end;
+                    elements.push(self.alloc_node(
+                        SyntaxKind::OptionalType,
+                        TextRange::new(self.node_start(type_node), end),
+                        NodeData::OptionalTypeNode(Box::new(OptionalTypeNodeData {
+                            type_: type_node,
+                        })),
+                        &[type_node],
+                    ));
+                } else {
+                    elements.push(type_node);
+                }
             }
             if self.current.kind != SyntaxKind::CommaToken {
                 break;
@@ -10259,6 +10479,30 @@ mod tests {
     }
 
     #[test]
+    fn optional_tuple_annotation_stops_before_variable_initializer() {
+        let result = parse_source_file("let [value = { a: 1 }]: [{ a: number }?] = [];");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let (list, _) = variable_list(&result, source_statements(&result)[0]);
+        let declaration = declaration_nodes(&result, list)[0];
+        let NodeData::VariableDeclaration(declaration) =
+            &result.arena.get(declaration).unwrap().data
+        else {
+            panic!("expected variable declaration");
+        };
+        assert!(declaration.initializer.is_some());
+        let NodeData::TupleTypeNode(tuple) =
+            &result.arena.get(declaration.type_.unwrap()).unwrap().data
+        else {
+            panic!("expected tuple annotation");
+        };
+        assert_eq!(tuple.elements.nodes.len(), 1);
+        assert_eq!(
+            result.arena.get(tuple.elements.nodes[0]).unwrap().kind,
+            SyntaxKind::OptionalType
+        );
+    }
+
+    #[test]
     fn parses_comma_separated_interface_members_without_empty_recovery_nodes() {
         let result = parse_source_file("interface Pair<T> { first: T, second: T, }");
         assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
@@ -10651,6 +10895,27 @@ mod tests {
                 .count()
                 == 2
         );
+    }
+
+    #[test]
+    fn parses_parenthesized_async_iife_variable_initializer() {
+        let result = parse_source_file(
+            "const test: Promise<[one: number, two: string]> = (async () => { return [1, 'two']; })();",
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let statement = source_statements(&result)[0];
+        let (list, _) = variable_list(&result, statement);
+        let declaration = declaration_nodes(&result, list)[0];
+        let NodeData::VariableDeclaration(declaration) =
+            &result.arena.get(declaration).unwrap().data
+        else {
+            panic!("expected variable declaration");
+        };
+        let initializer = declaration.initializer.expect("initializer");
+        assert!(matches!(
+            result.arena.get(initializer).map(|node| &node.data),
+            Some(NodeData::CallExpression(_))
+        ));
     }
 
     fn find_descendant_kind(
