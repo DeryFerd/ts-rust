@@ -4197,7 +4197,9 @@ impl<'a> Parser<'a> {
                 SyntaxKind::ColonToken
                     if parenthesis_depth == 1 && brace_depth == 0 && bracket_depth == 0 =>
                 {
-                    if previous_kind == SyntaxKind::QuestionToken || !top_level_question {
+                    if previous_kind != SyntaxKind::CloseParenToken
+                        && (previous_kind == SyntaxKind::QuestionToken || !top_level_question)
+                    {
                         typed_parameter = true;
                     }
                     top_level_question = false;
@@ -6894,6 +6896,28 @@ mod tests {
         for span in &template_data.template_spans.nodes {
             assert_eq!(result.arena.get(*span).unwrap().parent, Some(template));
         }
+    }
+
+    #[test]
+    fn parses_called_parenthesized_arrow_with_return_type() {
+        let result = parse_source_file("const pair = ((): [number, number] => [0, 0])();");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let statements = source_statements(&result);
+        let (list, _) = variable_list(&result, statements[0]);
+        let declaration = declaration_nodes(&result, list)[0];
+        let NodeData::VariableDeclaration(declaration) =
+            &result.arena.get(declaration).unwrap().data
+        else {
+            panic!("expected variable declaration");
+        };
+        assert_eq!(
+            result
+                .arena
+                .get(declaration.initializer.unwrap())
+                .unwrap()
+                .kind,
+            SyntaxKind::CallExpression
+        );
     }
 
     #[test]

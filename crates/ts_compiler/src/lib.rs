@@ -2490,7 +2490,7 @@ mod tests {
         assert_eq!(emitted.files[0].file_name, "/project/view.jsx");
         assert_eq!(
             emitted.files[0].text,
-            "\"use strict\";\nvar view = <Box label=\"ok\" />;\n"
+            "\"use strict\";\nvar view = <Box label=\"ok\"/>;\n"
         );
     }
 
