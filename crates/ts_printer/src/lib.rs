@@ -4433,8 +4433,12 @@ impl DeclarationPrinter<'_> {
             .named_type_references
             .and_then(|references| references.get(&type_id))
             .is_some_and(|reference| {
+                let reference_name = reference
+                    .name
+                    .strip_prefix("typeof ")
+                    .unwrap_or(&reference.name);
                 names.iter().any(|name| {
-                    reference.name == *name || reference.name.starts_with(&format!("{name}."))
+                    reference_name == *name || reference_name.starts_with(&format!("{name}."))
                 })
             })
         {

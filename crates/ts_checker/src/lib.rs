@@ -2265,9 +2265,18 @@ fn rewrite_named_descriptor_qualifier_matching(
             target,
         } => {
             if let Some(exported_names) = exported_names {
-                let root = name.split_once('.').map_or(name.as_str(), |(root, _)| root);
+                let (type_query, referenced_name) = name
+                    .strip_prefix("typeof ")
+                    .map_or((false, name.as_str()), |name| (true, name));
+                let root = referenced_name
+                    .split_once('.')
+                    .map_or(referenced_name, |(root, _)| root);
                 if exported_names.contains(root) {
-                    *name = format!("{qualifier}.{name}");
+                    *name = if type_query {
+                        format!("typeof {qualifier}.{referenced_name}")
+                    } else {
+                        format!("{qualifier}.{referenced_name}")
+                    };
                 }
             } else if let Some((_, suffix)) = name.split_once('.') {
                 *name = format!("{qualifier}.{suffix}");
@@ -12737,32 +12746,8 @@ fn paint_exported_named_descriptor_imports(
     module_name: &str,
     exports: &BTreeMap<String, TypeDescriptor>,
 ) {
-    if let TypeDescriptor::Named { name, .. } = descriptor {
-        let exported_root = name.split_once('.').map_or(name.as_str(), |(root, _)| root);
-        if !name.starts_with("__") && exports.contains_key(exported_root) {
-            let qualifier = name.clone();
-            let mut target = descriptor.clone();
-            if let TypeDescriptor::Named {
-                type_arguments,
-                target,
-                ..
-            } = &mut target
-            {
-                for argument in type_arguments {
-                    paint_exported_named_descriptor_imports(argument, module_name, exports);
-                }
-                paint_exported_named_descriptor_imports(target, module_name, exports);
-            }
-            *descriptor = TypeDescriptor::Import {
-                reference: ImportTypeReference {
-                    module_specifier: module_name.to_owned(),
-                    qualifier,
-                    is_typeof: false,
-                },
-                target: Box::new(target),
-            };
-            return;
-        }
+    if paint_exported_named_descriptor_import(descriptor, module_name, exports) {
+        return;
     }
     match descriptor {
         TypeDescriptor::Named {
@@ -12833,6 +12818,46 @@ fn paint_exported_named_descriptor_imports(
         }
         _ => {}
     }
+}
+
+fn paint_exported_named_descriptor_import(
+    descriptor: &mut TypeDescriptor,
+    module_name: &str,
+    exports: &BTreeMap<String, TypeDescriptor>,
+) -> bool {
+    if let TypeDescriptor::Named { name, .. } = descriptor {
+        let (is_typeof, referenced_name) = name
+            .strip_prefix("typeof ")
+            .map_or((false, name.as_str()), |name| (true, name));
+        let exported_root = referenced_name
+            .split_once('.')
+            .map_or(referenced_name, |(root, _)| root);
+        if !name.starts_with("__") && exports.contains_key(exported_root) {
+            let qualifier = referenced_name.to_owned();
+            let mut target = descriptor.clone();
+            if let TypeDescriptor::Named {
+                type_arguments,
+                target,
+                ..
+            } = &mut target
+            {
+                for argument in type_arguments {
+                    paint_exported_named_descriptor_imports(argument, module_name, exports);
+                }
+                paint_exported_named_descriptor_imports(target, module_name, exports);
+            }
+            *descriptor = TypeDescriptor::Import {
+                reference: ImportTypeReference {
+                    module_specifier: module_name.to_owned(),
+                    qualifier,
+                    is_typeof,
+                },
+                target: Box::new(target),
+            };
+            return true;
+        }
+    }
+    false
 }
 
 fn paint_imported_named_descriptor_references(
@@ -13167,6 +13192,32 @@ fn describe_type_node_syntax(
             semantic_target,
             exported_names,
         ),
+        NodeData::TypeQueryNode(query) => {
+            let Some(name) = checker.entity_name_text(query.expr_name) else {
+                return semantic_target;
+            };
+            let resolved = if matches!(
+                semantic_target,
+                TypeDescriptor::Any | TypeDescriptor::Unknown
+            ) {
+                local_const_value_descriptor(source, &name).unwrap_or_else(|| {
+                    let type_id = checker.type_from_type_node(node);
+                    describe_source_type(source, &checker.result, type_id)
+                })
+            } else {
+                semantic_target
+            };
+            let root = name.split_once('.').map_or(name.as_str(), |(root, _)| root);
+            if exported_names.contains(root) {
+                TypeDescriptor::Named {
+                    name: format!("typeof {name}"),
+                    type_arguments: Vec::new(),
+                    target: Box::new(resolved),
+                }
+            } else {
+                resolved
+            }
+        }
         NodeData::TypeReferenceNode(reference) => {
             let Some(name) = checker
                 .property_name(reference.type_name)
@@ -13650,6 +13701,45 @@ fn describe_type_node_syntax(
         }
         _ => semantic_target,
     }
+}
+
+fn local_const_value_descriptor(source: &ProgramSource<'_>, name: &str) -> Option<TypeDescriptor> {
+    source.arena.iter().find_map(|(_, node)| {
+        let NodeData::VariableDeclaration(declaration) = &node.data else {
+            return None;
+        };
+        if identifier_text(source.arena, declaration.name) != Some(name) {
+            return None;
+        }
+        let list = source.arena.get(node.parent?)?;
+        if !matches!(list.data, NodeData::VariableDeclarationList(_))
+            || list.flags.0 & (1 << 1) == 0
+        {
+            return None;
+        }
+        let initializer = source.arena.get(declaration.initializer?)?;
+        match &initializer.data {
+            NodeData::StringLiteral(literal) => {
+                Some(TypeDescriptor::StringLiteral(literal.text.clone()))
+            }
+            NodeData::NoSubstitutionTemplateLiteral(literal) => {
+                Some(TypeDescriptor::StringLiteral(literal.text.clone()))
+            }
+            NodeData::NumericLiteral(literal) => {
+                Some(TypeDescriptor::NumberLiteral(literal.text.clone()))
+            }
+            NodeData::BigIntLiteral(literal) => {
+                Some(TypeDescriptor::BigIntLiteral(literal.text.clone()))
+            }
+            NodeData::KeywordExpression(_) if initializer.kind == SyntaxKind::TrueKeyword => {
+                Some(TypeDescriptor::BooleanLiteral(true))
+            }
+            NodeData::KeywordExpression(_) if initializer.kind == SyntaxKind::FalseKeyword => {
+                Some(TypeDescriptor::BooleanLiteral(false))
+            }
+            _ => None,
+        }
+    })
 }
 
 fn is_homomorphic_identity_alias(
@@ -14998,8 +15088,8 @@ mod tests {
 
     use super::{
         Checker, CheckerOptions, EnumConstantValue, FunctionType, ImportTypeReference,
-        NamedTypeReference, ObjectType, ProgramSource, TypeArena, TypeDescriptor, TypeKind,
-        check_program, check_source_file, check_source_file_with_options,
+        NamedTypeReference, ObjectType, ProgramChecker, ProgramSource, TypeArena, TypeDescriptor,
+        TypeKind, check_program, check_source_file, check_source_file_with_options,
         describe_type_with_imports_bounded, identifier_text,
     };
 
@@ -18861,6 +18951,56 @@ mod tests {
             checked.files[1].diagnostics.is_empty(),
             "{:?}",
             checked.files[1].diagnostics
+        );
+    }
+
+    #[test]
+    fn preserves_exported_type_queries_and_private_const_literals_in_descriptors() {
+        let parsed = parse_source_file(concat!(
+            "export const publicValue = 'public';\n",
+            "const privateValue = 'private';\n",
+            "export const read = (a: typeof publicValue, b: typeof privateValue) => ",
+            "null! as { public: typeof publicValue; private: typeof privateValue };\n",
+        ));
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        let modules = BTreeMap::new();
+        let source = ProgramSource {
+            arena: &parsed.arena,
+            source_file: parsed.source_file,
+            bindings: &bindings,
+            resolved_modules: &modules,
+            is_default_library: false,
+            skip_diagnostics: false,
+            checker_options: CheckerOptions::default(),
+        };
+        let symbol = bindings.root_scope().unwrap().symbols.get("read").unwrap();
+        let TypeDescriptor::Function {
+            parameters,
+            return_type,
+            ..
+        } = ProgramChecker::describe_symbol(&source, &result, symbol).unwrap()
+        else {
+            panic!("expected function descriptor");
+        };
+        assert!(matches!(
+            &parameters[0],
+            TypeDescriptor::Named { name, .. } if name == "typeof publicValue"
+        ));
+        assert_eq!(
+            parameters[1],
+            TypeDescriptor::StringLiteral("private".into())
+        );
+        let TypeDescriptor::Object { properties, .. } = *return_type else {
+            panic!("expected object return descriptor");
+        };
+        assert!(matches!(
+            &properties["public"],
+            TypeDescriptor::Named { name, .. } if name == "typeof publicValue"
+        ));
+        assert_eq!(
+            properties["private"],
+            TypeDescriptor::StringLiteral("private".into())
         );
     }
 
