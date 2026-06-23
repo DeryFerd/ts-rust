@@ -15,7 +15,7 @@ use ts_config::{ConfigDiagnostic, resolve_config_file};
 use ts_core::{TextPos, TextRange};
 use ts_diagnostics::{Diagnostic, message_by_code};
 use ts_glob::{DiscoveryOptions, discover_files};
-use ts_module::{ResolutionOptions, Resolver, automatic_type_directive_names};
+use ts_module::{ResolutionOptions, Resolver, automatic_type_directive_names, parse_package_json};
 use ts_options::{CompilerOptions, ModuleKind, PrinterSettings, parse_project_options};
 use ts_parser::{ParseResult, parse_jsx_source_file, parse_source_file};
 use ts_path::{
@@ -38,6 +38,7 @@ pub struct SourceFile {
     pub binding: BindResult,
     pub checking: CheckResult,
     pub is_default_library: bool,
+    implied_node_format: ModuleKind,
 }
 
 /// A diagnostic produced while constructing or parsing a Program.
@@ -441,6 +442,14 @@ impl Program {
                 let mut source_settings = settings;
                 if source_file.file_name.to_ascii_lowercase().ends_with(".cts") {
                     source_settings.module = ModuleKind::CommonJs;
+                } else if matches!(
+                    source_settings.module,
+                    ModuleKind::Node16
+                        | ModuleKind::Node18
+                        | ModuleKind::Node20
+                        | ModuleKind::NodeNext
+                ) {
+                    source_settings.module = source_file.implied_node_format;
                 }
                 let amd_dependencies = source_file
                     .parse
@@ -528,10 +537,12 @@ impl Program {
             if settings.emit_declarations {
                 if (self.options.isolated_declarations
                     && has_unserializable_isolated_declaration_name(source_file))
+                    || has_private_export_type_query(source_file)
+                    || has_unserializable_exported_anonymous_class(source_file)
                     || source_file.checking.diagnostics.iter().any(|diagnostic| {
                         matches!(
                             diagnostic.diagnostic.code(),
-                            2527 | 2883 | 4023 | 4032 | 5088
+                            2527 | 2883 | 4023 | 4032 | 4081 | 4094 | 5088 | 9010
                         )
                     })
                 {
@@ -759,10 +770,12 @@ impl Program {
                 }
                 if (self.options.isolated_declarations
                     && has_unserializable_isolated_declaration_name(source))
+                    || has_private_export_type_query(source)
+                    || has_unserializable_exported_anonymous_class(source)
                     || source.checking.diagnostics.iter().any(|diagnostic| {
                         matches!(
                             diagnostic.diagnostic.code(),
-                            2527 | 2883 | 4023 | 4032 | 5088
+                            2527 | 2883 | 4023 | 4032 | 4081 | 4094 | 5088 | 9010
                         )
                     })
                 {
@@ -1435,6 +1448,7 @@ impl Program {
             binding,
             checking,
             is_default_library: false,
+            implied_node_format: implied_node_format(file_system, file_name),
         });
     }
 
@@ -1556,8 +1570,44 @@ impl Program {
             binding,
             checking,
             is_default_library: true,
+            implied_node_format: ModuleKind::CommonJs,
         });
     }
+}
+
+fn implied_node_format(file_system: &dyn FileSystem, file_name: &str) -> ModuleKind {
+    let extension = Path::new(file_name)
+        .extension()
+        .and_then(|value| value.to_str());
+    if extension.is_some_and(|extension| {
+        extension.eq_ignore_ascii_case("mts") || extension.eq_ignore_ascii_case("mjs")
+    }) {
+        return ModuleKind::EsNext;
+    }
+    if extension.is_some_and(|extension| {
+        extension.eq_ignore_ascii_case("cts") || extension.eq_ignore_ascii_case("cjs")
+    }) {
+        return ModuleKind::CommonJs;
+    }
+    let mut directory = directory_path(file_name);
+    loop {
+        let package_json = resolve_path(&directory, &["package.json"]);
+        if file_system.file_exists(&package_json) {
+            return file_system
+                .read_file(&package_json)
+                .ok()
+                .and_then(|contents| parse_package_json(&contents).ok())
+                .and_then(|package| package.package_type)
+                .filter(|package_type| package_type == "module")
+                .map_or(ModuleKind::CommonJs, |_| ModuleKind::EsNext);
+        }
+        let parent = directory_path(&directory);
+        if parent == directory {
+            break;
+        }
+        directory = parent;
+    }
+    ModuleKind::CommonJs
 }
 
 #[derive(Clone, Copy)]
@@ -1764,7 +1814,201 @@ fn has_unserializable_isolated_declaration_name(source: &SourceFile) -> bool {
             ),
             _ => true,
         }
+    }) || source.parse.arena.iter().any(|(_, node)| {
+        let NodeData::VariableStatement(statement) = &node.data else {
+            return false;
+        };
+        if !node_has_modifier(
+            &source.parse.arena,
+            statement.modifiers.as_ref(),
+            ts_ast::SyntaxKind::ExportKeyword,
+        ) {
+            return false;
+        }
+        let Some(NodeData::VariableDeclarationList(list)) = source
+            .parse
+            .arena
+            .get(statement.declaration_list)
+            .map(|node| &node.data)
+        else {
+            return false;
+        };
+        list.declarations.nodes.iter().any(|declaration| {
+            matches!(
+                source.parse.arena.get(*declaration).map(|node| &node.data),
+                Some(NodeData::VariableDeclaration(variable))
+                    if variable.type_.is_none()
+                        && variable.initializer.is_some_and(|initializer| matches!(
+                            source.parse.arena.get(initializer).map(|node| &node.data),
+                            Some(NodeData::PropertyAccessExpression(_)
+                                | NodeData::ElementAccessExpression(_)
+                                | NodeData::CallExpression(_)
+                                | NodeData::NewExpression(_))
+                        ))
+            )
+        })
     })
+}
+
+fn has_private_export_type_query(source: &SourceFile) -> bool {
+    source.parse.arena.iter().any(|(query_id, node)| {
+        let NodeData::TypeQueryNode(query) = &node.data else {
+            return false;
+        };
+        let mut ancestor = source
+            .parse
+            .arena
+            .get(query_id)
+            .and_then(|node| node.parent);
+        let mut exported_alias = false;
+        while let Some(id) = ancestor {
+            let Some(node) = source.parse.arena.get(id) else {
+                break;
+            };
+            if let NodeData::TypeAliasDeclaration(alias) = &node.data {
+                exported_alias = node_has_modifier(
+                    &source.parse.arena,
+                    alias.modifiers.as_ref(),
+                    ts_ast::SyntaxKind::ExportKeyword,
+                );
+                break;
+            }
+            ancestor = node.parent;
+        }
+        if !exported_alias {
+            return false;
+        }
+        let Some((identifier, name)) =
+            leftmost_entity_identifier(&source.parse.arena, query.expr_name)
+        else {
+            return false;
+        };
+        let Some(symbol) = source.binding.resolve_name_at(identifier, name) else {
+            return false;
+        };
+        let Some(symbol) = source.binding.symbols.get(symbol) else {
+            return false;
+        };
+        !symbol.declarations.is_empty()
+            && symbol.declarations.iter().all(|declaration| {
+                declaration_is_nested_in_runtime_block(
+                    &source.parse.arena,
+                    *declaration,
+                    source.parse.source_file,
+                )
+            })
+    })
+}
+
+fn has_unserializable_exported_anonymous_class(source: &SourceFile) -> bool {
+    let private_mixins = source
+        .parse
+        .arena
+        .iter()
+        .filter_map(|(_, node)| {
+            let NodeData::VariableDeclaration(variable) = &node.data else {
+                return None;
+            };
+            let NodeData::ClassExpression(class) =
+                &source.parse.arena.get(variable.initializer?)?.data
+            else {
+                return None;
+            };
+            class
+                .members
+                .nodes
+                .iter()
+                .any(|member| {
+                    let modifiers = match &source.parse.arena.get(*member).map(|node| &node.data) {
+                        Some(NodeData::PropertyDeclaration(member)) => member.modifiers.as_ref(),
+                        Some(NodeData::MethodDeclaration(member)) => member.modifiers.as_ref(),
+                        Some(NodeData::GetAccessorDeclaration(member)) => member.modifiers.as_ref(),
+                        Some(NodeData::SetAccessorDeclaration(member)) => member.modifiers.as_ref(),
+                        _ => None,
+                    };
+                    modifiers.is_some_and(|modifiers| {
+                        modifiers.list.nodes.iter().any(|modifier| {
+                            source.parse.arena.get(*modifier).is_some_and(|modifier| {
+                                matches!(
+                                    modifier.kind,
+                                    ts_ast::SyntaxKind::PrivateKeyword
+                                        | ts_ast::SyntaxKind::ProtectedKeyword
+                                )
+                            })
+                        })
+                    })
+                })
+                .then(|| identifier_text(&source.parse.arena, variable.name).map(str::to_owned))
+                .flatten()
+        })
+        .collect::<BTreeSet<_>>();
+    if private_mixins.is_empty() {
+        return false;
+    }
+    let Some(NodeData::SourceFile(file)) = source
+        .parse
+        .arena
+        .get(source.parse.source_file)
+        .map(|node| &node.data)
+    else {
+        return false;
+    };
+    file.statements.nodes.iter().any(|statement_id| {
+        let Some(statement) = source.parse.arena.get(*statement_id) else {
+            return false;
+        };
+        let exported = matches!(&statement.data, NodeData::ExportAssignment(_))
+            || match &statement.data {
+                NodeData::ClassDeclaration(class) => node_has_modifier(
+                    &source.parse.arena,
+                    class.modifiers.as_ref(),
+                    ts_ast::SyntaxKind::ExportKeyword,
+                ),
+                _ => false,
+            };
+        exported
+            && source.parse.arena.iter().any(|(_, node)| {
+                statement.range.start <= node.range.start
+                    && node.range.end <= statement.range.end
+                    && matches!(
+                        &node.data,
+                        NodeData::Identifier(identifier)
+                            if private_mixins.contains(&identifier.text)
+                    )
+            })
+    })
+}
+
+fn leftmost_entity_identifier(arena: &ts_ast::NodeArena, entity: NodeId) -> Option<(NodeId, &str)> {
+    match &arena.get(entity)?.data {
+        NodeData::Identifier(identifier) => Some((entity, &identifier.text)),
+        NodeData::QualifiedName(name) => leftmost_entity_identifier(arena, name.left),
+        NodeData::PropertyAccessExpression(access) => {
+            leftmost_entity_identifier(arena, access.expression)
+        }
+        _ => None,
+    }
+}
+
+fn declaration_is_nested_in_runtime_block(
+    arena: &ts_ast::NodeArena,
+    declaration: NodeId,
+    source_file: NodeId,
+) -> bool {
+    let mut current = declaration;
+    while let Some(parent) = arena.get(current).and_then(|node| node.parent) {
+        if parent == source_file {
+            return false;
+        }
+        if matches!(
+            arena.get(parent).map(|node| &node.data),
+            Some(NodeData::Block(_))
+        ) {
+            return true;
+        }
+        current = parent;
+    }
+    false
 }
 
 fn emit_diagnostic(source_file: &SourceFile, error: &ts_printer::EmitError) -> ProgramDiagnostic {
@@ -1831,7 +2075,19 @@ fn add_nonportable_inferred_type_diagnostics(source: &SourceFile, checking: &mut
             }) else {
                 continue;
             };
-            if inaccessible_imported_unique_symbol(checking, type_id)
+            let imported_computed_name_is_accessible =
+                inaccessible_computed_symbol_name(checking, type_id, &mut BTreeSet::new())
+                    .is_some_and(|qualifier| {
+                        imports.iter().any(|(local, _, _)| local == &qualifier)
+                    });
+            if ((inaccessible_imported_unique_symbol(checking, type_id)
+                && !imported_computed_name_is_accessible)
+                || inferred_empty_object_from_imported_call(
+                    source,
+                    checking,
+                    declaration.initializer,
+                    type_id,
+                ))
                 && let Some(name) = identifier_text(&source.parse.arena, declaration.name)
             {
                 let message =
@@ -1983,22 +2239,125 @@ fn add_nonportable_inferred_type_diagnostics(source: &SourceFile, checking: &mut
     }
 }
 
-fn inaccessible_imported_unique_symbol(checking: &CheckResult, type_id: TypeId) -> bool {
-    if !checking.import_type_references.contains_key(&type_id) {
+fn inferred_empty_object_from_imported_call(
+    source: &SourceFile,
+    checking: &CheckResult,
+    initializer: Option<NodeId>,
+    type_id: TypeId,
+) -> bool {
+    if checking.import_type_references.contains_key(&type_id)
+        || checking.named_type_references.contains_key(&type_id)
+    {
         return false;
     }
     let Some(TypeKind::Object(object)) = checking.types.get(type_id).map(|type_| &type_.kind)
     else {
         return false;
     };
-    object.readonly_properties.iter().any(|name| {
-        object.properties.get(name).is_some_and(|property| {
-            matches!(
-                checking.types.get(*property).map(|type_| &type_.kind),
-                Some(TypeKind::Unknown)
-            )
-        })
-    })
+    if !object.properties.is_empty()
+        || object.string_index_type.is_some()
+        || object.number_index_type.is_some()
+        || !object.call_signatures.is_empty()
+        || !object.construct_signatures.is_empty()
+    {
+        return false;
+    }
+    let Some(NodeData::CallExpression(call)) = initializer
+        .and_then(|initializer| source.parse.arena.get(initializer))
+        .map(|node| &node.data)
+    else {
+        return false;
+    };
+    let Some(callee_type) = checking.type_of_node(call.expression) else {
+        return false;
+    };
+    if nonportable_import_type_reference(checking, callee_type, &mut BTreeSet::new()).is_some() {
+        return true;
+    }
+    let mut root = call.expression;
+    while let Some(NodeData::PropertyAccessExpression(access)) =
+        source.parse.arena.get(root).map(|node| &node.data)
+    {
+        root = access.expression;
+    }
+    let Some(root_name) = identifier_text(&source.parse.arena, root) else {
+        return false;
+    };
+    source_import_bindings(source)
+        .iter()
+        .any(|(local, _, _)| local == root_name)
+}
+
+fn inaccessible_imported_unique_symbol(checking: &CheckResult, type_id: TypeId) -> bool {
+    fn visit(
+        checking: &CheckResult,
+        type_id: TypeId,
+        imported: bool,
+        visited: &mut BTreeSet<TypeId>,
+    ) -> bool {
+        if !visited.insert(type_id) {
+            return false;
+        }
+        let imported = imported
+            || checking.import_type_references.contains_key(&type_id)
+            || checking
+                .named_type_references
+                .get(&type_id)
+                .is_some_and(|reference| reference.name.starts_with("import("));
+        let Some(kind) = checking.types.get(type_id).map(|type_| &type_.kind) else {
+            return false;
+        };
+        match kind {
+            TypeKind::Object(object) => {
+                if imported
+                    && (object.properties.keys().any(|name| name.starts_with("[#"))
+                        || object.readonly_properties.iter().any(|name| {
+                            object.properties.get(name).is_some_and(|property| {
+                                matches!(
+                                    checking.types.get(*property).map(|type_| &type_.kind),
+                                    Some(TypeKind::Unknown)
+                                )
+                            })
+                        }))
+                {
+                    return true;
+                }
+                object
+                    .properties
+                    .values()
+                    .copied()
+                    .chain(object.string_index_type)
+                    .chain(object.number_index_type)
+                    .any(|part| visit(checking, part, imported, visited))
+            }
+            TypeKind::Array(element) => visit(checking, *element, imported, visited),
+            TypeKind::Tuple(elements)
+            | TypeKind::ReadonlyTuple(elements)
+            | TypeKind::Union(elements)
+            | TypeKind::Intersection(elements) => elements
+                .iter()
+                .any(|part| visit(checking, *part, imported, visited)),
+            TypeKind::Function(signature) | TypeKind::Constructor(signature) => signature
+                .parameters
+                .iter()
+                .copied()
+                .chain(signature.rest_parameter)
+                .chain(std::iter::once(signature.return_type))
+                .any(|part| visit(checking, part, imported, visited)),
+            TypeKind::Overload(signatures) => signatures.iter().any(|signature| {
+                signature
+                    .parameters
+                    .iter()
+                    .copied()
+                    .chain(signature.rest_parameter)
+                    .chain(std::iter::once(signature.return_type))
+                    .any(|part| visit(checking, part, imported, visited))
+            }),
+            _ => false,
+        }
+    }
+
+    visit(checking, type_id, false, &mut BTreeSet::new())
 }
 
 fn source_import_bindings(source: &SourceFile) -> Vec<(String, String, String)> {
@@ -2033,6 +2392,14 @@ fn source_import_bindings(source: &SourceFile) -> Vec<(String, String, String)> 
             .and_then(|name| identifier_text(&source.parse.arena, name))
         {
             imports.push((local.to_owned(), "default".into(), specifier.clone()));
+        }
+        if let Some(NodeData::NamespaceImport(namespace)) = clause
+            .named_bindings
+            .and_then(|bindings| source.parse.arena.get(bindings))
+            .map(|node| &node.data)
+            && let Some(local) = identifier_text(&source.parse.arena, namespace.name)
+        {
+            imports.push((local.to_owned(), "*".into(), specifier.clone()));
         }
         let Some(NodeData::NamedImports(named)) = clause
             .named_bindings
@@ -6238,6 +6605,96 @@ mod tests {
     }
 
     #[test]
+    fn private_name_export_diagnostic_suppresses_declaration_output() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/main.ts",
+            "if (false) { export var hidden = 0; } export type Public = typeof hidden; }",
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["main.ts".to_owned()],
+            CompilerOptions {
+                declaration: true,
+                no_lib: true,
+                target: ScriptTarget::Es2015,
+                ..CompilerOptions::default()
+            },
+        );
+        assert!(
+            !program
+                .emit()
+                .files
+                .iter()
+                .any(|file| file.file_name == "/project/main.d.ts")
+        );
+    }
+
+    #[test]
+    fn isolated_declaration_annotation_diagnostic_suppresses_declaration_output() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/main.ts",
+            "declare const internal: { value: number }; export const value = internal.value;",
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["main.ts".to_owned()],
+            CompilerOptions {
+                declaration: true,
+                isolated_declarations: true,
+                no_lib: true,
+                target: ScriptTarget::Es2015,
+                ..CompilerOptions::default()
+            },
+        );
+        assert!(
+            !program
+                .emit()
+                .files
+                .iter()
+                .any(|file| file.file_name == "/project/main.d.ts")
+        );
+    }
+
+    #[test]
+    fn private_anonymous_mixin_diagnostic_suppresses_declaration_output() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/main.ts",
+            concat!(
+                "declare function mix<T>(value: T): T;\n",
+                "const Mixin = class { protected dispose() {} private assert() {} };\n",
+                "export default class extends mix(Mixin) {}\n",
+            ),
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["main.ts".to_owned()],
+            CompilerOptions {
+                declaration: true,
+                module: ModuleKind::CommonJs,
+                no_lib: true,
+                target: ScriptTarget::Es2015,
+                ..CompilerOptions::default()
+            },
+        );
+        assert!(
+            !program
+                .emit()
+                .files
+                .iter()
+                .any(|file| file.file_name == "/project/main.d.ts")
+        );
+    }
+
+    #[test]
     fn nonportable_nested_package_inference_suppresses_declaration_output() {
         let fs = MemoryFileSystem::new(true);
         fs.write_file(
@@ -6290,6 +6747,90 @@ mod tests {
                 .files
                 .iter()
                 .any(|file| file.file_name == "/project/main.d.ts")
+        );
+    }
+
+    #[test]
+    fn node_next_uses_the_nearest_package_type_for_javascript_emit() {
+        for (package_json, common_js) in [
+            ("{\"name\":\"pkg\"}", true),
+            ("{\"name\":\"pkg\",\"type\":\"module\"}", false),
+        ] {
+            let fs = MemoryFileSystem::new(true);
+            fs.write_file("/project/package.json", package_json)
+                .unwrap();
+            fs.write_file(
+                "/project/index.ts",
+                "import { Shape } from './types'; export type Public = Shape;",
+            )
+            .unwrap();
+            fs.write_file("/project/types.ts", "export interface Shape {}")
+                .unwrap();
+            let program = Program::new_with_options(
+                &fs,
+                "/project",
+                &["index.ts".to_owned()],
+                CompilerOptions {
+                    module: ModuleKind::NodeNext,
+                    no_lib: true,
+                    target: ScriptTarget::Es2015,
+                    ..CompilerOptions::default()
+                },
+            );
+            let javascript = program
+                .emit()
+                .files
+                .into_iter()
+                .find(|file| file.file_name == "/project/index.js")
+                .unwrap();
+            assert_eq!(javascript.text.contains("__esModule"), common_js);
+            assert_eq!(javascript.text.contains("export {};"), !common_js);
+        }
+    }
+
+    #[test]
+    fn inferred_external_return_types_use_import_types_without_runtime_imports() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/node_modules/pkg/package.json",
+            "{\"name\":\"pkg\",\"types\":\"index.d.ts\"}",
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/node_modules/pkg/index.d.ts",
+            "export declare function createPlugin(): PluginConfig; export declare class PluginConfig {}",
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/index.ts",
+            "import { createPlugin } from 'pkg'; export function plugins() { return [createPlugin()]; }",
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["index.ts".to_owned()],
+            CompilerOptions {
+                declaration: true,
+                module: ModuleKind::NodeNext,
+                no_lib: true,
+                target: ScriptTarget::Es2015,
+                ..CompilerOptions::default()
+            },
+        );
+        let source = program.source_file("/project/index.ts").unwrap();
+        let declaration = program
+            .emit()
+            .files
+            .into_iter()
+            .find(|file| file.file_name == "/project/index.d.ts")
+            .unwrap();
+        assert_eq!(
+            declaration.text,
+            "export declare function plugins(): import(\"pkg\").PluginConfig[];\n",
+            "reachability={:?}, import refs={:?}",
+            source.checking.declaration_reachability,
+            source.checking.import_type_references,
         );
     }
 

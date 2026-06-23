@@ -4132,8 +4132,11 @@ impl<'a> Parser<'a> {
                     | SyntaxKind::CloseBracketToken
                     | SyntaxKind::CloseBraceToken
                     | SyntaxKind::GreaterThanToken => delimiter_depth -= 1,
+                    SyntaxKind::GreaterThanGreaterThanToken => delimiter_depth -= 2,
+                    SyntaxKind::GreaterThanGreaterThanGreaterThanToken => delimiter_depth -= 3,
                     SyntaxKind::EqualsGreaterThanToken if delimiter_depth == 0 => break true,
-                    SyntaxKind::EndOfFile | SyntaxKind::SemicolonToken => break false,
+                    SyntaxKind::EndOfFile => break false,
+                    SyntaxKind::SemicolonToken if delimiter_depth == 0 => break false,
                     _ => {}
                 }
             }
@@ -7841,6 +7844,30 @@ mod tests {
             result.arena.get(assertion.expression).unwrap().kind,
             SyntaxKind::Identifier
         );
+    }
+
+    #[test]
+    fn parses_generic_arrow_with_nested_generic_return_type() {
+        let result = parse_source_file(
+            "const build = <V extends string>(version: V): Output<{ value: Record<V, string>; }> => ({});",
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let statements = source_statements(&result);
+        let (list, _) = variable_list(&result, statements[0]);
+        let declaration = declaration_nodes(&result, list)[0];
+        let NodeData::VariableDeclaration(declaration) =
+            &result.arena.get(declaration).unwrap().data
+        else {
+            panic!("expected variable declaration");
+        };
+        assert!(matches!(
+            result
+                .arena
+                .get(declaration.initializer.unwrap())
+                .unwrap()
+                .data,
+            NodeData::ArrowFunction(_)
+        ));
     }
 
     #[test]
