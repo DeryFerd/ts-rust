@@ -5006,6 +5006,11 @@ impl<'a> Checker<'a> {
                 .get(&symbol)
                 .copied()
                 .unwrap_or_else(|| self.result.types.any());
+            if let Some(reference) = self.external_imports.get(&symbol).cloned() {
+                self.result
+                    .import_type_references
+                    .insert(type_id, reference);
+            }
             if let Some(class) = self.bindings.symbols.get(symbol).and_then(|symbol| {
                 symbol.declarations.iter().find_map(|declaration| {
                     let NodeData::ClassDeclaration(class) = &self.arena.get(*declaration)?.data
@@ -11944,6 +11949,62 @@ mod tests {
         for statement in &source.statements.nodes[4..] {
             assert_eq!(meanings.get(statement), Some(&false), "{statement:?}");
         }
+    }
+
+    #[test]
+    fn inferred_new_expression_keeps_imported_class_reference() {
+        let dependency = parse_source_file("export class B {}");
+        let consumer = parse_source_file(
+            r#"
+                import { B } from "./shared";
+                export function f() { return new B(); }
+            "#,
+        );
+        let dependency_bindings = bind_source_file(&dependency.arena, dependency.source_file);
+        let consumer_bindings = bind_source_file(&consumer.arena, consumer.source_file);
+        let no_modules = BTreeMap::new();
+        let consumer_modules = BTreeMap::from([("./shared".into(), 0)]);
+        let checked = check_program(&[
+            ProgramSource {
+                arena: &dependency.arena,
+                source_file: dependency.source_file,
+                bindings: &dependency_bindings,
+                resolved_modules: &no_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+            ProgramSource {
+                arena: &consumer.arena,
+                source_file: consumer.source_file,
+                bindings: &consumer_bindings,
+                resolved_modules: &consumer_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+        ]);
+        let function = consumer_bindings
+            .root_scope()
+            .unwrap()
+            .symbols
+            .get("f")
+            .unwrap();
+        let function_type = checked.files[1].type_of_symbol(function).unwrap();
+        let TypeKind::Function(signature) =
+            &checked.files[1].types.get(function_type).unwrap().kind
+        else {
+            panic!("expected function type");
+        };
+        assert_eq!(
+            checked.files[1]
+                .import_type_references
+                .get(&signature.return_type),
+            Some(&ImportTypeReference {
+                module_specifier: "./shared".into(),
+                qualifier: "B".into(),
+            })
+        );
     }
 
     #[test]

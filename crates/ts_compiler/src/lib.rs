@@ -635,6 +635,15 @@ impl Program {
             let mut code = String::new();
             let mut map_builder = self.options.declaration_map.then(SourceMapBuilder::new);
             let mut map_sources = Vec::new();
+            let bundle_source_names = sources
+                .iter()
+                .map(|source| source.file_name.clone())
+                .collect::<Vec<_>>();
+            let bundle_root = ts_outputpaths::common_source_directory(
+                &bundle_source_names,
+                &self.current_directory,
+                self.case_sensitivity,
+            );
             for source in &sources {
                 if source
                     .checking
@@ -661,7 +670,7 @@ impl Program {
                     Some(&declaration_node_types),
                     Some(&source.checking.import_type_references),
                 ) {
-                    Ok(emitted) => {
+                    Ok(mut emitted) => {
                         if !emitted.code.is_empty() {
                             if let Some(builder) = &mut map_builder {
                                 let source_index =
@@ -669,10 +678,36 @@ impl Program {
                                 let _ = builder.add_mapping(generated_line, 0, source_index, 0, 0);
                             }
                             map_sources.push(source.file_name.clone());
-                            if settings.module == ModuleKind::Amd
-                                && source_is_external_module(source)
-                            {
-                                append_amd_declaration_module(&mut code, source, &emitted.code);
+                            if source_is_external_module(source) {
+                                emitted.code = self.rewrite_bundle_declaration_specifiers(
+                                    source,
+                                    &emitted.code,
+                                    &bundle_root,
+                                    settings.module,
+                                );
+                                emitted.code = self.prefer_bundle_declaration_imports(
+                                    source,
+                                    &emitted.code,
+                                    &bundle_root,
+                                    settings.module,
+                                );
+                                emitted.code = self.rewrite_late_bundle_export_references(
+                                    source,
+                                    &emitted.code,
+                                    &bundle_root,
+                                    settings.module,
+                                );
+                                append_bundle_declaration_module(
+                                    &mut code,
+                                    source,
+                                    &emitted.code,
+                                    &bundle_declaration_module_name(
+                                        source,
+                                        &bundle_root,
+                                        settings.module,
+                                    ),
+                                    settings.module == ModuleKind::Amd,
+                                );
                             } else {
                                 code.push_str(&emitted.code);
                             }
@@ -748,6 +783,228 @@ impl Program {
             .into_iter()
             .map(|index| &self.source_files[index])
             .collect()
+    }
+
+    fn rewrite_bundle_declaration_specifiers(
+        &self,
+        source: &SourceFile,
+        declaration: &str,
+        bundle_root: &str,
+        module: ModuleKind,
+    ) -> String {
+        let containing = canonicalize(
+            &source.file_name,
+            &self.current_directory,
+            self.case_sensitivity,
+        );
+        self.resolved_modules
+            .iter()
+            .filter(|((source, _), _)| source == &containing)
+            .filter_map(|((_, specifier), target)| {
+                let target = self
+                    .file_index
+                    .get(target)
+                    .and_then(|index| self.source_files.get(*index))?;
+                Some((
+                    specifier,
+                    bundle_declaration_module_name(target, bundle_root, module),
+                ))
+            })
+            .fold(
+                declaration.to_owned(),
+                |declaration, (specifier, target)| {
+                    declaration
+                        .replace(&format!("\"{specifier}\""), &format!("\"{target}\""))
+                        .replace(&format!("'{specifier}'"), &format!("'{target}'"))
+                },
+            )
+    }
+
+    fn prefer_bundle_declaration_imports(
+        &self,
+        source: &SourceFile,
+        declaration: &str,
+        bundle_root: &str,
+        module: ModuleKind,
+    ) -> String {
+        let Some(NodeData::SourceFile(file)) = source
+            .parse
+            .arena
+            .get(source.parse.source_file)
+            .map(|node| &node.data)
+        else {
+            return declaration.to_owned();
+        };
+        let containing = canonicalize(
+            &source.file_name,
+            &self.current_directory,
+            self.case_sensitivity,
+        );
+        let mut declaration = declaration.to_owned();
+        let mut imports = Vec::new();
+        for statement in &file.statements.nodes {
+            let Some(NodeData::ImportDeclaration(import)) =
+                source.parse.arena.get(*statement).map(|node| &node.data)
+            else {
+                continue;
+            };
+            let Some((specifier, _)) = string_literal(&source.parse.arena, import.module_specifier)
+            else {
+                continue;
+            };
+            let Some(target) = self
+                .resolved_modules
+                .get(&(containing.clone(), specifier))
+                .and_then(|target| self.file_index.get(target))
+                .and_then(|index| self.source_files.get(*index))
+            else {
+                continue;
+            };
+            let target = bundle_declaration_module_name(target, bundle_root, module);
+            let Some(NodeData::ImportClause(clause)) = import
+                .import_clause
+                .and_then(|clause| source.parse.arena.get(clause))
+                .map(|node| &node.data)
+            else {
+                continue;
+            };
+            if let Some(local) = clause
+                .name
+                .and_then(|name| identifier_text(&source.parse.arena, name))
+                && replace_import_type_reference(&mut declaration, &target, "default", local)
+            {
+                imports.push(format!("import {local} from \"{target}\";"));
+            }
+            let Some(NodeData::NamedImports(named)) = clause
+                .named_bindings
+                .and_then(|bindings| source.parse.arena.get(bindings))
+                .map(|node| &node.data)
+            else {
+                continue;
+            };
+            let mut retained = Vec::new();
+            for element in &named.elements.nodes {
+                let Some(NodeData::ImportSpecifier(import)) =
+                    source.parse.arena.get(*element).map(|node| &node.data)
+                else {
+                    continue;
+                };
+                let Some(local) = identifier_text(&source.parse.arena, import.name) else {
+                    continue;
+                };
+                let imported = import
+                    .property_name
+                    .and_then(|name| identifier_text(&source.parse.arena, name))
+                    .unwrap_or(local);
+                if replace_import_type_reference(&mut declaration, &target, imported, local) {
+                    retained.push(if imported == local {
+                        local.to_owned()
+                    } else {
+                        format!("{imported} as {local}")
+                    });
+                }
+            }
+            if !retained.is_empty() {
+                imports.push(format!(
+                    "import {{ {} }} from \"{target}\";",
+                    retained.join(", ")
+                ));
+            }
+        }
+        if imports.is_empty() {
+            declaration
+        } else {
+            imports.sort();
+            imports.dedup();
+            format!("{}\n{declaration}", imports.join("\n"))
+        }
+    }
+
+    fn rewrite_late_bundle_export_references(
+        &self,
+        source: &SourceFile,
+        declaration: &str,
+        bundle_root: &str,
+        module: ModuleKind,
+    ) -> String {
+        let source_module = bundle_declaration_module_name(source, bundle_root, module);
+        let source_directory = source_module
+            .rsplit_once('/')
+            .map_or("", |(directory, _)| directory);
+        source
+            .checking
+            .import_type_references
+            .values()
+            .filter(|reference| module_name_is_relative(&reference.module_specifier))
+            .fold(declaration.to_owned(), |declaration, reference| {
+                let resolved = resolve_path(
+                    "/",
+                    &[source_directory, reference.module_specifier.as_str()],
+                );
+                let resolved = resolved.trim_start_matches('/');
+                let Some(target) = self.source_files.iter().find(|candidate| {
+                    bundle_declaration_module_name(candidate, bundle_root, module) == resolved
+                        && candidate
+                            .binding
+                            .exports
+                            .get(&reference.qualifier)
+                            .is_some()
+                }) else {
+                    return declaration;
+                };
+                let target_canonical = canonicalize(
+                    &target.file_name,
+                    &self.current_directory,
+                    self.case_sensitivity,
+                );
+                let target_directory = directory_path(&target.file_name);
+                let Some(barrel) = self.source_files.iter().find(|candidate| {
+                    directory_path(&candidate.file_name) == target_directory
+                        && ts_path::base_file_name(ts_path::remove_file_extension(
+                            &candidate.file_name,
+                        )) == "index"
+                        && self.source_reexports_target(candidate, &target_canonical)
+                }) else {
+                    return declaration;
+                };
+                let barrel = bundle_declaration_module_name(barrel, bundle_root, module);
+                let preferred = barrel.strip_suffix("/index").unwrap_or(&barrel);
+                if preferred.is_empty() {
+                    return declaration;
+                }
+                declaration.replace(
+                    &format!(
+                        "import(\"{}\").{}",
+                        reference.module_specifier, reference.qualifier
+                    ),
+                    &format!("import(\"{preferred}\").{}", reference.qualifier),
+                )
+            })
+    }
+
+    fn source_reexports_target(&self, source: &SourceFile, target: &str) -> bool {
+        let containing = canonicalize(
+            &source.file_name,
+            &self.current_directory,
+            self.case_sensitivity,
+        );
+        self.resolved_modules
+            .iter()
+            .any(|((owner, specifier), resolved)| {
+                owner == &containing
+                    && resolved == target
+                    && source.parse.arena.iter().any(|(_, node)| {
+                        matches!(
+                            &node.data,
+                            NodeData::ExportDeclaration(export)
+                                if export.export_clause.is_none()
+                                    && export.module_specifier.is_some_and(|module| {
+                                        string_literal(&source.parse.arena, module)
+                                            .is_some_and(|(text, _)| &text == specifier)
+                                    })
+                        )
+                    })
+            })
     }
 
     fn check_program(&mut self) {
@@ -1183,8 +1440,14 @@ fn source_is_external_module(source: &SourceFile) -> bool {
     })
 }
 
-fn append_amd_declaration_module(code: &mut String, source: &SourceFile, declaration: &str) {
-    if let Some(pragma) = source.parse.amd_module_names.last() {
+fn append_bundle_declaration_module(
+    code: &mut String,
+    source: &SourceFile,
+    declaration: &str,
+    module_name: &str,
+    preserve_amd_pragma: bool,
+) {
+    if preserve_amd_pragma && let Some(pragma) = source.parse.amd_module_names.last() {
         let start = usize::try_from(pragma.range.start.get()).unwrap_or(usize::MAX);
         let end = usize::try_from(pragma.range.end.get()).unwrap_or(usize::MAX);
         if let Some(comment) = source.source_text.get(start..end) {
@@ -1192,7 +1455,6 @@ fn append_amd_declaration_module(code: &mut String, source: &SourceFile, declara
             code.push('\n');
         }
     }
-    let module_name = amd_bundle_module_name(source);
     code.push_str("declare module \"");
     code.push_str(&module_name.replace('"', "\\\""));
     code.push_str("\" {\n");
@@ -1208,6 +1470,43 @@ fn append_amd_declaration_module(code: &mut String, source: &SourceFile, declara
         code.push('\n');
     }
     code.push_str("}\n");
+}
+
+fn bundle_declaration_module_name(
+    source: &SourceFile,
+    bundle_root: &str,
+    module: ModuleKind,
+) -> String {
+    if module == ModuleKind::Amd {
+        return amd_bundle_module_name(source);
+    }
+    let relative = source
+        .file_name
+        .strip_prefix(bundle_root)
+        .unwrap_or(&source.file_name)
+        .trim_start_matches('/');
+    ts_path::remove_file_extension(relative).to_owned()
+}
+
+fn identifier_text(arena: &ts_ast::NodeArena, node: NodeId) -> Option<&str> {
+    let NodeData::Identifier(identifier) = &arena.get(node)?.data else {
+        return None;
+    };
+    Some(&identifier.text)
+}
+
+fn replace_import_type_reference(
+    declaration: &mut String,
+    module: &str,
+    imported: &str,
+    local: &str,
+) -> bool {
+    let reference = format!("import(\"{module}\").{imported}");
+    if !declaration.contains(&reference) {
+        return false;
+    }
+    *declaration = declaration.replace(&reference, local);
+    true
 }
 
 fn amd_bundle_module_name(source: &SourceFile) -> String {
@@ -2930,6 +3229,75 @@ mod tests {
                 "declare module \"NamedB\" {\n",
                 "    export class Bar {\n",
                 "    }\n",
+                "}\n",
+            )
+        );
+    }
+
+    #[test]
+    fn commonjs_out_file_bundles_declarations_with_late_export_names() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/index.ts", "export * from './nested';")
+            .unwrap();
+        fs.write_file(
+            "/project/nested/base.ts",
+            "import { B } from './shared'; export function f() { return new B(); }",
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/nested/derived.ts",
+            "import { f } from './base'; export function g() { return f(); }",
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/nested/index.ts",
+            "export * from './base'; export * from './derived'; export * from './shared';",
+        )
+        .unwrap();
+        fs.write_file("/project/nested/shared.ts", "export class B {}")
+            .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["index.ts".to_owned()],
+            CompilerOptions {
+                declaration: true,
+                emit_declaration_only: true,
+                out_file: Some("dist/out.d.ts".into()),
+                module: ModuleKind::CommonJs,
+                target: ScriptTarget::Es2015,
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        let emitted = program.emit();
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        let declaration = emitted
+            .files
+            .iter()
+            .find(|file| file.file_name == "/project/dist/out.d.ts")
+            .unwrap();
+        assert_eq!(
+            declaration.text,
+            concat!(
+                "declare module \"nested/shared\" {\n",
+                "    export class B {\n",
+                "    }\n",
+                "}\n",
+                "declare module \"nested/base\" {\n",
+                "    import { B } from \"nested/shared\";\n",
+                "    export function f(): B;\n",
+                "}\n",
+                "declare module \"nested/derived\" {\n",
+                "    export function g(): import(\"nested\").B;\n",
+                "}\n",
+                "declare module \"nested/index\" {\n",
+                "    export * from \"nested/base\";\n",
+                "    export * from \"nested/derived\";\n",
+                "    export * from \"nested/shared\";\n",
+                "}\n",
+                "declare module \"index\" {\n",
+                "    export * from \"nested/index\";\n",
                 "}\n",
             )
         );
