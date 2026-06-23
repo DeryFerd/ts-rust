@@ -429,6 +429,10 @@ impl Program {
             let enum_member_values = enum_values_for_emit(&source_file.checking.enum_member_values);
             let enum_access_values = enum_values_for_emit(&source_file.checking.enum_access_values);
             if settings.emit_javascript {
+                let mut source_settings = settings;
+                if source_file.file_name.to_ascii_lowercase().ends_with(".cts") {
+                    source_settings.module = ModuleKind::CommonJs;
+                }
                 let amd_dependencies = source_file
                     .parse
                     .amd_dependencies
@@ -462,7 +466,7 @@ impl Program {
                     source_file.parse.source_file,
                     &source_file.file_name,
                     &source_file.source_text,
-                    settings,
+                    source_settings,
                     &emit_context,
                 ) {
                     Ok(mut emitted) => {
@@ -3042,6 +3046,48 @@ mod tests {
             .collect();
         assert!(paths.contains(&"/project/view.js"));
         assert!(paths.contains(&"/project/module.mjs"));
+    }
+
+    #[test]
+    fn cts_sources_use_commonjs_and_import_async_helpers() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/notmodule.cts",
+            concat!("export async function foo() {\n", "  await 0;\n", "}",),
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["notmodule.cts".to_owned()],
+            CompilerOptions {
+                import_helpers: true,
+                module: ModuleKind::EsNext,
+                target: ScriptTarget::Es2015,
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        let emitted = program.emit();
+        let javascript = emitted
+            .files
+            .iter()
+            .find(|file| file.file_name == "/project/notmodule.cjs")
+            .unwrap();
+        assert_eq!(
+            javascript.text,
+            concat!(
+                "\"use strict\";\n",
+                "Object.defineProperty(exports, \"__esModule\", { value: true });\n",
+                "exports.foo = foo;\n",
+                "const tslib_1 = require(\"tslib\");\n",
+                "function foo() {\n",
+                "    return tslib_1.__awaiter(this, void 0, void 0, function* () {\n",
+                "        yield 0;\n",
+                "    });\n",
+                "}\n",
+            )
+        );
     }
 
     #[test]

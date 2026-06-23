@@ -852,6 +852,7 @@ const SCALAR_OPTION_NAMES: &[&str] = &[
     "exactOptionalPropertyTypes",
     "forceConsistentCasingInFileNames",
     "incremental",
+    "importHelpers",
     "inlineSourceMap",
     "isolatedDeclarations",
     "isolatedModules",

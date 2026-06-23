@@ -40,6 +40,7 @@ pub enum TypeKind {
     },
     Array(TypeId),
     Tuple(Vec<TypeId>),
+    ReadonlyTuple(Vec<TypeId>),
     Union(Vec<TypeId>),
     Intersection(Vec<TypeId>),
     Object(ObjectType),
@@ -279,6 +280,14 @@ impl TypeArena {
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
+            TypeKind::ReadonlyTuple(elements) => format!(
+                "readonly [{}]",
+                elements
+                    .iter()
+                    .map(|element| self.display(*element))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
             TypeKind::Union(members) => members
                 .iter()
                 .map(|member| self.display(*member))
@@ -506,12 +515,17 @@ enum TypeDescriptor {
         reference: ImportTypeReference,
         target: Box<Self>,
     },
+    Named {
+        name: String,
+        target: Box<Self>,
+    },
     Alias {
         parameters: Vec<String>,
         body: Box<Self>,
     },
     Array(Box<Self>),
     Tuple(Vec<Self>),
+    ReadonlyTuple(Vec<Self>),
     Union(Vec<Self>),
     Intersection(Vec<Self>),
     Object {
@@ -1445,7 +1459,7 @@ impl<'a> ProgramChecker<'a> {
             match source.arena.get(*declaration).map(|node| &node.data) {
                 Some(NodeData::TypeAliasDeclaration(_)) => core_name,
                 Some(NodeData::InterfaceDeclaration(_) | NodeData::ClassDeclaration(_)) => {
-                    core_name
+                    core_name || value_is_referenced
                 }
                 Some(NodeData::FunctionDeclaration(_)) => {
                     core_name && symbol.declarations.len() > 1
@@ -1793,9 +1807,9 @@ fn descriptor_for_import_expression(
 fn descriptor_property(descriptor: &TypeDescriptor, property: &str) -> Option<TypeDescriptor> {
     match descriptor {
         TypeDescriptor::Object { properties, .. } => properties.get(property).cloned(),
-        TypeDescriptor::Import { target, .. } | TypeDescriptor::ConstEnum(target) => {
-            descriptor_property(target, property)
-        }
+        TypeDescriptor::Import { target, .. }
+        | TypeDescriptor::Named { target, .. }
+        | TypeDescriptor::ConstEnum(target) => descriptor_property(target, property),
         _ => None,
     }
 }
@@ -1806,11 +1820,15 @@ struct Checker<'a> {
     result: CheckResult,
     children: HashMap<NodeId, Vec<NodeId>>,
     type_parameter_scopes: Vec<HashMap<String, TypeId>>,
+    mapped_return_templates: HashMap<TypeId, (NodeId, HashMap<String, TypeId>)>,
     local_scopes: Vec<HashMap<String, TypeId>>,
     narrowings: Vec<HashMap<SymbolId, TypeId>>,
     flow_types: HashMap<SymbolId, TypeId>,
     alias_stack: Vec<SymbolId>,
     alias_instantiations: HashMap<(SymbolId, Vec<TypeId>), TypeId>,
+    declared_object_instantiations: HashMap<(SymbolId, Vec<TypeId>), TypeId>,
+    active_declared_object_instantiations: HashSet<(SymbolId, Vec<TypeId>)>,
+    declared_object_instantiation_depth: usize,
     external_symbols: HashMap<SymbolId, TypeDescriptor>,
     external_names: BTreeMap<String, TypeDescriptor>,
     external_aliases: HashMap<SymbolId, TypeDescriptor>,
@@ -1864,11 +1882,15 @@ impl<'a> Checker<'a> {
             },
             children,
             type_parameter_scopes: Vec::new(),
+            mapped_return_templates: HashMap::new(),
             local_scopes: Vec::new(),
             narrowings: Vec::new(),
             flow_types: HashMap::new(),
             alias_stack: Vec::new(),
             alias_instantiations: HashMap::new(),
+            declared_object_instantiations: HashMap::new(),
+            active_declared_object_instantiations: HashSet::new(),
+            declared_object_instantiation_depth: 0,
             external_symbols: HashMap::new(),
             external_names: BTreeMap::new(),
             external_aliases: HashMap::new(),
@@ -3821,7 +3843,18 @@ impl<'a> Checker<'a> {
         symbol: SymbolId,
         arguments: &[TypeId],
     ) -> Option<TypeId> {
-        if self.alias_stack.contains(&symbol) {
+        const MAX_DECLARED_OBJECT_INSTANTIATION_DEPTH: usize = 64;
+
+        let cache_key = (symbol, arguments.to_vec());
+        if let Some(type_id) = self.declared_object_instantiations.get(&cache_key) {
+            return Some(*type_id);
+        }
+        if self.declared_object_instantiation_depth >= MAX_DECLARED_OBJECT_INSTANTIATION_DEPTH
+            || self
+                .active_declared_object_instantiations
+                .contains(&cache_key)
+            || self.alias_stack.contains(&symbol)
+        {
             return Some(self.result.types.any());
         }
         let declaration = self
@@ -3839,6 +3872,9 @@ impl<'a> Checker<'a> {
                 }
                 _ => None,
             })?;
+        self.active_declared_object_instantiations
+            .insert(cache_key.clone());
+        self.declared_object_instantiation_depth += 1;
         self.alias_stack.push(symbol);
         let result = match declaration {
             DeclaredObject::Class(data) => self.declared_object_type(
@@ -3855,6 +3891,11 @@ impl<'a> Checker<'a> {
             ),
         };
         self.alias_stack.pop();
+        self.declared_object_instantiation_depth -= 1;
+        self.active_declared_object_instantiations
+            .remove(&cache_key);
+        self.declared_object_instantiations
+            .insert(cache_key, result);
         Some(result)
     }
 
@@ -5082,6 +5123,65 @@ impl<'a> Checker<'a> {
         self.simple_type_reference_name(type_node).as_deref() == Some("const")
     }
 
+    fn const_assertion_type(&mut self, expression: NodeId) -> TypeId {
+        let Some(node) = self.arena.get(expression).cloned() else {
+            return self.result.types.unknown();
+        };
+        match &node.data {
+            NodeData::ParenthesizedExpression(data) => self.const_assertion_type(data.expression),
+            NodeData::ArrayLiteralExpression(data) => {
+                let elements = data
+                    .elements
+                    .nodes
+                    .iter()
+                    .map(
+                        |element| match self.arena.get(*element).map(|node| &node.data) {
+                            Some(NodeData::SpreadElement(spread)) => {
+                                self.type_of_expression(spread.expression)
+                            }
+                            _ => self.const_assertion_type(*element),
+                        },
+                    )
+                    .collect();
+                self.result.types.alloc(TypeKind::ReadonlyTuple(elements))
+            }
+            NodeData::ObjectLiteralExpression(data) => {
+                let object = self.object_literal_type(data, None);
+                let Some(TypeKind::Object(mut object)) = self
+                    .result
+                    .types
+                    .get(object)
+                    .map(|type_| type_.kind.clone())
+                else {
+                    return object;
+                };
+                for property in &data.properties.nodes {
+                    let Some(NodeData::PropertyAssignment(property)) =
+                        self.arena.get(*property).map(|node| &node.data)
+                    else {
+                        continue;
+                    };
+                    let Some(name) = self.property_name(property.name) else {
+                        continue;
+                    };
+                    let property_type = self.const_assertion_type(property.initializer);
+                    object.properties.insert(name, property_type);
+                }
+                object
+                    .readonly_properties
+                    .extend(object.properties.keys().cloned());
+                self.result.types.alloc(TypeKind::Object(object))
+            }
+            NodeData::AsExpression(data) if self.type_node_is_const_reference(data.type_) => {
+                self.const_assertion_type(data.expression)
+            }
+            NodeData::TypeAssertion(data) if self.type_node_is_const_reference(data.type_) => {
+                self.const_assertion_type(data.expression)
+            }
+            _ => self.type_of_expression(expression),
+        }
+    }
+
     fn is_truthy_type(kind: &TypeKind) -> bool {
         match kind {
             TypeKind::Undefined | TypeKind::Null | TypeKind::BooleanLiteral(false) => false,
@@ -5306,10 +5406,10 @@ impl<'a> Checker<'a> {
                 self.type_of_expression_context(data.expression, contextual_type)
             }
             NodeData::AsExpression(data) => {
-                let expression = self.type_of_expression(data.expression);
                 if self.type_node_is_const_reference(data.type_) {
-                    expression
+                    self.const_assertion_type(data.expression)
                 } else {
+                    self.type_of_expression(data.expression);
                     self.type_from_type_node(data.type_)
                 }
             }
@@ -5318,8 +5418,12 @@ impl<'a> Checker<'a> {
                 self.type_of_expression_context(data.expression, Some(expected))
             }
             NodeData::TypeAssertion(data) => {
-                self.type_of_expression(data.expression);
-                self.type_from_type_node(data.type_)
+                if self.type_node_is_const_reference(data.type_) {
+                    self.const_assertion_type(data.expression)
+                } else {
+                    self.type_of_expression(data.expression);
+                    self.type_from_type_node(data.type_)
+                }
             }
             NodeData::PrefixUnaryExpression(data) => self.prefix_unary_type(data),
             NodeData::BinaryExpression(data) => {
@@ -5351,7 +5455,9 @@ impl<'a> Checker<'a> {
             NodeData::ArrayLiteralExpression(data) => {
                 let expected_tuple = contextual_type.and_then(|type_id| {
                     match &self.result.types.get(type_id)?.kind {
-                        TypeKind::Tuple(elements) => Some(elements.clone()),
+                        TypeKind::Tuple(elements) | TypeKind::ReadonlyTuple(elements) => {
+                            Some(elements.clone())
+                        }
                         _ => None,
                     }
                 });
@@ -5583,9 +5689,6 @@ impl<'a> Checker<'a> {
             && let Some(name) = self.readonly_assignment_name(data.left)
         {
             self.error(node_id, 2540, [name]);
-            if !self.is_assignable(right, assignment_target) {
-                self.assignment_target_error(data.left, right, assignment_target);
-            }
             right
         } else if operator == SyntaxKind::EqualsToken
             && !self.is_assignable(right, assignment_target)
@@ -6393,11 +6496,13 @@ impl<'a> Checker<'a> {
                     _ => None,
                 }
             }
-            TypeKind::Tuple(elements) if name == "length" => Some(
-                self.result
-                    .types
-                    .alloc(TypeKind::NumberLiteral(elements.len().to_string())),
-            ),
+            TypeKind::Tuple(elements) | TypeKind::ReadonlyTuple(elements) if name == "length" => {
+                Some(
+                    self.result
+                        .types
+                        .alloc(TypeKind::NumberLiteral(elements.len().to_string())),
+                )
+            }
             TypeKind::String | TypeKind::StringLiteral(_) if name == "length" => {
                 Some(self.result.types.number())
             }
@@ -6473,7 +6578,8 @@ impl<'a> Checker<'a> {
     }
 
     fn element_access_type(&mut self, node: NodeId, receiver: TypeId, index: TypeId) -> TypeId {
-        if let TypeKind::Tuple(elements) = self.result.types.get(receiver).unwrap().kind.clone()
+        if let TypeKind::Tuple(elements) | TypeKind::ReadonlyTuple(elements) =
+            self.result.types.get(receiver).unwrap().kind.clone()
             && let TypeKind::NumberLiteral(value) =
                 self.result.types.get(index).unwrap().kind.clone()
             && let Ok(position) = value.parse::<usize>()
@@ -6511,6 +6617,13 @@ impl<'a> Checker<'a> {
 
     fn lookup_indexed_type(&mut self, object: TypeId, index: TypeId) -> Option<TypeId> {
         let index_kind = self.result.types.get(index)?.kind.clone();
+        if let TypeKind::TypeParameter {
+            constraint: Some(constraint),
+            ..
+        } = &index_kind
+        {
+            return self.lookup_indexed_type(object, *constraint);
+        }
         if let TypeKind::Union(indices) = index_kind {
             let values = indices
                 .into_iter()
@@ -6521,7 +6634,7 @@ impl<'a> Checker<'a> {
         match self.result.types.get(object)?.kind.clone() {
             TypeKind::Any => Some(self.result.types.any()),
             TypeKind::Array(element) if self.is_number_like(index) => Some(element),
-            TypeKind::Tuple(elements) => match index_kind {
+            TypeKind::Tuple(elements) | TypeKind::ReadonlyTuple(elements) => match index_kind {
                 TypeKind::NumberLiteral(value) => value
                     .parse::<usize>()
                     .ok()
@@ -6644,6 +6757,7 @@ impl<'a> Checker<'a> {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn call_expression_type(
         &mut self,
         node: NodeId,
@@ -6733,6 +6847,7 @@ impl<'a> Checker<'a> {
             };
             let actual = self.type_of_expression_context(*argument, Some(parameter));
             self.infer_type_parameters(parameter, actual, &mut inference);
+            self.infer_named_type_parameters_from_argument(parameter, *argument, &mut inference);
             let expected = self.substitute_type(parameter, &inference);
             if !self.is_assignable(actual, expected) {
                 let code = if self.exact_optional_property_mismatch(actual, expected) {
@@ -6798,12 +6913,47 @@ impl<'a> Checker<'a> {
         self.result.types.union(members)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn infer_type_parameters(
         &mut self,
         parameter: TypeId,
         actual: TypeId,
         inference: &mut HashMap<TypeId, TypeId>,
     ) {
+        if let Some(reference) = self.result.named_type_references.get(&parameter).cloned()
+            && let Some(TypeKind::Object(actual_object)) = self
+                .result
+                .types
+                .get(actual)
+                .map(|type_| type_.kind.clone())
+        {
+            for argument in reference.type_arguments {
+                let Some(TypeKind::TypeParameter {
+                    constraint: Some(constraint),
+                    ..
+                }) = self
+                    .result
+                    .types
+                    .get(argument)
+                    .map(|type_| type_.kind.clone())
+                else {
+                    continue;
+                };
+                if let Some(candidate) = actual_object.properties.values().copied().find(|value| {
+                    matches!(
+                        self.result.types.get(*value).map(|type_| &type_.kind),
+                        Some(TypeKind::StringLiteral(_) | TypeKind::NumberLiteral(_))
+                    ) && self.is_assignable(*value, constraint)
+                }) {
+                    inference
+                        .entry(argument)
+                        .and_modify(|current| {
+                            *current = self.result.types.union([*current, candidate]);
+                        })
+                        .or_insert(candidate);
+                }
+            }
+        }
         match self.result.types.get(parameter).unwrap().kind.clone() {
             TypeKind::TypeParameter { .. } => {
                 let actual = if self.preserve_literal_inference
@@ -6832,8 +6982,8 @@ impl<'a> Checker<'a> {
                     self.infer_type_parameters(parameter_element, actual_element, inference);
                 }
             }
-            TypeKind::Tuple(parameter_elements) => {
-                if let TypeKind::Tuple(actual_elements) =
+            TypeKind::Tuple(parameter_elements) | TypeKind::ReadonlyTuple(parameter_elements) => {
+                if let TypeKind::Tuple(actual_elements) | TypeKind::ReadonlyTuple(actual_elements) =
                     self.result.types.get(actual).unwrap().kind.clone()
                 {
                     for (parameter, actual) in parameter_elements.iter().zip(&actual_elements) {
@@ -6892,10 +7042,77 @@ impl<'a> Checker<'a> {
         }
     }
 
+    fn infer_named_type_parameters_from_argument(
+        &mut self,
+        parameter: TypeId,
+        argument: NodeId,
+        inference: &mut HashMap<TypeId, TypeId>,
+    ) {
+        let Some(reference) = self.result.named_type_references.get(&parameter).cloned() else {
+            return;
+        };
+        let Some(NodeData::ObjectLiteralExpression(object)) =
+            self.arena.get(argument).map(|node| &node.data)
+        else {
+            return;
+        };
+        let properties = object.properties.nodes.clone();
+        for type_argument in reference.type_arguments {
+            let Some(TypeKind::TypeParameter {
+                constraint: Some(constraint),
+                ..
+            }) = self
+                .result
+                .types
+                .get(type_argument)
+                .map(|type_| type_.kind.clone())
+            else {
+                continue;
+            };
+            for property in &properties {
+                let Some(NodeData::PropertyAssignment(property)) =
+                    self.arena.get(*property).map(|node| &node.data)
+                else {
+                    continue;
+                };
+                let candidate = match self.arena.get(property.initializer).map(|node| &node.data) {
+                    Some(NodeData::StringLiteral(literal)) => self
+                        .result
+                        .types
+                        .alloc(TypeKind::StringLiteral(literal.text.clone())),
+                    Some(NodeData::NumericLiteral(literal)) => self
+                        .result
+                        .types
+                        .alloc(TypeKind::NumberLiteral(literal.text.clone())),
+                    _ => continue,
+                };
+                if self.is_assignable(candidate, constraint) {
+                    inference.insert(type_argument, candidate);
+                    break;
+                }
+            }
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     fn substitute_type(&mut self, type_id: TypeId, inference: &HashMap<TypeId, TypeId>) -> TypeId {
         if let Some(inferred) = inference.get(&type_id) {
             return *inferred;
+        }
+        if let Some((type_node, parameters)) = self.mapped_return_templates.get(&type_id).cloned() {
+            let scope = parameters
+                .into_iter()
+                .map(|(name, parameter)| {
+                    (
+                        name,
+                        inference.get(&parameter).copied().unwrap_or(parameter),
+                    )
+                })
+                .collect();
+            self.type_parameter_scopes.push(scope);
+            let substituted = self.type_from_type_node(type_node);
+            self.type_parameter_scopes.pop();
+            return substituted;
         }
         let substituted = match self.result.types.get(type_id).unwrap().kind.clone() {
             TypeKind::Array(element) => {
@@ -6959,6 +7176,13 @@ impl<'a> Checker<'a> {
                     .collect();
                 self.result.types.alloc(TypeKind::Tuple(elements))
             }
+            TypeKind::ReadonlyTuple(elements) => {
+                let elements = elements
+                    .into_iter()
+                    .map(|element| self.substitute_type(element, inference))
+                    .collect();
+                self.result.types.alloc(TypeKind::ReadonlyTuple(elements))
+            }
             TypeKind::Object(object) => {
                 let properties = object
                     .properties
@@ -7000,6 +7224,31 @@ impl<'a> Checker<'a> {
                 .into_iter()
                 .map(|argument| self.substitute_type(argument, inference))
                 .collect();
+            let indexed_mapped_alias = self
+                .bindings
+                .root_scope()
+                .and_then(|scope| scope.symbols.get(&reference.name))
+                .and_then(|symbol| self.bindings.symbols.get(symbol))
+                .and_then(|symbol| {
+                    symbol.declarations.iter().find_map(|declaration| {
+                        let NodeData::TypeAliasDeclaration(alias) =
+                            &self.arena.get(*declaration)?.data
+                        else {
+                            return None;
+                        };
+                        matches!(
+                            self.arena.get(alias.type_).map(|node| &node.data),
+                            Some(NodeData::IndexedAccessTypeNode(_))
+                        )
+                        .then_some(symbol.id)
+                    })
+                });
+            if let Some(symbol) = indexed_mapped_alias
+                && let Some(instantiated) =
+                    self.instantiate_alias(symbol, &reference.type_arguments)
+            {
+                return instantiated;
+            }
             self.result
                 .named_type_references
                 .insert(substituted, reference);
@@ -7158,6 +7407,7 @@ impl<'a> Checker<'a> {
             TypeKind::TypeParameter { name, .. } if name.starts_with("__cyclic_alias__") => true,
             TypeKind::Array(element) => self.type_contains_cyclic_alias(*element),
             TypeKind::Tuple(elements)
+            | TypeKind::ReadonlyTuple(elements)
             | TypeKind::Union(elements)
             | TypeKind::Intersection(elements) => elements
                 .iter()
@@ -7508,6 +7758,7 @@ impl<'a> Checker<'a> {
                 type_parameter_scope.insert(name, semantic_type);
             }
         }
+        let return_type_parameters = type_parameter_scope.clone();
         self.type_parameter_scopes.push(type_parameter_scope);
         let mut parameter_types = Vec::with_capacity(parameters.len());
         let mut parameter_names = Vec::with_capacity(parameters.len());
@@ -7555,6 +7806,15 @@ impl<'a> Checker<'a> {
             None => self.result.types.any(),
         };
         self.type_parameter_scopes.pop();
+        if let Some(return_annotation) = return_annotation
+            && matches!(
+                self.arena.get(return_annotation).map(|node| &node.data),
+                Some(NodeData::MappedTypeNode(_))
+            )
+        {
+            self.mapped_return_templates
+                .insert(return_type, (return_annotation, return_type_parameters));
+        }
         self.result.types.alloc(TypeKind::Function(FunctionType {
             parameters: parameter_types,
             parameter_names,
@@ -7678,14 +7938,15 @@ impl<'a> Checker<'a> {
                 } else {
                     self.unresolved_type_name(data.type_name, name.clone())
                 };
-                if !arguments.is_empty()
-                    && let Some(TypeKind::Object(object)) = self
-                        .result
-                        .types
-                        .get(type_id)
-                        .map(|type_| type_.kind.clone())
+                if let Some(
+                    kind @ (TypeKind::Object(_) | TypeKind::Union(_) | TypeKind::Intersection(_)),
+                ) = self
+                    .result
+                    .types
+                    .get(type_id)
+                    .map(|type_| type_.kind.clone())
                 {
-                    let referenced_type = self.result.types.alloc(TypeKind::Object(object));
+                    let referenced_type = self.result.types.alloc(kind);
                     if let Some(reference) =
                         self.result.import_type_references.get(&type_id).cloned()
                     {
@@ -7784,8 +8045,26 @@ impl<'a> Checker<'a> {
                 self.result.types.alloc(TypeKind::Constructor(signature))
             }
             NodeData::IndexedAccessTypeNode(data) => {
-                let object = self.type_from_type_node(data.object_type);
                 let index = self.type_from_type_node(data.index_type);
+                if matches!(
+                    self.result.types.get(index).map(|type_| &type_.kind),
+                    Some(TypeKind::TypeParameter { .. })
+                ) && let Some(NodeData::MappedTypeNode(mapped)) =
+                    self.arena.get(data.object_type).map(|node| &node.data)
+                    && let Some(NodeData::TypeParameterDeclaration(parameter)) =
+                        self.arena.get(mapped.type_parameter).map(|node| &node.data)
+                    && let Some(name) = self.property_name(parameter.name)
+                {
+                    self.type_parameter_scopes
+                        .push(HashMap::from([(name, index)]));
+                    let result = match mapped.type_ {
+                        Some(type_) => self.type_from_type_node(type_),
+                        None => self.result.types.any(),
+                    };
+                    self.type_parameter_scopes.pop();
+                    return result;
+                }
+                let object = self.type_from_type_node(data.object_type);
                 self.indexed_access_type(node_id, object, index)
             }
             _ => self.result.types.unknown(),
@@ -7807,7 +8086,7 @@ impl<'a> Checker<'a> {
                 }
                 self.result.types.union(keys)
             }
-            TypeKind::Tuple(_) | TypeKind::Array(_) => {
+            TypeKind::Tuple(_) | TypeKind::ReadonlyTuple(_) | TypeKind::Array(_) => {
                 let length = self
                     .result
                     .types
@@ -7914,7 +8193,9 @@ impl<'a> Checker<'a> {
             NodeData::ArrayTypeNode(data) => {
                 let element = match self.result.types.get(actual).unwrap().kind.clone() {
                     TypeKind::Array(element) => element,
-                    TypeKind::Tuple(elements) => self.result.types.union(elements),
+                    TypeKind::Tuple(elements) | TypeKind::ReadonlyTuple(elements) => {
+                        self.result.types.union(elements)
+                    }
                     _ => return false,
                 };
                 self.infer_conditional_type(data.element_type, element, inference)
@@ -7932,13 +8213,16 @@ impl<'a> Checker<'a> {
                 };
                 let element = match self.result.types.get(actual).unwrap().kind.clone() {
                     TypeKind::Array(element) => element,
-                    TypeKind::Tuple(elements) => self.result.types.union(elements),
+                    TypeKind::Tuple(elements) | TypeKind::ReadonlyTuple(elements) => {
+                        self.result.types.union(elements)
+                    }
                     _ => return false,
                 };
                 self.infer_conditional_type(*argument, element, inference)
             }
             NodeData::TupleTypeNode(data) => {
-                let TypeKind::Tuple(elements) = self.result.types.get(actual).unwrap().kind.clone()
+                let (TypeKind::Tuple(elements) | TypeKind::ReadonlyTuple(elements)) =
+                    self.result.types.get(actual).unwrap().kind.clone()
                 else {
                     return false;
                 };
@@ -8004,7 +8288,9 @@ impl<'a> Checker<'a> {
     fn type_keys(&self, type_id: TypeId) -> Vec<String> {
         match &self.result.types.get(type_id).unwrap().kind {
             TypeKind::Object(object) => object.properties.keys().cloned().collect(),
-            TypeKind::Tuple(_) | TypeKind::Array(_) => vec!["length".into()],
+            TypeKind::Tuple(_) | TypeKind::ReadonlyTuple(_) | TypeKind::Array(_) => {
+                vec!["length".into()]
+            }
             TypeKind::Intersection(members) => members
                 .iter()
                 .flat_map(|member| self.type_keys(*member))
@@ -8023,6 +8309,7 @@ impl<'a> Checker<'a> {
         self.result.types.union(types)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn mapped_type(&mut self, data: &ts_ast::MappedTypeNodeData) -> TypeId {
         let Some(NodeData::TypeParameterDeclaration(parameter)) =
             self.arena.get(data.type_parameter).map(|node| &node.data)
@@ -8036,6 +8323,62 @@ impl<'a> Checker<'a> {
             return self.result.types.unknown();
         };
         let constraint = self.type_from_type_node(constraint);
+        if let Some(name_type) = data.name_type {
+            let members = self.union_members(constraint);
+            let mut properties = BTreeMap::new();
+            let mut optional_properties = BTreeSet::new();
+            let mut readonly_properties = BTreeSet::new();
+            for member in members {
+                if !matches!(
+                    self.result.types.get(member).map(|type_| &type_.kind),
+                    Some(TypeKind::Object(_))
+                ) {
+                    continue;
+                }
+                self.type_parameter_scopes
+                    .push(HashMap::from([(name.clone(), member)]));
+                let mapped_name = self.type_from_type_node(name_type);
+                let output_names = self
+                    .literal_keys(mapped_name)
+                    .into_iter()
+                    .map(|(name, _)| name)
+                    .collect::<Vec<_>>();
+                let mut property_type = match data.type_ {
+                    Some(node) => self.type_from_type_node(node),
+                    None => self.result.types.any(),
+                };
+                self.type_parameter_scopes.pop();
+                if output_names.is_empty() {
+                    continue;
+                }
+                let is_optional = self.mapped_modifier(data.question_token) == Some(true);
+                if is_optional
+                    && !self.options.exact_optional_property_types
+                    && !self.type_includes_undefined(property_type)
+                {
+                    let undefined = self.result.types.undefined();
+                    property_type = self.result.types.union([property_type, undefined]);
+                }
+                let is_readonly = self.mapped_modifier(data.readonly_token) == Some(true);
+                for output_name in output_names {
+                    if is_optional {
+                        optional_properties.insert(output_name.clone());
+                    }
+                    if is_readonly {
+                        readonly_properties.insert(output_name.clone());
+                    }
+                    properties.insert(output_name, property_type);
+                }
+            }
+            if !properties.is_empty() {
+                return self.result.types.alloc(TypeKind::Object(ObjectType {
+                    properties,
+                    optional_properties,
+                    readonly_properties,
+                    ..ObjectType::default()
+                }));
+            }
+        }
         let keys = self.literal_keys(constraint);
         let homomorphic_object = self.mapped_source_object(parameter.constraint.unwrap());
         let mut properties = BTreeMap::new();
@@ -8150,6 +8493,10 @@ impl<'a> Checker<'a> {
                 .iter()
                 .flat_map(|member| self.literal_keys(*member))
                 .collect(),
+            TypeKind::TypeParameter {
+                constraint: Some(constraint),
+                ..
+            } => self.literal_keys(*constraint),
             _ => Vec::new(),
         }
     }
@@ -8255,6 +8602,15 @@ impl<'a> Checker<'a> {
         if self.enum_member_owners.get(&source) == Some(&target) {
             return true;
         }
+        if let Some(owner) = self.enum_member_owners.get(&source)
+            && self.enum_types.iter().any(|enum_type| {
+                self.result.types.get(*enum_type).map(|type_| &type_.kind)
+                    == self.result.types.get(target).map(|type_| &type_.kind)
+            })
+            && self.enum_types.contains(owner)
+        {
+            return true;
+        }
         if self.enum_types.contains(&target) {
             return false;
         }
@@ -8316,6 +8672,16 @@ impl<'a> Checker<'a> {
                 self.is_assignable(*source, *target)
             }
             (TypeKind::Tuple(sources), TypeKind::Tuple(targets)) => {
+                sources.len() == targets.len()
+                    && sources
+                        .iter()
+                        .zip(targets)
+                        .all(|(source, target)| self.is_assignable(*source, *target))
+            }
+            (
+                TypeKind::Tuple(sources) | TypeKind::ReadonlyTuple(sources),
+                TypeKind::ReadonlyTuple(targets),
+            ) => {
                 sources.len() == targets.len()
                     && sources
                         .iter()
@@ -8450,6 +8816,19 @@ impl<'a> Checker<'a> {
                     .insert(type_id, reference.clone());
                 type_id
             }
+            TypeDescriptor::Named { name, target } => {
+                let target = self.import_type(target);
+                let kind = self.result.types.get(target).unwrap().kind.clone();
+                let named = self.result.types.alloc(kind);
+                self.result.named_type_references.insert(
+                    named,
+                    NamedTypeReference {
+                        name: name.clone(),
+                        type_arguments: Vec::new(),
+                    },
+                );
+                named
+            }
             TypeDescriptor::Unknown => self.result.types.unknown(),
             TypeDescriptor::Never => self.result.types.never(),
             TypeDescriptor::Void => self.result.types.void(),
@@ -8490,6 +8869,13 @@ impl<'a> Checker<'a> {
                     .map(|element| self.import_type(element))
                     .collect();
                 self.result.types.alloc(TypeKind::Tuple(elements))
+            }
+            TypeDescriptor::ReadonlyTuple(elements) => {
+                let elements = elements
+                    .iter()
+                    .map(|element| self.import_type(element))
+                    .collect();
+                self.result.types.alloc(TypeKind::ReadonlyTuple(elements))
             }
             TypeDescriptor::Union(members) => {
                 let members = members
@@ -8674,7 +9060,14 @@ impl<'a> Checker<'a> {
                 let properties = object
                     .properties
                     .into_iter()
-                    .map(|(name, property)| (name, self.widen_literal(property)))
+                    .map(|(name, property)| {
+                        let property = if readonly_properties.contains(&name) {
+                            property
+                        } else {
+                            self.widen_literal(property)
+                        };
+                        (name, property)
+                    })
                     .collect();
                 self.result.types.alloc(TypeKind::Object(ObjectType {
                     properties,
@@ -9237,7 +9630,26 @@ fn describe_alias(
     checker.type_parameter_scopes.pop();
     TypeDescriptor::Alias {
         parameters,
-        body: Box::new(describe_type(&checker.result.types, body)),
+        body: Box::new(describe_source_type(source, &checker.result, body)),
+    }
+}
+
+fn describe_source_type(
+    source: &ProgramSource<'_>,
+    result: &CheckResult,
+    type_id: TypeId,
+) -> TypeDescriptor {
+    const DEFAULT_LIBRARY_DESCRIPTOR_NODE_BUDGET: usize = 32_768;
+    if source.is_default_library {
+        describe_type_with_imports_bounded(
+            &result.types,
+            &BTreeMap::new(),
+            Some(&result.named_type_references),
+            type_id,
+            DEFAULT_LIBRARY_DESCRIPTOR_NODE_BUDGET,
+        )
+    } else {
+        describe_type(&result.types, type_id)
     }
 }
 
@@ -9279,7 +9691,7 @@ fn describe_declaration_symbol(
             .filter(|declaration| function_declarations.len() == 1 || declaration.body.is_none())
             .map(|declaration| {
                 let type_id = checker.function_type(declaration);
-                describe_type(&checker.result.types, type_id)
+                describe_source_type(source, &checker.result, type_id)
             })
             .collect::<Vec<_>>();
         return if signatures.len() == 1 {
@@ -9317,7 +9729,7 @@ fn describe_declaration_symbol(
             properties,
             ..ObjectType::default()
         }));
-        let body = describe_type(&checker.result.types, body);
+        let body = describe_source_type(source, &checker.result, body);
         let mut descriptor = if parameters.is_empty() {
             body
         } else {
@@ -9365,7 +9777,7 @@ fn describe_declaration_symbol(
             }
             let mut checker = Checker::new(source.arena, source.bindings);
             let type_id = checker.type_from_type_node(annotation);
-            return Some(describe_type(&checker.result.types, type_id));
+            return Some(describe_source_type(source, &checker.result, type_id));
         };
         return result.map(|result| describe_checked_type(result, type_id));
     }
@@ -9384,7 +9796,7 @@ fn describe_declaration_symbol(
         &class.members.nodes,
         &arguments,
     );
-    let body = describe_type(&checker.result.types, object);
+    let body = describe_source_type(source, &checker.result, object);
     Some(if parameters.is_empty() {
         body
     } else {
@@ -9463,12 +9875,100 @@ fn describe_checked_type(result: &CheckResult, type_id: TypeId) -> TypeDescripto
     describe_type_with_imports(&result.types, &result.import_type_references, type_id)
 }
 
-#[allow(clippy::too_many_lines)]
 fn describe_type_with_imports(
     types: &TypeArena,
     imports: &BTreeMap<TypeId, ImportTypeReference>,
     type_id: TypeId,
 ) -> TypeDescriptor {
+    let mut remaining = usize::MAX;
+    let mut visiting = HashSet::new();
+    describe_type_with_imports_inner(
+        types,
+        imports,
+        None,
+        type_id,
+        &mut remaining,
+        &mut visiting,
+        0,
+        usize::MAX,
+    )
+}
+
+fn describe_type_with_imports_bounded(
+    types: &TypeArena,
+    imports: &BTreeMap<TypeId, ImportTypeReference>,
+    named_references: Option<&BTreeMap<TypeId, NamedTypeReference>>,
+    type_id: TypeId,
+    node_budget: usize,
+) -> TypeDescriptor {
+    let mut remaining = node_budget;
+    let mut visiting = HashSet::new();
+    describe_type_with_imports_inner(
+        types,
+        imports,
+        named_references,
+        type_id,
+        &mut remaining,
+        &mut visiting,
+        0,
+        64,
+    )
+}
+
+#[allow(
+    clippy::drop_non_drop,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
+)]
+fn describe_type_with_imports_inner(
+    types: &TypeArena,
+    imports: &BTreeMap<TypeId, ImportTypeReference>,
+    named_references: Option<&BTreeMap<TypeId, NamedTypeReference>>,
+    type_id: TypeId,
+    remaining: &mut usize,
+    visiting: &mut HashSet<TypeId>,
+    depth: usize,
+    max_depth: usize,
+) -> TypeDescriptor {
+    if !visiting.insert(type_id) {
+        return TypeDescriptor::Any;
+    }
+    if let Some(reference) = named_references.and_then(|references| references.get(&type_id))
+        && reference.type_arguments.is_empty()
+    {
+        visiting.remove(&type_id);
+        let target = describe_type_with_imports_inner(
+            types,
+            imports,
+            None,
+            type_id,
+            remaining,
+            visiting,
+            depth + 1,
+            max_depth,
+        );
+        return TypeDescriptor::Named {
+            name: reference.name.clone(),
+            target: Box::new(target),
+        };
+    }
+    if *remaining == 0 || depth >= max_depth {
+        visiting.remove(&type_id);
+        return TypeDescriptor::Any;
+    }
+    *remaining -= 1;
+    let mut describe = |child| {
+        describe_type_with_imports_inner(
+            types,
+            imports,
+            named_references,
+            child,
+            remaining,
+            visiting,
+            depth + 1,
+            max_depth,
+        )
+    };
     let descriptor = match &types
         .get(type_id)
         .expect("type ID originates from arena")
@@ -9489,37 +9989,24 @@ fn describe_type_with_imports(
         TypeKind::StringLiteral(value) => TypeDescriptor::StringLiteral(value.clone()),
         TypeKind::BigIntLiteral(value) => TypeDescriptor::BigIntLiteral(value.clone()),
         TypeKind::TypeParameter { name, .. } => TypeDescriptor::TypeParameter(name.clone()),
-        TypeKind::Array(element) => TypeDescriptor::Array(Box::new(describe_type_with_imports(
-            types, imports, *element,
-        ))),
-        TypeKind::Tuple(elements) => TypeDescriptor::Tuple(
-            elements
-                .iter()
-                .map(|element| describe_type_with_imports(types, imports, *element))
-                .collect(),
+        TypeKind::Array(element) => TypeDescriptor::Array(Box::new(describe(*element))),
+        TypeKind::Tuple(elements) => {
+            TypeDescriptor::Tuple(elements.iter().map(|element| describe(*element)).collect())
+        }
+        TypeKind::ReadonlyTuple(elements) => TypeDescriptor::ReadonlyTuple(
+            elements.iter().map(|element| describe(*element)).collect(),
         ),
-        TypeKind::Union(members) => TypeDescriptor::Union(
-            members
-                .iter()
-                .map(|member| describe_type_with_imports(types, imports, *member))
-                .collect(),
-        ),
-        TypeKind::Intersection(members) => TypeDescriptor::Intersection(
-            members
-                .iter()
-                .map(|member| describe_type_with_imports(types, imports, *member))
-                .collect(),
-        ),
+        TypeKind::Union(members) => {
+            TypeDescriptor::Union(members.iter().map(|member| describe(*member)).collect())
+        }
+        TypeKind::Intersection(members) => {
+            TypeDescriptor::Intersection(members.iter().map(|member| describe(*member)).collect())
+        }
         TypeKind::Object(object) => TypeDescriptor::Object {
             properties: object
                 .properties
                 .iter()
-                .map(|(name, property)| {
-                    (
-                        name.clone(),
-                        describe_type_with_imports(types, imports, *property),
-                    )
-                })
+                .map(|(name, property)| (name.clone(), describe(*property)))
                 .collect(),
             optional_properties: object.optional_properties.clone(),
             readonly_properties: object.readonly_properties.clone(),
@@ -9529,32 +10016,24 @@ fn describe_type_with_imports(
             parameters: function
                 .parameters
                 .iter()
-                .map(|parameter| describe_type_with_imports(types, imports, *parameter))
+                .map(|parameter| describe(*parameter))
                 .collect(),
             rest_parameter: function
                 .rest_parameter
-                .map(|parameter| Box::new(describe_type_with_imports(types, imports, parameter))),
-            return_type: Box::new(describe_type_with_imports(
-                types,
-                imports,
-                function.return_type,
-            )),
+                .map(|parameter| Box::new(describe(parameter))),
+            return_type: Box::new(describe(function.return_type)),
             parameters_optional: function.parameters_optional,
         },
         TypeKind::Constructor(constructor) => TypeDescriptor::Constructor {
             parameters: constructor
                 .parameters
                 .iter()
-                .map(|parameter| describe_type_with_imports(types, imports, *parameter))
+                .map(|parameter| describe(*parameter))
                 .collect(),
             rest_parameter: constructor
                 .rest_parameter
-                .map(|parameter| Box::new(describe_type_with_imports(types, imports, parameter))),
-            return_type: Box::new(describe_type_with_imports(
-                types,
-                imports,
-                constructor.return_type,
-            )),
+                .map(|parameter| Box::new(describe(parameter))),
+            return_type: Box::new(describe(constructor.return_type)),
             parameters_optional: constructor.parameters_optional,
         },
         TypeKind::Overload(signatures) => TypeDescriptor::Overload(
@@ -9564,21 +10043,19 @@ fn describe_type_with_imports(
                     parameters: signature
                         .parameters
                         .iter()
-                        .map(|parameter| describe_type_with_imports(types, imports, *parameter))
+                        .map(|parameter| describe(*parameter))
                         .collect(),
-                    rest_parameter: signature.rest_parameter.map(|parameter| {
-                        Box::new(describe_type_with_imports(types, imports, parameter))
-                    }),
-                    return_type: Box::new(describe_type_with_imports(
-                        types,
-                        imports,
-                        signature.return_type,
-                    )),
+                    rest_parameter: signature
+                        .rest_parameter
+                        .map(|parameter| Box::new(describe(parameter))),
+                    return_type: Box::new(describe(signature.return_type)),
                     parameters_optional: signature.parameters_optional,
                 })
                 .collect(),
         ),
     };
+    drop(describe);
+    visiting.remove(&type_id);
     if let Some(reference) = imports.get(&type_id) {
         TypeDescriptor::Import {
             reference: reference.clone(),
@@ -9589,6 +10066,7 @@ fn describe_type_with_imports(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn substitute_descriptor(
     descriptor: &TypeDescriptor,
     substitutions: &BTreeMap<String, TypeDescriptor>,
@@ -9602,6 +10080,10 @@ fn substitute_descriptor(
             reference: reference.clone(),
             target: Box::new(substitute_descriptor(target, substitutions)),
         },
+        TypeDescriptor::Named { name, target } => TypeDescriptor::Named {
+            name: name.clone(),
+            target: Box::new(substitute_descriptor(target, substitutions)),
+        },
         TypeDescriptor::ConstEnum(enum_type) => {
             TypeDescriptor::ConstEnum(Box::new(substitute_descriptor(enum_type, substitutions)))
         }
@@ -9609,6 +10091,12 @@ fn substitute_descriptor(
             TypeDescriptor::Array(Box::new(substitute_descriptor(element, substitutions)))
         }
         TypeDescriptor::Tuple(elements) => TypeDescriptor::Tuple(
+            elements
+                .iter()
+                .map(|element| substitute_descriptor(element, substitutions))
+                .collect(),
+        ),
+        TypeDescriptor::ReadonlyTuple(elements) => TypeDescriptor::ReadonlyTuple(
             elements
                 .iter()
                 .map(|element| substitute_descriptor(element, substitutions))
@@ -9939,9 +10427,9 @@ fn enum_constant_from_descriptor(descriptor: &TypeDescriptor) -> Option<Value> {
             Some(Value::Number(Number::new(value.parse::<f64>().ok()?)))
         }
         TypeDescriptor::StringLiteral(value) => Some(Value::String(value.clone())),
-        TypeDescriptor::Import { target, .. } | TypeDescriptor::ConstEnum(target) => {
-            enum_constant_from_descriptor(target)
-        }
+        TypeDescriptor::Import { target, .. }
+        | TypeDescriptor::Named { target, .. }
+        | TypeDescriptor::ConstEnum(target) => enum_constant_from_descriptor(target),
         _ => None,
     }
 }
@@ -10059,9 +10547,10 @@ mod tests {
     use ts_parser::parse_source_file;
 
     use super::{
-        Checker, CheckerOptions, EnumConstantValue, FunctionType, ImportTypeReference, ObjectType,
-        ProgramSource, TypeKind, check_program, check_source_file, check_source_file_with_options,
-        identifier_text,
+        Checker, CheckerOptions, EnumConstantValue, FunctionType, ImportTypeReference,
+        NamedTypeReference, ObjectType, ProgramSource, TypeArena, TypeDescriptor, TypeKind,
+        check_program, check_source_file, check_source_file_with_options,
+        describe_type_with_imports_bounded, identifier_text,
     };
 
     struct Builder {
@@ -11522,6 +12011,50 @@ mod tests {
     }
 
     #[test]
+    fn preserves_referenced_non_core_default_library_interfaces() {
+        let library = parse_source_file("interface CustomEventMap { click: { x: number } }");
+        let consumer =
+            parse_source_file("declare const event: CustomEventMap['click']; const x = event.x;");
+        let library_bindings = bind_source_file(&library.arena, library.source_file);
+        let consumer_bindings = bind_source_file(&consumer.arena, consumer.source_file);
+        let no_modules = BTreeMap::new();
+        let checked = check_program(&[
+            ProgramSource {
+                arena: &library.arena,
+                source_file: library.source_file,
+                bindings: &library_bindings,
+                resolved_modules: &no_modules,
+                is_default_library: true,
+                skip_diagnostics: true,
+                checker_options: CheckerOptions {
+                    is_declaration_file: true,
+                    ..CheckerOptions::default()
+                },
+            },
+            ProgramSource {
+                arena: &consumer.arena,
+                source_file: consumer.source_file,
+                bindings: &consumer_bindings,
+                resolved_modules: &no_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+        ]);
+        assert!(checked.files[1].diagnostics.is_empty());
+        let x = consumer_bindings
+            .root_scope()
+            .unwrap()
+            .symbols
+            .get("x")
+            .unwrap();
+        assert_eq!(
+            checked.files[1].type_of_symbol(x),
+            Some(checked.files[1].types.number())
+        );
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn infers_default_library_and_class_static_method_return_types() {
         let default_library = parse_source_file(
@@ -12149,6 +12682,252 @@ mod tests {
 
         assert_eq!(second, first);
         assert_eq!(checker.result.types.len(), type_count);
+    }
+
+    #[test]
+    fn memoizes_declared_object_instantiations() {
+        let parsed = parse_source_file(
+            "interface Shared { value: string } interface Uses { a: Shared; b: Shared; c: Shared }",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let symbol = bindings
+            .root_scope()
+            .unwrap()
+            .symbols
+            .get("Shared")
+            .unwrap();
+        let mut checker = Checker::new(&parsed.arena, &bindings);
+
+        let first = checker.instantiate_declared_object(symbol, &[]).unwrap();
+        let type_count = checker.result.types.len();
+        let second = checker.instantiate_declared_object(symbol, &[]).unwrap();
+
+        assert_eq!(second, first);
+        assert_eq!(checker.result.types.len(), type_count);
+    }
+
+    #[test]
+    fn terminates_recursive_declared_object_instantiations() {
+        let parsed = parse_source_file(
+            "interface Recursive<T> { value: T; next?: Recursive<T[]> } type Value = Recursive<string>;",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+
+        assert!(
+            result.types.len() < 100,
+            "type count: {}",
+            result.types.len()
+        );
+    }
+
+    #[test]
+    fn retains_named_provenance_for_zero_argument_declared_objects() {
+        let parsed =
+            parse_source_file("interface Result { value: string } declare const result: Result;");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let mut checker = Checker::new(&parsed.arena, &bindings);
+        let reference = parsed
+            .arena
+            .iter()
+            .find_map(|(id, node)| {
+                matches!(node.data, NodeData::TypeReferenceNode(_)).then_some(id)
+            })
+            .unwrap();
+
+        let type_id = checker.type_from_type_node(reference);
+        let reference = checker.result.named_type_references.get(&type_id).unwrap();
+        assert_eq!(reference.name, "Result");
+        assert!(reference.type_arguments.is_empty());
+    }
+
+    #[test]
+    fn const_assertions_preserve_readonly_tuple_objects_and_literals() {
+        let parsed =
+            parse_source_file(r#"const ALL_BARS = [{ name: "a" }, { name: "b" }] as const;"#);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        let symbol = bindings
+            .root_scope()
+            .unwrap()
+            .symbols
+            .get("ALL_BARS")
+            .unwrap();
+        let type_id = result.type_of_symbol(symbol).unwrap();
+        let TypeKind::ReadonlyTuple(elements) = &result.types.get(type_id).unwrap().kind else {
+            panic!(
+                "expected readonly tuple, got {}",
+                result.types.display(type_id)
+            );
+        };
+        assert_eq!(elements.len(), 2);
+        for (element, expected) in elements.iter().zip(["a", "b"]) {
+            let TypeKind::Object(object) = &result.types.get(*element).unwrap().kind else {
+                panic!("expected object element");
+            };
+            assert!(object.readonly_properties.contains("name"));
+            assert!(matches!(
+                result.types.get(object.properties["name"]).map(|type_| &type_.kind),
+                Some(TypeKind::StringLiteral(value)) if value == expected
+            ));
+        }
+    }
+
+    #[test]
+    fn mapped_key_remapping_uses_readonly_tuple_item_literals() {
+        let parsed = parse_source_file(
+            r#"
+                declare function makeLookup<T extends ReadonlyArray<any>, A extends keyof T[number]>(
+                    values: T, attribute: A
+                ): { [Item in T[number] as Item[A]]: Item };
+                const values = [{ name: "a" }, { name: "b" }] as const;
+                const lookup = makeLookup(values, "name");
+            "#,
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        let symbol = bindings
+            .root_scope()
+            .unwrap()
+            .symbols
+            .get("lookup")
+            .unwrap();
+        let type_id = result.type_of_symbol(symbol).unwrap();
+        let TypeKind::Object(lookup) = &result.types.get(type_id).unwrap().kind else {
+            panic!(
+                "expected lookup object, got {}",
+                result.types.display(type_id)
+            );
+        };
+        assert_eq!(lookup.properties.keys().collect::<Vec<_>>(), vec!["a", "b"]);
+        for (key, item) in &lookup.properties {
+            let TypeKind::Object(item) = &result.types.get(*item).unwrap().kind else {
+                panic!("expected lookup item");
+            };
+            assert!(item.readonly_properties.contains("name"));
+            assert!(matches!(
+                result.types.get(item.properties["name"]).map(|type_| &type_.kind),
+                Some(TypeKind::StringLiteral(value)) if value == key
+            ));
+        }
+    }
+
+    #[test]
+    fn bounded_descriptors_preserve_named_zero_argument_payloads() {
+        let mut types = TypeArena::new();
+        let payload = types.alloc(TypeKind::Object(ObjectType {
+            properties: BTreeMap::from([("x".into(), types.number())]),
+            ..ObjectType::default()
+        }));
+        let root = types.alloc(TypeKind::Object(ObjectType {
+            properties: BTreeMap::from([("event".into(), payload)]),
+            ..ObjectType::default()
+        }));
+        let names = BTreeMap::from([(
+            payload,
+            NamedTypeReference {
+                name: "PointerEvent".into(),
+                type_arguments: Vec::new(),
+            },
+        )]);
+        let descriptor =
+            describe_type_with_imports_bounded(&types, &BTreeMap::new(), Some(&names), root, 32);
+        let TypeDescriptor::Object { properties, .. } = descriptor else {
+            panic!("expected object descriptor");
+        };
+        assert_eq!(
+            properties.get("event"),
+            Some(&TypeDescriptor::Named {
+                name: "PointerEvent".into(),
+                target: Box::new(TypeDescriptor::Object {
+                    properties: BTreeMap::from([("x".into(), TypeDescriptor::Number)]),
+                    optional_properties: BTreeSet::new(),
+                    readonly_properties: BTreeSet::new(),
+                    getter_properties: BTreeSet::new(),
+                }),
+            })
+        );
+    }
+
+    #[test]
+    fn exhausted_bounded_descriptors_preserve_named_zero_argument_identity() {
+        let mut types = TypeArena::new();
+        let payload = types.alloc(TypeKind::Object(ObjectType {
+            properties: BTreeMap::from([("x".into(), types.number())]),
+            ..ObjectType::default()
+        }));
+        let root = types.alloc(TypeKind::Object(ObjectType {
+            properties: BTreeMap::from([("event".into(), payload)]),
+            ..ObjectType::default()
+        }));
+        let names = BTreeMap::from([(
+            payload,
+            NamedTypeReference {
+                name: "PointerEvent".into(),
+                type_arguments: Vec::new(),
+            },
+        )]);
+
+        let descriptor =
+            describe_type_with_imports_bounded(&types, &BTreeMap::new(), Some(&names), root, 1);
+        let TypeDescriptor::Object { properties, .. } = descriptor else {
+            panic!("expected object descriptor");
+        };
+        assert_eq!(
+            properties.get("event"),
+            Some(&TypeDescriptor::Named {
+                name: "PointerEvent".into(),
+                target: Box::new(TypeDescriptor::Any),
+            })
+        );
+    }
+
+    #[test]
+    fn infers_discriminants_through_indexed_mapped_aliases() {
+        let parsed = parse_source_file(
+            r#"
+                type EventMap = { click: { x: number }, scroll: { y: string } };
+                type Ev<K extends keyof EventMap> = { [P in K]: {
+                    readonly name: P;
+                    readonly callback: (event: EventMap[P]) => void;
+                } }[K];
+                declare function create<K extends keyof EventMap>(event: Ev<K>): Ev<K>;
+                const click = create({ name: "click", callback: _event => {} });
+            "#,
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+
+        let click = bindings.root_scope().unwrap().symbols.get("click").unwrap();
+        let click = result.type_of_symbol(click).unwrap();
+        let TypeKind::Object(click) = &result.types.get(click).unwrap().kind else {
+            panic!("expected concrete click event");
+        };
+        let name = click.properties["name"];
+        assert!(
+            matches!(
+                result.types.get(name).map(|type_| &type_.kind),
+                Some(TypeKind::StringLiteral(name)) if name == "click"
+            ),
+            "name type: {}",
+            result.types.display(name)
+        );
+        let callback = click.properties["callback"];
+        let TypeKind::Function(callback) = &result.types.get(callback).unwrap().kind else {
+            panic!("expected callback function");
+        };
+        let TypeKind::Object(event) = &result.types.get(callback.parameters[0]).unwrap().kind
+        else {
+            panic!("expected click event payload");
+        };
+        assert_eq!(event.properties.get("x"), Some(&result.types.number()));
     }
 
     #[test]
@@ -12843,7 +13622,13 @@ mod tests {
                 .iter()
                 .map(|diagnostic| diagnostic.diagnostic.code())
                 .collect::<Vec<_>>(),
-            [2654, 1253, 2540, 2416, 2416, 2416, 2676, 2676, 2676, 2676]
+            [2654, 1253, 2540, 2416, 2416, 2416, 2676, 2676, 2676, 2676],
+            "{:?}",
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.render().unwrap())
+                .collect::<Vec<_>>()
         );
     }
 

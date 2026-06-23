@@ -95,6 +95,7 @@ pub struct CompilerOptions {
     pub force_consistent_casing_in_file_names: bool,
     pub isolated_modules: bool,
     pub isolated_declarations: bool,
+    pub import_helpers: bool,
     pub module_detection: ModuleDetectionKind,
     pub no_check: bool,
     pub no_emit: bool,
@@ -154,6 +155,7 @@ impl Default for CompilerOptions {
             force_consistent_casing_in_file_names: false,
             isolated_modules: false,
             isolated_declarations: false,
+            import_helpers: false,
             module_detection: ModuleDetectionKind::Auto,
             no_check: false,
             no_emit: false,
@@ -210,6 +212,7 @@ pub struct PrinterSettings {
     pub emit_declarations: bool,
     pub source_map: bool,
     pub inline_source_map: bool,
+    pub import_helpers: bool,
     pub no_emit_helpers: bool,
     pub remove_comments: bool,
     pub use_define_for_class_fields: Option<bool>,
@@ -267,6 +270,7 @@ impl CompilerOptions {
                 "isolateddeclarations" => {
                     self.isolated_declarations = overrides.isolated_declarations;
                 }
+                "importhelpers" => self.import_helpers = overrides.import_helpers,
                 "jsx" => self.jsx = overrides.jsx,
                 "module" => {
                     self.module = overrides.module;
@@ -364,6 +368,7 @@ impl CompilerOptions {
                 && !self.no_emit
                 && !self.emit_declaration_only,
             inline_source_map: self.inline_source_map,
+            import_helpers: self.import_helpers,
             no_emit_helpers: self.no_emit_helpers,
             remove_comments: self.remove_comments,
             use_define_for_class_fields: self.use_define_for_class_fields,
@@ -473,6 +478,9 @@ pub fn parse_compiler_options_map(options: &BTreeMap<String, JsonValue>) -> Pars
             }
             "isolateddeclarations" => {
                 parsed.isolated_declarations = boolean(original_name, value, &mut diagnostics);
+            }
+            "importhelpers" => {
+                parsed.import_helpers = boolean(original_name, value, &mut diagnostics);
             }
             "moduledetection" => {
                 parsed.module_detection =
@@ -587,6 +595,7 @@ struct PartialOptions {
     force_consistent_casing_in_file_names: Option<bool>,
     isolated_modules: Option<bool>,
     isolated_declarations: Option<bool>,
+    import_helpers: Option<bool>,
     module_detection: Option<ModuleDetectionKind>,
     no_check: Option<bool>,
     no_emit: Option<bool>,
@@ -667,6 +676,7 @@ impl PartialOptions {
                 .unwrap_or(false),
             isolated_modules: self.isolated_modules.unwrap_or(false),
             isolated_declarations: self.isolated_declarations.unwrap_or(false),
+            import_helpers: self.import_helpers.unwrap_or(false),
             module_detection: self.module_detection.unwrap_or_default(),
             no_check: self.no_check.unwrap_or(false),
             no_emit: self.no_emit.unwrap_or(false),
@@ -1073,6 +1083,14 @@ mod tests {
         assert!(result.is_ok(), "{:?}", result.diagnostics);
         assert!(result.options.no_emit_helpers);
         assert!(result.options.printer_settings().no_emit_helpers);
+    }
+
+    #[test]
+    fn threads_import_helpers_to_the_printer() {
+        let result = parse_compiler_options(&object([("importHelpers", JsonValue::Bool(true))]));
+        assert!(result.is_ok(), "{:?}", result.diagnostics);
+        assert!(result.options.import_helpers);
+        assert!(result.options.printer_settings().import_helpers);
     }
 
     #[test]

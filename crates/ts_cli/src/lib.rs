@@ -174,6 +174,7 @@ fn compiler_boolean_name(argument: &str) -> Option<&'static str> {
         "--declaration" => "declaration",
         "--esmoduleinterop" => "esmoduleinterop",
         "--forceconsistentcasinginfilenames" => "forceconsistentcasinginfilenames",
+        "--importhelpers" => "importhelpers",
         "--isolatedmodules" => "isolatedmodules",
         "--nocheck" => "nocheck",
         "--noemit" => "noemit",

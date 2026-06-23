@@ -116,6 +116,7 @@ pub fn emit_source_file(arena: &NodeArena, source_file: NodeId) -> Result<EmitRe
             emit_declarations: false,
             source_map: false,
             inline_source_map: false,
+            import_helpers: false,
             no_emit_helpers: false,
             remove_comments: false,
             use_define_for_class_fields: None,
@@ -229,6 +230,7 @@ pub fn emit_source_file_with_context(
         commonjs_default_imports: HashMap::new(),
         commonjs_named_import_temps: HashMap::new(),
         commonjs_named_import_text_rewrites: HashMap::new(),
+        import_helpers_namespace: None,
         has_runtime_export_equals: false,
         bindings: context.bindings,
         identifier_rewrites: HashMap::new(),
@@ -311,6 +313,15 @@ pub fn emit_source_file_with_context(
         || context.module_detection == ModuleDetectionKind::Force
         || (context.module_detection == ModuleDetectionKind::Auto && automatic_jsx.any());
     printer.is_external_module = is_external_module;
+    if settings.import_helpers
+        && !settings.no_emit_helpers
+        && settings.module == ModuleKind::CommonJs
+        && ((settings.target < ScriptTarget::Es2017 && source_needs_awaiter_helper(arena))
+            || (settings.target < ScriptTarget::Es2015
+                && source_needs_downlevel_generator_helper(arena)))
+    {
+        printer.import_helpers_namespace = Some(printer.generated_names.generate("tslib"));
+    }
     let has_runtime_module_indicator = data.statements.nodes.iter().any(|statement| {
         arena.get(*statement).is_some_and(|node| {
             declaration_is_module_indicator(arena, node)
@@ -423,6 +434,7 @@ pub fn emit_source_file_with_context(
     if settings.target < ScriptTarget::Es2017
         && source_needs_awaiter_helper(arena)
         && !settings.no_emit_helpers
+        && printer.import_helpers_namespace.is_none()
     {
         printer.emit_awaiter_helper();
     }
@@ -431,6 +443,7 @@ pub fn emit_source_file_with_context(
             || source_needs_downlevel_generator_helper(arena)
             || needs_async_generator_helper)
         && !settings.no_emit_helpers
+        && printer.import_helpers_namespace.is_none()
     {
         printer.emit_generator_helper();
     }
@@ -603,6 +616,12 @@ pub fn emit_source_file_with_context(
             printer.emit_leading_source_comments(start);
         }
     }
+    if let Some(namespace) = printer.import_helpers_namespace.clone() {
+        printer.writer.write("const ");
+        printer.writer.write(&namespace);
+        printer.writer.write(" = require(\"tslib\");");
+        printer.writer.newline();
+    }
     printer.emit_automatic_jsx_prelude();
     printer.prepare_source_class_expression_temps(source_file);
     if (ScriptTarget::Es2015..ScriptTarget::Es2017).contains(&settings.target)
@@ -699,19 +718,31 @@ pub fn emit_source_file_with_context(
             printer.emit_reference_directives_between(0, source_end);
         }
     }
-    printer.emit_source_comments_between_with_trailing(previous_end, source_end, previous_emitted);
+    let needs_synthesized_empty_export = preserves_external_module_syntax
+        && (!has_emitted_module_indicator || has_empty_export || has_recovered_module_clause);
+    if needs_synthesized_empty_export {
+        printer.emit_source_comments_between_with_ownership(
+            previous_end,
+            source_end,
+            previous_emitted,
+            false,
+        );
+        printer.writer.write("export {};");
+        printer.writer.newline();
+        printer.emit_source_comments_between_with_ownership(previous_end, source_end, false, true);
+    } else {
+        printer.emit_source_comments_between_with_trailing(
+            previous_end,
+            source_end,
+            previous_emitted,
+        );
+    }
     if settings.module == ModuleKind::CommonJs
         && let Some(expression) = export_equals_expression
     {
         printer.writer.write("module.exports = ");
         printer.emit_expression(expression, 0)?;
         printer.writer.write(";");
-        printer.writer.newline();
-    }
-    if preserves_external_module_syntax
-        && (!has_emitted_module_indicator || has_empty_export || has_recovered_module_clause)
-    {
-        printer.writer.write("export {};");
         printer.writer.newline();
     }
     let source_map = printer
@@ -3542,14 +3573,21 @@ impl DeclarationPrinter<'_> {
     }
 
     fn asserted_initializer_type(&self, initializer: NodeId) -> Option<NodeId> {
-        match &self.arena.get(initializer)?.data {
-            NodeData::AsExpression(assertion) => Some(assertion.type_),
-            NodeData::TypeAssertion(assertion) => Some(assertion.type_),
+        let asserted = match &self.arena.get(initializer)?.data {
+            NodeData::AsExpression(assertion) => assertion.type_,
+            NodeData::TypeAssertion(assertion) => assertion.type_,
             NodeData::ParenthesizedExpression(parenthesized) => {
-                self.asserted_initializer_type(parenthesized.expression)
+                return self.asserted_initializer_type(parenthesized.expression);
             }
-            _ => None,
-        }
+            _ => return None,
+        };
+        let is_const = matches!(
+            self.arena.get(asserted).map(|node| &node.data),
+            Some(NodeData::TypeReferenceNode(reference))
+                if reference.type_arguments.is_none()
+                    && declaration_name_text(self.arena, reference.type_name) == Some("const")
+        );
+        (!is_const).then_some(asserted)
     }
 
     fn initializer_has_explicit_function_signature(&self, initializer: NodeId) -> bool {
@@ -3994,7 +4032,7 @@ impl DeclarationPrinter<'_> {
             let NodeData::ParameterDeclaration(parameter) = &node.data else {
                 return Err(Self::unsupported(*parameter, node.kind));
             };
-            self.emit_name(parameter.name)?;
+            self.emit_declaration_binding_name(parameter.name)?;
             self.writer.write(": ");
             if let Some(type_id) = signature.parameters.get(index) {
                 self.emit_semantic_type(*type_id)?;
@@ -4052,7 +4090,7 @@ impl DeclarationPrinter<'_> {
             if parameter.dot_dot_dot_token.is_some() {
                 self.writer.write("...");
             }
-            self.emit_name(parameter.name)?;
+            self.emit_declaration_binding_name(parameter.name)?;
             let type_id = signature.parameters.get(index).copied();
             let optional = parameter.question_token.is_some()
                 || parameter.initializer.is_some()
@@ -4367,7 +4405,7 @@ impl DeclarationPrinter<'_> {
             if data.dot_dot_dot_token.is_some() {
                 self.writer.write("...");
             }
-            self.emit_name(data.name)?;
+            self.emit_declaration_binding_name(data.name)?;
             if data.question_token.is_some() {
                 self.writer.write("?");
             }
@@ -5166,6 +5204,11 @@ impl DeclarationPrinter<'_> {
                 self.emit_semantic_type_list(&elements, ", ")?;
                 self.writer.write("]");
             }
+            TypeKind::ReadonlyTuple(elements) => {
+                self.writer.write("readonly [");
+                self.emit_semantic_type_list(&elements, ", ")?;
+                self.writer.write("]");
+            }
             TypeKind::Union(members) => self.emit_semantic_type_list(&members, " | ")?,
             TypeKind::Intersection(members) => self.emit_semantic_intersection_type(&members)?,
             TypeKind::Function(signature) => self.emit_semantic_function_type(&signature)?,
@@ -5398,12 +5441,15 @@ impl DeclarationPrinter<'_> {
         if !object.properties.is_empty() {
             self.writer.newline();
             self.writer.indent += 1;
-            for (name, type_id) in &object.properties {
-                if object.readonly_properties.contains(name) {
+            let ordered_names = self.semantic_object_property_order(object);
+            for name in ordered_names {
+                let type_id = &object.properties[&name];
+                let optional = object.optional_properties.contains(&name);
+                if object.readonly_properties.contains(&name) {
                     self.writer.write("readonly ");
                 }
-                self.emit_semantic_property_name(name);
-                if object.optional_properties.contains(name) {
+                self.emit_semantic_property_name(&name);
+                if optional {
                     self.writer.write("?");
                 }
                 let function = self
@@ -5446,7 +5492,7 @@ impl DeclarationPrinter<'_> {
                             self.emit_semantic_type(signature.return_type)?;
                         }
                     } else {
-                        self.emit_semantic_type(*type_id)?;
+                        self.emit_semantic_parameter_type(*type_id, optional)?;
                     }
                 }
                 self.writer.write(";");
@@ -5456,6 +5502,30 @@ impl DeclarationPrinter<'_> {
         }
         self.writer.write("}");
         Ok(())
+    }
+
+    fn semantic_object_property_order(&self, object: &ObjectType) -> Vec<String> {
+        let mapped_order = self.arena.iter().find_map(|(_, node)| {
+            let NodeData::MappedTypeNode(mapped) = &node.data else {
+                return None;
+            };
+            let type_literal = mapped.type_.and_then(|type_| self.arena.get(type_))?;
+            let NodeData::TypeLiteralNode(type_literal) = &type_literal.data else {
+                return None;
+            };
+            let names = type_literal
+                .members
+                .nodes
+                .iter()
+                .filter_map(|member| type_member_name_text(self.arena, *member).map(str::to_owned))
+                .collect::<Vec<_>>();
+            let present = names
+                .into_iter()
+                .filter(|name| object.properties.contains_key(name))
+                .collect::<Vec<_>>();
+            (present.len() == object.properties.len()).then_some(present)
+        });
+        mapped_order.unwrap_or_else(|| object.properties.keys().cloned().collect())
     }
 
     fn emit_computed_object_method_return(
@@ -5947,6 +6017,48 @@ impl DeclarationPrinter<'_> {
         Ok(())
     }
 
+    fn emit_declaration_binding_name(&mut self, id: NodeId) -> Result<(), EmitError> {
+        let node = self.node(id)?.clone();
+        let NodeData::BindingPattern(pattern) = &node.data else {
+            return self.emit_name(id);
+        };
+        let object = node.kind == SyntaxKind::ObjectBindingPattern;
+        self.writer.write(if object { "{" } else { "[" });
+        if object && !pattern.elements.nodes.is_empty() {
+            self.writer.write(" ");
+        }
+        for (index, element_id) in pattern.elements.nodes.iter().enumerate() {
+            if index != 0 {
+                self.writer.write(", ");
+            }
+            let element_node = self.node(*element_id)?.clone();
+            match &element_node.data {
+                NodeData::BindingElement(element) => {
+                    if element.dot_dot_dot_token.is_some() {
+                        self.writer.write("...");
+                    }
+                    if let Some(property_name) = element.property_name {
+                        self.emit_name(property_name)?;
+                        self.writer.write(": ");
+                    }
+                    if let Some(name) = element.name {
+                        self.emit_declaration_binding_name(name)?;
+                    }
+                }
+                NodeData::OmittedExpression(_) => {}
+                _ => return Err(Self::unsupported(*element_id, element_node.kind)),
+            }
+        }
+        if pattern.elements.has_trailing_comma {
+            self.writer.write(",");
+        }
+        if object && !pattern.elements.nodes.is_empty() {
+            self.writer.write(" ");
+        }
+        self.writer.write(if object { "}" } else { "]" });
+        Ok(())
+    }
+
     fn write_source_identifier(&mut self, id: NodeId, text: &str) {
         let source = self.arena.get(id).and_then(|node| {
             usize::try_from(node.range.start.get())
@@ -6408,6 +6520,19 @@ fn declaration_modifiers(node: &Node) -> Option<&ts_ast::ModifierList> {
     }
 }
 
+fn type_member_name_text(arena: &NodeArena, member: NodeId) -> Option<&str> {
+    let name = match &arena.get(member)?.data {
+        NodeData::PropertySignatureDeclaration(data) => data.name,
+        NodeData::PropertyDeclaration(data) => data.name,
+        NodeData::MethodSignatureDeclaration(data) => data.name,
+        NodeData::MethodDeclaration(data) => data.name,
+        NodeData::GetAccessorDeclaration(data) => data.name,
+        NodeData::SetAccessorDeclaration(data) => data.name,
+        _ => return None,
+    };
+    declaration_name_text(arena, name)
+}
+
 fn declaration_name_text(arena: &NodeArena, id: NodeId) -> Option<&str> {
     match &arena.get(id)?.data {
         NodeData::Identifier(identifier) => Some(&identifier.text),
@@ -6444,6 +6569,57 @@ fn is_identifier_text(text: &str) -> bool {
         .is_some_and(|character| character == '_' || character == '$' || character.is_alphabetic())
         && characters
             .all(|character| character == '_' || character == '$' || character.is_alphanumeric())
+}
+
+fn is_es5_reserved_binding_name(text: &str) -> bool {
+    matches!(
+        text,
+        "break"
+            | "case"
+            | "catch"
+            | "class"
+            | "const"
+            | "continue"
+            | "debugger"
+            | "default"
+            | "delete"
+            | "do"
+            | "else"
+            | "enum"
+            | "export"
+            | "extends"
+            | "false"
+            | "finally"
+            | "for"
+            | "function"
+            | "if"
+            | "import"
+            | "in"
+            | "instanceof"
+            | "new"
+            | "null"
+            | "return"
+            | "super"
+            | "switch"
+            | "this"
+            | "throw"
+            | "true"
+            | "try"
+            | "typeof"
+            | "var"
+            | "void"
+            | "while"
+            | "with"
+            | "implements"
+            | "interface"
+            | "let"
+            | "package"
+            | "private"
+            | "protected"
+            | "public"
+            | "static"
+            | "yield"
+    )
 }
 
 #[derive(Default)]
@@ -7280,6 +7456,7 @@ struct Printer<'a> {
     commonjs_default_imports: HashMap<String, String>,
     commonjs_named_import_temps: HashMap<NodeId, String>,
     commonjs_named_import_text_rewrites: HashMap<String, String>,
+    import_helpers_namespace: Option<String>,
     has_runtime_export_equals: bool,
     bindings: &'a BindResult,
     identifier_rewrites: HashMap<ts_ast::SymbolId, String>,
@@ -7316,6 +7493,22 @@ struct Printer<'a> {
 }
 
 impl Printer<'_> {
+    fn emit_awaiter_reference(&mut self) {
+        if let Some(namespace) = &self.import_helpers_namespace {
+            self.writer.write(namespace);
+            self.writer.write(".");
+        }
+        self.writer.write("__awaiter");
+    }
+
+    fn emit_generator_reference(&mut self) {
+        if let Some(namespace) = &self.import_helpers_namespace {
+            self.writer.write(namespace);
+            self.writer.write(".");
+        }
+        self.writer.write("__generator");
+    }
+
     fn prepare_private_field_lowerings(&mut self) {
         let mut declaration_order = 0;
         for (class_id, node) in self.arena.iter() {
@@ -12049,8 +12242,9 @@ impl Printer<'_> {
         self.writer.write("{");
         self.writer.newline();
         self.writer.indent += 1;
-        self.writer
-            .write("return __generator(this, function (_a) {");
+        self.writer.write("return ");
+        self.emit_generator_reference();
+        self.writer.write("(this, function (_a) {");
         self.writer.newline();
         self.writer.indent += 1;
         self.emit_es5_generator_state_machine(&block.statements.nodes, "_a")?;
@@ -12189,8 +12383,9 @@ impl Printer<'_> {
         self.writer.newline();
         self.writer.write("var e_1, _c;");
         self.writer.newline();
-        self.writer
-            .write("return __generator(this, function (_d) {");
+        self.writer.write("return ");
+        self.emit_generator_reference();
+        self.writer.write("(this, function (_d) {");
         self.writer.newline();
         self.writer.indent += 1;
         self.writer.write("switch (_d.label) {");
@@ -12204,8 +12399,9 @@ impl Printer<'_> {
         self.writer.write(") {");
         self.writer.newline();
         self.writer.indent += 1;
-        self.writer
-            .write("return __generator(this, function (_e) {");
+        self.writer.write("return ");
+        self.emit_generator_reference();
+        self.writer.write("(this, function (_e) {");
         self.writer.newline();
         self.writer.indent += 1;
         self.writer.write("switch (_e.label) {");
@@ -12345,8 +12541,9 @@ impl Printer<'_> {
         self.writer.write("() {");
         self.writer.newline();
         self.writer.indent += 1;
-        self.writer
-            .write("return __generator(this, function (_a) {");
+        self.writer.write("return ");
+        self.emit_generator_reference();
+        self.writer.write("(this, function (_a) {");
         self.writer.newline();
         self.writer.indent += 1;
         self.emit_es5_async_generator_state_machine(&block.statements.nodes, "_a")?;
@@ -12499,7 +12696,8 @@ impl Printer<'_> {
         if !compact_outer {
             self.writer.write("return ");
         }
-        self.writer.write("__awaiter(");
+        self.emit_awaiter_reference();
+        self.writer.write("(");
         self.writer.write(this_argument);
         self.writer.write(", void 0, void 0, function () {");
         let callback_is_indented = !compact_outer
@@ -12528,7 +12726,9 @@ impl Printer<'_> {
             self.emit_es5_async_captured_loop_hoists(&loop_info)?;
         }
 
-        self.writer.write("return __generator(");
+        self.writer.write("return ");
+        self.emit_generator_reference();
+        self.writer.write("(");
         self.writer.write(generator_this);
         self.writer.write(", function (");
         self.writer.write(state_parameter);
@@ -12899,8 +13099,9 @@ impl Printer<'_> {
         self.writer.write(") {");
         self.writer.newline();
         self.writer.indent += 1;
-        self.writer
-            .write("return __generator(this, function (_b) {");
+        self.writer.write("return ");
+        self.emit_generator_reference();
+        self.writer.write("(this, function (_b) {");
         self.writer.newline();
         self.writer.indent += 1;
         self.writer.write("switch (_b.label) {");
@@ -13031,7 +13232,8 @@ impl Printer<'_> {
         expression_body: Option<NodeId>,
         this_argument: &str,
     ) -> Result<(), EmitError> {
-        self.writer.write("__awaiter(");
+        self.emit_awaiter_reference();
+        self.writer.write("(");
         self.writer.write(this_argument);
         self.writer.write(", void 0, void 0, function* () ");
         let previous = self.async_expression_transform;
@@ -13157,7 +13359,8 @@ impl Printer<'_> {
         parameter_temp: &str,
         this_argument: &str,
     ) -> Result<(), EmitError> {
-        self.writer.write("__awaiter(");
+        self.emit_awaiter_reference();
+        self.writer.write("(");
         self.writer.write(this_argument);
         self.writer.write(", void 0, void 0, function* () {");
         self.writer.newline();
@@ -14339,24 +14542,47 @@ impl Printer<'_> {
         }) {
             return self.generated_names.generate("class");
         }
-        self.class_expression_inferred_name(id)
-            .unwrap_or_else(|| self.generated_names.generate("class"))
+        let Some(name) = self.class_expression_inferred_name(id) else {
+            return self.generated_names.generate("class");
+        };
+        if !is_identifier_text(&name) {
+            self.generated_names.generate("class")
+        } else if is_es5_reserved_binding_name(&name) {
+            self.generated_names.generate(&name)
+        } else {
+            name
+        }
     }
 
     fn class_expression_inferred_name(&self, id: NodeId) -> Option<String> {
         let parent = self.arena.get(id)?.parent?;
-        let (initializer, name) = match &self.arena.get(parent)?.data {
-            NodeData::VariableDeclaration(declaration) => {
-                (declaration.initializer, declaration.name)
+        match &self.arena.get(parent)?.data {
+            NodeData::VariableDeclaration(declaration) if declaration.initializer == Some(id) => {
+                declaration_name_text(self.arena, declaration.name).map(str::to_owned)
             }
-            NodeData::ParameterDeclaration(declaration) => {
-                (declaration.initializer, declaration.name)
+            NodeData::ParameterDeclaration(declaration) if declaration.initializer == Some(id) => {
+                declaration_name_text(self.arena, declaration.name).map(str::to_owned)
             }
-            _ => return None,
-        };
-        (initializer == Some(id))
-            .then(|| declaration_name_text(self.arena, name).map(str::to_owned))
-            .flatten()
+            NodeData::BinaryExpression(expression)
+                if expression.right == id
+                    && self
+                        .arena
+                        .get(expression.operator_token)
+                        .is_some_and(|operator| operator.kind == SyntaxKind::EqualsToken) =>
+            {
+                match &self.arena.get(expression.left)?.data {
+                    NodeData::Identifier(identifier) => Some(identifier.text.clone()),
+                    NodeData::PropertyAccessExpression(access) => {
+                        declaration_name_text(self.arena, access.name).map(str::to_owned)
+                    }
+                    _ => None,
+                }
+            }
+            NodeData::PropertyAssignment(property) if property.initializer == id => {
+                declaration_name_text(self.arena, property.name).map(str::to_owned)
+            }
+            _ => None,
+        }
     }
 
     fn class_expression_as_declaration(
@@ -21601,6 +21827,136 @@ mod tests {
     }
 
     #[test]
+    fn declaration_emit_erases_defaults_inside_parameter_binding_patterns() {
+        let output = emit_declarations_with_semantics(
+            "type Options = { name: string; once?: boolean; callback: () => void }; function create({ name, once = false, callback }: Options): void {}",
+        );
+        assert!(
+            output.contains("declare function create({ name, once, callback }: Options): void;"),
+            "{output}"
+        );
+        assert!(!output.contains("once = false"), "{output}");
+    }
+
+    #[test]
+    fn declaration_emit_preserves_recursive_const_assertion_types() {
+        let output = emit_declarations_with_semantics(
+            r#"const ALL_BARS = [{ name: "a" }, { name: "b" }] as const;"#,
+        );
+        assert!(
+            output.contains(concat!(
+                "declare const ALL_BARS: readonly [{\n",
+                "    readonly name: \"a\";\n",
+                "}, {\n",
+                "    readonly name: \"b\";\n",
+                "}];"
+            )),
+            "{output}"
+        );
+        assert!(!output.contains("ALL_BARS: const"), "{output}");
+    }
+
+    #[test]
+    fn declaration_emit_expands_mapped_key_remapping_from_readonly_tuple() {
+        let output = emit_declarations_with_semantics(
+            r#"
+                declare function makeLookup<T extends ReadonlyArray<any>, A extends keyof T[number]>(
+                    values: T, attribute: A
+                ): { [Item in T[number] as Item[A]]: Item };
+                const values = [{ name: "a" }, { name: "b" }] as const;
+                const lookup = makeLookup(values, "name");
+            "#,
+        );
+        let lookup = output.find("declare const lookup: {").map_or_else(
+            || panic!("missing lookup declaration: {output}"),
+            |start| &output[start..],
+        );
+        assert!(
+            lookup.contains(concat!(
+                "declare const lookup: {\n",
+                "    a: {\n",
+                "        readonly name: \"a\";\n",
+                "    };\n",
+                "    b: {\n",
+                "        readonly name: \"b\";\n",
+                "    };\n",
+                "};"
+            )),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn declaration_emit_expands_inferred_indexed_mapped_alias_results() {
+        let output = emit_declarations_with_semantics(
+            r#"
+                type EventMap = { click: { x: number }, scroll: { y: string } };
+                type Ev<K extends keyof EventMap> = { [P in K]: {
+                    readonly name: P;
+                    readonly once?: boolean;
+                    readonly callback: (event: EventMap[P]) => void;
+                } }[K];
+                declare function create<K extends keyof EventMap>(event: Ev<K>): Ev<K>;
+                const clickEvent = create({ name: "click", callback: _event => {} });
+            "#,
+        );
+        let click_event = output.find("declare const clickEvent: {").map_or_else(
+            || panic!("missing inferred clickEvent declaration: {output}"),
+            |start| &output[start..],
+        );
+        assert!(
+            click_event.contains("readonly name: \"click\";"),
+            "{output}"
+        );
+        let name = click_event.find("readonly name:").unwrap();
+        let once = click_event.find("readonly once?:").unwrap();
+        let callback = click_event.find("readonly callback:").unwrap();
+        assert!(name < once && once < callback, "{output}");
+        assert!(click_event.contains("readonly once?: boolean;"), "{output}");
+        assert!(
+            !click_event.contains("once?: undefined | boolean;"),
+            "{output}"
+        );
+        assert!(
+            !output.contains("declare const clickEvent: unknown;"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn semantic_object_properties_normalize_undefined_only_when_optional() {
+        let output = emit_declarations_with_semantics(
+            r#"
+                type OptionalOnly<K extends "only" = "only"> = { [P in K]: {
+                    value?: undefined;
+                } }[K];
+                type ExplicitUnion<K extends "only" = "only"> = { [P in K]: {
+                    value: boolean | undefined;
+                } }[K];
+                declare function optionalOnly<K extends "only">(value: OptionalOnly<K>): OptionalOnly<K>;
+                declare function explicitUnion<K extends "only">(value: ExplicitUnion<K>): ExplicitUnion<K>;
+                const optionalOnlyResult = optionalOnly<"only">({});
+                const explicitUnionResult = explicitUnion<"only">({ value: true });
+            "#,
+        );
+        let optional = output
+            .find("declare const optionalOnlyResult: {")
+            .map_or_else(
+                || panic!("missing optional result: {output}"),
+                |start| &output[start..],
+            );
+        assert!(optional.contains("value?: undefined;"), "{output}");
+
+        let explicit = output
+            .find("declare const explicitUnionResult: {")
+            .map_or_else(
+                || panic!("missing explicit union result: {output}"),
+                |start| &output[start..],
+            );
+        assert!(explicit.contains("value: undefined | boolean;"), "{output}");
+    }
+
+    #[test]
     fn declaration_emit_infers_auto_accessors_from_owning_class_writes() {
         let output = emit_declarations_with_semantics(
             r"
@@ -21671,6 +22027,7 @@ mod tests {
                 emit_declarations: false,
                 source_map: true,
                 inline_source_map: false,
+                import_helpers: false,
                 no_emit_helpers: false,
                 remove_comments: false,
                 use_define_for_class_fields: None,
@@ -21696,6 +22053,7 @@ mod tests {
                 emit_declarations: false,
                 source_map: false,
                 inline_source_map: false,
+                import_helpers: false,
                 no_emit_helpers: false,
                 remove_comments: false,
                 use_define_for_class_fields: Some(true),
@@ -21725,6 +22083,7 @@ mod tests {
                 emit_declarations: false,
                 source_map: false,
                 inline_source_map: false,
+                import_helpers: false,
                 no_emit_helpers: false,
                 remove_comments: false,
                 use_define_for_class_fields: None,
@@ -21762,6 +22121,7 @@ mod tests {
                 emit_declarations: false,
                 source_map: true,
                 inline_source_map: false,
+                import_helpers: false,
                 no_emit_helpers: false,
                 remove_comments: false,
                 use_define_for_class_fields: None,
@@ -21801,6 +22161,7 @@ mod tests {
                 emit_declarations: false,
                 source_map: false,
                 inline_source_map: false,
+                import_helpers: false,
                 no_emit_helpers: false,
                 remove_comments: false,
                 use_define_for_class_fields: None,
@@ -21877,6 +22238,7 @@ mod tests {
                 emit_declarations: false,
                 source_map: false,
                 inline_source_map: false,
+                import_helpers: false,
                 no_emit_helpers: false,
                 remove_comments: false,
                 use_define_for_class_fields: None,
@@ -22330,6 +22692,7 @@ mod tests {
                 emit_declarations: false,
                 source_map: false,
                 inline_source_map: false,
+                import_helpers: false,
                 no_emit_helpers: false,
                 remove_comments: false,
                 use_define_for_class_fields: None,
@@ -22452,6 +22815,46 @@ mod tests {
             ),
             "{output}"
         );
+    }
+
+    #[test]
+    fn imports_commonjs_async_helpers_from_tslib() {
+        let source = "export async function foo() { await 0; }";
+        let parsed = parse_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let output = emit_source_file_with_settings(
+            &parsed.arena,
+            parsed.source_file,
+            "notmodule.cts",
+            source,
+            PrinterSettings {
+                always_strict: false,
+                target: ScriptTarget::Es2015,
+                module: ModuleKind::CommonJs,
+                jsx: JsxEmit::Preserve,
+                emit_javascript: true,
+                emit_declarations: false,
+                source_map: false,
+                inline_source_map: false,
+                import_helpers: true,
+                no_emit_helpers: false,
+                remove_comments: false,
+                use_define_for_class_fields: None,
+            },
+        )
+        .unwrap()
+        .code;
+        let marker = output.find("Object.defineProperty(exports").unwrap();
+        let export = output.find("exports.foo = foo;").unwrap();
+        let helper = output.find("const tslib_1 = require(\"tslib\");").unwrap();
+        let function = output.find("function foo()").unwrap();
+        assert!(output.starts_with("\"use strict\";\n"), "{output}");
+        assert!(
+            marker < export && export < helper && helper < function,
+            "{output}"
+        );
+        assert!(output.contains("return tslib_1.__awaiter("), "{output}");
+        assert!(!output.contains("var __awaiter ="), "{output}");
     }
 
     #[test]
@@ -22757,6 +23160,7 @@ mod tests {
                 emit_declarations: false,
                 source_map: false,
                 inline_source_map: false,
+                import_helpers: false,
                 no_emit_helpers: false,
                 remove_comments: false,
                 use_define_for_class_fields: None,
@@ -23256,6 +23660,7 @@ mod tests {
                 emit_declarations: false,
                 source_map: false,
                 inline_source_map: false,
+                import_helpers: false,
                 no_emit_helpers: false,
                 remove_comments: false,
                 use_define_for_class_fields: None,
@@ -23630,6 +24035,7 @@ mod tests {
                     emit_declarations: false,
                     source_map: false,
                     inline_source_map: false,
+                    import_helpers: false,
                     no_emit_helpers: false,
                     remove_comments: false,
                     use_define_for_class_fields: None,
@@ -23748,6 +24154,60 @@ mod tests {
             emit_always_strict(source, ScriptTarget::Es2015, ModuleKind::None).code,
             "\"use strict\";\nfunction visible() { }\n"
         );
+    }
+
+    #[test]
+    fn emits_recovered_keyword_generics_and_class_names_in_both_strict_modes() {
+        let source = concat!(
+            "function bigGeneric<implements, interface, let>(value: implements) {}\n",
+            "namespace Names { class implements {} class Derived implements Contract {} ",
+            "class Fields { public var = 0; } }",
+        );
+        let parsed = parse_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+
+        for always_strict in [false, true] {
+            let output = emit_source_file_with_settings(
+                &parsed.arena,
+                parsed.source_file,
+                "input.ts",
+                source,
+                PrinterSettings {
+                    always_strict,
+                    target: ScriptTarget::Es2015,
+                    module: ModuleKind::None,
+                    jsx: JsxEmit::Preserve,
+                    emit_javascript: true,
+                    emit_declarations: false,
+                    source_map: false,
+                    inline_source_map: false,
+                    import_helpers: false,
+                    no_emit_helpers: false,
+                    remove_comments: false,
+                    use_define_for_class_fields: None,
+                },
+            )
+            .unwrap()
+            .code;
+
+            assert!(
+                output.contains("function bigGeneric(value) { }"),
+                "alwaysStrict={always_strict}:\n{output}"
+            );
+            assert!(
+                output.contains("class implements {"),
+                "alwaysStrict={always_strict}:\n{output}"
+            );
+            assert!(
+                output.contains("class Derived {"),
+                "alwaysStrict={always_strict}:\n{output}"
+            );
+            assert!(
+                output.contains("this.var = 0;"),
+                "alwaysStrict={always_strict}:\n{output}"
+            );
+            assert_eq!(output.starts_with("\"use strict\";\n"), always_strict);
+        }
     }
 
     #[test]
@@ -24253,6 +24713,34 @@ mod tests {
     }
 
     #[test]
+    fn downlevel_class_expression_names_follow_assignment_properties() {
+        let output = emit_with(
+            "const foo = {}; foo.x = class {}; foo.break = class {};",
+            ScriptTarget::Es5,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(output.contains("function x()"), "{output}");
+        assert!(output.contains("return x;"), "{output}");
+        assert!(output.contains("function break_1()"), "{output}");
+        assert!(output.contains("return break_1;"), "{output}");
+    }
+
+    #[test]
+    fn downlevel_class_expression_names_follow_object_properties() {
+        let output = emit_with(
+            "({ x: class {}, break: class {} });",
+            ScriptTarget::Es5,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(output.contains("function x()"), "{output}");
+        assert!(output.contains("return x;"), "{output}");
+        assert!(output.contains("function break_1()"), "{output}");
+        assert!(output.contains("return break_1;"), "{output}");
+    }
+
+    #[test]
     fn restores_inferred_class_name_only_for_lowered_static_elements() {
         let output = emit_with(
             concat!(
@@ -24290,6 +24778,7 @@ mod tests {
                 emit_declarations: false,
                 source_map: false,
                 inline_source_map: false,
+                import_helpers: false,
                 no_emit_helpers: false,
                 remove_comments: false,
                 use_define_for_class_fields: None,
@@ -24472,6 +24961,7 @@ class Board {
                 emit_declarations: false,
                 source_map: false,
                 inline_source_map: false,
+                import_helpers: false,
                 no_emit_helpers: false,
                 remove_comments: false,
                 use_define_for_class_fields: None,
@@ -24502,6 +24992,7 @@ class Board {
                 emit_declarations: false,
                 source_map: false,
                 inline_source_map: false,
+                import_helpers: false,
                 no_emit_helpers: false,
                 remove_comments: false,
                 use_define_for_class_fields: None,
@@ -24867,6 +25358,7 @@ class Board {
                 emit_declarations: false,
                 source_map: false,
                 inline_source_map: false,
+                import_helpers: false,
                 no_emit_helpers: false,
                 remove_comments: false,
                 use_define_for_class_fields: None,
@@ -24902,6 +25394,7 @@ class Board {
                     emit_declarations: false,
                     source_map: false,
                     inline_source_map: false,
+                    import_helpers: false,
                     no_emit_helpers: false,
                     remove_comments: false,
                     use_define_for_class_fields: None,
@@ -24927,6 +25420,7 @@ class Board {
                 emit_declarations: false,
                 source_map: false,
                 inline_source_map: false,
+                import_helpers: false,
                 no_emit_helpers: false,
                 remove_comments: false,
                 use_define_for_class_fields: None,
@@ -24946,6 +25440,29 @@ class Board {
         assert_eq!(
             result.code,
             "export const value = 1;\nexport default function read() { return value; }\n"
+        );
+    }
+
+    #[test]
+    fn emits_synthesized_empty_export_before_detached_tail_comments() {
+        let result = emit_with(
+            concat!(
+                "export interface Shape {}\n",
+                "const value: number = 1; // owned\n",
+                "// detached tail\n",
+                "// details",
+            ),
+            ScriptTarget::Es2015,
+            ModuleKind::EsNext,
+        );
+        assert_eq!(
+            result.code,
+            concat!(
+                "const value = 1; // owned\n",
+                "export {};\n",
+                "// detached tail\n",
+                "// details\n",
+            )
         );
     }
 
@@ -25479,6 +25996,7 @@ class Board {
                 emit_declarations: false,
                 source_map: false,
                 inline_source_map: false,
+                import_helpers: false,
                 no_emit_helpers: false,
                 remove_comments: false,
                 use_define_for_class_fields: None,

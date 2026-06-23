@@ -1342,7 +1342,11 @@ impl<'a> Parser<'a> {
             && self.current.kind != SyntaxKind::EndOfFile
         {
             let parameter_start = self.current.range.start;
-            let name = self.parse_identifier("Expected a type parameter name.");
+            // Contextual and reserved words are still identifier names for recovery here.  In
+            // particular, consuming them keeps a malformed list such as `<implements,
+            // interface>` synchronized through its closing `>` instead of abandoning the
+            // declaration at the first keyword.
+            let name = self.parse_identifier_name("Expected a type parameter name.");
             let constraint = if self.current.kind == SyntaxKind::ExtendsKeyword {
                 self.bump();
                 Some(self.parse_type())
@@ -1403,11 +1407,22 @@ impl<'a> Parser<'a> {
 
     fn parse_class_declaration(&mut self) -> NodeId {
         let start = self.consume().range.start;
-        let name = if !matches!(
+        let heritage_keyword_is_recovered_name = matches!(
             self.current.kind,
             SyntaxKind::ExtendsKeyword | SyntaxKind::ImplementsKeyword
-        ) && (self.current.kind == SyntaxKind::Identifier
+        ) && matches!(
+            self.next_token_kind(),
+            SyntaxKind::LessThanToken
+                | SyntaxKind::OpenBraceToken
+                | SyntaxKind::ExtendsKeyword
+                | SyntaxKind::ImplementsKeyword
+        );
+        let name = if (self.current.kind == SyntaxKind::Identifier
             || self.current.kind.is_keyword())
+            && (!matches!(
+                self.current.kind,
+                SyntaxKind::ExtendsKeyword | SyntaxKind::ImplementsKeyword
+            ) || heritage_keyword_is_recovered_name)
         {
             Some(self.parse_identifier_name("Expected a class name."))
         } else {
@@ -1920,6 +1935,20 @@ impl<'a> Parser<'a> {
 
     fn recover_invalid_class_var_modifier(&mut self, modifier_nodes: &mut Vec<NodeId>) {
         if self.current.kind != SyntaxKind::VarKeyword || modifier_nodes.is_empty() {
+            return;
+        }
+        // `var` can itself be a recovered property name (`public var = 0`). Only discard it as
+        // the invalid declaration keyword in forms where another token must provide the name.
+        if self.next_token_preceded_by_line_break()
+            || matches!(
+                self.next_token_kind(),
+                SyntaxKind::LessThanToken
+                    | SyntaxKind::OpenParenToken
+                    | SyntaxKind::QuestionToken
+                    | SyntaxKind::ColonToken
+                    | SyntaxKind::EqualsToken
+            )
+        {
             return;
         }
         self.error_code_at(self.current.range, 1440, std::iter::empty::<String>());
@@ -6360,7 +6389,27 @@ impl<'a> Parser<'a> {
 
     fn parse_type_reference(&mut self) -> NodeId {
         let start = self.current.range.start;
-        let type_name = self.parse_entity_name();
+        let mut type_name =
+            if self.current.kind == SyntaxKind::Identifier || self.current.kind.is_keyword() {
+                self.parse_identifier_name("Expected a type name.")
+            } else {
+                self.parse_identifier("Expected a type name.")
+            };
+        while self.current.kind == SyntaxKind::DotToken {
+            self.bump();
+            let right = self.parse_identifier_name("Expected an identifier after '.'.");
+            type_name = self.alloc_node(
+                SyntaxKind::QualifiedName,
+                TextRange::new(self.node_start(type_name), self.node_end(right)),
+                NodeData::QualifiedName(Box::new(QualifiedNameData {
+                    flow_node: None,
+                    left: type_name,
+                    right,
+                    facts: 0,
+                })),
+                &[type_name, right],
+            );
+        }
         let type_arguments = self.parse_type_arguments();
         let end = type_arguments
             .as_ref()
@@ -9970,6 +10019,94 @@ mod tests {
             NodeData::ClassExpression(_)
         ));
         assert_eq!(result.arena.get(class_id).unwrap().parent, Some(typeof_id));
+    }
+
+    #[test]
+    fn recovers_keyword_type_parameters_and_keyword_class_names() {
+        let result = parse_source_file(concat!(
+            "function bigGeneric<implements, interface, let, private>(value: implements) {} ",
+            "namespace Names { class implements {} class Derived implements Contract {} ",
+            "class Fields { public var = 0; } }",
+        ));
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let statements = source_statements(&result);
+        assert_eq!(statements.len(), 2, "{:?}", result.diagnostics);
+
+        let NodeData::FunctionDeclaration(function) =
+            &result.arena.get(statements[0]).unwrap().data
+        else {
+            panic!("expected recovered generic function");
+        };
+        let parameter_names = function
+            .type_parameters
+            .as_ref()
+            .unwrap()
+            .nodes
+            .iter()
+            .map(|parameter| {
+                let NodeData::TypeParameterDeclaration(parameter) =
+                    &result.arena.get(*parameter).unwrap().data
+                else {
+                    panic!("expected type parameter");
+                };
+                let NodeData::Identifier(name) = &result.arena.get(parameter.name).unwrap().data
+                else {
+                    panic!("expected type parameter name");
+                };
+                name.text.as_str()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            parameter_names,
+            ["implements", "interface", "let", "private"]
+        );
+        assert_eq!(function.parameters.nodes.len(), 1);
+        assert!(function.body.is_some());
+
+        let NodeData::ModuleDeclaration(module) = &result.arena.get(statements[1]).unwrap().data
+        else {
+            panic!("expected namespace");
+        };
+        let NodeData::ModuleBlock(block) = &result.arena.get(module.body.unwrap()).unwrap().data
+        else {
+            panic!("expected namespace body");
+        };
+        assert_eq!(block.statements.nodes.len(), 3, "{:?}", result.diagnostics);
+
+        let NodeData::ClassDeclaration(keyword_name) =
+            &result.arena.get(block.statements.nodes[0]).unwrap().data
+        else {
+            panic!("expected keyword-named class");
+        };
+        let NodeData::Identifier(keyword_name_text) =
+            &result.arena.get(keyword_name.name.unwrap()).unwrap().data
+        else {
+            panic!("expected keyword class name");
+        };
+        assert_eq!(keyword_name_text.text, "implements");
+        assert!(keyword_name.heritage_clauses.is_none());
+
+        let NodeData::ClassDeclaration(derived) =
+            &result.arena.get(block.statements.nodes[1]).unwrap().data
+        else {
+            panic!("expected derived class");
+        };
+        assert_eq!(derived.heritage_clauses.as_ref().unwrap().nodes.len(), 1);
+
+        let NodeData::ClassDeclaration(fields) =
+            &result.arena.get(block.statements.nodes[2]).unwrap().data
+        else {
+            panic!("expected fields class");
+        };
+        let NodeData::PropertyDeclaration(field) =
+            &result.arena.get(fields.members.nodes[0]).unwrap().data
+        else {
+            panic!("expected recovered keyword field");
+        };
+        let NodeData::Identifier(field_name) = &result.arena.get(field.name).unwrap().data else {
+            panic!("expected recovered field name");
+        };
+        assert_eq!(field_name.text, "var");
     }
 
     #[test]
