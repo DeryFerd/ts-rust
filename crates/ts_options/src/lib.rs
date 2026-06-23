@@ -664,9 +664,7 @@ impl PartialOptions {
             ),
             check_js,
             composite,
-            declaration: self
-                .declaration
-                .unwrap_or(emit_declaration_only || composite),
+            declaration: self.declaration.unwrap_or(composite),
             declaration_map: self.declaration_map.unwrap_or(false),
             emit_declaration_only,
             es_module_interop,

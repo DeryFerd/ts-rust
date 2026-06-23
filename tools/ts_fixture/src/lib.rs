@@ -2110,6 +2110,25 @@ mod tests {
     }
 
     #[test]
+    fn invalid_declaration_only_case_reports_5069_without_outputs() {
+        let case = Case::parse(
+            "declarationOnlyError.ts",
+            "// @emitDeclarationOnly: true\nvar hello = 'yo!';\n",
+        )
+        .unwrap();
+        let compilation = compile_case(&case).unwrap();
+        assert!(compilation.outputs.is_empty(), "{:?}", compilation.outputs);
+        assert_eq!(
+            compilation
+                .diagnostics
+                .iter()
+                .filter_map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [5069]
+        );
+    }
+
+    #[test]
     fn ignores_basename_markers_for_nested_declaration_inputs() {
         let case = Case::parse(
             "amdLike.ts",

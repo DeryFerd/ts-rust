@@ -1806,6 +1806,13 @@ impl<'a> Parser<'a> {
             },
             flags: ts_ast::ModifierFlags::default(),
         });
+        if self.current.kind == SyntaxKind::OpenBracketToken && self.is_index_signature() {
+            let member = self.parse_index_signature(start, modifiers);
+            for modifier in modifier_nodes {
+                self.arena.get_mut(modifier).unwrap().parent = Some(member);
+            }
+            return member;
+        }
         if matches!(
             self.current.kind,
             SyntaxKind::GetKeyword | SyntaxKind::SetKeyword

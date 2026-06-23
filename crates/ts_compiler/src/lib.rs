@@ -18,7 +18,10 @@ use ts_glob::{DiscoveryOptions, discover_files};
 use ts_module::{ResolutionOptions, Resolver, automatic_type_directive_names};
 use ts_options::{CompilerOptions, ModuleKind, PrinterSettings, parse_project_options};
 use ts_parser::{ParseResult, parse_jsx_source_file, parse_source_file};
-use ts_path::{CaseSensitivity, canonicalize, directory_path, is_absolute, resolve_path};
+use ts_path::{
+    CaseSensitivity, canonicalize, change_extension, declaration_emit_extension, directory_path,
+    is_absolute, resolve_path,
+};
 use ts_printer::{
     AmdDependency as PrinterAmdDependency, EmitConstantValue, EmitContext,
     emit_declaration_file_with_semantics, emit_source_file_with_context,
@@ -218,6 +221,12 @@ impl Program {
     ) -> Self {
         let mut program = Self::new_unchecked(file_system, current_directory, root_names);
         program.options = options;
+        if program.options.emit_declaration_only
+            && !program.options.declaration
+            && !program.options.composite
+        {
+            program.diagnostics.push(emit_declaration_only_diagnostic());
+        }
         if program
             .source_files
             .iter()
@@ -1556,11 +1565,11 @@ fn preserved_reference_directives(source: &SourceFile, declaration_file: &str) -
             continue;
         };
         let target = resolve_path(&source_directory, &[&trimmed[value_start..value_end]]);
+        let target = change_extension(&target, declaration_emit_extension(&target));
         let rewritten = relative_path(&declaration_directory, &target);
-        output.push_str(&trimmed[..value_start]);
+        output.push_str("/// <reference path=\"");
         output.push_str(&rewritten);
-        output.push_str(&trimmed[value_end..]);
-        output.push('\n');
+        output.push_str("\" preserve=\"true\" />\n");
     }
     output
 }
@@ -2030,6 +2039,22 @@ fn missing_file_diagnostic(file_name: &str) -> ProgramDiagnostic {
     }
 }
 
+fn emit_declaration_only_diagnostic() -> ProgramDiagnostic {
+    let message = message_by_code(5069).expect("TS5069 must be in the generated catalog");
+    ProgramDiagnostic {
+        file_name: None,
+        range: None,
+        code: Some(message.code()),
+        message: message
+            .format(&[
+                "emitDeclarationOnly".to_owned(),
+                "declaration".to_owned(),
+                "composite".to_owned(),
+            ])
+            .expect("TS5069 has three formatting arguments"),
+    }
+}
+
 fn module_not_found_diagnostic(
     file_name: &str,
     range: TextRange,
@@ -2275,6 +2300,42 @@ mod tests {
                 .diagnostics()
                 .iter()
                 .any(|diagnostic| diagnostic.code == Some(2304))
+        );
+    }
+
+    #[test]
+    fn preserved_declaration_references_are_canonical_and_target_declarations() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/dep.ts", "export interface Dep {}")
+            .unwrap();
+        fs.write_file(
+            "/project/main.ts",
+            "///<reference path='dep.ts' preserve=\"true\" />\nexport const value = 1;",
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["main.ts".to_owned()],
+            CompilerOptions {
+                declaration: true,
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        let emitted = program.emit();
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        let declaration = emitted
+            .files
+            .iter()
+            .find(|file| file.file_name == "/project/main.d.ts")
+            .unwrap();
+        assert!(
+            declaration
+                .text
+                .starts_with("/// <reference path=\"dep.d.ts\" preserve=\"true\" />\n"),
+            "{}",
+            declaration.text
         );
     }
 
@@ -3885,6 +3946,16 @@ mod tests {
                     "}\n",
                 ),
             ),
+            (
+                "namespace M { class C {} export var value: C = new C(); }",
+                concat!(
+                    "declare namespace M {\n",
+                    "    class C {\n",
+                    "    }\n",
+                    "    var value: C;\n",
+                    "}\n",
+                ),
+            ),
         ] {
             let fs = MemoryFileSystem::new(true);
             fs.write_file("/project/alias.ts", source).unwrap();
@@ -4062,7 +4133,7 @@ mod tests {
             "/project/tsconfig.json",
             r#"{
                 "files": ["src/index.ts"],
-                "compilerOptions": { "outDir": "types", "emitDeclarationOnly": true, "noLib": true }
+                "compilerOptions": { "outDir": "types", "declaration": true, "emitDeclarationOnly": true, "noLib": true }
             }"#,
         )
         .unwrap();
@@ -4079,6 +4150,32 @@ mod tests {
             emitted.files[0].text,
             "export declare const value: string;\n"
         );
+    }
+
+    #[test]
+    fn emit_declaration_only_requires_declaration_or_composite() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/index.ts", "var hello = 'yo!';")
+            .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["index.ts".to_owned()],
+            CompilerOptions {
+                emit_declaration_only: true,
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        assert_eq!(
+            program
+                .diagnostics()
+                .iter()
+                .filter_map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [5069]
+        );
+        assert!(program.emit().files.is_empty());
     }
 
     #[test]
