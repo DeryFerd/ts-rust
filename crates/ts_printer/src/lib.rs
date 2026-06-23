@@ -232,7 +232,7 @@ pub fn emit_source_file_with_context(
         enum_access_fallbacks,
         emitted_source_comments: HashSet::new(),
         class_expression_temps: HashMap::new(),
-        await_as_yield: false,
+        async_expression_transform: AsyncExpressionTransform::None,
         async_loop_counter: 0,
         async_control_counter: 0,
     };
@@ -297,10 +297,15 @@ pub fn emit_source_file_with_context(
             .get(*statement)
             .is_some_and(|statement| export_declaration_is_empty(arena, statement))
     });
+    let needs_async_generator_helper =
+        settings.target < ScriptTarget::Es2018 && source_needs_async_generator_helper(arena);
+    let needs_dynamic_import_helpers =
+        settings.module == ModuleKind::CommonJs && source_has_dynamic_import(arena);
     if !has_use_strict
         && !preserves_external_module_syntax
         && (settings.always_strict
-            || (settings.module == ModuleKind::CommonJs && is_external_module))
+            || (settings.module == ModuleKind::CommonJs && is_external_module)
+            || needs_async_generator_helper)
     {
         printer.writer.write("\"use strict\";");
         printer.writer.newline();
@@ -324,6 +329,14 @@ pub fn emit_source_file_with_context(
         } else {
             printer.emit_leading_pinned_source_comments(start);
         }
+    }
+    if needs_dynamic_import_helpers && !settings.no_emit_helpers {
+        printer.emit_create_binding_helper();
+        printer.emit_import_star_helper();
+    }
+    if needs_async_generator_helper && !settings.no_emit_helpers {
+        printer.emit_await_helper();
+        printer.emit_async_generator_helper();
     }
     if settings.target < ScriptTarget::Es2017
         && source_needs_awaiter_helper(arena)
@@ -366,10 +379,10 @@ pub fn emit_source_file_with_context(
             context.import_runtime_meanings,
         );
         let needs_export_star_helper = source_needs_export_star_helper(arena, &data.statements);
-        if needs_import_star_helper || needs_export_star_helper {
+        if (needs_import_star_helper || needs_export_star_helper) && !needs_dynamic_import_helpers {
             printer.emit_create_binding_helper();
         }
-        if needs_import_star_helper {
+        if needs_import_star_helper && !needs_dynamic_import_helpers {
             printer.emit_import_star_helper();
         }
         if needs_export_star_helper {
@@ -536,6 +549,38 @@ fn source_needs_awaiter_helper(arena: &NodeArena) -> bool {
                 && declaration_has_modifier(arena, node, SyntaxKind::AsyncKeyword)
         }
         _ => false,
+    })
+}
+
+fn source_needs_async_generator_helper(arena: &NodeArena) -> bool {
+    arena.iter().any(|(_, node)| match &node.data {
+        NodeData::FunctionDeclaration(function) => {
+            function.body.is_some()
+                && function.asterisk_token.is_some()
+                && declaration_has_modifier(arena, node, SyntaxKind::AsyncKeyword)
+        }
+        NodeData::FunctionExpression(function) => {
+            function.asterisk_token.is_some()
+                && declaration_has_modifier(arena, node, SyntaxKind::AsyncKeyword)
+        }
+        NodeData::MethodDeclaration(method) => {
+            method.body.is_some()
+                && method.asterisk_token.is_some()
+                && declaration_has_modifier(arena, node, SyntaxKind::AsyncKeyword)
+        }
+        _ => false,
+    })
+}
+
+fn source_has_dynamic_import(arena: &NodeArena) -> bool {
+    arena.iter().any(|(_, node)| {
+        let NodeData::CallExpression(call) = &node.data else {
+            return false;
+        };
+        matches!(
+            arena.get(call.expression).map(|node| &node.data),
+            Some(NodeData::Identifier(identifier)) if identifier.text == "import"
+        )
     })
 }
 
@@ -4598,6 +4643,13 @@ fn collect_namespace_alias_rewrites(
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AsyncExpressionTransform {
+    None,
+    AwaitAsYield,
+    AsyncGenerator,
+}
+
 struct Printer<'a> {
     arena: &'a NodeArena,
     writer: Writer,
@@ -4628,7 +4680,7 @@ struct Printer<'a> {
     enum_access_fallbacks: HashMap<NodeId, EmitConstantValue>,
     emitted_source_comments: HashSet<(usize, usize)>,
     class_expression_temps: HashMap<NodeId, String>,
-    await_as_yield: bool,
+    async_expression_transform: AsyncExpressionTransform,
     async_loop_counter: u32,
     async_control_counter: u32,
 }
@@ -5509,6 +5561,33 @@ impl Printer<'_> {
         }
     }
 
+    fn emit_await_helper(&mut self) {
+        self.writer.write(
+            "var __await = (this && this.__await) || function (v) { return this instanceof __await ? (this.v = v, this) : new __await(v); }",
+        );
+        self.writer.newline();
+    }
+
+    fn emit_async_generator_helper(&mut self) {
+        for line in [
+            "var __asyncGenerator = (this && this.__asyncGenerator) || function (thisArg, _arguments, generator) {",
+            "    if (!Symbol.asyncIterator) throw new TypeError(\"Symbol.asyncIterator is not defined.\");",
+            "    var g = generator.apply(thisArg, _arguments || []), i, q = [];",
+            "    return i = Object.create((typeof AsyncIterator === \"function\" ? AsyncIterator : Object).prototype), verb(\"next\"), verb(\"throw\"), verb(\"return\", awaitReturn), i[Symbol.asyncIterator] = function () { return this; }, i;",
+            "    function awaitReturn(f) { return function (v) { return Promise.resolve(v).then(f, reject); }; }",
+            "    function verb(n, f) { if (g[n]) { i[n] = function (v) { return new Promise(function (a, b) { q.push([n, v, a, b]) > 1 || resume(n, v); }); }; if (f) i[n] = f(i[n]); } }",
+            "    function resume(n, v) { try { step(g[n](v)); } catch (e) { settle(q[0][3], e); } }",
+            "    function step(r) { r.value instanceof __await ? Promise.resolve(r.value.v).then(fulfill, reject) : settle(q[0][2], r); }",
+            "    function fulfill(value) { resume(\"next\", value); }",
+            "    function reject(value) { resume(\"throw\", value); }",
+            "    function settle(f, v) { if (f(v), q.shift(), q.length) resume(q[0][0], q[0][1]); }",
+            "};",
+        ] {
+            self.writer.write(line);
+            self.writer.newline();
+        }
+    }
+
     fn emit_generator_helper(&mut self) {
         for line in [
             "var __generator = (this && this.__generator) || function (thisArg, body) {",
@@ -6192,19 +6271,26 @@ impl Printer<'_> {
             }
             NodeData::FunctionDeclaration(data) => {
                 self.emit_runtime_declaration_modifiers(data.modifiers.as_ref());
+                let is_async = self.has_modifier(data.modifiers.as_ref(), SyntaxKind::AsyncKeyword);
+                let downlevel_async_generator = (ScriptTarget::Es2015..ScriptTarget::Es2018)
+                    .contains(&self.settings.target)
+                    && data.asterisk_token.is_some()
+                    && is_async;
                 let downlevel_async = self.settings.target < ScriptTarget::Es2017
                     && data.asterisk_token.is_none()
-                    && self.has_modifier(data.modifiers.as_ref(), SyntaxKind::AsyncKeyword);
-                if !downlevel_async
-                    && self.has_modifier(data.modifiers.as_ref(), SyntaxKind::AsyncKeyword)
-                {
+                    && is_async;
+                if !downlevel_async && !downlevel_async_generator && is_async {
                     self.writer.write("async ");
                 }
                 self.writer.write("function");
-                if data.asterisk_token.is_some() {
+                if data.asterisk_token.is_some() && !downlevel_async_generator {
                     self.writer.write("*");
                 }
                 self.writer.write(" ");
+                let function_name = data
+                    .name
+                    .and_then(|name| declaration_name_text(self.arena, name))
+                    .map(str::to_owned);
                 if let Some(name) = data.name {
                     self.emit_expression(name, 0)?;
                 }
@@ -6214,6 +6300,14 @@ impl Printer<'_> {
                     self.emit_downlevel_async_function_body(
                         data.body.expect("body checked above"),
                         "this",
+                    )?;
+                } else if downlevel_async_generator {
+                    let inner_name = self
+                        .generated_names
+                        .generate(function_name.as_deref().unwrap_or("_default"));
+                    self.emit_downlevel_async_generator_body(
+                        data.body.expect("body checked above"),
+                        &inner_name,
                     )?;
                 } else {
                     self.emit_function_body(data.body.expect("body checked above"))?;
@@ -6268,7 +6362,15 @@ impl Printer<'_> {
             NodeData::ModuleDeclaration(data) => self.emit_namespace(data)?,
             NodeData::ReturnStatement(data) => {
                 self.writer.write("return");
-                if let Some(expression) = data.expression {
+                if self.async_expression_transform == AsyncExpressionTransform::AsyncGenerator {
+                    self.writer.write(" yield __await(");
+                    if let Some(expression) = data.expression {
+                        self.emit_expression(expression, 0)?;
+                    } else {
+                        self.writer.write("void 0");
+                    }
+                    self.writer.write(")");
+                } else if let Some(expression) = data.expression {
                     self.writer.write(" ");
                     self.emit_expression(expression, 0)?;
                 }
@@ -6948,6 +7050,33 @@ impl Printer<'_> {
         Ok(())
     }
 
+    fn emit_downlevel_async_generator_body(
+        &mut self,
+        body: NodeId,
+        inner_name: &str,
+    ) -> Result<(), EmitError> {
+        self.writer.write("{");
+        self.writer.newline();
+        self.writer.indent += 1;
+        self.writer
+            .write("return __asyncGenerator(this, arguments, function* ");
+        self.writer.write(inner_name);
+        self.writer.write("() {");
+        self.writer.newline();
+        self.writer.indent += 1;
+        let previous = self.async_expression_transform;
+        self.async_expression_transform = AsyncExpressionTransform::AsyncGenerator;
+        let result = self.emit_block_statements(body);
+        self.async_expression_transform = previous;
+        result?;
+        self.writer.indent -= 1;
+        self.writer.write("});");
+        self.writer.newline();
+        self.writer.indent -= 1;
+        self.writer.write("}");
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn emit_es5_async_function_body(
         &mut self,
@@ -7504,8 +7633,8 @@ impl Printer<'_> {
         self.writer.write("__awaiter(");
         self.writer.write(this_argument);
         self.writer.write(", void 0, void 0, function* () ");
-        let previous = self.await_as_yield;
-        self.await_as_yield = true;
+        let previous = self.async_expression_transform;
+        self.async_expression_transform = AsyncExpressionTransform::AwaitAsYield;
         let result = if let Some(expression) = expression_body {
             self.writer.write("{ return ");
             self.emit_expression(expression, 0)?;
@@ -7514,7 +7643,7 @@ impl Printer<'_> {
         } else {
             self.emit_function_body(body)
         };
-        self.await_as_yield = previous;
+        self.async_expression_transform = previous;
         result?;
         self.writer.write(")");
         Ok(())
@@ -7559,17 +7688,17 @@ impl Printer<'_> {
         self.writer.indent += 1;
         self.emit_object_rest_parameter_prologue(pattern, parameter_temp)?;
         if matches!(&self.node(body)?.data, NodeData::Block(_)) {
-            let previous = self.await_as_yield;
-            self.await_as_yield = true;
+            let previous = self.async_expression_transform;
+            self.async_expression_transform = AsyncExpressionTransform::AwaitAsYield;
             let result = self.emit_block_statements(body);
-            self.await_as_yield = previous;
+            self.async_expression_transform = previous;
             result?;
         } else {
             self.writer.write("return ");
-            let previous = self.await_as_yield;
-            self.await_as_yield = true;
+            let previous = self.async_expression_transform;
+            self.async_expression_transform = AsyncExpressionTransform::AwaitAsYield;
             let result = self.emit_expression(body, 0);
-            self.await_as_yield = previous;
+            self.async_expression_transform = previous;
             result?;
             self.writer.write(";");
             self.writer.newline();
@@ -10061,6 +10190,43 @@ impl Printer<'_> {
             })
     }
 
+    fn is_dynamic_import_call(&self, call: &ts_ast::CallExpressionData) -> bool {
+        matches!(
+            self.arena.get(call.expression).map(|node| &node.data),
+            Some(NodeData::Identifier(identifier)) if identifier.text == "import"
+        )
+    }
+
+    fn emit_commonjs_dynamic_import(
+        &mut self,
+        call: &ts_ast::CallExpressionData,
+    ) -> Result<(), EmitError> {
+        let argument = call.arguments.nodes.first().copied();
+        let inlineable = argument.is_none_or(|argument| {
+            matches!(
+                self.arena.get(argument).map(|node| &node.data),
+                Some(NodeData::StringLiteral(_) | NodeData::NoSubstitutionTemplateLiteral(_))
+            )
+        });
+        self.writer.write("Promise.resolve(");
+        if !inlineable {
+            self.writer.write("`${");
+            self.emit_expression(argument.expect("non-inlineable import has an argument"), 0)?;
+            self.writer.write("}`");
+        }
+        self.writer.write(").then(");
+        if inlineable {
+            self.writer.write("() => __importStar(require(");
+            if let Some(argument) = argument {
+                self.emit_expression(argument, 0)?;
+            }
+        } else {
+            self.writer.write("s => __importStar(require(s");
+        }
+        self.writer.write(")))");
+        Ok(())
+    }
+
     fn emit_shorthand_property(&mut self, name: NodeId) -> Result<(), EmitError> {
         let rewrite = self
             .identifier_text(name)
@@ -10444,7 +10610,10 @@ impl Printer<'_> {
                 }
             }
             NodeData::CallExpression(data) => {
-                if data.question_dot_token.is_some() && self.settings.target < ScriptTarget::Es2020
+                if self.commonjs_module_transform && self.is_dynamic_import_call(data) {
+                    self.emit_commonjs_dynamic_import(data)?;
+                } else if data.question_dot_token.is_some()
+                    && self.settings.target < ScriptTarget::Es2020
                 {
                     self.emit_downlevel_optional_call(
                         data.expression,
@@ -10487,25 +10656,43 @@ impl Printer<'_> {
                 self.emit_expression(data.expression, 1)?;
             }
             NodeData::AwaitExpression(data) => {
-                if self.await_as_yield {
+                if self.async_expression_transform == AsyncExpressionTransform::AsyncGenerator {
+                    self.writer.write("yield __await(");
+                    self.emit_expression(data.expression, 0)?;
+                    self.writer.write(")");
+                } else if self.async_expression_transform == AsyncExpressionTransform::AwaitAsYield
+                {
                     self.writer.write("yield ");
+                    self.emit_expression(data.expression, 2)?;
                 } else {
                     self.writer.write("await ");
+                    self.emit_expression(data.expression, 2)?;
                 }
-                self.emit_expression(data.expression, 2)?;
             }
             NodeData::TypeOfExpression(data) => {
                 self.writer.write("typeof ");
                 self.emit_expression(data.expression, 16)?;
             }
             NodeData::YieldExpression(data) => {
-                self.writer.write("yield");
-                if data.asterisk_token.is_some() {
-                    self.writer.write("*");
-                }
-                if let Some(expression) = data.expression {
-                    self.writer.write(" ");
-                    self.emit_expression(expression, 2)?;
+                if self.async_expression_transform == AsyncExpressionTransform::AsyncGenerator
+                    && data.asterisk_token.is_none()
+                {
+                    self.writer.write("yield yield __await(");
+                    if let Some(expression) = data.expression {
+                        self.emit_expression(expression, 0)?;
+                    } else {
+                        self.writer.write("void 0");
+                    }
+                    self.writer.write(")");
+                } else {
+                    self.writer.write("yield");
+                    if data.asterisk_token.is_some() {
+                        self.writer.write("*");
+                    }
+                    if let Some(expression) = data.expression {
+                        self.writer.write(" ");
+                        self.emit_expression(expression, 2)?;
+                    }
                 }
             }
             NodeData::NonNullExpression(data) => {
@@ -12892,6 +13079,40 @@ mod tests {
             .code,
             "async function* values() { yield 1; }\nexport {};\n"
         );
+    }
+
+    #[test]
+    fn lowers_nested_commonjs_dynamic_imports_in_async_generators() {
+        let output = emit_with(
+            concat!(
+                "async function* foo() {\n",
+                "    import((await import(yield \"foo\")).default);\n",
+                "}",
+            ),
+            ScriptTarget::Es2015,
+            ModuleKind::CommonJs,
+        )
+        .code;
+        let create_binding = output.find("var __createBinding").unwrap();
+        let import_star = output.find("var __importStar").unwrap();
+        let await_helper = output.find("var __await").unwrap();
+        let async_generator = output.find("var __asyncGenerator").unwrap();
+        let function = output.find("function foo()").unwrap();
+        assert!(
+            create_binding < import_star
+                && import_star < await_helper
+                && await_helper < async_generator
+                && async_generator < function,
+            "{output}"
+        );
+        assert!(!output.contains("Object.defineProperty(exports, \"__esModule\""));
+        assert!(output.ends_with(concat!(
+            "function foo() {\n",
+            "    return __asyncGenerator(this, arguments, function* foo_1() {\n",
+            "        Promise.resolve(`${(yield __await(Promise.resolve(`${yield yield __await(\"foo\")}`).then(s => __importStar(require(s))))).default}`).then(s => __importStar(require(s)));\n",
+            "    });\n",
+            "}\n",
+        )));
     }
 
     #[test]

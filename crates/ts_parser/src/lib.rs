@@ -504,6 +504,8 @@ impl<'a> Parser<'a> {
         let async_starts_function = self.current.kind == SyntaxKind::AsyncKeyword
             && !self.next_token_preceded_by_line_break()
             && self.next_token_kind() == SyntaxKind::FunctionKeyword;
+        let import_starts_call = self.current.kind == SyntaxKind::ImportKeyword
+            && self.next_token_kind() == SyntaxKind::OpenParenToken;
         match self.current.kind {
             SyntaxKind::OpenBraceToken => self.parse_block(),
             SyntaxKind::ConstKeyword if is_const_enum => self.parse_const_enum_declaration(),
@@ -545,6 +547,7 @@ impl<'a> Parser<'a> {
             SyntaxKind::DeclareKeyword | SyntaxKind::AbstractKeyword | SyntaxKind::AsyncKeyword => {
                 self.parse_modified_statement()
             }
+            SyntaxKind::ImportKeyword if import_starts_call => self.parse_expression_statement(),
             SyntaxKind::ImportKeyword => self.parse_import_declaration(),
             SyntaxKind::ExportKeyword => self.parse_export_declaration(),
             SyntaxKind::SemicolonToken => self.parse_empty_statement(),
@@ -4326,6 +4329,7 @@ impl<'a> Parser<'a> {
             SyntaxKind::NumericLiteral => self.parse_numeric_literal(),
             SyntaxKind::BigIntLiteral => self.parse_bigint_literal(),
             SyntaxKind::StringLiteral => self.parse_string_literal(),
+            SyntaxKind::ImportKeyword => self.parse_identifier_name("Expected an expression."),
             SyntaxKind::SlashToken | SyntaxKind::SlashEqualsToken => {
                 self.parse_regular_expression_literal()
             }
@@ -8668,6 +8672,47 @@ mod tests {
                 .unwrap()
                 .parent,
             Some(delegated)
+        );
+    }
+
+    #[test]
+    fn parses_nested_dynamic_imports_in_async_generator_expressions() {
+        let result = parse_source_file(concat!(
+            "async function* foo() {\n",
+            "    import((await import(yield \"foo\")).default);\n",
+            "}",
+        ));
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+
+        let dynamic_imports = result
+            .arena
+            .iter()
+            .filter(|(_, node)| {
+                let NodeData::CallExpression(call) = &node.data else {
+                    return false;
+                };
+                matches!(
+                    result.arena.get(call.expression).map(|node| &node.data),
+                    Some(NodeData::Identifier(identifier)) if identifier.text == "import"
+                )
+            })
+            .count();
+        assert_eq!(dynamic_imports, 2);
+        assert_eq!(
+            result
+                .arena
+                .iter()
+                .filter(|(_, node)| node.kind == SyntaxKind::AwaitExpression)
+                .count(),
+            1
+        );
+        assert_eq!(
+            result
+                .arena
+                .iter()
+                .filter(|(_, node)| node.kind == SyntaxKind::YieldExpression)
+                .count(),
+            1
         );
     }
 
