@@ -551,8 +551,23 @@ pub fn emit_source_file_with_context(
     for import in pending_commonjs_imports {
         printer.emit_commonjs_import_binding_exports(import, &data.statements)?;
     }
-    if !emitted_runtime_statement && data.statements.nodes.is_empty() {
-        printer.emit_reference_directives_between(0, source_end);
+    if !emitted_runtime_statement {
+        if data.statements.nodes.is_empty() {
+            printer.emit_reference_directives_between(0, source_end);
+        } else if settings.module == ModuleKind::None {
+            let mut reference_owner_start = 0;
+            for statement in &data.statements.nodes {
+                let Some(node) = arena.get(*statement) else {
+                    continue;
+                };
+                printer.emit_detached_reference_directives_between(
+                    reference_owner_start,
+                    node.range.start.get(),
+                );
+                reference_owner_start = node.range.end.get();
+            }
+            printer.emit_detached_reference_directives_between(reference_owner_start, source_end);
+        }
     }
     printer.emit_source_comments_between_with_trailing(previous_end, source_end, previous_emitted);
     if settings.module == ModuleKind::CommonJs
@@ -7104,6 +7119,7 @@ impl Printer<'_> {
                     self.node(*statement)?.data,
                     NodeData::Block(_) | NodeData::ReturnStatement(_)
                 )
+                && self.switch_clause_statement_is_inline(*clause_id, *statement)
             {
                 self.writer.write(" ");
                 self.emit_statement(*statement)?;
@@ -7121,6 +7137,23 @@ impl Printer<'_> {
         self.writer.indent -= 1;
         self.writer.write("}");
         Ok(())
+    }
+
+    fn switch_clause_statement_is_inline(&self, clause: NodeId, statement: NodeId) -> bool {
+        if self.source_text.is_empty() {
+            return true;
+        }
+        let Some(clause) = self.arena.get(clause) else {
+            return false;
+        };
+        let Some(statement) = self.arena.get(statement) else {
+            return false;
+        };
+        let start = usize::try_from(clause.range.start.get()).unwrap_or(usize::MAX);
+        let end = usize::try_from(statement.range.start.get()).unwrap_or(usize::MAX);
+        self.source_text
+            .get(start..end)
+            .is_some_and(|text| !text.contains(['\n', '\r']))
     }
 
     fn emit_if_statement(&mut self, data: &ts_ast::IfStatementData) -> Result<(), EmitError> {
@@ -8579,13 +8612,14 @@ impl Printer<'_> {
         self.writer.write("__awaiter(");
         self.writer.write(this_argument);
         self.writer.write(", void 0, void 0, function () {");
-        if object_rest.is_some() || expression_body.is_none() || !compact_outer {
+        let callback_is_indented = !compact_outer
+            || object_rest.is_some()
+            || (expression_body.is_none() && self.this_alias != Some("_a"));
+        if callback_is_indented {
             self.writer.newline();
         } else {
             self.writer.write(" ");
         }
-        let callback_is_indented =
-            !compact_outer || object_rest.is_some() || expression_body.is_none();
         if callback_is_indented {
             self.writer.indent += 1;
         }
@@ -12625,7 +12659,13 @@ impl Printer<'_> {
                     self.writer.write(" => ");
                 }
                 if downlevel_async {
-                    let this_argument = if let Some(alias) = self.this_alias {
+                    let this_argument = if self.settings.target < ScriptTarget::Es2015
+                        && self.this_alias == Some("_a")
+                    {
+                        // A lowered static field uses `_a` as the class-value capture for
+                        // the generator callback. It is not the receiver of the async arrow.
+                        "void 0"
+                    } else if let Some(alias) = self.this_alias {
                         alias
                     } else if self.arrow_is_nested_in_function(id) {
                         "this"
@@ -14550,6 +14590,19 @@ mod tests {
     }
 
     #[test]
+    fn preserves_multiline_switch_returns() {
+        assert_eq!(
+            emit_with(
+                "switch (value) {\ncase 0:\nreturn value;\n}",
+                ScriptTarget::EsNext,
+                ModuleKind::EsNext,
+            )
+            .code,
+            "switch (value) {\n    case 0:\n        return value;\n}\n"
+        );
+    }
+
+    #[test]
     fn captures_block_scoped_do_loop_bindings_when_downleveling() {
         assert_eq!(
             emit_with(
@@ -14852,6 +14905,22 @@ mod tests {
         assert!(
             static_field.contains("}\n_a = Test;\nTest.member = (x) => __awaiter("),
             "{static_field}"
+        );
+    }
+
+    #[test]
+    fn lowers_es5_async_static_field_with_separate_awaiter_and_generator_receivers() {
+        let output = emit_with(
+            "class Test { static member = async (x: string) => {}; }",
+            ScriptTarget::Es5,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(
+            output.contains(
+                "Test.member = function (x) { return __awaiter(void 0, void 0, void 0, function () { return __generator(_a, function (_b) {"
+            ),
+            "{output}"
         );
     }
 
@@ -16357,6 +16426,34 @@ class Board {
             )
         );
         assert!(!output.contains("<reference"));
+    }
+
+    #[test]
+    fn preserves_detached_lib_reference_in_type_only_script() {
+        let source = concat!(
+            "/// <reference lib=\"dom\" />\n",
+            "\n",
+            "interface Thenable<T> extends PromiseLike<T> {}\n",
+            "type Value = Awaited<Thenable<string>>;\n",
+        );
+        assert_eq!(
+            emit_with(source, ScriptTarget::Es2015, ModuleKind::None).code,
+            "/// <reference lib=\"dom\" />\n",
+        );
+    }
+
+    #[test]
+    fn drops_script_reference_directive_owned_by_erased_statement() {
+        let source = concat!(
+            "/// <reference path=\"types.d.ts\" />\n",
+            "interface Shape { value: number; }\n",
+            "\n",
+            "interface Other { name: string; }\n",
+        );
+        assert_eq!(
+            emit_with(source, ScriptTarget::Es2015, ModuleKind::None).code,
+            "",
+        );
     }
 
     #[test]
