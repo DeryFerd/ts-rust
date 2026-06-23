@@ -3038,10 +3038,10 @@ impl DeclarationPrinter<'_> {
             self.writer.write(": ");
             if let Some(hint) = self.jsdoc_parameter_type_hint(declaration, parameter.name) {
                 self.writer.write(&hint);
-            } else if let Some(type_id) = type_id {
-                self.emit_semantic_parameter_type(type_id, optional)?;
             } else if let Some(type_) = parameter.type_ {
                 self.emit_type(type_)?;
+            } else if let Some(type_id) = type_id {
+                self.emit_semantic_parameter_type(type_id, optional)?;
             } else {
                 self.writer.write("any");
             }
@@ -4129,9 +4129,25 @@ impl DeclarationPrinter<'_> {
             }
             self.writer.write(" from ");
         }
-        self.emit_name(data.module_specifier)?;
+        match self.arena.get(data.module_specifier).map(|node| &node.data) {
+            Some(NodeData::StringLiteral(literal)) => {
+                self.write_source_quoted_string(data.module_specifier, &literal.text);
+            }
+            _ => self.emit_name(data.module_specifier)?,
+        }
         self.writer.write(";");
         Ok(())
+    }
+
+    fn write_source_quoted_string(&mut self, id: NodeId, text: &str) {
+        let quote = self
+            .arena
+            .get(id)
+            .and_then(|node| usize::try_from(node.range.start.get()).ok())
+            .and_then(|start| self.source_text.as_bytes().get(start).copied())
+            .filter(|quote| matches!(quote, b'\'' | b'"'))
+            .unwrap_or(b'"');
+        write_quoted_with(&mut self.writer, text, char::from(quote));
     }
 
     fn emit_import_bindings(&mut self, id: NodeId) -> Result<(), EmitError> {
@@ -7153,7 +7169,11 @@ impl Printer<'_> {
             if let [statement] = clause.statements.nodes.as_slice()
                 && matches!(
                     self.node(*statement)?.data,
-                    NodeData::Block(_) | NodeData::ReturnStatement(_)
+                    NodeData::Block(_)
+                        | NodeData::BreakStatement(_)
+                        | NodeData::ContinueStatement(_)
+                        | NodeData::ExpressionStatement(_)
+                        | NodeData::ReturnStatement(_)
                 )
                 && self.switch_clause_statement_is_inline(*clause_id, *statement)
             {
@@ -15195,7 +15215,7 @@ mod tests {
             emit(
                 "let i = 0; do { i++; if (i === 1) continue; } while (i < 2); switch (i) { case 2: i = 3; break; default: i = 4; } try { throw i; } catch (error: unknown) { i = 5; } finally { i = 6; }"
             ),
-            "let i = 0;\ndo {\n    i++;\n    if (i === 1)\n        continue;\n} while (i < 2);\nswitch (i) {\n    case 2:\n        i = 3;\n        break;\n    default:\n        i = 4;\n}\ntry {\n    throw i;\n}\ncatch (error) {\n    i = 5;\n}\nfinally {\n    i = 6;\n}\n"
+            "let i = 0;\ndo {\n    i++;\n    if (i === 1)\n        continue;\n} while (i < 2);\nswitch (i) {\n    case 2:\n        i = 3;\n        break;\n    default: i = 4;\n}\ntry {\n    throw i;\n}\ncatch (error) {\n    i = 5;\n}\nfinally {\n    i = 6;\n}\n"
         );
     }
 
@@ -15300,6 +15320,41 @@ mod tests {
             )
             .code,
             "switch (value) {\n    case 0:\n        return value;\n}\n"
+        );
+    }
+
+    #[test]
+    fn preserves_source_layout_for_simple_switch_clause_statements() {
+        assert_eq!(
+            emit_with(
+                "switch (value) { case 0: break; case 1: use(value); case 2: continue; }",
+                ScriptTarget::EsNext,
+                ModuleKind::EsNext,
+            )
+            .code,
+            concat!(
+                "switch (value) {\n",
+                "    case 0: break;\n",
+                "    case 1: use(value);\n",
+                "    case 2: continue;\n",
+                "}\n",
+            )
+        );
+        assert_eq!(
+            emit_with(
+                "switch (value) {\ncase 0:\nbreak;\ncase 1:\nuse(value);\n}",
+                ScriptTarget::EsNext,
+                ModuleKind::EsNext,
+            )
+            .code,
+            concat!(
+                "switch (value) {\n",
+                "    case 0:\n",
+                "        break;\n",
+                "    case 1:\n",
+                "        use(value);\n",
+                "}\n",
+            )
         );
     }
 
