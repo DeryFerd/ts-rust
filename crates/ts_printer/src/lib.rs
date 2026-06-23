@@ -15717,6 +15717,37 @@ mod tests {
     }
 
     #[test]
+    fn emits_a_static_field_recovered_from_a_malformed_constructor() {
+        let source = "class foo { constructor() { static f = 3; } }";
+        let parsed = parse_source_file(source);
+        assert_eq!(parsed.diagnostics.len(), 2);
+        let result = emit_source_file_with_settings(
+            &parsed.arena,
+            parsed.source_file,
+            "input.ts",
+            source,
+            PrinterSettings {
+                always_strict: false,
+                target: ScriptTarget::Es2015,
+                module: ModuleKind::None,
+                jsx: JsxEmit::None,
+                emit_javascript: true,
+                emit_declarations: false,
+                source_map: false,
+                inline_source_map: false,
+                no_emit_helpers: false,
+                remove_comments: false,
+                use_define_for_class_fields: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            result.code,
+            "class foo {\n    constructor() { }\n}\nfoo.f = 3;\n"
+        );
+    }
+
+    #[test]
     fn emits_qualified_names_in_class_heritage_expressions() {
         let source = "class VisualizationModel extends Backbone.Model {}";
         assert_eq!(

@@ -421,9 +421,20 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_statement_list(&mut self, terminator: SyntaxKind) -> NodeList {
+        self.parse_statement_list_with_class_member_recovery(terminator, false)
+    }
+
+    fn parse_statement_list_with_class_member_recovery(
+        &mut self,
+        terminator: SyntaxKind,
+        recover_static_member: bool,
+    ) -> NodeList {
         let start = self.current.full_start;
         let mut statements = Vec::new();
         while self.current.kind != terminator && self.current.kind != SyntaxKind::EndOfFile {
+            if recover_static_member && self.static_starts_recovered_class_member() {
+                break;
+            }
             if self.current.kind == SyntaxKind::Unknown
                 || (self.current.kind == SyntaxKind::AtToken
                     && self.next_token_kind() == SyntaxKind::Unknown)
@@ -618,10 +629,24 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_block(&mut self) -> NodeId {
+        self.parse_block_with_class_member_recovery(false)
+    }
+
+    fn parse_class_member_block(&mut self) -> NodeId {
+        self.parse_block_with_class_member_recovery(true)
+    }
+
+    fn parse_block_with_class_member_recovery(&mut self, recover_static_member: bool) -> NodeId {
         let start = self.current.range.start;
         self.bump();
-        let statements = self.parse_statement_list(SyntaxKind::CloseBraceToken);
-        let end = if self.current.kind == SyntaxKind::CloseBraceToken {
+        let statements = self.parse_statement_list_with_class_member_recovery(
+            SyntaxKind::CloseBraceToken,
+            recover_static_member,
+        );
+        let end = if recover_static_member && self.static_starts_recovered_class_member() {
+            self.error_code_at(self.current.range, 1128, std::iter::empty::<String>());
+            self.current.full_start
+        } else if self.current.kind == SyntaxKind::CloseBraceToken {
             self.consume().range.end
         } else {
             self.error_current("Expected '}'.");
@@ -641,6 +666,24 @@ impl<'a> Parser<'a> {
             })),
             &children,
         )
+    }
+
+    fn static_starts_recovered_class_member(&mut self) -> bool {
+        if self.current.kind != SyntaxKind::StaticKeyword {
+            return false;
+        }
+        let next = self.next_token_kind();
+        next == SyntaxKind::Identifier
+            || next.is_keyword()
+            || matches!(
+                next,
+                SyntaxKind::StringLiteral
+                    | SyntaxKind::NumericLiteral
+                    | SyntaxKind::BigIntLiteral
+                    | SyntaxKind::PrivateIdentifier
+                    | SyntaxKind::OpenBracketToken
+                    | SyntaxKind::AsteriskToken
+            )
     }
 
     fn parse_empty_statement(&mut self) -> NodeId {
@@ -1603,7 +1646,7 @@ impl<'a> Parser<'a> {
             let parameters = self.parse_parameter_list();
             let return_type = self.parse_optional_type_annotation();
             let body = if !signature_only && self.current.kind == SyntaxKind::OpenBraceToken {
-                Some(self.parse_block())
+                Some(self.parse_class_member_block())
             } else {
                 self.parse_semicolon(parameters.range.end);
                 None
@@ -1714,7 +1757,7 @@ impl<'a> Parser<'a> {
         let parameters = self.parse_parameter_list();
         let return_type = self.parse_optional_type_annotation();
         let body = if self.current.kind == SyntaxKind::OpenBraceToken {
-            Some(self.parse_block())
+            Some(self.parse_class_member_block())
         } else {
             if body_required {
                 self.error_current("Expected '{'.");
@@ -8310,6 +8353,57 @@ mod tests {
             result.arena.get(statements[1]).unwrap().kind,
             SyntaxKind::VariableStatement
         );
+    }
+
+    #[test]
+    fn recovers_static_class_field_from_a_malformed_method_body() {
+        let result = parse_source_file("class foo { constructor() { static f = 3; } }");
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [Some(1128), Some(1128)]
+        );
+        let statements = source_statements(&result);
+        let NodeData::ClassDeclaration(class) = &result.arena.get(statements[0]).unwrap().data
+        else {
+            panic!("expected class declaration");
+        };
+        assert_eq!(class.members.nodes.len(), 2);
+        let NodeData::MethodDeclaration(constructor) =
+            &result.arena.get(class.members.nodes[0]).unwrap().data
+        else {
+            panic!("expected constructor");
+        };
+        let NodeData::Block(body) = &result
+            .arena
+            .get(constructor.body.expect("constructor body"))
+            .unwrap()
+            .data
+        else {
+            panic!("expected constructor block");
+        };
+        assert!(body.statements.nodes.is_empty());
+        let NodeData::PropertyDeclaration(field) =
+            &result.arena.get(class.members.nodes[1]).unwrap().data
+        else {
+            panic!("expected recovered class field");
+        };
+        assert_eq!(
+            field
+                .modifiers
+                .as_ref()
+                .expect("static modifier")
+                .list
+                .nodes
+                .iter()
+                .map(|modifier| result.arena.get(*modifier).unwrap().kind)
+                .collect::<Vec<_>>(),
+            [SyntaxKind::StaticKeyword]
+        );
+        assert!(field.initializer.is_some());
     }
 
     #[test]
