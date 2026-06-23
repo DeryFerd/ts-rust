@@ -2282,6 +2282,7 @@ struct Checker<'a> {
     checked_overload_symbols: HashSet<SymbolId>,
     reported_unresolved_type_names: HashSet<NodeId>,
     this_types: Vec<TypeId>,
+    super_types: Vec<TypeId>,
     class_value_stack: Vec<SymbolId>,
     preserve_literal_inference: bool,
 }
@@ -2349,6 +2350,7 @@ impl<'a> Checker<'a> {
             checked_overload_symbols: HashSet::new(),
             reported_unresolved_type_names: HashSet::new(),
             this_types: Vec::new(),
+            super_types: Vec::new(),
             class_value_stack: Vec::new(),
             preserve_literal_inference: false,
         }
@@ -4260,6 +4262,7 @@ impl<'a> Checker<'a> {
         let mut number_index_type: Option<TypeId> = None;
         let mut call_signatures = Vec::new();
         let mut construct_signatures = Vec::new();
+        let mut has_base = false;
         if let Some(clauses) = heritage_clauses {
             for clause in &clauses.nodes {
                 let Some(NodeData::HeritageClause(clause)) =
@@ -4296,6 +4299,7 @@ impl<'a> Checker<'a> {
                     if let TypeKind::Object(base) =
                         self.result.types.get(base).unwrap().kind.clone()
                     {
+                        has_base = true;
                         string_index_type = base.string_index_type.or(string_index_type);
                         number_index_type = base.number_index_type.or(number_index_type);
                         call_signatures.extend(base.call_signatures);
@@ -4315,7 +4319,27 @@ impl<'a> Checker<'a> {
                 }
             }
         }
+        if has_base {
+            let base = self.result.types.alloc(TypeKind::Object(ObjectType {
+                properties: properties.clone(),
+                property_order: property_order.clone(),
+                numeric_properties: numeric_properties.clone(),
+                string_index_type,
+                number_index_type,
+                call_signatures: call_signatures.clone(),
+                construct_signatures: construct_signatures.clone(),
+                optional_properties: optional_properties.clone(),
+                readonly_properties: readonly_properties.clone(),
+                getter_properties: getter_properties.clone(),
+                setter_properties: setter_properties.clone(),
+                setter_property_types: setter_property_types.clone(),
+            }));
+            self.super_types.push(base);
+        }
         let own = self.object_type_from_members(members);
+        if has_base {
+            self.super_types.pop();
+        }
         if let TypeKind::Object(own) = self.result.types.get(own).unwrap().kind.clone() {
             string_index_type = own.string_index_type.or(string_index_type);
             number_index_type = own.number_index_type.or(number_index_type);
@@ -6336,8 +6360,19 @@ impl<'a> Checker<'a> {
                 }
                 SyntaxKind::NullKeyword => self.result.types.null(),
                 SyntaxKind::UndefinedKeyword => self.result.types.undefined(),
-                SyntaxKind::ThisKeyword => self
-                    .this_types
+                SyntaxKind::ThisKeyword => match (
+                    self.this_types.last().copied(),
+                    self.super_types.last().copied(),
+                ) {
+                    (Some(this_type), Some(super_type)) => {
+                        self.result.types.intersection([this_type, super_type])
+                    }
+                    (Some(this_type), None) => this_type,
+                    (None, Some(super_type)) => super_type,
+                    (None, None) => self.result.types.unknown(),
+                },
+                SyntaxKind::SuperKeyword => self
+                    .super_types
                     .last()
                     .copied()
                     .unwrap_or_else(|| self.result.types.unknown()),
@@ -15816,6 +15851,31 @@ mod tests {
             panic!("expected strict defaults function");
         };
         assert_eq!(strict_defaults.parameters[1], strict.types.null());
+    }
+
+    #[test]
+    fn infers_derived_method_returns_from_super_and_inherited_this_members() {
+        let parsed = parse_source_file(
+            "class Base { x: number; f() { return this.x; } } class Derived extends Base { f() { return super.f() + this.x; } }",
+        );
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        let derived = bindings
+            .root_scope()
+            .unwrap()
+            .symbols
+            .get("Derived")
+            .unwrap();
+        let derived_type = result.type_of_symbol(derived).unwrap();
+        let TypeKind::Object(derived) = &result.types.get(derived_type).unwrap().kind else {
+            panic!("expected derived object");
+        };
+        let TypeKind::Function(method) = &result.types.get(derived.properties["f"]).unwrap().kind
+        else {
+            panic!("expected derived method");
+        };
+
+        assert_eq!(method.return_type, result.types.number());
     }
 
     #[test]
