@@ -20,6 +20,7 @@ mod tests {
         assert_eq!(NodeData::SCHEMA_LIST_ALIAS_COUNT, 23);
 
         let mut arena = NodeArena::new();
+        arena.set_source_text("const value = 1;");
         let first = arena.alloc(Node {
             kind: SyntaxKind::EndOfFile,
             flags: NodeFlags::default(),
@@ -39,5 +40,6 @@ mod tests {
         assert_eq!(second.index(), 1);
         assert_eq!(arena.get(first).unwrap().kind, SyntaxKind::EndOfFile);
         assert_eq!(arena.iter().count(), 2);
+        assert_eq!(arena.source_text(), Some("const value = 1;"));
     }
 }

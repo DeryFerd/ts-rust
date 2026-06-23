@@ -637,11 +637,24 @@ pub struct Node {
 #[derive(Clone, Debug, Default)]
 pub struct NodeArena {
     nodes: Vec<Node>,
+    source_text: Option<String>,
 }
 
 impl NodeArena {
     #[must_use]
-    pub const fn new() -> Self { Self { nodes: Vec::new() } }
+    pub const fn new() -> Self {
+        Self {
+            nodes: Vec::new(),
+            source_text: None,
+        }
+    }
+
+    pub fn set_source_text(&mut self, source_text: impl Into<String>) {
+        self.source_text = Some(source_text.into());
+    }
+
+    #[must_use]
+    pub fn source_text(&self) -> Option<&str> { self.source_text.as_deref() }
 
     /// Allocate a node and return its stable arena identifier.
     ///

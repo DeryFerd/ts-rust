@@ -244,6 +244,7 @@ pub fn parse_jsdoc_comment(source: &str) -> JsDocParseResult {
     scanner.reset_pos(if source.starts_with("/**") { 3 } else { 0 });
     scanner.set_skip_jsdoc_leading_asterisks(true);
     let mut arena = NodeArena::new();
+    arena.set_source_text(source);
     let mut comments = Vec::new();
     let mut tags = Vec::new();
     loop {
@@ -347,11 +348,13 @@ impl<'a> Parser<'a> {
         let mut scanner = Scanner::new(source);
         scanner.set_language_variant(variant);
         let current = scanner.scan();
+        let mut arena = NodeArena::new();
+        arena.set_source_text(source);
         Self {
             scanner,
             current,
             language_variant: variant,
-            arena: NodeArena::new(),
+            arena,
             diagnostics,
             invalid_token_recovery_ranges: Vec::new(),
             amd_dependencies,
@@ -8299,8 +8302,10 @@ mod tests {
 
     #[test]
     fn parses_jsdoc_text_and_tag_names() {
-        let result = parse_jsdoc_comment("/** Summary\n * @custom value\n */");
+        let source = "/** Summary\n * @custom value\n */";
+        let result = parse_jsdoc_comment(source);
         assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert_eq!(result.arena.source_text(), Some(source));
         let NodeData::JsDoc(jsdoc) = &result.arena.get(result.jsdoc).unwrap().data else {
             panic!("expected JSDoc root");
         };
