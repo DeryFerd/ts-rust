@@ -10459,16 +10459,20 @@ impl DeclarationPrinter<'_> {
                 self.writer.write("arg");
                 self.writer.write(&index.to_string());
             }
-            if self.semantic_parameter_is_optional(signature, index) {
+            let optional = self.semantic_parameter_is_optional(signature, index);
+            if optional {
                 self.writer.write("?");
             }
             self.writer.write(": ");
-            self.emit_semantic_type(*parameter)?;
+            self.emit_semantic_parameter_type(*parameter, optional)?;
         }
         Ok(())
     }
 
     fn semantic_parameter_is_optional(&self, signature: &FunctionType, index: usize) -> bool {
+        if signature.parameters_optional {
+            return true;
+        }
         self.arena.iter().any(|(_, node)| {
             let parameters = match &node.data {
                 NodeData::ArrowFunction(function) => &function.parameters,

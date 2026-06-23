@@ -8157,6 +8157,7 @@ impl<'a> Checker<'a> {
                 Some((signature, inference))
             }) {
                 self.apply_type_parameter_defaults(signature, &mut inference);
+                self.apply_uninferred_overload_type_parameters(signature, &mut inference);
                 let result = self.substitute_type(signature.return_type, &inference);
                 self.active_defaulted_type_parameters.clear();
                 return result;
@@ -8263,6 +8264,23 @@ impl<'a> Checker<'a> {
                     let resolved = self.substitute_type(current, inference);
                     inference.insert(*parameter, resolved);
                 }
+            }
+        }
+    }
+
+    fn apply_uninferred_overload_type_parameters(
+        &self,
+        signature: &FunctionType,
+        inference: &mut HashMap<TypeId, TypeId>,
+    ) {
+        let Some((_, parameters)) = self.mapped_return_templates.get(&signature.return_type) else {
+            return;
+        };
+        for parameter in parameters.values() {
+            if self.signature_contains_type(signature, *parameter) {
+                inference
+                    .entry(*parameter)
+                    .or_insert_with(|| self.result.types.unknown());
             }
         }
     }
@@ -9609,7 +9627,16 @@ impl<'a> Checker<'a> {
             parameter_names,
             rest_parameter: None,
             return_type,
-            parameters_optional: self.options.is_javascript_file,
+            parameters_optional: self.options.is_javascript_file
+                || (!parameters.is_empty()
+                    && parameters.iter().all(|parameter| {
+                        matches!(
+                            self.arena.get(*parameter).map(|node| &node.data),
+                            Some(NodeData::ParameterDeclaration(parameter))
+                                if parameter.question_token.is_some()
+                                    || parameter.initializer.is_some()
+                        )
+                    })),
         }))
     }
 
@@ -16453,6 +16480,42 @@ mod tests {
             });
         assert_eq!(reference.name, "Box");
         assert_eq!(reference.type_arguments, [result.types.number()]);
+    }
+
+    #[test]
+    fn defaults_uninferred_overload_type_parameters_to_unknown() {
+        let parsed = parse_source_file(
+            r"
+                declare function noArgs(): string;
+                declare function proxy<T, U>(fn: (options: T) => U): (options: T) => U;
+                declare function proxy<T, U>(fn: (options?: T) => U, noArgs: true): (options?: T) => U;
+                const value = proxy(noArgs, true);
+            ",
+        );
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        let value = bindings.root_scope().unwrap().symbols.get("value").unwrap();
+        let type_id = result.type_of_symbol(value).unwrap();
+
+        let Some(TypeKind::Function(signature)) =
+            result.types.get(type_id).map(|type_| &type_.kind)
+        else {
+            panic!("expected function, got {:?}", result.types.get(type_id));
+        };
+        assert!(signature.parameters_optional);
+        let Some(TypeKind::Union(parameters)) = result
+            .types
+            .get(signature.parameters[0])
+            .map(|type_| &type_.kind)
+        else {
+            panic!("expected optional union");
+        };
+        assert!(parameters.iter().any(|parameter| {
+            matches!(
+                result.types.get(*parameter).map(|type_| &type_.kind),
+                Some(TypeKind::Unknown)
+            )
+        }));
     }
 
     #[test]
