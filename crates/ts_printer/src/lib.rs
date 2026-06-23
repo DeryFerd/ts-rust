@@ -5,7 +5,7 @@ use std::error::Error;
 use std::fmt;
 
 use ts_ast::{Node, NodeArena, NodeData, NodeId, NodeList, SymbolId, SyntaxKind};
-use ts_binder::{BindResult, SymbolFlags, bind_source_file};
+use ts_binder::{BindResult, bind_source_file};
 use ts_checker::{FunctionType, ImportTypeReference, ObjectType, TypeArena, TypeId, TypeKind};
 use ts_options::{JsxEmit, ModuleKind, PrinterSettings, ScriptTarget};
 use ts_sourcemap::{SourceMap, SourceMapBuilder};
@@ -6113,17 +6113,13 @@ impl Printer<'_> {
         }
         match &node.data {
             NodeData::InterfaceDeclaration(_) | NodeData::TypeAliasDeclaration(_) => false,
-            NodeData::FunctionDeclaration(function) => function.body.is_some(),
             NodeData::ModuleDeclaration(module) => {
                 self.namespace_has_runtime_contents(module, visited)
             }
+            // Exported aliases instantiate a module even when their target is type-only and the
+            // alias is consequently erased. Non-exported imports do not instantiate a module.
             NodeData::ImportEqualsDeclaration(import) => {
-                !import.is_type_only
-                    && if self.is_external_import_equals(import) {
-                        self.import_semantically_has_runtime_value(statement)
-                    } else {
-                        self.internal_import_equals_has_runtime_value_with_visited(import, visited)
-                    }
+                self.has_modifier(import.modifiers.as_ref(), SyntaxKind::ExportKeyword)
             }
             NodeData::EnumDeclaration(_)
                 if is_const_enum_declaration(self.arena, node)
@@ -6141,12 +6137,23 @@ impl Printer<'_> {
             .get(&name)
             .and_then(|symbol| self.bindings.symbols.get(*symbol))
             .is_some_and(|symbol| {
-                symbol.flags.intersects(
-                    SymbolFlags::VARIABLE
-                        | SymbolFlags::FUNCTION
-                        | SymbolFlags::CLASS
-                        | SymbolFlags::ENUM,
-                )
+                symbol.declarations.iter().any(|declaration| {
+                    let Some(node) = self.arena.get(*declaration) else {
+                        return false;
+                    };
+                    if node_is_in_ambient_context(self.arena, *declaration) {
+                        return false;
+                    }
+                    match &node.data {
+                        NodeData::VariableDeclaration(_) | NodeData::ClassDeclaration(_) => true,
+                        NodeData::FunctionDeclaration(function) => function.body.is_some(),
+                        NodeData::EnumDeclaration(_) => {
+                            !is_const_enum_declaration(self.arena, node)
+                                || self.const_enum_emit_mode.preserves_declarations()
+                        }
+                        _ => false,
+                    }
+                })
             })
     }
 
@@ -13363,7 +13370,7 @@ mod tests {
                 ModuleKind::EsNext,
             )
             .code,
-            ""
+            concat!("var M;\n", "(function (M) {\n", "})(M || (M = {}));\n",)
         );
         assert_eq!(
             emit_with(
@@ -13390,6 +13397,24 @@ mod tests {
                 "(function (f) {\n",
                 "    f.value = 1;\n",
                 "})(f || (f = {}));\n",
+            )
+        );
+    }
+
+    #[test]
+    fn emits_namespace_variable_for_erased_ambient_value_merges() {
+        assert_eq!(
+            emit_with(
+                "declare class C {} namespace C { var value; }",
+                ScriptTarget::Es2015,
+                ModuleKind::EsNext,
+            )
+            .code,
+            concat!(
+                "var C;\n",
+                "(function (C) {\n",
+                "    var value;\n",
+                "})(C || (C = {}));\n",
             )
         );
     }
@@ -14839,7 +14864,10 @@ class Board {
             ScriptTarget::Es2015,
             ModuleKind::EsNext,
         );
-        assert_eq!(empty.code, "");
+        assert_eq!(
+            empty.code,
+            concat!("var M;\n", "(function (M) {\n", "})(M || (M = {}));\n",)
+        );
         let cyclic = emit_with(
             "namespace M { namespace N { import X = N; } export import Y = N; }",
             ScriptTarget::Es2015,
