@@ -565,30 +565,35 @@ impl<'a> ProgramChecker<'a> {
                 mut import_diagnostics,
                 import_runtime_meanings,
             ) = self.imports(source, &preliminary, &files);
-            let mut result = if source.is_default_library {
-                preliminary[file_index].clone()
-            } else {
-                let mut external_names = globals.clone();
-                for (specifier, target) in source.resolved_modules {
-                    let target_result = files.get(*target).unwrap_or(&preliminary[*target]);
-                    let exports = self.resolved_module_exports(*target, specifier, target_result);
-                    let descriptor =
-                        exports
-                            .get("export=")
-                            .cloned()
-                            .unwrap_or_else(|| TypeDescriptor::Object {
+            let mut result =
+                if source.is_default_library {
+                    preliminary[file_index].clone()
+                } else {
+                    let mut external_names = globals.clone();
+                    for (specifier, target) in source.resolved_modules {
+                        let target_result = files.get(*target).unwrap_or(&preliminary[*target]);
+                        let exports = self.resolved_module_exports(
+                            *target,
+                            specifier,
+                            target_result,
+                            &preliminary,
+                            &files,
+                        );
+                        let descriptor = exports.get("export=").cloned().unwrap_or_else(|| {
+                            TypeDescriptor::Object {
                                 properties: exports,
                                 optional_properties: BTreeSet::new(),
                                 readonly_properties: BTreeSet::new(),
                                 getter_properties: BTreeSet::new(),
-                            });
-                    external_names.insert(specifier.clone(), descriptor);
-                }
-                Checker::new(source.arena, source.bindings)
-                    .with_options(source.checker_options)
-                    .with_environment(external_symbols, external_imports, external_names)
-                    .check(source.source_file)
-            };
+                            }
+                        });
+                        external_names.insert(specifier.clone(), descriptor);
+                    }
+                    Checker::new(source.arena, source.bindings)
+                        .with_options(source.checker_options)
+                        .with_environment(external_symbols, external_imports, external_names)
+                        .check(source.source_file)
+                };
             if source.is_default_library || source.skip_diagnostics {
                 result.diagnostics.clear();
             }
@@ -644,11 +649,36 @@ impl<'a> ProgramChecker<'a> {
         target: usize,
         specifier: &str,
         result: &CheckResult,
+        preliminary: &[CheckResult],
+        completed: &[CheckResult],
     ) -> BTreeMap<String, TypeDescriptor> {
+        self.resolved_module_exports_inner(
+            target,
+            specifier,
+            result,
+            preliminary,
+            completed,
+            &mut HashSet::new(),
+        )
+    }
+
+    fn resolved_module_exports_inner(
+        &self,
+        target: usize,
+        specifier: &str,
+        result: &CheckResult,
+        preliminary: &[CheckResult],
+        completed: &[CheckResult],
+        visited: &mut HashSet<usize>,
+    ) -> BTreeMap<String, TypeDescriptor> {
+        if !visited.insert(target) {
+            return BTreeMap::new();
+        }
         let Some(source) = self.sources.get(target) else {
             return BTreeMap::new();
         };
-        self.resolved_module_export_symbols(target, specifier)
+        let mut exports = self
+            .resolved_module_export_symbols(target, specifier)
             .into_iter()
             .filter_map(|(name, symbol)| {
                 let descriptor = (name == "export=")
@@ -657,7 +687,50 @@ impl<'a> ProgramChecker<'a> {
                     .or_else(|| Self::describe_symbol(source, result, symbol));
                 descriptor.map(|descriptor| (name, descriptor))
             })
-            .collect()
+            .collect::<BTreeMap<_, _>>();
+        let Some(NodeData::SourceFile(file)) =
+            source.arena.get(source.source_file).map(|node| &node.data)
+        else {
+            return exports;
+        };
+        for statement in &file.statements.nodes {
+            let Some(NodeData::ExportDeclaration(export)) =
+                source.arena.get(*statement).map(|node| &node.data)
+            else {
+                continue;
+            };
+            if export.is_type_only || export.export_clause.is_some() {
+                continue;
+            }
+            let Some(module_specifier) = export.module_specifier else {
+                continue;
+            };
+            let Some(star_specifier) = string_literal_text(source.arena, module_specifier) else {
+                continue;
+            };
+            let Some(star_target) = source.resolved_modules.get(star_specifier).copied() else {
+                continue;
+            };
+            let Some(star_result) = completed
+                .get(star_target)
+                .or_else(|| preliminary.get(star_target))
+            else {
+                continue;
+            };
+            for (name, descriptor) in self.resolved_module_exports_inner(
+                star_target,
+                star_specifier,
+                star_result,
+                preliminary,
+                completed,
+                visited,
+            ) {
+                if name != "default" {
+                    exports.entry(name).or_insert(descriptor);
+                }
+            }
+        }
+        exports
     }
 
     fn describe_value_symbol(
@@ -738,9 +811,8 @@ impl<'a> ProgramChecker<'a> {
                 if let Some(bindings) = clause.named_bindings {
                     match &source.arena.get(bindings)?.data {
                         NodeData::NamespaceImport(_) => {
-                            has_value |= exports.values().any(|symbol| {
-                                self.symbol_has_runtime_value(target, *symbol, &mut HashSet::new())
-                            });
+                            has_value |=
+                                self.module_has_runtime_export(target, &mut HashSet::new());
                         }
                         NodeData::NamedImports(imports) => {
                             has_value |= imports.elements.nodes.iter().any(|specifier| {
@@ -756,9 +828,8 @@ impl<'a> ProgramChecker<'a> {
                                 let Some(name) = identifier_text(source.arena, imported) else {
                                     return false;
                                 };
-                                self.module_export_has_runtime_value(
+                                self.module_export_name_has_runtime_value(
                                     target,
-                                    &exports,
                                     name,
                                     &mut HashSet::new(),
                                 )
@@ -813,6 +884,75 @@ impl<'a> ProgramChecker<'a> {
         exports
             .values()
             .any(|symbol| self.symbol_has_runtime_value(target, *symbol, &mut visited.clone()))
+    }
+
+    fn module_has_runtime_export(
+        &self,
+        target: usize,
+        visited_modules: &mut HashSet<usize>,
+    ) -> bool {
+        if !visited_modules.insert(target) {
+            return false;
+        }
+        let exports = self.resolved_module_export_symbols(target, "");
+        if exports
+            .values()
+            .any(|symbol| self.symbol_has_runtime_value(target, *symbol, &mut HashSet::new()))
+        {
+            return true;
+        }
+        self.export_star_targets(target)
+            .into_iter()
+            .any(|target| self.module_has_runtime_export(target, &mut visited_modules.clone()))
+    }
+
+    fn module_export_name_has_runtime_value(
+        &self,
+        target: usize,
+        name: &str,
+        visited_modules: &mut HashSet<usize>,
+    ) -> bool {
+        if !visited_modules.insert(target) {
+            return false;
+        }
+        let exports = self.resolved_module_export_symbols(target, "");
+        if self.module_export_has_runtime_value(target, &exports, name, &mut HashSet::new()) {
+            return true;
+        }
+        name != "default"
+            && self.export_star_targets(target).into_iter().any(|target| {
+                self.module_export_name_has_runtime_value(
+                    target,
+                    name,
+                    &mut visited_modules.clone(),
+                )
+            })
+    }
+
+    fn export_star_targets(&self, source_index: usize) -> Vec<usize> {
+        let Some(source) = self.sources.get(source_index) else {
+            return Vec::new();
+        };
+        let Some(NodeData::SourceFile(file)) =
+            source.arena.get(source.source_file).map(|node| &node.data)
+        else {
+            return Vec::new();
+        };
+        file.statements
+            .nodes
+            .iter()
+            .filter_map(|statement| {
+                let NodeData::ExportDeclaration(export) = &source.arena.get(*statement)?.data
+                else {
+                    return None;
+                };
+                if export.is_type_only || export.export_clause.is_some() {
+                    return None;
+                }
+                let specifier = string_literal_text(source.arena, export.module_specifier?)?;
+                source.resolved_modules.get(specifier).copied()
+            })
+            .collect()
     }
 
     fn external_module_reference_text(arena: &NodeArena, reference: NodeId) -> Option<&str> {
@@ -1178,7 +1318,13 @@ impl<'a> ProgramChecker<'a> {
             else {
                 continue;
             };
-            let module_exports = self.resolved_module_exports(target, specifier, target_result);
+            let module_exports = self.resolved_module_exports(
+                target,
+                specifier,
+                target_result,
+                preliminary,
+                completed,
+            );
             let Some(clause) = import.import_clause else {
                 continue;
             };
@@ -1944,7 +2090,7 @@ impl<'a> Checker<'a> {
                 let inferred = annotation
                     .or(initializer.map(|value| {
                         if self.is_const_declaration(node_id)
-                            && matches!(
+                            && (matches!(
                                 self.result.types.get(value).map(|value| &value.kind),
                                 Some(
                                     TypeKind::NumberLiteral(_)
@@ -1952,7 +2098,16 @@ impl<'a> Checker<'a> {
                                         | TypeKind::BigIntLiteral(_)
                                         | TypeKind::BooleanLiteral(_)
                                 )
-                            )
+                            ) || data.initializer.is_some_and(|initializer| {
+                                matches!(
+                                    self.arena.get(initializer).map(|node| &node.data),
+                                    Some(
+                                        NodeData::AsExpression(_)
+                                            | NodeData::TypeAssertion(_)
+                                            | NodeData::SatisfiesExpression(_)
+                                    )
+                                )
+                            }))
                         {
                             value
                         } else {
@@ -2083,6 +2238,11 @@ impl<'a> Checker<'a> {
             }
             NodeData::ExpressionStatement(data) => {
                 self.type_of_expression(data.expression);
+                if let Some(NodeData::CallExpression(call)) =
+                    self.arena.get(data.expression).map(|node| &node.data)
+                {
+                    self.apply_assertion_call(call.expression, &call.arguments.nodes);
+                }
             }
             NodeData::ExportAssignment(data) => {
                 self.type_of_expression(data.expression);
@@ -3960,6 +4120,178 @@ impl<'a> Checker<'a> {
             .unwrap_or_else(|| self.result.types.any())
     }
 
+    fn apply_assertion_call(&mut self, callee: NodeId, arguments: &[NodeId]) {
+        let Some((parameters, predicate_node)) = self.assertion_signature_for_callee(callee) else {
+            return;
+        };
+        let Some(NodeData::TypePredicateNode(predicate)) =
+            self.arena.get(predicate_node).map(|node| &node.data)
+        else {
+            return;
+        };
+        let Some(parameter_name) = self.property_name(predicate.parameter_name) else {
+            return;
+        };
+        let Some(parameter_index) = parameters.iter().position(|parameter| {
+            matches!(
+                self.arena.get(*parameter).map(|node| &node.data),
+                Some(NodeData::ParameterDeclaration(parameter))
+                    if self.property_name(parameter.name).as_deref() == Some(parameter_name.as_str())
+            )
+        }) else {
+            return;
+        };
+        let Some(argument) = arguments.get(parameter_index).copied() else {
+            return;
+        };
+        let asserted_type = predicate
+            .type_
+            .map(|type_node| self.asserted_type_from_call(type_node, &parameters, arguments));
+        if let Some((subject, property)) = self.property_narrowing_subject(argument) {
+            if let Some(asserted_type) = asserted_type {
+                let narrowed = self.narrow_discriminant(subject, &property, asserted_type, true);
+                self.flow_types.insert(subject, narrowed);
+            }
+            return;
+        }
+        let Some(subject) = self.narrowing_subject(argument) else {
+            return;
+        };
+        let original = self.current_symbol_type(subject);
+        let narrowed = if let Some(asserted_type) = asserted_type {
+            let members = self
+                .union_members(original)
+                .into_iter()
+                .filter(|member| self.is_assignable(*member, asserted_type))
+                .collect::<Vec<_>>();
+            self.result.types.union(members)
+        } else {
+            self.narrow_truthiness(original, true)
+        };
+        self.flow_types.insert(subject, narrowed);
+    }
+
+    fn assertion_signature_for_callee(&self, callee: NodeId) -> Option<(Vec<NodeId>, NodeId)> {
+        match &self.arena.get(callee)?.data {
+            NodeData::Identifier(identifier) => {
+                let symbol = self.resolve_identifier(callee, &identifier.text)?;
+                self.bindings
+                    .symbols
+                    .get(symbol)?
+                    .declarations
+                    .iter()
+                    .find_map(|declaration| self.assertion_signature_for_declaration(*declaration))
+            }
+            NodeData::PropertyAccessExpression(access) => {
+                let name = self.property_name(access.name)?;
+                self.arena.iter().find_map(|(declaration, node)| {
+                    let declaration_name = match &node.data {
+                        NodeData::MethodDeclaration(method) => self.property_name(method.name),
+                        NodeData::MethodSignatureDeclaration(method) => {
+                            self.property_name(method.name)
+                        }
+                        NodeData::PropertyDeclaration(property) => {
+                            self.property_name(property.name)
+                        }
+                        NodeData::PropertySignatureDeclaration(property) => {
+                            self.property_name(property.name)
+                        }
+                        _ => None,
+                    };
+                    (declaration_name.as_deref() == Some(name.as_str()))
+                        .then(|| self.assertion_signature_for_declaration(declaration))
+                        .flatten()
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn assertion_signature_for_declaration(
+        &self,
+        declaration: NodeId,
+    ) -> Option<(Vec<NodeId>, NodeId)> {
+        let (parameters, return_type) = match &self.arena.get(declaration)?.data {
+            NodeData::FunctionDeclaration(function) => (&function.parameters.nodes, function.type_),
+            NodeData::MethodDeclaration(method) => (&method.parameters.nodes, method.type_),
+            NodeData::MethodSignatureDeclaration(method) => {
+                (&method.parameters.nodes, method.type_)
+            }
+            NodeData::VariableDeclaration(variable) => {
+                return self.assertion_signature_from_function_type(variable.type_?);
+            }
+            NodeData::PropertyDeclaration(property) => {
+                return self.assertion_signature_from_function_type(property.type_?);
+            }
+            NodeData::PropertySignatureDeclaration(property) => {
+                return self.assertion_signature_from_function_type(property.type_);
+            }
+            _ => return None,
+        };
+        let return_type = return_type?;
+        matches!(
+            self.arena.get(return_type).map(|node| &node.data),
+            Some(NodeData::TypePredicateNode(predicate)) if predicate.asserts_modifier.is_some()
+        )
+        .then(|| (parameters.clone(), return_type))
+    }
+
+    fn assertion_signature_from_function_type(
+        &self,
+        type_node: NodeId,
+    ) -> Option<(Vec<NodeId>, NodeId)> {
+        let NodeData::FunctionTypeNode(function) = &self.arena.get(type_node)?.data else {
+            return None;
+        };
+        let return_type = function.type_?;
+        matches!(
+            self.arena.get(return_type).map(|node| &node.data),
+            Some(NodeData::TypePredicateNode(predicate)) if predicate.asserts_modifier.is_some()
+        )
+        .then(|| (function.parameters.nodes.clone(), return_type))
+    }
+
+    fn asserted_type_from_call(
+        &mut self,
+        asserted_type: NodeId,
+        parameters: &[NodeId],
+        arguments: &[NodeId],
+    ) -> TypeId {
+        if let Some(type_parameter) = self.simple_type_reference_name(asserted_type) {
+            for (index, parameter) in parameters.iter().enumerate() {
+                let Some(NodeData::ParameterDeclaration(parameter)) =
+                    self.arena.get(*parameter).map(|node| &node.data)
+                else {
+                    continue;
+                };
+                if parameter
+                    .type_
+                    .and_then(|type_node| self.simple_type_reference_name(type_node))
+                    == Some(type_parameter.clone())
+                    && let Some(argument) = arguments.get(index)
+                {
+                    return self.type_of_expression(*argument);
+                }
+            }
+        }
+        self.type_from_type_node(asserted_type)
+    }
+
+    fn simple_type_reference_name(&self, type_node: NodeId) -> Option<String> {
+        let NodeData::TypeReferenceNode(reference) = &self.arena.get(type_node)?.data else {
+            return None;
+        };
+        reference
+            .type_arguments
+            .is_none()
+            .then(|| self.property_name(reference.type_name))
+            .flatten()
+    }
+
+    fn type_node_is_const_reference(&self, type_node: NodeId) -> bool {
+        self.simple_type_reference_name(type_node).as_deref() == Some("const")
+    }
+
     fn is_truthy_type(kind: &TypeKind) -> bool {
         match kind {
             TypeKind::Undefined | TypeKind::Null | TypeKind::BooleanLiteral(false) => false,
@@ -4178,6 +4510,22 @@ impl<'a> Checker<'a> {
             NodeData::ParenthesizedExpression(data) => {
                 self.type_of_expression_context(data.expression, contextual_type)
             }
+            NodeData::AsExpression(data) => {
+                let expression = self.type_of_expression(data.expression);
+                if self.type_node_is_const_reference(data.type_) {
+                    expression
+                } else {
+                    self.type_from_type_node(data.type_)
+                }
+            }
+            NodeData::SatisfiesExpression(data) => {
+                let expected = self.type_from_type_node(data.type_);
+                self.type_of_expression_context(data.expression, Some(expected))
+            }
+            NodeData::TypeAssertion(data) => {
+                self.type_of_expression(data.expression);
+                self.type_from_type_node(data.type_)
+            }
             NodeData::PrefixUnaryExpression(data) => self.prefix_unary_type(data),
             NodeData::BinaryExpression(data) => {
                 let left = self.type_of_expression(data.left);
@@ -4282,8 +4630,16 @@ impl<'a> Checker<'a> {
             }
             NodeData::PropertyAccessExpression(data) => {
                 let receiver = self.type_of_expression(data.expression);
+                let access_receiver = if data.question_dot_token.is_some() {
+                    self.non_nullish_type(receiver)
+                } else {
+                    receiver
+                };
                 if matches!(
-                    self.result.types.get(receiver).map(|type_| &type_.kind),
+                    self.result
+                        .types
+                        .get(access_receiver)
+                        .map(|type_| &type_.kind),
                     Some(TypeKind::Unknown)
                 ) {
                     let name = self
@@ -4293,7 +4649,11 @@ impl<'a> Checker<'a> {
                     return self.result.types.any();
                 }
                 let name = self.property_name(data.name).unwrap_or_default();
-                let value = self.property_access_type(node_id, receiver, &name);
+                let mut value = self.property_access_type(node_id, access_receiver, &name);
+                if data.question_dot_token.is_some() {
+                    let undefined = self.result.types.undefined();
+                    value = self.result.types.union([value, undefined]);
+                }
                 if let Some(reference) = self.result.import_type_references.get(&receiver).cloned()
                 {
                     let receiver_properties = self.import_receiver_property_names(receiver);
@@ -4967,7 +5327,13 @@ impl<'a> Checker<'a> {
 
     fn property_access_type(&mut self, node: NodeId, receiver: TypeId, name: &str) -> TypeId {
         if let Some(property) = self.lookup_property_type(receiver, name) {
-            property
+            if name == "flat"
+                && let Some(flat) = self.array_flat_property_type(receiver, property)
+            {
+                flat
+            } else {
+                property
+            }
         } else if self.options.is_javascript_file && self.is_assignment_left_hand_side(node) {
             let property = self.result.types.any();
             if let Some(Type {
@@ -4986,6 +5352,31 @@ impl<'a> Checker<'a> {
             );
             self.result.types.any()
         }
+    }
+
+    fn array_flat_property_type(&mut self, receiver: TypeId, property: TypeId) -> Option<TypeId> {
+        let TypeKind::Array(element) = self.result.types.get(receiver)?.kind.clone() else {
+            return None;
+        };
+        let TypeKind::Function(mut signature) = self.result.types.get(property)?.kind.clone()
+        else {
+            return None;
+        };
+        let TypeKind::Array(result_element) = self.result.types.get(signature.return_type)?.kind
+        else {
+            return None;
+        };
+        let depth = (-1..=20)
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let name = format!("FlatArray<{}, {depth}>", self.result.types.display(element));
+        let flat = self.result.types.alloc(TypeKind::TypeParameter {
+            name,
+            constraint: Some(result_element),
+        });
+        signature.return_type = self.result.types.alloc(TypeKind::Array(flat));
+        Some(self.result.types.alloc(TypeKind::Function(signature)))
     }
 
     fn propagate_import_reference(
@@ -5484,6 +5875,20 @@ impl<'a> Checker<'a> {
         )
     }
 
+    fn non_nullish_type(&mut self, type_id: TypeId) -> TypeId {
+        let members = self
+            .union_members(type_id)
+            .into_iter()
+            .filter(|member| {
+                !matches!(
+                    self.result.types.get(*member).map(|type_| &type_.kind),
+                    Some(TypeKind::Null | TypeKind::Undefined)
+                )
+            })
+            .collect::<Vec<_>>();
+        self.result.types.union(members)
+    }
+
     fn infer_type_parameters(
         &mut self,
         parameter: TypeId,
@@ -5778,11 +6183,23 @@ impl<'a> Checker<'a> {
                     (self.options.is_javascript_file && !self.function_body_has_return(body))
                         .then(|| self.result.types.void())
                 });
-            if let Some(inferred) = inferred
-                && let TypeKind::Function(signature) =
+            if let Some(inferred) = inferred {
+                if self.type_contains_cyclic_alias(inferred)
+                    && let Some(name_node) = data.name
+                    && !self.result.diagnostics.iter().any(|diagnostic| {
+                        diagnostic.node == name_node && diagnostic.diagnostic.code() == 5088
+                    })
+                {
+                    let name = self
+                        .property_name(name_node)
+                        .unwrap_or_else(|| "function".into());
+                    self.error(name_node, 5088, [name]);
+                }
+                if let TypeKind::Function(signature) =
                     &mut self.result.types.types[function.index()].kind
-            {
-                signature.return_type = inferred;
+                {
+                    signature.return_type = inferred;
+                }
             }
         }
         if let Some(node_id) = data
@@ -5799,6 +6216,33 @@ impl<'a> Checker<'a> {
             );
         }
         function
+    }
+
+    fn type_contains_cyclic_alias(&self, type_id: TypeId) -> bool {
+        match &self.result.types.get(type_id).expect("type exists").kind {
+            TypeKind::TypeParameter { name, .. } if name.starts_with("__cyclic_alias__") => true,
+            TypeKind::Array(element) => self.type_contains_cyclic_alias(*element),
+            TypeKind::Tuple(elements)
+            | TypeKind::Union(elements)
+            | TypeKind::Intersection(elements) => elements
+                .iter()
+                .any(|element| self.type_contains_cyclic_alias(*element)),
+            TypeKind::Function(signature) | TypeKind::Constructor(signature) => {
+                self.type_contains_cyclic_alias(signature.return_type)
+                    || signature
+                        .parameters
+                        .iter()
+                        .any(|parameter| self.type_contains_cyclic_alias(*parameter))
+            }
+            TypeKind::Object(object) => object
+                .properties
+                .values()
+                .any(|property| self.type_contains_cyclic_alias(*property)),
+            TypeKind::Overload(signatures) => signatures
+                .iter()
+                .any(|signature| self.type_contains_cyclic_alias(signature.return_type)),
+            _ => false,
+        }
     }
 
     fn declaration_signature_type(
@@ -6217,6 +6661,7 @@ impl<'a> Checker<'a> {
                     }
                     return self.unresolved_type_name(data.type_name, name);
                 };
+                let cyclic_alias = self.type_alias_is_recursive(symbol, &name);
                 let type_id = if let Some(descriptor) = self.external_aliases.get(&symbol).cloned()
                 {
                     self.import_alias(&descriptor, &arguments)
@@ -6236,7 +6681,14 @@ impl<'a> Checker<'a> {
                         .import_type_references
                         .insert(type_id, reference);
                 }
-                type_id
+                if cyclic_alias {
+                    self.result.types.alloc(TypeKind::TypeParameter {
+                        name: format!("__cyclic_alias__{name}"),
+                        constraint: Some(type_id),
+                    })
+                } else {
+                    type_id
+                }
             }
             NodeData::TypeQueryNode(data) => self.type_of_expression(data.expr_name),
             NodeData::UnionTypeNode(data) => {
@@ -6695,6 +7147,36 @@ impl<'a> Checker<'a> {
         let result = self.type_alias_type(declaration, arguments);
         self.alias_stack.pop();
         Some(result)
+    }
+
+    fn type_alias_is_recursive(&self, symbol: SymbolId, name: &str) -> bool {
+        self.bindings
+            .symbols
+            .get(symbol)
+            .into_iter()
+            .flat_map(|symbol| &symbol.declarations)
+            .filter_map(|declaration| {
+                let NodeData::TypeAliasDeclaration(alias) = &self.arena.get(*declaration)?.data
+                else {
+                    return None;
+                };
+                Some(alias.type_)
+            })
+            .any(|body| {
+                let mut pending = vec![body];
+                while let Some(node_id) = pending.pop() {
+                    if let Some(NodeData::TypeReferenceNode(reference)) =
+                        self.arena.get(node_id).map(|node| &node.data)
+                        && self.property_name(reference.type_name).as_deref() == Some(name)
+                    {
+                        return true;
+                    }
+                    if let Some(children) = self.children.get(&node_id) {
+                        pending.extend(children.iter().copied());
+                    }
+                }
+                false
+            })
     }
 
     fn type_alias_type(
@@ -8411,8 +8893,8 @@ mod tests {
     use ts_parser::parse_source_file;
 
     use super::{
-        Checker, CheckerOptions, EnumConstantValue, ImportTypeReference, ObjectType, ProgramSource,
-        TypeKind, check_program, check_source_file, check_source_file_with_options,
+        Checker, CheckerOptions, EnumConstantValue, FunctionType, ImportTypeReference, ObjectType,
+        ProgramSource, TypeKind, check_program, check_source_file, check_source_file_with_options,
         identifier_text,
     };
 
@@ -8913,6 +9395,48 @@ mod tests {
             result.diagnostics[0].diagnostic.render().unwrap(),
             "Property 'length' does not exist on type 'null'."
         );
+    }
+
+    #[test]
+    fn assertion_predicates_narrow_discriminated_and_optional_unions() {
+        let parsed = parse_source_file(
+            r"
+                interface Cat { type: 'cat'; canMeow: true; }
+                interface Dog { type: 'dog'; canBark: true; }
+                type Animal = Cat | Dog;
+                declare function assertEqual<T>(value: any, expected: T): asserts value is T;
+                const animal = { type: 'cat', canMeow: true } as Animal;
+                assertEqual(animal.type, 'cat' as const);
+                animal.canMeow;
+                const maybe = { type: 'cat', canMeow: true } as Animal | undefined;
+                assertEqual(maybe?.type, 'cat' as const);
+                maybe.canMeow;
+            ",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let accesses = parsed
+            .arena
+            .iter()
+            .filter_map(|(id, node)| {
+                let NodeData::PropertyAccessExpression(access) = &node.data else {
+                    return None;
+                };
+                (identifier_text(&parsed.arena, access.name) == Some("canMeow")).then_some(id)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(accesses.len(), 2);
+        for access in accesses {
+            let type_id = result
+                .type_of_node(access)
+                .expect("checked property access");
+            assert!(matches!(
+                result.types.get(type_id).unwrap().kind,
+                TypeKind::BooleanLiteral(true)
+            ));
+        }
     }
 
     #[test]
@@ -10190,6 +10714,68 @@ mod tests {
             result.types.get(arguments.properties["bar"]).unwrap().kind,
             TypeKind::Object(_)
         ));
+    }
+
+    #[test]
+    fn preserves_array_flat_aliases_and_reports_unserializable_recursive_inference() {
+        let standard = parse_source_file("");
+        let bindings = bind_source_file(&standard.arena, standard.source_file);
+        let mut checker = Checker::new(&standard.arena, &bindings);
+        let element = checker.result.types.alloc(TypeKind::TypeParameter {
+            name: "T".into(),
+            constraint: None,
+        });
+        let receiver = checker.result.types.alloc(TypeKind::Array(element));
+        let number = checker.result.types.number();
+        let return_type = checker.result.types.alloc(TypeKind::Array(number));
+        let property = checker.result.types.alloc(TypeKind::Function(FunctionType {
+            parameters: vec![number],
+            rest_parameter: None,
+            return_type,
+            parameters_optional: false,
+        }));
+        let flat = checker
+            .array_flat_property_type(receiver, property)
+            .unwrap();
+        let TypeKind::Function(flat) = &checker.result.types.get(flat).unwrap().kind else {
+            panic!("expected flat function");
+        };
+        assert_eq!(
+            checker.result.types.display(flat.return_type),
+            "FlatArray<T, -1 | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20>[]"
+        );
+
+        let recursive = parse_source_file(
+            r"
+                type BadFlatArray<Arr, Depth extends number> =
+                    Arr extends ReadonlyArray<infer InnerArr>
+                        ? BadFlatArray<InnerArr, Depth>
+                        : Arr;
+                declare function flat<A, D extends number = 1>(
+                    arr: A, depth?: D
+                ): BadFlatArray<A, D>[];
+                function bad<T>(arr: T[], depth: number) { return flat(arr, depth); }
+            ",
+        );
+        assert!(
+            recursive.diagnostics.is_empty(),
+            "{:?}",
+            recursive.diagnostics
+        );
+        let bindings = bind_source_file(&recursive.arena, recursive.source_file);
+        let result = check_source_file(&recursive.arena, recursive.source_file, &bindings);
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [5088]
+        );
+        assert_eq!(
+            result.diagnostics[0].diagnostic.render().unwrap(),
+            "The inferred type of 'bad' references a type with a cyclic structure which cannot be trivially serialized. A type annotation is necessary."
+        );
     }
 
     #[test]

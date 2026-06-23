@@ -475,6 +475,14 @@ impl Program {
                 }
             }
             if settings.emit_declarations {
+                if source_file
+                    .checking
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.diagnostic.code() == 5088)
+                {
+                    continue;
+                }
                 let declaration_node_types = declaration_node_types_for_emit(source_file);
                 match emit_declaration_file_with_semantics(
                     &source_file.parse.arena,
@@ -626,6 +634,14 @@ impl Program {
             let mut map_builder = self.options.declaration_map.then(SourceMapBuilder::new);
             let mut map_sources = Vec::new();
             for source in &sources {
+                if source
+                    .checking
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.diagnostic.code() == 5088)
+                {
+                    continue;
+                }
                 let generated_line =
                     u32::try_from(code.bytes().filter(|byte| *byte == b'\n').count())
                         .unwrap_or(u32::MAX);
@@ -4249,6 +4265,50 @@ mod tests {
                 "    foo: object | undefined;\n",
                 "}\n",
             )
+        );
+    }
+
+    #[test]
+    fn cyclic_inferred_alias_diagnostic_suppresses_only_declaration_output() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/main.ts",
+            concat!(
+                "type Bad<Arr> = Arr extends infer Inner ? Bad<Inner> : Arr;\n",
+                "declare function flat<A>(arr: A): Bad<A>[];\n",
+                "function foo<T>(arr: T[]) { return flat(arr); }\n",
+            ),
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["main.ts".to_owned()],
+            CompilerOptions {
+                declaration: true,
+                no_lib: true,
+                target: ScriptTarget::Es2015,
+                ..CompilerOptions::default()
+            },
+        );
+        assert!(
+            program
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code == Some(5088))
+        );
+        let emitted = program.emit();
+        assert!(
+            emitted
+                .files
+                .iter()
+                .any(|file| file.file_name == "/project/main.js")
+        );
+        assert!(
+            !emitted
+                .files
+                .iter()
+                .any(|file| file.file_name == "/project/main.d.ts")
         );
     }
 
