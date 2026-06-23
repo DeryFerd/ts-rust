@@ -3556,6 +3556,10 @@ impl Writer {
         while self.output.ends_with(' ') {
             self.output.pop();
         }
+        self.newline_preserving_trailing_spaces();
+    }
+
+    fn newline_preserving_trailing_spaces(&mut self) {
         self.output.push('\n');
         self.line_start = true;
         self.line += 1;
@@ -3575,6 +3579,10 @@ impl Writer {
                 .map_or(self.output.len(), |(_, line)| line.len()),
         )
         .unwrap_or(u32::MAX);
+    }
+
+    fn ends_with_tight_comment_delimiter(&self) -> bool {
+        matches!(self.output.as_bytes().last(), Some(b'(' | b'['))
     }
 
     fn finish(mut self) -> String {
@@ -4606,7 +4614,7 @@ impl Printer<'_> {
                 let comment = &trivia[index..comment_end];
                 if is_reference_directive(comment) {
                     self.writer.write(comment);
-                    self.writer.newline();
+                    self.writer.newline_preserving_trailing_spaces();
                 }
                 index = comment_end;
             } else if bytes[index..].starts_with(b"/*") {
@@ -4667,10 +4675,12 @@ impl Printer<'_> {
                 {
                     if immediate_trailing {
                         self.writer.remove_trailing_newline();
-                        self.writer.write(" ");
+                        if !self.writer.ends_with_tight_comment_delimiter() {
+                            self.writer.write(" ");
+                        }
                     }
                     self.writer.write(&trivia[index..comment_end]);
-                    self.writer.newline();
+                    self.writer.newline_preserving_trailing_spaces();
                 }
                 index = comment_end;
             } else if bytes[index..].starts_with(b"/*") {
@@ -4694,7 +4704,7 @@ impl Printer<'_> {
                         .split('\n')
                     {
                         self.writer.write(line);
-                        self.writer.newline();
+                        self.writer.newline_preserving_trailing_spaces();
                     }
                 }
                 index = comment_end;
@@ -4806,7 +4816,7 @@ impl Printer<'_> {
                     && self.emitted_source_comments.insert(comment_range)
                 {
                     self.writer.write(comment);
-                    self.writer.newline();
+                    self.writer.newline_preserving_trailing_spaces();
                 }
                 index = comment_end;
             } else if bytes[index..].starts_with(b"/*") {
@@ -4824,7 +4834,7 @@ impl Printer<'_> {
                         .split('\n')
                     {
                         self.writer.write(line);
-                        self.writer.newline();
+                        self.writer.newline_preserving_trailing_spaces();
                     }
                 }
                 index = comment_end;
@@ -8620,9 +8630,7 @@ impl Printer<'_> {
                     self.emit_downlevel_array_spread(data)?;
                     return Ok(());
                 }
-                self.writer.write("[");
-                self.emit_expression_list(&data.elements)?;
-                self.writer.write("]");
+                self.emit_array_literal(id, data)?;
             }
             NodeData::SpreadElement(data) => {
                 self.writer.write("...");
@@ -8841,7 +8849,7 @@ impl Printer<'_> {
                     self.emit_parameters(&data.parameters)?;
                     self.writer.write(" ");
                     if matches!(&self.node(data.body)?.data, NodeData::Block(_)) {
-                        self.emit_block(data.body)?;
+                        self.emit_function_body(data.body)?;
                     } else {
                         self.writer.write("{ return ");
                         self.emit_expression(data.body, 0)?;
@@ -8871,7 +8879,7 @@ impl Printer<'_> {
                 }
                 self.writer.write(" => ");
                 if matches!(&self.node(data.body)?.data, NodeData::Block(_)) {
-                    self.emit_block(data.body)?;
+                    self.emit_function_body(data.body)?;
                 } else {
                     self.emit_expression(data.body, 1)?;
                 }
@@ -8880,7 +8888,7 @@ impl Printer<'_> {
                 }
             }
             NodeData::FunctionExpression(data) => {
-                let wrap = parent_precedence > 1;
+                let wrap = parent_precedence >= 18;
                 if wrap {
                     self.writer.write("(");
                 }
@@ -9693,18 +9701,111 @@ impl Printer<'_> {
         Ok(())
     }
 
+    fn emit_array_literal(
+        &mut self,
+        id: NodeId,
+        data: &ts_ast::ArrayLiteralExpressionData,
+    ) -> Result<(), EmitError> {
+        let multiline = !data.elements.nodes.is_empty() && self.node_source_is_multiline(id);
+        self.writer.write("[");
+        if !multiline {
+            self.emit_expression_list(&data.elements)?;
+            self.writer.write("]");
+            return Ok(());
+        }
+
+        self.writer.indent += 1;
+        self.writer.newline();
+        let mut previous_end = data.elements.range.start.get();
+        for (index, element) in data.elements.nodes.iter().enumerate() {
+            if index != 0 {
+                self.writer.write(",");
+                self.writer.newline();
+            }
+            let node = self.node(*element)?.clone();
+            self.emit_source_comments_between_with_trailing(
+                previous_end,
+                node.range.start.get(),
+                index != 0,
+            );
+            self.emit_expression(*element, 1)?;
+            previous_end = node.range.end.get();
+        }
+        if data.elements.has_trailing_comma {
+            self.writer.write(",");
+        }
+        self.emit_source_comments_between_with_trailing(
+            previous_end,
+            self.node(id)?.range.end.get().saturating_sub(1),
+            true,
+        );
+        if !self.writer.line_start {
+            self.writer.newline();
+        }
+        self.writer.indent -= 1;
+        self.writer.write("]");
+        Ok(())
+    }
+
     fn emit_expression_list(&mut self, list: &NodeList) -> Result<(), EmitError> {
         let mut previous_end = list.range.start.get();
         for (index, expression) in list.nodes.iter().enumerate() {
             if index != 0 {
-                self.writer.write(", ");
+                self.writer.write(",");
             }
             let expression_start = self.node(*expression)?.range.start.get();
-            self.emit_inline_block_comments(previous_end, expression_start);
+            if self.source_range_contains_line_comment(previous_end, expression_start) {
+                self.emit_expression_list_line_comments(previous_end, expression_start);
+            } else {
+                if index != 0 {
+                    self.writer.write(" ");
+                }
+                self.emit_inline_block_comments(previous_end, expression_start);
+            }
             self.emit_expression(*expression, 1)?;
             previous_end = self.node(*expression)?.range.end.get();
         }
+        if self.source_range_contains_line_comment(previous_end, list.range.end.get()) {
+            self.emit_expression_list_line_comments(previous_end, list.range.end.get());
+        }
         Ok(())
+    }
+
+    fn source_range_contains_line_comment(&self, start: u32, end: u32) -> bool {
+        let start = usize::try_from(start).unwrap_or(usize::MAX);
+        let end = usize::try_from(end).unwrap_or(usize::MAX);
+        let Some(trivia) = self.source_text.get(start..end) else {
+            return false;
+        };
+        let bytes = trivia.as_bytes();
+        let mut index = 0;
+        while index + 1 < bytes.len() {
+            if bytes[index..].starts_with(b"//") {
+                return true;
+            }
+            if bytes[index..].starts_with(b"/*") {
+                index = bytes[index + 2..]
+                    .windows(2)
+                    .position(|window| window == b"*/")
+                    .map_or(bytes.len(), |offset| index + 2 + offset + 2);
+            } else {
+                index += 1;
+            }
+        }
+        false
+    }
+
+    fn emit_expression_list_line_comments(&mut self, start: u32, end: u32) {
+        let starts_on_new_line = usize::try_from(start)
+            .ok()
+            .zip(usize::try_from(end).ok())
+            .and_then(|(start, end)| self.source_text.get(start..end))
+            .and_then(|trivia| trivia.find("//").map(|comment| &trivia[..comment]))
+            .is_some_and(|leading| leading.contains(['\n', '\r']));
+        if starts_on_new_line && !self.writer.line_start {
+            self.writer.newline();
+        }
+        self.emit_source_comments_between_with_trailing(start, end, true);
     }
 
     fn emit_inline_block_comments(&mut self, start: u32, end: u32) {
@@ -10526,6 +10627,71 @@ mod tests {
                 "const callback = function (value: number): number { return value; }; const result = (function* named() { yield 1; })();"
             ),
             "const callback = function (value) { return value; };\nconst result = (function* named() {\n    yield 1;\n})();\n"
+        );
+    }
+
+    #[test]
+    fn avoids_redundant_parentheses_around_assigned_function_expressions() {
+        assert_eq!(
+            emit_with(
+                "let callback: unknown; callback = function () { return null; };",
+                ScriptTarget::Es2015,
+                ModuleKind::None,
+            )
+            .code,
+            "let callback;\ncallback = function () { return null; };\n"
+        );
+    }
+
+    #[test]
+    fn preserves_multiline_array_layout_and_element_comments() {
+        assert_eq!(
+            emit_with(
+                "const values = [\n    // object\n    { value: 1 },\n    // number\n    2\n];",
+                ScriptTarget::Es2015,
+                ModuleKind::None,
+            )
+            .code,
+            "const values = [\n    // object\n    { value: 1 },\n    // number\n    2\n];\n"
+        );
+    }
+
+    #[test]
+    fn preserves_line_comments_inside_call_argument_lists() {
+        assert_eq!(
+            emit_with(
+                "f(  // first\n    // second\n    () => {\n        // body\n    }\n    // trailing\n);",
+                ScriptTarget::Es2015,
+                ModuleKind::None,
+            )
+            .code,
+            "f(// first\n// second\n() => {\n    // body\n}\n// trailing\n);\n"
+        );
+    }
+
+    #[test]
+    fn keeps_single_line_arrow_bodies_compact_in_constructor_arguments() {
+        assert_eq!(
+            emit_with(
+                "const value = new Box(() => { return result; }); // trailing",
+                ScriptTarget::Es2015,
+                ModuleKind::None,
+            )
+            .code,
+            "const value = new Box(() => { return result; }); // trailing\n"
+        );
+    }
+
+    #[test]
+    fn preserves_trailing_spaces_in_source_comments() {
+        assert_eq!(
+            emit_with(
+                "// trailing space \nclass Value {}",
+                ScriptTarget::Es2015,
+                ModuleKind::None,
+            )
+            .code,
+            "// trailing space \nclass Value {\n}\n"
         );
     }
 
