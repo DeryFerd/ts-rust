@@ -5320,11 +5320,6 @@ impl DeclarationPrinter<'_> {
                     self.source_text.lines().any(|line| {
                         line.contains("as const") && line.contains("const") && line.contains(name)
                     })
-                }) || self.arena.iter().any(|(_, node)| {
-                    let NodeData::ComputedPropertyName(computed) = &node.data else {
-                        return false;
-                    };
-                    declaration_name_text(self.arena, computed.expression) == declaration_name
                 }) || declaration.initializer.is_some_and(|initializer| {
                     if self.expression_has_const_assertion_ancestor(initializer) {
                         return true;
@@ -5418,6 +5413,13 @@ impl DeclarationPrinter<'_> {
             {
                 self.writer.write(": ");
                 self.emit_jsdoc_type_hint(&hint);
+            } else if let Some(enum_name) = declaration
+                .initializer
+                .and_then(|initializer| self.asserted_indexed_enum_array_name(initializer))
+            {
+                self.writer.write(": ");
+                self.emit_name(enum_name)?;
+                self.writer.write("[]");
             } else if let Some(type_node) = declaration
                 .initializer
                 .and_then(|initializer| self.asserted_initializer_type(initializer))
@@ -5881,6 +5883,18 @@ impl DeclarationPrinter<'_> {
                     )
                 )
                 .then_some(initializer)
+                .or_else(|| {
+                    matches!(
+                        self.arena.get(initializer).map(|node| &node.data),
+                        Some(NodeData::PrefixUnaryExpression(prefix))
+                            if matches!(prefix.operator, SyntaxKind::PlusToken | SyntaxKind::MinusToken)
+                                && matches!(
+                                    self.arena.get(prefix.operand).map(|node| &node.data),
+                                    Some(NodeData::NumericLiteral(_))
+                                )
+                    )
+                    .then_some(initializer)
+                })
             })
     }
 
@@ -6881,6 +6895,41 @@ impl DeclarationPrinter<'_> {
         (!is_const).then_some(asserted)
     }
 
+    fn asserted_indexed_enum_array_name(&self, initializer: NodeId) -> Option<NodeId> {
+        let initializer = match &self.arena.get(initializer)?.data {
+            NodeData::SatisfiesExpression(expression) => expression.expression,
+            NodeData::ParenthesizedExpression(expression) => {
+                return self.asserted_indexed_enum_array_name(expression.expression);
+            }
+            _ => initializer,
+        };
+        let asserted = self.asserted_initializer_type(initializer)?;
+        let NodeData::ArrayTypeNode(array) = &self.arena.get(asserted)?.data else {
+            return None;
+        };
+        let NodeData::IndexedAccessTypeNode(indexed) = &self.arena.get(array.element_type)?.data
+        else {
+            return None;
+        };
+        let NodeData::TypeReferenceNode(reference) = &self.arena.get(indexed.object_type)?.data
+        else {
+            return None;
+        };
+        let alias_name = declaration_name_text(self.arena, reference.type_name)?;
+        self.arena.iter().find_map(|(_, node)| {
+            let NodeData::TypeAliasDeclaration(alias) = &node.data else {
+                return None;
+            };
+            if declaration_name_text(self.arena, alias.name) != Some(alias_name) {
+                return None;
+            }
+            let NodeData::TypeQueryNode(query) = &self.arena.get(alias.type_)?.data else {
+                return None;
+            };
+            Some(query.expr_name)
+        })
+    }
+
     fn initializer_has_const_assertion(&self, initializer: NodeId) -> bool {
         let (type_, expression) = match self.arena.get(initializer).map(|node| &node.data) {
             Some(NodeData::AsExpression(assertion)) => (assertion.type_, assertion.expression),
@@ -6989,22 +7038,25 @@ impl DeclarationPrinter<'_> {
     }
 
     fn initializer_has_explicit_function_signature(&self, initializer: NodeId) -> bool {
-        let (type_parameters, parameters, return_type) =
+        let (type_parameters, parameters, return_type, body) =
             match &self.arena.get(initializer).map(|node| &node.data) {
                 Some(NodeData::ArrowFunction(function)) => (
                     function.type_parameters.as_ref(),
                     &function.parameters,
                     function.type_,
+                    function.body,
                 ),
                 Some(NodeData::FunctionExpression(function)) => (
                     function.type_parameters.as_ref(),
                     &function.parameters,
                     function.type_,
+                    function.body,
                 ),
                 _ => return false,
             };
         type_parameters.is_some()
             || return_type.is_some()
+            || self.asserted_initializer_type(body).is_some()
             || parameters.nodes.iter().any(|parameter| {
                 matches!(
                     self.arena.get(*parameter).map(|node| &node.data),
@@ -7034,6 +7086,8 @@ impl DeclarationPrinter<'_> {
         self.emit_parameters(parameters)?;
         self.writer.write(" => ");
         if let Some(return_type) = return_type {
+            self.emit_type(return_type)
+        } else if let Some(return_type) = self.asserted_initializer_type(body) {
             self.emit_type(return_type)
         } else if matches!(
             self.arena.get(body).map(|node| &node.data),
@@ -10432,7 +10486,13 @@ impl DeclarationPrinter<'_> {
                 NodeData::SetAccessorDeclaration(accessor) => (accessor.name, None, false),
                 _ => continue,
             };
-            let syntactic_name = declaration_name_text(self.arena, name_node);
+            let computed_name = matches!(
+                self.arena.get(name_node).map(|node| &node.data),
+                Some(NodeData::ComputedPropertyName(_))
+            );
+            let syntactic_name = (!computed_name)
+                .then(|| declaration_name_text(self.arena, name_node))
+                .flatten();
             let Some(name) = syntactic_name.map(str::to_owned).or_else(|| {
                 matches!(
                     self.arena.get(name_node).map(|node| &node.data),
@@ -10478,10 +10538,12 @@ impl DeclarationPrinter<'_> {
                 })
             {
                 emitted_names.insert(name.clone());
-                if syntactic_name.is_some() {
-                    self.emit_name(name_node)?;
-                } else {
-                    self.emit_semantic_property_name(&name);
+                if !self.emit_computed_literal_property_name(name_node)? {
+                    if syntactic_name.is_some() {
+                        self.emit_name(name_node)?;
+                    } else {
+                        self.emit_semantic_property_name(&name);
+                    }
                 }
                 self.writer.write(": {};");
                 self.writer.newline();
@@ -10494,10 +10556,12 @@ impl DeclarationPrinter<'_> {
             if object.readonly_properties.contains(&name) {
                 self.writer.write("readonly ");
             }
-            if syntactic_name.is_some() {
-                self.emit_name(name_node)?;
-            } else {
-                self.emit_semantic_property_name(&name);
+            if !self.emit_computed_literal_property_name(name_node)? {
+                if syntactic_name.is_some() {
+                    self.emit_name(name_node)?;
+                } else {
+                    self.emit_semantic_property_name(&name);
+                }
             }
             let optional = object.optional_properties.contains(&name);
             if optional {
@@ -10596,6 +10660,8 @@ impl DeclarationPrinter<'_> {
                     initializer,
                     preserve_nullish_literals,
                 )?;
+            } else if computed_name && !object.readonly_properties.contains(&name) {
+                self.emit_widened_semantic_type(type_id)?;
             } else {
                 self.emit_semantic_parameter_type(type_id, optional)?;
             }
@@ -10764,6 +10830,14 @@ impl DeclarationPrinter<'_> {
                     self.writer.write("[");
                     write_quoted(&mut self.writer, &name);
                     self.writer.write("]");
+                } else if object.numeric_properties.contains(&name) {
+                    if name.starts_with('-') {
+                        self.writer.write("[");
+                        self.writer.write(&name);
+                        self.writer.write("]");
+                    } else {
+                        self.writer.write(&name);
+                    }
                 } else {
                     self.emit_semantic_property_name(&name);
                 }
@@ -11106,10 +11180,10 @@ impl DeclarationPrinter<'_> {
                     has_string_index |= key_kind == Some(SyntaxKind::StringKeyword);
                 }
                 _ => {
-                    if let Some(name) = type_member_name_text(self.arena, *member)
-                        && !property_names.iter().any(|existing| existing == name)
+                    if let Some(name) = self.type_member_semantic_name(*member)
+                        && !property_names.iter().any(|existing| existing == &name)
                     {
-                        property_names.push(name.to_owned());
+                        property_names.push(name);
                     }
                 }
             }
@@ -11169,6 +11243,14 @@ impl DeclarationPrinter<'_> {
     }
 
     fn semantic_object_property_order(&self, object: &ObjectType) -> Vec<String> {
+        if object.property_order.len() == object.properties.len()
+            && object
+                .property_order
+                .iter()
+                .all(|name| object.properties.contains_key(name))
+        {
+            return object.property_order.clone();
+        }
         if let Some(type_literal) = self
             .matching_source_type_literal(object)
             .and_then(|id| self.arena.get(id))
@@ -11181,7 +11263,7 @@ impl DeclarationPrinter<'_> {
                 .members
                 .nodes
                 .iter()
-                .filter_map(|member| type_member_name_text(self.arena, *member).map(str::to_owned))
+                .filter_map(|member| self.type_member_semantic_name(*member))
                 .filter(|name| object.properties.contains_key(name))
                 .collect::<Vec<_>>();
             present.dedup();
@@ -11506,6 +11588,32 @@ impl DeclarationPrinter<'_> {
                 _ => None,
             }
         })
+    }
+
+    fn emit_computed_literal_property_name(&mut self, name: NodeId) -> Result<bool, EmitError> {
+        let Some(NodeData::ComputedPropertyName(computed)) =
+            self.arena.get(name).map(|node| &node.data)
+        else {
+            return Ok(false);
+        };
+        let Some(literal) = self.const_literal_declaration_initializer(computed.expression) else {
+            return Ok(false);
+        };
+        let previous = self.canonical_literal_quotes;
+        self.canonical_literal_quotes = true;
+        let result = if matches!(
+            self.arena.get(literal).map(|node| &node.data),
+            Some(NodeData::PrefixUnaryExpression(_))
+        ) {
+            let literal = self.node(literal)?.clone();
+            self.emit_source_slice(&literal);
+            Ok(())
+        } else {
+            self.emit_literal_expression(literal)
+        };
+        self.canonical_literal_quotes = previous;
+        result?;
+        Ok(true)
     }
 
     /// Resolves a reference through lexical scopes without treating a computed
@@ -12070,6 +12178,12 @@ impl DeclarationPrinter<'_> {
         ) {
             return true;
         }
+        if self
+            .const_literal_declaration_initializer(computed.expression)
+            .is_some()
+        {
+            return true;
+        }
         let Some(symbol) = self.resolve_computed_type_key_symbol(computed.expression) else {
             return false;
         };
@@ -12077,9 +12191,27 @@ impl DeclarationPrinter<'_> {
             symbol.declarations.iter().any(|declaration| {
                 match self.arena.get(*declaration).map(|node| &node.data) {
                     Some(NodeData::EnumMember(_)) => true,
-                    Some(NodeData::VariableDeclaration(variable)) => variable
-                        .initializer
-                        .is_some_and(|initializer| self.is_symbol_factory_call(initializer)),
+                    Some(NodeData::VariableDeclaration(variable)) => variable.initializer.is_some_and(
+                        |initializer| {
+                            self.is_symbol_factory_call(initializer)
+                                || self
+                                    .arena
+                                    .get(*declaration)
+                                    .and_then(|node| node.parent)
+                                    .and_then(|list| self.arena.get(list))
+                                    .is_some_and(|list| list.flags.0 & (1 << 1) != 0)
+                                    && (self.is_const_declaration_literal_initializer(initializer)
+                                        || matches!(
+                                            self.arena.get(initializer).map(|node| &node.data),
+                                            Some(NodeData::PrefixUnaryExpression(prefix))
+                                                if matches!(prefix.operator, SyntaxKind::PlusToken | SyntaxKind::MinusToken)
+                                                    && matches!(
+                                                        self.arena.get(prefix.operand).map(|node| &node.data),
+                                                        Some(NodeData::NumericLiteral(_))
+                                                    )
+                                        ))
+                        },
+                    ),
                     _ => false,
                 }
             })
@@ -12105,6 +12237,73 @@ impl DeclarationPrinter<'_> {
             }
             NodeData::ParenthesizedExpression(parenthesized) => {
                 self.resolve_computed_type_key_symbol(parenthesized.expression)
+            }
+            _ => None,
+        }
+    }
+
+    fn type_member_semantic_name(&self, member: NodeId) -> Option<String> {
+        let name = type_member_name(self.arena, member)?;
+        let Some(NodeData::ComputedPropertyName(computed)) =
+            self.arena.get(name).map(|node| &node.data)
+        else {
+            return declaration_name_text(self.arena, name).map(str::to_owned);
+        };
+        self.constant_computed_property_name(computed.expression)
+    }
+
+    fn constant_computed_property_name(&self, expression: NodeId) -> Option<String> {
+        if let Some(name) = self.constant_property_name(expression) {
+            return Some(name);
+        }
+        let symbol = declaration_name_text(self.arena, expression)
+            .and_then(|name| self.resolve_lexical_name_at(expression, name))
+            .or_else(|| self.resolve_computed_type_key_symbol(expression))?;
+        self.bindings
+            .symbols
+            .get(symbol)?
+            .declarations
+            .iter()
+            .find_map(|declaration| {
+                let NodeData::VariableDeclaration(variable) = &self.arena.get(*declaration)?.data
+                else {
+                    return None;
+                };
+                self.constant_property_name(variable.initializer?)
+            })
+    }
+
+    fn constant_property_name(&self, expression: NodeId) -> Option<String> {
+        match &self.arena.get(expression)?.data {
+            NodeData::StringLiteral(literal) => Some(literal.text.clone()),
+            NodeData::NumericLiteral(literal) => Some(literal.text.clone()),
+            NodeData::NoSubstitutionTemplateLiteral(literal) => Some(
+                literal
+                    .raw_text
+                    .strip_prefix('`')
+                    .and_then(|text| text.strip_suffix('`'))
+                    .unwrap_or(&literal.raw_text)
+                    .to_owned(),
+            ),
+            NodeData::PrefixUnaryExpression(prefix)
+                if matches!(
+                    prefix.operator,
+                    SyntaxKind::PlusToken | SyntaxKind::MinusToken
+                ) =>
+            {
+                let NodeData::NumericLiteral(literal) = &self.arena.get(prefix.operand)?.data
+                else {
+                    return None;
+                };
+                Some(format!(
+                    "{}{}",
+                    if prefix.operator == SyntaxKind::MinusToken {
+                        "-"
+                    } else {
+                        "+"
+                    },
+                    literal.text
+                ))
             }
             _ => None,
         }
@@ -18690,7 +18889,12 @@ impl Printer<'_> {
             && self
                 .function_like_body_parameters(id)
                 .is_some_and(|parameters| self.parameters_have_rest_parameter(parameters));
-        if data.statements.nodes.is_empty() && !source_multiline && !has_downlevel_rest {
+        let has_binding_parameter_property = self.body_has_binding_parameter_property(id);
+        if data.statements.nodes.is_empty()
+            && !source_multiline
+            && !has_downlevel_rest
+            && !has_binding_parameter_property
+        {
             self.writer.write("{ }");
             return Ok(());
         }
@@ -21340,6 +21544,44 @@ impl Printer<'_> {
                 Some(NodeData::ParameterDeclaration(parameter))
                     if parameter.dot_dot_dot_token.is_some()
             )
+        })
+    }
+
+    fn body_has_binding_parameter_property(&self, body: NodeId) -> bool {
+        let Some(parent) = self.arena.get(body).and_then(|node| node.parent) else {
+            return false;
+        };
+        let parameters = match self.arena.get(parent).map(|node| &node.data) {
+            Some(NodeData::ConstructorDeclaration(constructor)) => &constructor.parameters,
+            Some(NodeData::MethodDeclaration(method))
+                if declaration_name_text(self.arena, method.name) == Some("constructor") =>
+            {
+                &method.parameters
+            }
+            _ => return false,
+        };
+        parameters.nodes.iter().any(|parameter| {
+            let Some(NodeData::ParameterDeclaration(parameter)) =
+                self.arena.get(*parameter).map(|node| &node.data)
+            else {
+                return false;
+            };
+            matches!(
+                self.arena.get(parameter.name).map(|node| node.kind),
+                Some(SyntaxKind::ObjectBindingPattern | SyntaxKind::ArrayBindingPattern)
+            ) && parameter.modifiers.as_ref().is_some_and(|modifiers| {
+                modifiers.list.nodes.iter().any(|modifier| {
+                    self.arena.get(*modifier).is_some_and(|modifier| {
+                        matches!(
+                            modifier.kind,
+                            SyntaxKind::PublicKeyword
+                                | SyntaxKind::PrivateKeyword
+                                | SyntaxKind::ProtectedKeyword
+                                | SyntaxKind::ReadonlyKeyword
+                        )
+                    })
+                })
+            })
         })
     }
 
@@ -24828,6 +25070,9 @@ impl Printer<'_> {
                         .commonjs_export_function_declaration(*specifier_id)
                         .is_some()
                     || self
+                        .commonjs_export_class_declaration(*specifier_id)
+                        .is_some()
+                    || self
                         .commonjs_export_variable_declaration(*specifier_id)
                         .is_some())
             {
@@ -24983,6 +25228,7 @@ impl Printer<'_> {
                     || self
                         .commonjs_export_function_declaration(*specifier)
                         .is_some()
+                    || self.commonjs_export_class_declaration(*specifier).is_some()
             })
     }
 
@@ -25046,6 +25292,33 @@ impl Printer<'_> {
                     .name
                     .and_then(|name| declaration_name_text(self.arena, name))
                     == Some(name)
+                && node.parent.is_some_and(|parent| {
+                    matches!(
+                        self.arena.get(parent).map(|parent| &parent.data),
+                        Some(NodeData::SourceFile(_))
+                    )
+                }))
+            .then_some(declaration)
+        })
+    }
+
+    fn commonjs_export_class_declaration(&self, specifier: NodeId) -> Option<NodeId> {
+        let NodeData::ExportSpecifier(specifier) = &self.arena.get(specifier)?.data else {
+            return None;
+        };
+        if specifier.is_type_only {
+            return None;
+        }
+        let local = specifier.property_name.unwrap_or(specifier.name);
+        let name = declaration_name_text(self.arena, local)?;
+        self.arena.iter().find_map(|(declaration, node)| {
+            let NodeData::ClassDeclaration(class) = &node.data else {
+                return None;
+            };
+            (class
+                .name
+                .and_then(|name| declaration_name_text(self.arena, name))
+                == Some(name)
                 && node.parent.is_some_and(|parent| {
                     matches!(
                         self.arena.get(parent).map(|parent| &parent.data),
@@ -25537,6 +25810,12 @@ impl Printer<'_> {
                 self.commonjs_export_initializer_can_be_direct(expression.expression)
             }
             Some(NodeData::SatisfiesExpression(expression)) => {
+                self.commonjs_export_initializer_can_be_direct(expression.expression)
+            }
+            Some(NodeData::NonNullExpression(expression)) => {
+                self.commonjs_export_initializer_can_be_direct(expression.expression)
+            }
+            Some(NodeData::ParenthesizedExpression(expression)) => {
                 self.commonjs_export_initializer_can_be_direct(expression.expression)
             }
             _ => false,
@@ -35059,6 +35338,22 @@ class Board {
         assert!(members.contains("Bar: string;"), "{members}");
         assert!(members.contains("Hello: typeof Hello;"), "{members}");
         assert!(members.contains("Hello2: typeof Hello;"), "{members}");
+    }
+
+    #[test]
+    fn declaration_const_literal_keeps_initializer_when_used_as_computed_key() {
+        let output = emit_declarations_with_semantics(concat!(
+            "export const text = '100'; export const number = 100; ",
+            "export const value = { [text]: true, [number]: false };",
+        ));
+        assert!(
+            output.contains("export declare const text = \"100\";"),
+            "{output}"
+        );
+        assert!(
+            output.contains("export declare const number = 100;"),
+            "{output}"
+        );
     }
 
     #[test]

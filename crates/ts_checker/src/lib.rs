@@ -59,6 +59,8 @@ pub enum TypeKind {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ObjectType {
     pub properties: BTreeMap<String, TypeId>,
+    pub property_order: Vec<String>,
+    pub numeric_properties: BTreeSet<String>,
     pub string_index_type: Option<TypeId>,
     pub number_index_type: Option<TypeId>,
     pub call_signatures: Vec<FunctionType>,
@@ -540,6 +542,8 @@ enum TypeDescriptor {
     Intersection(Vec<Self>),
     Object {
         properties: BTreeMap<String, Self>,
+        property_order: Vec<String>,
+        numeric_properties: BTreeSet<String>,
         string_index_type: Option<Box<Self>>,
         number_index_type: Option<Box<Self>>,
         call_signatures: Vec<Self>,
@@ -625,6 +629,8 @@ impl<'a> ProgramChecker<'a> {
                         let descriptor = exports.get("export=").cloned().unwrap_or_else(|| {
                             TypeDescriptor::Object {
                                 properties: exports,
+                                property_order: Vec::new(),
+                                numeric_properties: BTreeSet::new(),
                                 string_index_type: None,
                                 number_index_type: None,
                                 call_signatures: Vec::new(),
@@ -908,6 +914,8 @@ impl<'a> ProgramChecker<'a> {
                     local.to_owned(),
                     TypeDescriptor::Object {
                         properties: target_exports,
+                        property_order: Vec::new(),
+                        numeric_properties: BTreeSet::new(),
                         string_index_type: None,
                         number_index_type: None,
                         call_signatures: Vec::new(),
@@ -1686,6 +1694,8 @@ impl<'a> ProgramChecker<'a> {
                 let mut descriptor = module_exports.get("export=").cloned().unwrap_or_else(|| {
                     TypeDescriptor::Object {
                         properties: module_exports,
+                        property_order: Vec::new(),
+                        numeric_properties: BTreeSet::new(),
                         string_index_type: None,
                         number_index_type: None,
                         call_signatures: Vec::new(),
@@ -1789,6 +1799,8 @@ impl<'a> ProgramChecker<'a> {
                     *symbol,
                     TypeDescriptor::Object {
                         properties: module_exports,
+                        property_order: Vec::new(),
+                        numeric_properties: BTreeSet::new(),
                         string_index_type: None,
                         number_index_type: None,
                         call_signatures: Vec::new(),
@@ -1911,6 +1923,8 @@ impl<'a> ProgramChecker<'a> {
                                             .map(|descriptor| (name.to_owned(), descriptor))
                                     })
                                     .collect(),
+                                property_order: Vec::new(),
+                                numeric_properties: BTreeSet::new(),
                                 string_index_type: None,
                                 number_index_type: None,
                                 call_signatures: Vec::new(),
@@ -2027,6 +2041,8 @@ fn descriptor_for_declaration_expression(
             }
             Some(TypeDescriptor::Object {
                 properties,
+                property_order: Vec::new(),
+                numeric_properties: BTreeSet::new(),
                 string_index_type: None,
                 number_index_type: None,
                 call_signatures: Vec::new(),
@@ -2672,6 +2688,8 @@ impl<'a> Checker<'a> {
         }
         let enum_type = self.result.types.alloc(TypeKind::Object(ObjectType {
             properties: properties.clone(),
+            property_order: properties.keys().cloned().collect(),
+            numeric_properties: BTreeSet::new(),
             string_index_type: None,
             number_index_type: None,
             call_signatures: Vec::new(),
@@ -3462,6 +3480,8 @@ impl<'a> Checker<'a> {
     #[allow(clippy::too_many_lines)]
     fn object_type_from_members(&mut self, members: &[NodeId]) -> TypeId {
         let mut properties = BTreeMap::new();
+        let mut property_order = Vec::new();
+        let mut numeric_properties = BTreeSet::new();
         let mut optional_properties = BTreeSet::new();
         let mut readonly_properties = BTreeSet::new();
         let mut getter_properties = BTreeSet::new();
@@ -3480,6 +3500,12 @@ impl<'a> Checker<'a> {
             match &node.data {
                 NodeData::PropertyDeclaration(data) => {
                     if let Some(name) = self.type_property_name(data.name) {
+                        if !properties.contains_key(&name) {
+                            property_order.push(name.clone());
+                        }
+                        if self.type_property_name_is_numeric(data.name) {
+                            numeric_properties.insert(name.clone());
+                        }
                         let is_auto_accessor = self
                             .has_ast_modifier(data.modifiers.as_ref(), SyntaxKind::AccessorKeyword);
                         let is_static = self
@@ -3538,6 +3564,12 @@ impl<'a> Checker<'a> {
                 }
                 NodeData::PropertySignatureDeclaration(data) => {
                     if let Some(name) = self.type_property_name(data.name) {
+                        if !properties.contains_key(&name) {
+                            property_order.push(name.clone());
+                        }
+                        if self.type_property_name_is_numeric(data.name) {
+                            numeric_properties.insert(name.clone());
+                        }
                         let mut property_type = self.type_from_type_node(data.type_);
                         if self.is_question_token(data.postfix_token) {
                             optional_properties.insert(name.clone());
@@ -3585,6 +3617,8 @@ impl<'a> Checker<'a> {
                             ) {
                             let this_type = self.result.types.alloc(TypeKind::Object(ObjectType {
                                 properties: properties.clone(),
+                                property_order: property_order.clone(),
+                                numeric_properties: numeric_properties.clone(),
                                 string_index_type,
                                 number_index_type,
                                 call_signatures: call_signatures.clone(),
@@ -3730,6 +3764,8 @@ impl<'a> Checker<'a> {
                     if let Some(name) = self.property_name(data.name) {
                         let this_type = self.result.types.alloc(TypeKind::Object(ObjectType {
                             properties: properties.clone(),
+                            property_order: property_order.clone(),
+                            numeric_properties: numeric_properties.clone(),
                             string_index_type,
                             number_index_type,
                             call_signatures: call_signatures.clone(),
@@ -3810,6 +3846,8 @@ impl<'a> Checker<'a> {
         readonly_properties.extend(getter_properties.difference(&setter_properties).cloned());
         self.result.types.alloc(TypeKind::Object(ObjectType {
             properties,
+            property_order,
+            numeric_properties,
             string_index_type,
             number_index_type,
             call_signatures,
@@ -4180,6 +4218,8 @@ impl<'a> Checker<'a> {
         }
         self.type_parameter_scopes.push(scope);
         let mut properties = BTreeMap::new();
+        let mut property_order = Vec::new();
+        let mut numeric_properties = BTreeSet::new();
         let mut optional_properties = BTreeSet::new();
         let mut readonly_properties = BTreeSet::new();
         let mut getter_properties = BTreeSet::new();
@@ -4229,6 +4269,12 @@ impl<'a> Checker<'a> {
                         number_index_type = base.number_index_type.or(number_index_type);
                         call_signatures.extend(base.call_signatures);
                         construct_signatures.extend(base.construct_signatures);
+                        for name in base.property_order {
+                            if !property_order.contains(&name) {
+                                property_order.push(name);
+                            }
+                        }
+                        numeric_properties.extend(base.numeric_properties);
                         properties.extend(base.properties);
                         optional_properties.extend(base.optional_properties);
                         readonly_properties.extend(base.readonly_properties);
@@ -4244,6 +4290,12 @@ impl<'a> Checker<'a> {
             number_index_type = own.number_index_type.or(number_index_type);
             call_signatures.extend(own.call_signatures);
             construct_signatures.extend(own.construct_signatures);
+            for name in own.property_order {
+                if !property_order.contains(&name) {
+                    property_order.push(name);
+                }
+            }
+            numeric_properties.extend(own.numeric_properties);
             properties.extend(own.properties);
             optional_properties.extend(own.optional_properties);
             readonly_properties.extend(own.readonly_properties);
@@ -4253,6 +4305,8 @@ impl<'a> Checker<'a> {
         }
         let result = self.result.types.alloc(TypeKind::Object(ObjectType {
             properties,
+            property_order,
+            numeric_properties,
             string_index_type,
             number_index_type,
             call_signatures,
@@ -8775,6 +8829,8 @@ impl<'a> Checker<'a> {
                     .collect();
                 self.result.types.alloc(TypeKind::Object(ObjectType {
                     properties,
+                    property_order: object.property_order,
+                    numeric_properties: object.numeric_properties,
                     string_index_type,
                     number_index_type,
                     call_signatures: object.call_signatures,
@@ -10264,7 +10320,9 @@ impl<'a> Checker<'a> {
             }
         }
         self.result.types.alloc(TypeKind::Object(ObjectType {
+            property_order: properties.keys().cloned().collect(),
             properties,
+            numeric_properties: BTreeSet::new(),
             string_index_type: None,
             number_index_type: None,
             call_signatures: Vec::new(),
@@ -10786,6 +10844,8 @@ impl<'a> Checker<'a> {
             }
             TypeDescriptor::Object {
                 properties,
+                property_order,
+                numeric_properties,
                 string_index_type,
                 number_index_type,
                 call_signatures,
@@ -10830,6 +10890,8 @@ impl<'a> Checker<'a> {
                     .map(|index| self.import_type(index));
                 self.result.types.alloc(TypeKind::Object(ObjectType {
                     properties,
+                    property_order: property_order.clone(),
+                    numeric_properties: numeric_properties.clone(),
                     string_index_type,
                     number_index_type,
                     call_signatures,
@@ -10976,6 +11038,8 @@ impl<'a> Checker<'a> {
                 self.result.types.intersection(members)
             }
             Some(TypeKind::Object(object)) => {
+                let property_order = object.property_order;
+                let numeric_properties = object.numeric_properties;
                 let optional_properties = object.optional_properties;
                 let readonly_properties = object.readonly_properties;
                 let getter_properties = object.getter_properties;
@@ -11007,6 +11071,8 @@ impl<'a> Checker<'a> {
                     .collect();
                 self.result.types.alloc(TypeKind::Object(ObjectType {
                     properties,
+                    property_order,
+                    numeric_properties,
                     string_index_type,
                     number_index_type,
                     call_signatures,
@@ -11267,6 +11333,17 @@ impl<'a> Checker<'a> {
             })
         });
         (!enum_object).then(|| format!("[{text}]"))
+    }
+
+    fn type_property_name_is_numeric(&self, node: NodeId) -> bool {
+        match &self.arena.get(node).map(|node| &node.data) {
+            Some(NodeData::NumericLiteral(_)) => true,
+            Some(NodeData::ComputedPropertyName(computed)) => matches!(
+                self.enum_external_constant(computed.expression),
+                Some(Value::Number(_))
+            ),
+            _ => false,
+        }
     }
 
     fn resolve_computed_type_key_symbol(&self, expression: NodeId) -> Option<SymbolId> {
@@ -12633,6 +12710,8 @@ fn describe_type_node_syntax(
         NodeData::TypeLiteralNode(literal) => {
             let TypeDescriptor::Object {
                 mut properties,
+                property_order,
+                numeric_properties,
                 string_index_type,
                 number_index_type,
                 call_signatures,
@@ -12671,6 +12750,8 @@ fn describe_type_node_syntax(
             }
             TypeDescriptor::Object {
                 properties,
+                property_order,
+                numeric_properties,
                 string_index_type,
                 number_index_type,
                 call_signatures,
@@ -13360,6 +13441,8 @@ fn describe_type_with_imports_inner(
                 .iter()
                 .map(|(name, property)| (name.clone(), describe(*property)))
                 .collect(),
+            property_order: object.property_order.clone(),
+            numeric_properties: object.numeric_properties.clone(),
             string_index_type: object
                 .string_index_type
                 .map(|index| Box::new(describe(index))),
@@ -13517,6 +13600,8 @@ fn substitute_descriptor(
         ),
         TypeDescriptor::Object {
             properties,
+            property_order,
+            numeric_properties,
             string_index_type,
             number_index_type,
             call_signatures,
@@ -13531,6 +13616,8 @@ fn substitute_descriptor(
                     (name.clone(), substitute_descriptor(property, substitutions))
                 })
                 .collect(),
+            property_order: property_order.clone(),
+            numeric_properties: numeric_properties.clone(),
             string_index_type: string_index_type
                 .as_ref()
                 .map(|index| Box::new(substitute_descriptor(index, substitutions))),
@@ -13930,6 +14017,23 @@ fn enum_constant_literal(arena: &NodeArena, expression: NodeId) -> Option<Value>
         }
         NodeData::ParenthesizedExpression(parenthesized) => {
             enum_constant_literal(arena, parenthesized.expression)
+        }
+        NodeData::PrefixUnaryExpression(prefix)
+            if matches!(
+                prefix.operator,
+                SyntaxKind::PlusToken | SyntaxKind::MinusToken
+            ) =>
+        {
+            let Value::Number(value) = enum_constant_literal(arena, prefix.operand)? else {
+                return None;
+            };
+            Some(Value::Number(Number::new(
+                if prefix.operator == SyntaxKind::MinusToken {
+                    -value.value()
+                } else {
+                    value.value()
+                },
+            )))
         }
         _ => None,
     }
@@ -16491,6 +16595,8 @@ mod tests {
                 type_arguments: Vec::new(),
                 target: Box::new(TypeDescriptor::Object {
                     properties: BTreeMap::from([("x".into(), TypeDescriptor::Number)]),
+                    property_order: Vec::new(),
+                    numeric_properties: BTreeSet::new(),
                     string_index_type: None,
                     number_index_type: None,
                     call_signatures: Vec::new(),
@@ -17770,6 +17876,108 @@ mod tests {
             checked.files[1].diagnostics.is_empty(),
             "{:?}",
             checked.files[1].diagnostics
+        );
+    }
+
+    #[test]
+    fn preserves_imported_object_property_order_and_numeric_names() {
+        let dependency = parse_source_file(concat!(
+            "export const n = 'A'; export const poz = 1; export const neg = -1; ",
+            "export const o = () => null! as { ",
+            "[n]: string, foo: string, [poz]: number, [neg]: number };",
+        ));
+        let consumer = parse_source_file("import { o } from './dependency'; export const g = o;");
+        let dependency_bindings = bind_source_file(&dependency.arena, dependency.source_file);
+        let consumer_bindings = bind_source_file(&consumer.arena, consumer.source_file);
+        let no_modules = BTreeMap::new();
+        let consumer_modules = BTreeMap::from([("./dependency".into(), 0)]);
+        let checked = check_program(&[
+            ProgramSource {
+                arena: &dependency.arena,
+                source_file: dependency.source_file,
+                bindings: &dependency_bindings,
+                resolved_modules: &no_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+            ProgramSource {
+                arena: &consumer.arena,
+                source_file: consumer.source_file,
+                bindings: &consumer_bindings,
+                resolved_modules: &consumer_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+        ]);
+        let type_literal = dependency
+            .arena
+            .iter()
+            .find_map(|(id, node)| matches!(node.data, NodeData::TypeLiteralNode(_)).then_some(id))
+            .unwrap();
+        let mut direct_checker = Checker::new(&dependency.arena, &dependency_bindings);
+        direct_checker.seed_symbol_types();
+        let literal_type = direct_checker.type_from_type_node(type_literal);
+        let TypeKind::Object(literal_object) =
+            &direct_checker.result.types.get(literal_type).unwrap().kind
+        else {
+            panic!("expected literal object type");
+        };
+        assert_eq!(literal_object.property_order, ["A", "foo", "1", "-1"]);
+        let dependency_symbol = dependency_bindings
+            .root_scope()
+            .unwrap()
+            .symbols
+            .get("o")
+            .unwrap();
+        let dependency_type = checked.files[0].type_of_symbol(dependency_symbol).unwrap();
+        let TypeKind::Function(dependency_function) =
+            &checked.files[0].types.get(dependency_type).unwrap().kind
+        else {
+            panic!("expected dependency function type");
+        };
+        let TypeKind::Object(dependency_object) = &checked.files[0]
+            .types
+            .get(dependency_function.return_type)
+            .unwrap()
+            .kind
+        else {
+            panic!("expected dependency object return type");
+        };
+        assert_eq!(dependency_object.property_order, ["A", "foo", "1", "-1"]);
+        let TypeDescriptor::Function { return_type, .. } =
+            super::describe_checked_type(&checked.files[0], dependency_type)
+        else {
+            panic!("expected dependency descriptor function");
+        };
+        let TypeDescriptor::Object { property_order, .. } = *return_type else {
+            panic!("expected dependency descriptor object");
+        };
+        assert_eq!(property_order, ["A", "foo", "1", "-1"]);
+        let symbol = consumer_bindings
+            .root_scope()
+            .unwrap()
+            .symbols
+            .get("g")
+            .unwrap();
+        let type_id = checked.files[1].type_of_symbol(symbol).unwrap();
+        let TypeKind::Function(function) = &checked.files[1].types.get(type_id).unwrap().kind
+        else {
+            panic!("expected function type");
+        };
+        let TypeKind::Object(object) = &checked.files[1]
+            .types
+            .get(function.return_type)
+            .unwrap()
+            .kind
+        else {
+            panic!("expected object return type");
+        };
+        assert_eq!(object.property_order, ["A", "foo", "1", "-1"]);
+        assert_eq!(
+            object.numeric_properties,
+            BTreeSet::from(["1".into(), "-1".into()])
         );
     }
 
