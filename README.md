@@ -36,8 +36,8 @@ against the upstream TypeScript fixtures independently:
 Run the current checks with:
 
 ```sh
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
+./scripts/run-cargo-capped.sh test --workspace
+./scripts/run-cargo-capped.sh clippy --workspace --all-targets -- -D warnings
 ```
 
 Or run the complete local gate, including generated-source checks:

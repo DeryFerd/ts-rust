@@ -319,6 +319,14 @@ impl<'a> Binder<'a> {
         let Some(node) = self.arena.get(node_id) else {
             return;
         };
+        if self.implicit_export_depth > 0 && self.has_modifier(node_id, SyntaxKind::DeclareKeyword)
+        {
+            let message = message_by_code(1038).expect("binder diagnostic is in catalog");
+            self.result.diagnostics.push(BindDiagnostic {
+                node: node_id,
+                diagnostic: Diagnostic::new(message),
+            });
+        }
         match &node.data {
             NodeData::SourceFile(data) => {
                 for statement in &data.statements.nodes {

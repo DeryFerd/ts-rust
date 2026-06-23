@@ -18,6 +18,13 @@ impl TypeId {
     }
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum TypeTruthiness {
+    Always,
+    Maybe,
+    Never,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum TypeKind {
     Any,
@@ -969,6 +976,26 @@ impl<'a> ProgramChecker<'a> {
         Some(describe_type(&checker.result.types, value_type))
     }
 
+    fn describe_namespace_member_value(
+        source: &ProgramSource<'_>,
+        symbol_id: SymbolId,
+    ) -> Option<TypeDescriptor> {
+        let symbol = source.bindings.symbols.get(symbol_id)?;
+        if !symbol.flags.contains(ts_binder::SymbolFlags::CLASS) {
+            return None;
+        }
+        let mut names = vec![symbol.name.clone()];
+        let mut parent = symbol.parent;
+        while let Some(parent_id) = parent {
+            let parent_symbol = source.bindings.symbols.get(parent_id)?;
+            names.push(parent_symbol.name.clone());
+            parent = parent_symbol.parent;
+        }
+        names.reverse();
+        Self::describe_value_symbol(source, symbol_id)
+            .map(|descriptor| name_constructor_return(descriptor, &names.join(".")))
+    }
+
     #[allow(clippy::too_many_lines)]
     fn import_runtime_meaning(
         &self,
@@ -1746,10 +1773,13 @@ impl<'a> ProgramChecker<'a> {
                                     .members
                                     .iter()
                                     .filter_map(|(name, member)| {
-                                        descriptors
-                                            .get(&member)
-                                            .and_then(Option::as_ref)
-                                            .cloned()
+                                        Self::describe_namespace_member_value(source, member)
+                                            .or_else(|| {
+                                                descriptors
+                                                    .get(&member)
+                                                    .and_then(Option::as_ref)
+                                                    .cloned()
+                                            })
                                             .map(|descriptor| (name.to_owned(), descriptor))
                                     })
                                     .collect(),
@@ -1826,6 +1856,32 @@ fn descriptor_property(descriptor: &TypeDescriptor, property: &str) -> Option<Ty
         | TypeDescriptor::Named { target, .. }
         | TypeDescriptor::ConstEnum(target) => descriptor_property(target, property),
         _ => None,
+    }
+}
+
+fn name_constructor_return(descriptor: TypeDescriptor, name: &str) -> TypeDescriptor {
+    match descriptor {
+        TypeDescriptor::Constructor {
+            parameters,
+            rest_parameter,
+            return_type,
+            parameters_optional,
+        } => TypeDescriptor::Constructor {
+            parameters,
+            rest_parameter,
+            return_type: Box::new(TypeDescriptor::Named {
+                name: name.to_owned(),
+                target: return_type,
+            }),
+            parameters_optional,
+        },
+        TypeDescriptor::Intersection(members) => TypeDescriptor::Intersection(
+            members
+                .into_iter()
+                .map(|member| name_constructor_return(member, name))
+                .collect(),
+        ),
+        descriptor => descriptor,
     }
 }
 
@@ -3130,7 +3186,19 @@ impl<'a> Checker<'a> {
                             .type_
                             .map(|type_node| self.type_from_type_node(type_node))
                             .or_else(|| {
-                                data.initializer.map(|value| self.type_of_expression(value))
+                                data.initializer.map(|value| {
+                                    let type_id = self.type_of_expression(value);
+                                    if !self.options.strict_null_checks
+                                        && matches!(
+                                            self.result.types.get(type_id).map(|type_| &type_.kind),
+                                            Some(TypeKind::Null | TypeKind::Undefined)
+                                        )
+                                    {
+                                        self.result.types.any()
+                                    } else {
+                                        type_id
+                                    }
+                                })
                             })
                             .or(assignment_type)
                             .unwrap_or_else(|| self.result.types.any());
@@ -4049,6 +4117,7 @@ impl<'a> Checker<'a> {
         type_id
     }
 
+    #[allow(clippy::too_many_lines)]
     fn collect_object_literal_properties(
         &mut self,
         object: &ts_ast::ObjectLiteralExpressionData,
@@ -4088,6 +4157,16 @@ impl<'a> Checker<'a> {
                         );
                     }
                     let actual = self.type_of_expression_context(data.initializer, expected);
+                    let actual = if expected.is_none()
+                        && !self.options.strict_null_checks
+                        && matches!(
+                            self.result.types.get(actual).map(|type_| &type_.kind),
+                            Some(TypeKind::Null | TypeKind::Undefined)
+                        ) {
+                        self.result.types.any()
+                    } else {
+                        actual
+                    };
                     if let Some(expected) = expected
                         && !self.is_assignable(actual, expected)
                         && !(self.options.exact_optional_property_types
@@ -4900,7 +4979,13 @@ impl<'a> Checker<'a> {
             };
             let type_id = match data.type_ {
                 Some(node) => self.type_from_type_node(node),
-                None => self.result.types.any(),
+                None => match data.initializer {
+                    Some(initializer) => {
+                        let type_id = self.type_of_expression(initializer);
+                        self.widen_literal(type_id)
+                    }
+                    None => self.result.types.any(),
+                },
             };
             scope.insert(name, type_id);
         }
@@ -5277,6 +5362,115 @@ impl<'a> Checker<'a> {
         }
     }
 
+    fn type_truthiness(&self, type_id: TypeId) -> TypeTruthiness {
+        let Some(kind) = self
+            .result
+            .types
+            .get(type_id)
+            .map(|type_| type_.kind.clone())
+        else {
+            return TypeTruthiness::Maybe;
+        };
+        match kind {
+            TypeKind::Void
+            | TypeKind::Undefined
+            | TypeKind::Null
+            | TypeKind::BooleanLiteral(false) => TypeTruthiness::Never,
+            TypeKind::NumberLiteral(value) => {
+                if value.parse::<f64>().is_ok_and(|value| value == 0.0) {
+                    TypeTruthiness::Never
+                } else {
+                    TypeTruthiness::Always
+                }
+            }
+            TypeKind::StringLiteral(value) => {
+                if value.is_empty() {
+                    TypeTruthiness::Never
+                } else {
+                    TypeTruthiness::Always
+                }
+            }
+            TypeKind::BigIntLiteral(value) => {
+                let digits = value.trim_end_matches('n').trim_start_matches(['+', '-']);
+                if !digits.is_empty() && digits.chars().all(|digit| digit == '0' || digit == '_') {
+                    TypeTruthiness::Never
+                } else {
+                    TypeTruthiness::Always
+                }
+            }
+            TypeKind::Never
+            | TypeKind::BooleanLiteral(true)
+            | TypeKind::Array(_)
+            | TypeKind::Tuple(_)
+            | TypeKind::ReadonlyTuple(_)
+            | TypeKind::Object(_)
+            | TypeKind::Function(_)
+            | TypeKind::Constructor(_)
+            | TypeKind::Overload(_) => TypeTruthiness::Always,
+            TypeKind::Union(members) => {
+                let mut truthiness = members
+                    .into_iter()
+                    .map(|member| self.type_truthiness(member));
+                let Some(first) = truthiness.next() else {
+                    return TypeTruthiness::Always;
+                };
+                if truthiness.all(|current| current == first) {
+                    first
+                } else {
+                    TypeTruthiness::Maybe
+                }
+            }
+            TypeKind::Intersection(members) => {
+                if members
+                    .into_iter()
+                    .any(|member| self.type_truthiness(member) == TypeTruthiness::Always)
+                {
+                    TypeTruthiness::Always
+                } else {
+                    TypeTruthiness::Maybe
+                }
+            }
+            TypeKind::TypeParameter {
+                constraint: Some(constraint),
+                ..
+            } if self.type_truthiness(constraint) == TypeTruthiness::Always => {
+                TypeTruthiness::Always
+            }
+            TypeKind::Any
+            | TypeKind::Unknown
+            | TypeKind::Boolean
+            | TypeKind::Number
+            | TypeKind::String
+            | TypeKind::BigInt
+            | TypeKind::TypeParameter { .. } => TypeTruthiness::Maybe,
+        }
+    }
+
+    fn logical_or_type(&mut self, left: TypeId, right: TypeId) -> TypeId {
+        if self.type_truthiness(left) == TypeTruthiness::Always {
+            return left;
+        }
+        let mut members = Vec::new();
+        for member in self.union_members(left) {
+            match self.type_truthiness(member) {
+                TypeTruthiness::Always => members.push(member),
+                TypeTruthiness::Never => {}
+                TypeTruthiness::Maybe => {
+                    if matches!(
+                        self.result.types.get(member).map(|type_| &type_.kind),
+                        Some(TypeKind::Boolean)
+                    ) {
+                        members.push(self.result.types.alloc(TypeKind::BooleanLiteral(true)));
+                    } else {
+                        members.push(member);
+                    }
+                }
+            }
+        }
+        members.push(right);
+        self.result.types.union(members)
+    }
+
     fn narrow_truthiness(&mut self, original: TypeId, truthy: bool) -> TypeId {
         let mut filtered = Vec::new();
         for member in self.union_members(original) {
@@ -5512,6 +5706,10 @@ impl<'a> Checker<'a> {
                 }
             }
             NodeData::PrefixUnaryExpression(data) => self.prefix_unary_type(data),
+            NodeData::VoidExpression(data) => {
+                self.type_of_expression(data.expression);
+                self.result.types.undefined()
+            }
             NodeData::BinaryExpression(data) => {
                 let left = self.type_of_expression(data.left);
                 let right = self.type_of_expression(data.right);
@@ -5685,20 +5883,19 @@ impl<'a> Checker<'a> {
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default();
-                let explicit_class_value = (!type_arguments.is_empty())
-                    .then(|| self.resolve_value_expression_symbol(data.expression))
-                    .flatten()
+                let declared_class_value = self
+                    .resolve_value_expression_symbol(data.expression)
                     .and_then(|symbol| {
                         self.instantiate_declared_class_value(symbol, &type_arguments)
                     });
-                let callee = explicit_class_value
+                let callee = declared_class_value
                     .unwrap_or_else(|| self.type_of_expression(data.expression));
                 let arguments = data.arguments.as_ref().map_or(&[][..], |list| &list.nodes);
                 let previous = self.preserve_literal_inference;
                 self.preserve_literal_inference = false;
                 let result = self.call_expression_type(node_id, callee, arguments, true);
                 self.preserve_literal_inference = previous;
-                result
+                self.preserve_constructed_type_name(result, data.expression, &type_arguments)
             }
             NodeData::DeleteExpression(data) => {
                 let operand = self.type_of_expression(data.expression);
@@ -6236,13 +6433,25 @@ impl<'a> Checker<'a> {
         ) {
             let mut saw_return = false;
             self.check_node(data.body, expected_return, &mut saw_return);
-            expected_return.unwrap_or_else(|| {
-                if self.options.is_javascript_file && !saw_return {
-                    self.result.types.void()
-                } else {
+            if let Some(expected_return) = expected_return {
+                expected_return
+            } else if saw_return {
+                let return_types = self
+                    .function_return_expressions(data.body)
+                    .into_iter()
+                    .map(|expression| {
+                        let type_id = self.type_of_expression(expression);
+                        self.widen_literal(type_id)
+                    })
+                    .collect::<Vec<_>>();
+                if return_types.is_empty() {
                     self.result.types.any()
+                } else {
+                    self.result.types.union(return_types)
                 }
-            })
+            } else {
+                self.result.types.void()
+            }
         } else {
             let return_context = expected_return.filter(|expected| {
                 !matches!(
@@ -7502,6 +7711,9 @@ impl<'a> Checker<'a> {
         left: TypeId,
         right: TypeId,
     ) -> TypeId {
+        if operator == SyntaxKind::BarBarToken {
+            return self.logical_or_type(left, right);
+        }
         if matches!(
             self.result.types.get(left).map(|type_| &type_.kind),
             Some(TypeKind::Any)
@@ -7557,9 +7769,9 @@ impl<'a> Checker<'a> {
             | SyntaxKind::ExclamationEqualsEqualsToken
             | SyntaxKind::InKeyword
             | SyntaxKind::InstanceOfKeyword => self.result.types.boolean(),
-            SyntaxKind::AmpersandAmpersandToken
-            | SyntaxKind::BarBarToken
-            | SyntaxKind::QuestionQuestionToken => self.result.types.union([left, right]),
+            SyntaxKind::AmpersandAmpersandToken | SyntaxKind::QuestionQuestionToken => {
+                self.result.types.union([left, right])
+            }
             SyntaxKind::CommaToken => right,
             SyntaxKind::EqualsToken => {
                 if !self.is_assignable(right, left) {
@@ -8011,7 +8223,13 @@ impl<'a> Checker<'a> {
                 );
                 let base = match data.type_ {
                     Some(node) => self.type_from_type_node(node),
-                    None => self.result.types.any(),
+                    None => match data.initializer {
+                        Some(initializer) => {
+                            let type_id = self.type_of_expression(initializer);
+                            self.widen_literal(type_id)
+                        }
+                        None => self.result.types.any(),
+                    },
                 };
                 let base = if data.dot_dot_dot_token.is_some()
                     && !matches!(
@@ -9313,6 +9531,9 @@ impl<'a> Checker<'a> {
             .get(type_id)
             .map(|value| value.kind.clone())
         {
+            Some(TypeKind::Null | TypeKind::Undefined) if !self.options.strict_null_checks => {
+                self.result.types.any()
+            }
             Some(TypeKind::NumberLiteral(_)) => self.result.types.number(),
             Some(TypeKind::StringLiteral(_)) => self.result.types.string(),
             Some(TypeKind::BigIntLiteral(_)) => self.result.types.bigint(),
@@ -9486,6 +9707,63 @@ impl<'a> Checker<'a> {
             }
             _ => None,
         }
+    }
+
+    fn value_expression_text(&self, expression: NodeId) -> Option<String> {
+        match &self.arena.get(expression)?.data {
+            NodeData::Identifier(identifier) => Some(identifier.text.clone()),
+            NodeData::PropertyAccessExpression(access) => Some(format!(
+                "{}.{}",
+                self.value_expression_text(access.expression)?,
+                self.property_name(access.name)?,
+            )),
+            NodeData::ParenthesizedExpression(parenthesized) => {
+                self.value_expression_text(parenthesized.expression)
+            }
+            _ => None,
+        }
+    }
+
+    fn preserve_constructed_type_name(
+        &mut self,
+        type_id: TypeId,
+        expression: NodeId,
+        type_arguments: &[TypeId],
+    ) -> TypeId {
+        let Some(symbol) = self.resolve_value_expression_symbol(expression) else {
+            return type_id;
+        };
+        let is_class = self.bindings.symbols.get(symbol).is_some_and(|symbol| {
+            symbol.declarations.iter().any(|declaration| {
+                matches!(
+                    self.arena.get(*declaration).map(|node| &node.data),
+                    Some(NodeData::ClassDeclaration(_))
+                )
+            })
+        });
+        if !is_class || self.result.import_type_references.contains_key(&type_id) {
+            return type_id;
+        }
+        let Some(kind @ (TypeKind::Object(_) | TypeKind::Union(_) | TypeKind::Intersection(_))) =
+            self.result
+                .types
+                .get(type_id)
+                .map(|type_| type_.kind.clone())
+        else {
+            return type_id;
+        };
+        let Some(name) = self.value_expression_text(expression) else {
+            return type_id;
+        };
+        let named = self.result.types.alloc(kind);
+        self.result.named_type_references.insert(
+            named,
+            NamedTypeReference {
+                name,
+                type_arguments: type_arguments.to_vec(),
+            },
+        );
+        named
     }
 
     fn resolve_type_entity_symbol(&self, entity: NodeId) -> Option<SymbolId> {
@@ -12155,6 +12433,97 @@ mod tests {
     }
 
     #[test]
+    fn infers_widened_default_parameter_and_method_return_types() {
+        let parsed = parse_source_file(
+            r#"
+                class Example {
+                    f() { return ""; }
+                    h(x = 4, nullable = null, label = "") {}
+                }
+                function defaults(x = 1, nullable = null, label = "") { return label; }
+            "#,
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file_with_options(
+            &parsed.arena,
+            parsed.source_file,
+            &bindings,
+            CheckerOptions {
+                strict_null_checks: false,
+                ..CheckerOptions::default()
+            },
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let root = bindings.root_scope().unwrap();
+        let example = result
+            .type_of_symbol(root.symbols.get("Example").unwrap())
+            .unwrap();
+        let TypeKind::Object(example) = &result.types.get(example).unwrap().kind else {
+            panic!("expected class instance type");
+        };
+        let TypeKind::Function(f) = &result.types.get(example.properties["f"]).unwrap().kind else {
+            panic!("expected f method");
+        };
+        assert_eq!(f.return_type, result.types.string());
+        let TypeKind::Function(h) = &result.types.get(example.properties["h"]).unwrap().kind else {
+            panic!("expected h method");
+        };
+        assert_eq!(
+            h.parameters,
+            [
+                result.types.number(),
+                result.types.any(),
+                result.types.string()
+            ]
+        );
+        assert_eq!(h.return_type, result.types.void());
+
+        let defaults = result
+            .type_of_symbol(root.symbols.get("defaults").unwrap())
+            .unwrap();
+        let TypeKind::Function(defaults) = &result.types.get(defaults).unwrap().kind else {
+            panic!("expected defaults function");
+        };
+        assert_eq!(
+            defaults.parameters,
+            [
+                result.types.number(),
+                result.types.any(),
+                result.types.string()
+            ]
+        );
+        assert_eq!(defaults.return_type, result.types.string());
+
+        let strict = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        assert!(strict.diagnostics.is_empty(), "{:?}", strict.diagnostics);
+        let strict_example = strict
+            .type_of_symbol(root.symbols.get("Example").unwrap())
+            .unwrap();
+        let TypeKind::Object(strict_example) = &strict.types.get(strict_example).unwrap().kind
+        else {
+            panic!("expected strict class instance type");
+        };
+        let TypeKind::Function(strict_h) = &strict
+            .types
+            .get(strict_example.properties["h"])
+            .unwrap()
+            .kind
+        else {
+            panic!("expected strict h method");
+        };
+        assert_eq!(strict_h.parameters[1], strict.types.null());
+        let strict_defaults = strict
+            .type_of_symbol(root.symbols.get("defaults").unwrap())
+            .unwrap();
+        let TypeKind::Function(strict_defaults) = &strict.types.get(strict_defaults).unwrap().kind
+        else {
+            panic!("expected strict defaults function");
+        };
+        assert_eq!(strict_defaults.parameters[1], strict.types.null());
+    }
+
+    #[test]
     fn infers_anonymous_class_function_returns_and_inherited_parameter_properties() {
         let parsed = parse_source_file(
             r"
@@ -13196,6 +13565,28 @@ mod tests {
     }
 
     #[test]
+    fn retains_named_generic_alias_provenance_through_call_inference() {
+        let parsed = parse_source_file(
+            "type Box<T> = { get: () => T; set: (value: T) => void }; declare function box<T>(value: T): Box<T>; const value = box(0);",
+        );
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        let value = bindings.root_scope().unwrap().symbols.get("value").unwrap();
+        let type_id = result.type_of_symbol(value).unwrap();
+        let reference = result
+            .named_type_references
+            .get(&type_id)
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing Box provenance for {}",
+                    result.types.display(type_id)
+                )
+            });
+        assert_eq!(reference.name, "Box");
+        assert_eq!(reference.type_arguments, [result.types.number()]);
+    }
+
+    #[test]
     fn const_assertions_preserve_readonly_tuple_objects_and_literals() {
         let parsed =
             parse_source_file(r#"const ALL_BARS = [{ name: "a" }, { name: "b" }] as const;"#);
@@ -13757,6 +14148,68 @@ mod tests {
     }
 
     #[test]
+    fn preserves_erroneous_ambient_class_construction_across_files() {
+        let declarations = parse_source_file(
+            r"
+                declare namespace M {
+                    declare var x;
+                    declare function f();
+                    declare namespace N {}
+                    declare class C {}
+                }
+            ",
+        );
+        let client = parse_source_file("var value = new M.C();");
+        let declaration_bindings = bind_source_file(&declarations.arena, declarations.source_file);
+        let client_bindings = bind_source_file(&client.arena, client.source_file);
+        assert!(
+            declaration_bindings
+                .diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.diagnostic.code() == 1038 })
+        );
+        let no_modules = BTreeMap::new();
+        let checked = check_program(&[
+            ProgramSource {
+                arena: &declarations.arena,
+                source_file: declarations.source_file,
+                bindings: &declaration_bindings,
+                resolved_modules: &no_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+            ProgramSource {
+                arena: &client.arena,
+                source_file: client.source_file,
+                bindings: &client_bindings,
+                resolved_modules: &no_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+        ]);
+        assert!(
+            checked.files[1].diagnostics.is_empty(),
+            "{:?}",
+            checked.files[1].diagnostics
+        );
+        let value = client_bindings
+            .root_scope()
+            .unwrap()
+            .symbols
+            .get("value")
+            .unwrap();
+        let value_type = checked.files[1].type_of_symbol(value).unwrap();
+        let reference = checked.files[1]
+            .named_type_references
+            .get(&value_type)
+            .expect("new M.C() should retain its cross-file class name");
+        assert_eq!(reference.name, "M.C");
+        assert!(reference.type_arguments.is_empty());
+    }
+
+    #[test]
     fn preserves_callable_types_when_functions_merge_with_namespaces() {
         let parsed = parse_source_file(
             r"
@@ -13843,6 +14296,54 @@ mod tests {
                 .map(|diagnostic| diagnostic.diagnostic.render().unwrap())
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn infers_logical_or_from_truthy_left_constituents() {
+        let parsed = parse_source_file(
+            r#"
+                const callable = (() => 1) || "unreachable";
+                const object = {} || "unreachable";
+                const falseResult = false || "fallback";
+                const zeroResult = 0 || "fallback";
+                const emptyResult = "" || 1;
+                let maybe: (() => number) | null;
+                const mixed = maybe || "fallback";
+                let booleanValue: boolean;
+                const booleanResult: true | string = booleanValue || "fallback";
+            "#,
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let root = bindings.root_scope().unwrap();
+        let kind = |name: &str| {
+            let symbol = root.symbols.get(name).unwrap();
+            &result
+                .types
+                .get(result.type_of_symbol(symbol).unwrap())
+                .unwrap()
+                .kind
+        };
+
+        assert!(matches!(kind("callable"), TypeKind::Function(_)));
+        assert!(matches!(kind("object"), TypeKind::Object(_)));
+        assert!(
+            matches!(kind("falseResult"), TypeKind::StringLiteral(value) if value == "fallback")
+        );
+        assert!(
+            matches!(kind("zeroResult"), TypeKind::StringLiteral(value) if value == "fallback")
+        );
+        assert!(matches!(kind("emptyResult"), TypeKind::NumberLiteral(value) if value == "1"));
+        let TypeKind::Union(mixed) = kind("mixed") else {
+            panic!("expected truthy function and fallback union");
+        };
+        assert_eq!(mixed.len(), 2);
+        assert!(mixed.iter().any(|member| matches!(
+            result.types.get(*member).map(|type_| &type_.kind),
+            Some(TypeKind::Function(_))
+        )));
     }
 
     #[test]

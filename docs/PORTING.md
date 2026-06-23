@@ -31,9 +31,9 @@ implemented.
 Near-term gates are:
 
 ```sh
-cargo fmt --all -- --check
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
+./scripts/run-cargo-capped.sh fmt --all -- --check
+./scripts/run-cargo-capped.sh test --workspace
+./scripts/run-cargo-capped.sh clippy --workspace --all-targets -- -D warnings
 ```
 
 Full completion requires all upstream local and TypeScript-submodule baselines,

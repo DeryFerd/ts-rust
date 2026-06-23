@@ -16,10 +16,12 @@ checkout with Go 1.26.4:
 
 ```sh
 CGO_ENABLED=0 go build -o ~/.local/bin/tsgo-oracle ./cmd/tsgo
-cargo run -p ts_compare -- ~/.local/bin/tsgo-oracle target/debug/tsgo -- --version
+./scripts/run-cargo-capped.sh run -p ts_compare -- \
+  ~/.local/bin/tsgo-oracle target/debug/tsgo -- --version
 ```
 
 The upstream TypeScript submodule must be initialized for the full compiler
-corpus. `TS_GO_REPO=/path/to/typescript-go cargo test -p ts_fixture --test
-upstream_cases` validates fixture parsing across the available cases and keeps
-invalid-UTF-8 scanner cases visible as a known source-text requirement.
+corpus. `TS_GO_REPO=/path/to/typescript-go ./scripts/run-cargo-capped.sh test
+-p ts_fixture --test upstream_cases` validates fixture parsing across the
+available cases and keeps invalid-UTF-8 scanner cases visible as a known
+source-text requirement.

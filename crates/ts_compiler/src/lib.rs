@@ -531,7 +531,8 @@ impl Program {
                 {
                     continue;
                 }
-                let declaration_node_types = declaration_node_types_for_emit(source_file);
+                let declaration_node_types =
+                    declaration_node_types_for_emit(source_file, self.options.strict_null_checks);
                 match emit_declaration_file_with_semantics(
                     &source_file.parse.arena,
                     source_file.parse.source_file,
@@ -708,9 +709,36 @@ impl Program {
 
         if settings.emit_declarations {
             let mut code = String::new();
+            let mut preserved_references = BTreeSet::new();
+            if let Some(declaration_file) = paths.declaration.as_deref() {
+                for source in &sources {
+                    let lower = source.file_name.to_ascii_lowercase();
+                    if lower.ends_with(".d.ts")
+                        || lower.ends_with(".d.mts")
+                        || lower.ends_with(".d.cts")
+                    {
+                        continue;
+                    }
+                    for directive in
+                        preserved_reference_directives(source, declaration_file).lines()
+                    {
+                        if preserved_references.insert(directive.to_owned()) {
+                            code.push_str(directive);
+                            code.push('\n');
+                        }
+                    }
+                }
+            }
             let mut map_builder = self.options.declaration_map.then(SourceMapBuilder::new);
             let mut map_sources = Vec::new();
             for source in &sources {
+                let lower = source.file_name.to_ascii_lowercase();
+                if lower.ends_with(".d.ts")
+                    || lower.ends_with(".d.mts")
+                    || lower.ends_with(".d.cts")
+                {
+                    continue;
+                }
                 if (self.options.isolated_declarations
                     && has_unserializable_isolated_declaration_name(source))
                     || source
@@ -725,7 +753,8 @@ impl Program {
                     u32::try_from(code.bytes().filter(|byte| *byte == b'\n').count())
                         .unwrap_or(u32::MAX);
                 let enum_member_values = enum_values_for_emit(&source.checking.enum_member_values);
-                let declaration_node_types = declaration_node_types_for_emit(source);
+                let declaration_node_types =
+                    declaration_node_types_for_emit(source, self.options.strict_null_checks);
                 match emit_declaration_file_with_semantics(
                     &source.parse.arena,
                     source.parse.source_file,
@@ -1627,15 +1656,51 @@ fn enum_values_for_emit(
         .collect()
 }
 
-fn declaration_node_types_for_emit(source: &SourceFile) -> BTreeMap<NodeId, ts_checker::TypeId> {
+fn declaration_node_types_for_emit(
+    source: &SourceFile,
+    strict_null_checks: bool,
+) -> BTreeMap<NodeId, ts_checker::TypeId> {
     let mut node_types = source.checking.node_types.clone();
     for (id, node) in source.parse.arena.iter() {
+        if !strict_null_checks
+            && let NodeData::ParameterDeclaration(parameter) = &node.data
+            && parameter.type_.is_none()
+            && let Some(initializer) = parameter.initializer
+            && source
+                .parse
+                .arena
+                .get(initializer)
+                .is_some_and(|initializer| initializer.kind == ts_ast::SyntaxKind::NullKeyword)
+        {
+            node_types.insert(initializer, source.checking.types.any());
+        }
         if let NodeData::Identifier(identifier) = &node.data
             && !node_types.contains_key(&id)
             && let Some(type_id) = source
                 .binding
                 .resolve_name_at(id, &identifier.text)
                 .and_then(|symbol| source.checking.type_of_symbol(symbol))
+        {
+            node_types.insert(id, type_id);
+        }
+        if let NodeData::MethodDeclaration(method) = &node.data
+            && !node_types.contains_key(&id)
+            && let Some(name) = identifier_text(&source.parse.arena, method.name)
+            && let Some(class_symbol) = node
+                .parent
+                .and_then(|class| source.binding.node_symbols.get(&class).copied())
+            && let Some(class_type) = source.checking.type_of_symbol(class_symbol)
+            && let Some(type_id) =
+                source
+                    .checking
+                    .types
+                    .get(class_type)
+                    .and_then(|type_| match &type_.kind {
+                        ts_checker::TypeKind::Object(object) => {
+                            object.properties.get(name).copied()
+                        }
+                        _ => None,
+                    })
         {
             node_types.insert(id, type_id);
         }
@@ -2337,6 +2402,170 @@ mod tests {
             "{}",
             declaration.text
         );
+    }
+
+    #[test]
+    fn declarations_use_named_classes_from_erroneous_ambient_inputs() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/declFile.d.ts",
+            concat!(
+                "declare namespace M {\n",
+                "    declare var x;\n",
+                "    declare function f();\n",
+                "    declare namespace N {}\n",
+                "    declare class C {}\n",
+                "}\n",
+            ),
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/client.ts",
+            concat!(
+                "///<reference path=\"declFile.d.ts\" preserve=\"true\"/>\n",
+                "var value = new M.C();\n",
+            ),
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["client.ts".to_owned()],
+            CompilerOptions {
+                declaration: true,
+                no_lib: true,
+                target: ScriptTarget::Es2015,
+                ..CompilerOptions::default()
+            },
+        );
+        assert!(
+            program
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code == Some(1038)),
+            "{:?}",
+            program.diagnostics()
+        );
+        let emitted = program.emit();
+        let declaration = emitted
+            .files
+            .iter()
+            .find(|file| file.file_name == "/project/client.d.ts")
+            .unwrap();
+        assert!(
+            declaration.text.contains("declare var value: M.C;"),
+            "{}",
+            declaration.text
+        );
+    }
+
+    #[test]
+    fn declaration_emit_recovers_inferred_class_method_signatures() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/input.ts",
+            concat!(
+                "interface Example {}\n",
+                "class Example {\n",
+                "    f() { return ''; }\n",
+                "    h(x = 4, nullable = null, label = '') {}\n",
+                "}\n",
+            ),
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["input.ts".to_owned()],
+            CompilerOptions {
+                declaration: true,
+                no_lib: true,
+                strict: false,
+                target: ScriptTarget::Es2015,
+                ..CompilerOptions::default()
+            },
+        );
+        let emitted = program.emit();
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        let declaration = emitted
+            .files
+            .iter()
+            .find(|file| file.file_name == "/project/input.d.ts")
+            .unwrap();
+        assert!(
+            declaration.text.contains("f(): string;"),
+            "{}",
+            declaration.text
+        );
+        assert!(
+            declaration
+                .text
+                .contains("h(x?: number, nullable?: any, label?: string): void;"),
+            "{}",
+            declaration.text
+        );
+    }
+
+    #[test]
+    fn bundled_declarations_preserve_deduplicated_references_without_declaration_inputs() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/declFile.d.ts",
+            concat!(
+                "declare namespace M {\n",
+                "    declare var x;\n",
+                "    declare function f();\n",
+                "    declare namespace N {}\n",
+                "    declare class C {}\n",
+                "}\n",
+            ),
+        )
+        .unwrap();
+        for file in ["client.ts", "other.ts"] {
+            fs.write_file(
+                &format!("/project/{file}"),
+                concat!(
+                    "///<reference path=\"declFile.d.ts\" preserve=\"true\"/>\n",
+                    "var value = new M.C();\n",
+                ),
+            )
+            .unwrap();
+        }
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &[
+                "declFile.d.ts".to_owned(),
+                "client.ts".to_owned(),
+                "other.ts".to_owned(),
+            ],
+            CompilerOptions {
+                declaration: true,
+                out_file: Some("out.js".into()),
+                no_lib: true,
+                target: ScriptTarget::Es2015,
+                ..CompilerOptions::default()
+            },
+        );
+        assert!(
+            program
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code == Some(1038)),
+            "{:?}",
+            program.diagnostics()
+        );
+        let emitted = program.emit();
+        let declaration = emitted
+            .files
+            .iter()
+            .find(|file| file.file_name == "/project/out.d.ts")
+            .unwrap();
+        let directive = "/// <reference path=\"declFile.d.ts\" preserve=\"true\" />";
+        assert_eq!(declaration.text.matches(directive).count(), 1);
+        assert!(declaration.text.starts_with(directive));
+        assert!(declaration.text.contains("declare var value: M.C;"));
+        assert!(!declaration.text.contains("declare namespace M"));
     }
 
     #[test]
