@@ -529,7 +529,10 @@ impl Program {
                 if (self.options.isolated_declarations
                     && has_unserializable_isolated_declaration_name(source_file))
                     || source_file.checking.diagnostics.iter().any(|diagnostic| {
-                        matches!(diagnostic.diagnostic.code(), 2883 | 4023 | 5088)
+                        matches!(
+                            diagnostic.diagnostic.code(),
+                            2527 | 2883 | 4023 | 4032 | 5088
+                        )
                     })
                 {
                     continue;
@@ -757,7 +760,10 @@ impl Program {
                 if (self.options.isolated_declarations
                     && has_unserializable_isolated_declaration_name(source))
                     || source.checking.diagnostics.iter().any(|diagnostic| {
-                        matches!(diagnostic.diagnostic.code(), 2883 | 4023 | 5088)
+                        matches!(
+                            diagnostic.diagnostic.code(),
+                            2527 | 2883 | 4023 | 4032 | 5088
+                        )
                     })
                 {
                     continue;
@@ -1774,6 +1780,7 @@ fn emit_diagnostic(source_file: &SourceFile, error: &ts_printer::EmitError) -> P
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn add_nonportable_inferred_type_diagnostics(source: &SourceFile, checking: &mut CheckResult) {
     let imports = source_import_bindings(source);
     let Some(NodeData::SourceFile(file)) = source
@@ -1824,6 +1831,20 @@ fn add_nonportable_inferred_type_diagnostics(source: &SourceFile, checking: &mut
             }) else {
                 continue;
             };
+            if inaccessible_imported_unique_symbol(checking, type_id)
+                && let Some(name) = identifier_text(&source.parse.arena, declaration.name)
+            {
+                let message =
+                    message_by_code(2527).expect("TS2527 must be in the diagnostic catalog");
+                checking.diagnostics.push(CheckDiagnostic {
+                    node: declaration.name,
+                    diagnostic: Diagnostic::with_arguments(
+                        message,
+                        [name.to_owned(), "unique symbol".into()],
+                    ),
+                });
+                continue;
+            }
             if let Some(qualifier) =
                 inaccessible_computed_symbol_name(checking, type_id, &mut BTreeSet::new())
                 && !imports.iter().any(|(local, _, _)| local == &qualifier)
@@ -1863,6 +1884,121 @@ fn add_nonportable_inferred_type_diagnostics(source: &SourceFile, checking: &mut
             });
         }
     }
+
+    let exported_functions = file
+        .statements
+        .nodes
+        .iter()
+        .filter_map(|statement| {
+            let node = source.parse.arena.get(*statement)?;
+            let NodeData::FunctionDeclaration(function) = &node.data else {
+                return None;
+            };
+            node_has_modifier(
+                &source.parse.arena,
+                function.modifiers.as_ref(),
+                ts_ast::SyntaxKind::ExportKeyword,
+            )
+            .then(|| {
+                function
+                    .name
+                    .and_then(|name| identifier_text(&source.parse.arena, name))
+            })
+            .flatten()
+        })
+        .collect::<BTreeSet<_>>();
+    for statement in &file.statements.nodes {
+        let Some(NodeData::ExpressionStatement(statement)) =
+            source.parse.arena.get(*statement).map(|node| &node.data)
+        else {
+            continue;
+        };
+        let Some(NodeData::BinaryExpression(assignment)) = source
+            .parse
+            .arena
+            .get(statement.expression)
+            .map(|node| &node.data)
+        else {
+            continue;
+        };
+        if source
+            .parse
+            .arena
+            .get(assignment.operator_token)
+            .is_none_or(|operator| operator.kind != ts_ast::SyntaxKind::EqualsToken)
+        {
+            continue;
+        }
+        let Some(NodeData::PropertyAccessExpression(access)) = source
+            .parse
+            .arena
+            .get(assignment.left)
+            .map(|node| &node.data)
+        else {
+            continue;
+        };
+        let Some(receiver) = identifier_text(&source.parse.arena, access.expression) else {
+            continue;
+        };
+        if !exported_functions.contains(receiver) {
+            continue;
+        }
+        let Some(NodeData::CallExpression(call)) = source
+            .parse
+            .arena
+            .get(assignment.right)
+            .map(|node| &node.data)
+        else {
+            continue;
+        };
+        let Some(callee) = identifier_text(&source.parse.arena, call.expression) else {
+            continue;
+        };
+        let Some((_, _, module)) = imports.iter().find(|(local, _, _)| local == callee) else {
+            continue;
+        };
+        let Some(type_id) = checking.type_of_node(assignment.right) else {
+            continue;
+        };
+        let Some(private_name) =
+            inaccessible_named_type_reference(checking, type_id, &mut BTreeSet::new())
+        else {
+            continue;
+        };
+        let Some(property) = identifier_text(&source.parse.arena, access.name) else {
+            continue;
+        };
+        let message = message_by_code(4032).expect("TS4032 must be in the diagnostic catalog");
+        checking.diagnostics.push(CheckDiagnostic {
+            node: assignment.left,
+            diagnostic: Diagnostic::with_arguments(
+                message,
+                [
+                    property.to_owned(),
+                    private_name,
+                    format!("\"{}\"", module.trim_start_matches("./")),
+                ],
+            ),
+        });
+    }
+}
+
+fn inaccessible_imported_unique_symbol(checking: &CheckResult, type_id: TypeId) -> bool {
+    if !checking.import_type_references.contains_key(&type_id) {
+        return false;
+    }
+    let Some(TypeKind::Object(object)) = checking.types.get(type_id).map(|type_| &type_.kind)
+    else {
+        return false;
+    };
+    object.readonly_properties.iter().any(|name| {
+        object.properties.get(name).is_some_and(|property| {
+            matches!(
+                checking.types.get(*property).map(|type_| &type_.kind),
+                Some(TypeKind::Unknown)
+            )
+        })
+    })
 }
 
 fn source_import_bindings(source: &SourceFile) -> Vec<(String, String, String)> {
@@ -2098,6 +2234,50 @@ fn inaccessible_computed_symbol_name(
     children
         .into_iter()
         .find_map(|child| inaccessible_computed_symbol_name(checking, child, visited))
+}
+
+fn inaccessible_named_type_reference(
+    checking: &CheckResult,
+    type_id: TypeId,
+    visited: &mut BTreeSet<TypeId>,
+) -> Option<String> {
+    if !visited.insert(type_id) || checking.import_type_references.contains_key(&type_id) {
+        return None;
+    }
+    if let Some(reference) = checking.named_type_references.get(&type_id) {
+        return Some(reference.name.clone());
+    }
+    let kind = &checking.types.get(type_id)?.kind;
+    let mut children = Vec::new();
+    match kind {
+        TypeKind::TypeParameter { constraint, .. } => children.extend(constraint),
+        TypeKind::Array(element) => children.push(*element),
+        TypeKind::Tuple(elements)
+        | TypeKind::ReadonlyTuple(elements)
+        | TypeKind::Union(elements)
+        | TypeKind::Intersection(elements) => children.extend(elements),
+        TypeKind::Object(object) => {
+            children.extend(object.properties.values());
+            children.extend(object.string_index_type);
+            children.extend(object.number_index_type);
+        }
+        TypeKind::Function(signature) | TypeKind::Constructor(signature) => {
+            children.extend(&signature.parameters);
+            children.extend(signature.rest_parameter);
+            children.push(signature.return_type);
+        }
+        TypeKind::Overload(signatures) => {
+            for signature in signatures {
+                children.extend(&signature.parameters);
+                children.extend(signature.rest_parameter);
+                children.push(signature.return_type);
+            }
+        }
+        _ => {}
+    }
+    children
+        .into_iter()
+        .find_map(|child| inaccessible_named_type_reference(checking, child, visited))
 }
 
 fn enum_values_for_emit(
@@ -2408,6 +2588,18 @@ fn module_specifiers(parse: &ParseResult) -> Vec<(String, TextRange, bool)> {
                 .module_specifier
                 .and_then(|specifier| string_literal(&parse.arena, specifier))
                 .map(|(specifier, range)| (specifier, range, false)),
+            NodeData::CallExpression(data)
+                if matches!(
+                    parse.arena.get(data.expression).map(|node| &node.data),
+                    Some(NodeData::Identifier(identifier)) if identifier.text == "import"
+                ) =>
+            {
+                data.arguments
+                    .nodes
+                    .first()
+                    .and_then(|argument| string_literal(&parse.arena, *argument))
+                    .map(|(specifier, range)| (specifier, range, false))
+            }
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -2751,6 +2943,61 @@ mod tests {
                 program.diagnostics()
             );
         }
+    }
+
+    #[test]
+    fn suppresses_declaration_with_private_imported_expando_property_type() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/a.ts",
+            "interface I {} export function f(): I { return null as I; }",
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/b.ts",
+            concat!(
+                "import { f } from './a';\n",
+                "export function q() {}\n",
+                "q.val = f();",
+            ),
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["a.ts".to_owned(), "b.ts".to_owned()],
+            CompilerOptions {
+                declaration: true,
+                module: ModuleKind::CommonJs,
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        assert!(
+            program
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code == Some(4032)),
+            "{:?}",
+            program.diagnostics()
+        );
+        let emitted = program.emit();
+        assert!(
+            emitted
+                .files
+                .iter()
+                .any(|file| file.file_name.ends_with("a.d.ts")),
+            "{:?}",
+            emitted.files
+        );
+        assert!(
+            !emitted
+                .files
+                .iter()
+                .any(|file| file.file_name.ends_with("b.d.ts")),
+            "{:?}",
+            emitted.files
+        );
     }
 
     #[test]

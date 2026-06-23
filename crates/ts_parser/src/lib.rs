@@ -24,10 +24,11 @@ use ts_ast::{
     JsxSpreadAttributeData, JsxTextData, KeywordExpressionData, KeywordTypeNodeData,
     LabeledStatementData, LiteralTypeNodeData, MappedTypeNodeData, MethodDeclarationData,
     MethodSignatureDeclarationData, ModifierList, ModuleBlockData, ModuleDeclarationData,
-    NamedExportsData, NamedImportsData, NamedTupleMemberData, NamespaceExportDeclarationData,
-    NamespaceImportData, NewExpressionData, NoSubstitutionTemplateLiteralData, Node, NodeArena,
-    NodeData, NodeFlags, NodeId, NodeList, NonNullExpressionData, NotEmittedStatementData,
-    NumericLiteralData, ObjectLiteralExpressionData, OmittedExpressionData, OptionalTypeNodeData,
+    NamedExportsData, NamedImportsData, NamedTupleMemberData, NamespaceExportData,
+    NamespaceExportDeclarationData, NamespaceImportData, NewExpressionData,
+    NoSubstitutionTemplateLiteralData, Node, NodeArena, NodeData, NodeFlags, NodeId, NodeList,
+    NonNullExpressionData, NotEmittedStatementData, NumericLiteralData,
+    ObjectLiteralExpressionData, OmittedExpressionData, OptionalTypeNodeData,
     ParameterDeclarationData, ParenthesizedExpressionData, ParenthesizedTypeNodeData,
     PostfixUnaryExpressionData, PrefixUnaryExpressionData, PrivateIdentifierData,
     PropertyAccessExpressionData, PropertyAssignmentData, PropertyDeclarationData,
@@ -3676,8 +3677,19 @@ impl<'a> Parser<'a> {
         let export_clause = if self.current.kind == SyntaxKind::OpenBraceToken {
             Some(self.parse_named_exports())
         } else if self.current.kind == SyntaxKind::AsteriskToken {
-            self.bump();
-            None
+            let star_start = self.consume().range.start;
+            if self.current.kind == SyntaxKind::AsKeyword {
+                self.bump();
+                let name = self.parse_module_export_name("Expected a namespace export name.");
+                Some(self.alloc_node(
+                    SyntaxKind::NamespaceExport,
+                    TextRange::new(star_start, self.node_end(name)),
+                    NodeData::NamespaceExport(Box::new(NamespaceExportData { symbol: None, name })),
+                    &[name],
+                ))
+            } else {
+                None
+            }
         } else {
             self.error_current("Expected an export clause.");
             None
