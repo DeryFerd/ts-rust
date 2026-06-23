@@ -1529,6 +1529,7 @@ struct Checker<'a> {
     checked_overload_symbols: HashSet<SymbolId>,
     reported_unresolved_type_names: HashSet<NodeId>,
     this_types: Vec<TypeId>,
+    class_value_stack: Vec<SymbolId>,
     preserve_literal_inference: bool,
 }
 
@@ -1584,6 +1585,7 @@ impl<'a> Checker<'a> {
             checked_overload_symbols: HashSet::new(),
             reported_unresolved_type_names: HashSet::new(),
             this_types: Vec::new(),
+            class_value_stack: Vec::new(),
             preserve_literal_inference: false,
         }
     }
@@ -1680,12 +1682,17 @@ impl<'a> Checker<'a> {
                         break;
                     }
                     NodeData::ClassDeclaration(data) => {
+                        self.result
+                            .symbol_types
+                            .insert(symbol.id, self.result.types.any());
+                        self.class_value_stack.push(symbol.id);
                         symbol_type = Some(self.declared_object_type(
                             data.type_parameters.as_ref(),
                             data.heritage_clauses.as_ref(),
                             &data.members.nodes,
                             &[],
                         ));
+                        self.class_value_stack.pop();
                         break;
                     }
                     NodeData::InterfaceDeclaration(data) => {
@@ -5008,6 +5015,10 @@ impl<'a> Checker<'a> {
                     Some(class.as_ref().clone())
                 })
             }) {
+                if self.class_value_stack.contains(&symbol) {
+                    return type_id;
+                }
+                self.class_value_stack.push(symbol);
                 let signature = self.class_constructor_signature(&class.members.nodes, type_id);
                 let constructor = self.result.types.alloc(TypeKind::Constructor(signature));
                 let static_members = class
@@ -5020,11 +5031,14 @@ impl<'a> Checker<'a> {
                     })
                     .copied()
                     .collect::<Vec<_>>();
-                if static_members.is_empty() {
-                    return constructor;
-                }
-                let static_type = self.object_type_from_members(&static_members);
-                return self.result.types.intersection([constructor, static_type]);
+                let class_value = if static_members.is_empty() {
+                    constructor
+                } else {
+                    let static_type = self.object_type_from_members(&static_members);
+                    self.result.types.intersection([constructor, static_type])
+                };
+                self.class_value_stack.pop();
+                return class_value;
             }
             return type_id;
         }
@@ -12794,5 +12808,33 @@ mod tests {
             },
         );
         assert!(loose.diagnostics.is_empty(), "{:?}", loose.diagnostics);
+    }
+
+    #[test]
+    fn resolves_self_referential_static_class_initializers() {
+        let parsed = parse_source_file(
+            r"
+                class Point {
+                    constructor(public x: number, public y: number) {}
+                    getDist() { return this.x + this.y; }
+                    static origin = new Point(0, 0);
+                }
+                const point: Point = Point.origin;
+            ",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+
+        let point = bindings.root_scope().unwrap().symbols.get("Point").unwrap();
+        let point_type = result.type_of_symbol(point).unwrap();
+        let TypeKind::Object(point) = &result.types.get(point_type).unwrap().kind else {
+            panic!("expected Point instance type");
+        };
+        assert!(point.properties.contains_key("x"));
+        assert!(point.properties.contains_key("y"));
+        assert!(point.properties.contains_key("getDist"));
+        assert!(point.properties.contains_key("origin"));
     }
 }
