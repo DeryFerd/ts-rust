@@ -2323,20 +2323,34 @@ impl<'a> Parser<'a> {
                 SyntaxKind::UsingKeyword => NODE_FLAG_USING,
                 _ => NodeFlags::default(),
             };
-            let declaration = self.parse_variable_declaration();
+            let previous_disallow_in = self.disallow_in;
+            self.disallow_in = true;
+            let declaration_start = self.current.range.start;
+            let mut declarations = Vec::new();
+            loop {
+                declarations.push(self.parse_variable_declaration());
+                if self.current.kind != SyntaxKind::CommaToken {
+                    break;
+                }
+                self.bump();
+            }
+            self.disallow_in = previous_disallow_in;
+            let declarations_end = declarations
+                .last()
+                .map_or(declaration_start, |declaration| self.node_end(*declaration));
             Some(self.alloc_node_with_flags(
                 SyntaxKind::VariableDeclarationList,
                 flags,
-                TextRange::new(keyword.range.start, self.node_end(declaration)),
+                TextRange::new(keyword.range.start, declarations_end),
                 NodeData::VariableDeclarationList(Box::new(VariableDeclarationListData {
                     declarations: NodeList {
-                        range: self.arena.get(declaration).unwrap().range,
-                        nodes: vec![declaration],
+                        range: TextRange::new(declaration_start, declarations_end),
+                        nodes: declarations.clone(),
                         has_trailing_comma: false,
                     },
                     facts: 0,
                 })),
-                &[declaration],
+                &declarations,
             ))
         } else {
             let previous_disallow_in = self.disallow_in;
@@ -9655,7 +9669,9 @@ mod tests {
         let result = parse_source_file(concat!(
             "const f = async (): Promise<void> => {};\n",
             "for (i = 1; i < limit; ++i) {}\n",
+            "for (let x = 0, y = 1; x < y; ++x, --y) {}\n",
             "for (key in value) {}\n",
+            "for (const property in value) {}\n",
         ));
         assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
         assert!(result.arena.iter().any(|(_, node)| {
@@ -9673,17 +9689,29 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(for_statements.len(), 1);
+        assert_eq!(for_statements.len(), 2);
         let initializer = for_statements[0].initializer.expect("initializer");
         assert_eq!(
             result.arena.get(initializer).unwrap().kind,
+            SyntaxKind::BinaryExpression
+        );
+        let declaration_list = for_statements[1].initializer.expect("initializer");
+        assert_eq!(declaration_nodes(&result, declaration_list).len(), 2);
+        assert_eq!(
+            result
+                .arena
+                .get(for_statements[1].incrementor.expect("incrementor"))
+                .unwrap()
+                .kind,
             SyntaxKind::BinaryExpression
         );
         assert!(
             result
                 .arena
                 .iter()
-                .any(|(_, node)| matches!(node.data, NodeData::ForInOrOfStatement(_)))
+                .filter(|(_, node)| matches!(node.data, NodeData::ForInOrOfStatement(_)))
+                .count()
+                == 2
         );
     }
 

@@ -269,6 +269,12 @@ pub fn emit_source_file_with_context(
             .get(*statement)
             .is_some_and(|statement| declaration_is_module_indicator(arena, statement))
     });
+    let has_runtime_module_indicator = data.statements.nodes.iter().any(|statement| {
+        arena.get(*statement).is_some_and(|node| {
+            declaration_is_module_indicator(arena, node)
+                && printer.statement_emits_runtime(*statement, node)
+        })
+    });
     if settings.module == ModuleKind::System && is_external_module {
         return printer.emit_system_source_file(data);
     }
@@ -498,26 +504,28 @@ pub fn emit_source_file_with_context(
             }
         }
         if let Some(node) = arena.get(*statement) {
+            if current_emitted {
+                printer.emit_reference_directives_between(
+                    reference_owner_start,
+                    node.range.start.get(),
+                );
+            } else if settings.module != ModuleKind::None {
+                printer.emit_detached_reference_directives_between(
+                    reference_owner_start,
+                    node.range.start.get(),
+                );
+            }
             printer.emit_source_comments_between_with_ownership(
                 previous_end,
                 node.range.start.get(),
                 previous_emitted,
                 current_emitted,
             );
-            if current_emitted {
-                printer.emit_reference_directives_between(
-                    reference_owner_start,
-                    node.range.start.get(),
-                );
-            } else {
-                printer.emit_detached_reference_directives_between(
-                    reference_owner_start,
-                    node.range.start.get(),
-                );
-            }
             previous_emitted = current_emitted;
             previous_end = node.range.end.get();
-            reference_owner_start = node.range.end.get();
+            if current_emitted || settings.module != ModuleKind::None {
+                reference_owner_start = node.range.end.get();
+            }
         }
         printer.emit_statement(*statement)?;
         if settings.module == ModuleKind::CommonJs && current_emitted && current_is_import {
@@ -539,8 +547,8 @@ pub fn emit_source_file_with_context(
         printer.writer.write(";");
         printer.writer.newline();
     }
-    if (settings.module == ModuleKind::None && is_external_module && !emitted_runtime_statement)
-        || (preserves_external_module_syntax && (has_empty_export || has_recovered_module_clause))
+    if preserves_external_module_syntax
+        && (!has_runtime_module_indicator || has_empty_export || has_recovered_module_clause)
     {
         printer.writer.write("export {};");
         printer.writer.newline();
@@ -4194,8 +4202,14 @@ fn const_enum_access_fallbacks(
         };
         let resolved_name = bindings
             .resolve_name_at(receiver, receiver_name)
-            .and_then(|symbol| bindings.symbols.get(symbol))
-            .map_or(receiver_name, |symbol| symbol.name.as_str());
+            .and_then(|symbol| bindings.symbols.get(symbol));
+        let resolved_name = match resolved_name {
+            Some(symbol) if symbol.flags.contains(ts_binder::SymbolFlags::CONST_ENUM) => {
+                symbol.name.as_str()
+            }
+            Some(_) => continue,
+            None => receiver_name,
+        };
         if let Some(value) = members.get(&(resolved_name.to_owned(), member.to_owned())) {
             fallbacks.insert(id, value.clone());
         }
@@ -7356,6 +7370,7 @@ impl Printer<'_> {
         self.writer.write("{");
         self.writer.newline();
         self.writer.indent += 1;
+        self.namespace_declarations.push(HashSet::new());
         self.prepare_returned_class_expression_temps(id, data);
         let mut previous_end = node.range.start.get().saturating_add(1);
         let mut previous_emitted = false;
@@ -7408,6 +7423,7 @@ impl Printer<'_> {
             node.range.end.get().saturating_sub(1),
             previous_emitted,
         );
+        self.namespace_declarations.pop();
         self.writer.indent -= 1;
         self.writer.write("}");
         Ok(())
@@ -10004,7 +10020,17 @@ impl Printer<'_> {
             .expect("every enum has a lexical declaration scope")
             .insert(name.clone());
         if first_declaration && !self.namespace_has_prior_merged_value_declaration(data.name) {
-            self.writer.write("var ");
+            let block_scoped = self.settings.target >= ScriptTarget::Es2015
+                && self
+                    .arena
+                    .get(data.name)
+                    .and_then(|name| name.parent)
+                    .and_then(|declaration| self.arena.get(declaration))
+                    .and_then(|declaration| declaration.parent)
+                    .and_then(|parent| self.arena.get(parent))
+                    .is_some_and(|parent| matches!(parent.data, NodeData::Block(_)));
+            self.writer
+                .write(if block_scoped { "let " } else { "var " });
             self.writer.write(&name);
             self.writer.write(";");
             self.writer.newline();

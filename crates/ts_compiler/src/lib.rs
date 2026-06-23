@@ -429,7 +429,8 @@ impl Program {
                     preserve_const_enums: self.options.preserve_const_enums
                         || self.options.isolated_modules
                         || self.options.verbatim_module_syntax,
-                    inline_const_enums: !self.options.isolated_modules,
+                    inline_const_enums: !self.options.isolated_modules
+                        && !self.options.verbatim_module_syntax,
                 };
                 match emit_source_file_with_context(
                     &source_file.parse.arena,
@@ -577,7 +578,8 @@ impl Program {
                     preserve_const_enums: self.options.preserve_const_enums
                         || self.options.isolated_modules
                         || self.options.verbatim_module_syntax,
-                    inline_const_enums: !self.options.isolated_modules,
+                    inline_const_enums: !self.options.isolated_modules
+                        && !self.options.verbatim_module_syntax,
                 };
                 match emit_source_file_with_context(
                     &source.parse.arena,

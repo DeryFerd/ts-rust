@@ -144,7 +144,11 @@ impl FileSystem for OsFileSystem {
     }
 
     fn read_file(&self, path: &str) -> io::Result<String> {
-        fs::read_to_string(normalize_path(path))
+        let bytes = fs::read(normalize_path(path))?;
+        if let Some(decoded) = decode_utf16_bom(&bytes) {
+            return Ok(decoded);
+        }
+        String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
     }
 
     fn write_file(&self, path: &str, contents: &str) -> io::Result<()> {
@@ -172,6 +176,29 @@ impl FileSystem for OsFileSystem {
         directories.sort();
         Ok(DirectoryEntries { files, directories })
     }
+}
+
+/// Decodes UTF-16 text carrying a little- or big-endian byte-order mark.
+#[must_use]
+pub fn decode_utf16_bom(bytes: &[u8]) -> Option<String> {
+    let (payload, little_endian) = match bytes {
+        [0xff, 0xfe, payload @ ..] => (payload, true),
+        [0xfe, 0xff, payload @ ..] => (payload, false),
+        _ => return None,
+    };
+    let units = payload.chunks_exact(2).map(|chunk| {
+        let pair = [chunk[0], chunk[1]];
+        if little_endian {
+            u16::from_le_bytes(pair)
+        } else {
+            u16::from_be_bytes(pair)
+        }
+    });
+    Some(
+        char::decode_utf16(units)
+            .map(|unit| unit.unwrap_or('\u{fffd}'))
+            .collect(),
+    )
 }
 
 #[derive(Clone, Debug)]

@@ -13,7 +13,7 @@ use std::{
 };
 
 use ts_core::SourceText;
-use ts_vfs::{FileSystem, MemoryFileSystem};
+use ts_vfs::{FileSystem, MemoryFileSystem, decode_utf16_bom};
 
 /// A parsed compiler test case.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -40,6 +40,8 @@ impl Case {
     ) -> Result<Self, ParseError> {
         let path = path.into();
         let source_text = source_text.into();
+        let source_text =
+            decode_utf16_bom(source_text.as_bytes()).map_or(source_text, SourceText::from);
         let mut directives = Vec::new();
         let mut units = Vec::new();
         let mut current = UnitBuilder::new(path.clone(), 1, false);
@@ -71,7 +73,7 @@ impl Case {
                         return Err(ParseError::EmptyFileName { line: line_number });
                     }
 
-                    if current.explicit || current.has_source() {
+                    if current.explicit || current.has_substantive_source() {
                         units.push(current.finish());
                     }
                     current = UnitBuilder::new(
@@ -1202,6 +1204,28 @@ impl UnitBuilder {
             .as_scannable_str()
             .trim()
             .is_empty()
+    }
+
+    fn has_substantive_source(&self) -> bool {
+        let mut bytes = self.source_bytes.as_slice();
+        while let Some((&byte, rest)) = bytes.split_first() {
+            if byte.is_ascii_whitespace() {
+                bytes = rest;
+            } else if bytes.starts_with(b"//") {
+                bytes = bytes
+                    .iter()
+                    .position(|byte| *byte == b'\n' || *byte == b'\r')
+                    .map_or(&[], |end| &bytes[end..]);
+            } else if bytes.starts_with(b"/*") {
+                bytes = bytes[2..]
+                    .windows(2)
+                    .position(|window| window == b"*/")
+                    .map_or(&[], |end| &bytes[end + 4..]);
+            } else {
+                return true;
+            }
+        }
+        false
     }
 
     fn finish(self) -> Unit {
