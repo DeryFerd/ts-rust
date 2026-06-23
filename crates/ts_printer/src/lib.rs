@@ -508,6 +508,11 @@ pub fn emit_source_file_with_context(
     let mut reference_owner_start = 0;
     let mut previous_emitted = false;
     let mut emitted_runtime_statement = false;
+    let has_runtime_statement = data.statements.nodes.iter().any(|statement| {
+        arena
+            .get(*statement)
+            .is_some_and(|node| printer.statement_emits_runtime(*statement, node))
+    });
     let mut pending_commonjs_imports = Vec::new();
     for statement in &data.statements.nodes {
         let statement_node = arena.get(*statement);
@@ -531,7 +536,7 @@ pub fn emit_source_file_with_context(
                     reference_owner_start,
                     node.range.start.get(),
                 );
-            } else if settings.module != ModuleKind::None {
+            } else if settings.module != ModuleKind::None && has_runtime_statement {
                 printer.emit_detached_reference_directives_between(
                     reference_owner_start,
                     node.range.start.get(),
@@ -573,6 +578,8 @@ pub fn emit_source_file_with_context(
                 reference_owner_start = node.range.end.get();
             }
             printer.emit_detached_reference_directives_between(reference_owner_start, source_end);
+        } else {
+            printer.emit_reference_directives_between(0, source_end);
         }
     }
     printer.emit_source_comments_between_with_trailing(previous_end, source_end, previous_emitted);
@@ -1295,7 +1302,7 @@ fn export_declaration_is_empty(arena: &NodeArena, node: &Node) -> bool {
 }
 
 fn runtime_identifier_uses(arena: &NodeArena, source_file: NodeId) -> HashSet<String> {
-    arena
+    let mut uses = arena
         .iter()
         .filter_map(|(id, node)| {
             let NodeData::Identifier(identifier) = &node.data else {
@@ -1303,7 +1310,41 @@ fn runtime_identifier_uses(arena: &NodeArena, source_file: NodeId) -> HashSet<St
             };
             identifier_is_runtime_use(arena, id, source_file).then(|| identifier.text.clone())
         })
-        .collect()
+        .collect::<HashSet<_>>();
+
+    // An internal import-equals declaration is a runtime alias when the alias itself is used at
+    // runtime. Propagate that use through the alias chain so an external import at its root is not
+    // incorrectly elided (for example, `import x = require("x"); import y = x; y.run()`).
+    loop {
+        let mut changed = false;
+        for (_, node) in arena.iter() {
+            let NodeData::ImportEqualsDeclaration(import) = &node.data else {
+                continue;
+            };
+            let Some(alias) = declaration_name_text(arena, import.name) else {
+                continue;
+            };
+            if !uses.contains(alias) {
+                continue;
+            }
+            let Some(root) = entity_root_identifier_text(arena, import.module_reference) else {
+                continue;
+            };
+            changed |= uses.insert(root.to_owned());
+        }
+        if !changed {
+            break;
+        }
+    }
+    uses
+}
+
+fn entity_root_identifier_text(arena: &NodeArena, entity: NodeId) -> Option<&str> {
+    match &arena.get(entity)?.data {
+        NodeData::Identifier(identifier) => Some(&identifier.text),
+        NodeData::QualifiedName(name) => entity_root_identifier_text(arena, name.left),
+        _ => None,
+    }
 }
 
 fn source_has_jsx(arena: &NodeArena) -> bool {
@@ -6692,6 +6733,7 @@ impl Printer<'_> {
         EmitError { node: id, kind }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn commonjs_preinitialized_export_names(&self, statements: &NodeList) -> Vec<String> {
         let mut names = Vec::new();
         let mut seen = HashSet::new();
@@ -6727,6 +6769,16 @@ impl Printer<'_> {
                 }
                 NodeData::EnumDeclaration(enumeration) if exported => {
                     if let Some(name) = declaration_name_text(self.arena, enumeration.name)
+                        && seen.insert(name.to_owned())
+                    {
+                        names.push(name.to_owned());
+                    }
+                }
+                NodeData::ModuleDeclaration(module)
+                    if exported
+                        && self.namespace_has_runtime_contents(module, &mut HashSet::new()) =>
+                {
+                    if let Some(name) = declaration_name_text(self.arena, module.name)
                         && seen.insert(name.to_owned())
                     {
                         names.push(name.to_owned());
@@ -7531,16 +7583,23 @@ impl Printer<'_> {
         self.emit_expression(data.expression, 0)?;
         self.writer.write(") {");
         self.writer.newline();
-        let block = self.node(data.case_block)?.clone();
-        let NodeData::CaseBlock(block) = &block.data else {
-            return Err(Self::unsupported(data.case_block, block.kind));
+        let block_node = self.node(data.case_block)?.clone();
+        let NodeData::CaseBlock(block) = &block_node.data else {
+            return Err(Self::unsupported(data.case_block, block_node.kind));
         };
         self.writer.indent += 1;
+        let mut previous_end = block_node.range.start.get().saturating_add(1);
+        let mut previous_emitted = false;
         for clause_id in &block.clauses.nodes {
             let clause_node = self.node(*clause_id)?.clone();
             let NodeData::CaseOrDefaultClause(clause) = &clause_node.data else {
                 return Err(Self::unsupported(*clause_id, clause_node.kind));
             };
+            self.emit_source_comments_between_with_trailing(
+                previous_end,
+                clause_node.range.start.get(),
+                previous_emitted,
+            );
             if clause_node.kind == SyntaxKind::DefaultClause {
                 self.writer.write("default:");
             } else {
@@ -7563,15 +7622,33 @@ impl Printer<'_> {
                 self.emit_statement(*statement)?;
                 self.writer.remove_trailing_newline();
                 self.writer.newline();
+                let statement_node = self.node(*statement)?;
+                previous_end = statement_node.range.end.get();
+                previous_emitted = statement_emits_javascript(self.arena, statement_node);
             } else {
                 self.writer.newline();
                 self.writer.indent += 1;
+                previous_end = clause_node.range.start.get();
+                previous_emitted = false;
                 for statement in &clause.statements.nodes {
+                    let statement_node = self.node(*statement)?.clone();
+                    self.emit_source_comments_between_with_trailing(
+                        previous_end,
+                        statement_node.range.start.get(),
+                        previous_emitted,
+                    );
                     self.emit_statement(*statement)?;
+                    previous_end = statement_node.range.end.get();
+                    previous_emitted = statement_emits_javascript(self.arena, &statement_node);
                 }
                 self.writer.indent -= 1;
             }
         }
+        self.emit_source_comments_between_with_trailing(
+            previous_end,
+            block_node.range.end.get().saturating_sub(1),
+            previous_emitted,
+        );
         self.writer.indent -= 1;
         self.writer.write("}");
         Ok(())
@@ -8834,8 +8911,15 @@ impl Printer<'_> {
 
     fn emit_function_body(&mut self, body: NodeId) -> Result<(), EmitError> {
         if let Some(statement) = self.single_line_body_statement(body)? {
+            let body_node = self.node(body)?.clone();
+            let statement_node = self.node(statement)?.clone();
             self.writer.write("{ ");
             self.emit_statement(statement)?;
+            self.emit_source_comments_between_with_trailing(
+                statement_node.range.end.get(),
+                body_node.range.end.get().saturating_sub(1),
+                statement_emits_javascript(self.arena, &statement_node),
+            );
             self.writer.remove_trailing_newline();
             self.writer.write(" }");
             Ok(())
@@ -12037,7 +12121,13 @@ impl Printer<'_> {
         match &reference.data {
             NodeData::ExternalModuleReference(reference) => {
                 self.writer.write("require(");
-                self.emit_expression(reference.expression, 0)?;
+                if let Some(NodeData::StringLiteral(literal)) =
+                    self.arena.get(reference.expression).map(|node| &node.data)
+                {
+                    write_quoted(&mut self.writer, &literal.text);
+                } else {
+                    self.emit_expression(reference.expression, 0)?;
+                }
                 self.writer.write(")");
             }
             NodeData::Identifier(_) => self.emit_expression(data.module_reference, 0)?,
@@ -12094,7 +12184,7 @@ impl Printer<'_> {
     ) -> Result<(), EmitError> {
         let Some(clause_id) = data.import_clause else {
             self.writer.write("require(");
-            self.emit_expression(data.module_specifier, 0)?;
+            self.emit_commonjs_module_specifier(data.module_specifier)?;
             self.writer.write(");");
             return Ok(());
         };
@@ -12117,7 +12207,7 @@ impl Printer<'_> {
             self.writer.write(" ");
             self.writer.write(temp);
             self.writer.write(" = __importDefault(require(");
-            self.emit_expression(data.module_specifier, 0)?;
+            self.emit_commonjs_module_specifier(data.module_specifier)?;
             self.writer.write("));");
             if self.commonjs_has_non_default_bindings(clause.named_bindings) {
                 self.writer.newline();
@@ -12128,11 +12218,7 @@ impl Printer<'_> {
             self.writer.write(" ");
             self.writer.write(&temp);
             self.writer.write(" = require(");
-            if let Some(module) = string_literal_text(self.arena, data.module_specifier) {
-                write_quoted(&mut self.writer, module);
-            } else {
-                self.emit_expression(data.module_specifier, 0)?;
-            }
+            self.emit_commonjs_module_specifier(data.module_specifier)?;
             self.writer.write(");");
             return Ok(());
         }
@@ -12153,11 +12239,23 @@ impl Printer<'_> {
                 self.emit_commonjs_named_imports(bindings)?;
                 self.writer.write(" } = require(");
             }
-            self.emit_expression(data.module_specifier, 0)?;
+            self.emit_commonjs_module_specifier(data.module_specifier)?;
             self.writer
                 .write(if is_namespace_import { "));" } else { ");" });
         }
         Ok(())
+    }
+
+    fn emit_commonjs_module_specifier(
+        &mut self,
+        module_specifier: NodeId,
+    ) -> Result<(), EmitError> {
+        if let Some(module) = string_literal_text(self.arena, module_specifier) {
+            write_quoted(&mut self.writer, module);
+            Ok(())
+        } else {
+            self.emit_expression(module_specifier, 0)
+        }
     }
 
     fn commonjs_named_default_local(&self, bindings: Option<NodeId>) -> Option<String> {
@@ -12302,7 +12400,7 @@ impl Printer<'_> {
         let Some(clause) = data.export_clause else {
             self.writer.write("__exportStar(require(");
             if let Some(module) = data.module_specifier {
-                self.emit_expression(module, 0)?;
+                self.emit_commonjs_module_specifier(module)?;
             } else {
                 write_quoted(&mut self.writer, "");
             }
@@ -12337,7 +12435,7 @@ impl Printer<'_> {
             self.writer.write(" = ");
             if let Some(module) = data.module_specifier {
                 self.writer.write("require(");
-                self.emit_expression(module, 0)?;
+                self.emit_commonjs_module_specifier(module)?;
                 self.writer.write(").");
             }
             self.emit_expression(specifier.property_name.unwrap_or(specifier.name), 0)?;
@@ -12860,7 +12958,7 @@ impl Printer<'_> {
         if inlineable {
             self.writer.write("() => __importStar(require(");
             if let Some(argument) = argument {
-                self.emit_expression(argument, 0)?;
+                self.emit_commonjs_module_specifier(argument)?;
             }
         } else {
             self.writer.write("s => __importStar(require(s");
@@ -13863,7 +13961,10 @@ impl Printer<'_> {
         let NodeData::JsxOpeningElement(opening) = &opening_node.data else {
             return Err(Self::unsupported(data.opening_element, opening_node.kind));
         };
-        if matches!(self.settings.jsx, JsxEmit::Preserve | JsxEmit::ReactNative) {
+        if matches!(
+            self.settings.jsx,
+            JsxEmit::None | JsxEmit::Preserve | JsxEmit::ReactNative
+        ) {
             self.writer.write("<");
             self.emit_expression(opening.tag_name, 0)?;
             self.emit_jsx_attributes(opening.attributes, true)?;
@@ -13900,11 +14001,14 @@ impl Printer<'_> {
         &mut self,
         data: &ts_ast::JsxSelfClosingElementData,
     ) -> Result<(), EmitError> {
-        if matches!(self.settings.jsx, JsxEmit::Preserve | JsxEmit::ReactNative) {
+        if matches!(
+            self.settings.jsx,
+            JsxEmit::None | JsxEmit::Preserve | JsxEmit::ReactNative
+        ) {
             self.writer.write("<");
             self.emit_expression(data.tag_name, 0)?;
             self.emit_jsx_attributes(data.attributes, true)?;
-            self.writer.write("/>");
+            self.writer.write(" />");
             return Ok(());
         }
         if self.settings.jsx == JsxEmit::React {
@@ -13924,7 +14028,10 @@ impl Printer<'_> {
     }
 
     fn emit_jsx_fragment(&mut self, data: &ts_ast::JsxFragmentData) -> Result<(), EmitError> {
-        if matches!(self.settings.jsx, JsxEmit::Preserve | JsxEmit::ReactNative) {
+        if matches!(
+            self.settings.jsx,
+            JsxEmit::None | JsxEmit::Preserve | JsxEmit::ReactNative
+        ) {
             self.writer.write("<>");
             for child in &data.children.nodes {
                 self.emit_jsx_child(*child, true)?;
@@ -14958,13 +15065,10 @@ impl Printer<'_> {
             return Ok(None);
         }
         if source_has_braces
-            && (self.source_range_contains_comment(
+            && self.source_range_contains_comment(
                 node.range.start.get().saturating_add(1),
                 statement_node.range.start.get(),
-            ) || self.source_range_contains_comment(
-                statement_node.range.end.get(),
-                node.range.end.get().saturating_sub(1),
-            ))
+            )
         {
             return Ok(None);
         }
@@ -15773,6 +15877,33 @@ mod tests {
     }
 
     #[test]
+    fn preserves_trailing_comments_between_switch_clauses() {
+        assert_eq!(
+            emit_with(
+                concat!(
+                    "switch (value) {\n",
+                    "case 0:\n",
+                    "let result = value; // Error\n",
+                    "default:\n",
+                    "break;\n",
+                    "}",
+                ),
+                ScriptTarget::EsNext,
+                ModuleKind::EsNext,
+            )
+            .code,
+            concat!(
+                "switch (value) {\n",
+                "    case 0:\n",
+                "        let result = value; // Error\n",
+                "    default:\n",
+                "        break;\n",
+                "}\n",
+            )
+        );
+    }
+
+    #[test]
     fn captures_block_scoped_do_loop_bindings_when_downleveling() {
         assert_eq!(
             emit_with(
@@ -15906,7 +16037,7 @@ mod tests {
         let source = "const view = <Panel enabled {...props} title='hello'><span>{value}</span><Icon /></Panel>;";
         assert_eq!(
             emit_jsx(source, JsxEmit::Preserve),
-            "const view = <Panel enabled {...props} title=\"hello\"><span>{value}</span><Icon/></Panel>;\n"
+            "const view = <Panel enabled {...props} title=\"hello\"><span>{value}</span><Icon /></Panel>;\n"
         );
         assert_eq!(
             emit_jsx(source, JsxEmit::React),
@@ -15915,7 +16046,7 @@ mod tests {
         let fragment = "const view = <><span />{value}</>;";
         assert_eq!(
             emit_jsx(fragment, JsxEmit::Preserve),
-            "const view = <><span/>{value}</>;\n"
+            "const view = <><span />{value}</>;\n"
         );
         assert_eq!(
             emit_jsx(fragment, JsxEmit::React),
@@ -17516,6 +17647,19 @@ class Board {
     }
 
     #[test]
+    fn preserves_trailing_block_comments_in_compact_arrow_bodies() {
+        assert_eq!(
+            emit_with(
+                "var sequence: any; sequence.each(x => { x.key /* retained */ });",
+                ScriptTarget::Es2015,
+                ModuleKind::EsNext,
+            )
+            .code,
+            "var sequence;\nsequence.each(x => { x.key; /* retained */ });\n",
+        );
+    }
+
+    #[test]
     fn preserves_trailing_comments_on_namespaced_class_declarations() {
         let source = concat!(
             "namespace M {\n",
@@ -17627,6 +17771,18 @@ class Board {
         assert_eq!(
             emit_with(source, ScriptTarget::Es2015, ModuleKind::None).code,
             "",
+        );
+    }
+
+    #[test]
+    fn preserves_reference_directive_when_non_none_module_erases_every_statement() {
+        let source = concat!(
+            "///<reference path='types.d.ts' />\n",
+            "interface Shape { value: number; }\n",
+        );
+        assert_eq!(
+            emit_always_strict(source, ScriptTarget::Es2015, ModuleKind::CommonJs).code,
+            concat!("\"use strict\";\n", "///<reference path='types.d.ts' />\n")
         );
     }
 
@@ -17822,11 +17978,11 @@ class Board {
                 "};\n",
                 "Object.defineProperty(exports, \"__esModule\", { value: true });\n",
                 "exports.result = void 0;\n",
-                "const pkg_1 = __importDefault(require('pkg'));\n",
-                "const { read: load, write } = require('pkg');\n",
-                "require('side');\n",
+                "const pkg_1 = __importDefault(require(\"pkg\"));\n",
+                "const { read: load, write } = require(\"pkg\");\n",
+                "require(\"side\");\n",
                 "exports.result = load;\n",
-                "__exportStar(require('other'), exports);\n",
+                "__exportStar(require(\"other\"), exports);\n",
                 "exports.default = pkg_1.default;\n",
             )
         );
@@ -17858,7 +18014,7 @@ class Board {
                 "    for (var p in m) if (p !== \"default\" && !Object.prototype.hasOwnProperty.call(exports, p)) __createBinding(exports, m, p);\n",
                 "};\n",
                 "Object.defineProperty(exports, \"__esModule\", { value: true });\n",
-                "__exportStar(require('./dep'), exports);\n",
+                "__exportStar(require(\"./dep\"), exports);\n",
             )
         );
     }
@@ -17918,7 +18074,7 @@ class Board {
                 "    return (mod && mod.__esModule) ? mod : { \"default\": mod };\n",
                 "};\n",
                 "Object.defineProperty(exports, \"__esModule\", { value: true });\n",
-                "const b_1 = __importDefault(require('./b'));\n",
+                "const b_1 = __importDefault(require(\"./b\"));\n",
                 "const b_2 = require(\"./b\");\n",
                 "b_1.default;\n",
                 "(0, b_2.read)();\n",
@@ -18092,7 +18248,7 @@ class Board {
         );
         assert_eq!(
             commonjs.code,
-            "\"use strict\";\nObject.defineProperty(exports, \"__esModule\", { value: true });\nconst ts = require('typescript');\nts.version;\n"
+            "\"use strict\";\nObject.defineProperty(exports, \"__esModule\", { value: true });\nconst ts = require(\"typescript\");\nts.version;\n"
         );
 
         let es_module = emit_with(
@@ -18102,7 +18258,33 @@ class Board {
         );
         assert_eq!(
             es_module.code,
-            "const ts = require('typescript');\nts.version;\n"
+            "const ts = require(\"typescript\");\nts.version;\n"
+        );
+    }
+
+    #[test]
+    fn preserves_external_import_equals_used_through_an_alias_chain() {
+        let result = emit_with(
+            "import x = require('./dep'); import y = x; y.run();",
+            ScriptTarget::Es2015,
+            ModuleKind::CommonJs,
+        );
+        assert_eq!(
+            result.code,
+            "\"use strict\";\nObject.defineProperty(exports, \"__esModule\", { value: true });\nconst x = require(\"./dep\");\nvar y = x;\ny.run();\n"
+        );
+    }
+
+    #[test]
+    fn preinitializes_exported_commonjs_namespaces() {
+        let result = emit_with(
+            "export namespace m { export function foo() {} }",
+            ScriptTarget::Es2015,
+            ModuleKind::CommonJs,
+        );
+        assert_eq!(
+            result.code,
+            "\"use strict\";\nObject.defineProperty(exports, \"__esModule\", { value: true });\nexports.m = void 0;\nvar m;\n(function (m) {\n    function foo() { }\n    m.foo = foo;\n})(m || (exports.m = m = {}));\n"
         );
     }
 
@@ -18181,18 +18363,26 @@ class Board {
     fn elides_imports_used_only_in_type_positions() {
         let source = "import Types = require('types'); import Runtime = require('runtime'); import 'side'; interface Box { value: Types.Value; } class Derived extends Runtime.Base {}";
         let result = emit_with(source, ScriptTarget::Es2015, ModuleKind::CommonJs);
-        assert!(!result.code.contains("require('types')"), "{}", result.code);
-        assert!(result.code.contains("const Runtime = require('runtime');"));
-        assert!(result.code.contains("require('side');"));
+        assert!(
+            !result.code.contains("require(\"types\")"),
+            "{}",
+            result.code
+        );
+        assert!(
+            result
+                .code
+                .contains("const Runtime = require(\"runtime\");")
+        );
+        assert!(result.code.contains("require(\"side\");"));
         assert!(result.code.contains("class Derived extends Runtime.Base"));
 
         let namespace_source = "import * as Types from 'types'; import * as Runtime from 'runtime'; type Value = Types.Value; Runtime.run();";
         let namespace = emit_with(namespace_source, ScriptTarget::Es2015, ModuleKind::CommonJs);
-        assert!(!namespace.code.contains("require('types')"));
+        assert!(!namespace.code.contains("require(\"types\")"));
         assert!(
             namespace
                 .code
-                .contains("const Runtime = __importStar(require('runtime'));")
+                .contains("const Runtime = __importStar(require(\"runtime\"));")
         );
 
         let type_only_namespace = emit_with(
@@ -18201,7 +18391,7 @@ class Board {
             ModuleKind::CommonJs,
         );
         assert!(!type_only_namespace.code.contains("__importStar"));
-        assert!(!type_only_namespace.code.contains("require('types')"));
+        assert!(!type_only_namespace.code.contains("require(\"types\")"));
     }
 
     #[test]
@@ -18227,7 +18417,7 @@ class Board {
         assert!(
             commonjs
                 .code
-                .ends_with("const ts = __importStar(require('typescript'));\nts.version;\n")
+                .ends_with("const ts = __importStar(require(\"typescript\"));\nts.version;\n")
         );
     }
 
@@ -18242,12 +18432,12 @@ class Board {
         assert!(
             result
                 .code
-                .contains("const first = __importStar(require('first'));")
+                .contains("const first = __importStar(require(\"first\"));")
         );
         assert!(
             result
                 .code
-                .contains("const second = __importStar(require('second'));")
+                .contains("const second = __importStar(require(\"second\"));")
         );
     }
 

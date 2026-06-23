@@ -61,6 +61,7 @@ pub enum ScriptTarget {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum JsxEmit {
     #[default]
+    None,
     Preserve,
     React,
     ReactNative,
@@ -172,7 +173,7 @@ impl Default for CompilerOptions {
             module: ModuleKind::default(),
             module_resolution: ModuleResolutionKind::Node10,
             target: ScriptTarget::Es5,
-            jsx: JsxEmit::Preserve,
+            jsx: JsxEmit::None,
             resolve_json_module: false,
             source_map: false,
             inline_source_map: false,
@@ -1145,6 +1146,16 @@ mod tests {
         let disabled = parse_compiler_options(&object([("alwaysStrict", JsonValue::Bool(false))]));
         assert!(disabled.is_ok());
         assert!(!disabled.options.always_strict);
+    }
+
+    #[test]
+    fn distinguishes_an_unspecified_jsx_mode_from_explicit_preserve() {
+        let defaults = parse_compiler_options(&object([]));
+        assert_eq!(defaults.options.jsx, JsxEmit::None);
+
+        let preserve =
+            parse_compiler_options(&object([("jsx", JsonValue::String("preserve".into()))]));
+        assert_eq!(preserve.options.jsx, JsxEmit::Preserve);
     }
 
     #[test]

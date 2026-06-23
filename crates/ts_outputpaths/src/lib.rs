@@ -214,6 +214,8 @@ mod tests {
 
     #[test]
     fn selects_javascript_and_declaration_extensions() {
+        assert_eq!(output_extension("view.tsx", JsxEmit::None), ".js");
+        assert_eq!(output_extension("view.jsx", JsxEmit::None), ".js");
         assert_eq!(output_extension("view.tsx", JsxEmit::Preserve), ".jsx");
         assert_eq!(output_extension("view.tsx", JsxEmit::ReactJsx), ".js");
         assert_eq!(output_extension("entry.mts", JsxEmit::Preserve), ".mjs");

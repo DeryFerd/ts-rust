@@ -845,7 +845,13 @@ fn join(left: &str, right: &str) -> String {
 
 fn ancestors(path: &str) -> Vec<String> {
     let mut result = Vec::new();
-    let mut current = normalize_path(path).trim_end_matches('/').to_owned();
+    let normalized = normalize_path(path);
+    let root = root_length(&normalized);
+    let mut current = if normalized.len() == root {
+        normalized
+    } else {
+        normalized.trim_end_matches('/').to_owned()
+    };
     loop {
         result.push(current.clone());
         let parent = directory_path(&current);
@@ -879,6 +885,26 @@ mod tests {
         assert_eq!(resolved.resolved_file_name, "/src/lib.ts");
         assert_eq!(resolved.extension, Some(FileExtension::Ts));
         assert!(!resolved.is_external_library_import);
+    }
+
+    #[test]
+    fn resolves_scoped_packages_from_the_filesystem_root() {
+        let fs = fs(&[(
+            "/node_modules/@fullcalendar/react/index.d.ts",
+            "export default class FullCalendar {}",
+        )]);
+        let result = Resolver::new(
+            &fs,
+            ResolutionOptions {
+                mode: ResolutionMode::Bundler,
+                ..ResolutionOptions::default()
+            },
+        )
+        .resolve("@fullcalendar/react", "/index.tsx");
+        assert_eq!(
+            result.resolved.unwrap().resolved_file_name,
+            "/node_modules/@fullcalendar/react/index.d.ts"
+        );
     }
 
     #[test]

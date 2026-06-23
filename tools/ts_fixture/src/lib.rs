@@ -458,14 +458,12 @@ fn compare_case_emitted_output_sections(
     let input_echoes = case
         .units
         .iter()
-        .filter_map(|unit| {
+        .map(|unit| {
             let path = unit.path.to_string_lossy().replace('\\', "/");
-            (!ts_path::is_declaration_file(&path)).then(|| {
-                (
-                    normalize_section_name(&path),
-                    normalize_input_section(unit.source_text.as_scannable_str()),
-                )
-            })
+            (
+                normalize_section_name(&path),
+                normalize_input_section(unit.source_text.as_scannable_str()),
+            )
         })
         .collect::<Vec<_>>();
     compare_emitted_output_sections_excluding(outputs, baseline, &excluded_expected, &input_echoes)
@@ -1843,6 +1841,40 @@ mod tests {
             "const output = 2;\n",
             "//// [a.js] ////\n",
             "const output = 1;\n",
+        );
+        assert!(
+            compare_case_emitted_output_sections(
+                &outputs,
+                baseline,
+                &case,
+                &OptionVariant::default(),
+            )
+            .is_match()
+        );
+    }
+
+    #[test]
+    fn excludes_duplicate_declaration_input_echoes_by_content() {
+        let case = Case::parse(
+            "declarationEcho.ts",
+            concat!(
+                "// @filename: /node_modules/one/index.d.ts\n",
+                "export interface One {}\n",
+                "// @filename: /node_modules/two/index.d.ts\n",
+                "export interface Two {}\n",
+                "// @filename: /index.ts\n",
+                "export {};\n",
+            ),
+        )
+        .unwrap();
+        let outputs = BTreeMap::from([("/index.js".into(), "export {};\n".into())]);
+        let baseline = concat!(
+            "//// [index.d.ts] ////\n",
+            "export interface One {}\n",
+            "//// [index.d.ts] ////\n",
+            "export interface Two {}\n",
+            "//// [index.js] ////\n",
+            "export {};\n",
         );
         assert!(
             compare_case_emitted_output_sections(
