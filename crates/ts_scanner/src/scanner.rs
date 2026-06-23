@@ -1325,7 +1325,7 @@ const fn diagnostic_category(category: Category) -> DiagnosticCategory {
 }
 
 fn is_identifier_start(ch: char) -> bool {
-    matches!(ch, '$' | '_') || ch.is_alphabetic() && !is_combining_mark(ch)
+    matches!(ch, '$' | '_') || unicode_ident::is_xid_start(ch)
 }
 
 fn text_pos(byte_pos: usize) -> TextPos {
@@ -1350,21 +1350,7 @@ fn is_radix_digit(ch: char, radix: u32) -> bool {
 }
 
 fn is_identifier_part(ch: char) -> bool {
-    is_identifier_start(ch)
-        || ch.is_alphanumeric()
-        || is_combining_mark(ch)
-        || matches!(ch, '\u{200c}' | '\u{200d}')
-}
-
-fn is_combining_mark(ch: char) -> bool {
-    matches!(
-        ch,
-        '\u{0300}'..='\u{036f}'
-            | '\u{1ab0}'..='\u{1aff}'
-            | '\u{1dc0}'..='\u{1dff}'
-            | '\u{20d0}'..='\u{20ff}'
-            | '\u{fe20}'..='\u{fe2f}'
-    )
+    matches!(ch, '$' | '\u{200c}' | '\u{200d}') || unicode_ident::is_xid_continue(ch)
 }
 
 fn is_line_break(ch: char) -> bool {
@@ -1717,6 +1703,18 @@ mod tests {
         assert_eq!(identifier.kind, SyntaxKind::Identifier);
         assert_eq!(identifier.value.unwrap().as_units(), &[b'a'.into(), 0x200c]);
         assert!(identifier.flags.contains(TokenFlags::UNICODE_ESCAPE));
+        assert!(scanner.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn scans_unicode_identifier_continue_categories() {
+        let name = "才能ソЫⅨर्क";
+        let mut scanner = Scanner::new(name);
+
+        let identifier = scanner.scan();
+        assert_eq!(identifier.kind, SyntaxKind::Identifier);
+        assert_eq!(identifier.text, name);
+        assert_eq!(scanner.scan().kind, SyntaxKind::EndOfFile);
         assert!(scanner.diagnostics().is_empty());
     }
 

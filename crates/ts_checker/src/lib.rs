@@ -1452,57 +1452,101 @@ impl<'a> ProgramChecker<'a> {
         result: &CheckResult,
         symbol_id: SymbolId,
     ) -> Option<TypeDescriptor> {
-        let symbol = source.bindings.symbols.get(symbol_id)?;
-        let namespace = symbol
-            .flags
-            .contains(ts_binder::SymbolFlags::NAMESPACE_MODULE)
-            .then(|| {
-                let properties = symbol
-                    .members
-                    .iter()
-                    .filter_map(|(name, member)| {
-                        Self::describe_symbol(source, result, member)
-                            .map(|descriptor| (name.to_owned(), descriptor))
-                    })
-                    .collect();
-                TypeDescriptor::Object {
-                    properties,
-                    optional_properties: BTreeSet::new(),
-                    readonly_properties: BTreeSet::new(),
-                    getter_properties: BTreeSet::new(),
+        #[derive(Clone, Copy)]
+        enum Task {
+            Enter(SymbolId),
+            Exit(SymbolId),
+        }
+
+        let mut stack = vec![Task::Enter(symbol_id)];
+        let mut visiting = HashSet::new();
+        let mut descriptors = HashMap::<SymbolId, Option<TypeDescriptor>>::new();
+
+        while let Some(task) = stack.pop() {
+            match task {
+                Task::Enter(current) => {
+                    if descriptors.contains_key(&current) || !visiting.insert(current) {
+                        continue;
+                    }
+                    let Some(symbol) = source.bindings.symbols.get(current) else {
+                        visiting.remove(&current);
+                        descriptors.insert(current, None);
+                        continue;
+                    };
+                    stack.push(Task::Exit(current));
+                    if symbol
+                        .flags
+                        .contains(ts_binder::SymbolFlags::NAMESPACE_MODULE)
+                    {
+                        for (_, member) in symbol.members.iter() {
+                            if !visiting.contains(&member) && !descriptors.contains_key(&member) {
+                                stack.push(Task::Enter(member));
+                            }
+                        }
+                    }
                 }
-            });
-        if let Some(declaration) = describe_declaration_symbol(source, Some(result), symbol_id) {
-            return Some(namespace.map_or(declaration.clone(), |namespace| {
-                TypeDescriptor::Intersection(vec![declaration, namespace])
-            }));
-        }
-        if namespace.is_some() {
-            return namespace;
-        }
-        let target = symbol.target.unwrap_or(symbol_id);
-        let target_symbol = source.bindings.symbols.get(target)?;
-        for declaration in &target_symbol.declarations {
-            if let Some(NodeData::ExportAssignment(assignment)) =
-                source.arena.get(*declaration).map(|node| &node.data)
-                && let Some(type_id) = result.type_of_node(assignment.expression)
-            {
-                return Some(describe_type(&result.types, type_id));
+                Task::Exit(current) => {
+                    let descriptor = source.bindings.symbols.get(current).and_then(|symbol| {
+                        let namespace = symbol
+                            .flags
+                            .contains(ts_binder::SymbolFlags::NAMESPACE_MODULE)
+                            .then(|| TypeDescriptor::Object {
+                                properties: symbol
+                                    .members
+                                    .iter()
+                                    .filter_map(|(name, member)| {
+                                        descriptors
+                                            .get(&member)
+                                            .and_then(Option::as_ref)
+                                            .cloned()
+                                            .map(|descriptor| (name.to_owned(), descriptor))
+                                    })
+                                    .collect(),
+                                optional_properties: BTreeSet::new(),
+                                readonly_properties: BTreeSet::new(),
+                                getter_properties: BTreeSet::new(),
+                            });
+                        if let Some(declaration) =
+                            describe_declaration_symbol(source, Some(result), current)
+                        {
+                            return Some(namespace.map_or(declaration.clone(), |namespace| {
+                                TypeDescriptor::Intersection(vec![declaration, namespace])
+                            }));
+                        }
+                        if namespace.is_some() {
+                            return namespace;
+                        }
+                        let target = symbol.target.unwrap_or(current);
+                        let target_symbol = source.bindings.symbols.get(target)?;
+                        for declaration in &target_symbol.declarations {
+                            if let Some(NodeData::ExportAssignment(assignment)) =
+                                source.arena.get(*declaration).map(|node| &node.data)
+                                && let Some(type_id) = result.type_of_node(assignment.expression)
+                            {
+                                return Some(describe_type(&result.types, type_id));
+                            }
+                        }
+                        let descriptor = result
+                            .type_of_symbol(target)
+                            .map(|type_id| describe_type(&result.types, type_id))?;
+                        Some(
+                            if target_symbol
+                                .flags
+                                .contains(ts_binder::SymbolFlags::CONST_ENUM)
+                            {
+                                TypeDescriptor::ConstEnum(Box::new(descriptor))
+                            } else {
+                                descriptor
+                            },
+                        )
+                    });
+                    visiting.remove(&current);
+                    descriptors.insert(current, descriptor);
+                }
             }
         }
-        let descriptor = result
-            .type_of_symbol(target)
-            .map(|type_id| describe_type(&result.types, type_id))?;
-        Some(
-            if target_symbol
-                .flags
-                .contains(ts_binder::SymbolFlags::CONST_ENUM)
-            {
-                TypeDescriptor::ConstEnum(Box::new(descriptor))
-            } else {
-                descriptor
-            },
-        )
+
+        descriptors.remove(&symbol_id).flatten()
     }
 }
 
@@ -12537,6 +12581,45 @@ mod tests {
                 assert!(!meanings.contains_key(&node));
             }
         }
+    }
+
+    #[test]
+    fn checks_namespace_member_with_container_name_without_recursive_symbol() {
+        let parsed =
+            parse_source_file("namespace m1 { export var m1 = 10; var b = m1; } var foo = m1.m1;");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        assert!(
+            bindings.diagnostics.is_empty(),
+            "{:?}",
+            bindings.diagnostics
+        );
+        let modules = BTreeMap::new();
+        let checked = check_program(&[ProgramSource {
+            arena: &parsed.arena,
+            source_file: parsed.source_file,
+            bindings: &bindings,
+            resolved_modules: &modules,
+            is_default_library: false,
+            skip_diagnostics: false,
+            checker_options: CheckerOptions::default(),
+        }]);
+        assert!(checked.files[0].diagnostics.is_empty());
+
+        let namespace = bindings.root_scope().unwrap().symbols.get("m1").unwrap();
+        let member = bindings
+            .symbols
+            .get(namespace)
+            .unwrap()
+            .members
+            .get("m1")
+            .unwrap();
+        assert_ne!(namespace, member);
+        let member_type = checked.files[0].type_of_symbol(member).unwrap();
+        assert!(matches!(
+            checked.files[0].types.get(member_type).unwrap().kind,
+            TypeKind::Number | TypeKind::NumberLiteral(_)
+        ));
     }
 
     #[test]

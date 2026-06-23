@@ -504,10 +504,13 @@ impl<'a> Parser<'a> {
             && self.next_token_kind() == SyntaxKind::EnumKeyword;
         let is_module_declaration = match self.current.kind {
             SyntaxKind::GlobalKeyword => self.next_token_kind() == SyntaxKind::OpenBraceToken,
-            SyntaxKind::NamespaceKeyword => self.next_token_kind() == SyntaxKind::Identifier,
+            SyntaxKind::NamespaceKeyword => matches!(
+                self.next_token_kind(),
+                SyntaxKind::Identifier | SyntaxKind::RequireKeyword
+            ),
             SyntaxKind::ModuleKeyword => matches!(
                 self.next_token_kind(),
-                SyntaxKind::Identifier | SyntaxKind::StringLiteral
+                SyntaxKind::Identifier | SyntaxKind::RequireKeyword | SyntaxKind::StringLiteral
             ),
             _ => false,
         };
@@ -1660,7 +1663,9 @@ impl<'a> Parser<'a> {
                 break;
             }
             let before = (self.current.kind, self.current.range);
-            if self.current.kind == SyntaxKind::SemicolonToken {
+            if self.current.kind == SyntaxKind::SemicolonToken
+                || (signature_only && self.current.kind == SyntaxKind::CommaToken)
+            {
                 self.bump();
                 continue;
             }
@@ -2010,7 +2015,7 @@ impl<'a> Parser<'a> {
         let parameters = self.parse_parameter_list();
         let return_type = self.parse_optional_type_annotation();
         let fallback = return_type.map_or(parameters.range.end, |node| self.node_end(node));
-        let end = self.parse_semicolon(fallback);
+        let end = self.parse_type_member_terminator(fallback);
         let mut children = Vec::new();
         extend_list_children(&mut children, type_parameters.as_ref());
         children.extend(parameters.nodes.iter().copied());
@@ -2058,7 +2063,7 @@ impl<'a> Parser<'a> {
             );
             Some(body)
         } else {
-            self.parse_semicolon(fallback);
+            self.parse_type_member_terminator(fallback);
             None
         };
         let end = body.map_or(fallback, |node| self.node_end(node));
@@ -2142,7 +2147,7 @@ impl<'a> Parser<'a> {
             self.error_current("Expected a type annotation.");
         }
         let type_node = self.parse_type();
-        let end = self.parse_semicolon(self.node_end(type_node));
+        let end = self.parse_type_member_terminator(self.node_end(type_node));
         let parameters = NodeList {
             range: TextRange::new(parameters_start, parameters_end),
             nodes: parameter_nodes.clone(),
@@ -2186,7 +2191,7 @@ impl<'a> Parser<'a> {
             let parameters = self.parse_parameter_list();
             let return_type = self.parse_optional_type_annotation();
             let fallback = return_type.map_or(parameters.range.end, |node| self.node_end(node));
-            let end = self.parse_semicolon(fallback);
+            let end = self.parse_type_member_terminator(fallback);
             let mut children = vec![name];
             children.extend(postfix_token);
             extend_list_children(&mut children, type_parameters.as_ref());
@@ -2213,7 +2218,7 @@ impl<'a> Parser<'a> {
 
         let type_node = self.parse_optional_type_annotation();
         let fallback = type_node.map_or_else(|| self.node_end(name), |node| self.node_end(node));
-        let end = self.parse_semicolon(fallback);
+        let end = self.parse_type_member_terminator(fallback);
         let mut children = vec![name];
         children.extend(postfix_token);
         children.extend(type_node);
@@ -2996,7 +3001,10 @@ impl<'a> Parser<'a> {
             None
         } else {
             let clause_start = self.current.range.start;
-            let name = if self.current.kind == SyntaxKind::Identifier {
+            let name = if matches!(
+                self.current.kind,
+                SyntaxKind::Identifier | SyntaxKind::RequireKeyword
+            ) {
                 Some(self.parse_identifier("Expected an import binding."))
             } else {
                 None
@@ -5312,7 +5320,10 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_identifier(&mut self, message: &str) -> NodeId {
-        if self.current.kind != SyntaxKind::Identifier {
+        if !matches!(
+            self.current.kind,
+            SyntaxKind::Identifier | SyntaxKind::RequireKeyword
+        ) {
             let position = self.current.range.start;
             self.error_current(message);
             return self.missing_identifier(position);
@@ -6349,6 +6360,15 @@ impl<'a> Parser<'a> {
         })
     }
 
+    fn parse_type_member_terminator(&mut self, fallback_end: TextPos) -> TextPos {
+        if self.current.kind == SyntaxKind::CommaToken {
+            self.bump();
+            fallback_end
+        } else {
+            self.parse_semicolon(fallback_end)
+        }
+    }
+
     fn parse_semicolon(&mut self, fallback_end: TextPos) -> TextPos {
         if self.current.kind == SyntaxKind::SemicolonToken {
             return self.consume().range.end;
@@ -6919,6 +6939,27 @@ mod tests {
                 Some(source_statements(&result)[1])
             );
         }
+    }
+
+    #[test]
+    fn accepts_require_as_a_contextual_declaration_name() {
+        let result = parse_source_file(
+            "namespace require {} enum require { A } import require = M.C; new require();",
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let kinds = source_statements(&result)
+            .iter()
+            .map(|statement| result.arena.get(*statement).unwrap().kind)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            [
+                SyntaxKind::ModuleDeclaration,
+                SyntaxKind::EnumDeclaration,
+                SyntaxKind::ImportEqualsDeclaration,
+                SyntaxKind::ExpressionStatement,
+            ]
+        );
     }
 
     #[test]
@@ -9733,6 +9774,37 @@ mod tests {
             result.arena.get(statements[1]).unwrap().kind,
             SyntaxKind::VariableStatement
         );
+    }
+
+    #[test]
+    fn parses_comma_separated_interface_members_without_empty_recovery_nodes() {
+        let result = parse_source_file("interface Pair<T> { first: T, second: T, }");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let statements = source_statements(&result);
+        let NodeData::InterfaceDeclaration(interface) =
+            &result.arena.get(statements[0]).unwrap().data
+        else {
+            panic!("expected interface");
+        };
+        assert_eq!(interface.members.nodes.len(), 2);
+        let names = interface
+            .members
+            .nodes
+            .iter()
+            .map(|member| {
+                let NodeData::PropertyDeclaration(property) =
+                    &result.arena.get(*member).unwrap().data
+                else {
+                    panic!("expected property");
+                };
+                let NodeData::Identifier(name) = &result.arena.get(property.name).unwrap().data
+                else {
+                    panic!("expected identifier name");
+                };
+                name.text.as_str()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["first", "second"]);
     }
 
     #[test]

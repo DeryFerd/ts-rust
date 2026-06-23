@@ -250,6 +250,13 @@ impl BindResult {
             if let Some(symbol) = current.symbols.get(name) {
                 return Some(symbol);
             }
+            if current.kind == ScopeKind::Module
+                && let Some(symbol) = self.node_symbols.get(&current.owner)
+                && let Some(symbol) = self.symbols.get(*symbol)
+                && let Some(member) = symbol.members.get(name)
+            {
+                return Some(member);
+            }
             scope = current.parent?;
         }
     }
@@ -1301,7 +1308,10 @@ impl<'a> Binder<'a> {
     fn nearest_var_scope(&self, mut scope: ScopeId) -> ScopeId {
         loop {
             let current = &self.result.scopes[scope.index()];
-            if matches!(current.kind, ScopeKind::SourceFile | ScopeKind::Function) {
+            if matches!(
+                current.kind,
+                ScopeKind::SourceFile | ScopeKind::Function | ScopeKind::Module
+            ) {
                 return scope;
             }
             scope = current.parent.unwrap_or(scope);
@@ -2019,6 +2029,37 @@ mod tests {
                 .iter()
                 .any(|scope| scope.kind == ScopeKind::Module)
         );
+    }
+
+    #[test]
+    fn keeps_function_scoped_variables_inside_namespace_scopes() {
+        let parsed = parse_source_file(
+            r"
+                namespace m1 {
+                    export var m1 = 10;
+                    var local = m1;
+                }
+                var value = m1.m1;
+            ",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let result = bind_source_file(&parsed.arena, parsed.source_file);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+
+        let root = result.root_scope().unwrap();
+        let namespace_id = root.symbols.get("m1").unwrap();
+        let namespace = result.symbols.get(namespace_id).unwrap();
+        let exported_id = namespace.members.get("m1").unwrap();
+        assert_ne!(namespace_id, exported_id);
+
+        let module_scope = result
+            .scopes
+            .iter()
+            .find(|scope| scope.kind == ScopeKind::Module)
+            .unwrap();
+        assert_eq!(module_scope.symbols.get("m1"), Some(exported_id));
+        assert!(module_scope.symbols.get("local").is_some());
+        assert!(root.symbols.get("local").is_none());
     }
 
     #[test]
