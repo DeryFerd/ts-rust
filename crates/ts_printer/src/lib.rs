@@ -3174,6 +3174,20 @@ impl DeclarationPrinter<'_> {
                     self.writer.write("export default ");
                     self.writer.write(&name);
                     self.writer.write(";");
+                } else if let Some(type_query) = self
+                    .entity_value_type_query(data.expression)
+                    .or_else(|| self.imported_namespace_entity_type_query(data.expression))
+                {
+                    let name = self.generate_declaration_name_avoiding_source("_default");
+                    self.writer.write("declare const ");
+                    self.writer.write(&name);
+                    self.writer.write(": typeof ");
+                    self.emit_name(type_query)?;
+                    self.writer.write(";");
+                    self.writer.newline();
+                    self.writer.write("export default ");
+                    self.writer.write(&name);
+                    self.writer.write(";");
                 } else if let Some(type_id) = self.synthesized_expression_type(data.expression) {
                     let name = self.generate_declaration_name_avoiding_source("_default");
                     self.writer.write("declare const ");
@@ -4437,10 +4451,7 @@ impl DeclarationPrinter<'_> {
             match &self.arena.get(parent).map(|node| &node.data) {
                 Some(NodeData::AsExpression(_) | NodeData::TypeAssertion(_)) => return true,
                 Some(NodeData::ExportAssignment(export))
-                    if !export.is_export_equals
-                        && self
-                            .synthesized_expression_type(export.expression)
-                            .is_some() =>
+                    if self.export_assignment_use_is_synthesized(export) =>
                 {
                     return true;
                 }
@@ -4462,6 +4473,16 @@ impl DeclarationPrinter<'_> {
             }
         }
         false
+    }
+
+    fn export_assignment_use_is_synthesized(&self, export: &ts_ast::ExportAssignmentData) -> bool {
+        !export.is_export_equals
+            && self
+                .synthesized_expression_type(export.expression)
+                .is_some()
+            && self
+                .imported_namespace_entity_type_query(export.expression)
+                .is_none()
     }
 
     fn identifier_is_in_untyped_exported_variable(&self, identifier: NodeId) -> bool {
@@ -5964,6 +5985,29 @@ impl DeclarationPrinter<'_> {
                     _ => false,
                 },
             )
+            .then_some(initializer)
+    }
+
+    fn imported_namespace_entity_type_query(&self, initializer: NodeId) -> Option<NodeId> {
+        let root = self.entity_expression_root_identifier(initializer)?;
+        let name = declaration_name_text(self.arena, root)?;
+        let symbol = self
+            .bindings
+            .node_symbols
+            .get(&root)
+            .copied()
+            .or_else(|| self.bindings.resolve_name_at(root, name))?;
+        self.bindings
+            .symbols
+            .get(symbol)?
+            .declarations
+            .iter()
+            .any(|declaration| {
+                matches!(
+                    self.arena.get(*declaration).map(|node| &node.data),
+                    Some(NodeData::NamespaceImport(_))
+                )
+            })
             .then_some(initializer)
     }
 
@@ -26264,8 +26308,8 @@ impl Printer<'_> {
                     break;
                 }
                 if let NodeData::ExportAssignment(assignment) = &parent.data {
-                    return assignment.is_export_equals
-                        && self
+                    return !assignment.is_export_equals
+                        || self
                             .entity_has_runtime_value(assignment.expression, &mut HashSet::new());
                 }
                 if matches!(parent.data, NodeData::ExportDeclaration(_))
