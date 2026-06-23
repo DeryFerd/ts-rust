@@ -539,6 +539,7 @@ impl Program {
                     && has_unserializable_isolated_declaration_name(source_file))
                     || has_private_export_type_query(source_file)
                     || has_unserializable_exported_anonymous_class(source_file)
+                    || has_unserializable_exported_class_property_type(source_file)
                     || source_file.checking.diagnostics.iter().any(|diagnostic| {
                         matches!(
                             diagnostic.diagnostic.code(),
@@ -772,6 +773,7 @@ impl Program {
                     && has_unserializable_isolated_declaration_name(source))
                     || has_private_export_type_query(source)
                     || has_unserializable_exported_anonymous_class(source)
+                    || has_unserializable_exported_class_property_type(source)
                     || source.checking.diagnostics.iter().any(|diagnostic| {
                         matches!(
                             diagnostic.diagnostic.code(),
@@ -1979,6 +1981,65 @@ fn has_unserializable_exported_anonymous_class(source: &SourceFile) -> bool {
     })
 }
 
+fn has_unserializable_exported_class_property_type(source: &SourceFile) -> bool {
+    source.parse.arena.iter().any(|(_, node)| {
+        let NodeData::ClassDeclaration(class) = &node.data else {
+            return false;
+        };
+        if !node_has_modifier(
+            &source.parse.arena,
+            class.modifiers.as_ref(),
+            ts_ast::SyntaxKind::ExportKeyword,
+        ) {
+            return false;
+        }
+        class.members.nodes.iter().any(|member| {
+            let Some(NodeData::PropertyDeclaration(property)) =
+                source.parse.arena.get(*member).map(|node| &node.data)
+            else {
+                return false;
+            };
+            if property.type_.is_some()
+                || node_has_modifier(
+                    &source.parse.arena,
+                    property.modifiers.as_ref(),
+                    ts_ast::SyntaxKind::PrivateKeyword,
+                )
+                || node_has_modifier(
+                    &source.parse.arena,
+                    property.modifiers.as_ref(),
+                    ts_ast::SyntaxKind::ProtectedKeyword,
+                )
+            {
+                return false;
+            }
+            let Some(type_id) = source.checking.type_of_node(*member).or_else(|| {
+                property
+                    .initializer
+                    .and_then(|id| source.checking.type_of_node(id))
+            }) else {
+                return false;
+            };
+            inaccessible_named_type_reference(&source.checking, type_id, &mut BTreeSet::new())
+                .or_else(|| cyclic_alias_type_name(&source.checking, type_id, &mut BTreeSet::new()))
+                .is_some_and(|name| !source_declares_type_name(source, &name))
+        })
+    })
+}
+
+fn source_declares_type_name(source: &SourceFile, expected: &str) -> bool {
+    source.parse.arena.iter().any(|(_, node)| {
+        let name = match &node.data {
+            NodeData::TypeAliasDeclaration(declaration) => Some(declaration.name),
+            NodeData::InterfaceDeclaration(declaration) => Some(declaration.name),
+            NodeData::ClassDeclaration(declaration) => declaration.name,
+            NodeData::EnumDeclaration(declaration) => Some(declaration.name),
+            _ => None,
+        };
+        name.and_then(|name| identifier_text(&source.parse.arena, name)) == Some(expected)
+    })
+}
+
 fn leftmost_entity_identifier(arena: &ts_ast::NodeArena, entity: NodeId) -> Option<(NodeId, &str)> {
     match &arena.get(entity)?.data {
         NodeData::Identifier(identifier) => Some((entity, &identifier.text)),
@@ -2645,6 +2706,61 @@ fn inaccessible_named_type_reference(
     children
         .into_iter()
         .find_map(|child| inaccessible_named_type_reference(checking, child, visited))
+}
+
+fn cyclic_alias_type_name(
+    checking: &CheckResult,
+    type_id: TypeId,
+    visited: &mut BTreeSet<TypeId>,
+) -> Option<String> {
+    if !visited.insert(type_id) {
+        return None;
+    }
+    let kind = &checking.types.get(type_id)?.kind;
+    if let TypeKind::TypeParameter { name, .. } = kind
+        && let Some(name) = name.strip_prefix("__cyclic_alias__")
+    {
+        return Some(name.to_owned());
+    }
+    let mut children = Vec::new();
+    match kind {
+        TypeKind::TypeParameter { constraint, .. } => children.extend(constraint),
+        TypeKind::Array(element) => children.push(*element),
+        TypeKind::Tuple(elements)
+        | TypeKind::ReadonlyTuple(elements)
+        | TypeKind::Union(elements)
+        | TypeKind::Intersection(elements) => children.extend(elements),
+        TypeKind::Object(object) => {
+            children.extend(object.properties.values());
+            children.extend(object.string_index_type);
+            children.extend(object.number_index_type);
+            for signature in object
+                .call_signatures
+                .iter()
+                .chain(&object.construct_signatures)
+            {
+                children.extend(&signature.parameters);
+                children.extend(signature.rest_parameter);
+                children.push(signature.return_type);
+            }
+        }
+        TypeKind::Function(signature) | TypeKind::Constructor(signature) => {
+            children.extend(&signature.parameters);
+            children.extend(signature.rest_parameter);
+            children.push(signature.return_type);
+        }
+        TypeKind::Overload(signatures) => {
+            for signature in signatures {
+                children.extend(&signature.parameters);
+                children.extend(signature.rest_parameter);
+                children.push(signature.return_type);
+            }
+        }
+        _ => {}
+    }
+    children
+        .into_iter()
+        .find_map(|child| cyclic_alias_type_name(checking, child, visited))
 }
 
 fn enum_values_for_emit(

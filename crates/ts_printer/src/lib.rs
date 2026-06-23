@@ -1715,6 +1715,7 @@ pub fn emit_declaration_file_with_semantics(
         named_type_references,
         active_semantic_types: HashSet::new(),
         active_type_parameter_renames: HashMap::new(),
+        active_type_query_substitutions: HashMap::new(),
         javascript_source: [".js", ".jsx", ".mjs", ".cjs"]
             .iter()
             .any(|extension| source_name.to_ascii_lowercase().ends_with(extension)),
@@ -1856,6 +1857,7 @@ struct DeclarationPrinter<'a> {
     named_type_references: Option<&'a BTreeMap<TypeId, NamedTypeReference>>,
     active_semantic_types: HashSet<TypeId>,
     active_type_parameter_renames: HashMap<String, String>,
+    active_type_query_substitutions: HashMap<String, NodeId>,
     javascript_source: bool,
     generated_names: HashSet<String>,
     emitted_javascript_class_properties: HashSet<(NodeId, String)>,
@@ -4666,6 +4668,48 @@ impl DeclarationPrinter<'_> {
             .and_then(|body| self.returned_new_expression_type(body))
         {
             self.writer.write(&type_name);
+            return Ok(());
+        }
+        if let Some(annotation) = function
+            .body
+            .and_then(|body| self.returned_local_function_type_annotation(body))
+        {
+            let previous = std::mem::take(&mut self.active_type_parameter_renames);
+            self.active_type_parameter_renames =
+                self.nested_type_parameter_renames(function, annotation);
+            let result = self.emit_type(annotation);
+            self.active_type_parameter_renames = previous;
+            result?;
+            return Ok(());
+        }
+        if let Some(annotation) = function
+            .body
+            .and_then(|body| self.returned_local_conditional_type_annotation(body))
+        {
+            let previous_renames = std::mem::take(&mut self.active_type_parameter_renames);
+            let previous_queries = std::mem::take(&mut self.active_type_query_substitutions);
+            self.active_type_parameter_renames =
+                self.nested_type_parameter_renames(function, annotation);
+            self.active_type_query_substitutions = function
+                .parameters
+                .nodes
+                .iter()
+                .filter_map(|parameter| {
+                    let NodeData::ParameterDeclaration(parameter) =
+                        &self.arena.get(*parameter)?.data
+                    else {
+                        return None;
+                    };
+                    Some((
+                        declaration_name_text(self.arena, parameter.name)?.to_owned(),
+                        parameter.type_?,
+                    ))
+                })
+                .collect();
+            let result = self.emit_type(annotation);
+            self.active_type_parameter_renames = previous_renames;
+            self.active_type_query_substitutions = previous_queries;
+            result?;
             return Ok(());
         }
         if let Some(annotation) = function
@@ -8604,6 +8648,10 @@ impl DeclarationPrinter<'_> {
                     {
                         self.writer.write("typeof ");
                         self.emit_name(class_name)?;
+                    } else if let Some(initializer) = data.initializer
+                        && self.initializer_has_explicit_function_signature(initializer)
+                    {
+                        self.emit_initializer_function_type(initializer)?;
                     } else if let Some(type_node) = data
                         .initializer
                         .and_then(|initializer| self.asserted_initializer_type(initializer))
@@ -11812,6 +11860,132 @@ impl DeclarationPrinter<'_> {
         })
     }
 
+    fn returned_local_function_type_annotation(&self, body: NodeId) -> Option<NodeId> {
+        let NodeData::Block(block) = &self.arena.get(body)?.data else {
+            return None;
+        };
+        let returned_name = block.statements.nodes.iter().find_map(|statement| {
+            let NodeData::ReturnStatement(return_) = &self.arena.get(*statement)?.data else {
+                return None;
+            };
+            declaration_name_text(self.arena, return_.expression?)
+        })?;
+        block.statements.nodes.iter().find_map(|statement| {
+            let NodeData::VariableStatement(statement) = &self.arena.get(*statement)?.data else {
+                return None;
+            };
+            let NodeData::VariableDeclarationList(list) =
+                &self.arena.get(statement.declaration_list)?.data
+            else {
+                return None;
+            };
+            list.declarations.nodes.iter().find_map(|declaration| {
+                let NodeData::VariableDeclaration(variable) = &self.arena.get(*declaration)?.data
+                else {
+                    return None;
+                };
+                let annotation = variable.type_?;
+                (declaration_name_text(self.arena, variable.name) == Some(returned_name)
+                    && matches!(
+                        self.arena.get(annotation).map(|node| &node.data),
+                        Some(NodeData::FunctionTypeNode(_))
+                    ))
+                .then_some(annotation)
+            })
+        })
+    }
+
+    fn returned_local_conditional_type_annotation(&self, body: NodeId) -> Option<NodeId> {
+        let NodeData::Block(block) = &self.arena.get(body)?.data else {
+            return None;
+        };
+        let returned_name = block.statements.nodes.iter().find_map(|statement| {
+            let NodeData::ReturnStatement(return_) = &self.arena.get(*statement)?.data else {
+                return None;
+            };
+            declaration_name_text(self.arena, return_.expression?)
+        })?;
+        block.statements.nodes.iter().find_map(|statement| {
+            let NodeData::VariableStatement(statement) = &self.arena.get(*statement)?.data else {
+                return None;
+            };
+            let NodeData::VariableDeclarationList(list) =
+                &self.arena.get(statement.declaration_list)?.data
+            else {
+                return None;
+            };
+            list.declarations.nodes.iter().find_map(|declaration| {
+                let NodeData::VariableDeclaration(variable) = &self.arena.get(*declaration)?.data
+                else {
+                    return None;
+                };
+                let annotation = variable.type_?;
+                (declaration_name_text(self.arena, variable.name) == Some(returned_name)
+                    && matches!(
+                        self.arena.get(annotation).map(|node| &node.data),
+                        Some(NodeData::ConditionalTypeNode(_))
+                    ))
+                .then_some(annotation)
+            })
+        })
+    }
+
+    fn nested_type_parameter_renames(
+        &self,
+        function: &ts_ast::FunctionDeclarationData,
+        nested_type: NodeId,
+    ) -> HashMap<String, String> {
+        let outer = function
+            .type_parameters
+            .as_ref()
+            .into_iter()
+            .flat_map(|parameters| &parameters.nodes)
+            .filter_map(|parameter| {
+                let NodeData::TypeParameterDeclaration(parameter) =
+                    &self.arena.get(*parameter)?.data
+                else {
+                    return None;
+                };
+                declaration_name_text(self.arena, parameter.name).map(str::to_owned)
+            })
+            .collect::<HashSet<_>>();
+        let source_names = self
+            .arena
+            .iter()
+            .filter_map(|(_, node)| match &node.data {
+                NodeData::Identifier(identifier) => Some(identifier.text.as_str()),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        let mut renames = HashMap::new();
+        for (candidate, node) in self.arena.iter() {
+            let NodeData::TypeParameterDeclaration(parameter) = &node.data else {
+                continue;
+            };
+            if !self.node_is_within(candidate, nested_type) {
+                continue;
+            }
+            let Some(name) = declaration_name_text(self.arena, parameter.name) else {
+                continue;
+            };
+            if !outer.contains(name) || renames.contains_key(name) {
+                continue;
+            }
+            let mut index = 1_u32;
+            loop {
+                let replacement = format!("{name}_{index}");
+                if !source_names.contains(replacement.as_str())
+                    && !renames.values().any(|existing| existing == &replacement)
+                {
+                    renames.insert(name.to_owned(), replacement);
+                    break;
+                }
+                index += 1;
+            }
+        }
+        renames
+    }
+
     fn returned_local_type_alias_body(&self, body: NodeId) -> Option<NodeId> {
         let NodeData::Block(block) = &self.arena.get(body)?.data else {
             return None;
@@ -12163,6 +12337,18 @@ impl DeclarationPrinter<'_> {
                 });
                 self.emit_type(data.type_)?;
             }
+            NodeData::InferTypeNode(data) => {
+                self.writer.write("infer ");
+                let parameter = self.node(data.type_parameter)?.clone();
+                let NodeData::TypeParameterDeclaration(parameter) = &parameter.data else {
+                    return Err(Self::unsupported(data.type_parameter, parameter.kind));
+                };
+                self.emit_name(parameter.name)?;
+                if let Some(constraint) = parameter.constraint {
+                    self.writer.write(" extends ");
+                    self.emit_type(constraint)?;
+                }
+            }
             NodeData::OptionalTypeNode(data) => {
                 self.emit_type(data.type_)?;
                 self.writer.write("?");
@@ -12183,9 +12369,19 @@ impl DeclarationPrinter<'_> {
                 self.emit_type(data.type_)?;
             }
             NodeData::TypeQueryNode(data) => {
-                self.writer.write("typeof ");
-                self.emit_name(data.expr_name)?;
-                self.emit_type_arguments(data.type_arguments.as_ref())?;
+                let substitution = declaration_name_text(self.arena, data.expr_name)
+                    .and_then(|name| self.active_type_query_substitutions.get(name))
+                    .copied();
+                if let Some(substitution) = substitution {
+                    let renames = std::mem::take(&mut self.active_type_parameter_renames);
+                    let result = self.emit_type(substitution);
+                    self.active_type_parameter_renames = renames;
+                    result?;
+                } else {
+                    self.writer.write("typeof ");
+                    self.emit_name(data.expr_name)?;
+                    self.emit_type_arguments(data.type_arguments.as_ref())?;
+                }
             }
             NodeData::ThisTypeNode(_) => self.writer.write("this"),
             _ => self.emit_source_slice(&node),

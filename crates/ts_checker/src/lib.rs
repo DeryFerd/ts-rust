@@ -3526,7 +3526,26 @@ impl<'a> Checker<'a> {
                             .map(|type_node| self.type_from_type_node(type_node))
                             .or_else(|| {
                                 data.initializer.map(|value| {
+                                    if !is_static {
+                                        let this_type =
+                                            self.result.types.alloc(TypeKind::Object(ObjectType {
+                                                properties: properties.clone(),
+                                                property_order: property_order.clone(),
+                                                numeric_properties: numeric_properties.clone(),
+                                                optional_properties: optional_properties.clone(),
+                                                readonly_properties: readonly_properties.clone(),
+                                                getter_properties: getter_properties.clone(),
+                                                setter_properties: setter_properties.clone(),
+                                                setter_property_types: setter_property_types
+                                                    .clone(),
+                                                ..ObjectType::default()
+                                            }));
+                                        self.this_types.push(this_type);
+                                    }
                                     let type_id = self.type_of_expression(value);
+                                    if !is_static {
+                                        self.this_types.pop();
+                                    }
                                     if !self.options.strict_null_checks
                                         && matches!(
                                             self.result.types.get(type_id).map(|type_| &type_.kind),
