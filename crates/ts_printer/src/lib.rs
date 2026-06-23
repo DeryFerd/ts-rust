@@ -302,6 +302,7 @@ pub fn emit_source_file_with_context(
         .and_then(|statement| arena.get(*statement))
         .map(|node| node.range.start.get());
     if let Some(start) = first_statement_start {
+        printer.emit_leading_detached_source_comments(start);
         if settings.module == ModuleKind::CommonJs && is_external_module {
             printer.emit_leading_pinned_source_comments(start);
         } else if data.statements.nodes.first().is_some_and(|statement| {
@@ -4705,6 +4706,64 @@ impl Printer<'_> {
 
     fn emit_leading_source_comments(&mut self, end: u32) {
         self.emit_leading_source_comments_excluding_with_mode(end, &[], false);
+    }
+
+    fn emit_leading_detached_source_comments(&mut self, end: u32) {
+        let end = usize::try_from(end).unwrap_or(usize::MAX);
+        let Some(prefix) = self.source_text.get(..end) else {
+            return;
+        };
+        let bytes = prefix.as_bytes();
+        let mut index = 0;
+        let mut comment_end = None;
+        while index < bytes.len() {
+            if bytes[index..].starts_with(b"//") {
+                if let Some(last_comment_end) = comment_end
+                    && contains_blank_line(&prefix[last_comment_end..index])
+                {
+                    self.emit_leading_source_comments_excluding_with_mode(
+                        u32::try_from(last_comment_end).unwrap_or(u32::MAX),
+                        &[],
+                        false,
+                    );
+                    return;
+                }
+                let end = bytes[index..]
+                    .iter()
+                    .position(|byte| *byte == b'\n' || *byte == b'\r')
+                    .map_or(bytes.len(), |offset| index + offset);
+                comment_end = Some(end);
+                index = end;
+            } else if bytes[index..].starts_with(b"/*") {
+                if let Some(last_comment_end) = comment_end
+                    && contains_blank_line(&prefix[last_comment_end..index])
+                {
+                    self.emit_leading_source_comments_excluding_with_mode(
+                        u32::try_from(last_comment_end).unwrap_or(u32::MAX),
+                        &[],
+                        false,
+                    );
+                    return;
+                }
+                let end = bytes[index + 2..]
+                    .windows(2)
+                    .position(|window| window == b"*/")
+                    .map_or(bytes.len(), |offset| index + 2 + offset + 2);
+                comment_end = Some(end);
+                index = end;
+            } else {
+                index += 1;
+            }
+        }
+        if let Some(last_comment_end) = comment_end
+            && contains_blank_line(&prefix[last_comment_end..])
+        {
+            self.emit_leading_source_comments_excluding_with_mode(
+                u32::try_from(last_comment_end).unwrap_or(u32::MAX),
+                &[],
+                false,
+            );
+        }
     }
 
     fn emit_leading_pinned_source_comments(&mut self, end: u32) {
@@ -9948,6 +10007,36 @@ fn is_reference_directive(comment: &str) -> bool {
         .is_some_and(|character| character.is_whitespace() || matches!(character, '/' | '>'))
 }
 
+fn contains_blank_line(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    let mut line_breaks = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\n' => {
+                line_breaks += 1;
+                index += 1;
+            }
+            b'\r' => {
+                line_breaks += 1;
+                index += 1;
+                if bytes.get(index) == Some(&b'\n') {
+                    index += 1;
+                }
+            }
+            b' ' | b'\t' => index += 1,
+            _ => {
+                line_breaks = 0;
+                index += 1;
+            }
+        }
+        if line_breaks >= 2 {
+            return true;
+        }
+    }
+    false
+}
+
 fn is_amd_dependency_directive(comment: &str) -> bool {
     let Some(directive) = comment.strip_prefix("///") else {
         return false;
@@ -12220,6 +12309,33 @@ class Board {
         assert_eq!(
             emit_always_strict(source, ScriptTarget::Es2015, ModuleKind::CommonJs).code,
             "\"use strict\";\nObject.defineProperty(exports, \"__esModule\", { value: true });\nexports.a = void 0;\n// Module commonjs\nexports.a = 1;\n"
+        );
+    }
+
+    #[test]
+    fn detached_file_header_precedes_commonjs_generated_prologue() {
+        let source = "/* file header */\n\nexport const value = 1;";
+        assert_eq!(
+            emit_with(source, ScriptTarget::Es2015, ModuleKind::CommonJs).code,
+            "\"use strict\";\n/* file header */\nObject.defineProperty(exports, \"__esModule\", { value: true });\nexports.value = void 0;\nexports.value = 1;\n"
+        );
+    }
+
+    #[test]
+    fn keeps_first_statement_comment_after_commonjs_generated_prologue() {
+        let source = "// file header\n\n// statement comment\nexport const value = 1;";
+        assert_eq!(
+            emit_with(source, ScriptTarget::Es2015, ModuleKind::CommonJs).code,
+            "\"use strict\";\n// file header\nObject.defineProperty(exports, \"__esModule\", { value: true });\nexports.value = void 0;\n// statement comment\nexports.value = 1;\n"
+        );
+    }
+
+    #[test]
+    fn detached_file_header_precedes_runtime_after_erased_declarations() {
+        let source = "// file header\n\ntype Alias = string;\nlet value: Alias = \"x\";";
+        assert_eq!(
+            emit_with(source, ScriptTarget::Es2015, ModuleKind::None).code,
+            "// file header\nlet value = \"x\";\n"
         );
     }
 
