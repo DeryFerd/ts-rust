@@ -1084,6 +1084,18 @@ pub fn emit_declaration_file_with_semantics(
             .node(*statement)
             .is_ok_and(|node| declaration_is_module_indicator(printer.arena, node))
     });
+    if let Some((name, type_id)) = printer.amd_like_factory_export(data) {
+        printer.writer.write("export = ");
+        printer.writer.write(&name);
+        printer.writer.write(";");
+        printer.writer.newline();
+        printer.writer.write("declare const ");
+        printer.writer.write(&name);
+        printer.writer.write(": ");
+        printer.emit_amd_like_factory_export_type(type_id)?;
+        printer.writer.write(";");
+        printer.writer.newline();
+    }
     let mut deferred_javascript_namespaces = Vec::new();
     for statement in &data.statements.nodes {
         if printer.is_javascript_object_namespace_statement(*statement) {
@@ -1147,6 +1159,180 @@ impl DeclarationPrinter<'_> {
         if let Some(builder) = &mut self.source_map {
             let _ = builder.add_mapping(line, column, 0, original_line, original_column);
         }
+    }
+
+    fn amd_like_factory_export(&self, source: &ts_ast::SourceFileData) -> Option<(String, TypeId)> {
+        if !self.javascript_source {
+            return None;
+        }
+        source.statements.nodes.iter().find_map(|statement| {
+            let NodeData::ExpressionStatement(statement) = &self.arena.get(*statement)?.data else {
+                return None;
+            };
+            let NodeData::CallExpression(call) = &self
+                .arena
+                .get(self.unwrap_parenthesized(statement.expression))?
+                .data
+            else {
+                return None;
+            };
+            if declaration_name_text(self.arena, call.expression) != Some("define") {
+                return None;
+            }
+            call.arguments.nodes.iter().rev().find_map(|factory| {
+                let block = self.factory_function_block(*factory)?;
+                self.amd_like_block_export(block)
+            })
+        })
+    }
+
+    fn factory_function_block(&self, expression: NodeId) -> Option<&ts_ast::BlockData> {
+        let expression = self.unwrap_parenthesized(expression);
+        let body = match &self.arena.get(expression)?.data {
+            NodeData::ArrowFunction(function) => function.body,
+            NodeData::FunctionExpression(function) => function.body,
+            _ => return None,
+        };
+        let NodeData::Block(block) = &self.arena.get(body)?.data else {
+            return None;
+        };
+        Some(block)
+    }
+
+    fn amd_like_block_export(&self, block: &ts_ast::BlockData) -> Option<(String, TypeId)> {
+        let returned_module = block.statements.nodes.iter().rev().find_map(|statement| {
+            let NodeData::ReturnStatement(return_) = &self.arena.get(*statement)?.data else {
+                return None;
+            };
+            self.module_exports_receiver(return_.expression?)
+                .map(str::to_owned)
+        })?;
+        if !block
+            .statements
+            .nodes
+            .iter()
+            .any(|statement| self.variable_statement_declares(*statement, &returned_module))
+        {
+            return None;
+        }
+        let exported_name = block.statements.nodes.iter().find_map(|statement| {
+            let NodeData::ExpressionStatement(statement) = &self.arena.get(*statement)?.data else {
+                return None;
+            };
+            let NodeData::BinaryExpression(assignment) = &self
+                .arena
+                .get(self.unwrap_parenthesized(statement.expression))?
+                .data
+            else {
+                return None;
+            };
+            if self.arena.get(assignment.operator_token)?.kind != SyntaxKind::EqualsToken
+                || self.module_exports_receiver(assignment.left) != Some(returned_module.as_str())
+            {
+                return None;
+            }
+            declaration_name_text(self.arena, assignment.right).map(str::to_owned)
+        })?;
+        block.statements.nodes.iter().find_map(|statement| {
+            let NodeData::VariableStatement(statement) = &self.arena.get(*statement)?.data else {
+                return None;
+            };
+            let NodeData::VariableDeclarationList(list) =
+                &self.arena.get(statement.declaration_list)?.data
+            else {
+                return None;
+            };
+            list.declarations.nodes.iter().find_map(|declaration_id| {
+                let NodeData::VariableDeclaration(declaration) =
+                    &self.arena.get(*declaration_id)?.data
+                else {
+                    return None;
+                };
+                (declaration_name_text(self.arena, declaration.name)
+                    == Some(exported_name.as_str()))
+                .then(|| {
+                    let types = self.node_types?;
+                    [
+                        Some(*declaration_id),
+                        Some(declaration.name),
+                        declaration.initializer,
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|node| types.get(&node).copied())
+                    .find(|type_id| {
+                        matches!(
+                            self.semantic_types
+                                .and_then(|types| types.get(*type_id))
+                                .map(|type_| &type_.kind),
+                            Some(TypeKind::Constructor(_))
+                        )
+                    })
+                })
+                .flatten()
+                .map(|type_id| (exported_name.clone(), type_id))
+            })
+        })
+    }
+
+    fn variable_statement_declares(&self, statement: NodeId, name: &str) -> bool {
+        let Some(NodeData::VariableStatement(statement)) =
+            self.arena.get(statement).map(|node| &node.data)
+        else {
+            return false;
+        };
+        let Some(NodeData::VariableDeclarationList(list)) = self
+            .arena
+            .get(statement.declaration_list)
+            .map(|node| &node.data)
+        else {
+            return false;
+        };
+        list.declarations.nodes.iter().any(|declaration| {
+            let Some(NodeData::VariableDeclaration(declaration)) =
+                self.arena.get(*declaration).map(|node| &node.data)
+            else {
+                return false;
+            };
+            declaration_name_text(self.arena, declaration.name) == Some(name)
+        })
+    }
+
+    fn module_exports_receiver(&self, expression: NodeId) -> Option<&str> {
+        let NodeData::PropertyAccessExpression(access) =
+            &self.arena.get(self.unwrap_parenthesized(expression))?.data
+        else {
+            return None;
+        };
+        (declaration_name_text(self.arena, access.name) == Some("exports"))
+            .then(|| declaration_name_text(self.arena, access.expression))
+            .flatten()
+    }
+
+    fn unwrap_parenthesized(&self, mut expression: NodeId) -> NodeId {
+        while let Some(NodeData::ParenthesizedExpression(parenthesized)) =
+            self.arena.get(expression).map(|node| &node.data)
+        {
+            expression = parenthesized.expression;
+        }
+        expression
+    }
+
+    fn emit_amd_like_factory_export_type(&mut self, type_id: TypeId) -> Result<(), EmitError> {
+        let constructor = self
+            .semantic_types
+            .and_then(|types| types.get(type_id))
+            .and_then(|type_| match &type_.kind {
+                TypeKind::Constructor(signature) => Some(signature.clone()),
+                _ => None,
+            });
+        let Some(constructor) = constructor else {
+            return self.emit_semantic_type(type_id);
+        };
+        self.writer.write("new (");
+        self.emit_semantic_parameters(&constructor, None)?;
+        self.writer.write(") => ");
+        self.emit_semantic_type(constructor.return_type)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -2640,8 +2826,11 @@ impl DeclarationPrinter<'_> {
         {
             self.writer.write("import(");
             write_quoted(&mut self.writer, &reference.module_specifier);
-            self.writer.write(").");
-            self.writer.write(&reference.qualifier);
+            self.writer.write(")");
+            if reference.qualifier != "export=" && !reference.qualifier.is_empty() {
+                self.writer.write(".");
+                self.writer.write(&reference.qualifier);
+            }
             return Ok(());
         }
         let Some(kind) = self

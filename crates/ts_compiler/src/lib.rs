@@ -12,7 +12,7 @@ use ts_checker::{
     check_program, empty_check_result,
 };
 use ts_config::{ConfigDiagnostic, resolve_config_file};
-use ts_core::TextRange;
+use ts_core::{TextPos, TextRange};
 use ts_diagnostics::message_by_code;
 use ts_glob::{DiscoveryOptions, discover_files};
 use ts_module::{ResolutionOptions, Resolver, automatic_type_directive_names};
@@ -162,7 +162,7 @@ impl Program {
             );
             let containing_file = self.source_files[file_index].file_name.clone();
             let specifiers = module_specifiers(&self.source_files[file_index].parse);
-            for (specifier, range, is_import_equals) in specifiers {
+            for (specifier, range, can_resolve_ambient) in specifiers {
                 let result = resolver.resolve(&specifier, &containing_file);
                 if let Some(resolved) = result.resolved {
                     let containing = canonicalize(
@@ -178,7 +178,7 @@ impl Program {
                     self.resolved_modules
                         .insert((containing, specifier.clone()), target);
                     self.load_file(file_system, &resolved.resolved_file_name, false);
-                } else if is_import_equals
+                } else if can_resolve_ambient
                     && !module_name_is_relative(&specifier)
                     && let Some(target) = ambient_modules.get(&specifier)
                 {
@@ -1228,7 +1228,7 @@ fn base64_encode(bytes: &[u8]) -> String {
 }
 
 fn module_specifiers(parse: &ParseResult) -> Vec<(String, TextRange, bool)> {
-    parse
+    let mut specifiers = parse
         .arena
         .iter()
         .filter_map(|(_, node)| match &node.data {
@@ -1252,7 +1252,59 @@ fn module_specifiers(parse: &ParseResult) -> Vec<(String, TextRange, bool)> {
                 .map(|(specifier, range)| (specifier, range, false)),
             _ => None,
         })
-        .collect()
+        .collect::<Vec<_>>();
+    if let Some(source) = parse.arena.source_text() {
+        specifiers.extend(jsdoc_import_specifiers(source));
+    }
+    specifiers
+}
+
+fn jsdoc_import_specifiers(source: &str) -> Vec<(String, TextRange, bool)> {
+    let mut specifiers = Vec::new();
+    let mut search_start = 0;
+    while let Some(relative_start) = source[search_start..].find("/**") {
+        let comment_start = search_start + relative_start;
+        let body_start = comment_start + 3;
+        let Some(relative_end) = source[body_start..].find("*/") else {
+            break;
+        };
+        let comment_end = body_start + relative_end;
+        let comment = &source[body_start..comment_end];
+        let mut import_search = 0;
+        while let Some(relative_import) = comment[import_search..].find("import(") {
+            let import_start = body_start + import_search + relative_import;
+            let argument_start = import_start + "import(".len();
+            let argument = &source[argument_start..comment_end];
+            let whitespace = argument.len() - argument.trim_start().len();
+            let quote_start = argument_start + whitespace;
+            let Some(quote @ ('\'' | '"')) = source[quote_start..].chars().next() else {
+                import_search += relative_import + "import(".len();
+                continue;
+            };
+            let value_start = quote_start + quote.len_utf8();
+            let Some(value_end_relative) = source[value_start..comment_end].find(quote) else {
+                import_search += relative_import + "import(".len();
+                continue;
+            };
+            let value_end = value_start + value_end_relative;
+            let after_quote = &source[value_end + quote.len_utf8()..comment_end];
+            if !after_quote.trim_start().starts_with(')') {
+                import_search += relative_import + "import(".len();
+                continue;
+            }
+            specifiers.push((
+                source[value_start..value_end].to_owned(),
+                TextRange::new(
+                    TextPos::new(u32::try_from(value_start).unwrap_or(u32::MAX)),
+                    TextPos::new(u32::try_from(value_end).unwrap_or(u32::MAX)),
+                ),
+                true,
+            ));
+            import_search = value_end.saturating_sub(body_start);
+        }
+        search_start = comment_end + 2;
+    }
+    specifiers
 }
 
 fn register_ambient_external_modules(
@@ -4056,6 +4108,82 @@ mod tests {
         assert_eq!(
             declaration.text,
             "declare function f2(x: any): void;\ndeclare namespace foo {\n    function f1(params: any): void;\n}\n"
+        );
+    }
+
+    #[test]
+    fn javascript_declaration_emit_synthesizes_amd_like_module_exports() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/typing.d.ts",
+            "declare function define<T = unknown>(name: string, modules: string[], ready: (...modules: unknown[]) => T): void;",
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/deps/BaseClass.d.ts",
+            concat!(
+                "declare module \"deps/BaseClass\" {\n",
+                "    class BaseClass {\n",
+                "        static extends<A>(a: A): new () => A & BaseClass;\n",
+                "    }\n",
+                "    export = BaseClass;\n",
+                "}\n",
+            ),
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/ExtendedClass.js",
+            concat!(
+                "define(\"lib/ExtendedClass\", [\"deps/BaseClass\"],\n",
+                "/** @param {typeof import(\"deps/BaseClass\")} BaseClass */\n",
+                "(BaseClass) => {\n",
+                "    const ExtendedClass = BaseClass.extends({\n",
+                "        f: function() { return \"something\"; }\n",
+                "    });\n",
+                "    const module = {};\n",
+                "    module.exports = ExtendedClass;\n",
+                "    return module.exports;\n",
+                "});\n",
+            ),
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &[
+                "typing.d.ts".to_owned(),
+                "deps/BaseClass.d.ts".to_owned(),
+                "ExtendedClass.js".to_owned(),
+            ],
+            CompilerOptions {
+                allow_js: true,
+                check_js: true,
+                declaration: true,
+                emit_declaration_only: true,
+                no_lib: true,
+                target: ScriptTarget::Es2015,
+                ..CompilerOptions::default()
+            },
+        );
+        assert!(
+            program.diagnostics().is_empty(),
+            "{:?}",
+            program.diagnostics()
+        );
+        let declaration = program
+            .emit()
+            .files
+            .into_iter()
+            .find(|file| file.file_name == "/project/ExtendedClass.d.ts")
+            .unwrap();
+        assert_eq!(
+            declaration.text,
+            concat!(
+                "export = ExtendedClass;\n",
+                "declare const ExtendedClass: new () => {\n",
+                "    f: () => \"something\";\n",
+                "} & import(\"deps/BaseClass\");\n",
+            )
         );
     }
 
