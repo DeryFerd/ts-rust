@@ -491,6 +491,11 @@ pub fn emit_source_file_with_context(
                     reference_owner_start,
                     node.range.start.get(),
                 );
+            } else {
+                printer.emit_detached_reference_directives_between(
+                    reference_owner_start,
+                    node.range.start.get(),
+                );
             }
             previous_emitted = current_emitted;
             previous_end = node.range.end.get();
@@ -504,7 +509,7 @@ pub fn emit_source_file_with_context(
     for import in pending_commonjs_imports {
         printer.emit_commonjs_import_binding_exports(import, &data.statements)?;
     }
-    if !emitted_runtime_statement {
+    if !emitted_runtime_statement && data.statements.nodes.is_empty() {
         printer.emit_reference_directives_between(0, source_end);
     }
     printer.emit_source_comments_between_with_trailing(previous_end, source_end, previous_emitted);
@@ -4894,7 +4899,7 @@ impl Printer<'_> {
         }) && let Some(first_statement) = data.statements.nodes.first()
             && let Some(node) = self.arena.get(*first_statement)
         {
-            self.emit_reference_directives_between(0, node.range.start.get());
+            self.emit_detached_reference_directives_between(0, node.range.start.get());
         }
 
         for dependency in context.amd_dependencies {
@@ -5275,6 +5280,19 @@ impl Printer<'_> {
     }
 
     fn emit_reference_directives_between(&mut self, start: u32, end: u32) {
+        self.emit_reference_directives_between_with_ownership(start, end, true);
+    }
+
+    fn emit_detached_reference_directives_between(&mut self, start: u32, end: u32) {
+        self.emit_reference_directives_between_with_ownership(start, end, false);
+    }
+
+    fn emit_reference_directives_between_with_ownership(
+        &mut self,
+        start: u32,
+        end: u32,
+        include_owned: bool,
+    ) {
         let start = usize::try_from(start).unwrap_or(usize::MAX);
         let end = usize::try_from(end).unwrap_or(usize::MAX);
         let Some(trivia) = self.source_text.get(start..end) else {
@@ -5289,7 +5307,9 @@ impl Printer<'_> {
                     .position(|byte| *byte == b'\n' || *byte == b'\r')
                     .map_or(bytes.len(), |offset| index + offset);
                 let comment = &trivia[index..comment_end];
-                if is_reference_directive(comment) {
+                if is_reference_directive(comment)
+                    && (include_owned || contains_blank_line(&trivia[comment_end..]))
+                {
                     self.writer.write(comment);
                     self.writer.newline_preserving_trailing_spaces();
                 }
