@@ -113,6 +113,33 @@ fn reports_missing_baselines() {
 }
 
 #[test]
+fn accepts_a_missing_emit_baseline_when_virtual_project_disables_emit() {
+    let repository = TestRepository::new();
+    repository.write_case(
+        "projectNoEmit",
+        concat!(
+            "// @target: es2015\n",
+            "// @filename: /packages/main/tsconfig.json\n",
+            "{ \"compilerOptions\": { \"noEmit\": true } }\n",
+            "// @filename: /packages/main/index.ts\n",
+            "const value = 1;\n",
+        ),
+        None,
+    );
+
+    let output = run(&repository.0, &["--filter", "projectNoEmit"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "summary: matched=1 mismatched=0 missing=0 content=0 missing_sections=0 unexpected_sections=0 diagnostics=0\n"
+    );
+}
+
+#[test]
 fn compiles_and_matches_option_variants() {
     let repository = TestRepository::new();
     repository.write_case(

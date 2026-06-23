@@ -595,11 +595,11 @@ fn compile_case_variant(case: &Case, variant: &OptionVariant) -> std::io::Result
         }
     }
 
-    let mut compiler_options = fixture_compiler_options(variant);
+    let mut compiler_options = fixture_compiler_options(case, variant);
     // Compiler baselines generally assume libraries. Keeping this enabled is
     // important for diagnostic fidelity even though syntax-only corpus tests
     // use the cheaper parser path directly.
-    if case.directive_values("noLib").next().is_none() {
+    if project_config_unit(case).is_none() && case.directive_values("noLib").next().is_none() {
         compiler_options.no_lib = false;
     }
     let program =
@@ -649,12 +649,56 @@ fn is_compilation_unit(path: &str) -> bool {
         .any(|extension| path.ends_with(extension))
 }
 
-fn fixture_compiler_options(variant: &OptionVariant) -> ts_options::CompilerOptions {
-    let mut values = BTreeMap::new();
+fn fixture_compiler_options(case: &Case, variant: &OptionVariant) -> ts_options::CompilerOptions {
+    let project_config = project_config_unit(case).and_then(|(path, unit)| {
+        ts_config::parse_config_text(&path, unit.source_text.as_scannable_str()).value
+    });
+    let mut values = project_config
+        .as_ref()
+        .map_or_else(BTreeMap::new, |config| config.compiler_options.clone());
     for (name, value) in &variant.values {
+        values.retain(|configured_name, _| !configured_name.eq_ignore_ascii_case(name));
         values.insert(name.to_owned(), directive_json_value(name, value));
     }
-    ts_options::parse_compiler_options(&ts_config::JsonValue::Object(values)).options
+    if let Some(mut config) = project_config {
+        config.compiler_options = values;
+        ts_options::parse_project_options(&config).options
+    } else {
+        ts_options::parse_compiler_options(&ts_config::JsonValue::Object(values)).options
+    }
+}
+
+fn project_config_unit(case: &Case) -> Option<(String, &Unit)> {
+    let entry = case
+        .units
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, unit)| {
+            let path = virtual_unit_path(case, unit, index);
+            is_compilation_unit(&path).then_some(path)
+        })?;
+    case.units
+        .iter()
+        .enumerate()
+        .filter_map(|(index, unit)| {
+            let path = virtual_unit_path(case, unit, index);
+            let (directory, file_name) = path.rsplit_once('/')?;
+            let directory_len = directory.len();
+            (file_name.eq_ignore_ascii_case("tsconfig.json")
+                && path_is_within_directory(&entry, directory))
+            .then_some((path, unit, directory_len))
+        })
+        .max_by_key(|(_, _, directory_len)| *directory_len)
+        .map(|(path, unit, _)| (path, unit))
+}
+
+fn path_is_within_directory(path: &str, directory: &str) -> bool {
+    directory.is_empty()
+        || path == directory
+        || path
+            .strip_prefix(directory)
+            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 fn directive_json_value(name: &str, value: &str) -> ts_config::JsonValue {
@@ -1265,6 +1309,51 @@ mod tests {
             "export const value = 1;\n"
         );
         assert!(compilation.outputs["/case/b.js"].contains("result = value + 1"));
+    }
+
+    #[test]
+    fn honors_no_emit_from_the_nearest_virtual_project_config() {
+        let case = Case::parse(
+            "projectNoEmit.ts",
+            concat!(
+                "// @target: es2015\n",
+                "// @filename: /packages/shared/value.ts\n",
+                "export const shared = 1;\n",
+                "// @filename: /packages/main/tsconfig.json\n",
+                "{ \"compilerOptions\": { \"noEmit\": true, \"strict\": true } }\n",
+                "// @filename: /packages/main/index.ts\n",
+                "const value: number = 1;\n",
+            ),
+        )
+        .unwrap();
+
+        let compilation = compile_case(&case).unwrap();
+        assert!(compilation.outputs.is_empty());
+        assert!(
+            compilation.diagnostics.is_empty(),
+            "{:?}",
+            compilation.diagnostics
+        );
+    }
+
+    #[test]
+    fn fixture_directives_override_virtual_project_options() {
+        let case = Case::parse(
+            "projectEmitOverride.ts",
+            concat!(
+                "// @noEmit: false\n",
+                "// @noLib: true\n",
+                "// @filename: /project/tsconfig.json\n",
+                "{ \"compilerOptions\": { \"noEmit\": true } }\n",
+                "// @filename: /project/index.ts\n",
+                "const value: number = 1;\n",
+            ),
+        )
+        .unwrap();
+
+        let compilation = compile_case(&case).unwrap();
+        assert_eq!(compilation.outputs.len(), 1);
+        assert!(compilation.outputs.contains_key("/project/index.js"));
     }
 
     #[test]
