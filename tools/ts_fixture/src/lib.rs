@@ -389,7 +389,7 @@ pub fn compare_emitted_output_sections(
     outputs: &BTreeMap<String, String>,
     baseline: &str,
 ) -> BaselineComparison {
-    compare_emitted_output_sections_excluding(outputs, baseline, &BTreeSet::new())
+    compare_emitted_output_sections_excluding(outputs, baseline, &BTreeSet::new(), &[])
 }
 
 fn compare_case_emitted_output_sections(
@@ -427,7 +427,7 @@ fn compare_case_emitted_output_sections(
         }
         let name = normalize_section_name(&path);
         let basename = section_basename(&name);
-        let source = normalize_declaration_input_section(unit.source_text.as_scannable_str());
+        let source = normalize_input_section(unit.source_text.as_scannable_str());
         let candidates = [
             baseline_sections
                 .contains_key(&name)
@@ -453,15 +453,29 @@ fn compare_case_emitted_output_sections(
                 .cloned(),
         );
     }
-    compare_emitted_output_sections_excluding(outputs, baseline, &excluded_expected)
+    let input_echoes = case
+        .units
+        .iter()
+        .filter_map(|unit| {
+            let path = unit.path.to_string_lossy().replace('\\', "/");
+            (!ts_path::is_declaration_file(&path)).then(|| {
+                (
+                    normalize_section_name(&path),
+                    normalize_input_section(unit.source_text.as_scannable_str()),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    compare_emitted_output_sections_excluding(outputs, baseline, &excluded_expected, &input_echoes)
 }
 
 fn compare_emitted_output_sections_excluding(
     outputs: &BTreeMap<String, String>,
     baseline: &str,
     excluded_expected: &BTreeSet<String>,
+    input_echoes: &[(String, String)],
 ) -> BaselineComparison {
-    let expected = parse_baseline_section_list(baseline)
+    let mut expected = parse_baseline_section_list(baseline)
         .into_iter()
         .filter(|(name, _)| is_emitted_section(name))
         .map(|(name, text)| {
@@ -482,8 +496,36 @@ fn compare_emitted_output_sections_excluding(
             )
         })
         .collect::<Vec<_>>();
+    exclude_input_echo_sections(&mut expected, &actual, input_echoes);
     let differences = compare_section_multisets(&expected, &actual);
     BaselineComparison { differences }
+}
+
+fn exclude_input_echo_sections(
+    expected: &mut Vec<(String, String)>,
+    actual: &[(String, String)],
+    input_echoes: &[(String, String)],
+) {
+    for (input_name, input_text) in input_echoes {
+        let basename = section_basename(input_name);
+        let expected_count = expected
+            .iter()
+            .filter(|(name, _)| section_basename(name) == basename)
+            .count();
+        let actual_count = actual
+            .iter()
+            .filter(|(name, _)| section_basename(name) == basename)
+            .count();
+        if expected_count <= actual_count {
+            continue;
+        }
+        if let Some(index) = expected
+            .iter()
+            .position(|(name, text)| section_basename(name) == basename && text == input_text)
+        {
+            expected.remove(index);
+        }
+    }
 }
 
 fn compare_section_multisets(
@@ -1073,7 +1115,7 @@ fn normalize_emitted_section(text: &str) -> String {
     normalized
 }
 
-fn normalize_declaration_input_section(text: &str) -> String {
+fn normalize_input_section(text: &str) -> String {
     let normalized = normalize_emitted_section(text);
     normalized
         .strip_prefix('\n')
@@ -1716,6 +1758,74 @@ mod tests {
             comparison.differences[0].kind,
             OutputDifferenceKind::Missing { .. }
         ));
+    }
+
+    #[test]
+    fn excludes_javascript_input_echo_before_comparing_emitted_output() {
+        let case = Case::parse(
+            "inputEcho.ts",
+            concat!(
+                "// @allowJs: true\n",
+                "// @outDir: ./out\n",
+                "// @filename: /a.js\n",
+                "\nconst value = 1;\n",
+            ),
+        )
+        .unwrap();
+        let outputs = BTreeMap::from([(
+            "/case/out/a.js".into(),
+            "\"use strict\";\nconst value = 1;\n".into(),
+        )]);
+        let baseline = concat!(
+            "//// [a.js] ////\n",
+            "const value = 1;\n",
+            "//// [a.js] ////\n",
+            "\"use strict\";\nconst value = 1;\n",
+        );
+        assert!(
+            compare_case_emitted_output_sections(
+                &outputs,
+                baseline,
+                &case,
+                &OptionVariant::default(),
+            )
+            .is_match()
+        );
+    }
+
+    #[test]
+    fn input_echo_exclusion_preserves_legitimate_duplicate_outputs() {
+        let case = Case::parse(
+            "inputEcho.ts",
+            concat!(
+                "// @allowJs: true\n",
+                "// @outDir: ./out\n",
+                "// @filename: /a.js\n",
+                "\nconst source = true;\n",
+            ),
+        )
+        .unwrap();
+        let outputs = BTreeMap::from([
+            ("/case/out/one/a.js".into(), "const output = 1;\n".into()),
+            ("/case/out/two/a.js".into(), "const output = 2;\n".into()),
+        ]);
+        let baseline = concat!(
+            "//// [a.js] ////\n",
+            "const source = true;\n",
+            "//// [a.js] ////\n",
+            "const output = 2;\n",
+            "//// [a.js] ////\n",
+            "const output = 1;\n",
+        );
+        assert!(
+            compare_case_emitted_output_sections(
+                &outputs,
+                baseline,
+                &case,
+                &OptionVariant::default(),
+            )
+            .is_match()
+        );
     }
 
     #[test]
