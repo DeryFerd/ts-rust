@@ -7363,12 +7363,14 @@ impl<'a> Checker<'a> {
             {
                 self.assignability_error(data.body, actual, expected);
             }
-            if expected_return.is_some_and(|expected| {
-                matches!(
-                    self.result.types.get(expected).map(|type_| &type_.kind),
-                    Some(TypeKind::TypeParameter { .. })
-                )
-            }) {
+            if data.type_.is_none()
+                && expected_return.is_some_and(|expected| {
+                    matches!(
+                        self.result.types.get(expected).map(|type_| &type_.kind),
+                        Some(TypeKind::TypeParameter { .. })
+                    )
+                })
+            {
                 self.widen_literal(actual)
             } else {
                 expected_return.unwrap_or_else(|| self.widen_literal(actual))
@@ -16975,6 +16977,23 @@ mod tests {
                 Some(TypeKind::Unknown)
             )
         }));
+    }
+
+    #[test]
+    fn preserves_explicit_nested_arrow_type_parameter_returns() {
+        let parsed = parse_source_file("const o = <T>(value: T) => (): T => null!;");
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        let o = bindings.root_scope().unwrap().symbols.get("o").unwrap();
+        let outer_type = result.type_of_symbol(o).unwrap();
+        let TypeKind::Function(outer) = &result.types.get(outer_type).unwrap().kind else {
+            panic!("expected outer function");
+        };
+        let TypeKind::Function(inner) = &result.types.get(outer.return_type).unwrap().kind else {
+            panic!("expected inner function");
+        };
+
+        assert_eq!(inner.return_type, outer.parameters[0]);
     }
 
     #[test]
