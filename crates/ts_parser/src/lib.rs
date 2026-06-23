@@ -2899,7 +2899,11 @@ impl<'a> Parser<'a> {
     fn parse_namespace_import(&mut self) -> NodeId {
         let start = self.consume().range.start;
         self.expect_and_bump(SyntaxKind::AsKeyword, "Expected 'as'.");
-        let name = self.parse_identifier("Expected a namespace import name.");
+        let name = if is_contextual_keyword(self.current.kind) {
+            self.parse_identifier_name("Expected a namespace import name.")
+        } else {
+            self.parse_identifier("Expected a namespace import name.")
+        };
         self.alloc_node(
             SyntaxKind::NamespaceImport,
             TextRange::new(start, self.node_end(name)),
@@ -8150,6 +8154,70 @@ mod tests {
                 Some(predicate_id)
             );
         }
+    }
+
+    #[test]
+    fn parses_asserts_as_a_namespace_import_binding_and_expression() {
+        let result = parse_source_file(
+            r#"
+                import * as asserts from "./asserts";
+                function test(value: unknown): void {
+                    asserts.isNonNullable(value);
+                }
+            "#,
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+
+        let statements = source_statements(&result);
+        assert_eq!(statements.len(), 2);
+        let NodeData::ImportDeclaration(import) = &result.arena.get(statements[0]).unwrap().data
+        else {
+            panic!("expected import declaration");
+        };
+        let NodeData::ImportClause(clause) = &result
+            .arena
+            .get(import.import_clause.expect("import clause"))
+            .unwrap()
+            .data
+        else {
+            panic!("expected import clause");
+        };
+        let NodeData::NamespaceImport(namespace_import) = &result
+            .arena
+            .get(clause.named_bindings.expect("namespace import"))
+            .unwrap()
+            .data
+        else {
+            panic!("expected namespace import");
+        };
+        let NodeData::Identifier(name) = &result.arena.get(namespace_import.name).unwrap().data
+        else {
+            panic!("expected namespace import identifier");
+        };
+        assert_eq!(name.text, "asserts");
+
+        let NodeData::FunctionDeclaration(function) =
+            &result.arena.get(statements[1]).unwrap().data
+        else {
+            panic!("expected function declaration");
+        };
+        let NodeData::Block(body) = &result
+            .arena
+            .get(function.body.expect("function body"))
+            .unwrap()
+            .data
+        else {
+            panic!("expected function body");
+        };
+        let NodeData::ExpressionStatement(statement) =
+            &result.arena.get(body.statements.nodes[0]).unwrap().data
+        else {
+            panic!("expected expression statement");
+        };
+        assert_eq!(
+            result.arena.get(statement.expression).unwrap().kind,
+            SyntaxKind::CallExpression
+        );
     }
 
     #[test]
