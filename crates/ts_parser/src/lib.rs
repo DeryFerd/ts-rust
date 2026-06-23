@@ -3346,6 +3346,47 @@ impl<'a> Parser<'a> {
         let first = self.scanner.scan();
         let result = if first.kind == SyntaxKind::Identifier {
             self.scanner.scan().kind == SyntaxKind::EqualsGreaterThanToken
+        } else if first.kind == SyntaxKind::LessThanToken {
+            let mut angle_depth = 1_u32;
+            let mut token = self.scanner.scan();
+            while token.kind != SyntaxKind::EndOfFile && angle_depth != 0 {
+                match token.kind {
+                    SyntaxKind::LessThanToken => angle_depth += 1,
+                    SyntaxKind::GreaterThanToken => angle_depth -= 1,
+                    _ => {}
+                }
+                if angle_depth != 0 {
+                    token = self.scanner.scan();
+                }
+            }
+            if angle_depth != 0 || self.scanner.scan().kind != SyntaxKind::OpenParenToken {
+                false
+            } else {
+                let mut parenthesis_depth = 1_u32;
+                token = self.scanner.scan();
+                while token.kind != SyntaxKind::EndOfFile && parenthesis_depth != 0 {
+                    match token.kind {
+                        SyntaxKind::OpenParenToken => parenthesis_depth += 1,
+                        SyntaxKind::CloseParenToken => parenthesis_depth -= 1,
+                        _ => {}
+                    }
+                    if parenthesis_depth != 0 {
+                        token = self.scanner.scan();
+                    }
+                }
+                token = self.scanner.scan();
+                if token.kind == SyntaxKind::ColonToken {
+                    while !matches!(
+                        token.kind,
+                        SyntaxKind::EqualsGreaterThanToken
+                            | SyntaxKind::SemicolonToken
+                            | SyntaxKind::EndOfFile
+                    ) {
+                        token = self.scanner.scan();
+                    }
+                }
+                token.kind == SyntaxKind::EqualsGreaterThanToken
+            }
         } else if first.kind == SyntaxKind::OpenParenToken {
             let mut depth = 1_u32;
             let mut token = self.scanner.scan();
@@ -3446,11 +3487,7 @@ impl<'a> Parser<'a> {
         let return_type = self.parse_optional_type_annotation();
         let arrow =
             self.parse_expected_token_node(SyntaxKind::EqualsGreaterThanToken, "Expected '=>'.");
-        let body = if self.current.kind == SyntaxKind::OpenBraceToken {
-            self.parse_block()
-        } else {
-            self.parse_binary_expression(2)
-        };
+        let body = self.parse_arrow_function_body();
         let mut children = Vec::new();
         extend_list_children(&mut children, type_parameters.as_ref());
         children.extend(parameters.nodes.iter().copied());
@@ -3483,6 +3520,7 @@ impl<'a> Parser<'a> {
     fn parse_async_arrow_function(&mut self) -> NodeId {
         let async_modifier = self.consume_token_node();
         let start = self.node_start(async_modifier);
+        let type_parameters = self.parse_type_parameters();
         let parameters = if self.current.kind == SyntaxKind::OpenParenToken {
             self.parse_parameter_list()
         } else {
@@ -3511,12 +3549,9 @@ impl<'a> Parser<'a> {
         let return_type = self.parse_optional_type_annotation();
         let arrow =
             self.parse_expected_token_node(SyntaxKind::EqualsGreaterThanToken, "Expected '=>'.");
-        let body = if self.current.kind == SyntaxKind::OpenBraceToken {
-            self.parse_block()
-        } else {
-            self.parse_binary_expression(2)
-        };
+        let body = self.parse_arrow_function_body();
         let mut children = vec![async_modifier];
+        extend_list_children(&mut children, type_parameters.as_ref());
         children.extend(parameters.nodes.iter().copied());
         children.extend(return_type);
         children.push(arrow);
@@ -3536,7 +3571,7 @@ impl<'a> Parser<'a> {
                 parameters,
                 symbol: None,
                 type_: return_type,
-                type_parameters: None,
+                type_parameters,
                 facts: 0,
                 modifiers: Some(ModifierList {
                     list: NodeList {
@@ -3888,33 +3923,50 @@ impl<'a> Parser<'a> {
 
     fn is_parenthesized_arrow(&mut self) -> bool {
         let checkpoint = self.scanner.mark();
-        let mut depth = 1_u32;
+        let mut parenthesis_depth = 1_u32;
+        let mut brace_depth = 0_u32;
+        let mut bracket_depth = 0_u32;
+        let mut typed_parameter = false;
+        let mut top_level_question = false;
+        let mut previous_kind = SyntaxKind::OpenParenToken;
         let mut token = self.scanner.scan();
         while token.kind != SyntaxKind::EndOfFile {
             match token.kind {
-                SyntaxKind::OpenParenToken => depth += 1,
+                SyntaxKind::OpenParenToken => parenthesis_depth += 1,
                 SyntaxKind::CloseParenToken => {
-                    depth -= 1;
-                    if depth == 0 {
+                    parenthesis_depth -= 1;
+                    if parenthesis_depth == 0 {
                         token = self.scanner.scan();
-                        if token.kind == SyntaxKind::ColonToken {
-                            while !matches!(
-                                token.kind,
-                                SyntaxKind::EqualsGreaterThanToken | SyntaxKind::EndOfFile
-                            ) {
-                                token = self.scanner.scan();
-                            }
-                        }
                         let result = matches!(
                             token.kind,
-                            SyntaxKind::EqualsGreaterThanToken | SyntaxKind::OpenBraceToken
-                        );
+                            SyntaxKind::EqualsGreaterThanToken
+                                | SyntaxKind::OpenBraceToken
+                                | SyntaxKind::ColonToken
+                        ) || typed_parameter;
                         self.scanner.rewind(checkpoint);
                         return result;
                     }
                 }
+                SyntaxKind::OpenBraceToken => brace_depth += 1,
+                SyntaxKind::CloseBraceToken => brace_depth = brace_depth.saturating_sub(1),
+                SyntaxKind::OpenBracketToken => bracket_depth += 1,
+                SyntaxKind::CloseBracketToken => bracket_depth = bracket_depth.saturating_sub(1),
+                SyntaxKind::QuestionToken
+                    if parenthesis_depth == 1 && brace_depth == 0 && bracket_depth == 0 =>
+                {
+                    top_level_question = true;
+                }
+                SyntaxKind::ColonToken
+                    if parenthesis_depth == 1 && brace_depth == 0 && bracket_depth == 0 =>
+                {
+                    if previous_kind == SyntaxKind::QuestionToken || !top_level_question {
+                        typed_parameter = true;
+                    }
+                    top_level_question = false;
+                }
                 _ => {}
             }
+            previous_kind = token.kind;
             token = self.scanner.scan();
         }
         self.scanner.rewind(checkpoint);
@@ -3927,11 +3979,7 @@ impl<'a> Parser<'a> {
         let return_type = self.parse_optional_type_annotation();
         let arrow =
             self.parse_expected_token_node(SyntaxKind::EqualsGreaterThanToken, "Expected '=>'.");
-        let body = if self.current.kind == SyntaxKind::OpenBraceToken {
-            self.parse_block()
-        } else {
-            self.parse_binary_expression(2)
-        };
+        let body = self.parse_arrow_function_body();
         let mut children = parameters.nodes.clone();
         children.extend(return_type);
         children.push(arrow);
@@ -3977,11 +4025,7 @@ impl<'a> Parser<'a> {
             &[name],
         );
         let arrow = self.consume_token_node();
-        let body = if self.current.kind == SyntaxKind::OpenBraceToken {
-            self.parse_block()
-        } else {
-            self.parse_binary_expression(2)
-        };
+        let body = self.parse_arrow_function_body();
         self.alloc_node(
             SyntaxKind::ArrowFunction,
             TextRange::new(start, self.node_end(body)),
@@ -4007,6 +4051,139 @@ impl<'a> Parser<'a> {
             })),
             &[parameter, arrow, body],
         )
+    }
+
+    fn parse_arrow_function_body(&mut self) -> NodeId {
+        if self.current.kind == SyntaxKind::OpenBraceToken {
+            return self.parse_block();
+        }
+        if self.current.kind == SyntaxKind::VarKeyword {
+            return self.parse_arrow_body_with_missing_open_brace();
+        }
+        let body = self.parse_binary_expression(2);
+        let body = self.parenthesize_asserted_object_literal(body);
+        self.collapse_redundant_parentheses_around_asserted_object(body)
+    }
+
+    fn parse_arrow_body_with_missing_open_brace(&mut self) -> NodeId {
+        self.error_current("Expected '{'.");
+        let start = self.current.range.start;
+        let statement = self.parse_statement();
+        let statement_end = self.node_end(statement);
+        let end = if self.current.kind == SyntaxKind::CloseBraceToken {
+            self.consume().range.end
+        } else {
+            statement_end
+        };
+        self.alloc_node(
+            SyntaxKind::Block,
+            TextRange::new(start, end),
+            NodeData::Block(Box::new(BlockData {
+                flow_node: None,
+                locals: SymbolTable,
+                multi_line: false,
+                next_container: None,
+                statements: NodeList {
+                    range: TextRange::new(start, statement_end),
+                    nodes: vec![statement],
+                    has_trailing_comma: false,
+                },
+                facts: 0,
+            })),
+            &[statement],
+        )
+    }
+
+    fn parenthesize_asserted_object_literal(&mut self, expression: NodeId) -> NodeId {
+        let child = match &self.arena.get(expression).unwrap().data {
+            NodeData::TypeAssertion(assertion) => Some(assertion.expression),
+            NodeData::AsExpression(assertion) => Some(assertion.expression),
+            NodeData::SatisfiesExpression(assertion) => Some(assertion.expression),
+            NodeData::ParenthesizedExpression(parenthesized)
+                if matches!(
+                    self.arena
+                        .get(parenthesized.expression)
+                        .map(|node| &node.data),
+                    Some(
+                        NodeData::TypeAssertion(_)
+                            | NodeData::AsExpression(_)
+                            | NodeData::SatisfiesExpression(_)
+                    )
+                ) =>
+            {
+                Some(parenthesized.expression)
+            }
+            NodeData::ObjectLiteralExpression(_) => {
+                let range = self.arena.get(expression).unwrap().range;
+                return self.alloc_node(
+                    SyntaxKind::ParenthesizedExpression,
+                    range,
+                    NodeData::ParenthesizedExpression(Box::new(ParenthesizedExpressionData {
+                        expression,
+                    })),
+                    &[expression],
+                );
+            }
+            _ => None,
+        };
+        if let Some(child) = child {
+            let protected = self.parenthesize_asserted_object_literal(child);
+            if protected != child {
+                match &mut self.arena.get_mut(expression).unwrap().data {
+                    NodeData::TypeAssertion(assertion) => assertion.expression = protected,
+                    NodeData::AsExpression(assertion) => assertion.expression = protected,
+                    NodeData::SatisfiesExpression(assertion) => assertion.expression = protected,
+                    NodeData::ParenthesizedExpression(parenthesized) => {
+                        parenthesized.expression = protected;
+                    }
+                    _ => unreachable!(),
+                }
+                self.arena.get_mut(protected).unwrap().parent = Some(expression);
+            }
+        }
+        expression
+    }
+
+    fn collapse_redundant_parentheses_around_asserted_object(
+        &self,
+        mut expression: NodeId,
+    ) -> NodeId {
+        loop {
+            let NodeData::ParenthesizedExpression(parenthesized) =
+                &self.arena.get(expression).unwrap().data
+            else {
+                return expression;
+            };
+            if !matches!(
+                self.arena
+                    .get(parenthesized.expression)
+                    .map(|node| &node.data),
+                Some(NodeData::ParenthesizedExpression(_))
+            ) || !self.contains_asserted_object_literal(parenthesized.expression, false)
+            {
+                return expression;
+            }
+            expression = parenthesized.expression;
+        }
+    }
+
+    fn contains_asserted_object_literal(&self, expression: NodeId, asserted: bool) -> bool {
+        match &self.arena.get(expression).unwrap().data {
+            NodeData::TypeAssertion(assertion) => {
+                self.contains_asserted_object_literal(assertion.expression, true)
+            }
+            NodeData::AsExpression(assertion) => {
+                self.contains_asserted_object_literal(assertion.expression, true)
+            }
+            NodeData::SatisfiesExpression(assertion) => {
+                self.contains_asserted_object_literal(assertion.expression, true)
+            }
+            NodeData::ParenthesizedExpression(parenthesized) => {
+                self.contains_asserted_object_literal(parenthesized.expression, asserted)
+            }
+            NodeData::ObjectLiteralExpression(_) => asserted,
+            _ => false,
+        }
     }
 
     fn parse_primary_expression(&mut self) -> NodeId {
@@ -6471,6 +6648,151 @@ mod tests {
     }
 
     #[test]
+    fn keeps_asserted_object_literals_as_arrow_expression_bodies() {
+        let result = parse_source_file(concat!(
+            "var a = value => <any>{};\n",
+            "var b = value => <any><any>{};\n",
+            "var c = () => (<Error>{ name: 'x' });\n",
+            "var d = () => ({ name: 'x' });\n",
+        ));
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+
+        for statement in source_statements(&result) {
+            let (list, _) = variable_list(&result, *statement);
+            let declaration = declaration_nodes(&result, list)[0];
+            let NodeData::VariableDeclaration(declaration) =
+                &result.arena.get(declaration).unwrap().data
+            else {
+                panic!("expected variable declaration");
+            };
+            let arrow = declaration.initializer.unwrap();
+            let NodeData::ArrowFunction(arrow) = &result.arena.get(arrow).unwrap().data else {
+                panic!("expected arrow function");
+            };
+            assert_ne!(
+                result.arena.get(arrow.body).unwrap().kind,
+                SyntaxKind::Block
+            );
+            let object =
+                find_descendant_kind(&result, arrow.body, SyntaxKind::ObjectLiteralExpression)
+                    .expect("expected object literal body");
+            assert_eq!(
+                result
+                    .arena
+                    .get(result.arena.get(object).unwrap().parent.unwrap())
+                    .unwrap()
+                    .kind,
+                SyntaxKind::ParenthesizedExpression
+            );
+        }
+    }
+
+    #[test]
+    fn parses_async_generic_arrows_in_object_literal_properties() {
+        let result = parse_source_file(concat!(
+            "const fn1 = () => ({\n",
+            "  test: async <T = undefined>(value: T): Promise<T> => value,\n",
+            "  extra: () => {},\n",
+            "});\n",
+        ));
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let arrows = result
+            .arena
+            .iter()
+            .filter_map(|(id, node)| matches!(node.data, NodeData::ArrowFunction(_)).then_some(id))
+            .collect::<Vec<_>>();
+        assert_eq!(arrows.len(), 3);
+        let generic = arrows
+            .into_iter()
+            .find(|id| {
+                matches!(
+                    &result.arena.get(*id).unwrap().data,
+                    NodeData::ArrowFunction(arrow) if arrow.type_parameters.is_some()
+                )
+            })
+            .expect("expected async generic arrow");
+        let NodeData::ArrowFunction(generic) = &result.arena.get(generic).unwrap().data else {
+            unreachable!();
+        };
+        assert_eq!(generic.type_parameters.as_ref().unwrap().nodes.len(), 1);
+        assert_eq!(generic.parameters.nodes.len(), 1);
+        assert!(generic.modifiers.as_ref().is_some_and(|modifiers| {
+            modifiers.list.nodes.iter().any(|modifier| {
+                result.arena.get(*modifier).unwrap().kind == SyntaxKind::AsyncKeyword
+            })
+        }));
+        assert_eq!(
+            result.arena.get(generic.body).unwrap().kind,
+            SyntaxKind::Identifier
+        );
+    }
+
+    #[test]
+    fn recovers_missing_arrow_tokens_without_confusing_parenthesized_objects() {
+        let missing_body_brace = parse_source_file("var a = () => var k = 10;}");
+        assert_eq!(
+            missing_body_brace
+                .diagnostics
+                .iter()
+                .filter_map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [1005]
+        );
+        let (list, _) = variable_list(
+            &missing_body_brace,
+            source_statements(&missing_body_brace)[0],
+        );
+        let declaration = declaration_nodes(&missing_body_brace, list)[0];
+        let NodeData::VariableDeclaration(declaration) =
+            &missing_body_brace.arena.get(declaration).unwrap().data
+        else {
+            panic!("expected variable declaration");
+        };
+        let NodeData::ArrowFunction(arrow) = &missing_body_brace
+            .arena
+            .get(declaration.initializer.unwrap())
+            .unwrap()
+            .data
+        else {
+            panic!("expected recovered arrow");
+        };
+        assert_eq!(
+            missing_body_brace.arena.get(arrow.body).unwrap().kind,
+            SyntaxKind::Block
+        );
+
+        let missing_arrow = parse_source_file("var typed = (x: number);");
+        let (list, _) = variable_list(&missing_arrow, source_statements(&missing_arrow)[0]);
+        let declaration = declaration_nodes(&missing_arrow, list)[0];
+        let NodeData::VariableDeclaration(declaration) =
+            &missing_arrow.arena.get(declaration).unwrap().data
+        else {
+            panic!("expected variable declaration");
+        };
+        assert_eq!(
+            missing_arrow
+                .arena
+                .get(declaration.initializer.unwrap())
+                .unwrap()
+                .kind,
+            SyntaxKind::ArrowFunction
+        );
+
+        let object = parse_source_file(
+            "const test = () => ({ prop: !value, run: () => { if (!a.b()) return 'x'; } });",
+        );
+        assert!(object.diagnostics.is_empty(), "{:?}", object.diagnostics);
+        assert_eq!(
+            object
+                .arena
+                .iter()
+                .filter(|(_, node)| matches!(node.data, NodeData::ArrowFunction(_)))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
     fn keeps_double_less_than_on_the_shift_recovery_path() {
         let source = "var r3 = <<T>(x: T) => T>f;";
         let result = parse_source_file(source);
@@ -8416,6 +8738,26 @@ mod tests {
             panic!("expected source file");
         };
         &data.statements.nodes
+    }
+
+    fn find_descendant_kind(
+        result: &ParseResult,
+        ancestor: NodeId,
+        kind: SyntaxKind,
+    ) -> Option<NodeId> {
+        result.arena.iter().find_map(|(id, node)| {
+            if node.kind != kind {
+                return None;
+            }
+            let mut parent = node.parent;
+            while let Some(current) = parent {
+                if current == ancestor {
+                    return Some(id);
+                }
+                parent = result.arena.get(current).and_then(|node| node.parent);
+            }
+            None
+        })
     }
 
     fn variable_list(result: &ParseResult, statement: NodeId) -> (NodeId, NodeId) {
