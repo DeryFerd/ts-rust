@@ -431,6 +431,7 @@ impl Program {
                         || self.options.verbatim_module_syntax,
                     inline_const_enums: !self.options.isolated_modules
                         && !self.options.verbatim_module_syntax,
+                    module_detection: self.options.module_detection,
                 };
                 match emit_source_file_with_context(
                     &source_file.parse.arena,
@@ -580,6 +581,7 @@ impl Program {
                         || self.options.verbatim_module_syntax,
                     inline_const_enums: !self.options.isolated_modules
                         && !self.options.verbatim_module_syntax,
+                    module_detection: self.options.module_detection,
                 };
                 match emit_source_file_with_context(
                     &source.parse.arena,

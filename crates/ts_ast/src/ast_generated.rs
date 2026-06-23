@@ -1430,7 +1430,7 @@ pub struct SyntheticReferenceExpressionData {
 
 #[derive(Clone, Debug)]
 pub struct TaggedTemplateExpressionData {
-    pub question_dot_token: NodeId,
+    pub question_dot_token: Option<NodeId>,
     pub tag: NodeId,
     pub template: NodeId,
     pub type_arguments: Option<NodeList>,

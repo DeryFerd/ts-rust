@@ -7,7 +7,7 @@ use std::fmt;
 use ts_ast::{Node, NodeArena, NodeData, NodeId, NodeList, SymbolId, SyntaxKind};
 use ts_binder::{BindResult, SymbolFlags, bind_source_file};
 use ts_checker::{FunctionType, ImportTypeReference, ObjectType, TypeArena, TypeId, TypeKind};
-use ts_options::{JsxEmit, ModuleKind, PrinterSettings, ScriptTarget};
+use ts_options::{JsxEmit, ModuleDetectionKind, ModuleKind, PrinterSettings, ScriptTarget};
 use ts_sourcemap::{SourceMap, SourceMapBuilder};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -50,6 +50,8 @@ pub struct EmitContext<'a> {
     pub import_runtime_meanings: &'a BTreeMap<NodeId, bool>,
     pub preserve_const_enums: bool,
     pub inline_const_enums: bool,
+    /// Controls whether JSX-generated runtime imports make an otherwise-script file a module.
+    pub module_detection: ModuleDetectionKind,
 }
 
 #[derive(Clone, Copy)]
@@ -173,6 +175,7 @@ pub fn emit_source_file_with_settings_and_bindings(
             import_runtime_meanings: &empty_import_meanings,
             preserve_const_enums: true,
             inline_const_enums: false,
+            module_detection: ModuleDetectionKind::Auto,
         },
     )
 }
@@ -248,6 +251,7 @@ pub fn emit_source_file_with_context(
         commonjs_empty_binding_hoists: Vec::new(),
         private_method_plans: HashMap::new(),
         active_private_method_plan: None,
+        is_external_module: false,
     };
     let node = printer.node(source_file)?.clone();
     let NodeData::SourceFile(data) = &node.data else {
@@ -282,17 +286,22 @@ pub fn emit_source_file_with_context(
         printer.commonjs_named_import_temps = temps;
         printer.identifier_rewrites.extend(rewrites);
     }
-    let is_external_module = data.statements.nodes.iter().any(|statement| {
+    let has_explicit_module_indicator = data.statements.nodes.iter().any(|statement| {
         arena
             .get(*statement)
             .is_some_and(|statement| declaration_is_module_indicator(arena, statement))
     });
+    let is_external_module = has_explicit_module_indicator
+        || context.module_detection == ModuleDetectionKind::Force
+        || (context.module_detection == ModuleDetectionKind::Auto && automatic_jsx.any());
+    printer.is_external_module = is_external_module;
     let has_runtime_module_indicator = data.statements.nodes.iter().any(|statement| {
         arena.get(*statement).is_some_and(|node| {
             declaration_is_module_indicator(arena, node)
                 && printer.statement_emits_runtime(*statement, node)
         })
     });
+    let has_emitted_module_indicator = has_runtime_module_indicator || automatic_jsx.any();
     if settings.module == ModuleKind::System && is_external_module {
         return printer.emit_system_source_file(data);
     }
@@ -363,7 +372,13 @@ pub fn emit_source_file_with_context(
         .map(|node| node.range.start.get());
     if let Some(start) = first_statement_start {
         printer.emit_leading_detached_source_comments(start);
-        printer.emit_leading_pinned_source_comments(start);
+        if data.statements.nodes.first().is_some_and(|statement| {
+            arena
+                .get(*statement)
+                .is_some_and(|node| printer.statement_emits_in_place(*statement, node))
+        }) {
+            printer.emit_leading_pinned_source_comments(start);
+        }
     }
     if needs_dynamic_import_helpers && !settings.no_emit_helpers {
         printer.emit_create_binding_helper();
@@ -407,6 +422,9 @@ pub fn emit_source_file_with_context(
         && !settings.no_emit_helpers
     {
         printer.emit_object_rest_helper();
+    }
+    if source_needs_legacy_decorate_helper(arena) && !settings.no_emit_helpers {
+        printer.emit_decorate_helper();
     }
     if settings.target < ScriptTarget::Es2015 && source_needs_extends_helper(arena) {
         printer.emit_extends_helper();
@@ -523,7 +541,13 @@ pub fn emit_source_file_with_context(
             }
             printer.emit_commonjs_hoisted_function_exports(&data.statements)?;
         }
-        if let Some(start) = first_statement_start {
+        if let Some(start) = first_statement_start
+            && data.statements.nodes.first().is_some_and(|statement| {
+                arena
+                    .get(*statement)
+                    .is_some_and(|node| printer.statement_emits_in_place(*statement, node))
+            })
+        {
             printer.emit_leading_source_comments(start);
         }
     }
@@ -607,13 +631,16 @@ pub fn emit_source_file_with_context(
                 let Some(node) = arena.get(*statement) else {
                     continue;
                 };
-                printer.emit_detached_reference_directives_between(
+                printer.emit_detached_or_compact_reference_directives_between(
                     reference_owner_start,
                     node.range.start.get(),
                 );
                 reference_owner_start = node.range.end.get();
             }
-            printer.emit_detached_reference_directives_between(reference_owner_start, source_end);
+            printer.emit_detached_or_compact_reference_directives_between(
+                reference_owner_start,
+                source_end,
+            );
         } else if !is_external_module {
             printer.emit_reference_directives_between(0, source_end);
         }
@@ -628,7 +655,7 @@ pub fn emit_source_file_with_context(
         printer.writer.newline();
     }
     if preserves_external_module_syntax
-        && (!has_runtime_module_indicator || has_empty_export || has_recovered_module_clause)
+        && (!has_emitted_module_indicator || has_empty_export || has_recovered_module_clause)
     {
         printer.writer.write("export {};");
         printer.writer.newline();
@@ -814,6 +841,20 @@ fn source_needs_object_rest_helper(arena: &NodeArena) -> bool {
                     })
             })
         })
+    })
+}
+
+fn source_needs_legacy_decorate_helper(arena: &NodeArena) -> bool {
+    arena.iter().any(|(id, node)| {
+        let NodeData::ClassDeclaration(class) = &node.data else {
+            return false;
+        };
+        !node_is_in_ambient_context(arena, id)
+            && declaration_has_modifier_in_list(
+                arena,
+                class.modifiers.as_ref(),
+                SyntaxKind::Decorator,
+            )
     })
 }
 
@@ -1855,6 +1896,7 @@ impl DeclarationPrinter<'_> {
             .and_then(|reachability| reachability.get(&scope))
             && !retained.contains(&id)
             && !matches!(&node.data, NodeData::ImportDeclaration(import) if self.import_is_used_by_inferred_return(id, import))
+            && !matches!(&node.data, NodeData::ImportEqualsDeclaration(import) if self.import_equals_is_used_by_inferred_variable_type(id, import))
         {
             return Ok(());
         }
@@ -1883,6 +1925,7 @@ impl DeclarationPrinter<'_> {
         {
             return Ok(());
         }
+        self.emit_leading_jsdoc(id);
         self.record_mapping(&node);
         match &node.data {
             NodeData::VariableStatement(data) => {
@@ -1890,16 +1933,17 @@ impl DeclarationPrinter<'_> {
                     return Ok(());
                 }
                 if !self.emit_javascript_object_namespaces(&node, data.declaration_list)? {
-                    self.emit_declaration_prefix(&node, !in_namespace);
+                    if !in_namespace {
+                        self.emit_declaration_prefix(&node, true);
+                    }
                     self.emit_variable_declarations(data.declaration_list)?;
                     self.writer.write(";");
                 }
             }
             NodeData::FunctionDeclaration(data) => {
-                self.emit_declaration_prefix(
-                    &node,
-                    !(in_namespace || self.javascript_source && exported),
-                );
+                if !in_namespace {
+                    self.emit_declaration_prefix(&node, !(self.javascript_source && exported));
+                }
                 self.writer.write("function ");
                 if let Some(name) = data.name {
                     self.emit_name(name)?;
@@ -1972,6 +2016,18 @@ impl DeclarationPrinter<'_> {
                         continue;
                     }
                     self.emit_member(*member)?;
+                    if matches!(
+                        self.arena.get(*member).map(|member| &member.data),
+                        Some(NodeData::PropertyDeclaration(_))
+                    ) {
+                        let trailing_end = data
+                            .members
+                            .nodes
+                            .get(member_index + 1)
+                            .and_then(|next| self.arena.get(*next))
+                            .map_or(data.members.range.end.get(), |next| next.range.start.get());
+                        self.emit_immediate_trailing_member_comment(*member, trailing_end);
+                    }
                     self.emit_javascript_instance_properties(id, *member)?;
                 }
                 if self.class_has_recovered_constructor(data) {
@@ -1999,7 +2055,9 @@ impl DeclarationPrinter<'_> {
                 self.writer.write("}");
             }
             NodeData::TypeAliasDeclaration(data) => {
-                self.emit_declaration_prefix(&node, false);
+                if !in_namespace {
+                    self.emit_declaration_prefix(&node, false);
+                }
                 self.writer.write("type ");
                 self.emit_name(data.name)?;
                 self.emit_type_parameters(data.type_parameters.as_ref())?;
@@ -2008,7 +2066,9 @@ impl DeclarationPrinter<'_> {
                 self.writer.write(";");
             }
             NodeData::EnumDeclaration(data) => {
-                self.emit_declaration_prefix(&node, !in_namespace);
+                if !in_namespace {
+                    self.emit_declaration_prefix(&node, true);
+                }
                 let is_const =
                     declaration_has_modifier(self.arena, &node, SyntaxKind::ConstKeyword);
                 if is_const {
@@ -2025,6 +2085,7 @@ impl DeclarationPrinter<'_> {
                     let NodeData::EnumMember(member) = &member_node.data else {
                         return Err(Self::unsupported(*member, member_node.kind));
                     };
+                    self.emit_leading_jsdoc(member_id);
                     self.emit_name(member.name)?;
                     if let Some(value) = self
                         .enum_member_values
@@ -2059,10 +2120,21 @@ impl DeclarationPrinter<'_> {
                     },
                 );
                 self.emit_name(data.name)?;
+                let mut body = data.body;
+                while let Some(body_id) = body {
+                    let Some(NodeData::ModuleDeclaration(nested)) =
+                        self.arena.get(body_id).map(|node| &node.data)
+                    else {
+                        break;
+                    };
+                    self.writer.write(".");
+                    self.emit_name(nested.name)?;
+                    body = nested.body;
+                }
                 self.writer.write(" {");
                 self.writer.newline();
                 self.writer.indent += 1;
-                if let Some(body) = data.body {
+                if let Some(body) = body {
                     self.emit_module_body(body)?;
                 }
                 self.writer.indent -= 1;
@@ -2515,6 +2587,71 @@ impl DeclarationPrinter<'_> {
             }
             false
         })
+    }
+
+    fn import_equals_is_used_by_inferred_variable_type(
+        &self,
+        import_id: NodeId,
+        import: &ts_ast::ImportEqualsDeclarationData,
+    ) -> bool {
+        let import_symbol = import
+            .local_symbol
+            .or(import.symbol)
+            .or_else(|| self.bindings.node_symbols.get(&import.name).copied());
+        self.arena.iter().any(|(id, node)| {
+            let NodeData::NewExpression(new_expression) = &node.data else {
+                return false;
+            };
+            let Some(root) = self.entity_expression_root_identifier(new_expression.expression)
+            else {
+                return false;
+            };
+            let same_import = import_symbol.is_some_and(|symbol| {
+                let Some(NodeData::Identifier(identifier)) =
+                    self.arena.get(root).map(|node| &node.data)
+                else {
+                    return false;
+                };
+                self.bindings.resolve_name_at(root, &identifier.text) == Some(symbol)
+            });
+            if !same_import || self.node_is_within(id, import_id) {
+                return false;
+            }
+            let mut current = id;
+            while let Some(parent) = self.arena.get(current).and_then(|node| node.parent) {
+                match self.arena.get(parent).map(|node| &node.data) {
+                    Some(NodeData::VariableDeclaration(declaration)) => {
+                        if declaration.type_.is_some() {
+                            return false;
+                        }
+                    }
+                    Some(NodeData::VariableStatement(_)) => {
+                        return self.declaration_reachability.is_none_or(|reachability| {
+                            reachability
+                                .values()
+                                .any(|retained| retained.contains(&parent))
+                        });
+                    }
+                    Some(NodeData::SourceFile(_)) => return false,
+                    _ => {}
+                }
+                current = parent;
+            }
+            false
+        })
+    }
+
+    fn entity_expression_root_identifier(&self, expression: NodeId) -> Option<NodeId> {
+        match &self.arena.get(expression)?.data {
+            NodeData::Identifier(_) => Some(expression),
+            NodeData::PropertyAccessExpression(access) => {
+                self.entity_expression_root_identifier(access.expression)
+            }
+            NodeData::ParenthesizedExpression(parenthesized) => {
+                self.entity_expression_root_identifier(parenthesized.expression)
+            }
+            _ => None,
+        }
     }
 
     fn identifier_use_is_synthesized(&self, identifier: NodeId) -> bool {
@@ -2977,6 +3114,26 @@ impl DeclarationPrinter<'_> {
             {
                 self.writer.write(" = ");
                 self.emit_literal_expression(declaration.initializer.unwrap())?;
+            } else if let Some(type_query) = declaration
+                .initializer
+                .and_then(|initializer| self.class_value_type_query(initializer))
+            {
+                self.writer.write(": typeof ");
+                self.emit_name(type_query)?;
+            } else if keyword != "const"
+                && let Some(enum_type) = declaration
+                    .initializer
+                    .and_then(|initializer| self.enum_member_type_expression(initializer))
+            {
+                self.writer.write(": ");
+                self.emit_name(enum_type)?;
+            } else if let Some((class_name, type_arguments)) = declaration
+                .initializer
+                .and_then(|initializer| self.local_class_new_expression_type(initializer))
+            {
+                self.writer.write(": ");
+                self.emit_name(class_name)?;
+                self.emit_type_arguments(type_arguments.as_ref())?;
             } else if let Some(type_name) = declaration
                 .initializer
                 .and_then(|initializer| self.known_new_expression_type(initializer))
@@ -3033,6 +3190,116 @@ impl DeclarationPrinter<'_> {
             }
         }
         Ok(())
+    }
+
+    fn class_value_type_query(&self, initializer: NodeId) -> Option<NodeId> {
+        let symbol = self.resolve_entity_expression_symbol(initializer)?;
+        self.bindings
+            .symbols
+            .get(symbol)?
+            .declarations
+            .iter()
+            .any(
+                |declaration| match self.arena.get(*declaration).map(|node| &node.data) {
+                    Some(NodeData::ClassDeclaration(_)) => true,
+                    Some(NodeData::MethodDeclaration(method)) => declaration_has_modifier_in_list(
+                        self.arena,
+                        method.modifiers.as_ref(),
+                        SyntaxKind::StaticKeyword,
+                    ),
+                    _ => false,
+                },
+            )
+            .then_some(initializer)
+    }
+
+    fn enum_member_type_expression(&self, initializer: NodeId) -> Option<NodeId> {
+        let NodeData::PropertyAccessExpression(access) = &self.arena.get(initializer)?.data else {
+            return None;
+        };
+        let symbol = self.resolve_entity_expression_symbol(initializer)?;
+        self.bindings
+            .symbols
+            .get(symbol)?
+            .declarations
+            .iter()
+            .any(|declaration| {
+                matches!(
+                    self.arena.get(*declaration).map(|node| &node.data),
+                    Some(NodeData::EnumMember(_))
+                )
+            })
+            .then_some(access.expression)
+    }
+
+    fn local_class_new_expression_type(
+        &self,
+        initializer: NodeId,
+    ) -> Option<(NodeId, Option<NodeList>)> {
+        let NodeData::NewExpression(new_expression) = &self.arena.get(initializer)?.data else {
+            return None;
+        };
+        let root = self.entity_expression_root_identifier(new_expression.expression)?;
+        let NodeData::Identifier(identifier) = &self.arena.get(root)?.data else {
+            return None;
+        };
+        let root_symbol = self.bindings.resolve_name_at(root, &identifier.text)?;
+        let root_kind = self
+            .bindings
+            .symbols
+            .get(root_symbol)?
+            .declarations
+            .iter()
+            .find_map(
+                |declaration| match self.arena.get(*declaration).map(|node| &node.data) {
+                    Some(NodeData::ImportEqualsDeclaration(_)) => Some(true),
+                    Some(NodeData::ModuleDeclaration(_)) => Some(false),
+                    _ => None,
+                },
+            );
+        let root_is_import = root_kind == Some(true);
+        let root_is_namespace = root_kind == Some(false)
+            && matches!(
+                self.arena
+                    .get(new_expression.expression)
+                    .map(|node| &node.data),
+                Some(NodeData::PropertyAccessExpression(_))
+            );
+        let expression_is_class = self
+            .resolve_entity_expression_symbol(new_expression.expression)
+            .and_then(|symbol| self.bindings.symbols.get(symbol))
+            .is_some_and(|symbol| {
+                symbol.declarations.iter().any(|declaration| {
+                    matches!(
+                        self.arena.get(*declaration).map(|node| &node.data),
+                        Some(NodeData::ClassDeclaration(_))
+                    )
+                })
+            });
+        let has_nominal_type = root_is_import || root_is_namespace || expression_is_class;
+        has_nominal_type.then(|| {
+            (
+                new_expression.expression,
+                new_expression.type_arguments.clone(),
+            )
+        })
+    }
+
+    fn resolve_entity_expression_symbol(&self, expression: NodeId) -> Option<SymbolId> {
+        match &self.arena.get(expression)?.data {
+            NodeData::Identifier(identifier) => {
+                self.bindings.resolve_name_at(expression, &identifier.text)
+            }
+            NodeData::PropertyAccessExpression(access) => {
+                let receiver = self.resolve_entity_expression_symbol(access.expression)?;
+                let name = declaration_name_text(self.arena, access.name)?;
+                self.bindings.symbols.get(receiver)?.members.get(name)
+            }
+            NodeData::ParenthesizedExpression(parenthesized) => {
+                self.resolve_entity_expression_symbol(parenthesized.expression)
+            }
+            _ => None,
+        }
     }
 
     fn variable_list_has_bound_names(&self, list: NodeId) -> bool {
@@ -3568,6 +3835,7 @@ impl DeclarationPrinter<'_> {
         declaration: NodeId,
     ) -> Result<(), EmitError> {
         self.writer.write("(");
+        let mut previous_end = parameters.range.start.get().saturating_add(1);
         for (index, parameter_id) in parameters.nodes.iter().enumerate() {
             if index != 0 {
                 self.writer.write(", ");
@@ -3576,6 +3844,7 @@ impl DeclarationPrinter<'_> {
             let NodeData::ParameterDeclaration(parameter) = &node.data else {
                 return Err(Self::unsupported(*parameter_id, node.kind));
             };
+            self.emit_declaration_parameter_comments(previous_end, node.range.start.get());
             if parameter.dot_dot_dot_token.is_some() {
                 self.writer.write("...");
             }
@@ -3588,15 +3857,16 @@ impl DeclarationPrinter<'_> {
                 self.writer.write("?");
             }
             self.writer.write(": ");
-            if let Some(hint) = self.jsdoc_parameter_type_hint(declaration, parameter.name) {
-                self.writer.write(&hint);
-            } else if let Some(type_) = parameter.type_ {
+            if let Some(type_) = parameter.type_ {
                 self.emit_type(type_)?;
+            } else if let Some(hint) = self.jsdoc_parameter_type_hint(declaration, parameter.name) {
+                self.writer.write(&hint);
             } else if let Some(type_id) = type_id {
                 self.emit_semantic_parameter_type(type_id, optional)?;
             } else {
                 self.writer.write("any");
             }
+            previous_end = node.range.end.get();
         }
         if let Some(rest) = signature.rest_parameter
             && !parameters.nodes.iter().any(|parameter| {
@@ -3615,6 +3885,54 @@ impl DeclarationPrinter<'_> {
         }
         self.writer.write(")");
         Ok(())
+    }
+
+    fn emit_declaration_parameter_comments(&mut self, start: u32, end: u32) {
+        let start = usize::try_from(start).unwrap_or(usize::MAX);
+        let end = usize::try_from(end).unwrap_or(usize::MAX);
+        let Some(trivia) = self.source_text.get(start..end) else {
+            return;
+        };
+        let mut cursor = trivia_comma_offset(trivia).map_or(0, |comma| comma + 1);
+        let initial_cursor = cursor;
+        while let Some(relative_start) = trivia[cursor..].find("/*") {
+            let comment_start = cursor + relative_start;
+            let Some(relative_end) = trivia[comment_start + 2..].find("*/") else {
+                break;
+            };
+            let comment_end = comment_start + 2 + relative_end + 2;
+            if trivia[cursor..comment_start].contains(['\n', '\r']) && !self.writer.line_start {
+                self.writer.newline_preserving_trailing_spaces();
+            }
+            let absolute_start = start + comment_start;
+            let source_column = source_visual_column(self.source_text, absolute_start);
+            let normalized = trivia[comment_start..comment_end]
+                .replace("\r\n", "\n")
+                .replace('\r', "\n");
+            let mut lines = normalized.split('\n').peekable();
+            let mut first = true;
+            while let Some(line) = lines.next() {
+                if first {
+                    self.writer.write(line);
+                    first = false;
+                } else {
+                    self.writer.write_comment_continuation(line, source_column);
+                }
+                if lines.peek().is_some() {
+                    self.writer.newline_preserving_trailing_spaces();
+                }
+            }
+            cursor = comment_end;
+        }
+        if cursor != initial_cursor {
+            if trivia[cursor..].contains(['\n', '\r']) {
+                if !self.writer.line_start {
+                    self.writer.newline_preserving_trailing_spaces();
+                }
+            } else if !self.writer.line_start {
+                self.writer.write(" ");
+            }
+        }
     }
 
     fn emit_semantic_parameter_type(
@@ -3665,9 +3983,6 @@ impl DeclarationPrinter<'_> {
     }
 
     fn leading_jsdoc_comment(&self, node: NodeId) -> Option<&str> {
-        if !self.javascript_source {
-            return None;
-        }
         let start = usize::try_from(self.arena.get(node)?.range.start.get()).ok()?;
         let prefix = self.source_text.get(..start)?.trim_end();
         if !prefix.ends_with("*/") {
@@ -3678,16 +3993,126 @@ impl DeclarationPrinter<'_> {
     }
 
     fn emit_leading_jsdoc(&mut self, node: NodeId) {
-        let Some(comment) = self.leading_jsdoc_comment(node).map(str::to_owned) else {
+        let comments = self.leading_jsdoc_comments(node);
+        if comments.is_empty() {
+            return;
+        }
+        for (comment_index, (absolute_start, comment)) in comments.iter().enumerate() {
+            let line_start = self.source_text[..*absolute_start]
+                .rfind(['\n', '\r'])
+                .map_or(0, |line_break| line_break + 1);
+            let line_prefix = &self.source_text[line_start..*absolute_start];
+            let source_column = if line_prefix.trim().is_empty() {
+                source_visual_column(self.source_text, *absolute_start)
+            } else {
+                split_visual_indentation(line_prefix).0
+            };
+            for (line_index, line) in comment.lines().enumerate() {
+                if line_index == 0 {
+                    self.writer.write(line);
+                } else {
+                    self.writer.write_comment_continuation(line, source_column);
+                }
+                if !line.trim().is_empty() {
+                    self.writer.remove_trailing_spaces();
+                }
+                if line_index + 1 != comment.lines().count() {
+                    self.writer.newline_preserving_trailing_spaces();
+                }
+            }
+            let inline_with_next =
+                comments
+                    .get(comment_index + 1)
+                    .is_some_and(|(next_start, _)| {
+                        !self.source_text[absolute_start + comment.len()..*next_start]
+                            .contains(['\n', '\r'])
+                    });
+            if inline_with_next {
+                self.writer.write(" ");
+            } else {
+                self.writer.newline_preserving_trailing_spaces();
+            }
+        }
+    }
+
+    fn leading_jsdoc_comments(&self, node: NodeId) -> Vec<(usize, String)> {
+        let Some(mut position) = self
+            .arena
+            .get(node)
+            .and_then(|node| usize::try_from(node.range.start.get()).ok())
+        else {
+            return Vec::new();
+        };
+        let mut comments = Vec::new();
+        loop {
+            while position > 0 && self.source_text.as_bytes()[position - 1].is_ascii_whitespace() {
+                position -= 1;
+            }
+            if position >= 2 && &self.source_text[position - 2..position] == "*/" {
+                let Some(start) = self.source_text[..position - 2].rfind("/*") else {
+                    break;
+                };
+                let line_start = self.source_text[..start]
+                    .rfind(['\n', '\r'])
+                    .map_or(0, |line_break| line_break + 1);
+                let line_prefix = self.source_text[line_start..start].trim();
+                if !line_prefix.is_empty() && !line_prefix.ends_with("*/") {
+                    break;
+                }
+                let comment = &self.source_text[start..position];
+                if !comment.starts_with("/**") {
+                    break;
+                }
+                if comment != "/**/" {
+                    comments.push((start, comment.to_owned()));
+                }
+                position = start;
+                continue;
+            }
+            let line_start = self.source_text[..position]
+                .rfind(['\n', '\r'])
+                .map_or(0, |line_break| line_break + 1);
+            if self.source_text[line_start..position]
+                .trim_start()
+                .starts_with("//")
+            {
+                position = line_start;
+                continue;
+            }
+            break;
+        }
+        comments.reverse();
+        comments
+    }
+
+    fn emit_immediate_trailing_member_comment(&mut self, member: NodeId, end: u32) {
+        let Some(member) = self.arena.get(member) else {
             return;
         };
-        for (index, line) in comment.lines().enumerate() {
-            if index != 0 {
-                self.writer.write(" ");
-            }
-            self.writer.write(line.trim_start());
-            self.writer.newline();
+        let start = usize::try_from(member.range.end.get()).unwrap_or(usize::MAX);
+        let end = usize::try_from(end).unwrap_or(usize::MAX);
+        let Some(trivia) = self.source_text.get(start..end) else {
+            return;
+        };
+        let line_end = trivia.find(['\n', '\r']).unwrap_or(trivia.len());
+        let line = &trivia[..line_end];
+        let Some(comment_start) = line.find("/*") else {
+            return;
+        };
+        if !line[comment_start..].starts_with("/**") {
+            return;
         }
+        let Some(comment_end) = line[comment_start + 2..]
+            .find("*/")
+            .map(|end| comment_start + 2 + end + 2)
+        else {
+            return;
+        };
+        self.writer.remove_trailing_newline();
+        self.writer.remove_trailing_spaces();
+        self.writer.write(" ");
+        self.writer.write(&line[comment_start..comment_end]);
+        self.writer.newline();
     }
 
     fn jsdoc_parameter_type_hint(&self, declaration: NodeId, name: NodeId) -> Option<String> {
@@ -3717,6 +4142,7 @@ impl DeclarationPrinter<'_> {
 
     fn emit_parameters(&mut self, parameters: &NodeList) -> Result<(), EmitError> {
         self.writer.write("(");
+        let mut previous_end = parameters.range.start.get().saturating_add(1);
         for (index, parameter) in parameters.nodes.iter().enumerate() {
             if index != 0 {
                 self.writer.write(", ");
@@ -3725,6 +4151,7 @@ impl DeclarationPrinter<'_> {
             let NodeData::ParameterDeclaration(data) = &node.data else {
                 return Err(Self::unsupported(*parameter, node.kind));
             };
+            self.emit_declaration_parameter_comments(previous_end, node.range.start.get());
             if data.dot_dot_dot_token.is_some() {
                 self.writer.write("...");
             }
@@ -3740,6 +4167,7 @@ impl DeclarationPrinter<'_> {
             } else {
                 self.writer.write("any");
             }
+            previous_end = node.range.end.get();
         }
         self.writer.write(")");
         Ok(())
@@ -3999,6 +4427,25 @@ impl DeclarationPrinter<'_> {
                 self.emit_declaration_member_modifiers(data.modifiers.as_ref());
                 self.writer.write("set ");
                 self.emit_name(data.name)?;
+                if self.member_has_modifier(data.modifiers.as_ref(), SyntaxKind::PrivateKeyword) {
+                    self.writer.write("(");
+                    for (index, parameter) in data.parameters.nodes.iter().enumerate() {
+                        if index != 0 {
+                            self.writer.write(", ");
+                        }
+                        let parameter = self.node(*parameter)?.clone();
+                        let NodeData::ParameterDeclaration(parameter) = &parameter.data else {
+                            continue;
+                        };
+                        if parameter.dot_dot_dot_token.is_some() {
+                            self.writer.write("...");
+                        }
+                        self.emit_name(parameter.name)?;
+                    }
+                    self.writer.write(");");
+                    self.writer.newline();
+                    return Ok(());
+                }
                 self.emit_parameters(&data.parameters)?;
                 self.writer.write(";");
             }
@@ -4017,6 +4464,7 @@ impl DeclarationPrinter<'_> {
             }
             NodeData::IndexSignatureDeclaration(data) => {
                 self.writer.write("[");
+                let mut previous_end = data.parameters.range.start.get().saturating_add(1);
                 for (index, parameter) in data.parameters.nodes.iter().enumerate() {
                     if index != 0 {
                         self.writer.write(", ");
@@ -4025,6 +4473,10 @@ impl DeclarationPrinter<'_> {
                     let NodeData::ParameterDeclaration(parameter) = &parameter_node.data else {
                         return Err(Self::unsupported(*parameter, parameter_node.kind));
                     };
+                    self.emit_declaration_parameter_comments(
+                        previous_end,
+                        parameter_node.range.start.get(),
+                    );
                     self.emit_name(parameter.name)?;
                     self.writer.write(": ");
                     if let Some(type_) = parameter.type_ {
@@ -4032,6 +4484,7 @@ impl DeclarationPrinter<'_> {
                     } else {
                         self.writer.write("any");
                     }
+                    previous_end = parameter_node.range.end.get();
                 }
                 self.writer.write("]: ");
                 self.emit_type(data.type_)?;
@@ -4599,6 +5052,9 @@ impl DeclarationPrinter<'_> {
         signature: &FunctionType,
         parameter_names: Option<&[String]>,
     ) -> Result<(), EmitError> {
+        let parameter_names = parameter_names.or_else(|| {
+            (!signature.parameter_names.is_empty()).then_some(signature.parameter_names.as_slice())
+        });
         for (index, parameter) in signature.parameters.iter().enumerate() {
             if index != 0 {
                 self.writer.write(", ");
@@ -5614,11 +6070,33 @@ impl Writer {
         self.column += u32::try_from(text.len()).unwrap_or(u32::MAX);
     }
 
+    fn write_comment_continuation(&mut self, text: &str, source_comment_column: usize) {
+        if !self.line_start {
+            self.write(text);
+            return;
+        }
+        let (leading, content) = split_visual_indentation(text);
+        let output_column = self
+            .indent
+            .saturating_mul(4)
+            .saturating_add(leading)
+            .saturating_sub(source_comment_column);
+        self.output.extend(std::iter::repeat_n(' ', output_column));
+        self.column = u32::try_from(output_column).unwrap_or(u32::MAX);
+        self.line_start = false;
+        self.write(content);
+    }
+
     fn newline(&mut self) {
+        self.remove_trailing_spaces();
+        self.newline_preserving_trailing_spaces();
+    }
+
+    fn remove_trailing_spaces(&mut self) {
         while self.output.ends_with(' ') {
             self.output.pop();
+            self.column = self.column.saturating_sub(1);
         }
-        self.newline_preserving_trailing_spaces();
     }
 
     fn newline_preserving_trailing_spaces(&mut self) {
@@ -5873,6 +6351,9 @@ impl SystemModulePlan {
         bindings: &BindResult,
         data: &ts_ast::SourceFileData,
         import_runtime_meanings: &BTreeMap<NodeId, bool>,
+        automatic_jsx: AutomaticJsxUsage,
+        jsx: JsxEmit,
+        runtime_modules: &HashSet<NodeId>,
     ) -> Self {
         let mut names = GeneratedNames::new(arena);
         let export_function = names.generate("exports");
@@ -5882,6 +6363,24 @@ impl SystemModulePlan {
         let mut identifier_rewrites = HashMap::new();
         let mut exported_bindings = HashMap::new();
         let mut hoisted_functions = Vec::new();
+        if automatic_jsx.any() {
+            let (runtime, base) = if jsx == JsxEmit::ReactJsxDev {
+                ("react/jsx-dev-runtime", "jsx_dev_runtime")
+            } else {
+                ("react/jsx-runtime", "jsx_runtime")
+            };
+            let storage = names.generate(base);
+            let parameter = names.generate(&storage);
+            dependencies.push(SystemDependency {
+                specifier: runtime.to_owned(),
+                storage: storage.clone(),
+                parameter,
+            });
+            push_unique(&mut hoisted_names, &storage);
+            if jsx == JsxEmit::ReactJsxDev {
+                push_unique(&mut hoisted_names, "_jsxFileName");
+            }
+        }
         for statement in &data.statements.nodes {
             if import_runtime_meanings.get(statement) == Some(&false) {
                 continue;
@@ -6015,7 +6514,8 @@ impl SystemModulePlan {
                     }
                 }
                 NodeData::ModuleDeclaration(module)
-                    if !declaration_has_modifier(arena, node, SyntaxKind::DeclareKeyword) =>
+                    if !declaration_has_modifier(arena, node, SyntaxKind::DeclareKeyword)
+                        && runtime_modules.contains(statement) =>
                 {
                     if let Some(name) = declaration_name_text(arena, module.name) {
                         push_unique(&mut hoisted_names, name);
@@ -6382,6 +6882,7 @@ struct Printer<'a> {
     commonjs_empty_binding_hoists: Vec<String>,
     private_method_plans: HashMap<NodeId, PrivateMethodPlan>,
     active_private_method_plan: Option<PrivateMethodPlan>,
+    is_external_module: bool,
 }
 
 impl Printer<'_> {
@@ -6798,6 +7299,16 @@ impl Printer<'_> {
         }
         if let Some(first_statement) = data.statements.nodes.first()
             && let Some(node) = self.arena.get(*first_statement)
+            && ((self.statement_emits_in_place(*first_statement, node)
+                && !match &node.data {
+                    NodeData::ImportDeclaration(_) => true,
+                    NodeData::ImportEqualsDeclaration(import) => {
+                        external_module_reference_text(self.arena, import.module_reference)
+                            .is_some()
+                    }
+                    _ => false,
+                })
+                || context.amd_module_name.is_some())
         {
             let excluded = context
                 .amd_dependencies
@@ -6817,10 +7328,22 @@ impl Printer<'_> {
         let mut previous_emitted = false;
         for statement in &data.statements.nodes {
             if let Some(node) = self.arena.get(*statement) {
-                let current_owns_source_comments = self.statement_emits_in_place(*statement, node);
-                if current_owns_source_comments {
-                    self.emit_source_comments_between(previous_end, node.range.start.get());
-                }
+                let skip_import = match &node.data {
+                    NodeData::ImportDeclaration(_) => true,
+                    NodeData::ImportEqualsDeclaration(import) => {
+                        external_module_reference_text(self.arena, import.module_reference)
+                            .is_some()
+                    }
+                    _ => false,
+                };
+                let current_owns_source_comments =
+                    self.statement_emits_in_place(*statement, node) && !skip_import;
+                self.emit_source_comments_between_with_ownership(
+                    previous_end,
+                    node.range.start.get(),
+                    previous_emitted,
+                    current_owns_source_comments,
+                );
                 if self.statement_emits_runtime(*statement, node)
                     && !self.import_runtime_meanings.contains_key(statement)
                 {
@@ -6875,11 +7398,26 @@ impl Printer<'_> {
         &mut self,
         data: &ts_ast::SourceFileData,
     ) -> Result<EmitResult, EmitError> {
+        let runtime_modules = data
+            .statements
+            .nodes
+            .iter()
+            .copied()
+            .filter(|statement| {
+                self.arena.get(*statement).is_some_and(|node| {
+                    matches!(node.data, NodeData::ModuleDeclaration(_))
+                        && self.statement_emits_runtime(*statement, node)
+                })
+            })
+            .collect::<HashSet<_>>();
         let plan = SystemModulePlan::analyze(
             self.arena,
             self.bindings,
             data,
             self.import_runtime_meanings,
+            self.automatic_jsx,
+            self.settings.jsx,
+            &runtime_modules,
         );
         self.identifier_rewrites = plan.identifier_rewrites;
         self.system_export_function = Some(plan.export_function.clone());
@@ -6974,6 +7512,12 @@ impl Printer<'_> {
         self.writer.write("execute: function () {");
         self.writer.newline();
         self.writer.indent += 1;
+        if self.settings.jsx == JsxEmit::ReactJsxDev && self.automatic_jsx.any() {
+            self.writer.write("_jsxFileName = ");
+            write_quoted(&mut self.writer, source_basename(self.source_name));
+            self.writer.write(";");
+            self.writer.newline();
+        }
         for statement in &data.statements.nodes {
             self.emit_system_execute_statement(*statement, &plan.export_function)?;
         }
@@ -7097,16 +7641,16 @@ impl Printer<'_> {
         }
     }
 
-    fn emit_source_comments_between(&mut self, start: u32, end: u32) {
-        self.emit_source_comments_between_with_trailing(start, end, true);
-    }
-
     fn emit_reference_directives_between(&mut self, start: u32, end: u32) {
-        self.emit_reference_directives_between_with_ownership(start, end, true);
+        self.emit_reference_directives_between_with_ownership(start, end, true, false);
     }
 
     fn emit_detached_reference_directives_between(&mut self, start: u32, end: u32) {
-        self.emit_reference_directives_between_with_ownership(start, end, false);
+        self.emit_reference_directives_between_with_ownership(start, end, false, false);
+    }
+
+    fn emit_detached_or_compact_reference_directives_between(&mut self, start: u32, end: u32) {
+        self.emit_reference_directives_between_with_ownership(start, end, false, true);
     }
 
     fn emit_reference_directives_between_with_ownership(
@@ -7114,6 +7658,7 @@ impl Printer<'_> {
         start: u32,
         end: u32,
         include_owned: bool,
+        include_compact_owned: bool,
     ) {
         let start = usize::try_from(start).unwrap_or(usize::MAX);
         let end = usize::try_from(end).unwrap_or(usize::MAX);
@@ -7130,7 +7675,9 @@ impl Printer<'_> {
                     .map_or(bytes.len(), |offset| index + offset);
                 let comment = &trivia[index..comment_end];
                 if is_reference_directive(comment)
-                    && (include_owned || contains_blank_line(&trivia[comment_end..]))
+                    && (include_owned
+                        || (include_compact_owned && comment.starts_with("///<reference"))
+                        || contains_blank_line(&trivia[comment_end..]))
                 {
                     self.writer.write(comment);
                     self.writer.newline_preserving_trailing_spaces();
@@ -7250,6 +7797,7 @@ impl Printer<'_> {
                     if immediate_trailing {
                         self.writer.remove_trailing_newline();
                         if !self.writer.ends_with_tight_comment_delimiter() {
+                            self.writer.remove_trailing_spaces();
                             self.writer.write(" ");
                         }
                     } else if !self.writer.line_start {
@@ -7270,22 +7818,38 @@ impl Printer<'_> {
                     || (!immediate_trailing && preserve_leading))
                     && self.emitted_source_comments.insert(comment_range)
                 {
+                    let continues_previous_block = trivia[..index]
+                        .rfind("*/")
+                        .is_some_and(|end| !trivia[end + 2..index].contains(['\n', '\r']));
                     if immediate_trailing {
                         self.writer.remove_trailing_newline();
+                        self.writer.remove_trailing_spaces();
                         self.writer.write(" ");
-                    } else if !self.writer.line_start {
+                    } else if !continues_previous_block && !self.writer.line_start {
                         self.writer.newline();
                     }
-                    let normalized = trivia[index..comment_end]
-                        .replace("\r\n", "\n")
-                        .replace('\r', "\n");
-                    let mut lines = normalized.split('\n').peekable();
-                    while let Some(line) = lines.next() {
-                        self.writer.write(line);
-                        if lines.peek().is_none() && comment_range.1 == self.source_text.len() {
-                            self.writer.write(" ");
-                        }
-                        self.writer.newline_preserving_trailing_spaces();
+                    let remainder = &trivia[comment_end..];
+                    let next_comment = [remainder.find("/*"), remainder.find("//")]
+                        .into_iter()
+                        .flatten()
+                        .min();
+                    let until_next = next_comment.map_or(remainder, |next| &remainder[..next]);
+                    let inline_with_next =
+                        next_comment.is_some() && !until_next.contains(['\n', '\r']);
+                    let inline_with_node = next_comment.is_none()
+                        && !immediate_trailing
+                        && preserve_leading
+                        && !remainder.contains(['\n', '\r'])
+                        && remainder.trim().is_empty();
+                    let inline_after = inline_with_next || inline_with_node;
+                    self.emit_normalized_block_comment(
+                        &trivia[index..comment_end],
+                        comment_range.0,
+                        !inline_after,
+                        comment_range.1 == self.source_text.len(),
+                    );
+                    if inline_after {
+                        self.writer.write(" ");
                     }
                 }
                 index = comment_end;
@@ -7412,18 +7976,134 @@ impl Printer<'_> {
                 let comment_range = (index, comment_end);
                 let pinned = comment.starts_with("/*!") || comment.contains("@license");
                 if (!pinned_only || pinned) && self.emitted_source_comments.insert(comment_range) {
-                    for line in comment
-                        .replace("\r\n", "\n")
-                        .replace('\r', "\n")
-                        .split('\n')
-                    {
-                        self.writer.write(line);
-                        self.writer.newline_preserving_trailing_spaces();
+                    let remainder = &prefix[comment_end..];
+                    let next_comment = [remainder.find("/*"), remainder.find("//")]
+                        .into_iter()
+                        .flatten()
+                        .min();
+                    let inline_with_next =
+                        next_comment.is_some_and(|next| !remainder[..next].contains(['\n', '\r']));
+                    self.emit_normalized_block_comment(
+                        comment,
+                        comment_range.0,
+                        !inline_with_next,
+                        false,
+                    );
+                    if inline_with_next {
+                        self.writer.write(" ");
                     }
                 }
                 index = comment_end;
             } else {
                 index += 1;
+            }
+        }
+    }
+
+    fn emit_normalized_block_comment(
+        &mut self,
+        comment: &str,
+        absolute_start: usize,
+        trailing_newline: bool,
+        trailing_space: bool,
+    ) {
+        let line_start = self.source_text[..absolute_start.min(self.source_text.len())]
+            .rfind(['\n', '\r'])
+            .map_or(0, |line_break| line_break + 1);
+        let line_prefix = &self.source_text[line_start..absolute_start.min(self.source_text.len())];
+        let source_column = if line_prefix.trim().is_empty() {
+            source_visual_column(self.source_text, absolute_start)
+        } else {
+            split_visual_indentation(line_prefix).0
+        };
+        let normalized = comment.replace("\r\n", "\n").replace('\r', "\n");
+        let mut lines = normalized.split('\n').peekable();
+        let mut first = true;
+        while let Some(line) = lines.next() {
+            if first {
+                self.writer.write(line);
+                first = false;
+            } else {
+                self.writer.write_comment_continuation(line, source_column);
+            }
+            if lines.peek().is_some() || trailing_newline {
+                if !line.trim().is_empty() {
+                    self.writer.remove_trailing_spaces();
+                }
+                if lines.peek().is_none() && trailing_space {
+                    self.writer.write(" ");
+                }
+                self.writer.newline_preserving_trailing_spaces();
+            }
+        }
+    }
+
+    fn trivia_has_block_comment(&self, start: u32, end: u32) -> bool {
+        usize::try_from(start)
+            .ok()
+            .zip(usize::try_from(end).ok())
+            .and_then(|(start, end)| self.source_text.get(start..end))
+            .is_some_and(|trivia| trivia.contains("/*"))
+    }
+
+    fn block_comment_starts_on_new_line(&self, start: u32, end: u32) -> bool {
+        usize::try_from(start)
+            .ok()
+            .zip(usize::try_from(end).ok())
+            .and_then(|(start, end)| self.source_text.get(start..end))
+            .and_then(|trivia| trivia.find("/*").map(|comment| &trivia[..comment]))
+            .is_some_and(|leading| leading.contains(['\n', '\r']))
+    }
+
+    fn emit_block_comment_trivia(&mut self, start: u32, end: u32, terminal_space: bool) {
+        if self.settings.remove_comments {
+            return;
+        }
+        let start = usize::try_from(start).unwrap_or(usize::MAX);
+        let end = usize::try_from(end).unwrap_or(usize::MAX);
+        let Some(trivia) = self.source_text.get(start..end) else {
+            return;
+        };
+        let mut cursor = 0;
+        let mut emitted = false;
+        let mut comments_on_new_line = false;
+        while let Some(relative_start) = trivia[cursor..].find("/*") {
+            let comment_start = cursor + relative_start;
+            let Some(relative_end) = trivia[comment_start + 2..].find("*/") else {
+                break;
+            };
+            let comment_end = comment_start + 2 + relative_end + 2;
+            let comment_range = (start + comment_start, start + comment_end);
+            if self.emitted_source_comments.insert(comment_range) {
+                let leading = &trivia[cursor..comment_start];
+                if leading.contains(['\n', '\r']) {
+                    comments_on_new_line = true;
+                    if !self.writer.line_start {
+                        self.writer.newline_preserving_trailing_spaces();
+                    }
+                } else if !leading.is_empty() && !self.writer.line_start {
+                    self.writer.write(" ");
+                }
+                self.emit_normalized_block_comment(
+                    &trivia[comment_start..comment_end],
+                    comment_range.0,
+                    false,
+                    false,
+                );
+                emitted = true;
+            }
+            cursor = comment_end;
+        }
+        if emitted && terminal_space {
+            let trailing = &trivia[cursor..];
+            if trailing.contains(['\n', '\r']) {
+                if comments_on_new_line && !self.writer.line_start {
+                    self.writer.newline();
+                } else if !comments_on_new_line && !self.writer.line_start {
+                    self.writer.write(" ");
+                }
+            } else if !self.writer.line_start {
+                self.writer.write(" ");
             }
         }
     }
@@ -7628,6 +8308,20 @@ impl Printer<'_> {
         }
     }
 
+    fn emit_decorate_helper(&mut self) {
+        for line in [
+            "var __decorate = (this && this.__decorate) || function (decorators, target, key, desc) {",
+            "    var c = arguments.length, r = c < 3 ? target : desc === null ? desc = Object.getOwnPropertyDescriptor(target, key) : desc, d;",
+            "    if (typeof Reflect === \"object\" && typeof Reflect.decorate === \"function\") r = Reflect.decorate(decorators, target, key, desc);",
+            "    else for (var i = decorators.length - 1; i >= 0; i--) if (d = decorators[i]) r = (c < 3 ? d(r) : c > 3 ? d(target, key, r) : d(target, key)) || r;",
+            "    return c > 3 && r && Object.defineProperty(target, key, r), r;",
+            "};",
+        ] {
+            self.writer.write(line);
+            self.writer.newline();
+        }
+    }
+
     fn emit_extends_helper(&mut self) {
         self.writer
             .write("var __extends = (this && this.__extends) || (function () {");
@@ -7724,39 +8418,43 @@ impl Printer<'_> {
         } else {
             "react/jsx-runtime"
         };
-        if self.commonjs_module_transform {
-            self.writer.write("const jsx_runtime_1 = require(");
-            write_quoted(&mut self.writer, runtime);
-            self.writer.write(");");
-            self.writer.newline();
-        } else {
-            self.writer.write("import { ");
-            let mut first = true;
-            for (used, imported, local) in [
-                (development, "jsxDEV", "_jsxDEV"),
-                (!development && self.automatic_jsx.jsx, "jsx", "_jsx"),
-                (!development && self.automatic_jsx.jsxs, "jsxs", "_jsxs"),
-                (self.automatic_jsx.fragment, "Fragment", "_Fragment"),
-            ] {
-                if !used {
-                    continue;
+        if self.is_external_module {
+            if self.commonjs_module_transform {
+                self.writer.write("const ");
+                self.writer.write(self.automatic_jsx_runtime_binding());
+                self.writer.write(" = require(");
+                write_quoted(&mut self.writer, runtime);
+                self.writer.write(");");
+                self.writer.newline();
+            } else {
+                self.writer.write("import { ");
+                let mut first = true;
+                for (used, imported, local) in [
+                    (development, "jsxDEV", "_jsxDEV"),
+                    (!development && self.automatic_jsx.jsx, "jsx", "_jsx"),
+                    (!development && self.automatic_jsx.jsxs, "jsxs", "_jsxs"),
+                    (self.automatic_jsx.fragment, "Fragment", "_Fragment"),
+                ] {
+                    if !used {
+                        continue;
+                    }
+                    if !first {
+                        self.writer.write(", ");
+                    }
+                    first = false;
+                    self.writer.write(imported);
+                    self.writer.write(" as ");
+                    self.writer.write(local);
                 }
-                if !first {
-                    self.writer.write(", ");
-                }
-                first = false;
-                self.writer.write(imported);
-                self.writer.write(" as ");
-                self.writer.write(local);
+                self.writer.write(" } from ");
+                write_quoted(&mut self.writer, runtime);
+                self.writer.write(";");
+                self.writer.newline();
             }
-            self.writer.write(" } from ");
-            write_quoted(&mut self.writer, runtime);
-            self.writer.write(";");
-            self.writer.newline();
         }
         if development {
             self.writer.write("const _jsxFileName = ");
-            write_quoted(&mut self.writer, self.source_name);
+            write_quoted(&mut self.writer, source_basename(self.source_name));
             self.writer.write(";");
             self.writer.newline();
         }
@@ -7846,7 +8544,7 @@ impl Printer<'_> {
                         }
                     }
                 }
-                NodeData::ExportDeclaration(export) if export.module_specifier.is_none() => {
+                NodeData::ExportDeclaration(export) => {
                     let Some(NodeData::NamedExports(exports)) = export
                         .export_clause
                         .and_then(|clause| self.arena.get(clause))
@@ -7861,7 +8559,9 @@ impl Printer<'_> {
                             continue;
                         };
                         if specifier.is_type_only
-                            || !self.export_specifier_target_has_runtime_value(specifier)
+                            || export.is_type_only
+                            || (export.module_specifier.is_none()
+                                && !self.export_specifier_target_has_runtime_value(specifier))
                             || self
                                 .commonjs_export_function_declaration(*element)
                                 .is_some()
@@ -7929,7 +8629,7 @@ impl Printer<'_> {
                 self.namespace_has_runtime_contents(module, &mut HashSet::new())
             }
             NodeData::VariableStatement(statement)
-                if self.commonjs_module_transform
+                if (self.commonjs_module_transform || !self.namespace_containers.is_empty())
                     && declaration_has_modifier(self.arena, node, SyntaxKind::ExportKeyword)
                     && self.variable_list_is_uninitialized(statement.declaration_list) =>
             {
@@ -8451,9 +9151,17 @@ impl Printer<'_> {
                 }
             }
             NodeData::ClassDeclaration(data) => {
-                self.emit_runtime_declaration_modifiers(data.modifiers.as_ref());
-                self.emit_class(data)?;
+                let decorators = self.class_decorator_expressions(data.modifiers.as_ref());
+                if decorators.is_empty() {
+                    self.emit_runtime_declaration_modifiers(data.modifiers.as_ref());
+                    self.emit_class(data)?;
+                } else {
+                    self.emit_decorated_class_binding(data)?;
+                }
                 self.emit_auto_accessor_storage_initializers(data);
+                if !decorators.is_empty() {
+                    self.emit_class_decorator_assignment(data, &decorators)?;
+                }
                 if let Some(name) = data.name {
                     let names = self.declaration_names(&[name]);
                     if let Some(container) = self.namespace_containers.last().cloned() {
@@ -8672,7 +9380,7 @@ impl Printer<'_> {
         self.writer.indent += 1;
         let mut previous_end = block_node.range.start.get().saturating_add(1);
         let mut previous_emitted = false;
-        for clause_id in &block.clauses.nodes {
+        for (clause_index, clause_id) in block.clauses.nodes.iter().enumerate() {
             let clause_node = self.node(*clause_id)?.clone();
             let NodeData::CaseOrDefaultClause(clause) = &clause_node.data else {
                 return Err(Self::unsupported(*clause_id, clause_node.kind));
@@ -8688,6 +9396,31 @@ impl Printer<'_> {
                 self.writer.write("case ");
                 self.emit_expression(clause.expression, 0)?;
                 self.writer.write(":");
+            }
+            let comment_end = clause
+                .statements
+                .nodes
+                .first()
+                .and_then(|statement| self.arena.get(*statement))
+                .map(|node| node.range.start.get())
+                .or_else(|| {
+                    block
+                        .clauses
+                        .nodes
+                        .get(clause_index + 1)
+                        .and_then(|next| self.arena.get(*next))
+                        .map(|node| node.range.start.get())
+                })
+                .unwrap_or_else(|| block_node.range.end.get().saturating_sub(1));
+            if let Some(comment_start) =
+                self.switch_clause_colon_end(&clause_node, clause, comment_end)
+            {
+                self.emit_source_comments_between_with_ownership(
+                    comment_start,
+                    comment_end,
+                    true,
+                    false,
+                );
             }
             if let [statement] = clause.statements.nodes.as_slice()
                 && matches!(
@@ -8708,7 +9441,9 @@ impl Printer<'_> {
                 previous_end = statement_node.range.end.get();
                 previous_emitted = statement_emits_javascript(self.arena, statement_node);
             } else {
-                self.writer.newline();
+                if !self.writer.line_start {
+                    self.writer.newline();
+                }
                 self.writer.indent += 1;
                 previous_end = clause_node.range.start.get();
                 previous_emitted = false;
@@ -8734,6 +9469,24 @@ impl Printer<'_> {
         self.writer.indent -= 1;
         self.writer.write("}");
         Ok(())
+    }
+
+    fn switch_clause_colon_end(
+        &self,
+        clause_node: &Node,
+        clause: &ts_ast::CaseOrDefaultClauseData,
+        boundary: u32,
+    ) -> Option<u32> {
+        let start = if clause_node.kind == SyntaxKind::DefaultClause {
+            clause_node.range.start.get()
+        } else {
+            self.arena.get(clause.expression)?.range.end.get()
+        };
+        let start_index = usize::try_from(start).ok()?;
+        let end_index = usize::try_from(boundary).ok()?;
+        let suffix = self.source_text.get(start_index..end_index)?;
+        let colon = suffix.find(':')?;
+        u32::try_from(start_index + colon + 1).ok()
     }
 
     fn switch_clause_statement_is_inline(&self, clause: NodeId, statement: NodeId) -> bool {
@@ -9822,6 +10575,13 @@ impl Printer<'_> {
                 comment_end,
                 previous_emitted || previous_end == node.range.start.get().saturating_add(1),
             );
+            if self.block_comment_touches_range_end(previous_end, comment_end)
+                && matches!(statement_node.data, NodeData::Block(_))
+                && self.writer.line_start
+            {
+                self.writer.remove_trailing_newline();
+                self.writer.write(" ");
+            }
             if let Some(comment_start) = inline_comment_start {
                 self.emit_inline_block_comments_between(
                     comment_start,
@@ -9842,6 +10602,18 @@ impl Printer<'_> {
         self.writer.indent -= 1;
         self.writer.write("}");
         Ok(())
+    }
+
+    fn block_comment_touches_range_end(&self, start: u32, end: u32) -> bool {
+        let start = usize::try_from(start).unwrap_or(usize::MAX);
+        let end = usize::try_from(end).unwrap_or(usize::MAX);
+        let Some(trivia) = self.source_text.get(start..end) else {
+            return false;
+        };
+        let Some(comment_end) = trivia.rfind("*/").map(|end| end + 2) else {
+            return false;
+        };
+        !trivia[comment_end..].contains(['\n', '\r'])
     }
 
     #[allow(clippy::too_many_lines)]
@@ -11655,6 +12427,68 @@ impl Printer<'_> {
         false
     }
 
+    fn emit_arrow_body_line_comments(&mut self, arrow: NodeId, body: NodeId) {
+        if self.settings.remove_comments {
+            return;
+        }
+        let Some(arrow_node) = self.arena.get(arrow) else {
+            return;
+        };
+        let Some(body_node) = self.arena.get(body) else {
+            return;
+        };
+        let start = usize::try_from(arrow_node.range.start.get()).unwrap_or(usize::MAX);
+        let end = usize::try_from(body_node.range.start.get()).unwrap_or(usize::MAX);
+        let Some(prefix) = self.source_text.get(start..end) else {
+            return;
+        };
+        let Some(arrow_offset) = prefix.rfind("=>") else {
+            return;
+        };
+        let trivia_start = arrow_offset + 2;
+        let trivia = &prefix[trivia_start..];
+        let Some(comment_start) = trivia.find("//") else {
+            return;
+        };
+        let comment_end = trivia[comment_start..]
+            .find(['\n', '\r'])
+            .map_or(trivia.len(), |offset| comment_start + offset);
+        let absolute_comment_start = start + trivia_start + comment_start;
+        let absolute_comment_end = start + trivia_start + comment_end;
+        if !self
+            .emitted_source_comments
+            .insert((absolute_comment_start, absolute_comment_end))
+        {
+            return;
+        }
+        if trivia[..comment_start].contains(['\n', '\r']) {
+            self.writer.newline_preserving_trailing_spaces();
+        }
+        self.writer.write(&trivia[comment_start..comment_end]);
+        self.writer.newline_preserving_trailing_spaces();
+    }
+
+    fn finish_spread_comment_trivia(&mut self, start: u32, end: u32) {
+        let start = usize::try_from(start).unwrap_or(usize::MAX);
+        let end = usize::try_from(end).unwrap_or(usize::MAX);
+        let Some(trivia) = self.source_text.get(start..end) else {
+            return;
+        };
+        let Some(comment_start) = trivia.find("/*") else {
+            return;
+        };
+        let Some(comment_end) = trivia.rfind("*/").map(|end| end + 2) else {
+            return;
+        };
+        if trivia[..comment_start].contains(['\n', '\r']) && !self.writer.line_start {
+            if trivia[comment_end..].contains(['\n', '\r']) {
+                self.writer.newline();
+            } else {
+                self.writer.write(" ");
+            }
+        }
+    }
+
     fn emit_accessor_body(&mut self, body: Option<NodeId>) -> Result<(), EmitError> {
         let Some(body) = body else {
             self.writer.write("{ }");
@@ -11748,10 +12582,40 @@ impl Printer<'_> {
             self.emit_expression(declaration.name, 0)?;
             if let Some(initializer) = declaration.initializer {
                 self.writer.write(" = ");
+                self.emit_initializer_leading_block_comments(declaration.name, initializer);
                 self.emit_expression(initializer, 1)?;
             }
         }
         Ok(())
+    }
+
+    fn emit_initializer_leading_block_comments(&mut self, name: NodeId, initializer: NodeId) {
+        let Some(start) = self.arena.get(name).map(|node| node.range.end.get()) else {
+            return;
+        };
+        let Some(end) = self
+            .arena
+            .get(initializer)
+            .map(|node| node.range.start.get())
+        else {
+            return;
+        };
+        let Some(trivia) = usize::try_from(start)
+            .ok()
+            .zip(usize::try_from(end).ok())
+            .and_then(|(start, end)| self.source_text.get(start..end))
+        else {
+            return;
+        };
+        let Some(equals) = trivia.rfind('=') else {
+            return;
+        };
+        let Some(comment) = trivia[equals + 1..].find("/*") else {
+            return;
+        };
+        let comment_start =
+            start.saturating_add(u32::try_from(equals + 1 + comment).unwrap_or(u32::MAX));
+        self.emit_block_comment_trivia(comment_start, end, true);
     }
 
     fn array_binding_can_inline_initializer(&self, name: NodeId) -> bool {
@@ -11801,33 +12665,224 @@ impl Printer<'_> {
     }
 
     fn emit_parameters(&mut self, parameters: &NodeList) -> Result<(), EmitError> {
+        self.emit_parameters_with_initializer_mode(parameters, true)
+    }
+
+    fn emit_parameters_without_initializers(
+        &mut self,
+        parameters: &NodeList,
+    ) -> Result<(), EmitError> {
+        self.emit_parameters_with_initializer_mode(parameters, false)
+    }
+
+    fn emit_parameters_with_initializer_mode(
+        &mut self,
+        parameters: &NodeList,
+        emit_initializers: bool,
+    ) -> Result<(), EmitError> {
         self.writer.write("(");
-        let mut emitted = 0;
-        for parameter in &parameters.nodes {
+        let emitted_parameters = parameters
+            .nodes
+            .iter()
+            .copied()
+            .filter(|parameter| {
+                let Some(NodeData::ParameterDeclaration(data)) =
+                    self.arena.get(*parameter).map(|node| &node.data)
+                else {
+                    return true;
+                };
+                self.identifier_text(data.name).ok() != Some("this")
+                    && !(self.settings.target < ScriptTarget::Es2015
+                        && data.dot_dot_dot_token.is_some())
+            })
+            .collect::<Vec<_>>();
+        if emitted_parameters.is_empty() {
+            let start = parameters.range.start.get().saturating_add(1);
+            let end = parameters.range.end.get().saturating_sub(1);
+            if self.trivia_has_block_comment(start, end) {
+                self.writer.write(" ");
+                self.emit_block_comment_trivia(start, end, false);
+            }
+            self.writer.write(")");
+            return Ok(());
+        }
+        let mut previous_end = parameters.range.start.get().saturating_add(1);
+        for (index, parameter) in emitted_parameters.iter().enumerate() {
             let node = self.node(*parameter)?.clone();
             let NodeData::ParameterDeclaration(data) = &node.data else {
                 return Err(Self::unsupported(*parameter, node.kind));
             };
-            if self.identifier_text(data.name).ok() == Some("this") {
-                continue;
+            if index == 0 {
+                let comment_start = self
+                    .source_text
+                    .get(
+                        usize::try_from(previous_end).unwrap_or(usize::MAX)
+                            ..usize::try_from(node.range.start.get()).unwrap_or(usize::MAX),
+                    )
+                    .and_then(|trivia| {
+                        let comment = trivia.find("/*")?;
+                        (!trivia[..comment].contains(['\n', '\r'])).then_some(
+                            previous_end.saturating_add(u32::try_from(comment).unwrap_or(u32::MAX)),
+                        )
+                    })
+                    .unwrap_or(previous_end);
+                self.emit_block_comment_trivia(comment_start, node.range.start.get(), true);
+            } else {
+                let trivia = self
+                    .source_text
+                    .get(
+                        usize::try_from(previous_end).unwrap_or(usize::MAX)
+                            ..usize::try_from(node.range.start.get()).unwrap_or(usize::MAX),
+                    )
+                    .unwrap_or("");
+                let comma = trivia_comma_offset(trivia).unwrap_or(0);
+                let comma_position =
+                    previous_end.saturating_add(u32::try_from(comma).unwrap_or(u32::MAX));
+                if trivia[..comma].starts_with("/*") {
+                    self.writer.write(" ");
+                }
+                self.emit_block_comment_trivia(previous_end, comma_position, true);
+                self.writer.remove_trailing_spaces();
+                self.writer.write(",");
+                let after_comma = comma_position.saturating_add(1);
+                if self.trivia_has_block_comment(after_comma, node.range.start.get()) {
+                    if self
+                        .source_text
+                        .get(
+                            usize::try_from(after_comma).unwrap_or(usize::MAX)
+                                ..usize::try_from(node.range.start.get()).unwrap_or(usize::MAX),
+                        )
+                        .is_some_and(|trivia| {
+                            trivia.starts_with("/*")
+                                || trivia
+                                    .find("/*")
+                                    .is_some_and(|comment| trivia[..comment].contains(['\n', '\r']))
+                        })
+                    {
+                        self.writer.write(" ");
+                    }
+                    self.emit_block_comment_trivia(after_comma, node.range.start.get(), true);
+                } else {
+                    self.writer.write(" ");
+                }
             }
-            if self.settings.target < ScriptTarget::Es2015 && data.dot_dot_dot_token.is_some() {
-                continue;
-            }
-            if emitted != 0 {
-                self.writer.write(", ");
-            }
-            emitted += 1;
             if data.dot_dot_dot_token.is_some() {
                 self.writer.write("...");
+                let comment_start = node.range.start.get().saturating_add(3);
+                let name_start = self.node(data.name)?.range.start.get();
+                if self.trivia_has_block_comment(comment_start, name_start) {
+                    self.writer.write(" ");
+                    self.emit_block_comment_trivia(comment_start, name_start, false);
+                }
             }
             self.emit_expression(data.name, 0)?;
-            if let Some(initializer) = data.initializer {
+            if emit_initializers && let Some(initializer) = data.initializer {
                 self.writer.write(" = ");
                 self.emit_expression(initializer, 1)?;
             }
+            previous_end = node.range.end.get();
         }
+        let list_end = parameters.range.end.get().saturating_sub(1);
+        let trailing = self
+            .source_text
+            .get(
+                usize::try_from(previous_end).unwrap_or(usize::MAX)
+                    ..usize::try_from(list_end).unwrap_or(usize::MAX),
+            )
+            .unwrap_or("");
+        let comment_end = trivia_comma_offset(trailing).map_or(list_end, |comma| {
+            previous_end.saturating_add(u32::try_from(comma).unwrap_or(u32::MAX))
+        });
+        if self.trivia_has_block_comment(previous_end, comment_end) {
+            if trailing.starts_with("/*") {
+                self.writer.write(" ");
+            }
+            self.emit_block_comment_trivia(previous_end, comment_end, true);
+        } else if self.source_range_contains_line_comment(previous_end, list_end) {
+            self.emit_expression_list_line_comments(previous_end, list_end);
+        }
+        self.writer.remove_trailing_spaces();
         self.writer.write(")");
+        Ok(())
+    }
+
+    fn class_decorator_expressions(&self, modifiers: Option<&ts_ast::ModifierList>) -> Vec<NodeId> {
+        modifiers
+            .into_iter()
+            .flat_map(|modifiers| modifiers.list.nodes.iter())
+            .filter_map(|modifier| {
+                let NodeData::Decorator(decorator) = &self.arena.get(*modifier)?.data else {
+                    return None;
+                };
+                Some(decorator.expression)
+            })
+            .collect()
+    }
+
+    fn emit_decorated_class_binding(
+        &mut self,
+        data: &ts_ast::ClassDeclarationData,
+    ) -> Result<(), EmitError> {
+        if self.settings.target < ScriptTarget::Es2015 || data.name.is_none() {
+            return self.emit_class(data);
+        }
+        let name = data.name.expect("decorated class name checked");
+        let preserves_module_modifier = !self.commonjs_module_transform
+            && self.system_export_function.is_none()
+            && self.namespace_containers.is_empty();
+        if preserves_module_modifier
+            && self.has_modifier(data.modifiers.as_ref(), SyntaxKind::ExportKeyword)
+            && !self.has_modifier(data.modifiers.as_ref(), SyntaxKind::DefaultKeyword)
+        {
+            self.writer.write("export ");
+        }
+        self.writer.write("let ");
+        self.emit_expression(name, 0)?;
+        self.writer.write(" = ");
+        self.emit_class(data)?;
+        self.writer.write(";");
+        Ok(())
+    }
+
+    fn emit_class_decorator_assignment(
+        &mut self,
+        data: &ts_ast::ClassDeclarationData,
+        decorators: &[NodeId],
+    ) -> Result<(), EmitError> {
+        let Some(name) = data.name else {
+            return Ok(());
+        };
+        if !self.writer.line_start {
+            self.writer.newline();
+        }
+        self.emit_expression(name, 0)?;
+        self.writer.write(" = __decorate([");
+        self.writer.newline();
+        self.writer.indent += 1;
+        for (index, decorator) in decorators.iter().enumerate() {
+            self.emit_expression(*decorator, 1)?;
+            if index + 1 != decorators.len() {
+                self.writer.write(",");
+            }
+            self.writer.newline();
+        }
+        self.writer.indent -= 1;
+        self.writer.write("], ");
+        self.emit_expression(name, 0)?;
+        self.writer.write(");");
+
+        let preserves_module_modifier = !self.commonjs_module_transform
+            && self.system_export_function.is_none()
+            && self.namespace_containers.is_empty();
+        if preserves_module_modifier
+            && self.has_modifier(data.modifiers.as_ref(), SyntaxKind::ExportKeyword)
+            && self.has_modifier(data.modifiers.as_ref(), SyntaxKind::DefaultKeyword)
+        {
+            self.writer.newline();
+            self.writer.write("export default ");
+            self.emit_expression(name, 0)?;
+            self.writer.write(";");
+        }
         Ok(())
     }
 
@@ -12939,6 +13994,17 @@ impl Printer<'_> {
                 continue;
             }
             self.writer.newline();
+            let leading_start = index
+                .checked_sub(1)
+                .and_then(|index| data.members.nodes.get(index))
+                .and_then(|previous| self.arena.get(*previous))
+                .map_or(data.members.range.start.get(), |node| node.range.end.get());
+            self.emit_source_comments_between_with_ownership(
+                leading_start,
+                node.range.start.get(),
+                false,
+                true,
+            );
             if self.settings.use_define_for_class_fields == Some(true) {
                 self.emit_class_field_definition(&receiver, property.name, initializer)?;
             } else {
@@ -12962,7 +14028,7 @@ impl Printer<'_> {
                 node.range.end.get(),
                 comment_end,
                 true,
-                true,
+                false,
             );
             if self.emitted_source_comments.len() != comment_count {
                 // `emit_statement` supplies the final line break for the class.
@@ -13016,19 +14082,38 @@ impl Printer<'_> {
             self.writer.newline();
         }
 
-        let constructor = data.members.nodes.iter().find_map(|member| {
-            let node = self.arena.get(*member)?;
-            let NodeData::MethodDeclaration(method) = &node.data else {
-                return None;
-            };
-            (!self.class_member_is_abstract(node)
-                && method.body.is_some()
-                && self.is_constructor_name(method.name))
-            .then_some(method.as_ref())
-        });
+        let constructor = data
+            .members
+            .nodes
+            .iter()
+            .enumerate()
+            .find_map(|(index, member)| {
+                let node = self.arena.get(*member)?;
+                let NodeData::MethodDeclaration(method) = &node.data else {
+                    return None;
+                };
+                (!self.class_member_is_abstract(node)
+                    && method.body.is_some()
+                    && self.is_constructor_name(method.name))
+                .then_some((index, *member, method.as_ref()))
+            });
+        if let Some((index, constructor_id, _)) = constructor {
+            let previous_end = index
+                .checked_sub(1)
+                .and_then(|index| data.members.nodes.get(index))
+                .and_then(|member| self.arena.get(*member))
+                .map_or(data.members.range.start.get(), |node| node.range.end.get());
+            let constructor_start = self.node(constructor_id)?.range.start.get();
+            self.emit_source_comments_between_with_ownership(
+                previous_end,
+                constructor_start,
+                false,
+                true,
+            );
+        }
         self.writer.write("function ");
         self.writer.write(name);
-        if let Some(constructor) = constructor {
+        if let Some((_, _, constructor)) = constructor {
             self.emit_parameters(&constructor.parameters)?;
             self.writer.write(" {");
             self.writer.newline();
@@ -13193,6 +14278,7 @@ impl Printer<'_> {
 
         let mut previous_end = data.members.range.start.get();
         let mut previous_emitted = false;
+        let mut previous_emitted_for_empty = false;
         for (index, member) in data.members.nodes.iter().enumerate() {
             let node = self.node(*member)?.clone();
             let current_emitted = !self.class_member_is_abstract(&node)
@@ -13201,25 +14287,29 @@ impl Printer<'_> {
                     NodeData::MethodDeclaration(method) if method.body.is_some()
                 ) || matches!(
                     &node.data,
-                    NodeData::GetAccessorDeclaration(accessor) if accessor.body.is_some()
-                ) || matches!(
-                    &node.data,
-                    NodeData::SetAccessorDeclaration(accessor) if accessor.body.is_some()
-                ) || matches!(
-                    &node.data,
                     NodeData::PropertyDeclaration(property) if self.property_is_auto_accessor(property)
                 ));
+            let current_emitted_for_empty = current_emitted
+                || (!self.class_member_is_abstract(&node)
+                    && (matches!(
+                        &node.data,
+                        NodeData::GetAccessorDeclaration(accessor) if accessor.body.is_some()
+                    ) || matches!(
+                        &node.data,
+                        NodeData::SetAccessorDeclaration(accessor) if accessor.body.is_some()
+                    )));
             self.emit_source_comments_between_with_ownership(
                 previous_end,
                 node.range.start.get(),
                 previous_emitted,
                 current_emitted,
             );
-            if previous_emitted {
+            if previous_emitted_for_empty {
                 self.emit_class_empty_elements_between(previous_end, node.range.start.get());
             }
             previous_end = node.range.end.get();
             previous_emitted = current_emitted;
+            previous_emitted_for_empty = current_emitted_for_empty;
             if self.class_member_is_abstract(&node) {
                 // Abstract members have no runtime representation.
             } else {
@@ -13297,7 +14387,7 @@ impl Printer<'_> {
             previous_emitted,
             false,
         );
-        if previous_emitted {
+        if previous_emitted_for_empty {
             self.emit_class_empty_elements_between(previous_end, data.members.range.end.get());
         }
         let captures_static_this = class_has_async_static_field(self.arena, data);
@@ -13413,14 +14503,29 @@ impl Printer<'_> {
         self.writer.newline();
         self.writer.indent += 1;
         if let Some(getter) = getter {
+            self.emit_downlevel_accessor_leading_comments(class, getter);
             self.writer.write("get: ");
             self.emit_downlevel_accessor_function(getter)?;
+            let boundary = setter
+                .and_then(|setter| self.arena.get(setter).map(|node| node.range.start.get()))
+                .unwrap_or(class.members.range.end.get());
+            self.emit_downlevel_accessor_trailing_comments(getter, boundary);
             self.writer.write(",");
             self.writer.newline();
         }
         if let Some(setter) = setter {
+            self.emit_downlevel_accessor_leading_comments(class, setter);
             self.writer.write("set: ");
             self.emit_downlevel_accessor_function(setter)?;
+            let boundary = class
+                .members
+                .nodes
+                .iter()
+                .position(|candidate| *candidate == setter)
+                .and_then(|index| class.members.nodes.get(index + 1))
+                .and_then(|next| self.arena.get(*next).map(|node| node.range.start.get()))
+                .unwrap_or(class.members.range.end.get());
+            self.emit_downlevel_accessor_trailing_comments(setter, boundary);
             self.writer.write(",");
             self.writer.newline();
         }
@@ -13432,6 +14537,48 @@ impl Printer<'_> {
         self.writer.write("});");
         self.writer.newline();
         Ok(())
+    }
+
+    fn emit_downlevel_accessor_leading_comments(
+        &mut self,
+        class: &ts_ast::ClassDeclarationData,
+        member: NodeId,
+    ) {
+        let Some(index) = class
+            .members
+            .nodes
+            .iter()
+            .position(|candidate| *candidate == member)
+        else {
+            return;
+        };
+        let start = index
+            .checked_sub(1)
+            .and_then(|index| class.members.nodes.get(index))
+            .and_then(|member| self.arena.get(*member))
+            .map_or(class.members.range.start.get(), |node| node.range.end.get());
+        let Some(end) = self.arena.get(member).map(|node| node.range.start.get()) else {
+            return;
+        };
+        self.emit_source_comments_between_with_ownership(start, end, false, true);
+    }
+
+    fn emit_downlevel_accessor_trailing_comments(&mut self, member: NodeId, boundary: u32) {
+        let Some(start) = self.arena.get(member).map(|node| node.range.end.get()) else {
+            return;
+        };
+        let immediate_block = usize::try_from(start)
+            .ok()
+            .zip(usize::try_from(boundary).ok())
+            .and_then(|(start, end)| self.source_text.get(start..end))
+            .is_some_and(|trivia| {
+                let first_line = trivia.split(['\n', '\r']).next().unwrap_or("");
+                first_line.contains("/*")
+            });
+        self.emit_source_comments_between_with_ownership(start, boundary, true, false);
+        if immediate_block {
+            self.writer.remove_trailing_newline();
+        }
     }
 
     fn accessor_info(&self, id: NodeId) -> Option<(bool, NodeId, bool, String)> {
@@ -13487,7 +14634,7 @@ impl Printer<'_> {
             _ => return Err(Self::unsupported(id, node.kind)),
         };
         self.writer.write("function ");
-        self.emit_parameter_names(parameters)?;
+        self.emit_parameters_without_initializers(parameters)?;
         self.writer.write(" ");
         self.emit_downlevel_accessor_body(parameters, body)
     }
@@ -14281,19 +15428,21 @@ impl Printer<'_> {
                         let statement_node = self.node(*statement)?.clone();
                         let current_emitted =
                             self.statement_emits_runtime(*statement, &statement_node);
-                        self.emit_source_comments_between_with_trailing(
+                        self.emit_source_comments_between_with_ownership(
                             previous_end,
                             statement_node.range.start.get(),
                             previous_emitted,
+                            current_emitted,
                         );
                         self.emit_statement(*statement)?;
                         previous_end = statement_node.range.end.get();
                         previous_emitted = current_emitted;
                     }
-                    self.emit_source_comments_between_with_trailing(
+                    self.emit_source_comments_between_with_ownership(
                         previous_end,
                         body_node.range.end.get().saturating_sub(1),
                         previous_emitted,
+                        true,
                     );
                 }
                 NodeData::ModuleDeclaration(module) => {
@@ -14376,12 +15525,19 @@ impl Printer<'_> {
         self.writer.newline();
         self.writer.indent += 1;
         let mut next_number = 0_i64;
+        let mut previous_end = data.members.range.start.get();
         for (index, member) in data.members.nodes.iter().enumerate() {
             let member_id = *member;
             let node = self.node(*member)?.clone();
             let NodeData::EnumMember(member) = &node.data else {
                 return Err(Self::unsupported(*member, node.kind));
             };
+            self.emit_source_comments_between_with_ownership(
+                previous_end,
+                node.range.start.get(),
+                false,
+                true,
+            );
             let (member_name, numeric_name) = self.enum_member_name_text(member.name)?;
             let constant = self.enum_member_values.get(&member_id);
             self.writer.write(&name);
@@ -14456,11 +15612,13 @@ impl Printer<'_> {
                     },
                     |next| next.range.start,
                 );
-            self.emit_source_comments_between_with_trailing(
+            self.emit_source_comments_between_with_ownership(
                 node.range.end.get(),
                 comment_end.get(),
                 true,
+                false,
             );
+            previous_end = node.range.end.get();
         }
         self.writer.indent -= 1;
         self.writer.write("})(");
@@ -14838,6 +15996,20 @@ impl Printer<'_> {
         let NodeData::NamedExports(exports) = &node.data else {
             return Err(Self::unsupported(clause, node.kind));
         };
+        let module_temp = data.module_specifier.map(|module| {
+            self.generated_names
+                .generate(&commonjs_module_temp_base(self.arena, module))
+        });
+        if let (Some(module), Some(module_temp)) = (data.module_specifier, module_temp.as_deref()) {
+            self.writer.write("var ");
+            self.writer.write(module_temp);
+            self.writer.write(" = require(");
+            self.emit_commonjs_module_specifier(module)?;
+            self.writer.write(");");
+            if !exports.elements.nodes.is_empty() {
+                self.writer.newline();
+            }
+        }
         let mut emitted = false;
         for specifier_id in &exports.elements.nodes {
             if data.module_specifier.is_none()
@@ -14857,16 +16029,24 @@ impl Printer<'_> {
             let NodeData::ExportSpecifier(specifier) = &node.data else {
                 return Err(Self::unsupported(*specifier_id, node.kind));
             };
-            self.writer.write("exports.");
-            self.emit_expression(specifier.name, 0)?;
-            self.writer.write(" = ");
-            if let Some(module) = data.module_specifier {
-                self.writer.write("require(");
-                self.emit_commonjs_module_specifier(module)?;
-                self.writer.write(").");
+            if let Some(module_temp) = module_temp.as_deref() {
+                self.writer.write("Object.defineProperty(exports, ");
+                let exported_name =
+                    declaration_name_text(self.arena, specifier.name).unwrap_or_default();
+                write_quoted(&mut self.writer, exported_name);
+                self.writer
+                    .write(", { enumerable: true, get: function () { return ");
+                self.writer.write(module_temp);
+                self.writer.write(".");
+                self.emit_expression(specifier.property_name.unwrap_or(specifier.name), 0)?;
+                self.writer.write("; } });");
+            } else {
+                self.writer.write("exports.");
+                self.emit_expression(specifier.name, 0)?;
+                self.writer.write(" = ");
+                self.emit_expression(specifier.property_name.unwrap_or(specifier.name), 0)?;
+                self.writer.write(";");
             }
-            self.emit_expression(specifier.property_name.unwrap_or(specifier.name), 0)?;
-            self.writer.write(";");
             emitted = true;
         }
         Ok(())
@@ -15306,6 +16486,7 @@ impl Printer<'_> {
                 Some(
                     NodeData::Identifier(_)
                         | NodeData::CallExpression(_)
+                        | NodeData::NewExpression(_)
                         | NodeData::ObjectLiteralExpression(_)
                         | NodeData::NumericLiteral(_)
                         | NodeData::BigIntLiteral(_)
@@ -15616,7 +16797,13 @@ impl Printer<'_> {
                 }
                 self.emit_expression_list(&data.elements)?;
                 if !object && data.elements.has_trailing_comma {
-                    self.writer.write(",");
+                    let last_is_omitted = data
+                        .elements
+                        .nodes
+                        .last()
+                        .and_then(|last| self.arena.get(*last))
+                        .is_some_and(|last| matches!(last.data, NodeData::OmittedExpression(_)));
+                    self.writer.write(if last_is_omitted { " ," } else { "," });
                 }
                 if object && !data.elements.nodes.is_empty() {
                     self.writer.write(" ");
@@ -15626,6 +16813,15 @@ impl Printer<'_> {
             NodeData::BindingElement(data) => {
                 if data.dot_dot_dot_token.is_some() {
                     self.writer.write("...");
+                    let comment_start = node.range.start.get().saturating_add(3);
+                    let name_start = data
+                        .name
+                        .and_then(|name| self.arena.get(name))
+                        .map_or(node.range.end.get(), |name| name.range.start.get());
+                    if self.trivia_has_block_comment(comment_start, name_start) {
+                        self.writer.write(" ");
+                        self.emit_block_comment_trivia(comment_start, name_start, false);
+                    }
                 }
                 if let Some(property_name) = data.property_name {
                     self.emit_expression(property_name, 0)?;
@@ -15684,8 +16880,15 @@ impl Printer<'_> {
                                     if new_expression.expression == id
                             )
                         });
-                    if keep_for_object_statement || keep_as_new_target {
+                    let comment_start = node.range.start.get().saturating_add(1);
+                    let asserted_start = self.node(asserted_expression)?.range.start.get();
+                    let keep_for_leading_comment =
+                        self.trivia_has_block_comment(comment_start, asserted_start);
+                    if keep_for_object_statement || keep_as_new_target || keep_for_leading_comment {
                         self.writer.write("(");
+                        if keep_for_leading_comment {
+                            self.emit_block_comment_trivia(comment_start, asserted_start, true);
+                        }
                         self.emit_expression(data.expression, 0)?;
                         self.writer.write(")");
                     } else {
@@ -15702,7 +16905,18 @@ impl Printer<'_> {
                     }
                 } else {
                     self.writer.write("(");
+                    let comment_start = node.range.start.get().saturating_add(1);
+                    let expression_start = self.node(data.expression)?.range.start.get();
+                    if self.trivia_has_block_comment(comment_start, expression_start) {
+                        self.emit_block_comment_trivia(comment_start, expression_start, false);
+                    }
                     self.emit_expression(data.expression, 0)?;
+                    self.emit_inline_block_comments_between(
+                        self.node(data.expression)?.range.end.get(),
+                        node.range.end.get().saturating_sub(1),
+                        true,
+                    );
+                    self.writer.remove_trailing_spaces();
                     self.writer.write(")");
                 }
             }
@@ -15860,6 +17074,15 @@ impl Printer<'_> {
             }
             NodeData::SpreadElement(data) => {
                 self.writer.write("...");
+                let comment_start = node.range.start.get().saturating_add(3);
+                let expression_start = self.node(data.expression)?.range.start.get();
+                if self.trivia_has_block_comment(comment_start, expression_start) {
+                    if !self.block_comment_starts_on_new_line(comment_start, expression_start) {
+                        self.writer.write(" ");
+                    }
+                    self.emit_block_comment_trivia(comment_start, expression_start, false);
+                    self.finish_spread_comment_trivia(comment_start, expression_start);
+                }
                 self.emit_expression(data.expression, 1)?;
             }
             NodeData::AwaitExpression(data) => {
@@ -16139,7 +17362,20 @@ impl Printer<'_> {
                     match &node.data {
                         NodeData::PropertyAssignment(property) => {
                             self.emit_expression(property.name, 0)?;
-                            self.writer.write(": ");
+                            let name_end = self.node(property.name)?.range.end.get();
+                            let initializer_start =
+                                self.node(property.initializer)?.range.start.get();
+                            if self.trivia_has_block_comment(name_end, initializer_start) {
+                                self.writer.write(":");
+                                if self
+                                    .block_comment_starts_on_new_line(name_end, initializer_start)
+                                {
+                                    self.writer.write(" ");
+                                }
+                                self.emit_block_comment_trivia(name_end, initializer_start, true);
+                            } else {
+                                self.writer.write(": ");
+                            }
                             self.emit_expression(property.initializer, 1)?;
                         }
                         NodeData::ShorthandPropertyAssignment(property) => {
@@ -16147,6 +17383,23 @@ impl Printer<'_> {
                         }
                         NodeData::SpreadAssignment(property) => {
                             self.writer.write("...");
+                            let comment_start = node.range.start.get().saturating_add(3);
+                            let expression_start =
+                                self.node(property.expression)?.range.start.get();
+                            if self.trivia_has_block_comment(comment_start, expression_start) {
+                                if !self.block_comment_starts_on_new_line(
+                                    comment_start,
+                                    expression_start,
+                                ) {
+                                    self.writer.write(" ");
+                                }
+                                self.emit_block_comment_trivia(
+                                    comment_start,
+                                    expression_start,
+                                    false,
+                                );
+                                self.finish_spread_comment_trivia(comment_start, expression_start);
+                            }
                             self.emit_expression(property.expression, 1)?;
                         }
                         NodeData::MethodDeclaration(method) if method.body.is_some() => {
@@ -16157,27 +17410,39 @@ impl Printer<'_> {
                                 )
                                 && (ScriptTarget::Es2015..ScriptTarget::Es2017)
                                     .contains(&self.settings.target);
-                            if !downlevel_async
-                                && self.has_modifier(
-                                    method.modifiers.as_ref(),
-                                    SyntaxKind::AsyncKeyword,
-                                )
+                            if self.settings.target < ScriptTarget::Es2015
+                                && method.asterisk_token.is_none()
                             {
-                                self.writer.write("async ");
-                            }
-                            if method.asterisk_token.is_some() {
-                                self.writer.write("*");
-                            }
-                            self.emit_expression(method.name, 0)?;
-                            self.emit_parameters(&method.parameters)?;
-                            self.writer.write(" ");
-                            if downlevel_async {
-                                self.emit_downlevel_async_function_body(
-                                    method.body.expect("body checked above"),
-                                    "this",
-                                )?;
-                            } else {
+                                self.emit_expression(method.name, 0)?;
+                                self.writer.write(": function ");
+                                self.emit_parameters(&method.parameters)?;
+                                self.writer.write(" ");
                                 self.emit_function_body(method.body.expect("body checked above"))?;
+                            } else {
+                                if !downlevel_async
+                                    && self.has_modifier(
+                                        method.modifiers.as_ref(),
+                                        SyntaxKind::AsyncKeyword,
+                                    )
+                                {
+                                    self.writer.write("async ");
+                                }
+                                if method.asterisk_token.is_some() {
+                                    self.writer.write("*");
+                                }
+                                self.emit_expression(method.name, 0)?;
+                                self.emit_parameters(&method.parameters)?;
+                                self.writer.write(" ");
+                                if downlevel_async {
+                                    self.emit_downlevel_async_function_body(
+                                        method.body.expect("body checked above"),
+                                        "this",
+                                    )?;
+                                } else {
+                                    self.emit_function_body(
+                                        method.body.expect("body checked above"),
+                                    )?;
+                                }
                             }
                         }
                         NodeData::GetAccessorDeclaration(accessor) => {
@@ -16196,13 +17461,41 @@ impl Printer<'_> {
                         }
                         _ => return Err(Self::unsupported(*property, node.kind)),
                     }
+                    previous_end = node.range.end.get();
                     if multiline
                         && (index + 1 < data.properties.nodes.len()
                             || data.properties.has_trailing_comma)
                     {
+                        let boundary = data
+                            .properties
+                            .nodes
+                            .get(index + 1)
+                            .and_then(|next| self.arena.get(*next))
+                            .map_or_else(
+                                || {
+                                    self.node(id)
+                                        .map(|node| node.range.end.get().saturating_sub(1))
+                                },
+                                |next| Ok(next.range.start.get()),
+                            )?;
+                        let trivia = self
+                            .source_text
+                            .get(
+                                usize::try_from(previous_end).unwrap_or(usize::MAX)
+                                    ..usize::try_from(boundary).unwrap_or(usize::MAX),
+                            )
+                            .unwrap_or("");
+                        let comma_position =
+                            trivia_comma_offset(trivia).map_or(previous_end, |offset| {
+                                previous_end
+                                    .saturating_add(u32::try_from(offset).unwrap_or(u32::MAX))
+                            });
+                        if self.trivia_has_block_comment(previous_end, comma_position) {
+                            self.emit_block_comment_trivia(previous_end, comma_position, false);
+                        }
                         self.writer.write(",");
+                        previous_end = comma_position.saturating_add(1);
                     }
-                    previous_end = node.range.end.get();
                 }
                 if multiline {
                     self.emit_source_comments_between_with_trailing(
@@ -16351,6 +17644,7 @@ impl Printer<'_> {
                 } else if matches!(&self.node(data.body)?.data, NodeData::Block(_)) {
                     self.emit_function_body(data.body)?;
                 } else {
+                    self.emit_arrow_body_line_comments(id, data.body);
                     self.emit_expression(data.body, 1)?;
                 }
                 if wrap {
@@ -16440,6 +17734,15 @@ impl Printer<'_> {
                 } else {
                     self.emit_template(data)?;
                 }
+            }
+            NodeData::TaggedTemplateExpression(data) => {
+                self.emit_expression(data.tag, 18)?;
+                if data.question_dot_token.is_some() {
+                    self.writer.write("?.");
+                } else {
+                    self.writer.write(" ");
+                }
+                self.emit_expression(data.template, 18)?;
             }
             NodeData::JsxElement(data) => self.emit_jsx_element(data)?,
             NodeData::JsxSelfClosingElement(data) => self.emit_jsx_self_closing(data)?,
@@ -16558,9 +17861,9 @@ impl Printer<'_> {
         if self.settings.jsx == JsxEmit::React {
             self.writer
                 .write("React.createElement(React.Fragment, null");
-            for child in &data.children.nodes {
+            for child in semantic_jsx_children(self.arena, &data.children) {
                 self.writer.write(", ");
-                self.emit_jsx_child(*child, false)?;
+                self.emit_jsx_child(child, false)?;
             }
             self.writer.write(")");
             return Ok(());
@@ -16593,9 +17896,9 @@ impl Printer<'_> {
         self.writer.write(", ");
         self.emit_jsx_attributes(attributes, false)?;
         if let Some(children) = children {
-            for child in &children.nodes {
+            for child in semantic_jsx_children(self.arena, children) {
                 self.writer.write(", ");
-                self.emit_jsx_child(*child, false)?;
+                self.emit_jsx_child(child, false)?;
             }
         }
         self.writer.write(")");
@@ -16645,7 +17948,13 @@ impl Printer<'_> {
 
     fn emit_automatic_helper(&mut self, static_children: bool) {
         if self.commonjs_module_transform {
-            self.writer.write("(0, jsx_runtime_1.");
+            self.writer.write("(0, ");
+            self.writer.write(if self.is_external_module {
+                self.automatic_jsx_runtime_binding()
+            } else {
+                "_a"
+            });
+            self.writer.write(".");
             self.writer
                 .write(if self.settings.jsx == JsxEmit::ReactJsxDev {
                     "jsxDEV"
@@ -16666,9 +17975,22 @@ impl Printer<'_> {
 
     fn emit_automatic_fragment_reference(&mut self) {
         if self.commonjs_module_transform {
-            self.writer.write("jsx_runtime_1.Fragment");
+            self.writer.write(if self.is_external_module {
+                self.automatic_jsx_runtime_binding()
+            } else {
+                "_a"
+            });
+            self.writer.write(".Fragment");
         } else {
             self.writer.write("_Fragment");
+        }
+    }
+
+    fn automatic_jsx_runtime_binding(&self) -> &'static str {
+        if self.settings.jsx == JsxEmit::ReactJsxDev {
+            "jsx_dev_runtime_1"
+        } else {
+            "jsx_runtime_1"
         }
     }
 
@@ -16810,6 +18132,7 @@ impl Printer<'_> {
             NodeData::JsxExpression(expression) => {
                 if let Some(expression) = expression.expression {
                     self.emit_expression(expression, 0)?;
+                    self.emit_jsx_expression_trailing_comments(child, expression);
                 }
             }
             NodeData::JsxElement(element) => self.emit_jsx_element(element)?,
@@ -16945,12 +18268,24 @@ impl Printer<'_> {
                 self.writer.write("{");
                 if let Some(expression) = expression.expression {
                     self.emit_expression(expression, 0)?;
+                    self.emit_jsx_expression_trailing_comments(id, expression);
+                } else {
+                    let multiline = self.jsx_empty_expression_is_multiline(id);
+                    self.writer.indent += usize::from(multiline);
+                    self.emit_jsx_empty_expression_comments(id);
+                    if multiline && !self.writer.line_start {
+                        self.writer.write(" ");
+                    }
+                    self.writer.write("}");
+                    self.writer.indent -= usize::from(multiline);
+                    return Ok(());
                 }
                 self.writer.write("}");
             }
             NodeData::JsxExpression(expression) => {
                 if let Some(expression) = expression.expression {
                     self.emit_expression(expression, 0)?;
+                    self.emit_jsx_expression_trailing_comments(id, expression);
                 } else {
                     self.writer.write("undefined");
                 }
@@ -16961,6 +18296,66 @@ impl Printer<'_> {
             _ => return Err(Self::unsupported(id, node.kind)),
         }
         Ok(())
+    }
+
+    fn emit_jsx_expression_trailing_comments(&mut self, jsx: NodeId, expression: NodeId) {
+        let Some(expression_end) = self.arena.get(expression).map(|node| node.range.end.get())
+        else {
+            return;
+        };
+        let Some(jsx_end) = self.arena.get(jsx).map(|node| node.range.end.get()) else {
+            return;
+        };
+        let trivia_end = jsx_end.saturating_sub(1);
+        if !self.source_range_has_comment(expression_end, trivia_end) {
+            return;
+        }
+        // TypeScript separates a trailing JSX expression comment from the value even
+        // when the source wrote `value/* comment */`.
+        if !self.writer.line_start {
+            self.writer.write(" ");
+        }
+        self.emit_binary_comment_trivia(expression_end, trivia_end);
+    }
+
+    fn emit_jsx_empty_expression_comments(&mut self, jsx: NodeId) {
+        if self.settings.remove_comments {
+            return;
+        }
+        let Some(node) = self.arena.get(jsx) else {
+            return;
+        };
+        let mut start = node.range.start.get().saturating_add(1);
+        let end = node.range.end.get().saturating_sub(1);
+        if let Some(trivia) = usize::try_from(start)
+            .ok()
+            .zip(usize::try_from(end).ok())
+            .and_then(|(start, end)| self.source_text.get(start..end))
+        {
+            let first_comment = [trivia.find("//"), trivia.find("/*")]
+                .into_iter()
+                .flatten()
+                .min();
+            if let Some(first_comment) = first_comment
+                && !trivia[..first_comment].contains(['\n', '\r'])
+            {
+                start = start.saturating_add(u32::try_from(first_comment).unwrap_or(u32::MAX));
+            }
+        }
+        if self.source_range_has_comment(start, end) {
+            self.emit_binary_comment_trivia(start, end);
+        }
+    }
+
+    fn jsx_empty_expression_is_multiline(&self, jsx: NodeId) -> bool {
+        let Some(node) = self.arena.get(jsx) else {
+            return false;
+        };
+        usize::try_from(node.range.start.get().saturating_add(1))
+            .ok()
+            .zip(usize::try_from(node.range.end.get().saturating_sub(1)).ok())
+            .and_then(|(start, end)| self.source_text.get(start..end))
+            .is_some_and(|trivia| trivia.contains(['\n', '\r']))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -16974,8 +18369,17 @@ impl Printer<'_> {
             Expression(NodeId, u8),
             Write(&'static str),
             SystemExportStart(String),
-            BeforeOperator { comma: bool, line_break: bool },
-            AfterOperator { line_break: bool },
+            BeforeOperator {
+                comma: bool,
+                line_break: bool,
+                start: u32,
+                end: u32,
+            },
+            AfterOperator {
+                line_break: bool,
+                start: u32,
+                end: u32,
+            },
             Dedent,
         }
 
@@ -16998,16 +18402,35 @@ impl Printer<'_> {
                 }
                 Action::Write(text) => self.writer.write(text),
                 Action::SystemExportStart(name) => self.emit_system_export_call_start(&name),
-                Action::BeforeOperator { comma, line_break } => {
-                    if line_break {
+                Action::BeforeOperator {
+                    comma,
+                    line_break,
+                    start,
+                    end,
+                } => {
+                    if !self.settings.remove_comments && self.source_range_has_comment(start, end) {
+                        if line_break {
+                            self.writer.indent += 1;
+                        }
+                        self.emit_binary_comment_trivia(start, end);
+                    } else if line_break {
                         self.writer.indent += 1;
                         self.writer.newline();
                     } else if !comma {
                         self.writer.write(" ");
                     }
                 }
-                Action::AfterOperator { line_break } => {
-                    if line_break {
+                Action::AfterOperator {
+                    line_break,
+                    start,
+                    end,
+                } => {
+                    if !self.settings.remove_comments && self.source_range_has_comment(start, end) {
+                        if line_break {
+                            self.writer.indent += 1;
+                        }
+                        self.emit_binary_comment_trivia(start, end);
+                    } else if line_break {
                         self.writer.indent += 1;
                         self.writer.newline();
                     } else {
@@ -17108,11 +18531,15 @@ impl Printer<'_> {
                     ));
                     actions.push(Action::AfterOperator {
                         line_break: line_break_after_operator,
+                        start: self.node(binary.operator_token)?.range.end.get(),
+                        end: self.node(binary.right)?.range.start.get(),
                     });
                     actions.push(Action::Write(operator_text));
                     actions.push(Action::BeforeOperator {
                         comma: operator == SyntaxKind::CommaToken,
                         line_break: line_break_before_operator,
+                        start: self.node(binary.left)?.range.end.get(),
+                        end: self.node(binary.operator_token)?.range.start.get(),
                     });
                     actions.push(Action::Expression(binary.left, operator_precedence));
                     if wrap {
@@ -17125,6 +18552,82 @@ impl Printer<'_> {
             }
         }
         Ok(())
+    }
+
+    fn source_range_has_comment(&self, start: u32, end: u32) -> bool {
+        usize::try_from(start)
+            .ok()
+            .zip(usize::try_from(end).ok())
+            .and_then(|(start, end)| self.source_text.get(start..end))
+            .is_some_and(|trivia| trivia.contains("//") || trivia.contains("/*"))
+    }
+
+    fn emit_binary_comment_trivia(&mut self, start: u32, end: u32) {
+        if self.settings.remove_comments {
+            return;
+        }
+        let start = usize::try_from(start).unwrap_or(usize::MAX);
+        let end = usize::try_from(end).unwrap_or(usize::MAX);
+        let Some(trivia) = self.source_text.get(start..end) else {
+            return;
+        };
+        let bytes = trivia.as_bytes();
+        let mut cursor = 0;
+        while cursor < bytes.len() {
+            let line = trivia[cursor..].find("//").map(|offset| cursor + offset);
+            let block = trivia[cursor..].find("/*").map(|offset| cursor + offset);
+            let Some(comment_start) = (match (line, block) {
+                (Some(line), Some(block)) => Some(line.min(block)),
+                (Some(line), None) => Some(line),
+                (None, Some(block)) => Some(block),
+                (None, None) => None,
+            }) else {
+                break;
+            };
+            let leading = &trivia[cursor..comment_start];
+            if leading.contains(['\n', '\r']) {
+                if !self.writer.line_start {
+                    self.writer.newline();
+                }
+            } else if !leading.is_empty() && !self.writer.line_start {
+                self.writer.write(" ");
+            }
+            if bytes[comment_start..].starts_with(b"//") {
+                let comment_end = bytes[comment_start..]
+                    .iter()
+                    .position(|byte| matches!(*byte, b'\n' | b'\r'))
+                    .map_or(bytes.len(), |offset| comment_start + offset);
+                let range = (start + comment_start, start + comment_end);
+                if self.emitted_source_comments.insert(range) {
+                    self.writer.write(&trivia[comment_start..comment_end]);
+                    self.writer.newline_preserving_trailing_spaces();
+                }
+                cursor = comment_end;
+            } else {
+                let comment_end = bytes[comment_start + 2..]
+                    .windows(2)
+                    .position(|window| window == b"*/")
+                    .map_or(bytes.len(), |offset| comment_start + 2 + offset + 2);
+                let range = (start + comment_start, start + comment_end);
+                if self.emitted_source_comments.insert(range) {
+                    self.emit_normalized_block_comment(
+                        &trivia[comment_start..comment_end],
+                        range.0,
+                        false,
+                        false,
+                    );
+                }
+                cursor = comment_end;
+            }
+        }
+        let trailing = &trivia[cursor..];
+        if trailing.contains(['\n', '\r']) {
+            if !self.writer.line_start {
+                self.writer.newline();
+            }
+        } else if !trailing.is_empty() && !self.writer.line_start {
+            self.writer.write(" ");
+        }
     }
 
     fn emit_downlevel_optional_property(
@@ -17387,7 +18890,14 @@ impl Printer<'_> {
         match &node.data {
             NodeData::PropertyAssignment(property) => {
                 self.emit_expression(property.name, 0)?;
-                self.writer.write(": ");
+                let name_end = self.node(property.name)?.range.end.get();
+                let initializer_start = self.node(property.initializer)?.range.start.get();
+                if self.trivia_has_block_comment(name_end, initializer_start) {
+                    self.writer.write(":");
+                    self.emit_block_comment_trivia(name_end, initializer_start, true);
+                } else {
+                    self.writer.write(": ");
+                }
                 self.emit_expression(property.initializer, 1)?;
             }
             NodeData::ShorthandPropertyAssignment(property) => {
@@ -17397,6 +18907,14 @@ impl Printer<'_> {
                 let downlevel_async = method.asterisk_token.is_none()
                     && self.has_modifier(method.modifiers.as_ref(), SyntaxKind::AsyncKeyword)
                     && (ScriptTarget::Es2015..ScriptTarget::Es2017).contains(&self.settings.target);
+                if self.settings.target < ScriptTarget::Es2015 && method.asterisk_token.is_none() {
+                    self.emit_expression(method.name, 0)?;
+                    self.writer.write(": function ");
+                    self.emit_parameters(&method.parameters)?;
+                    self.writer.write(" ");
+                    self.emit_function_body(method.body.expect("body checked above"))?;
+                    return Ok(());
+                }
                 if !downlevel_async
                     && self.has_modifier(method.modifiers.as_ref(), SyntaxKind::AsyncKeyword)
                 {
@@ -17505,33 +19023,81 @@ impl Printer<'_> {
         let multiline = !data.elements.nodes.is_empty() && self.node_source_is_multiline(id);
         self.writer.write("[");
         if !multiline {
-            self.emit_expression_list(&data.elements)?;
-            if data.elements.has_trailing_comma {
-                self.writer.write(",");
-            }
+            self.emit_compact_array_elements(id, data)?;
             self.writer.write("]");
             return Ok(());
         }
 
         self.writer.indent += 1;
-        self.writer.newline();
+        let break_before_first = data
+            .elements
+            .nodes
+            .first()
+            .and_then(|first| self.arena.get(*first))
+            .and_then(|first| {
+                usize::try_from(data.elements.range.start.get().saturating_add(1))
+                    .ok()
+                    .zip(usize::try_from(first.range.start.get()).ok())
+                    .and_then(|(start, end)| self.source_text.get(start..end))
+            })
+            .is_some_and(|trivia| trivia.contains(['\n', '\r']));
+        if break_before_first {
+            self.writer.newline();
+        }
         let mut previous_end = data.elements.range.start.get();
         for (index, element) in data.elements.nodes.iter().enumerate() {
-            if index != 0 {
-                self.writer.write(",");
+            if index != 0 && !self.writer.line_start {
                 self.writer.newline();
             }
             let node = self.node(*element)?.clone();
-            self.emit_source_comments_between_with_trailing(
-                previous_end,
-                node.range.start.get(),
-                index != 0,
-            );
+            if self.trivia_has_block_comment(previous_end, node.range.start.get()) {
+                self.emit_block_comment_trivia(previous_end, node.range.start.get(), true);
+            } else {
+                self.emit_source_comments_between_with_trailing(
+                    previous_end,
+                    node.range.start.get(),
+                    index != 0,
+                );
+            }
             self.emit_expression(*element, 1)?;
             previous_end = node.range.end.get();
-        }
-        if data.elements.has_trailing_comma {
-            self.writer.write(",");
+            let needs_comma =
+                index + 1 < data.elements.nodes.len() || data.elements.has_trailing_comma;
+            if needs_comma {
+                let boundary = data
+                    .elements
+                    .nodes
+                    .get(index + 1)
+                    .and_then(|next| self.arena.get(*next))
+                    .map_or_else(
+                        || {
+                            self.node(id)
+                                .map(|node| node.range.end.get().saturating_sub(1))
+                        },
+                        |next| Ok(next.range.start.get()),
+                    )?;
+                let trivia = self
+                    .source_text
+                    .get(
+                        usize::try_from(previous_end).unwrap_or(usize::MAX)
+                            ..usize::try_from(boundary).unwrap_or(usize::MAX),
+                    )
+                    .unwrap_or("");
+                let comma_offset = trivia_comma_offset(trivia).unwrap_or(0);
+                let comma_position =
+                    previous_end.saturating_add(u32::try_from(comma_offset).unwrap_or(u32::MAX));
+                if self.trivia_has_block_comment(previous_end, comma_position) {
+                    let comment_on_new_line = trivia[..comma_offset]
+                        .find("/*")
+                        .is_some_and(|comment| trivia[..comment].contains(['\n', '\r']));
+                    self.emit_block_comment_trivia(previous_end, comma_position, false);
+                    if comment_on_new_line {
+                        self.writer.write(" ");
+                    }
+                }
+                self.writer.write(",");
+                previous_end = comma_position.saturating_add(1);
+            }
         }
         self.emit_source_comments_between_with_trailing(
             previous_end,
@@ -17546,27 +19112,124 @@ impl Printer<'_> {
         Ok(())
     }
 
-    fn emit_expression_list(&mut self, list: &NodeList) -> Result<(), EmitError> {
-        let mut previous_end = list.range.start.get();
-        for (index, expression) in list.nodes.iter().enumerate() {
-            if index != 0 {
-                self.writer.write(",");
+    fn emit_compact_array_elements(
+        &mut self,
+        id: NodeId,
+        data: &ts_ast::ArrayLiteralExpressionData,
+    ) -> Result<(), EmitError> {
+        let close = self.node(id)?.range.end.get().saturating_sub(1);
+        let mut previous_end = self.node(id)?.range.start.get().saturating_add(1);
+        for (index, element) in data.elements.nodes.iter().enumerate() {
+            let node = self.node(*element)?.clone();
+            if self.trivia_has_block_comment(previous_end, node.range.start.get()) {
+                self.emit_block_comment_trivia(previous_end, node.range.start.get(), true);
+            } else if index != 0 {
+                self.writer.write(" ");
             }
+            self.emit_expression(*element, 1)?;
+            previous_end = node.range.end.get();
+            let needs_comma =
+                index + 1 < data.elements.nodes.len() || data.elements.has_trailing_comma;
+            if needs_comma {
+                let boundary = data
+                    .elements
+                    .nodes
+                    .get(index + 1)
+                    .and_then(|next| self.arena.get(*next))
+                    .map_or(close, |next| next.range.start.get());
+                let trivia = self
+                    .source_text
+                    .get(
+                        usize::try_from(previous_end).unwrap_or(usize::MAX)
+                            ..usize::try_from(boundary).unwrap_or(usize::MAX),
+                    )
+                    .unwrap_or("");
+                let comma = trivia_comma_offset(trivia).unwrap_or(0);
+                let comma_position =
+                    previous_end.saturating_add(u32::try_from(comma).unwrap_or(u32::MAX));
+                if self.trivia_has_block_comment(previous_end, comma_position) {
+                    self.emit_block_comment_trivia(previous_end, comma_position, false);
+                }
+                self.writer.write(",");
+                previous_end = comma_position.saturating_add(1);
+            }
+        }
+        if self.trivia_has_block_comment(previous_end, close) {
+            if data.elements.nodes.is_empty() {
+                self.writer.write(" ");
+            }
+            self.emit_block_comment_trivia(previous_end, close, false);
+        }
+        Ok(())
+    }
+
+    fn emit_expression_list(&mut self, list: &NodeList) -> Result<(), EmitError> {
+        let mut previous_end = list.range.start.get().saturating_add(1);
+        for (index, expression) in list.nodes.iter().enumerate() {
             let expression_start = self.node(*expression)?.range.start.get();
-            if self.source_range_contains_line_comment(previous_end, expression_start) {
-                self.emit_expression_list_line_comments(previous_end, expression_start);
+            if index == 0 {
+                if self.trivia_has_block_comment(previous_end, expression_start) {
+                    self.emit_block_comment_trivia(previous_end, expression_start, true);
+                } else if self.source_range_contains_line_comment(previous_end, expression_start) {
+                    self.emit_expression_list_line_comments(previous_end, expression_start);
+                }
             } else {
-                if index != 0 {
+                let trivia = self
+                    .source_text
+                    .get(
+                        usize::try_from(previous_end).unwrap_or(usize::MAX)
+                            ..usize::try_from(expression_start).unwrap_or(usize::MAX),
+                    )
+                    .unwrap_or("");
+                let comma = trivia_comma_offset(trivia).unwrap_or(0);
+                let comma_position =
+                    previous_end.saturating_add(u32::try_from(comma).unwrap_or(u32::MAX));
+                if self.trivia_has_block_comment(previous_end, comma_position) {
+                    self.emit_block_comment_trivia(previous_end, comma_position, true);
+                }
+                let previous_was_omitted = list
+                    .nodes
+                    .get(index - 1)
+                    .and_then(|previous| self.arena.get(*previous))
+                    .is_some_and(|node| matches!(node.data, NodeData::OmittedExpression(_)));
+                if !previous_was_omitted {
+                    self.writer.remove_trailing_spaces();
+                }
+                self.writer.write(",");
+                let after_comma = comma_position.saturating_add(1);
+                if self.trivia_has_block_comment(after_comma, expression_start) {
+                    if self
+                        .source_text
+                        .get(
+                            usize::try_from(after_comma).unwrap_or(usize::MAX)
+                                ..usize::try_from(expression_start).unwrap_or(usize::MAX),
+                        )
+                        .is_some_and(|trivia| {
+                            trivia.starts_with("/*")
+                                || trivia
+                                    .find("/*")
+                                    .is_some_and(|comment| trivia[..comment].contains(['\n', '\r']))
+                        })
+                    {
+                        self.writer.write(" ");
+                    }
+                    self.emit_block_comment_trivia(after_comma, expression_start, true);
+                } else if self.source_range_contains_line_comment(after_comma, expression_start) {
+                    self.emit_expression_list_line_comments(after_comma, expression_start);
+                } else {
                     self.writer.write(" ");
                 }
-                self.emit_inline_block_comments(previous_end, expression_start);
             }
             self.emit_expression(*expression, 1)?;
             previous_end = self.node(*expression)?.range.end.get();
         }
-        if self.source_range_contains_line_comment(previous_end, list.range.end.get()) {
-            self.emit_expression_list_line_comments(previous_end, list.range.end.get());
+        let list_end = list.range.end.get().saturating_sub(1);
+        if self.trivia_has_block_comment(previous_end, list_end) {
+            self.emit_block_comment_trivia(previous_end, list_end, true);
+        } else if self.source_range_contains_line_comment(previous_end, list_end) {
+            self.emit_expression_list_line_comments(previous_end, list_end);
         }
+        self.writer.remove_trailing_spaces();
         Ok(())
     }
 
@@ -17608,32 +19271,6 @@ impl Printer<'_> {
             self.writer.newline();
         }
         self.emit_source_comments_between_with_trailing(start, end, true);
-    }
-
-    fn emit_inline_block_comments(&mut self, start: u32, end: u32) {
-        if self.settings.remove_comments {
-            return;
-        }
-        let start = usize::try_from(start).unwrap_or(usize::MAX);
-        let end = usize::try_from(end).unwrap_or(usize::MAX);
-        let Some(trivia) = self.source_text.get(start..end) else {
-            return;
-        };
-        let bytes = trivia.as_bytes();
-        let mut index = 0;
-        while index + 1 < bytes.len() {
-            if bytes[index..].starts_with(b"/*") {
-                let comment_end = bytes[index + 2..]
-                    .windows(2)
-                    .position(|window| window == b"*/")
-                    .map_or(bytes.len(), |offset| index + 2 + offset + 2);
-                self.writer.write(&trivia[index..comment_end]);
-                self.writer.write(" ");
-                index = comment_end;
-            } else {
-                index += 1;
-            }
-        }
     }
 
     fn single_line_return_expression(&self, block: NodeId) -> Result<Option<NodeId>, EmitError> {
@@ -17951,6 +19588,10 @@ fn semantic_jsx_children(arena: &NodeArena, children: &NodeList) -> Vec<NodeId> 
         .collect()
 }
 
+fn source_basename(path: &str) -> &str {
+    path.rsplit(['/', '\\']).next().unwrap_or(path)
+}
+
 fn normalize_jsx_text(text: &str) -> String {
     if !text.contains(['\n', '\r']) {
         return text.to_owned();
@@ -18015,6 +19656,61 @@ fn contains_blank_line(text: &str) -> bool {
         }
     }
     false
+}
+
+fn source_visual_column(source: &str, offset: usize) -> usize {
+    let line_start = source[..offset.min(source.len())]
+        .rfind(['\n', '\r'])
+        .map_or(0, |line_break| line_break + 1);
+    source[line_start..offset.min(source.len())]
+        .chars()
+        .fold(0, |column, character| {
+            if character == '\t' {
+                (column / 4 + 1) * 4
+            } else {
+                column + 1
+            }
+        })
+}
+
+fn split_visual_indentation(line: &str) -> (usize, &str) {
+    let mut column = 0;
+    let mut byte_end = 0;
+    for (index, character) in line.char_indices() {
+        if !matches!(character, ' ' | '\t') {
+            break;
+        }
+        column = if character == '\t' {
+            (column / 4 + 1) * 4
+        } else {
+            column + 1
+        };
+        byte_end = index + character.len_utf8();
+    }
+    (column, &line[byte_end..])
+}
+
+fn trivia_comma_offset(trivia: &str) -> Option<usize> {
+    let bytes = trivia.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index..].starts_with(b"//") {
+            index = bytes[index..]
+                .iter()
+                .position(|byte| matches!(*byte, b'\n' | b'\r'))
+                .map_or(bytes.len(), |offset| index + offset);
+        } else if bytes[index..].starts_with(b"/*") {
+            index = bytes[index + 2..]
+                .windows(2)
+                .position(|window| window == b"*/")
+                .map_or(bytes.len(), |offset| index + 2 + offset + 2);
+        } else if bytes[index] == b',' {
+            return Some(index);
+        } else {
+            index += 1;
+        }
+    }
+    None
 }
 
 fn is_amd_dependency_directive(comment: &str) -> bool {
@@ -18172,7 +19868,7 @@ mod tests {
     use ts_ast::NodeData;
     use ts_binder::bind_source_file;
     use ts_checker::check_source_file;
-    use ts_options::{JsxEmit, ModuleKind, PrinterSettings, ScriptTarget};
+    use ts_options::{JsxEmit, ModuleDetectionKind, ModuleKind, PrinterSettings, ScriptTarget};
     use ts_parser::{parse_jsx_source_file, parse_source_file};
 
     use super::{
@@ -18333,6 +20029,7 @@ mod tests {
                 import_runtime_meanings: &import_meanings,
                 preserve_const_enums: true,
                 inline_const_enums: false,
+                module_detection: ModuleDetectionKind::Auto,
             },
         )
         .unwrap()
@@ -18623,6 +20320,25 @@ mod tests {
     }
 
     #[test]
+    fn preserves_comments_immediately_after_switch_clause_colons() {
+        assert_eq!(
+            emit_with(
+                "switch (value) { case 0: // zero\ncase 1: /* one */\nreturn value; }",
+                ScriptTarget::EsNext,
+                ModuleKind::None,
+            )
+            .code,
+            concat!(
+                "switch (value) {\n",
+                "    case 0: // zero\n",
+                "    case 1: /* one */\n",
+                "        return value;\n",
+                "}\n",
+            )
+        );
+    }
+
+    #[test]
     fn captures_block_scoped_do_loop_bindings_when_downleveling() {
         assert_eq!(
             emit_with(
@@ -18784,6 +20500,23 @@ mod tests {
         assert_eq!(
             emit_jsx(source, JsxEmit::React),
             "import React from 'react';\nconst view = React.createElement(Panel, null);\n"
+        );
+    }
+
+    #[test]
+    fn jsx_comments_are_preserved_without_creating_empty_children() {
+        let source = "const view = <div>\n    {/* missing */}\n    {null/* preserved */}\n</div>;";
+        assert_eq!(
+            emit_jsx(source, JsxEmit::React),
+            "const view = React.createElement(\"div\", null, null /* preserved */);\n"
+        );
+        assert_eq!(
+            emit_jsx(source, JsxEmit::ReactJsx),
+            "import { jsx as _jsx } from \"react/jsx-runtime\";\nconst view = _jsx(\"div\", { children: null /* preserved */ });\n"
+        );
+        assert_eq!(
+            emit_jsx(source, JsxEmit::Preserve),
+            "const view = <div>\n    {/* missing */}\n    {null /* preserved */}\n</div>;\n"
         );
     }
 
@@ -19330,6 +21063,26 @@ mod tests {
     }
 
     #[test]
+    fn downlevel_setter_strips_default_without_dropping_parameter_comments() {
+        let output = emit_with(
+            "class C { set value(/** value */ next = 1) {} }",
+            ScriptTarget::Es5,
+            ModuleKind::EsNext,
+        )
+        .code;
+        assert!(
+            output.contains(
+                "set: function (/** value */ next) {\n            if (next === void 0) { next = 1; }"
+            ),
+            "{output}"
+        );
+        assert!(
+            !output.contains("function (/** value */ next = 1)"),
+            "{output}"
+        );
+    }
+
+    #[test]
     fn lowers_private_methods_with_brand_checks_and_constructor_initialization() {
         let output = emit_with(
             "class C { #read() { return C; } constructor(value: number) { this.value = value; } call() { return this.#read(); } }",
@@ -19559,6 +21312,7 @@ mod tests {
                 import_runtime_meanings: &import_meanings,
                 preserve_const_enums: false,
                 inline_const_enums: true,
+                module_detection: ModuleDetectionKind::Auto,
             },
         )
         .unwrap();
@@ -19930,6 +21684,7 @@ mod tests {
                     import_runtime_meanings: &import_meanings,
                     preserve_const_enums: false,
                     inline_const_enums: false,
+                    module_detection: ModuleDetectionKind::Auto,
                 },
             )
             .unwrap()
@@ -21694,6 +23449,49 @@ class Board {
     }
 
     #[test]
+    fn remove_comments_preserves_binary_operator_line_breaks() {
+        let source = concat!(
+            "var a = 'some'\n    // before operator\n    + 'text';\n",
+            "var b = 'some'\n    /* before */\n    + /* after */\n    'text';\n",
+        );
+        let parsed = parse_source_file(source);
+        let mut settings = ts_options::CompilerOptions::default().printer_settings();
+        settings.always_strict = false;
+        settings.target = ScriptTarget::Es2015;
+        settings.module = ModuleKind::None;
+        settings.remove_comments = true;
+        let result = emit_source_file_with_settings(
+            &parsed.arena,
+            parsed.source_file,
+            "source.ts",
+            source,
+            settings,
+        )
+        .unwrap();
+        assert_eq!(
+            result.code,
+            concat!(
+                "var a = 'some'\n    + 'text';\n",
+                "var b = 'some'\n    +\n        'text';\n",
+            )
+        );
+    }
+
+    #[test]
+    fn dotted_namespace_keeps_a_final_body_comment() {
+        let output = emit_with(
+            "namespace hello.hi.world { function foo() {}\n\n// TODO, blah\n}",
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(
+            output.contains("            function foo() { }\n            // TODO, blah\n"),
+            "{output}"
+        );
+    }
+
+    #[test]
     fn keeps_first_statement_comment_after_commonjs_generated_prologue() {
         let source = "// file header\n\n// statement comment\nexport const value = 1;";
         assert_eq!(
@@ -21838,7 +23636,7 @@ class Board {
                 .unwrap();
         assert_eq!(
             result.code,
-            "import { Input } from \"./types\";\nexport declare const version: number;\nexport declare function identity<T>(value: T): T;\nexport declare function parse(value: string): string;\nexport declare class Store<T> {\n    value: T;\n    read(input: T): T;\n}\nexport interface Box<T> {\n    value: T;\n}\nexport type Maybe<T> = T | undefined;\nexport declare enum Color {\n    Red,\n    Blue = 2\n}\nexport declare namespace Helpers {\n    export function read(value: string): string;\n}\nexport { Input };\n"
+            "import { Input } from \"./types\";\nexport declare const version: number;\nexport declare function identity<T>(value: T): T;\nexport declare function parse(value: string): string;\nexport declare class Store<T> {\n    value: T;\n    read(input: T): T;\n}\nexport interface Box<T> {\n    value: T;\n}\nexport type Maybe<T> = T | undefined;\nexport declare enum Color {\n    Red,\n    Blue = 2\n}\nexport declare namespace Helpers {\n    function read(value: string): string;\n}\nexport { Input };\n"
         );
         assert!(result.source_map.is_some());
     }
@@ -22051,5 +23849,283 @@ class Board {
             .code,
             "interface Color {\n    c: string;\n}\nexport default Color;\n"
         );
+    }
+
+    #[test]
+    fn drops_attached_pinned_comments_owned_by_erased_ambient_declarations() {
+        let source = concat!(
+            "/*! detached license */\n",
+            "\n",
+            "/*! ambient owner */\n",
+            "declare class Hidden {}\n",
+        );
+        assert_eq!(
+            emit_with(source, ScriptTarget::Es2015, ModuleKind::None).code,
+            "/*! detached license */\n",
+        );
+    }
+
+    #[test]
+    fn namespace_comments_follow_the_next_runtime_declaration() {
+        let source = concat!(
+            "namespace M {\n",
+            "    /** erased value */\n",
+            "    export var value: number;\n",
+            "    /** runtime function */\n",
+            "    export function run() {}\n",
+            "}\n",
+        );
+        let output = emit_with(source, ScriptTarget::Es2015, ModuleKind::None).code;
+        assert!(!output.contains("erased value"), "{output}");
+        assert!(
+            output.contains("    /** runtime function */\n    function run()"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn declaration_emit_preserves_namespace_jsdoc() {
+        let source = concat!(
+            "/** module docs */\n",
+            "export namespace M {\n",
+            "    /** value docs */\n",
+            "    export const value = 1;\n",
+            "}\n",
+        );
+        let output = emit_declarations_with_semantics(source);
+        assert!(
+            output.starts_with("/** module docs */\nexport declare namespace M {\n"),
+            "{output}"
+        );
+        assert!(
+            output.contains("    /** value docs */\n    const value = 1;"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn commonjs_reexport_prologue_precedes_owned_comments() {
+        let source = concat!(
+            "/* first */\n",
+            "export { subject } from './0';\n",
+            "/* second */\n",
+            "export { subject1 } from './1';\n",
+        );
+        let output = emit_with(source, ScriptTarget::Es2015, ModuleKind::CommonJs).code;
+        let preinitialization = output
+            .find("exports.subject1 = exports.subject = void 0;")
+            .unwrap();
+        let first_comment = output.find("/* first */").unwrap();
+        let first_require = output.find("var _0_1 = require(\"./0\");").unwrap();
+        assert!(
+            preinitialization < first_comment && first_comment < first_require,
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn preserves_parameter_and_call_argument_comment_layout() {
+        let source = concat!(
+            "function f(/** a */a: number,\n",
+            "    /** b */\n",
+            "    b: number) {}\n",
+            "f(\n",
+            "    /* first */ 1,\n",
+            "    /* second */ 2);\n",
+        );
+        let output = emit_with(source, ScriptTarget::Es2015, ModuleKind::None).code;
+        assert!(
+            output.contains("function f(/** a */ a, \n/** b */\nb)"),
+            "{output}"
+        );
+        assert!(
+            output.contains("f(\n/* first */ 1, \n/* second */ 2);"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn reindents_multiline_comments_relative_to_their_source_column() {
+        let source =
+            "namespace M {\n    /** aligned\n* left\n     * right */\n    export class C {}\n}";
+        let output = emit_with(source, ScriptTarget::Es2015, ModuleKind::None).code;
+        assert!(
+            output.contains("    /** aligned\n* left\n     * right */\n    class C"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn lowers_legacy_class_decorators_with_owned_comments() {
+        let source = concat!(
+            "declare function decorator(value: string): any;\n",
+            "/** leading */\n",
+            "@decorator(\"hello\")\n",
+            "class Remote {}\n",
+            "/** floating */\n\n",
+            "@decorator(\"hi\")\n",
+            "class Other { constructor() {} }\n",
+        );
+        let output = emit_with(source, ScriptTarget::Es2015, ModuleKind::None).code;
+        assert!(output.starts_with("var __decorate = "), "{output}");
+        assert!(
+            output.contains(
+                "/** leading */\nlet Remote = class Remote {\n};\nRemote = __decorate([\n    decorator(\"hello\")\n], Remote);\n/** floating */\nlet Other = class Other {"
+            ),
+            "{output}"
+        );
+        assert!(
+            output.ends_with("};\nOther = __decorate([\n    decorator(\"hi\")\n], Other);\n"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn preserves_multiple_class_decorator_evaluation_order() {
+        let output = emit_with(
+            "@first\n@second(1)\nclass C {}",
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(
+            output.contains("C = __decorate([\n    first,\n    second(1)\n], C);"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn declaration_emit_preserves_dotted_namespaces_and_nominal_new_types() {
+        let output = emit_declarations_with_semantics(concat!(
+            "namespace A.B {\n",
+            "    export class C {}\n",
+            "    export var value = new C();\n",
+            "    export function f(/** p */ p: string) {}\n",
+            "}\n",
+            "var outside = new A.B.C();\n",
+        ));
+        assert!(output.contains("declare namespace A.B {"), "{output}");
+        assert!(output.contains("    var value: C;"), "{output}");
+        assert!(
+            output.contains("    function f(/** p */ p: string): void;"),
+            "{output}"
+        );
+        assert!(output.contains("declare var outside: A.B.C;"), "{output}");
+    }
+
+    #[test]
+    fn declaration_emit_retains_import_equals_for_inferred_new_type() {
+        let output = emit_declarations_with_semantics(concat!(
+            "/** dependency */\n",
+            "import dep = require(\"./dep\");\n",
+            "export var value = new dep.C();\n",
+        ));
+        assert!(
+            output.starts_with(
+                "/** dependency */\nimport dep = require(\"./dep\");\nexport declare var value: dep.C;"
+            ),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn declaration_emit_preserves_nominal_class_and_enum_values() {
+        let output = emit_declarations_with_semantics(concat!(
+            "class C { static make() { return new C(); } }\n",
+            "enum Color { Blue }\n",
+            "var constructor = C;\n",
+            "var factory = C.make;\n",
+            "var instance = new C();\n",
+            "var color = Color.Blue;\n",
+        ));
+        assert!(
+            output.contains("declare var constructor: typeof C;"),
+            "{output}"
+        );
+        assert!(
+            output.contains("declare var factory: typeof C.make;"),
+            "{output}"
+        );
+        assert!(output.contains("declare var instance: C;"), "{output}");
+        assert!(output.contains("declare var color: Color;"), "{output}");
+    }
+
+    #[test]
+    fn commonjs_exported_new_initializer_is_emitted_directly() {
+        let output = emit_with(
+            "class C {}\nexport var value = new C();",
+            ScriptTarget::Es2015,
+            ModuleKind::CommonJs,
+        )
+        .code;
+        assert!(output.contains("exports.value = new C();"), "{output}");
+        assert!(!output.contains("var value = new C();"), "{output}");
+    }
+
+    #[test]
+    fn emits_tagged_templates_and_expression_trailing_comments() {
+        let output = emit_with(
+            "let tag: any; tag = (0, tag.fn)``; var value = (x => 0 /* kept */);",
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(output.contains("tag = (0, tag.fn) ``;"), "{output}");
+        assert!(output.contains("(x => 0 /* kept */)"), "{output}");
+    }
+
+    #[test]
+    fn preserves_spread_comments_without_spurious_line_breaks() {
+        let output = emit_with(
+            concat!(
+                "const value = { ...\n/*#__PURE__*/identity({ x: 1 }) };\n",
+                "function f(.../* rest */args) {\n",
+                "  const [head, .../* tail */\nrest] = args;\n",
+                "  return { head, .../* object */rest };\n",
+                "}\n",
+            ),
+            ScriptTarget::EsNext,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(
+            output.contains("...\n    /*#__PURE__*/ identity"),
+            "{output}"
+        );
+        assert!(output.contains("... /* rest */args"), "{output}");
+        assert!(output.contains("... /* tail */rest"), "{output}");
+        assert!(output.contains("... /* object */rest"), "{output}");
+    }
+
+    #[test]
+    fn preserves_adjacent_leading_block_comments_on_the_same_line() {
+        assert_eq!(
+            emit_with(
+                "function before() {}\nbefore();\n\n/** first\n* line */\n/** second\n* line */ /** third */\nfunction value() {}",
+                ScriptTarget::Es2015,
+                ModuleKind::None,
+            )
+            .code,
+            "function before() { }\nbefore();\n/** first\n* line */\n/** second\n* line */ /** third */\nfunction value() { }\n"
+        );
+    }
+
+    #[test]
+    fn relocates_only_initialized_static_field_comments() {
+        let output = emit_with(
+            concat!(
+                "class C {\n",
+                "    /** kept */\n    static kept = 1;\n",
+                "    /** erased */\n    static erased: number;\n",
+                "    /** second */\n    static second = 2;\n",
+                "}\n",
+            ),
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(output.contains("/** kept */\nC.kept = 1;"), "{output}");
+        assert!(output.contains("/** second */\nC.second = 2;"), "{output}");
+        assert!(!output.contains("erased"), "{output}");
     }
 }

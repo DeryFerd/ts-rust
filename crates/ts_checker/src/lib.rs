@@ -51,6 +51,10 @@ pub enum TypeKind {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ObjectType {
     pub properties: BTreeMap<String, TypeId>,
+    pub string_index_type: Option<TypeId>,
+    pub number_index_type: Option<TypeId>,
+    pub call_signatures: Vec<FunctionType>,
+    pub construct_signatures: Vec<FunctionType>,
     pub optional_properties: BTreeSet<String>,
     pub readonly_properties: BTreeSet<String>,
     pub getter_properties: BTreeSet<String>,
@@ -60,6 +64,7 @@ pub struct ObjectType {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct FunctionType {
     pub parameters: Vec<TypeId>,
+    pub parameter_names: Vec<String>,
     pub rest_parameter: Option<TypeId>,
     pub return_type: TypeId,
     pub parameters_optional: bool,
@@ -1978,6 +1983,10 @@ impl<'a> Checker<'a> {
         }
         let enum_type = self.result.types.alloc(TypeKind::Object(ObjectType {
             properties: properties.clone(),
+            string_index_type: None,
+            number_index_type: None,
+            call_signatures: Vec::new(),
+            construct_signatures: Vec::new(),
             optional_properties: BTreeSet::new(),
             readonly_properties: properties.keys().cloned().collect(),
             getter_properties: BTreeSet::new(),
@@ -2728,6 +2737,10 @@ impl<'a> Checker<'a> {
         let mut readonly_properties = BTreeSet::new();
         let mut getter_properties = BTreeSet::new();
         let mut setter_properties = BTreeSet::new();
+        let mut string_index_type: Option<TypeId> = None;
+        let mut number_index_type: Option<TypeId> = None;
+        let mut call_signatures = Vec::new();
+        let mut construct_signatures = Vec::new();
         let constructor_assignment_types = self.constructor_assignment_types(members);
         for member in members {
             let Some(node) = self.arena.get(*member) else {
@@ -2800,13 +2813,61 @@ impl<'a> Checker<'a> {
                             self.result.node_types.insert(*member, constructor_type);
                             continue;
                         }
-                        let method_type = self.declaration_signature_type(
-                            *member,
-                            &data.parameters.nodes,
-                            data.type_,
-                            data.type_parameters.as_ref(),
-                            data.body,
-                        );
+                        let method_type = if !self.options.is_javascript_file
+                            && data.type_.is_none()
+                            && data.body.is_some()
+                            && !matches!(
+                                self.arena.get(data.name).map(|name| &name.data),
+                                Some(NodeData::ComputedPropertyName(_))
+                            ) {
+                            let this_type = self.result.types.alloc(TypeKind::Object(ObjectType {
+                                properties: properties.clone(),
+                                string_index_type,
+                                number_index_type,
+                                call_signatures: call_signatures.clone(),
+                                construct_signatures: construct_signatures.clone(),
+                                optional_properties: optional_properties.clone(),
+                                readonly_properties: readonly_properties.clone(),
+                                getter_properties: getter_properties.clone(),
+                                setter_properties: setter_properties.clone(),
+                            }));
+                            self.this_types.push(this_type);
+                            let static_class_name = self
+                                .has_ast_modifier(
+                                    data.modifiers.as_ref(),
+                                    SyntaxKind::StaticKeyword,
+                                )
+                                .then(|| {
+                                    self.arena
+                                        .get(*member)
+                                        .and_then(|member| member.parent)
+                                        .and_then(|class| self.arena.get(class))
+                                        .and_then(|class| match &class.data {
+                                            NodeData::ClassDeclaration(class) => class.name,
+                                            _ => None,
+                                        })
+                                        .and_then(|name| self.property_name(name))
+                                })
+                                .flatten();
+                            if let Some(class_name) = static_class_name.as_ref() {
+                                self.local_scopes
+                                    .push(HashMap::from([(class_name.clone(), this_type)]));
+                            }
+                            let method_type = self.inferred_method_type(data);
+                            if static_class_name.is_some() {
+                                self.local_scopes.pop();
+                            }
+                            self.this_types.pop();
+                            method_type
+                        } else {
+                            self.declaration_signature_type(
+                                *member,
+                                &data.parameters.nodes,
+                                data.type_,
+                                data.type_parameters.as_ref(),
+                                data.body,
+                            )
+                        };
                         self.result.node_types.insert(*member, method_type);
                         let optional = self.is_question_token(data.postfix_token);
                         if optional {
@@ -2856,9 +2917,88 @@ impl<'a> Checker<'a> {
                         }
                     }
                 }
+                NodeData::IndexSignatureDeclaration(data) => {
+                    let value_type = self.type_from_type_node(data.type_);
+                    let index_type = data
+                        .parameters
+                        .nodes
+                        .first()
+                        .and_then(|parameter| self.arena.get(*parameter))
+                        .and_then(|parameter| match &parameter.data {
+                            NodeData::ParameterDeclaration(parameter) => parameter.type_,
+                            _ => None,
+                        });
+                    if index_type.is_some_and(|index_type| {
+                        self.arena
+                            .get(index_type)
+                            .is_some_and(|index_type| index_type.kind == SyntaxKind::NumberKeyword)
+                    }) {
+                        number_index_type = Some(value_type);
+                    } else {
+                        string_index_type = Some(value_type);
+                    }
+                }
+                NodeData::CallSignatureDeclaration(data) => {
+                    let signature = self.signature_type(
+                        &data.parameters.nodes,
+                        data.type_,
+                        data.type_parameters.as_ref(),
+                    );
+                    if let Some(TypeKind::Function(signature)) =
+                        self.result.types.get(signature).map(|type_| &type_.kind)
+                    {
+                        call_signatures.push(signature.clone());
+                    }
+                }
+                NodeData::ConstructSignatureDeclaration(data) => {
+                    let signature = self.signature_type(
+                        &data.parameters.nodes,
+                        data.type_,
+                        data.type_parameters.as_ref(),
+                    );
+                    if let Some(TypeKind::Function(signature)) =
+                        self.result.types.get(signature).map(|type_| &type_.kind)
+                    {
+                        construct_signatures.push(signature.clone());
+                    }
+                }
                 NodeData::GetAccessorDeclaration(data) => {
                     if let Some(name) = self.property_name(data.name) {
+                        let this_type = self.result.types.alloc(TypeKind::Object(ObjectType {
+                            properties: properties.clone(),
+                            string_index_type,
+                            number_index_type,
+                            call_signatures: call_signatures.clone(),
+                            construct_signatures: construct_signatures.clone(),
+                            optional_properties: optional_properties.clone(),
+                            readonly_properties: readonly_properties.clone(),
+                            getter_properties: getter_properties.clone(),
+                            setter_properties: setter_properties.clone(),
+                        }));
+                        self.this_types.push(this_type);
+                        let static_class_name = self
+                            .has_ast_modifier(data.modifiers.as_ref(), SyntaxKind::StaticKeyword)
+                            .then(|| {
+                                self.arena
+                                    .get(*member)
+                                    .and_then(|member| member.parent)
+                                    .and_then(|class| self.arena.get(class))
+                                    .and_then(|class| match &class.data {
+                                        NodeData::ClassDeclaration(class) => class.name,
+                                        _ => None,
+                                    })
+                                    .and_then(|name| self.property_name(name))
+                            })
+                            .flatten();
+                        if let Some(class_name) = static_class_name.as_ref() {
+                            self.local_scopes
+                                .push(HashMap::from([(class_name.clone(), this_type)]));
+                        }
                         let property_type = self.getter_property_type(data.type_, data.body);
+                        if static_class_name.is_some() {
+                            self.local_scopes.pop();
+                        }
+                        self.this_types.pop();
                         self.result.node_types.insert(*member, property_type);
                         properties.insert(name.clone(), property_type);
                         getter_properties.insert(name);
@@ -2903,6 +3043,10 @@ impl<'a> Checker<'a> {
         }
         self.result.types.alloc(TypeKind::Object(ObjectType {
             properties,
+            string_index_type,
+            number_index_type,
+            call_signatures,
+            construct_signatures,
             optional_properties,
             readonly_properties,
             getter_properties,
@@ -3169,6 +3313,7 @@ impl<'a> Checker<'a> {
         properties.insert(name, overload);
     }
 
+    #[allow(clippy::too_many_lines)]
     fn declared_object_type(
         &mut self,
         type_parameters: Option<&ts_ast::NodeList>,
@@ -3202,6 +3347,10 @@ impl<'a> Checker<'a> {
         let mut readonly_properties = BTreeSet::new();
         let mut getter_properties = BTreeSet::new();
         let mut setter_properties = BTreeSet::new();
+        let mut string_index_type: Option<TypeId> = None;
+        let mut number_index_type: Option<TypeId> = None;
+        let mut call_signatures = Vec::new();
+        let mut construct_signatures = Vec::new();
         if let Some(clauses) = heritage_clauses {
             for clause in &clauses.nodes {
                 let Some(NodeData::HeritageClause(clause)) =
@@ -3238,6 +3387,10 @@ impl<'a> Checker<'a> {
                     if let TypeKind::Object(base) =
                         self.result.types.get(base).unwrap().kind.clone()
                     {
+                        string_index_type = base.string_index_type.or(string_index_type);
+                        number_index_type = base.number_index_type.or(number_index_type);
+                        call_signatures.extend(base.call_signatures);
+                        construct_signatures.extend(base.construct_signatures);
                         properties.extend(base.properties);
                         optional_properties.extend(base.optional_properties);
                         readonly_properties.extend(base.readonly_properties);
@@ -3249,6 +3402,10 @@ impl<'a> Checker<'a> {
         }
         let own = self.object_type_from_members(members);
         if let TypeKind::Object(own) = self.result.types.get(own).unwrap().kind.clone() {
+            string_index_type = own.string_index_type.or(string_index_type);
+            number_index_type = own.number_index_type.or(number_index_type);
+            call_signatures.extend(own.call_signatures);
+            construct_signatures.extend(own.construct_signatures);
             properties.extend(own.properties);
             optional_properties.extend(own.optional_properties);
             readonly_properties.extend(own.readonly_properties);
@@ -3257,6 +3414,10 @@ impl<'a> Checker<'a> {
         }
         let result = self.result.types.alloc(TypeKind::Object(ObjectType {
             properties,
+            string_index_type,
+            number_index_type,
+            call_signatures,
+            construct_signatures,
             optional_properties,
             readonly_properties,
             getter_properties,
@@ -3738,6 +3899,7 @@ impl<'a> Checker<'a> {
         }
         FunctionType {
             parameters: Vec::new(),
+            parameter_names: Vec::new(),
             rest_parameter: None,
             return_type: instance_type,
             parameters_optional: false,
@@ -5472,6 +5634,19 @@ impl<'a> Checker<'a> {
         self.local_scopes.pop();
         let function = self.result.types.alloc(TypeKind::Function(FunctionType {
             parameters,
+            parameter_names: data
+                .parameters
+                .nodes
+                .iter()
+                .filter_map(|parameter| {
+                    let NodeData::ParameterDeclaration(parameter) =
+                        &self.arena.get(*parameter)?.data
+                    else {
+                        return None;
+                    };
+                    self.property_name(parameter.name)
+                })
+                .collect(),
             rest_parameter: None,
             return_type,
             parameters_optional: self.options.is_javascript_file,
@@ -5486,6 +5661,7 @@ impl<'a> Checker<'a> {
         function
     }
 
+    #[allow(clippy::too_many_lines)]
     fn function_expression_type(
         &mut self,
         node_id: NodeId,
@@ -5573,6 +5749,19 @@ impl<'a> Checker<'a> {
         self.local_scopes.pop();
         let function = self.result.types.alloc(TypeKind::Function(FunctionType {
             parameters,
+            parameter_names: data
+                .parameters
+                .nodes
+                .iter()
+                .filter_map(|parameter| {
+                    let NodeData::ParameterDeclaration(parameter) =
+                        &self.arena.get(*parameter)?.data
+                    else {
+                        return None;
+                    };
+                    self.property_name(parameter.name)
+                })
+                .collect(),
             rest_parameter: None,
             return_type,
             parameters_optional: self.options.is_javascript_file,
@@ -5901,9 +6090,17 @@ impl<'a> Checker<'a> {
                 _ => None,
             },
             TypeKind::Object(object_type) => match index_kind {
-                TypeKind::StringLiteral(name) | TypeKind::NumberLiteral(name) => {
-                    self.object_property_type(&object_type, &name, true)
-                }
+                TypeKind::StringLiteral(name) => self
+                    .object_property_type(&object_type, &name, true)
+                    .or(object_type.string_index_type),
+                TypeKind::NumberLiteral(name) => self
+                    .object_property_type(&object_type, &name, true)
+                    .or(object_type.number_index_type)
+                    .or(object_type.string_index_type),
+                TypeKind::Number => object_type
+                    .number_index_type
+                    .or(object_type.string_index_type),
+                TypeKind::String => object_type.string_index_type,
                 _ => None,
             },
             TypeKind::TypeParameter {
@@ -5969,6 +6166,9 @@ impl<'a> Checker<'a> {
         match kind {
             TypeKind::Function(signature) => Some(vec![signature]),
             TypeKind::Overload(signatures) => Some(signatures),
+            TypeKind::Object(object) if !object.call_signatures.is_empty() => {
+                Some(object.call_signatures)
+            }
             TypeKind::Intersection(members) => members.into_iter().find_map(|member| {
                 self.result
                     .types
@@ -5982,6 +6182,9 @@ impl<'a> Checker<'a> {
     fn construct_signatures(&self, kind: TypeKind) -> Option<Vec<FunctionType>> {
         match kind {
             TypeKind::Constructor(signature) => Some(vec![signature]),
+            TypeKind::Object(object) if !object.construct_signatures.is_empty() => {
+                Some(object.construct_signatures)
+            }
             TypeKind::Intersection(members) => members.into_iter().find_map(|member| {
                 self.result
                     .types
@@ -6008,7 +6211,10 @@ impl<'a> Checker<'a> {
         construct: bool,
     ) -> TypeId {
         let callee_kind = self.result.types.get(callee).unwrap().kind.clone();
-        if construct && let TypeKind::Object(_) = callee_kind {
+        if construct
+            && matches!(callee_kind, TypeKind::Object(_))
+            && self.result.import_type_references.contains_key(&callee)
+        {
             for argument in arguments {
                 self.type_of_expression(*argument);
             }
@@ -6280,6 +6486,7 @@ impl<'a> Checker<'a> {
                     .map(|parameter| self.substitute_type(parameter, inference));
                 self.result.types.alloc(TypeKind::Function(FunctionType {
                     parameters,
+                    parameter_names: signature.parameter_names,
                     rest_parameter,
                     return_type,
                     parameters_optional: signature.parameters_optional,
@@ -6297,6 +6504,7 @@ impl<'a> Checker<'a> {
                     .map(|parameter| self.substitute_type(parameter, inference));
                 self.result.types.alloc(TypeKind::Constructor(FunctionType {
                     parameters,
+                    parameter_names: signature.parameter_names,
                     rest_parameter,
                     return_type,
                     parameters_optional: signature.parameters_optional,
@@ -6315,8 +6523,18 @@ impl<'a> Checker<'a> {
                     .into_iter()
                     .map(|(name, property)| (name, self.substitute_type(property, inference)))
                     .collect();
+                let string_index_type = object
+                    .string_index_type
+                    .map(|index| self.substitute_type(index, inference));
+                let number_index_type = object
+                    .number_index_type
+                    .map(|index| self.substitute_type(index, inference));
                 self.result.types.alloc(TypeKind::Object(ObjectType {
                     properties,
+                    string_index_type,
+                    number_index_type,
+                    call_signatures: object.call_signatures,
+                    construct_signatures: object.construct_signatures,
                     optional_properties: object.optional_properties,
                     readonly_properties: object.readonly_properties,
                     getter_properties: object.getter_properties,
@@ -6837,36 +7055,43 @@ impl<'a> Checker<'a> {
         }
         self.type_parameter_scopes.push(type_parameter_scope);
         let mut parameter_types = Vec::with_capacity(parameters.len());
+        let mut parameter_names = Vec::with_capacity(parameters.len());
         for parameter in parameters {
-            let parameter_type = match self.arena.get(*parameter).map(|node| &node.data) {
-                Some(NodeData::ParameterDeclaration(data)) => {
-                    let base = match data.type_ {
-                        Some(node) => self.type_from_type_node(node),
-                        None => self.result.types.any(),
-                    };
-                    let base = if data.dot_dot_dot_token.is_some()
-                        && !matches!(
-                            self.result.types.get(base).map(|type_| &type_.kind),
-                            Some(TypeKind::Array(_))
-                        ) {
-                        self.result.types.alloc(TypeKind::Array(base))
+            let parameter_type = if let Some(NodeData::ParameterDeclaration(data)) =
+                self.arena.get(*parameter).map(|node| &node.data)
+            {
+                parameter_names.push(
+                    self.property_name(data.name)
+                        .unwrap_or_else(|| format!("arg{}", parameter_names.len())),
+                );
+                let base = match data.type_ {
+                    Some(node) => self.type_from_type_node(node),
+                    None => self.result.types.any(),
+                };
+                let base = if data.dot_dot_dot_token.is_some()
+                    && !matches!(
+                        self.result.types.get(base).map(|type_| &type_.kind),
+                        Some(TypeKind::Array(_))
+                    ) {
+                    self.result.types.alloc(TypeKind::Array(base))
+                } else {
+                    base
+                };
+                if data.question_token.is_some() {
+                    let undefined = self.result.types.undefined();
+                    if base == self.result.types.any() {
+                        self.result
+                            .types
+                            .alloc(TypeKind::Union(vec![base, undefined]))
                     } else {
-                        base
-                    };
-                    if data.question_token.is_some() {
-                        let undefined = self.result.types.undefined();
-                        if base == self.result.types.any() {
-                            self.result
-                                .types
-                                .alloc(TypeKind::Union(vec![base, undefined]))
-                        } else {
-                            self.result.types.union([base, undefined])
-                        }
-                    } else {
-                        base
+                        self.result.types.union([base, undefined])
                     }
+                } else {
+                    base
                 }
-                _ => self.result.types.any(),
+            } else {
+                parameter_names.push(format!("arg{}", parameter_names.len()));
+                self.result.types.any()
             };
             parameter_types.push(parameter_type);
         }
@@ -6877,6 +7102,7 @@ impl<'a> Checker<'a> {
         self.type_parameter_scopes.pop();
         self.result.types.alloc(TypeKind::Function(FunctionType {
             parameters: parameter_types,
+            parameter_names,
             rest_parameter: None,
             return_type,
             parameters_optional: self.options.is_javascript_file,
@@ -7394,6 +7620,10 @@ impl<'a> Checker<'a> {
         }
         self.result.types.alloc(TypeKind::Object(ObjectType {
             properties,
+            string_index_type: None,
+            number_index_type: None,
+            call_signatures: Vec::new(),
+            construct_signatures: Vec::new(),
             optional_properties,
             readonly_properties,
             getter_properties: BTreeSet::new(),
@@ -7806,6 +8036,10 @@ impl<'a> Checker<'a> {
                     .collect();
                 self.result.types.alloc(TypeKind::Object(ObjectType {
                     properties,
+                    string_index_type: None,
+                    number_index_type: None,
+                    call_signatures: Vec::new(),
+                    construct_signatures: Vec::new(),
                     optional_properties: optional_properties.clone(),
                     readonly_properties: readonly_properties.clone(),
                     getter_properties: getter_properties.clone(),
@@ -7828,6 +8062,7 @@ impl<'a> Checker<'a> {
                     .map(|parameter| self.import_type(parameter));
                 self.result.types.alloc(TypeKind::Function(FunctionType {
                     parameters,
+                    parameter_names: Vec::new(),
                     rest_parameter,
                     return_type,
                     parameters_optional: *parameters_optional,
@@ -7849,6 +8084,7 @@ impl<'a> Checker<'a> {
                     .map(|parameter| self.import_type(parameter));
                 self.result.types.alloc(TypeKind::Constructor(FunctionType {
                     parameters,
+                    parameter_names: Vec::new(),
                     rest_parameter,
                     return_type,
                     parameters_optional: *parameters_optional,
@@ -7872,6 +8108,7 @@ impl<'a> Checker<'a> {
                                 .iter()
                                 .map(|parameter| self.import_type(parameter))
                                 .collect(),
+                            parameter_names: Vec::new(),
                             rest_parameter: rest_parameter
                                 .as_deref()
                                 .map(|parameter| self.import_type(parameter)),
@@ -7939,6 +8176,14 @@ impl<'a> Checker<'a> {
                 let readonly_properties = object.readonly_properties;
                 let getter_properties = object.getter_properties;
                 let setter_properties = object.setter_properties;
+                let string_index_type = object
+                    .string_index_type
+                    .map(|index| self.widen_literal(index));
+                let number_index_type = object
+                    .number_index_type
+                    .map(|index| self.widen_literal(index));
+                let call_signatures = object.call_signatures;
+                let construct_signatures = object.construct_signatures;
                 let properties = object
                     .properties
                     .into_iter()
@@ -7946,6 +8191,10 @@ impl<'a> Checker<'a> {
                     .collect();
                 self.result.types.alloc(TypeKind::Object(ObjectType {
                     properties,
+                    string_index_type,
+                    number_index_type,
+                    call_signatures,
+                    construct_signatures,
                     optional_properties,
                     readonly_properties,
                     getter_properties,
@@ -11115,6 +11364,7 @@ mod tests {
         let return_type = checker.result.types.alloc(TypeKind::Array(number));
         let property = checker.result.types.alloc(TypeKind::Function(FunctionType {
             parameters: vec![number],
+            parameter_names: vec!["depth".into()],
             rest_parameter: None,
             return_type,
             parameters_optional: false,

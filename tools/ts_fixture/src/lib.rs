@@ -974,11 +974,14 @@ fn select_variant_baselines<'a>(
                 .to_ascii_lowercase();
             axes.iter().all(|axis| {
                 variant.values.get(axis).is_some_and(|value| {
-                    name.contains(&format!(
+                    let tag = format!(
                         "{}={}",
                         axis.to_ascii_lowercase(),
                         value.to_ascii_lowercase()
-                    ))
+                    );
+                    name.match_indices(&tag).any(|(start, _)| {
+                        matches!(name.as_bytes().get(start + tag.len()), Some(b',' | b')'))
+                    })
                 })
             })
         })
@@ -1270,13 +1273,16 @@ fn is_directive_name_character(character: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, path::Path};
+    use std::{
+        collections::BTreeMap,
+        path::{Path, PathBuf},
+    };
 
     use super::{
         Case, OptionVariant, OutputDifferenceKind, ParseError,
         compare_case_emitted_output_sections, compare_emitted_output_sections, compile_case,
         compile_case_matrix, expand_option_matrix, first_different_line, fixture_compiler_options,
-        parse_baseline_sections, run_case_against_baseline,
+        parse_baseline_sections, run_case_against_baseline, select_variant_baselines,
     };
 
     #[test]
@@ -1594,6 +1600,29 @@ mod tests {
             ]
         );
         assert_eq!(compile_case_matrix(&case).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn selects_matrix_baselines_using_complete_axis_values() {
+        let paths = [
+            PathBuf::from("case(jsx=react,module=commonjs).js"),
+            PathBuf::from("case(jsx=react-jsx,module=commonjs).js"),
+            PathBuf::from("case(jsx=react-jsxdev,module=commonjs).js"),
+        ];
+        let candidates = paths.iter().collect::<Vec<_>>();
+        let variant = OptionVariant {
+            values: BTreeMap::from([
+                ("jsx".to_owned(), "react".to_owned()),
+                ("module".to_owned(), "commonjs".to_owned()),
+            ]),
+        };
+        let selected = select_variant_baselines(
+            &candidates,
+            "case",
+            &variant,
+            &["jsx".to_owned(), "module".to_owned()],
+        );
+        assert_eq!(selected, vec![&paths[0]]);
     }
 
     #[test]

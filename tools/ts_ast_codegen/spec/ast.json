@@ -3243,7 +3243,8 @@
                     },
                     {
                         "name": "QuestionDotToken",
-                        "type": "QuestionDotToken"
+                        "type": "QuestionDotToken",
+                        "optional": true
                     },
                     {
                         "name": "TypeArguments",

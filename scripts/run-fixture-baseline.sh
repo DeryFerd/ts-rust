@@ -5,7 +5,8 @@ set -euo pipefail
 
 # Fixture recovery bugs can otherwise grow until the machine OOMs. Keep this
 # hard ceiling below the host limit so a bad case fails locally and predictably.
-ulimit -v 8388608
+memory_limit_kib="${TS_FIXTURE_MEMORY_LIMIT_KIB:-4194304}"
+ulimit -v "${memory_limit_kib}"
 
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
 timeout_seconds="${TS_FIXTURE_TIMEOUT_SECONDS:-120}"

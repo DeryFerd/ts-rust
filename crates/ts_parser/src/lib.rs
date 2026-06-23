@@ -34,11 +34,11 @@ use ts_ast::{
     RegularExpressionLiteralData, RestTypeNodeData, ReturnStatementData, SatisfiesExpressionData,
     SetAccessorDeclarationData, ShorthandPropertyAssignmentData, SourceFileData,
     SpreadAssignmentData, SpreadElementData, StringLiteralData, SwitchStatementData, SymbolTable,
-    SyntaxKind, TemplateExpressionData, TemplateHeadData, TemplateLiteralTypeNodeData,
-    TemplateLiteralTypeSpanData, TemplateMiddleData, TemplateSpanData, TemplateTailData,
-    ThisTypeNodeData, ThrowStatementData, TokenData, TokenFlags, TryStatementData,
-    TupleTypeNodeData, TypeAliasDeclarationData, TypeAssertionData, TypeLiteralNodeData,
-    TypeOfExpressionData, TypeOperatorNodeData, TypeParameterDeclarationData,
+    SyntaxKind, TaggedTemplateExpressionData, TemplateExpressionData, TemplateHeadData,
+    TemplateLiteralTypeNodeData, TemplateLiteralTypeSpanData, TemplateMiddleData, TemplateSpanData,
+    TemplateTailData, ThisTypeNodeData, ThrowStatementData, TokenData, TokenFlags,
+    TryStatementData, TupleTypeNodeData, TypeAliasDeclarationData, TypeAssertionData,
+    TypeLiteralNodeData, TypeOfExpressionData, TypeOperatorNodeData, TypeParameterDeclarationData,
     TypePredicateNodeData, TypeQueryNodeData, TypeReferenceNodeData, UnionTypeNodeData,
     VariableDeclarationData, VariableDeclarationListData, VariableStatementData,
     VoidExpressionData, WhileStatementData, WithStatementData, YieldExpressionData,
@@ -3543,32 +3543,32 @@ impl<'a> Parser<'a> {
         )
     }
 
+    #[allow(clippy::too_many_lines)]
     fn parse_binary_expression(&mut self, minimum_precedence: u8) -> NodeId {
-        if minimum_precedence <= 2
+        let mut left = if minimum_precedence <= 2
             && self.current.kind == SyntaxKind::AsyncKeyword
             && self.is_async_arrow_function()
         {
-            return self.parse_async_arrow_function();
-        }
-        if minimum_precedence <= 2
+            self.parse_async_arrow_function()
+        } else if minimum_precedence <= 2
             && self.current.kind == SyntaxKind::LessThanToken
             && self.language_variant != LanguageVariant::Jsx
             && self.is_generic_arrow_function()
         {
-            return self.parse_generic_arrow_function();
-        }
-        if minimum_precedence <= 2
+            self.parse_generic_arrow_function()
+        } else if minimum_precedence <= 2
             && self.current.kind == SyntaxKind::OpenParenToken
             && self.is_parenthesized_arrow()
         {
-            return self.parse_parenthesized_arrow_function();
-        }
-        let mut left = self.parse_postfix_expression();
+            self.parse_parenthesized_arrow_function()
+        } else {
+            self.parse_postfix_expression()
+        };
         if minimum_precedence <= 2
             && self.current.kind == SyntaxKind::EqualsGreaterThanToken
             && self.arena.get(left).unwrap().kind == SyntaxKind::Identifier
         {
-            return self.parse_single_parameter_arrow_function(left);
+            left = self.parse_single_parameter_arrow_function(left);
         }
         loop {
             if self.disallow_in && self.current.kind == SyntaxKind::InKeyword {
@@ -3613,10 +3613,10 @@ impl<'a> Parser<'a> {
         }
         if minimum_precedence <= 2 && self.current.kind == SyntaxKind::QuestionToken {
             let question_token = self.consume_token_node();
-            let when_true = self.parse_binary_expression(0);
+            let when_true = self.parse_binary_expression(2);
             let colon_token =
                 self.parse_expected_token_node(SyntaxKind::ColonToken, "Expected ':'.");
-            let when_false = self.parse_binary_expression(0);
+            let when_false = self.parse_binary_expression(2);
             left = self.alloc_node(
                 SyntaxKind::ConditionalExpression,
                 TextRange::new(self.node_start(left), self.node_end(when_false)),
@@ -3629,6 +3629,31 @@ impl<'a> Parser<'a> {
                     facts: 0,
                 })),
                 &[left, question_token, when_true, colon_token, when_false],
+            );
+        }
+        while minimum_precedence <= 1 && self.current.kind == SyntaxKind::CommaToken {
+            let operator = self.consume();
+            let operator_node = self.alloc_node(
+                operator.kind,
+                operator.range,
+                NodeData::Token(Box::new(TokenData)),
+                &[],
+            );
+            let right = self.parse_binary_expression(2);
+            let range = TextRange::new(self.node_start(left), self.node_end(right));
+            left = self.alloc_node(
+                SyntaxKind::BinaryExpression,
+                range,
+                NodeData::BinaryExpression(Box::new(BinaryExpressionData {
+                    left,
+                    operator_token: operator_node,
+                    right,
+                    symbol: None,
+                    type_: None,
+                    facts: 0,
+                    modifiers: None,
+                })),
+                &[left, operator_node, right],
             );
         }
         left
@@ -4050,6 +4075,27 @@ impl<'a> Parser<'a> {
                             facts: 0,
                         })),
                         &children,
+                    );
+                }
+                SyntaxKind::NoSubstitutionTemplateLiteral | SyntaxKind::TemplateHead => {
+                    let template = if self.current.kind == SyntaxKind::TemplateHead {
+                        self.parse_template_expression()
+                    } else {
+                        self.parse_template_literal()
+                    };
+                    expression = self.alloc_node(
+                        SyntaxKind::TaggedTemplateExpression,
+                        TextRange::new(self.node_start(expression), self.node_end(template)),
+                        NodeData::TaggedTemplateExpression(Box::new(
+                            TaggedTemplateExpressionData {
+                                question_dot_token: None,
+                                tag: expression,
+                                template,
+                                type_arguments: None,
+                                facts: 0,
+                            },
+                        )),
+                        &[expression, template],
                     );
                 }
                 SyntaxKind::LessThanToken => {
@@ -7073,6 +7119,7 @@ mod tests {
             const f = (x: number): number => x + 1;
             f({value: [1, 2]}).value;
             const t = `a${f(1)}b${2}`;
+            const tagged = f`value`;
         ";
         let result = parse_source_file(source);
         assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
@@ -7140,6 +7187,21 @@ mod tests {
         for span in &template_data.template_spans.nodes {
             assert_eq!(result.arena.get(*span).unwrap().parent, Some(template));
         }
+        let (list, _) = variable_list(&result, statements[3]);
+        let declaration = declaration_nodes(&result, list)[0];
+        let NodeData::VariableDeclaration(declaration) =
+            &result.arena.get(declaration).unwrap().data
+        else {
+            panic!("expected tagged-template declaration");
+        };
+        assert_eq!(
+            result
+                .arena
+                .get(declaration.initializer.unwrap())
+                .unwrap()
+                .kind,
+            SyntaxKind::TaggedTemplateExpression
+        );
     }
 
     #[test]
