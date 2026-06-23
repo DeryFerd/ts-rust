@@ -7677,9 +7677,23 @@ impl DeclarationPrinter<'_> {
 
     fn semantic_function_signature(&self, declaration: NodeId) -> Option<FunctionType> {
         let type_id = self.node_types?.get(&declaration)?;
-        match &self.semantic_types?.get(*type_id)?.kind {
+        self.semantic_function_signature_for_type(*type_id, &mut HashSet::new())
+    }
+
+    fn semantic_function_signature_for_type(
+        &self,
+        type_id: TypeId,
+        visited: &mut HashSet<TypeId>,
+    ) -> Option<FunctionType> {
+        if !visited.insert(type_id) {
+            return None;
+        }
+        match &self.semantic_types?.get(type_id)?.kind {
             TypeKind::Function(signature) => Some(signature.clone()),
             TypeKind::Overload(signatures) => signatures.first().cloned(),
+            TypeKind::Intersection(members) => members
+                .iter()
+                .find_map(|member| self.semantic_function_signature_for_type(*member, visited)),
             _ => None,
         }
     }

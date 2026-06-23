@@ -16519,6 +16519,42 @@ mod tests {
     }
 
     #[test]
+    fn infers_return_type_for_function_namespace_merges() {
+        let parsed = parse_source_file(
+            "function ExpandoMerge(n: number) { return n; } namespace ExpandoMerge { export interface I {} }",
+        );
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        let function = parsed
+            .arena
+            .iter()
+            .find_map(|(id, node)| {
+                matches!(node.data, NodeData::FunctionDeclaration(_)).then_some(id)
+            })
+            .unwrap();
+        let type_id = result.type_of_node(function).unwrap();
+        let signature =
+            match result.types.get(type_id).map(|type_| &type_.kind) {
+                Some(TypeKind::Function(signature)) => Some(signature),
+                Some(TypeKind::Intersection(members)) => members.iter().find_map(|member| {
+                    match result.types.get(*member).map(|type_| &type_.kind) {
+                        Some(TypeKind::Function(signature)) => Some(signature),
+                        _ => None,
+                    }
+                }),
+                _ => None,
+            }
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected callable merge, got {:?}",
+                    result.types.get(type_id)
+                )
+            });
+
+        assert_eq!(signature.return_type, result.types.number());
+    }
+
+    #[test]
     fn drops_named_provenance_with_unresolved_inferred_type_arguments() {
         let parsed = parse_source_file(
             r#"
