@@ -5824,7 +5824,7 @@ impl DeclarationPrinter<'_> {
                                             self.arena.get(*property).map(|node| &node.data),
                                             Some(NodeData::SpreadAssignment(_))
                                         )
-                                    })
+                                    }) && !self.semantic_object_has_divergent_accessors(&object)
                             ) {
                                 self.emit_semantic_object_literal_type(
                                     &object,
@@ -7602,6 +7602,12 @@ impl DeclarationPrinter<'_> {
         {
             return Ok(false);
         }
+        if declarations
+            .iter()
+            .any(|declaration| self.javascript_object_has_divergent_accessors(*declaration))
+        {
+            return Ok(false);
+        }
         for (index, declaration_id) in declarations.iter().enumerate() {
             if index != 0 {
                 self.writer.newline();
@@ -7612,6 +7618,28 @@ impl DeclarationPrinter<'_> {
             )?;
         }
         Ok(true)
+    }
+
+    fn javascript_object_has_divergent_accessors(&self, declaration: NodeId) -> bool {
+        let Some(TypeKind::Object(object)) = self
+            .node_types
+            .and_then(|types| types.get(&declaration))
+            .and_then(|type_id| self.semantic_types?.get(*type_id))
+            .map(|type_| &type_.kind)
+        else {
+            return false;
+        };
+        self.semantic_object_has_divergent_accessors(object)
+    }
+
+    fn semantic_object_has_divergent_accessors(&self, object: &ObjectType) -> bool {
+        object.setter_property_types.iter().any(|(name, setter)| {
+            object.getter_properties.contains(name)
+                && object.properties.get(name).is_some_and(|getter| {
+                    self.semantic_types.and_then(|types| types.get(*getter))
+                        != self.semantic_types.and_then(|types| types.get(*setter))
+                })
+        })
     }
 
     fn is_javascript_object_namespace_statement(&self, statement: NodeId) -> bool {
@@ -7744,6 +7772,7 @@ impl DeclarationPrinter<'_> {
         }
 
         let mut emitted = HashSet::new();
+        let mut requires_explicit_exports = false;
         for property in &object.properties.nodes {
             let Some(node) = self.arena.get(*property) else {
                 continue;
@@ -7776,6 +7805,8 @@ impl DeclarationPrinter<'_> {
             }
             let local_name = self.generate_declaration_name(exported_name);
             let renamed = local_name != exported_name;
+            let explicit_export = requires_explicit_exports && !renamed;
+            requires_explicit_exports |= renamed;
             let semantic_type = semantic_object
                 .properties
                 .get(exported_name)
@@ -7785,6 +7816,9 @@ impl DeclarationPrinter<'_> {
             if let (Some(initializer), Some(TypeKind::Function(signature))) =
                 (function_initializer, semantic_type.as_ref())
             {
+                if explicit_export {
+                    self.writer.write("export ");
+                }
                 self.emit_javascript_namespace_function(&local_name, initializer, signature)?;
                 if renamed {
                     self.writer.write("export { ");
@@ -7796,10 +7830,7 @@ impl DeclarationPrinter<'_> {
                 }
                 continue;
             }
-            let paired_accessor = accessor_halves
-                .get(exported_name)
-                .is_some_and(|(getter, setter)| *getter && *setter);
-            if paired_accessor && !renamed {
+            if explicit_export {
                 self.writer.write("export ");
             }
             self.writer
@@ -10914,7 +10945,15 @@ impl DeclarationPrinter<'_> {
             let Some(type_id) = type_id else {
                 continue;
             };
-            emitted_names.insert(name.clone());
+            if !emitted_names.insert(name.clone()) {
+                continue;
+            }
+            if matches!(
+                property.data,
+                NodeData::GetAccessorDeclaration(_) | NodeData::SetAccessorDeclaration(_)
+            ) {
+                self.emit_leading_jsdoc(property_id);
+            }
             if object.readonly_properties.contains(&name) {
                 self.writer.write("readonly ");
             }
@@ -11144,6 +11183,10 @@ impl DeclarationPrinter<'_> {
                     });
                 let auto_accessor = self.source_class_property_is_auto_accessor(object, &name);
                 if divergent_accessor || auto_accessor {
+                    let source_accessors = self.source_object_accessors(object, &name);
+                    if let Some((getter, _)) = source_accessors {
+                        self.emit_leading_jsdoc(getter);
+                    }
                     self.writer.write("get ");
                     self.emit_semantic_property_name(&name);
                     self.writer.write("(): ");
@@ -11174,6 +11217,9 @@ impl DeclarationPrinter<'_> {
                     }
                     self.writer.write(";");
                     self.writer.newline();
+                    if let Some((_, setter)) = source_accessors {
+                        self.emit_leading_jsdoc(setter);
+                    }
                     self.writer.write("set ");
                     self.emit_semantic_property_name(&name);
                     let setter_parameter = self
@@ -11355,28 +11401,61 @@ impl DeclarationPrinter<'_> {
         &self,
         object: &ObjectType,
     ) -> Option<&ts_ast::ObjectLiteralExpressionData> {
-        self.arena.iter().find_map(|(_, node)| {
+        let exact = self.arena.iter().find_map(|(id, node)| {
             let NodeData::ObjectLiteralExpression(literal) = &node.data else {
                 return None;
             };
-            let names = literal
-                .properties
-                .nodes
-                .iter()
-                .filter_map(|property| type_member_name_text(self.arena, *property))
-                .collect::<Vec<_>>();
-            let required = object
-                .properties
-                .keys()
-                .filter(|name| !object.optional_properties.contains(*name))
-                .count();
-            (names.len() == required
-                && names.iter().all(|name| {
-                    object.properties.contains_key(*name)
-                        && !object.optional_properties.contains(*name)
-                }))
-            .then_some(literal.as_ref())
+            self.node_types
+                .and_then(|types| types.get(&id).copied())
+                .and_then(|type_id| self.semantic_types?.get(type_id))
+                .is_some_and(|type_| {
+                    matches!(&type_.kind, TypeKind::Object(candidate) if candidate == object)
+                })
+                .then_some(literal.as_ref())
+        });
+        exact.or_else(|| {
+            self.arena.iter().find_map(|(_, node)| {
+                let NodeData::ObjectLiteralExpression(literal) = &node.data else {
+                    return None;
+                };
+                let names = literal
+                    .properties
+                    .nodes
+                    .iter()
+                    .filter_map(|property| type_member_name_text(self.arena, *property))
+                    .collect::<Vec<_>>();
+                let required = object
+                    .properties
+                    .keys()
+                    .filter(|name| !object.optional_properties.contains(*name))
+                    .count();
+                (names.len() == required
+                    && names.iter().all(|name| {
+                        object.properties.contains_key(*name)
+                            && !object.optional_properties.contains(*name)
+                    }))
+                .then_some(literal.as_ref())
+            })
         })
+    }
+
+    fn source_object_accessors(&self, object: &ObjectType, name: &str) -> Option<(NodeId, NodeId)> {
+        let literal = self.matching_source_object_literal(object)?;
+        let getter = literal.properties.nodes.iter().find(|property| {
+            matches!(
+                self.arena.get(**property).map(|node| &node.data),
+                Some(NodeData::GetAccessorDeclaration(getter))
+                    if declaration_name_text(self.arena, getter.name) == Some(name)
+            )
+        })?;
+        let setter = literal.properties.nodes.iter().find(|property| {
+            matches!(
+                self.arena.get(**property).map(|node| &node.data),
+                Some(NodeData::SetAccessorDeclaration(setter))
+                    if declaration_name_text(self.arena, setter.name) == Some(name)
+            )
+        })?;
+        Some((*getter, *setter))
     }
 
     fn source_class_property_is_auto_accessor(&self, object: &ObjectType, name: &str) -> bool {
@@ -30621,6 +30700,38 @@ mod tests {
         .code
     }
 
+    fn emit_javascript_declarations_with_semantics(source: &str) -> String {
+        let parsed = parse_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let checked = ts_checker::check_source_file_with_options(
+            &parsed.arena,
+            parsed.source_file,
+            &bindings,
+            CheckerOptions {
+                is_javascript_file: true,
+                ..CheckerOptions::default()
+            },
+        );
+        emit_declaration_file_with_semantics(
+            &parsed.arena,
+            parsed.source_file,
+            "input.js",
+            source,
+            false,
+            Some(&checked.declaration_reachability),
+            None,
+            Some(&checked.types),
+            Some(&checked.node_types),
+            Some(&checked.import_type_references),
+            Some(&checked.named_type_references),
+            false,
+            false,
+        )
+        .unwrap()
+        .code
+    }
+
     #[test]
     fn declaration_emit_preserves_inferred_local_generic_identities() {
         let box_output = emit_declarations_with_semantics(
@@ -36319,6 +36430,36 @@ class Board {
         ));
         assert!(output.contains("release: string;"), "{output}");
         assert!(output.contains("fixed: \"2.0.0\";"), "{output}");
+    }
+
+    #[test]
+    fn declaration_emit_preserves_object_literal_accessor_shapes() {
+        let javascript = emit_javascript_declarations_with_semantics(concat!(
+            "export const same = {\n",
+            "    /** @returns {string} */ get x() { return ''; },\n",
+            "    /** @param {string} value */ set x(value) {},\n",
+            "};\n",
+        ));
+        assert!(
+            javascript.contains("export namespace same {\n    let x: string;\n}"),
+            "{javascript}"
+        );
+        assert!(!javascript.contains("export let x"), "{javascript}");
+
+        let typescript = emit_declarations_with_semantics(concat!(
+            "export const divergent = {\n",
+            "    /** getter */ get x(): string { return ''; },\n",
+            "    /** setter */ set x(value: number) {},\n",
+            "};\n",
+        ));
+        assert!(
+            typescript.contains("/** getter */ get x(): string;"),
+            "{typescript}"
+        );
+        assert!(
+            typescript.contains("/** setter */ set x(value: number);"),
+            "{typescript}"
+        );
     }
 
     #[test]

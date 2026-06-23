@@ -4618,6 +4618,7 @@ impl<'a> Checker<'a> {
         let readonly_properties = object_type.readonly_properties.clone();
         let getter_properties = object_type.getter_properties.clone();
         let setter_properties = object_type.setter_properties.clone();
+        let mut setter_property_types = object_type.setter_property_types.clone();
         let type_id = self.result.types.alloc(TypeKind::Object(object_type));
         if object.properties.nodes.iter().any(|property| {
             let Some(NodeData::SpreadAssignment(spread)) =
@@ -4642,8 +4643,15 @@ impl<'a> Checker<'a> {
                     self.check_object_literal_getter(*property, data, &mut properties);
                 }
                 NodeData::SetAccessorDeclaration(data) => {
-                    let property_type = self.object_literal_setter_type(data);
+                    let name = self.property_name(data.name);
+                    let property_type = self
+                        .object_literal_explicit_setter_type(*property, data)
+                        .or_else(|| name.as_ref().and_then(|name| properties.get(name).copied()))
+                        .unwrap_or_else(|| self.result.types.any());
                     self.result.node_types.insert(*property, property_type);
+                    if let Some(name) = name {
+                        setter_property_types.insert(name, property_type);
+                    }
                     let local_scope = self.parameter_scope(&data.parameters.nodes);
                     self.local_scopes.push(local_scope);
                     let mut saw_return = false;
@@ -4662,6 +4670,7 @@ impl<'a> Checker<'a> {
             readonly_properties,
             getter_properties,
             setter_properties,
+            setter_property_types,
             ..ObjectType::default()
         });
         type_id
@@ -4683,6 +4692,7 @@ impl<'a> Checker<'a> {
         let mut readonly_properties = BTreeSet::new();
         let mut getter_properties = BTreeSet::new();
         let mut setter_properties = BTreeSet::new();
+        let mut setter_property_types = BTreeMap::new();
         for property in &object.properties.nodes {
             let Some(node) = self.arena.get(*property).cloned() else {
                 continue;
@@ -4760,8 +4770,11 @@ impl<'a> Checker<'a> {
                     let Some(name) = self.property_name(data.name) else {
                         continue;
                     };
-                    let type_id = self.object_literal_setter_type(data);
+                    let type_id = self
+                        .object_literal_explicit_setter_type(*property, data)
+                        .unwrap_or_else(|| self.result.types.any());
                     properties.entry(name.clone()).or_insert(type_id);
+                    setter_property_types.insert(name.clone(), type_id);
                     setter_properties.insert(name);
                 }
                 NodeData::MethodDeclaration(data) => {
@@ -4787,6 +4800,7 @@ impl<'a> Checker<'a> {
                     readonly_properties.extend(spread.readonly_properties);
                     getter_properties.extend(spread.getter_properties);
                     setter_properties.extend(spread.setter_properties);
+                    setter_property_types.extend(spread.setter_property_types);
                 }
                 _ => {}
             }
@@ -4800,6 +4814,7 @@ impl<'a> Checker<'a> {
                 .collect(),
             getter_properties,
             setter_properties,
+            setter_property_types,
             ..ObjectType::default()
         }
     }
@@ -4987,22 +5002,31 @@ impl<'a> Checker<'a> {
         properties.insert(name, inferred);
     }
 
-    fn object_literal_setter_type(
+    fn object_literal_explicit_setter_type(
         &mut self,
+        setter_node: NodeId,
         setter: &ts_ast::SetAccessorDeclarationData,
-    ) -> TypeId {
-        let annotation = setter
+    ) -> Option<TypeId> {
+        let parameter = setter
             .parameters
             .nodes
             .first()
             .and_then(|parameter| self.arena.get(*parameter))
             .and_then(|parameter| match &parameter.data {
-                NodeData::ParameterDeclaration(parameter) => parameter.type_,
+                NodeData::ParameterDeclaration(parameter) => Some(parameter.as_ref()),
                 _ => None,
             });
+        let annotation = parameter.and_then(|parameter| parameter.type_);
         match annotation {
-            Some(annotation) => self.type_from_type_node(annotation),
-            None => self.result.types.any(),
+            Some(annotation) => Some(self.type_from_type_node(annotation)),
+            None => parameter
+                .and_then(|parameter| self.property_name(parameter.name))
+                .and_then(|name| {
+                    self.jsdoc_signature_types(setter_node)
+                        .parameters
+                        .get(&name)
+                        .map(|(type_id, _)| *type_id)
+                }),
         }
     }
 
