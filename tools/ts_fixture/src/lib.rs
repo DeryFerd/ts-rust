@@ -668,10 +668,31 @@ fn compile_case_variant(case: &Case, variant: &OptionVariant) -> std::io::Result
         path.rsplit_once('/')
             .map(|(directory, _)| directory.to_owned())
     });
+    let links = case
+        .directive_values("link")
+        .chain(case.directive_values("symlink"))
+        .filter_map(|value| value.split_once("->"))
+        .map(|(source, target)| {
+            (
+                ts_path::normalize_path(source.trim()),
+                ts_path::normalize_path(target.trim()),
+            )
+        })
+        .collect::<Vec<_>>();
     let mut roots = Vec::with_capacity(case.units.len());
     for (index, unit) in case.units.iter().enumerate() {
         let path = virtual_unit_path(case, unit, index);
         file_system.write_file(&path, unit.source_text.as_scannable_str())?;
+        for (source, target) in &links {
+            if path == *source
+                || path
+                    .strip_prefix(source)
+                    .is_some_and(|rest| rest.starts_with('/'))
+            {
+                let alias = format!("{target}{}", &path[source.len()..]);
+                file_system.write_file(&alias, unit.source_text.as_scannable_str())?;
+            }
+        }
         if is_compilation_unit(&path)
             && project_directory.as_ref().is_none_or(|directory| {
                 path_is_within_directory(&path, directory)
@@ -683,6 +704,16 @@ fn compile_case_variant(case: &Case, variant: &OptionVariant) -> std::io::Result
             roots.push(path);
         }
     }
+    if project_directory.is_none()
+        && case
+            .directive_values("noImplicitReferences")
+            .next()
+            .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+        && let Some(last_root) = roots.pop()
+    {
+        roots.clear();
+        roots.push(last_root);
+    }
 
     let mut compiler_options = fixture_compiler_options(case, variant);
     // Compiler baselines generally assume libraries. Keeping this enabled is
@@ -691,7 +722,10 @@ fn compile_case_variant(case: &Case, variant: &OptionVariant) -> std::io::Result
     if project_config_unit(case).is_none() && case.directive_values("noLib").next().is_none() {
         compiler_options.no_lib = false;
     }
-    let current_directory = project_directory.as_deref().unwrap_or("/case");
+    let current_directory = project_directory
+        .as_deref()
+        .or_else(|| case.directive_values("currentDirectory").next())
+        .unwrap_or("/case");
     let program = ts_compiler::Program::new_with_options(
         &file_system,
         current_directory,
@@ -1469,6 +1503,48 @@ mod tests {
             "export const value = 1;\n"
         );
         assert!(compilation.outputs["/case/b.js"].contains("result = value + 1"));
+    }
+
+    #[test]
+    fn no_implicit_references_and_links_model_the_upstream_harness() {
+        let case = Case::parse(
+            "linkedBundle.ts",
+            concat!(
+                "// @declaration: true\n",
+                "// @emitDeclarationOnly: true\n",
+                "// @outFile: dist/index.d.ts\n",
+                "// @currentDirectory: /project\n",
+                "// @noImplicitReferences: true\n",
+                "// @noLib: true\n",
+                "// @filename: /package/index.ts\n",
+                "export class External {}\n",
+                "// @filename: /project/index.ts\n",
+                "import { External } from 'package';\n",
+                "export default function value() { return new External(); }\n",
+                "// @link: /package -> /project/node_modules/package\n",
+            ),
+        )
+        .unwrap();
+        let compilation = compile_case(&case).unwrap();
+        assert!(
+            compilation.diagnostics.is_empty(),
+            "{:?}",
+            compilation.diagnostics
+        );
+        let declaration = &compilation.outputs["/project/dist/index.d.ts"];
+        assert!(
+            declaration.contains("import { External } from 'package';"),
+            "{declaration}"
+        );
+        assert!(
+            declaration.contains("export default function value(): External;"),
+            "{declaration}"
+        );
+        assert!(!declaration.contains("node_modules"), "{declaration}");
+        assert!(
+            !declaration.contains("declare module \"package/index\""),
+            "{declaration}"
+        );
     }
 
     #[test]

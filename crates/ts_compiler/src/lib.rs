@@ -8,12 +8,12 @@ use std::{
 use ts_ast::{NodeData, NodeId};
 use ts_binder::{BindResult, bind_source_file};
 use ts_checker::{
-    CheckResult, CheckerOptions, EnumConstantValue as CheckerConstantValue, ProgramSource,
-    check_program, empty_check_result,
+    CheckDiagnostic, CheckResult, CheckerOptions, EnumConstantValue as CheckerConstantValue,
+    ProgramSource, TypeId, TypeKind, check_program, empty_check_result,
 };
 use ts_config::{ConfigDiagnostic, resolve_config_file};
 use ts_core::{TextPos, TextRange};
-use ts_diagnostics::message_by_code;
+use ts_diagnostics::{Diagnostic, message_by_code};
 use ts_glob::{DiscoveryOptions, discover_files};
 use ts_module::{ResolutionOptions, Resolver, automatic_type_directive_names};
 use ts_options::{CompilerOptions, ModuleKind, PrinterSettings, parse_project_options};
@@ -453,6 +453,11 @@ impl Program {
                         comment_end: dependency.range.end.get(),
                     })
                     .collect::<Vec<_>>();
+                let import_runtime_meanings = if source_settings.module == ModuleKind::Amd {
+                    import_runtime_meanings_for_emit(source_file)
+                } else {
+                    source_file.checking.import_runtime_meanings.clone()
+                };
                 let emit_context = EmitContext {
                     bindings: &source_file.binding,
                     amd_module_name: source_file.parse.amd_module_name.as_deref(),
@@ -462,7 +467,7 @@ impl Program {
                     amd_generated_name_offsets: &BTreeMap::new(),
                     enum_member_values: &enum_member_values,
                     enum_access_values: &enum_access_values,
-                    import_runtime_meanings: &source_file.checking.import_runtime_meanings,
+                    import_runtime_meanings: &import_runtime_meanings,
                     preserve_const_enums: self.options.preserve_const_enums
                         || self.options.isolated_modules
                         || self.options.verbatim_module_syntax,
@@ -527,7 +532,7 @@ impl Program {
                         .checking
                         .diagnostics
                         .iter()
-                        .any(|diagnostic| diagnostic.diagnostic.code() == 5088)
+                        .any(|diagnostic| matches!(diagnostic.diagnostic.code(), 2883 | 5088))
                 {
                     continue;
                 }
@@ -637,6 +642,11 @@ impl Program {
                 .then(|| amd_bundle_module_name(source, &bundle_root));
                 let amd_module_specifier_rewrites =
                     self.amd_bundle_specifier_rewrites(source, &bundle_root);
+                let import_runtime_meanings = if settings.module == ModuleKind::Amd {
+                    import_runtime_meanings_for_emit(source)
+                } else {
+                    source.checking.import_runtime_meanings.clone()
+                };
                 let emit_context = EmitContext {
                     bindings: &source.binding,
                     amd_module_name: amd_module_name.as_deref(),
@@ -646,7 +656,7 @@ impl Program {
                     amd_generated_name_offsets: &amd_generated_name_offsets,
                     enum_member_values: &enum_member_values,
                     enum_access_values: &enum_access_values,
-                    import_runtime_meanings: &source.checking.import_runtime_meanings,
+                    import_runtime_meanings: &import_runtime_meanings,
                     preserve_const_enums: self.options.preserve_const_enums
                         || self.options.isolated_modules
                         || self.options.verbatim_module_syntax,
@@ -745,7 +755,7 @@ impl Program {
                         .checking
                         .diagnostics
                         .iter()
-                        .any(|diagnostic| diagnostic.diagnostic.code() == 5088)
+                        .any(|diagnostic| matches!(diagnostic.diagnostic.code(), 2883 | 5088))
                 {
                     continue;
                 }
@@ -796,6 +806,8 @@ impl Program {
                                     &bundle_root,
                                     settings.module,
                                 );
+                                emitted.code =
+                                    remove_unused_named_declaration_imports(&emitted.code);
                                 append_bundle_declaration_module(
                                     &mut code,
                                     source,
@@ -964,6 +976,9 @@ impl Program {
                     .file_index
                     .get(target)
                     .and_then(|index| self.source_files.get(*index))?;
+                if !self.source_should_emit(target) {
+                    return None;
+                }
                 Some((
                     specifier,
                     bundle_declaration_module_name(target, bundle_root, module),
@@ -1222,7 +1237,21 @@ impl Program {
                 .collect::<Vec<_>>();
             check_program(&inputs)
         };
-        for (source_file, mut checking) in self.source_files.iter_mut().zip(checked.files) {
+        let check_declaration_portability = self.options.declaration && !self.options.no_check;
+        let portability_diagnostics = if check_declaration_portability {
+            self.nonportable_nested_package_diagnostics()
+        } else {
+            vec![Vec::new(); self.source_files.len()]
+        };
+        for (index, (source_file, mut checking)) in
+            self.source_files.iter_mut().zip(checked.files).enumerate()
+        {
+            if check_declaration_portability {
+                add_nonportable_inferred_type_diagnostics(source_file, &mut checking);
+            }
+            checking
+                .diagnostics
+                .extend(portability_diagnostics[index].iter().cloned());
             if self.options.no_check {
                 checking.diagnostics.clear();
             }
@@ -1244,6 +1273,107 @@ impl Program {
             }
             source_file.checking = checking;
         }
+    }
+
+    fn nonportable_nested_package_diagnostics(&self) -> Vec<Vec<CheckDiagnostic>> {
+        let mut diagnostics = vec![Vec::new(); self.source_files.len()];
+        for (source_index, source) in self.source_files.iter().enumerate() {
+            let containing = canonicalize(
+                &source.file_name,
+                &self.current_directory,
+                self.case_sensitivity,
+            );
+            let imports = source_import_bindings(source);
+            let Some(NodeData::SourceFile(file)) = source
+                .parse
+                .arena
+                .get(source.parse.source_file)
+                .map(|node| &node.data)
+            else {
+                continue;
+            };
+            for statement in &file.statements.nodes {
+                let Some(NodeData::VariableStatement(variable)) =
+                    source.parse.arena.get(*statement).map(|node| &node.data)
+                else {
+                    continue;
+                };
+                if !node_has_modifier(
+                    &source.parse.arena,
+                    variable.modifiers.as_ref(),
+                    ts_ast::SyntaxKind::ExportKeyword,
+                ) {
+                    continue;
+                }
+                let Some(NodeData::VariableDeclarationList(list)) = source
+                    .parse
+                    .arena
+                    .get(variable.declaration_list)
+                    .map(|node| &node.data)
+                else {
+                    continue;
+                };
+                for declaration_id in &list.declarations.nodes {
+                    let Some(NodeData::VariableDeclaration(declaration)) = source
+                        .parse
+                        .arena
+                        .get(*declaration_id)
+                        .map(|node| &node.data)
+                    else {
+                        continue;
+                    };
+                    if declaration.type_.is_some() {
+                        continue;
+                    }
+                    let Some(NodeData::CallExpression(call)) = declaration
+                        .initializer
+                        .and_then(|initializer| source.parse.arena.get(initializer))
+                        .map(|node| &node.data)
+                    else {
+                        continue;
+                    };
+                    let Some(callee) = identifier_text(&source.parse.arena, call.expression) else {
+                        continue;
+                    };
+                    let Some((_, imported_name, specifier)) =
+                        imports.iter().find(|(local, _, _)| local == callee)
+                    else {
+                        continue;
+                    };
+                    let Some(target_name) = self
+                        .resolved_modules
+                        .get(&(containing.clone(), specifier.clone()))
+                    else {
+                        continue;
+                    };
+                    let Some(target) = self
+                        .file_index
+                        .get(target_name)
+                        .and_then(|index| self.source_files.get(*index))
+                    else {
+                        continue;
+                    };
+                    let Some((qualifier, module)) =
+                        nonportable_return_import(self, target, imported_name)
+                    else {
+                        continue;
+                    };
+                    let Some(name) = identifier_text(&source.parse.arena, declaration.name) else {
+                        continue;
+                    };
+                    let message =
+                        message_by_code(2883).expect("TS2883 must be in the diagnostic catalog");
+                    diagnostics[source_index].push(CheckDiagnostic {
+                        node: declaration.name,
+                        diagnostic: Diagnostic::with_arguments(
+                            message,
+                            [name.to_owned(), qualifier, module],
+                        ),
+                    });
+                }
+            }
+        }
+        diagnostics
     }
 
     fn load_file(&mut self, file_system: &dyn FileSystem, file_name: &str, report_missing: bool) {
@@ -1641,6 +1771,261 @@ fn emit_diagnostic(source_file: &SourceFile, error: &ts_printer::EmitError) -> P
     }
 }
 
+fn add_nonportable_inferred_type_diagnostics(source: &SourceFile, checking: &mut CheckResult) {
+    let Some(NodeData::SourceFile(file)) = source
+        .parse
+        .arena
+        .get(source.parse.source_file)
+        .map(|node| &node.data)
+    else {
+        return;
+    };
+    for statement in &file.statements.nodes {
+        let Some(NodeData::VariableStatement(variable)) =
+            source.parse.arena.get(*statement).map(|node| &node.data)
+        else {
+            continue;
+        };
+        if !node_has_modifier(
+            &source.parse.arena,
+            variable.modifiers.as_ref(),
+            ts_ast::SyntaxKind::ExportKeyword,
+        ) {
+            continue;
+        }
+        let Some(NodeData::VariableDeclarationList(list)) = source
+            .parse
+            .arena
+            .get(variable.declaration_list)
+            .map(|node| &node.data)
+        else {
+            continue;
+        };
+        for declaration_id in &list.declarations.nodes {
+            let Some(NodeData::VariableDeclaration(declaration)) = source
+                .parse
+                .arena
+                .get(*declaration_id)
+                .map(|node| &node.data)
+            else {
+                continue;
+            };
+            if declaration.type_.is_some() {
+                continue;
+            }
+            let Some(type_id) = checking.type_of_node(*declaration_id).or_else(|| {
+                declaration
+                    .initializer
+                    .and_then(|node| checking.type_of_node(node))
+            }) else {
+                continue;
+            };
+            let Some((qualifier, module)) =
+                nonportable_import_type_reference(checking, type_id, &mut BTreeSet::new())
+            else {
+                continue;
+            };
+            let Some(name) = identifier_text(&source.parse.arena, declaration.name) else {
+                continue;
+            };
+            let message = message_by_code(2883).expect("TS2883 must be in the diagnostic catalog");
+            checking.diagnostics.push(CheckDiagnostic {
+                node: declaration.name,
+                diagnostic: Diagnostic::with_arguments(
+                    message,
+                    [name.to_owned(), qualifier, module],
+                ),
+            });
+        }
+    }
+}
+
+fn source_import_bindings(source: &SourceFile) -> Vec<(String, String, String)> {
+    let Some(NodeData::SourceFile(file)) = source
+        .parse
+        .arena
+        .get(source.parse.source_file)
+        .map(|node| &node.data)
+    else {
+        return Vec::new();
+    };
+    let mut imports = Vec::new();
+    for statement in &file.statements.nodes {
+        let Some(NodeData::ImportDeclaration(import)) =
+            source.parse.arena.get(*statement).map(|node| &node.data)
+        else {
+            continue;
+        };
+        let Some((specifier, _)) = string_literal(&source.parse.arena, import.module_specifier)
+        else {
+            continue;
+        };
+        let Some(NodeData::ImportClause(clause)) = import
+            .import_clause
+            .and_then(|clause| source.parse.arena.get(clause))
+            .map(|node| &node.data)
+        else {
+            continue;
+        };
+        if let Some(local) = clause
+            .name
+            .and_then(|name| identifier_text(&source.parse.arena, name))
+        {
+            imports.push((local.to_owned(), "default".into(), specifier.clone()));
+        }
+        let Some(NodeData::NamedImports(named)) = clause
+            .named_bindings
+            .and_then(|bindings| source.parse.arena.get(bindings))
+            .map(|node| &node.data)
+        else {
+            continue;
+        };
+        for element in &named.elements.nodes {
+            let Some(NodeData::ImportSpecifier(imported)) =
+                source.parse.arena.get(*element).map(|node| &node.data)
+            else {
+                continue;
+            };
+            let Some(local) = identifier_text(&source.parse.arena, imported.name) else {
+                continue;
+            };
+            let imported_name = imported
+                .property_name
+                .and_then(|name| identifier_text(&source.parse.arena, name))
+                .unwrap_or(local);
+            imports.push((
+                local.to_owned(),
+                imported_name.to_owned(),
+                specifier.clone(),
+            ));
+        }
+    }
+    imports
+}
+
+fn nonportable_return_import(
+    program: &Program,
+    target: &SourceFile,
+    function_name: &str,
+) -> Option<(String, String)> {
+    let containing = canonicalize(
+        &target.file_name,
+        &program.current_directory,
+        program.case_sensitivity,
+    );
+    let nested_imports = source_import_bindings(target)
+        .into_iter()
+        .filter_map(|(local, imported, specifier)| {
+            let resolved = program
+                .resolved_modules
+                .get(&(containing.clone(), specifier))?;
+            (resolved.match_indices("/node_modules/").count() >= 2).then(|| {
+                let relative = resolved.split_once("/node_modules/").unwrap().1;
+                let module = ts_path::remove_file_extension(relative)
+                    .trim_end_matches("/index")
+                    .to_owned();
+                (local, imported, module)
+            })
+        })
+        .collect::<Vec<_>>();
+    if nested_imports.is_empty() {
+        return None;
+    }
+    let Some(NodeData::SourceFile(file)) = target
+        .parse
+        .arena
+        .get(target.parse.source_file)
+        .map(|node| &node.data)
+    else {
+        return None;
+    };
+    for statement in &file.statements.nodes {
+        let Some(NodeData::FunctionDeclaration(function)) =
+            target.parse.arena.get(*statement).map(|node| &node.data)
+        else {
+            continue;
+        };
+        if function
+            .name
+            .and_then(|name| identifier_text(&target.parse.arena, name))
+            != Some(function_name)
+        {
+            continue;
+        }
+        let type_node = target.parse.arena.get(function.type_?)?;
+        return nested_imports.iter().find_map(|(local, imported, module)| {
+            target.parse.arena.iter().find_map(|(_, node)| {
+                (type_node.range.start <= node.range.start
+                    && node.range.end <= type_node.range.end
+                    && matches!(
+                        &node.data,
+                        NodeData::Identifier(identifier) if identifier.text == *local
+                    ))
+                .then(|| (imported.clone(), module.clone()))
+            })
+        });
+    }
+    None
+}
+
+fn nonportable_import_type_reference(
+    checking: &CheckResult,
+    type_id: TypeId,
+    visited: &mut BTreeSet<TypeId>,
+) -> Option<(String, String)> {
+    if !visited.insert(type_id) {
+        return None;
+    }
+    if let Some(reference) = checking.import_type_references.get(&type_id)
+        && reference.module_specifier.contains("/node_modules/")
+    {
+        return Some((
+            reference.qualifier.clone(),
+            reference.module_specifier.clone(),
+        ));
+    }
+    let kind = &checking.types.get(type_id)?.kind;
+    let mut children = Vec::new();
+    match kind {
+        TypeKind::TypeParameter { constraint, .. } => children.extend(constraint),
+        TypeKind::Array(element) => children.push(*element),
+        TypeKind::Tuple(elements)
+        | TypeKind::ReadonlyTuple(elements)
+        | TypeKind::Union(elements)
+        | TypeKind::Intersection(elements) => children.extend(elements),
+        TypeKind::Object(object) => {
+            children.extend(object.properties.values());
+            children.extend(object.string_index_type);
+            children.extend(object.number_index_type);
+            for signature in object
+                .call_signatures
+                .iter()
+                .chain(&object.construct_signatures)
+            {
+                children.extend(&signature.parameters);
+                children.extend(signature.rest_parameter);
+                children.push(signature.return_type);
+            }
+        }
+        TypeKind::Function(signature) | TypeKind::Constructor(signature) => {
+            children.extend(&signature.parameters);
+            children.extend(signature.rest_parameter);
+            children.push(signature.return_type);
+        }
+        TypeKind::Overload(signatures) => {
+            for signature in signatures {
+                children.extend(&signature.parameters);
+                children.extend(signature.rest_parameter);
+                children.push(signature.return_type);
+            }
+        }
+        _ => {}
+    }
+    children
+        .into_iter()
+        .find_map(|child| nonportable_import_type_reference(checking, child, visited))
+}
+
 fn enum_values_for_emit(
     values: &BTreeMap<NodeId, CheckerConstantValue>,
 ) -> BTreeMap<NodeId, EmitConstantValue> {
@@ -1745,6 +2130,32 @@ fn source_is_external_module(source: &SourceFile) -> bool {
     })
 }
 
+fn import_runtime_meanings_for_emit(source: &SourceFile) -> BTreeMap<NodeId, bool> {
+    let mut meanings = source.checking.import_runtime_meanings.clone();
+    let Some(NodeData::SourceFile(file)) = source
+        .parse
+        .arena
+        .get(source.parse.source_file)
+        .map(|node| &node.data)
+    else {
+        return meanings;
+    };
+    for statement in &file.statements.nodes {
+        let Some(NodeData::ImportEqualsDeclaration(import)) =
+            source.parse.arena.get(*statement).map(|node| &node.data)
+        else {
+            continue;
+        };
+        if !import.is_type_only {
+            // Import-equals runtime use is decided from its actual value references by
+            // the emitter. An ambient module has no implementation initializer, so
+            // symbol-shape classification alone must not erase a referenced require.
+            meanings.insert(*statement, true);
+        }
+    }
+    meanings
+}
+
 fn append_bundle_declaration_module(
     code: &mut String,
     source: &SourceFile,
@@ -1764,6 +2175,12 @@ fn append_bundle_declaration_module(
     code.push_str(&module_name.replace('"', "\\\""));
     code.push_str("\" {\n");
     for line in declaration.lines() {
+        if preserve_amd_pragma {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("///") && trimmed.contains("<amd-module") {
+                continue;
+            }
+        }
         let line = line.strip_prefix("export declare ").map_or_else(
             || line.strip_prefix("declare ").unwrap_or(line).to_owned(),
             |line| format!("export {line}"),
@@ -1812,6 +2229,50 @@ fn replace_import_type_reference(
     }
     *declaration = declaration.replace(&reference, local);
     true
+}
+
+fn remove_unused_named_declaration_imports(declaration: &str) -> String {
+    let body = declaration
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("import "))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut output = declaration
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            let Some(imports) = trimmed
+                .strip_prefix("import { ")
+                .and_then(|import| import.split_once(" } from "))
+                .map(|(imports, _)| imports)
+            else {
+                return true;
+            };
+            imports.split(',').map(str::trim).any(|import| {
+                let local = import.split_once(" as ").map_or(import, |(_, local)| local);
+                text_contains_identifier(&body, local)
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if declaration.ends_with('\n') {
+        output.push('\n');
+    }
+    output
+}
+
+fn text_contains_identifier(text: &str, identifier: &str) -> bool {
+    text.match_indices(identifier).any(|(start, _)| {
+        let before = text[..start].chars().next_back();
+        let end = start + identifier.len();
+        let after = text[end..].chars().next();
+        before.is_none_or(|character| !is_identifier_character(character))
+            && after.is_none_or(|character| !is_identifier_character(character))
+    })
+}
+
+fn is_identifier_character(character: char) -> bool {
+    character == '_' || character == '$' || character.is_alphanumeric()
 }
 
 fn amd_bundle_module_name(source: &SourceFile, bundle_root: &str) -> String {
@@ -5150,6 +5611,66 @@ mod tests {
     }
 
     #[test]
+    fn javascript_declaration_emit_preserves_inline_jsdoc_casts_and_typedefs() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/a.js",
+            concat!(
+                "/** @typedef {{ } & { name?: string }} P */\n",
+                "const value = /** @type {*} */(null);\n",
+                "export let cast = /** @type {P} */(value);\n",
+                "export function use(input = /** @type {P} */(value)) {}\n",
+                "export class C {\n",
+                "  /** @readonly */ field = /** @type {P} */(value);\n",
+                "  get current() { return /** @type {P} */(value); }\n",
+                "  set current(next) {}\n",
+                "}\n",
+                "export default /** @type {P} */(value);\n",
+            ),
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["a.js".to_owned()],
+            CompilerOptions {
+                allow_js: true,
+                check_js: true,
+                declaration: true,
+                emit_declaration_only: true,
+                no_lib: true,
+                target: ScriptTarget::Es2015,
+                ..CompilerOptions::default()
+            },
+        );
+        let declaration = program
+            .emit()
+            .files
+            .into_iter()
+            .find(|file| file.file_name == "/project/a.d.ts")
+            .unwrap()
+            .text;
+        assert!(declaration.starts_with("export function use(input?: P): void;\n"));
+        assert!(declaration.contains("export let cast: P;"), "{declaration}");
+        assert!(
+            declaration.contains("/** @readonly */ readonly field: P;"),
+            "{declaration}"
+        );
+        assert!(
+            declaration.contains("set current(next: P);\n    get current(): P;"),
+            "{declaration}"
+        );
+        assert!(
+            declaration.contains("declare const _default: P;"),
+            "{declaration}"
+        );
+        assert!(
+            declaration.contains("export type P = {} & {"),
+            "{declaration}"
+        );
+    }
+
+    #[test]
     fn javascript_declaration_emit_synthesizes_amd_like_module_exports() {
         let fs = MemoryFileSystem::new(true);
         fs.write_file(
@@ -5335,6 +5856,62 @@ mod tests {
     }
 
     #[test]
+    fn nonportable_nested_package_inference_suppresses_declaration_output() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/node_modules/foo/node_modules/nested/index.d.ts",
+            "export interface NestedProps {}",
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/node_modules/foo/index.d.ts",
+            concat!(
+                "import { NestedProps } from 'nested';\n",
+                "export function foo(): [NestedProps];\n",
+            ),
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/main.ts",
+            "import { foo } from 'foo'; export const value = foo();",
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["main.ts".to_owned()],
+            CompilerOptions {
+                declaration: true,
+                no_lib: true,
+                module: ModuleKind::CommonJs,
+                target: ScriptTarget::Es2015,
+                ..CompilerOptions::default()
+            },
+        );
+        let entry = program
+            .source_files
+            .iter()
+            .find(|source| source.file_name == "/project/main.ts")
+            .unwrap();
+        assert!(
+            program
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code == Some(2883)),
+            "refs={:?}, types={:?}",
+            entry.checking.import_type_references,
+            entry.checking.types
+        );
+        assert!(
+            !program
+                .emit()
+                .files
+                .iter()
+                .any(|file| file.file_name == "/project/main.d.ts")
+        );
+    }
+
+    #[test]
     fn declaration_emit_preserves_ambient_auto_accessors() {
         let source = concat!(
             "declare class AmbientClass { accessor prop1: string; static accessor prop2: number; private accessor prop3: boolean; private static accessor prop4: symbol; }\n",
@@ -5371,6 +5948,63 @@ mod tests {
                 .unwrap();
             assert_eq!(declaration.text, expected);
         }
+    }
+
+    #[test]
+    fn declaration_emit_preserves_cross_file_alias_operator_provenance() {
+        let fs = MemoryFileSystem::new(true);
+        let body = concat!(
+            "type O = { prop: string; prop2: string }; ",
+            "type I = { prop: string }; ",
+            "export const fn = (v: O['prop'], p: Omit<O, 'prop'>, key: keyof O, p2: Omit<O, keyof I>) => {};",
+        );
+        fs.write_file("/project/a.ts", body).unwrap();
+        fs.write_file(
+            "/project/aExp.ts",
+            &body
+                .replace("type O", "export type O")
+                .replace("type I", "export type I"),
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/b.ts",
+            "import { fn } from './a'; import { fn as fnExp } from './aExp'; export const f = fn; export const fExp = fnExp;",
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["b.ts".to_owned()],
+            CompilerOptions {
+                declaration: true,
+                module: ModuleKind::CommonJs,
+                strict: true,
+                ..CompilerOptions::default()
+            },
+        );
+        let emitted = program.emit();
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        let declaration = emitted
+            .files
+            .iter()
+            .find(|file| file.file_name == "/project/b.d.ts")
+            .unwrap();
+        assert!(
+            declaration
+                .text
+                .contains("p: Omit<{\n    prop: string;\n    prop2: string;\n}, \"prop\">")
+                && declaration
+                    .text
+                    .contains("key: keyof {\n    prop: string;\n    prop2: string;\n}")
+                && declaration
+                    .text
+                    .contains("v: import(\"./aExp\").O[\"prop\"]")
+                && declaration
+                    .text
+                    .contains("p2: Omit<import(\"./aExp\").O, keyof import(\"./aExp\").I>"),
+            "{}",
+            declaration.text
+        );
     }
 
     #[test]
