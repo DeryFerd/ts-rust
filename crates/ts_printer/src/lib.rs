@@ -111,6 +111,7 @@ pub fn emit_source_file(arena: &NodeArena, source_file: NodeId) -> Result<EmitRe
             source_map: false,
             inline_source_map: false,
             no_emit_helpers: false,
+            remove_comments: false,
             use_define_for_class_fields: None,
         },
     )
@@ -5324,6 +5325,9 @@ impl Printer<'_> {
         end: u32,
         space_before_first: bool,
     ) {
+        if self.settings.remove_comments {
+            return;
+        }
         let start = usize::try_from(start).unwrap_or(usize::MAX);
         let end = usize::try_from(end).unwrap_or(usize::MAX);
         let Some(trivia) = self.source_text.get(start..end) else {
@@ -5374,6 +5378,9 @@ impl Printer<'_> {
         preserve_immediate_trailing: bool,
         preserve_leading: bool,
     ) {
+        if self.settings.remove_comments {
+            return;
+        }
         let start = usize::try_from(start).unwrap_or(usize::MAX);
         let end = usize::try_from(end).unwrap_or(usize::MAX);
         let Some(trivia) = self.source_text.get(start..end) else {
@@ -5423,12 +5430,15 @@ impl Printer<'_> {
                         self.writer.remove_trailing_newline();
                         self.writer.write(" ");
                     }
-                    for line in trivia[index..comment_end]
+                    let normalized = trivia[index..comment_end]
                         .replace("\r\n", "\n")
-                        .replace('\r', "\n")
-                        .split('\n')
-                    {
+                        .replace('\r', "\n");
+                    let mut lines = normalized.split('\n').peekable();
+                    while let Some(line) = lines.next() {
                         self.writer.write(line);
+                        if lines.peek().is_none() && comment_range.1 == self.source_text.len() {
+                            self.writer.write(" ");
+                        }
                         self.writer.newline_preserving_trailing_spaces();
                     }
                 }
@@ -5515,6 +5525,9 @@ impl Printer<'_> {
         excluded: &[(u32, u32)],
         pinned_only: bool,
     ) {
+        if self.settings.remove_comments {
+            return;
+        }
         let end = usize::try_from(end).unwrap_or(usize::MAX);
         let Some(prefix) = self.source_text.get(..end) else {
             return;
@@ -6457,7 +6470,15 @@ impl Printer<'_> {
                         if self.has_modifier(data.modifiers.as_ref(), SyntaxKind::ExportKeyword)
                             && let Some(name) = names.first()
                         {
-                            self.writer.newline();
+                            self.emit_source_comments_between_with_ownership(
+                                node.range.end.get(),
+                                u32::try_from(self.source_text.len()).unwrap_or(u32::MAX),
+                                true,
+                                false,
+                            );
+                            if !self.writer.line_start {
+                                self.writer.newline();
+                            }
                             self.writer.write(&container);
                             self.writer.write(".");
                             self.writer.write(name);
@@ -10658,93 +10679,8 @@ impl Printer<'_> {
                     self.writer.write(")");
                 }
             }
-            NodeData::BinaryExpression(data) => {
-                let operator = self.node(data.operator_token)?.kind;
-                if operator == SyntaxKind::QuestionQuestionToken
-                    && self.settings.target < ScriptTarget::Es2020
-                {
-                    self.emit_downlevel_nullish(data.left, data.right, parent_precedence)?;
-                    return Ok(());
-                }
-                if self.settings.target < ScriptTarget::Es2016
-                    && matches!(
-                        operator,
-                        SyntaxKind::AsteriskAsteriskToken | SyntaxKind::AsteriskAsteriskEqualsToken
-                    )
-                {
-                    let compound = operator == SyntaxKind::AsteriskAsteriskEqualsToken;
-                    let wrap = compound && parent_precedence > 1;
-                    if wrap {
-                        self.writer.write("(");
-                    }
-                    if compound {
-                        self.emit_expression(data.left, 2)?;
-                        self.writer.write(" = ");
-                    }
-                    self.writer.write("Math.pow(");
-                    self.emit_expression(data.left, 0)?;
-                    self.writer.write(", ");
-                    self.emit_expression(data.right, 0)?;
-                    self.writer.write(")");
-                    if wrap {
-                        self.writer.write(")");
-                    }
-                    return Ok(());
-                }
-                let (precedence, right_associative) = binary_precedence(operator)
-                    .ok_or_else(|| Self::unsupported(data.operator_token, operator))?;
-                let system_export = operator
-                    .is_assignment_operator()
-                    .then(|| self.system_exported_name(data.left))
-                    .flatten();
-                if let Some(name) = &system_export {
-                    self.emit_system_export_call_start(name);
-                }
-                let wrap = system_export.is_none() && precedence < parent_precedence;
-                if wrap {
-                    self.writer.write("(");
-                }
-                self.emit_expression(data.left, precedence)?;
-                let line_break_before_operator = operator != SyntaxKind::CommaToken
-                    && self.source_has_known_line_break_between(data.left, data.operator_token);
-                if line_break_before_operator {
-                    self.writer.indent += 1;
-                    self.writer.newline();
-                } else if operator != SyntaxKind::CommaToken {
-                    self.writer.write(" ");
-                }
-                self.writer.write(
-                    operator_text(operator)
-                        .ok_or_else(|| Self::unsupported(data.operator_token, operator))?,
-                );
-                let line_break_after_operator =
-                    self.source_has_known_line_break_between(data.operator_token, data.right);
-                if line_break_after_operator {
-                    self.writer.indent += 1;
-                    self.writer.newline();
-                } else {
-                    self.writer.write(" ");
-                }
-                self.emit_expression(
-                    data.right,
-                    if right_associative {
-                        precedence
-                    } else {
-                        precedence + 1
-                    },
-                )?;
-                if line_break_after_operator {
-                    self.writer.indent -= 1;
-                }
-                if line_break_before_operator {
-                    self.writer.indent -= 1;
-                }
-                if wrap {
-                    self.writer.write(")");
-                }
-                if system_export.is_some() {
-                    self.writer.write(")");
-                }
+            NodeData::BinaryExpression(_) => {
+                self.emit_binary_expression(id, parent_precedence)?;
             }
             NodeData::PropertyAccessExpression(data) => {
                 if data.question_dot_token.is_some() && self.settings.target < ScriptTarget::Es2020
@@ -11816,25 +11752,166 @@ impl Printer<'_> {
         Ok(())
     }
 
-    fn emit_downlevel_nullish(
+    #[allow(clippy::too_many_lines)]
+    fn emit_binary_expression(
         &mut self,
-        left: NodeId,
-        right: NodeId,
+        expression: NodeId,
         parent_precedence: u8,
     ) -> Result<(), EmitError> {
-        let wrap = parent_precedence > 2;
-        if wrap {
-            self.writer.write("(");
+        enum Action {
+            Binary(NodeId, u8),
+            Expression(NodeId, u8),
+            Write(&'static str),
+            SystemExportStart(String),
+            BeforeOperator { comma: bool, line_break: bool },
+            AfterOperator { line_break: bool },
+            Dedent,
         }
-        self.emit_expression(left, 10)?;
-        self.writer.write(" !== null && ");
-        self.emit_expression(left, 10)?;
-        self.writer.write(" !== void 0 ? ");
-        self.emit_expression(left, 2)?;
-        self.writer.write(" : ");
-        self.emit_expression(right, 2)?;
-        if wrap {
-            self.writer.write(")");
+
+        let mut actions = vec![Action::Binary(expression, parent_precedence)];
+        while let Some(action) = actions.pop() {
+            match action {
+                Action::Expression(id, precedence) => {
+                    let is_binary = matches!(
+                        self.arena.get(id).map(|node| &node.data),
+                        Some(NodeData::BinaryExpression(_))
+                    );
+                    let is_inlined_constant = self.const_enum_emit_mode.inlines_accesses()
+                        && (self.enum_access_values.contains_key(&id)
+                            || self.enum_access_fallbacks.contains_key(&id));
+                    if is_binary && !is_inlined_constant {
+                        actions.push(Action::Binary(id, precedence));
+                    } else {
+                        self.emit_expression(id, precedence)?;
+                    }
+                }
+                Action::Write(text) => self.writer.write(text),
+                Action::SystemExportStart(name) => self.emit_system_export_call_start(&name),
+                Action::BeforeOperator { comma, line_break } => {
+                    if line_break {
+                        self.writer.indent += 1;
+                        self.writer.newline();
+                    } else if !comma {
+                        self.writer.write(" ");
+                    }
+                }
+                Action::AfterOperator { line_break } => {
+                    if line_break {
+                        self.writer.indent += 1;
+                        self.writer.newline();
+                    } else {
+                        self.writer.write(" ");
+                    }
+                }
+                Action::Dedent => self.writer.indent -= 1,
+                Action::Binary(id, precedence) => {
+                    let node = self.node(id)?.clone();
+                    let NodeData::BinaryExpression(binary) = &node.data else {
+                        return Err(Self::unsupported(id, node.kind));
+                    };
+                    let operator = self.node(binary.operator_token)?.kind;
+
+                    if operator == SyntaxKind::QuestionQuestionToken
+                        && self.settings.target < ScriptTarget::Es2020
+                    {
+                        let wrap = precedence > 2;
+                        if wrap {
+                            actions.push(Action::Write(")"));
+                        }
+                        actions.push(Action::Expression(binary.right, 2));
+                        actions.push(Action::Write(" : "));
+                        actions.push(Action::Expression(binary.left, 2));
+                        actions.push(Action::Write(" !== void 0 ? "));
+                        actions.push(Action::Expression(binary.left, 10));
+                        actions.push(Action::Write(" !== null && "));
+                        actions.push(Action::Expression(binary.left, 10));
+                        if wrap {
+                            actions.push(Action::Write("("));
+                        }
+                        continue;
+                    }
+
+                    if self.settings.target < ScriptTarget::Es2016
+                        && matches!(
+                            operator,
+                            SyntaxKind::AsteriskAsteriskToken
+                                | SyntaxKind::AsteriskAsteriskEqualsToken
+                        )
+                    {
+                        let compound = operator == SyntaxKind::AsteriskAsteriskEqualsToken;
+                        let wrap = compound && precedence > 1;
+                        if wrap {
+                            actions.push(Action::Write(")"));
+                        }
+                        actions.push(Action::Write(")"));
+                        actions.push(Action::Expression(binary.right, 0));
+                        actions.push(Action::Write(", "));
+                        actions.push(Action::Expression(binary.left, 0));
+                        actions.push(Action::Write("Math.pow("));
+                        if compound {
+                            actions.push(Action::Write(" = "));
+                            actions.push(Action::Expression(binary.left, 2));
+                        }
+                        if wrap {
+                            actions.push(Action::Write("("));
+                        }
+                        continue;
+                    }
+
+                    let (operator_precedence, right_associative) = binary_precedence(operator)
+                        .ok_or_else(|| Self::unsupported(binary.operator_token, operator))?;
+                    let operator_text = operator_text(operator)
+                        .ok_or_else(|| Self::unsupported(binary.operator_token, operator))?;
+                    let system_export = operator
+                        .is_assignment_operator()
+                        .then(|| self.system_exported_name(binary.left))
+                        .flatten();
+                    let wrap = system_export.is_none() && operator_precedence < precedence;
+                    let line_break_before_operator = operator != SyntaxKind::CommaToken
+                        && self.source_has_known_line_break_between(
+                            binary.left,
+                            binary.operator_token,
+                        );
+                    let line_break_after_operator = self
+                        .source_has_known_line_break_between(binary.operator_token, binary.right);
+
+                    if system_export.is_some() {
+                        actions.push(Action::Write(")"));
+                    }
+                    if wrap {
+                        actions.push(Action::Write(")"));
+                    }
+                    if line_break_before_operator {
+                        actions.push(Action::Dedent);
+                    }
+                    if line_break_after_operator {
+                        actions.push(Action::Dedent);
+                    }
+                    actions.push(Action::Expression(
+                        binary.right,
+                        if right_associative {
+                            operator_precedence
+                        } else {
+                            operator_precedence + 1
+                        },
+                    ));
+                    actions.push(Action::AfterOperator {
+                        line_break: line_break_after_operator,
+                    });
+                    actions.push(Action::Write(operator_text));
+                    actions.push(Action::BeforeOperator {
+                        comma: operator == SyntaxKind::CommaToken,
+                        line_break: line_break_before_operator,
+                    });
+                    actions.push(Action::Expression(binary.left, operator_precedence));
+                    if wrap {
+                        actions.push(Action::Write("("));
+                    }
+                    if let Some(name) = system_export {
+                        actions.push(Action::SystemExportStart(name));
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -12200,6 +12277,9 @@ impl Printer<'_> {
     }
 
     fn emit_expression_list_line_comments(&mut self, start: u32, end: u32) {
+        if self.settings.remove_comments {
+            return;
+        }
         let starts_on_new_line = usize::try_from(start)
             .ok()
             .zip(usize::try_from(end).ok())
@@ -12213,6 +12293,9 @@ impl Printer<'_> {
     }
 
     fn emit_inline_block_comments(&mut self, start: u32, end: u32) {
+        if self.settings.remove_comments {
+            return;
+        }
         let start = usize::try_from(start).unwrap_or(usize::MAX);
         let end = usize::try_from(end).unwrap_or(usize::MAX);
         let Some(trivia) = self.source_text.get(start..end) else {
@@ -12740,6 +12823,7 @@ mod tests {
                 source_map: true,
                 inline_source_map: false,
                 no_emit_helpers: false,
+                remove_comments: false,
                 use_define_for_class_fields: None,
             },
         )
@@ -12768,6 +12852,7 @@ mod tests {
                 source_map: false,
                 inline_source_map: false,
                 no_emit_helpers: false,
+                remove_comments: false,
                 use_define_for_class_fields: None,
             },
         )
@@ -12804,6 +12889,7 @@ mod tests {
                 source_map: true,
                 inline_source_map: false,
                 no_emit_helpers: false,
+                remove_comments: false,
                 use_define_for_class_fields: None,
             },
             &EmitContext {
@@ -12839,6 +12925,7 @@ mod tests {
                 source_map: false,
                 inline_source_map: false,
                 no_emit_helpers: false,
+                remove_comments: false,
                 use_define_for_class_fields: None,
             },
         )
@@ -13170,6 +13257,19 @@ mod tests {
     }
 
     #[test]
+    fn separates_a_final_block_comment_from_the_synthesized_newline() {
+        assert_eq!(
+            emit_with(
+                "let value = 1;\n/* retained\n*/",
+                ScriptTarget::Es2015,
+                ModuleKind::None,
+            )
+            .code,
+            "let value = 1;\n/* retained\n*/ \n"
+        );
+    }
+
+    #[test]
     fn preserves_omitted_array_binding_slots() {
         assert_eq!(
             emit_with(
@@ -13241,6 +13341,7 @@ mod tests {
                 source_map: false,
                 inline_source_map: false,
                 no_emit_helpers: false,
+                remove_comments: false,
                 use_define_for_class_fields: None,
             },
         )
@@ -13553,6 +13654,7 @@ mod tests {
                 source_map: false,
                 inline_source_map: false,
                 no_emit_helpers: false,
+                remove_comments: false,
                 use_define_for_class_fields: None,
             },
             &EmitContext {
@@ -13827,6 +13929,7 @@ mod tests {
                     source_map: false,
                     inline_source_map: false,
                     no_emit_helpers: false,
+                    remove_comments: false,
                     use_define_for_class_fields: None,
                 },
                 &EmitContext {
@@ -14295,6 +14398,7 @@ mod tests {
                 source_map: false,
                 inline_source_map: false,
                 no_emit_helpers: false,
+                remove_comments: false,
                 use_define_for_class_fields: None,
             },
         )
@@ -14372,6 +14476,7 @@ class Board {
                 source_map: false,
                 inline_source_map: false,
                 no_emit_helpers: false,
+                remove_comments: false,
                 use_define_for_class_fields: None,
             },
         )
@@ -14401,6 +14506,7 @@ class Board {
                 source_map: false,
                 inline_source_map: false,
                 no_emit_helpers: false,
+                remove_comments: false,
                 use_define_for_class_fields: None,
             },
         )
@@ -14524,6 +14630,26 @@ class Board {
                 "x = 1; // Should be error\n",
                 "var y = 1;\n",
                 "y = moduleA; // should be error\n",
+            )
+        );
+    }
+
+    #[test]
+    fn preserves_trailing_comments_on_namespaced_class_declarations() {
+        let source = concat!(
+            "namespace M {\n",
+            "    export class C implements I {} // unresolved I\n",
+            "}\n",
+        );
+        assert_eq!(
+            emit_with(source, ScriptTarget::Es2015, ModuleKind::None).code,
+            concat!(
+                "var M;\n",
+                "(function (M) {\n",
+                "    class C {\n",
+                "    } // unresolved I\n",
+                "    M.C = C;\n",
+                "})(M || (M = {}));\n",
             )
         );
     }
@@ -14676,6 +14802,7 @@ class Board {
                 source_map: false,
                 inline_source_map: false,
                 no_emit_helpers: false,
+                remove_comments: false,
                 use_define_for_class_fields: None,
             },
         )
@@ -14710,6 +14837,7 @@ class Board {
                     source_map: false,
                     inline_source_map: false,
                     no_emit_helpers: false,
+                    remove_comments: false,
                     use_define_for_class_fields: None,
                 },
             )
@@ -14734,6 +14862,7 @@ class Board {
                 source_map: false,
                 inline_source_map: false,
                 no_emit_helpers: false,
+                remove_comments: false,
                 use_define_for_class_fields: None,
             },
         )
@@ -15264,6 +15393,26 @@ class Board {
             emit_with(source, ScriptTarget::Es2015, ModuleKind::CommonJs).code,
             "\"use strict\";\n/* file header */\nObject.defineProperty(exports, \"__esModule\", { value: true });\nexports.value = void 0;\nexports.value = 1;\n"
         );
+    }
+
+    #[test]
+    fn remove_comments_suppresses_detached_inline_and_trailing_source_comments() {
+        let source = "// header\n\nconst value = 1 /* inline */; // trailing";
+        let parsed = parse_source_file(source);
+        let mut settings = ts_options::CompilerOptions::default().printer_settings();
+        settings.always_strict = false;
+        settings.target = ScriptTarget::EsNext;
+        settings.module = ModuleKind::EsNext;
+        settings.remove_comments = true;
+        let result = emit_source_file_with_settings(
+            &parsed.arena,
+            parsed.source_file,
+            "source.ts",
+            source,
+            settings,
+        )
+        .unwrap();
+        assert_eq!(result.code, "const value = 1;\n");
     }
 
     #[test]

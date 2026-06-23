@@ -98,6 +98,7 @@ pub struct CompilerOptions {
     pub no_emit: bool,
     pub no_emit_helpers: bool,
     pub no_emit_on_error: bool,
+    pub remove_comments: bool,
     pub no_implicit_any: bool,
     pub no_implicit_returns: bool,
     pub no_lib: bool,
@@ -153,6 +154,7 @@ impl Default for CompilerOptions {
             no_emit: false,
             no_emit_helpers: false,
             no_emit_on_error: false,
+            remove_comments: false,
             no_implicit_any: false,
             no_implicit_returns: false,
             no_lib: false,
@@ -202,6 +204,7 @@ pub struct PrinterSettings {
     pub source_map: bool,
     pub inline_source_map: bool,
     pub no_emit_helpers: bool,
+    pub remove_comments: bool,
     pub use_define_for_class_fields: Option<bool>,
 }
 
@@ -267,6 +270,7 @@ impl CompilerOptions {
                 "noemit" => self.no_emit = overrides.no_emit,
                 "noemithelpers" => self.no_emit_helpers = overrides.no_emit_helpers,
                 "noemitonerror" => self.no_emit_on_error = overrides.no_emit_on_error,
+                "removecomments" => self.remove_comments = overrides.remove_comments,
                 "noimplicitany" => self.no_implicit_any = overrides.no_implicit_any,
                 "noimplicitreturns" => self.no_implicit_returns = overrides.no_implicit_returns,
                 "nolib" => self.no_lib = overrides.no_lib,
@@ -349,6 +353,7 @@ impl CompilerOptions {
                 && !self.emit_declaration_only,
             inline_source_map: self.inline_source_map,
             no_emit_helpers: self.no_emit_helpers,
+            remove_comments: self.remove_comments,
             use_define_for_class_fields: self.use_define_for_class_fields,
         }
     }
@@ -461,6 +466,9 @@ pub fn parse_compiler_options_map(options: &BTreeMap<String, JsonValue>) -> Pars
             "noemitonerror" => {
                 parsed.no_emit_on_error = boolean(original_name, value, &mut diagnostics);
             }
+            "removecomments" => {
+                parsed.remove_comments = boolean(original_name, value, &mut diagnostics);
+            }
             "noimplicitany" => {
                 parsed.no_implicit_any = boolean(original_name, value, &mut diagnostics);
             }
@@ -561,6 +569,7 @@ struct PartialOptions {
     no_emit: Option<bool>,
     no_emit_helpers: Option<bool>,
     no_emit_on_error: Option<bool>,
+    remove_comments: Option<bool>,
     no_implicit_any: Option<bool>,
     no_implicit_returns: Option<bool>,
     no_lib: Option<bool>,
@@ -634,6 +643,7 @@ impl PartialOptions {
             no_emit: self.no_emit.unwrap_or(false),
             no_emit_helpers: self.no_emit_helpers.unwrap_or(false),
             no_emit_on_error: self.no_emit_on_error.unwrap_or(false),
+            remove_comments: self.remove_comments.unwrap_or(false),
             no_implicit_any: self.no_implicit_any.unwrap_or(strict),
             no_implicit_returns: self.no_implicit_returns.unwrap_or(false),
             no_lib: self.no_lib.unwrap_or(false),
@@ -1031,6 +1041,14 @@ mod tests {
         assert!(result.is_ok(), "{:?}", result.diagnostics);
         assert!(result.options.no_emit_helpers);
         assert!(result.options.printer_settings().no_emit_helpers);
+    }
+
+    #[test]
+    fn threads_remove_comments_to_the_printer() {
+        let result = parse_compiler_options(&object([("removeComments", JsonValue::Bool(true))]));
+        assert!(result.is_ok(), "{:?}", result.diagnostics);
+        assert!(result.options.remove_comments);
+        assert!(result.options.printer_settings().remove_comments);
     }
 
     #[test]

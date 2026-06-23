@@ -839,6 +839,7 @@ const SCALAR_OPTION_NAMES: &[&str] = &[
     "outDir",
     "preserveConstEnums",
     "resolveJsonModule",
+    "removeComments",
     "rootDir",
     "skipLibCheck",
     "sourceMap",

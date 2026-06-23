@@ -1420,8 +1420,29 @@ impl<'a> Parser<'a> {
             let keyword = self.consume();
             let mut types = Vec::new();
             loop {
-                let expression = self.parse_heritage_expression();
-                let type_arguments = self.parse_type_arguments();
+                let mut expression = self.parse_heritage_expression();
+                let mut type_arguments = self.parse_type_arguments();
+                while self.current.kind == SyntaxKind::OpenParenToken {
+                    let arguments = self.parse_argument_list();
+                    let end = arguments.range.end;
+                    let mut children = vec![expression];
+                    extend_list_children(&mut children, type_arguments.as_ref());
+                    children.extend(arguments.nodes.iter().copied());
+                    expression = self.alloc_node(
+                        SyntaxKind::CallExpression,
+                        TextRange::new(self.node_start(expression), end),
+                        NodeData::CallExpression(Box::new(CallExpressionData {
+                            arguments,
+                            expression,
+                            question_dot_token: None,
+                            symbol: None,
+                            type_arguments,
+                            facts: 0,
+                        })),
+                        &children,
+                    );
+                    type_arguments = self.parse_type_arguments();
+                }
                 let end = type_arguments
                     .as_ref()
                     .map_or_else(|| self.node_end(expression), |list| list.range.end);
@@ -3357,7 +3378,13 @@ impl<'a> Parser<'a> {
         let start = self.current.range.start;
         let expression = self.parse_binary_expression(0);
         let expression_end = self.node_end(expression);
-        let end = self.parse_semicolon(expression_end);
+        let end = if self.current.kind == SyntaxKind::ColonToken {
+            self.error_current("Expected ';'.");
+            self.bump();
+            expression_end
+        } else {
+            self.parse_semicolon(expression_end)
+        };
         self.alloc_node(
             SyntaxKind::ExpressionStatement,
             TextRange::new(start, end),
@@ -4403,6 +4430,7 @@ impl<'a> Parser<'a> {
             | SyntaxKind::UndefinedKeyword
             | SyntaxKind::ThisKeyword
             | SyntaxKind::SuperKeyword => self.parse_keyword_expression(),
+            kind if is_keyword_type(kind) => self.parse_identifier_name("Expected an expression."),
             kind if is_contextual_keyword(kind) => {
                 self.parse_identifier_name("Expected an expression.")
             }
@@ -6309,6 +6337,7 @@ fn is_expression_terminator(kind: SyntaxKind) -> bool {
         SyntaxKind::SemicolonToken
             | SyntaxKind::CommaToken
             | SyntaxKind::CloseParenToken
+            | SyntaxKind::CloseBracketToken
             | SyntaxKind::CloseBraceToken
             | SyntaxKind::EndOfFile
     )
@@ -8954,6 +8983,109 @@ mod tests {
             NodeData::QualifiedName(_)
         ));
         assert_eq!(heritage.type_arguments.as_ref().unwrap().nodes.len(), 1);
+
+        let generic_call = parse_source_file("class Derived<T> extends base<T>() {}");
+        assert!(
+            generic_call.diagnostics.is_empty(),
+            "{:?}",
+            generic_call.diagnostics
+        );
+        let generic_call_statement = source_statements(&generic_call)[0];
+        let NodeData::ClassDeclaration(class) =
+            &generic_call.arena.get(generic_call_statement).unwrap().data
+        else {
+            panic!("expected class declaration");
+        };
+        let clause_id = class.heritage_clauses.as_ref().unwrap().nodes[0];
+        let NodeData::HeritageClause(clause) = &generic_call.arena.get(clause_id).unwrap().data
+        else {
+            panic!("expected heritage clause");
+        };
+        let NodeData::ExpressionWithTypeArguments(heritage) =
+            &generic_call.arena.get(clause.types.nodes[0]).unwrap().data
+        else {
+            panic!("expected heritage expression");
+        };
+        assert!(heritage.type_arguments.is_none());
+        let NodeData::CallExpression(call) =
+            &generic_call.arena.get(heritage.expression).unwrap().data
+        else {
+            panic!("expected generic call expression");
+        };
+        assert_eq!(call.type_arguments.as_ref().unwrap().nodes.len(), 1);
+        assert!(call.arguments.nodes.is_empty());
+    }
+
+    #[test]
+    fn preserves_keyword_types_used_as_recovery_expressions() {
+        let result = parse_source_file("any; number; string;");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let statements = source_statements(&result);
+        assert_eq!(statements.len(), 3);
+        for (statement, expected) in statements.iter().zip(["any", "number", "string"]) {
+            let NodeData::ExpressionStatement(statement) =
+                &result.arena.get(*statement).unwrap().data
+            else {
+                panic!("expected expression statement");
+            };
+            let NodeData::Identifier(identifier) =
+                &result.arena.get(statement.expression).unwrap().data
+            else {
+                panic!("expected identifier expression");
+            };
+            assert_eq!(identifier.text, expected);
+        }
+    }
+
+    #[test]
+    fn recovers_after_colons_in_expression_statements() {
+        let result = parse_source_file("{ this.value: any; }");
+        let statements = source_statements(&result);
+        let NodeData::Block(block) = &result.arena.get(statements[0]).unwrap().data else {
+            panic!("expected block");
+        };
+        assert_eq!(block.statements.nodes.len(), 2);
+        let NodeData::ExpressionStatement(recovered) =
+            &result.arena.get(block.statements.nodes[1]).unwrap().data
+        else {
+            panic!("expected recovered expression statement");
+        };
+        let NodeData::Identifier(identifier) =
+            &result.arena.get(recovered.expression).unwrap().data
+        else {
+            panic!("expected identifier expression");
+        };
+        assert_eq!(identifier.text, "any");
+        assert!(result.arena.iter().all(|(_, node)| {
+            !matches!(&node.data, NodeData::Identifier(identifier) if identifier.text.is_empty())
+        }));
+    }
+
+    #[test]
+    fn keeps_empty_element_access_before_call_parentheses() {
+        let result = parse_source_file("new Z[]();");
+        let statements = source_statements(&result);
+        let NodeData::ExpressionStatement(statement) =
+            &result.arena.get(statements[0]).unwrap().data
+        else {
+            panic!("expected expression statement");
+        };
+        let NodeData::CallExpression(call) = &result.arena.get(statement.expression).unwrap().data
+        else {
+            panic!("expected call expression");
+        };
+        assert!(call.arguments.nodes.is_empty());
+        let NodeData::ElementAccessExpression(access) =
+            &result.arena.get(call.expression).unwrap().data
+        else {
+            panic!("expected element access expression");
+        };
+        let NodeData::Identifier(argument) =
+            &result.arena.get(access.argument_expression).unwrap().data
+        else {
+            panic!("expected missing identifier");
+        };
+        assert!(argument.text.is_empty());
     }
 
     #[test]
