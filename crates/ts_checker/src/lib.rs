@@ -2506,6 +2506,9 @@ impl<'a> Checker<'a> {
             self.check_parameter(*parameter);
         }
         let mut local_scope = HashMap::new();
+        if data.body.is_some() {
+            local_scope.insert("arguments".to_owned(), self.result.types.any());
+        }
         for (index, parameter) in data.parameters.nodes.iter().enumerate() {
             let Some(NodeData::ParameterDeclaration(parameter_data)) =
                 self.arena.get(*parameter).map(|node| &node.data)
@@ -10560,6 +10563,21 @@ mod tests {
                 .collect::<Vec<_>>(),
             source.statements.nodes[..2]
         );
+    }
+
+    #[test]
+    fn function_has_implicit_arguments_value() {
+        let parsed = parse_source_file("function f() { arguments; }");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file_with_options(
+            &parsed.arena,
+            parsed.source_file,
+            &bindings,
+            CheckerOptions::default(),
+        );
+
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
     }
 
     #[test]
