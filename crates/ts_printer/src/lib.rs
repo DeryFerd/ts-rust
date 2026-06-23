@@ -246,6 +246,12 @@ pub fn emit_source_file_with_context(
     };
     let source_end = node.range.end.get();
     printer.runtime_identifier_uses = runtime_identifier_uses(arena, source_file);
+    // The classic JSX transform synthesizes `React.createElement` calls, so a default
+    // `React` import is a runtime dependency even when every source-level reference is
+    // confined to type positions.
+    if settings.jsx == JsxEmit::React && source_has_jsx(arena) {
+        printer.runtime_identifier_uses.insert("React".to_owned());
+    }
     if settings.module == ModuleKind::CommonJs {
         printer.commonjs_default_imports = commonjs_default_imports(
             arena,
@@ -1203,6 +1209,15 @@ fn runtime_identifier_uses(arena: &NodeArena, source_file: NodeId) -> HashSet<St
             identifier_is_runtime_use(arena, id, source_file).then(|| identifier.text.clone())
         })
         .collect()
+}
+
+fn source_has_jsx(arena: &NodeArena) -> bool {
+    arena.iter().any(|(_, node)| {
+        matches!(
+            node.data,
+            NodeData::JsxElement(_) | NodeData::JsxSelfClosingElement(_) | NodeData::JsxFragment(_)
+        )
+    })
 }
 
 fn identifier_is_runtime_use(arena: &NodeArena, id: NodeId, source_file: NodeId) -> bool {
@@ -7371,7 +7386,7 @@ impl Printer<'_> {
         self.writer.newline();
         self.writer.indent += 1;
         self.namespace_declarations.push(HashSet::new());
-        self.prepare_returned_class_expression_temps(id, data);
+        self.prepare_class_expression_temps(id, data);
         let mut previous_end = node.range.start.get().saturating_add(1);
         let mut previous_emitted = false;
         for statement in &data.statements.nodes {
@@ -7429,29 +7444,61 @@ impl Printer<'_> {
         Ok(())
     }
 
-    fn prepare_returned_class_expression_temps(
+    fn prepare_class_expression_temps(
         &mut self,
         block_id: NodeId,
         block: &ts_ast::BlockData,
     ) {
-        if !(ScriptTarget::Es2015..ScriptTarget::Es2022).contains(&self.settings.target) {
+        if self.settings.target >= ScriptTarget::Es2022 {
             return;
         }
         let class_expressions = block
             .statements
             .nodes
             .iter()
-            .filter_map(|statement| {
-                let NodeData::ReturnStatement(return_) = &self.arena.get(*statement)?.data else {
-                    return None;
+            .flat_map(|statement| {
+                let Some(statement) = self.arena.get(*statement) else {
+                    return Vec::new();
                 };
-                let expression = return_.expression?;
-                let NodeData::ClassExpression(class) = &self.arena.get(expression)?.data else {
-                    return None;
+                let expressions = match &statement.data {
+                    NodeData::ReturnStatement(return_) => {
+                        return_.expression.into_iter().collect::<Vec<_>>()
+                    }
+                    NodeData::VariableStatement(variable) => {
+                        let Some(NodeData::VariableDeclarationList(list)) = self
+                            .arena
+                            .get(variable.declaration_list)
+                            .map(|node| &node.data)
+                        else {
+                            return Vec::new();
+                        };
+                        list.declarations
+                            .nodes
+                            .iter()
+                            .filter_map(|declaration| {
+                                let NodeData::VariableDeclaration(declaration) =
+                                    &self.arena.get(*declaration)?.data
+                                else {
+                                    return None;
+                                };
+                                declaration.initializer
+                            })
+                            .collect()
+                    }
+                    _ => Vec::new(),
                 };
-                let declaration = Self::class_expression_as_declaration(class);
-                self.class_expression_requires_post_class_lowering(&declaration)
-                    .then_some(expression)
+                expressions
+                    .into_iter()
+                    .filter(|expression| {
+                        let Some(NodeData::ClassExpression(class)) =
+                            self.arena.get(*expression).map(|node| &node.data)
+                        else {
+                            return false;
+                        };
+                        let declaration = Self::class_expression_as_declaration(class);
+                        self.class_expression_requires_post_class_lowering(&declaration)
+                    })
+                    .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
         let mut claimed = HashSet::new();
@@ -8854,23 +8901,51 @@ impl Printer<'_> {
         data: &ts_ast::ClassExpressionData,
     ) -> Result<(), EmitError> {
         let declaration = Self::class_expression_as_declaration(data);
-        if self.settings.target < ScriptTarget::Es2015 {
-            let name = declaration
-                .name
-                .and_then(|name| self.identifier_text(name).ok())
-                .unwrap_or("_class")
-                .to_owned();
-            return self.emit_downlevel_class_value(&declaration, &name);
-        }
-        if self.settings.target < ScriptTarget::Es2022
-            && self.class_expression_requires_post_class_lowering(&declaration)
-        {
+        let needs_post_class_lowering = self.settings.target < ScriptTarget::Es2022
+            && self.class_expression_requires_post_class_lowering(&declaration);
+        if needs_post_class_lowering {
             let Some(temp) = self.class_expression_temps.get(&id).cloned() else {
                 return Err(Self::unsupported(id, SyntaxKind::ClassExpression));
             };
-            return self.emit_lowered_class_expression(&declaration, &temp);
+            let downlevel_name = (self.settings.target < ScriptTarget::Es2015)
+                .then(|| self.class_expression_downlevel_name(id, &declaration));
+            return self.emit_lowered_class_expression(id, &declaration, &temp, downlevel_name.as_deref());
+        }
+        if self.settings.target < ScriptTarget::Es2015 {
+            let name = self.class_expression_downlevel_name(id, &declaration);
+            return self.emit_downlevel_class_value(&declaration, &name);
         }
         self.emit_class(&declaration)
+    }
+
+    fn class_expression_downlevel_name(
+        &mut self,
+        id: NodeId,
+        data: &ts_ast::ClassDeclarationData,
+    ) -> String {
+        if let Some(name) = data.name.and_then(|name| self.identifier_text(name).ok()) {
+            return name.to_owned();
+        }
+        if data.members.nodes.iter().any(|member| {
+            matches!(
+                self.arena.get(*member).map(|node| &node.data),
+                Some(NodeData::PropertyDeclaration(_))
+            )
+        }) {
+            return self.generated_names.generate("class");
+        }
+        self.class_expression_inferred_name(id)
+            .unwrap_or_else(|| "_class".to_owned())
+    }
+
+    fn class_expression_inferred_name(&self, id: NodeId) -> Option<String> {
+        let parent = self.arena.get(id)?.parent?;
+        let NodeData::VariableDeclaration(declaration) = &self.arena.get(parent)?.data else {
+            return None;
+        };
+        (declaration.initializer == Some(id))
+            .then(|| declaration_name_text(self.arena, declaration.name).map(str::to_owned))
+            .flatten()
     }
 
     fn class_expression_as_declaration(
@@ -8893,8 +8968,10 @@ impl Printer<'_> {
 
     fn emit_lowered_class_expression(
         &mut self,
+        id: NodeId,
         data: &ts_ast::ClassDeclarationData,
         temp: &str,
+        downlevel_name: Option<&str>,
     ) -> Result<(), EmitError> {
         let mut core = data.clone();
         core.members.nodes.retain(|member| {
@@ -8914,8 +8991,22 @@ impl Printer<'_> {
         self.writer.write(temp);
         self.writer.write(" = ");
         self.writer.indent += 1;
-        self.emit_class(&core)?;
+        if let Some(name) = downlevel_name {
+            self.emit_downlevel_class_value(&core, name)?;
+        } else {
+            self.emit_class(&core)?;
+        }
         self.writer.write(",");
+        if data.name.is_none()
+            && let Some(name) = self.class_expression_inferred_name(id)
+        {
+            self.writer.newline();
+            self.writer.write("__setFunctionName(");
+            self.writer.write(temp);
+            self.writer.write(", ");
+            write_quoted(&mut self.writer, &name);
+            self.writer.write("),");
+        }
         for member in &data.members.nodes {
             let node = self.node(*member)?.clone();
             match &node.data {
@@ -9039,6 +9130,15 @@ impl Printer<'_> {
             && !self.has_parameter_properties(&method.parameters)
         {
             self.writer.write(" { }");
+            self.writer.newline();
+            return Ok(());
+        }
+        if !self.has_instance_field_initializers(data)
+            && !self.has_parameter_properties(&method.parameters)
+            && self.single_line_body_statement(body_id)?.is_some()
+        {
+            self.writer.write(" ");
+            self.emit_function_body(body_id)?;
             self.writer.newline();
             return Ok(());
         }
@@ -11863,7 +11963,7 @@ impl Printer<'_> {
             self.writer.write("<");
             self.emit_expression(data.tag_name, 0)?;
             self.emit_jsx_attributes(data.attributes, true)?;
-            self.writer.write(" />");
+            self.writer.write("/>");
             return Ok(());
         }
         if self.settings.jsx == JsxEmit::React {
@@ -12235,7 +12335,7 @@ impl Printer<'_> {
             self.writer.write("null");
             return Ok(());
         }
-        self.writer.write("{");
+        self.writer.write("{ ");
         for (index, attribute) in attributes.properties.nodes.iter().enumerate() {
             if index != 0 {
                 self.writer.write(", ");
@@ -12268,7 +12368,7 @@ impl Printer<'_> {
                 self.writer.write("true");
             }
         }
-        self.writer.write("}");
+        self.writer.write(" }");
         Ok(())
     }
 
@@ -13628,20 +13728,30 @@ mod tests {
         let source = "const view = <Panel enabled {...props} title='hello'><span>{value}</span><Icon /></Panel>;";
         assert_eq!(
             emit_jsx(source, JsxEmit::Preserve),
-            "const view = <Panel enabled {...props} title=\"hello\"><span>{value}</span><Icon /></Panel>;\n"
+            "const view = <Panel enabled {...props} title=\"hello\"><span>{value}</span><Icon/></Panel>;\n"
         );
         assert_eq!(
             emit_jsx(source, JsxEmit::React),
-            "const view = React.createElement(Panel, {enabled: true, ...props, title: \"hello\"}, React.createElement(\"span\", null, value), React.createElement(Icon, null));\n"
+            "const view = React.createElement(Panel, { enabled: true, ...props, title: \"hello\" }, React.createElement(\"span\", null, value), React.createElement(Icon, null));\n"
         );
         let fragment = "const view = <><span />{value}</>;";
         assert_eq!(
             emit_jsx(fragment, JsxEmit::Preserve),
-            "const view = <><span />{value}</>;\n"
+            "const view = <><span/>{value}</>;\n"
         );
         assert_eq!(
             emit_jsx(fragment, JsxEmit::React),
             "const view = React.createElement(React.Fragment, null, React.createElement(\"span\", null), value);\n"
+        );
+    }
+
+    #[test]
+    fn classic_jsx_retains_the_react_import_used_by_the_transform() {
+        let source =
+            "import React from 'react'; type ReactNode = React.ReactNode; const view = <Panel />;";
+        assert_eq!(
+            emit_jsx(source, JsxEmit::React),
+            "import React from 'react';\nconst view = React.createElement(Panel, null);\n"
         );
     }
 
