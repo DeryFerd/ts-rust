@@ -499,6 +499,9 @@ impl<'a> Parser<'a> {
         };
         let abstract_starts_expression = self.current.kind == SyntaxKind::AbstractKeyword
             && self.next_token_preceded_by_line_break();
+        let async_starts_function = self.current.kind == SyntaxKind::AsyncKeyword
+            && !self.next_token_preceded_by_line_break()
+            && self.next_token_kind() == SyntaxKind::FunctionKeyword;
         match self.current.kind {
             SyntaxKind::OpenBraceToken => self.parse_block(),
             SyntaxKind::ConstKeyword if is_const_enum => self.parse_const_enum_declaration(),
@@ -536,6 +539,7 @@ impl<'a> Parser<'a> {
             SyntaxKind::AbstractKeyword if abstract_starts_expression => {
                 self.parse_expression_statement()
             }
+            SyntaxKind::AsyncKeyword if !async_starts_function => self.parse_expression_statement(),
             SyntaxKind::DeclareKeyword | SyntaxKind::AbstractKeyword | SyntaxKind::AsyncKeyword => {
                 self.parse_modified_statement()
             }
@@ -2703,6 +2707,7 @@ impl<'a> Parser<'a> {
             .and_then(|node| match &node.data {
                 NodeData::ClassDeclaration(data) => data.modifiers.clone(),
                 NodeData::FunctionDeclaration(data) => data.modifiers.clone(),
+                NodeData::FunctionExpression(data) => data.modifiers.clone(),
                 NodeData::InterfaceDeclaration(data) => data.modifiers.clone(),
                 NodeData::TypeAliasDeclaration(data) => data.modifiers.clone(),
                 NodeData::EnumDeclaration(data) => data.modifiers.clone(),
@@ -2726,6 +2731,7 @@ impl<'a> Parser<'a> {
             match &mut node.data {
                 NodeData::ClassDeclaration(data) => data.modifiers = Some(modifiers.clone()),
                 NodeData::FunctionDeclaration(data) => data.modifiers = Some(modifiers.clone()),
+                NodeData::FunctionExpression(data) => data.modifiers = Some(modifiers.clone()),
                 NodeData::InterfaceDeclaration(data) => data.modifiers = Some(modifiers.clone()),
                 NodeData::TypeAliasDeclaration(data) => data.modifiers = Some(modifiers.clone()),
                 NodeData::EnumDeclaration(data) => data.modifiers = Some(modifiers.clone()),
@@ -3617,6 +3623,9 @@ impl<'a> Parser<'a> {
 
     #[allow(clippy::too_many_lines)]
     fn parse_postfix_expression(&mut self) -> NodeId {
+        let async_function = self.current.kind == SyntaxKind::AsyncKeyword
+            && !self.next_token_preceded_by_line_break()
+            && self.next_token_kind() == SyntaxKind::FunctionKeyword;
         if self.current.kind == SyntaxKind::AwaitKeyword {
             return self.parse_await_expression();
         }
@@ -3657,7 +3666,9 @@ impl<'a> Parser<'a> {
                 &[operand],
             );
         }
-        let mut expression = if self.current.kind == SyntaxKind::NewKeyword {
+        let mut expression = if async_function {
+            self.parse_async_function_expression()
+        } else if self.current.kind == SyntaxKind::NewKeyword {
             self.parse_new_expression()
         } else {
             self.parse_primary_expression()
@@ -5062,7 +5073,29 @@ impl<'a> Parser<'a> {
         let type_parameters = self.parse_type_parameters();
         let parameters = self.parse_parameter_list();
         let return_type = self.parse_optional_type_annotation();
-        let body = self.parse_block();
+        let body = if self.current.kind == SyntaxKind::OpenBraceToken {
+            self.parse_block()
+        } else {
+            self.error_current("Expected '{'.");
+            let position = self.current.range.start;
+            self.alloc_node(
+                SyntaxKind::Block,
+                TextRange::new(position, position),
+                NodeData::Block(Box::new(BlockData {
+                    flow_node: None,
+                    locals: SymbolTable,
+                    multi_line: false,
+                    next_container: None,
+                    statements: NodeList {
+                        range: TextRange::new(position, position),
+                        nodes: Vec::new(),
+                        has_trailing_comma: false,
+                    },
+                    facts: 0,
+                })),
+                &[],
+            )
+        };
         let mut children = Vec::new();
         children.extend(asterisk_token);
         children.extend(name);
@@ -5092,6 +5125,14 @@ impl<'a> Parser<'a> {
             })),
             &children,
         )
+    }
+
+    fn parse_async_function_expression(&mut self) -> NodeId {
+        let start = self.current.range.start;
+        let async_modifier = self.consume_token_node();
+        let expression = self.parse_function_expression();
+        self.attach_modifiers(expression, vec![async_modifier], start);
+        expression
     }
 
     fn parse_template_literal(&mut self) -> NodeId {
@@ -8373,6 +8414,137 @@ mod tests {
                 SyntaxKind::FunctionExpression
             );
         }
+    }
+
+    #[test]
+    fn parses_async_generator_declarations_and_expressions_with_parent_links() {
+        let source = concat!(
+            "async function * declared(source) { yield source; yield* source; } ",
+            "const expression = async function* named() { yield; };",
+        );
+        let result = parse_source_file(source);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let statements = source_statements(&result);
+        assert_eq!(statements.len(), 2);
+
+        let declaration_id = statements[0];
+        let declaration_node = result.arena.get(declaration_id).unwrap();
+        let NodeData::FunctionDeclaration(declaration) = &declaration_node.data else {
+            panic!("expected async generator declaration");
+        };
+        assert_eq!(
+            &source[declaration_node.range.start.get() as usize
+                ..declaration_node.range.end.get() as usize],
+            "async function * declared(source) { yield source; yield* source; }"
+        );
+        let declaration_modifier = declaration.modifiers.as_ref().unwrap().list.nodes[0];
+        assert_eq!(
+            result.arena.get(declaration_modifier).unwrap().kind,
+            SyntaxKind::AsyncKeyword
+        );
+        assert_eq!(
+            result.arena.get(declaration_modifier).unwrap().parent,
+            Some(declaration_id)
+        );
+        assert_eq!(
+            result
+                .arena
+                .get(declaration.asterisk_token.unwrap())
+                .unwrap()
+                .parent,
+            Some(declaration_id)
+        );
+        assert_eq!(
+            result.arena.get(declaration.body.unwrap()).unwrap().parent,
+            Some(declaration_id)
+        );
+
+        let (list, _) = variable_list(&result, statements[1]);
+        let variable = declaration_nodes(&result, list)[0];
+        let NodeData::VariableDeclaration(variable) = &result.arena.get(variable).unwrap().data
+        else {
+            panic!("expected variable declaration");
+        };
+        let expression_id = variable.initializer.unwrap();
+        let expression_node = result.arena.get(expression_id).unwrap();
+        let NodeData::FunctionExpression(expression) = &expression_node.data else {
+            panic!("expected async generator expression");
+        };
+        assert_eq!(
+            &source[expression_node.range.start.get() as usize
+                ..expression_node.range.end.get() as usize],
+            "async function* named() { yield; }"
+        );
+        let expression_modifier = expression.modifiers.as_ref().unwrap().list.nodes[0];
+        for child in [
+            expression_modifier,
+            expression.asterisk_token.unwrap(),
+            expression.body,
+        ] {
+            assert_eq!(result.arena.get(child).unwrap().parent, Some(expression_id));
+        }
+
+        let yields = result
+            .arena
+            .iter()
+            .filter_map(|(id, node)| (node.kind == SyntaxKind::YieldExpression).then_some(id))
+            .collect::<Vec<_>>();
+        assert_eq!(yields.len(), 3);
+        let delegated = yields
+            .into_iter()
+            .find(|yield_id| {
+                matches!(
+                    &result.arena.get(*yield_id).unwrap().data,
+                    NodeData::YieldExpression(yield_expression)
+                        if yield_expression.asterisk_token.is_some()
+                )
+            })
+            .expect("expected delegated yield");
+        let NodeData::YieldExpression(delegated_yield) = &result.arena.get(delegated).unwrap().data
+        else {
+            unreachable!();
+        };
+        assert_eq!(
+            result
+                .arena
+                .get(delegated_yield.asterisk_token.unwrap())
+                .unwrap()
+                .parent,
+            Some(delegated)
+        );
+    }
+
+    #[test]
+    fn recovers_after_an_async_generator_expression_missing_its_body() {
+        let result = parse_source_file("const broken = async function* named(); const after = 1;");
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == Some(1005))
+        );
+        let statements = source_statements(&result);
+        assert_eq!(statements.len(), 2, "{:?}", result.diagnostics);
+        assert_eq!(
+            result.arena.get(statements[1]).unwrap().kind,
+            SyntaxKind::VariableStatement
+        );
+
+        let (list, _) = variable_list(&result, statements[0]);
+        let variable = declaration_nodes(&result, list)[0];
+        let NodeData::VariableDeclaration(variable) = &result.arena.get(variable).unwrap().data
+        else {
+            panic!("expected variable declaration");
+        };
+        let expression = variable.initializer.unwrap();
+        let NodeData::FunctionExpression(function) = &result.arena.get(expression).unwrap().data
+        else {
+            panic!("expected recovered function expression");
+        };
+        let body = result.arena.get(function.body).unwrap();
+        assert_eq!(body.kind, SyntaxKind::Block);
+        assert_eq!(body.range.start, body.range.end);
+        assert_eq!(body.parent, Some(expression));
     }
 
     #[test]
