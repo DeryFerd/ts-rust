@@ -1797,10 +1797,21 @@ impl<'a> ProgramChecker<'a> {
                     .get(&bindings)
                     .or_else(|| source.bindings.node_symbols.get(&namespace.name))
             {
+                let mut qualified_exports = module_exports;
+                if let Some(local_name) = identifier_text(source.arena, namespace.name) {
+                    let exported_names = qualified_exports.keys().cloned().collect::<BTreeSet<_>>();
+                    for descriptor in qualified_exports.values_mut() {
+                        rewrite_exported_named_descriptor_qualifier(
+                            descriptor,
+                            local_name,
+                            &exported_names,
+                        );
+                    }
+                }
                 symbols.insert(
                     *symbol,
                     TypeDescriptor::Object {
-                        properties: module_exports,
+                        properties: qualified_exports,
                         property_order: Vec::new(),
                         numeric_properties: BTreeSet::new(),
                         string_index_type: None,
@@ -2231,28 +2242,49 @@ fn name_constructor_return(descriptor: TypeDescriptor, name: &str) -> TypeDescri
 }
 
 fn rewrite_named_descriptor_qualifier(descriptor: &mut TypeDescriptor, qualifier: &str) {
+    rewrite_named_descriptor_qualifier_matching(descriptor, qualifier, None);
+}
+
+fn rewrite_exported_named_descriptor_qualifier(
+    descriptor: &mut TypeDescriptor,
+    qualifier: &str,
+    exported_names: &BTreeSet<String>,
+) {
+    rewrite_named_descriptor_qualifier_matching(descriptor, qualifier, Some(exported_names));
+}
+
+fn rewrite_named_descriptor_qualifier_matching(
+    descriptor: &mut TypeDescriptor,
+    qualifier: &str,
+    exported_names: Option<&BTreeSet<String>>,
+) {
     match descriptor {
         TypeDescriptor::Named {
             name,
             type_arguments,
             target,
         } => {
-            if let Some((_, suffix)) = name.split_once('.') {
+            if let Some(exported_names) = exported_names {
+                let root = name.split_once('.').map_or(name.as_str(), |(root, _)| root);
+                if exported_names.contains(root) {
+                    *name = format!("{qualifier}.{name}");
+                }
+            } else if let Some((_, suffix)) = name.split_once('.') {
                 *name = format!("{qualifier}.{suffix}");
             }
             for argument in type_arguments {
-                rewrite_named_descriptor_qualifier(argument, qualifier);
+                rewrite_named_descriptor_qualifier_matching(argument, qualifier, exported_names);
             }
-            rewrite_named_descriptor_qualifier(target, qualifier);
+            rewrite_named_descriptor_qualifier_matching(target, qualifier, exported_names);
         }
         TypeDescriptor::Import { target, .. } | TypeDescriptor::ConstEnum(target) => {
-            rewrite_named_descriptor_qualifier(target, qualifier);
+            rewrite_named_descriptor_qualifier_matching(target, qualifier, exported_names);
         }
         TypeDescriptor::Alias { body, .. } => {
-            rewrite_named_descriptor_qualifier(body, qualifier);
+            rewrite_named_descriptor_qualifier_matching(body, qualifier, exported_names);
         }
         TypeDescriptor::Array(element) => {
-            rewrite_named_descriptor_qualifier(element, qualifier);
+            rewrite_named_descriptor_qualifier_matching(element, qualifier, exported_names);
         }
         TypeDescriptor::Tuple(elements)
         | TypeDescriptor::ReadonlyTuple(elements)
@@ -2260,7 +2292,7 @@ fn rewrite_named_descriptor_qualifier(descriptor: &mut TypeDescriptor, qualifier
         | TypeDescriptor::Intersection(elements)
         | TypeDescriptor::Overload(elements) => {
             for element in elements {
-                rewrite_named_descriptor_qualifier(element, qualifier);
+                rewrite_named_descriptor_qualifier_matching(element, qualifier, exported_names);
             }
         }
         TypeDescriptor::Object {
@@ -2272,16 +2304,16 @@ fn rewrite_named_descriptor_qualifier(descriptor: &mut TypeDescriptor, qualifier
             ..
         } => {
             for property in properties.values_mut() {
-                rewrite_named_descriptor_qualifier(property, qualifier);
+                rewrite_named_descriptor_qualifier_matching(property, qualifier, exported_names);
             }
             if let Some(index) = string_index_type {
-                rewrite_named_descriptor_qualifier(index, qualifier);
+                rewrite_named_descriptor_qualifier_matching(index, qualifier, exported_names);
             }
             if let Some(index) = number_index_type {
-                rewrite_named_descriptor_qualifier(index, qualifier);
+                rewrite_named_descriptor_qualifier_matching(index, qualifier, exported_names);
             }
             for signature in call_signatures.iter_mut().chain(construct_signatures) {
-                rewrite_named_descriptor_qualifier(signature, qualifier);
+                rewrite_named_descriptor_qualifier_matching(signature, qualifier, exported_names);
             }
         }
         TypeDescriptor::Function {
@@ -2297,12 +2329,16 @@ fn rewrite_named_descriptor_qualifier(descriptor: &mut TypeDescriptor, qualifier
             ..
         } => {
             for parameter in parameters {
-                rewrite_named_descriptor_qualifier(parameter, qualifier);
+                rewrite_named_descriptor_qualifier_matching(parameter, qualifier, exported_names);
             }
             if let Some(rest_parameter) = rest_parameter {
-                rewrite_named_descriptor_qualifier(rest_parameter, qualifier);
+                rewrite_named_descriptor_qualifier_matching(
+                    rest_parameter,
+                    qualifier,
+                    exported_names,
+                );
             }
-            rewrite_named_descriptor_qualifier(return_type, qualifier);
+            rewrite_named_descriptor_qualifier_matching(return_type, qualifier, exported_names);
         }
         _ => {}
     }
@@ -12677,15 +12713,39 @@ fn paint_exported_named_descriptor_imports(
     module_name: &str,
     exports: &BTreeMap<String, TypeDescriptor>,
 ) {
+    if let TypeDescriptor::Named { name, .. } = descriptor {
+        let exported_root = name.split_once('.').map_or(name.as_str(), |(root, _)| root);
+        if !name.starts_with("__") && exports.contains_key(exported_root) {
+            let qualifier = name.clone();
+            let mut target = descriptor.clone();
+            if let TypeDescriptor::Named {
+                type_arguments,
+                target,
+                ..
+            } = &mut target
+            {
+                for argument in type_arguments {
+                    paint_exported_named_descriptor_imports(argument, module_name, exports);
+                }
+                paint_exported_named_descriptor_imports(target, module_name, exports);
+            }
+            *descriptor = TypeDescriptor::Import {
+                reference: ImportTypeReference {
+                    module_specifier: module_name.to_owned(),
+                    qualifier,
+                    is_typeof: false,
+                },
+                target: Box::new(target),
+            };
+            return;
+        }
+    }
     match descriptor {
         TypeDescriptor::Named {
-            name,
+            name: _,
             type_arguments,
             target,
         } => {
-            if !name.starts_with("__") && exports.contains_key(name) {
-                *name = format!("import(\"{module_name}\").{name}");
-            }
             for argument in type_arguments {
                 paint_exported_named_descriptor_imports(argument, module_name, exports);
             }
@@ -12970,13 +13030,20 @@ fn describe_explicit_function_value(
     let Some(initializer) = variable.initializer else {
         return descriptor;
     };
-    let parameters = match source.arena.get(initializer).map(|node| &node.data) {
-        Some(NodeData::ArrowFunction(function)) => &function.parameters,
-        Some(NodeData::FunctionExpression(function)) => &function.parameters,
+    let (parameters, return_type_node) = match source.arena.get(initializer).map(|node| &node.data)
+    {
+        Some(NodeData::ArrowFunction(function)) => (
+            &function.parameters,
+            function
+                .type_
+                .or_else(|| explicit_asserted_expression_type(source.arena, function.body)),
+        ),
+        Some(NodeData::FunctionExpression(function)) => (&function.parameters, function.type_),
         _ => return descriptor,
     };
     let TypeDescriptor::Function {
         parameters: descriptor_parameters,
+        return_type,
         ..
     } = &mut descriptor
     else {
@@ -13006,7 +13073,30 @@ fn describe_explicit_function_value(
         descriptor_parameters[index] =
             describe_type_node_syntax(source, &mut checker, type_node, target, &exported_names);
     }
+    if let Some(type_node) = return_type_node {
+        **return_type = describe_type_node_syntax(
+            source,
+            &mut checker,
+            type_node,
+            (**return_type).clone(),
+            &exported_names,
+        );
+    }
     descriptor
+}
+
+fn explicit_asserted_expression_type(arena: &NodeArena, expression: NodeId) -> Option<NodeId> {
+    match &arena.get(expression)?.data {
+        NodeData::AsExpression(assertion) => Some(assertion.type_),
+        NodeData::TypeAssertion(assertion) => Some(assertion.type_),
+        NodeData::ParenthesizedExpression(parenthesized) => {
+            explicit_asserted_expression_type(arena, parenthesized.expression)
+        }
+        NodeData::NonNullExpression(non_null) => {
+            explicit_asserted_expression_type(arena, non_null.expression)
+        }
+        _ => None,
+    }
 }
 
 #[allow(clippy::too_many_lines)]

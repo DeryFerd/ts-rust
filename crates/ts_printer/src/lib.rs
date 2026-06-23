@@ -3111,6 +3111,7 @@ impl DeclarationPrinter<'_> {
                 if self.import_is_only_used_by_synthesized_declarations(id, data)
                     && !self.statement_is_inferred_class_property_dependency(id)
                     && !self.import_has_non_assertion_type_reference(data)
+                    && !self.import_is_used_by_inferred_semantic_variable_type(id, data)
                 {
                     return Ok(());
                 }
@@ -4141,20 +4142,24 @@ impl DeclarationPrinter<'_> {
                 _ => {}
             }
         }
-        self.declaration_reachability.is_none_or(|reachability| {
-            reachability.values().any(|retained| {
-                retained.iter().any(|statement| {
-                    *statement != import_id
-                        && self.arena.iter().any(|(identifier, node)| {
-                            matches!(
-                                &node.data,
-                                NodeData::Identifier(identifier_data)
-                                    if names.contains(identifier_data.text.as_str())
-                            ) && self.node_is_within(identifier, *statement)
-                        })
+        names
+            .iter()
+            .any(|name| self.inferred_semantic_variable_types_reference_name(name))
+            || self.declaration_reachability.is_none_or(|reachability| {
+                reachability.values().any(|retained| {
+                    retained.iter().any(|statement| {
+                        *statement != import_id
+                            && self.arena.iter().any(|(identifier, node)| {
+                                matches!(
+                                    &node.data,
+                                    NodeData::Identifier(identifier_data)
+                                        if names.contains(identifier_data.text.as_str())
+                                ) && self.node_is_within(identifier, *statement)
+                                    && !self.identifier_is_in_untyped_exported_variable(identifier)
+                            })
+                    })
                 })
             })
-        })
     }
 
     fn import_has_non_assertion_type_reference(
@@ -4360,6 +4365,13 @@ impl DeclarationPrinter<'_> {
                 };
                 declaration_name_text(self.arena, specifier.name).map(str::to_owned)
             }));
+        } else if let Some(NodeData::NamespaceImport(namespace)) = clause
+            .named_bindings
+            .and_then(|bindings| self.arena.get(bindings))
+            .map(|node| &node.data)
+            && let Some(name) = declaration_name_text(self.arena, namespace.name)
+        {
+            names.insert(name.to_owned());
         }
         if names.is_empty() {
             return false;
@@ -4402,7 +4414,7 @@ impl DeclarationPrinter<'_> {
                 else {
                     return false;
                 };
-                self.semantic_type_references_names(type_id, &names, &mut HashSet::new())
+                self.semantic_type_references_names(type_id, &names, &mut HashSet::new(), false)
             })
         })
     }
@@ -4412,6 +4424,7 @@ impl DeclarationPrinter<'_> {
         type_id: TypeId,
         names: &HashSet<String>,
         visiting: &mut HashSet<TypeId>,
+        include_direct_import: bool,
     ) -> bool {
         if !visiting.insert(type_id) {
             return false;
@@ -4424,6 +4437,14 @@ impl DeclarationPrinter<'_> {
                     reference.name == *name || reference.name.starts_with(&format!("{name}."))
                 })
             })
+        {
+            return true;
+        }
+        if include_direct_import
+            && self
+                .import_type_references
+                .and_then(|references| references.get(&type_id))
+                .is_some_and(|reference| names.contains(&reference.qualifier))
         {
             return true;
         }
@@ -4472,7 +4493,7 @@ impl DeclarationPrinter<'_> {
         };
         children
             .into_iter()
-            .any(|child| self.semantic_type_references_names(child, names, visiting))
+            .any(|child| self.semantic_type_references_names(child, names, visiting, true))
     }
 
     fn namespace_import_name(&self, expression: NodeId) -> Option<&str> {
@@ -4560,6 +4581,9 @@ impl DeclarationPrinter<'_> {
     }
 
     fn identifier_use_is_synthesized(&self, identifier: NodeId) -> bool {
+        if self.identifier_is_synthesized_export_initializer(identifier) {
+            return true;
+        }
         if self
             .arena
             .get(identifier)
@@ -4659,6 +4683,11 @@ impl DeclarationPrinter<'_> {
         false
     }
 
+    fn identifier_is_synthesized_export_initializer(&self, identifier: NodeId) -> bool {
+        self.identifier_is_in_untyped_exported_variable(identifier)
+            && !self.identifier_is_in_erased_type_context(identifier)
+    }
+
     fn export_assignment_use_is_synthesized(&self, export: &ts_ast::ExportAssignmentData) -> bool {
         !export.is_export_equals
             && self
@@ -4688,6 +4717,23 @@ impl DeclarationPrinter<'_> {
                 _ => {}
             }
             current = node.parent;
+        }
+        false
+    }
+
+    fn identifier_is_in_erased_type_context(&self, identifier: NodeId) -> bool {
+        let mut current = identifier;
+        while let Some(parent) = self.arena.get(current).and_then(|node| node.parent) {
+            let Some(parent_node) = self.arena.get(parent) else {
+                return false;
+            };
+            if node_is_erased_type_context(parent_node) {
+                return true;
+            }
+            if matches!(parent_node.data, NodeData::SourceFile(_)) {
+                return false;
+            }
+            current = parent;
         }
         false
     }
@@ -10400,6 +10446,7 @@ impl DeclarationPrinter<'_> {
                     .values()
                     .any(|statements| statements.contains(&import_id))
                     || self.import_is_used_by_inferred_return(import_id, import)
+                    || self.import_is_used_by_inferred_semantic_variable_type(import_id, import)
             });
             if !retained {
                 return None;
@@ -13588,6 +13635,8 @@ impl DeclarationPrinter<'_> {
                                 NodeData::Identifier(identifier_data)
                                     if identifier_data.text == name
                             ) && self.node_is_within(identifier, *statement)
+                                && (!self.identifier_is_in_untyped_exported_variable(identifier)
+                                    || self.identifier_is_in_erased_type_context(identifier))
                         })
                 })
             })
@@ -13629,7 +13678,12 @@ impl DeclarationPrinter<'_> {
                     .initializer
                     .and_then(|initializer| self.node_types?.get(&initializer).copied())
                     .is_some_and(|type_id| {
-                        self.semantic_type_references_names(type_id, &names, &mut HashSet::new())
+                        self.semantic_type_references_names(
+                            type_id,
+                            &names,
+                            &mut HashSet::new(),
+                            false,
+                        )
                     })
             })
         })
@@ -25197,11 +25251,17 @@ impl Printer<'_> {
             };
             if let Some(name) = clause.name {
                 self.emit_expression(name, 0)?;
-                if clause.named_bindings.is_some() {
+                if clause
+                    .named_bindings
+                    .is_some_and(|bindings| self.import_bindings_have_runtime_use(bindings))
+                {
                     self.writer.write(", ");
                 }
             }
-            if let Some(bindings) = clause.named_bindings {
+            if let Some(bindings) = clause
+                .named_bindings
+                .filter(|bindings| self.import_bindings_have_runtime_use(*bindings))
+            {
                 self.emit_named_imports(bindings)?;
             }
             self.writer.write(" from ");
@@ -25382,7 +25442,7 @@ impl Printer<'_> {
         if let Some(bindings) = clause.named_bindings {
             let bindings_node = self.node(bindings)?.clone();
             let is_namespace_import = matches!(bindings_node.data, NodeData::NamespaceImport(_));
-            if matches!(&bindings_node.data, NodeData::NamedImports(imports) if imports.elements.nodes.iter().all(|element| self.commonjs_import_specifier_is_default(*element)))
+            if matches!(&bindings_node.data, NodeData::NamedImports(imports) if imports.elements.nodes.iter().filter(|element| self.import_specifier_has_runtime_use(**element)).all(|element| self.commonjs_import_specifier_is_default(*element)))
             {
                 return Ok(());
             }
@@ -25446,11 +25506,10 @@ impl Printer<'_> {
         };
         match &bindings.data {
             NodeData::NamespaceImport(_) => true,
-            NodeData::NamedImports(imports) => imports
-                .elements
-                .nodes
-                .iter()
-                .any(|element| !self.commonjs_import_specifier_is_default(*element)),
+            NodeData::NamedImports(imports) => imports.elements.nodes.iter().any(|element| {
+                self.import_specifier_has_runtime_use(*element)
+                    && !self.commonjs_import_specifier_is_default(*element)
+            }),
             _ => false,
         }
     }
@@ -25462,7 +25521,9 @@ impl Printer<'_> {
         };
         let mut emitted = false;
         for specifier in &data.elements.nodes {
-            if self.commonjs_import_specifier_is_default(*specifier) {
+            if self.commonjs_import_specifier_is_default(*specifier)
+                || !self.import_specifier_has_runtime_use(*specifier)
+            {
                 continue;
             }
             if emitted {
@@ -25492,8 +25553,12 @@ impl Printer<'_> {
             return Err(Self::unsupported(id, node.kind));
         };
         self.writer.write("{ ");
-        for (index, specifier) in data.elements.nodes.iter().enumerate() {
-            if index != 0 {
+        let mut emitted = false;
+        for specifier in &data.elements.nodes {
+            if !self.import_specifier_has_runtime_use(*specifier) {
+                continue;
+            }
+            if emitted {
                 self.writer.write(", ");
             }
             let node = self.node(*specifier)?.clone();
@@ -25505,9 +25570,62 @@ impl Printer<'_> {
                 self.writer.write(" as ");
             }
             self.emit_expression(specifier.name, 0)?;
+            emitted = true;
         }
         self.writer.write(" }");
         Ok(())
+    }
+
+    fn import_bindings_have_runtime_use(&self, bindings: NodeId) -> bool {
+        match self.arena.get(bindings).map(|node| &node.data) {
+            Some(NodeData::NamespaceImport(namespace)) => self
+                .identifier_text(namespace.name)
+                .is_ok_and(|name| self.import_name_has_non_erased_runtime_reference(name)),
+            Some(NodeData::NamedImports(imports)) => imports
+                .elements
+                .nodes
+                .iter()
+                .any(|specifier| self.import_specifier_has_runtime_use(*specifier)),
+            _ => true,
+        }
+    }
+
+    fn import_specifier_has_runtime_use(&self, specifier: NodeId) -> bool {
+        let Some(NodeData::ImportSpecifier(specifier)) =
+            self.arena.get(specifier).map(|node| &node.data)
+        else {
+            return true;
+        };
+        if specifier.is_type_only {
+            return false;
+        }
+        self.identifier_text(specifier.name).is_ok_and(|name| {
+            self.import_name_has_non_erased_runtime_reference(name)
+                || (self.import_runtime_meanings.is_empty()
+                    && !self.import_name_has_reference_outside_import(name))
+        })
+    }
+
+    fn import_name_has_reference_outside_import(&self, name: &str) -> bool {
+        self.arena.iter().any(|(identifier, node)| {
+            if !matches!(
+                &node.data,
+                NodeData::Identifier(identifier) if identifier.text == name
+            ) {
+                return false;
+            }
+            let mut current = identifier;
+            while let Some(parent) = self.arena.get(current).and_then(|node| node.parent) {
+                if matches!(
+                    self.arena.get(parent).map(|node| &node.data),
+                    Some(NodeData::ImportDeclaration(_))
+                ) {
+                    return false;
+                }
+                current = parent;
+            }
+            true
+        })
     }
 
     fn emit_export(&mut self, data: &ts_ast::ExportDeclarationData) -> Result<(), EmitError> {
@@ -35074,6 +35192,22 @@ class Board {
             result.code,
             "\"use strict\";\nObject.defineProperty(exports, \"__esModule\", { value: true });\nlet value;\n"
         );
+    }
+
+    #[test]
+    fn omits_type_only_bindings_from_mixed_runtime_imports() {
+        let source = concat!(
+            "import { value, Type } from \"./module\";\n",
+            "export const result = value;\n",
+            "let annotation: Type;\n",
+        );
+        let es_module = emit_with(source, ScriptTarget::Es2015, ModuleKind::EsNext).code;
+        assert!(es_module.contains("import { value } from"), "{es_module}");
+        assert!(!es_module.contains("value, Type"), "{es_module}");
+
+        let commonjs = emit_with(source, ScriptTarget::Es2015, ModuleKind::CommonJs).code;
+        assert!(commonjs.contains("require(\"./module\")"), "{commonjs}");
+        assert!(!commonjs.contains("Type"), "{commonjs}");
     }
 
     #[test]
