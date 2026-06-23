@@ -1409,7 +1409,7 @@ pub fn emit_declaration_file_with_semantics(
     for statement in deferred_javascript_namespaces {
         printer.emit_statement(statement, false, source_file)?;
     }
-    if printer.scope_needs_seal(source_file) {
+    if printer.scope_needs_seal(source_file) || (printer.module_file && printer.writer.is_empty()) {
         printer.writer.write("export {};");
         printer.writer.newline();
     }
@@ -1681,6 +1681,9 @@ impl DeclarationPrinter<'_> {
         self.record_mapping(&node);
         match &node.data {
             NodeData::VariableStatement(data) => {
+                if !self.variable_list_has_bound_names(data.declaration_list) {
+                    return Ok(());
+                }
                 if !self.emit_javascript_object_namespaces(&node, data.declaration_list)? {
                     self.emit_declaration_prefix(&node, !in_namespace);
                     self.emit_variable_declarations(data.declaration_list)?;
@@ -2382,7 +2385,21 @@ impl DeclarationPrinter<'_> {
         };
         self.writer.write(keyword);
         self.writer.write(" ");
-        for (index, declaration) in data.declarations.nodes.iter().enumerate() {
+        let declarations = data
+            .declarations
+            .nodes
+            .iter()
+            .copied()
+            .filter(|declaration| {
+                let Some(NodeData::VariableDeclaration(declaration)) =
+                    self.arena.get(*declaration).map(|node| &node.data)
+                else {
+                    return true;
+                };
+                self.binding_name_has_identifier(declaration.name)
+            })
+            .collect::<Vec<_>>();
+        for (index, declaration) in declarations.iter().enumerate() {
             if index != 0 {
                 self.writer.write(", ");
             }
@@ -2423,6 +2440,41 @@ impl DeclarationPrinter<'_> {
             }
         }
         Ok(())
+    }
+
+    fn variable_list_has_bound_names(&self, list: NodeId) -> bool {
+        let Some(NodeData::VariableDeclarationList(list)) =
+            self.arena.get(list).map(|node| &node.data)
+        else {
+            return true;
+        };
+        list.declarations.nodes.iter().any(|declaration| {
+            let Some(NodeData::VariableDeclaration(declaration)) =
+                self.arena.get(*declaration).map(|node| &node.data)
+            else {
+                return true;
+            };
+            self.binding_name_has_identifier(declaration.name)
+        })
+    }
+
+    fn binding_name_has_identifier(&self, name: NodeId) -> bool {
+        match self.arena.get(name).map(|node| &node.data) {
+            Some(NodeData::Identifier(_)) => true,
+            Some(NodeData::BindingPattern(pattern)) => {
+                pattern.elements.nodes.iter().any(|element| {
+                    let Some(NodeData::BindingElement(element)) =
+                        self.arena.get(*element).map(|node| &node.data)
+                    else {
+                        return false;
+                    };
+                    element
+                        .name
+                        .is_some_and(|name| self.binding_name_has_identifier(name))
+                })
+            }
+            _ => false,
+        }
     }
 
     fn known_new_expression_type(&self, initializer: NodeId) -> Option<String> {
@@ -4213,6 +4265,10 @@ struct Writer {
 }
 
 impl Writer {
+    fn is_empty(&self) -> bool {
+        self.output.is_empty()
+    }
+
     fn write(&mut self, text: &str) {
         if self.line_start {
             for _ in 0..self.indent {
@@ -16028,6 +16084,32 @@ class Board {
             "import { Input } from \"./types\";\nexport declare const version: number;\nexport declare function identity<T>(value: T): T;\nexport declare function parse(value: string): string;\nexport declare class Store<T> {\n    value: T;\n    read(input: T): T;\n}\nexport interface Box<T> {\n    value: T;\n}\nexport type Maybe<T> = T | undefined;\nexport declare enum Color {\n    Red,\n    Blue = 2\n}\nexport declare namespace Helpers {\n    export function read(value: string): string;\n}\nexport { Input };\n"
         );
         assert!(result.source_map.is_some());
+    }
+
+    #[test]
+    fn declaration_emit_erases_empty_binding_patterns_and_preserves_module_scope() {
+        let source = "export let [,,[,[],,[],]] = undefined as any;";
+        let parsed = parse_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        assert_eq!(
+            emit_declaration_file(&parsed.arena, parsed.source_file, "input.ts", source, false)
+                .unwrap()
+                .code,
+            "export {};\n"
+        );
+    }
+
+    #[test]
+    fn declaration_emit_keeps_named_declarators_beside_empty_patterns() {
+        let source = "export let [] = [] as any, value = 1;";
+        let parsed = parse_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        assert_eq!(
+            emit_declaration_file(&parsed.arena, parsed.source_file, "input.ts", source, false)
+                .unwrap()
+                .code,
+            "export declare let value: any;\n"
+        );
     }
 
     #[test]
