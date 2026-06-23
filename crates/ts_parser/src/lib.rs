@@ -41,7 +41,7 @@ use ts_ast::{
     TypeOfExpressionData, TypeOperatorNodeData, TypeParameterDeclarationData,
     TypePredicateNodeData, TypeQueryNodeData, TypeReferenceNodeData, UnionTypeNodeData,
     VariableDeclarationData, VariableDeclarationListData, VariableStatementData,
-    WhileStatementData, WithStatementData, YieldExpressionData,
+    VoidExpressionData, WhileStatementData, WithStatementData, YieldExpressionData,
 };
 use ts_core::{Diagnostic, DiagnosticCategory, TextPos, TextRange};
 use ts_diagnostics::{Category, message_by_code};
@@ -3778,6 +3778,16 @@ impl<'a> Parser<'a> {
                 &[expression],
             );
         }
+        if self.current.kind == SyntaxKind::VoidKeyword {
+            let start = self.consume().range.start;
+            let expression = self.parse_postfix_expression();
+            return self.alloc_node(
+                SyntaxKind::VoidExpression,
+                TextRange::new(start, self.node_end(expression)),
+                NodeData::VoidExpression(Box::new(VoidExpressionData { expression })),
+                &[expression],
+            );
+        }
         if self.current.kind == SyntaxKind::DeleteKeyword {
             let start = self.consume().range.start;
             let expression = self.parse_postfix_expression();
@@ -4092,7 +4102,55 @@ impl<'a> Parser<'a> {
 
     fn parse_new_expression(&mut self) -> NodeId {
         let start = self.consume().range.start;
-        let expression = self.parse_primary_expression();
+        let mut expression = self.parse_primary_expression();
+        loop {
+            match self.current.kind {
+                SyntaxKind::DotToken => {
+                    self.bump();
+                    let name = self.parse_property_name("Expected a property name.");
+                    expression = self.alloc_node(
+                        SyntaxKind::PropertyAccessExpression,
+                        TextRange::new(self.node_start(expression), self.node_end(name)),
+                        NodeData::PropertyAccessExpression(Box::new(
+                            PropertyAccessExpressionData {
+                                expression,
+                                flow_node: None,
+                                question_dot_token: None,
+                                facts: 0,
+                                name,
+                            },
+                        )),
+                        &[expression, name],
+                    );
+                }
+                SyntaxKind::OpenBracketToken => {
+                    if self.next_token_kind() == SyntaxKind::CloseBracketToken {
+                        break;
+                    }
+                    self.bump();
+                    let argument_expression = self.parse_binary_expression(0);
+                    let end = if self.current.kind == SyntaxKind::CloseBracketToken {
+                        self.consume().range.end
+                    } else {
+                        self.error_current("Expected ']'.");
+                        self.node_end(argument_expression)
+                    };
+                    expression = self.alloc_node(
+                        SyntaxKind::ElementAccessExpression,
+                        TextRange::new(self.node_start(expression), end),
+                        NodeData::ElementAccessExpression(Box::new(ElementAccessExpressionData {
+                            argument_expression,
+                            expression,
+                            flow_node: None,
+                            question_dot_token: None,
+                            facts: 0,
+                        })),
+                        &[expression, argument_expression],
+                    );
+                }
+                _ => break,
+            }
+        }
         let type_arguments = self.parse_type_arguments();
         let arguments = if self.current.kind == SyntaxKind::OpenParenToken {
             Some(self.parse_argument_list())
@@ -4475,7 +4533,17 @@ impl<'a> Parser<'a> {
         let start = self.consume().range.start;
         let type_node = self.parse_type();
         self.expect_and_bump(SyntaxKind::GreaterThanToken, "Expected '>'.");
-        let expression = self.parse_postfix_expression();
+        // A type assertion consumes a unary expression, but `yield` is not a
+        // unary expression in this grammar. Leave it for the following
+        // expression statement so recovery matches TypeScript's `; yield x;`
+        // emit rather than incorrectly accepting `<T> yield x`.
+        let expression = if self.current.kind == SyntaxKind::YieldKeyword {
+            let position = self.current.range.start;
+            self.error_current("Expected an expression.");
+            self.missing_identifier(position)
+        } else {
+            self.parse_postfix_expression()
+        };
         self.alloc_node(
             SyntaxKind::TypeAssertionExpression,
             TextRange::new(start, self.node_end(expression)),
