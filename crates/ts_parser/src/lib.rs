@@ -5154,6 +5154,9 @@ impl<'a> Parser<'a> {
     }
 
     fn is_type_predicate(&mut self) -> bool {
+        if self.current.kind == SyntaxKind::AssertsKeyword {
+            return true;
+        }
         if !matches!(
             self.current.kind,
             SyntaxKind::Identifier | SyntaxKind::ThisKeyword
@@ -5168,6 +5171,8 @@ impl<'a> Parser<'a> {
 
     fn parse_type_predicate(&mut self) -> NodeId {
         let start = self.current.range.start;
+        let asserts_modifier =
+            (self.current.kind == SyntaxKind::AssertsKeyword).then(|| self.consume_token_node());
         let parameter_name = if self.current.kind == SyntaxKind::ThisKeyword {
             let token = self.consume();
             self.alloc_node(
@@ -5179,17 +5184,30 @@ impl<'a> Parser<'a> {
         } else {
             self.parse_identifier("Expected a predicate parameter name.")
         };
-        self.expect_and_bump(SyntaxKind::IsKeyword, "Expected 'is'.");
-        let type_node = self.parse_type();
+        let type_node = if self.current.kind == SyntaxKind::IsKeyword {
+            self.bump();
+            Some(self.parse_type())
+        } else if asserts_modifier.is_some() {
+            None
+        } else {
+            self.expect_and_bump(SyntaxKind::IsKeyword, "Expected 'is'.");
+            Some(self.parse_type())
+        };
+        let end =
+            type_node.map_or_else(|| self.node_end(parameter_name), |node| self.node_end(node));
+        let mut children = Vec::new();
+        children.extend(asserts_modifier);
+        children.push(parameter_name);
+        children.extend(type_node);
         self.alloc_node(
             SyntaxKind::TypePredicate,
-            TextRange::new(start, self.node_end(type_node)),
+            TextRange::new(start, end),
             NodeData::TypePredicateNode(Box::new(TypePredicateNodeData {
-                asserts_modifier: None,
+                asserts_modifier,
                 parameter_name,
-                type_: Some(type_node),
+                type_: type_node,
             })),
-            &[parameter_name, type_node],
+            &children,
         )
     }
 
@@ -5352,6 +5370,19 @@ impl<'a> Parser<'a> {
             }
             SyntaxKind::NewKeyword => self.parse_constructor_type(),
             SyntaxKind::AbstractKeyword => self.parse_abstract_constructor_type(),
+            SyntaxKind::ConstKeyword => {
+                let start = self.current.range.start;
+                let type_name = self.parse_identifier_name("Expected 'const'.");
+                self.alloc_node(
+                    SyntaxKind::TypeReference,
+                    TextRange::new(start, self.node_end(type_name)),
+                    NodeData::TypeReferenceNode(Box::new(TypeReferenceNodeData {
+                        type_arguments: None,
+                        type_name,
+                    })),
+                    &[type_name],
+                )
+            }
             SyntaxKind::OpenParenToken => {
                 let start = self.consume().range.start;
                 let type_node = self.parse_type();
@@ -8029,6 +8060,54 @@ mod tests {
             SyntaxKind::TypeQuery,
         ] {
             assert!(kinds.contains(&expected), "missing {expected:?}");
+        }
+    }
+
+    #[test]
+    fn parses_assertion_predicates_in_functions_methods_and_properties() {
+        let result = parse_source_file(
+            r"
+                declare function assertTruth(value: unknown): asserts value;
+                function assertType<T>(value: unknown): asserts value is T {}
+                interface Assertions {
+                    assert(value: unknown): asserts value is string;
+                    property: (value: unknown) => asserts value;
+                }
+            ",
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let predicates = result
+            .arena
+            .iter()
+            .filter_map(|(id, node)| {
+                let NodeData::TypePredicateNode(predicate) = &node.data else {
+                    return None;
+                };
+                Some((id, predicate))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(predicates.len(), 4);
+        assert_eq!(
+            predicates
+                .iter()
+                .filter(|(_, predicate)| predicate.type_.is_some())
+                .count(),
+            2
+        );
+        for (predicate_id, predicate) in predicates {
+            let asserts = predicate.asserts_modifier.expect("assertion modifier");
+            assert_eq!(
+                result.arena.get(asserts).unwrap().kind,
+                SyntaxKind::AssertsKeyword
+            );
+            assert_eq!(
+                result.arena.get(asserts).unwrap().parent,
+                Some(predicate_id)
+            );
+            assert_eq!(
+                result.arena.get(predicate.parameter_name).unwrap().parent,
+                Some(predicate_id)
+            );
         }
     }
 
