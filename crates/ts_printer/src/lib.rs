@@ -578,7 +578,7 @@ pub fn emit_source_file_with_context(
                 reference_owner_start = node.range.end.get();
             }
             printer.emit_detached_reference_directives_between(reference_owner_start, source_end);
-        } else {
+        } else if !is_external_module {
             printer.emit_reference_directives_between(0, source_end);
         }
     }
@@ -13333,7 +13333,28 @@ impl Printer<'_> {
                         parent_precedence,
                     )?;
                 } else {
-                    self.emit_expression(data.expression, 18)?;
+                    // An empty element access is parser recovery for invalid input such as
+                    // `new C[]`. TypeScript preserves that spelling in its JavaScript emit.
+                    // Treat the recovered access as part of a bare `new` expression instead of
+                    // applying the normal element-access precedence, which would print
+                    // `(new C)[]`. Valid element accesses still require the parentheses.
+                    let empty_argument =
+                        self.node(data.argument_expression).is_ok_and(|argument| {
+                            matches!(
+                                &argument.data,
+                                NodeData::Identifier(identifier) if identifier.text.is_empty()
+                            )
+                        });
+                    let recovered_bare_new = empty_argument
+                        && self.node(data.expression).is_ok_and(|expression| {
+                            matches!(
+                                &expression.data,
+                                NodeData::NewExpression(new_expression)
+                                    if new_expression.arguments.is_none()
+                            )
+                        });
+                    let expression_precedence = if recovered_bare_new { 17 } else { 18 };
+                    self.emit_expression(data.expression, expression_precedence)?;
                     if data.question_dot_token.is_some() {
                         self.writer.write("?.");
                     }
@@ -14008,7 +14029,12 @@ impl Printer<'_> {
             self.writer.write("<");
             self.emit_expression(data.tag_name, 0)?;
             self.emit_jsx_attributes(data.attributes, true)?;
-            self.writer.write(" />");
+            self.writer
+                .write(if self.settings.jsx == JsxEmit::Preserve {
+                    "/>"
+                } else {
+                    " />"
+                });
             return Ok(());
         }
         if self.settings.jsx == JsxEmit::React {
@@ -16068,7 +16094,7 @@ mod tests {
         let source = "const view = <Panel enabled {...props} title='hello'><span>{value}</span><Icon /></Panel>;";
         assert_eq!(
             emit_jsx(source, JsxEmit::Preserve),
-            "const view = <Panel enabled {...props} title=\"hello\"><span>{value}</span><Icon /></Panel>;\n"
+            "const view = <Panel enabled {...props} title=\"hello\"><span>{value}</span><Icon/></Panel>;\n"
         );
         assert_eq!(
             emit_jsx(source, JsxEmit::React),
@@ -16077,11 +16103,15 @@ mod tests {
         let fragment = "const view = <><span />{value}</>;";
         assert_eq!(
             emit_jsx(fragment, JsxEmit::Preserve),
-            "const view = <><span />{value}</>;\n"
+            "const view = <><span/>{value}</>;\n"
         );
         assert_eq!(
             emit_jsx(fragment, JsxEmit::React),
             "const view = React.createElement(React.Fragment, null, React.createElement(\"span\", null), value);\n"
+        );
+        assert_eq!(
+            emit_jsx("const view = <Panel />;", JsxEmit::None),
+            "const view = <Panel />;\n"
         );
     }
 
@@ -16494,6 +16524,19 @@ mod tests {
                 .unwrap()
                 .code,
             "var value = { get item() { }, set item(next) { } };\n"
+        );
+    }
+
+    #[test]
+    fn preserves_empty_element_access_recovery_after_new_expressions() {
+        let source = "var one = new Z[]; var two = new Z[][]; var grouped = (<any>new Z).value;";
+        let parsed = parse_source_file(source);
+        assert_eq!(parsed.diagnostics.len(), 3, "{:?}", parsed.diagnostics);
+        assert_eq!(
+            emit_source_file(&parsed.arena, parsed.source_file)
+                .unwrap()
+                .code,
+            "var one = new Z[];\nvar two = new Z[][];\nvar grouped = (new Z).value;\n"
         );
     }
 
@@ -17814,6 +17857,22 @@ class Board {
         assert_eq!(
             emit_always_strict(source, ScriptTarget::Es2015, ModuleKind::CommonJs).code,
             concat!("\"use strict\";\n", "///<reference path='types.d.ts' />\n")
+        );
+    }
+
+    #[test]
+    fn drops_reference_directive_when_external_module_erases_every_statement() {
+        let source = concat!(
+            "/// <reference path=\"types.d.ts\"/>\n",
+            "import * as types from \"types\";\n",
+            "declare module \"types\" { interface Shape { value: number; } }\n",
+        );
+        assert_eq!(
+            emit_with(source, ScriptTarget::Es2015, ModuleKind::CommonJs).code,
+            concat!(
+                "\"use strict\";\n",
+                "Object.defineProperty(exports, \"__esModule\", { value: true });\n",
+            )
         );
     }
 
