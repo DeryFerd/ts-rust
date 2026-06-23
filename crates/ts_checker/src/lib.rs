@@ -2068,6 +2068,65 @@ fn descriptor_property(descriptor: &TypeDescriptor, property: &str) -> Option<Ty
     }
 }
 
+fn descriptor_contains_serialized_reference(descriptor: &TypeDescriptor) -> bool {
+    match descriptor {
+        TypeDescriptor::Import { .. } | TypeDescriptor::Named { .. } => true,
+        TypeDescriptor::ConstEnum(target)
+        | TypeDescriptor::Alias { body: target, .. }
+        | TypeDescriptor::Array(target) => descriptor_contains_serialized_reference(target),
+        TypeDescriptor::Tuple(members)
+        | TypeDescriptor::ReadonlyTuple(members)
+        | TypeDescriptor::Union(members)
+        | TypeDescriptor::Intersection(members)
+        | TypeDescriptor::Overload(members) => {
+            members.iter().any(descriptor_contains_serialized_reference)
+        }
+        TypeDescriptor::Object {
+            properties,
+            string_index_type,
+            number_index_type,
+            call_signatures,
+            construct_signatures,
+            ..
+        } => {
+            properties
+                .values()
+                .any(descriptor_contains_serialized_reference)
+                || string_index_type
+                    .as_deref()
+                    .is_some_and(descriptor_contains_serialized_reference)
+                || number_index_type
+                    .as_deref()
+                    .is_some_and(descriptor_contains_serialized_reference)
+                || call_signatures
+                    .iter()
+                    .chain(construct_signatures)
+                    .any(descriptor_contains_serialized_reference)
+        }
+        TypeDescriptor::Function {
+            parameters,
+            rest_parameter,
+            return_type,
+            ..
+        }
+        | TypeDescriptor::Constructor {
+            parameters,
+            rest_parameter,
+            return_type,
+            ..
+        } => {
+            parameters
+                .iter()
+                .any(descriptor_contains_serialized_reference)
+                || rest_parameter
+                    .as_deref()
+                    .is_some_and(descriptor_contains_serialized_reference)
+                || descriptor_contains_serialized_reference(return_type)
+        }
+        _ => false,
+    }
+}
+
 fn add_implicit_undefined_to_optional_properties(descriptor: &mut TypeDescriptor) {
     match descriptor {
         TypeDescriptor::Import { target, .. }
@@ -2270,6 +2329,7 @@ struct Checker<'a> {
     declared_object_instantiation_depth: usize,
     external_symbols: HashMap<SymbolId, TypeDescriptor>,
     structural_external_symbols: HashSet<SymbolId>,
+    serialized_structural_external_symbols: HashSet<SymbolId>,
     external_names: BTreeMap<String, TypeDescriptor>,
     external_aliases: HashMap<SymbolId, TypeDescriptor>,
     external_imports: HashMap<SymbolId, ImportTypeReference>,
@@ -2338,6 +2398,7 @@ impl<'a> Checker<'a> {
             declared_object_instantiation_depth: 0,
             external_symbols: HashMap::new(),
             structural_external_symbols: HashSet::new(),
+            serialized_structural_external_symbols: HashSet::new(),
             external_names: BTreeMap::new(),
             external_aliases: HashMap::new(),
             external_imports: HashMap::new(),
@@ -2377,6 +2438,9 @@ impl<'a> Checker<'a> {
         for (symbol, descriptor) in std::mem::take(&mut self.external_symbols) {
             if matches!(descriptor, TypeDescriptor::Object { .. }) {
                 self.structural_external_symbols.insert(symbol);
+                if descriptor_contains_serialized_reference(&descriptor) {
+                    self.serialized_structural_external_symbols.insert(symbol);
+                }
             }
             if matches!(descriptor, TypeDescriptor::Alias { .. }) {
                 self.external_aliases.insert(symbol, descriptor.clone());
@@ -7052,7 +7116,10 @@ impl<'a> Checker<'a> {
                 .get(&symbol)
                 .copied()
                 .unwrap_or_else(|| self.result.types.any());
-            if !self.result.import_type_references.contains_key(&type_id)
+            if !self
+                .serialized_structural_external_symbols
+                .contains(&symbol)
+                && !self.result.import_type_references.contains_key(&type_id)
                 && let Some(reference) = self.external_imports.get(&symbol).cloned()
             {
                 self.result
@@ -9950,6 +10017,64 @@ impl<'a> Checker<'a> {
             NodeData::ArrayTypeNode(data) => {
                 let element = self.type_from_type_node(data.element_type);
                 self.result.types.alloc(TypeKind::Array(element))
+            }
+            NodeData::ImportTypeNode(data) => {
+                let argument = match self.arena.get(data.argument).map(|node| &node.data) {
+                    Some(NodeData::LiteralTypeNode(literal)) => literal.literal,
+                    _ => data.argument,
+                };
+                let Some(module) = string_literal_text(self.arena, argument) else {
+                    return self.result.types.unknown();
+                };
+                let qualifier = data
+                    .qualifier
+                    .and_then(|qualifier| self.entity_name_text(qualifier))
+                    .unwrap_or_default();
+                let arguments = data
+                    .type_arguments
+                    .as_ref()
+                    .map(|arguments| {
+                        arguments
+                            .nodes
+                            .iter()
+                            .map(|argument| self.type_from_type_node(*argument))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let Some(descriptor) = self.external_names.get(module).cloned() else {
+                    return self.result.types.unknown();
+                };
+                let Some(descriptor) = (if qualifier.is_empty() {
+                    Some(descriptor)
+                } else {
+                    descriptor_property(&descriptor, &qualifier)
+                }) else {
+                    return self.result.types.unknown();
+                };
+                let target = self.import_alias(&descriptor, &arguments);
+                let target = if arguments.is_empty() {
+                    target
+                } else {
+                    let kind = self.result.types.get(target).unwrap().kind.clone();
+                    let named = self.result.types.alloc(kind);
+                    self.result.named_type_references.insert(
+                        named,
+                        NamedTypeReference {
+                            name: qualifier.clone(),
+                            type_arguments: arguments,
+                        },
+                    );
+                    named
+                };
+                self.result.import_type_references.insert(
+                    target,
+                    ImportTypeReference {
+                        module_specifier: module.to_owned(),
+                        qualifier,
+                        is_typeof: data.is_type_of,
+                    },
+                );
+                target
             }
             NodeData::TypeReferenceNode(data) => {
                 if matches!(
@@ -12929,9 +13054,16 @@ fn describe_type_node_syntax(
             exported_names,
         ),
         NodeData::TypeReferenceNode(reference) => {
-            let Some(name) = checker.property_name(reference.type_name) else {
+            let Some(name) = checker
+                .property_name(reference.type_name)
+                .or_else(|| checker.entity_name_text(reference.type_name))
+            else {
                 return semantic_target;
             };
+            let qualified = matches!(
+                source.arena.get(reference.type_name).map(|node| &node.data),
+                Some(NodeData::QualifiedName(_))
+            );
             if matches!(semantic_target, TypeDescriptor::TypeParameter(_)) {
                 return semantic_target;
             }
@@ -12959,6 +13091,14 @@ fn describe_type_node_syntax(
             if !exported_names.contains(&name)
                 && let [argument] = type_arguments.as_slice()
                 && is_homomorphic_identity_alias(source, checker, &name)
+            {
+                return argument.clone();
+            }
+            if qualified
+                && matches!(semantic_target, TypeDescriptor::Unknown)
+                && let [argument @ TypeDescriptor::Object { properties, .. }] =
+                    type_arguments.as_slice()
+                && !properties.is_empty()
             {
                 return argument.clone();
             }
@@ -13051,7 +13191,7 @@ fn describe_type_node_syntax(
                     target: Box::new(semantic_target),
                 };
             }
-            if name == "Omit" || exported_names.contains(&name) {
+            if qualified || name == "Omit" || exported_names.contains(&name) {
                 TypeDescriptor::Named {
                     name,
                     type_arguments,
@@ -13072,13 +13212,57 @@ fn describe_type_node_syntax(
             let qualifier = import
                 .qualifier
                 .and_then(|qualifier| checker.entity_name_text(qualifier));
+            let type_arguments = import
+                .type_arguments
+                .as_ref()
+                .map(|arguments| {
+                    arguments
+                        .nodes
+                        .iter()
+                        .map(|argument| {
+                            let type_id = checker.type_from_type_node(*argument);
+                            let target = describe_source_type(source, &checker.result, type_id);
+                            let described = describe_type_node_syntax(
+                                source,
+                                checker,
+                                *argument,
+                                target.clone(),
+                                exported_names,
+                            );
+                            (target, described)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let qualifier = qualifier.unwrap_or_default();
+            if let [(argument_target, argument @ TypeDescriptor::Object { properties, .. })] =
+                type_arguments.as_slice()
+                && !properties.is_empty()
+                && (semantic_target == *argument_target
+                    || matches!(semantic_target, TypeDescriptor::Unknown))
+            {
+                return argument.clone();
+            }
+            let type_arguments = type_arguments
+                .into_iter()
+                .map(|(_, described)| described)
+                .collect::<Vec<_>>();
+            let target = if type_arguments.is_empty() {
+                semantic_target
+            } else {
+                TypeDescriptor::Named {
+                    name: qualifier.clone(),
+                    type_arguments,
+                    target: Box::new(semantic_target),
+                }
+            };
             TypeDescriptor::Import {
                 reference: ImportTypeReference {
                     module_specifier: module.to_owned(),
-                    qualifier: qualifier.unwrap_or_default(),
+                    qualifier,
                     is_typeof: false,
                 },
-                target: Box::new(semantic_target),
+                target: Box::new(target),
             }
         }
         NodeData::TypeLiteralNode(literal) => {

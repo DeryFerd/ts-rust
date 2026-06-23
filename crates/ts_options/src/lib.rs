@@ -102,6 +102,7 @@ pub struct CompilerOptions {
     pub no_emit_helpers: bool,
     pub no_emit_on_error: bool,
     pub remove_comments: bool,
+    pub rewrite_relative_import_extensions: bool,
     pub no_implicit_any: bool,
     pub no_implicit_returns: bool,
     pub no_lib: bool,
@@ -162,6 +163,7 @@ impl Default for CompilerOptions {
             no_emit_helpers: false,
             no_emit_on_error: false,
             remove_comments: false,
+            rewrite_relative_import_extensions: false,
             no_implicit_any: false,
             no_implicit_returns: false,
             no_lib: false,
@@ -285,6 +287,10 @@ impl CompilerOptions {
                 "noemithelpers" => self.no_emit_helpers = overrides.no_emit_helpers,
                 "noemitonerror" => self.no_emit_on_error = overrides.no_emit_on_error,
                 "removecomments" => self.remove_comments = overrides.remove_comments,
+                "rewriterelativeimportextensions" => {
+                    self.rewrite_relative_import_extensions =
+                        overrides.rewrite_relative_import_extensions;
+                }
                 "noimplicitany" => self.no_implicit_any = overrides.no_implicit_any,
                 "noimplicitreturns" => self.no_implicit_returns = overrides.no_implicit_returns,
                 "nolib" => self.no_lib = overrides.no_lib,
@@ -497,6 +503,10 @@ pub fn parse_compiler_options_map(options: &BTreeMap<String, JsonValue>) -> Pars
             "removecomments" => {
                 parsed.remove_comments = boolean(original_name, value, &mut diagnostics);
             }
+            "rewriterelativeimportextensions" => {
+                parsed.rewrite_relative_import_extensions =
+                    boolean(original_name, value, &mut diagnostics);
+            }
             "noimplicitany" => {
                 parsed.no_implicit_any = boolean(original_name, value, &mut diagnostics);
             }
@@ -602,6 +612,7 @@ struct PartialOptions {
     no_emit_helpers: Option<bool>,
     no_emit_on_error: Option<bool>,
     remove_comments: Option<bool>,
+    rewrite_relative_import_extensions: Option<bool>,
     no_implicit_any: Option<bool>,
     no_implicit_returns: Option<bool>,
     no_lib: Option<bool>,
@@ -681,6 +692,9 @@ impl PartialOptions {
             no_emit_helpers: self.no_emit_helpers.unwrap_or(false),
             no_emit_on_error: self.no_emit_on_error.unwrap_or(false),
             remove_comments: self.remove_comments.unwrap_or(false),
+            rewrite_relative_import_extensions: self
+                .rewrite_relative_import_extensions
+                .unwrap_or(false),
             no_implicit_any: self.no_implicit_any.unwrap_or(strict),
             no_implicit_returns: self.no_implicit_returns.unwrap_or(false),
             no_lib: self.no_lib.unwrap_or(false),

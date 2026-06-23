@@ -1670,6 +1670,7 @@ pub fn emit_declaration_file_with_reachability(
         None,
         None,
         false,
+        false,
     )
 }
 
@@ -1692,6 +1693,7 @@ pub fn emit_declaration_file_with_semantics(
     import_type_references: Option<&BTreeMap<TypeId, ImportTypeReference>>,
     named_type_references: Option<&BTreeMap<TypeId, NamedTypeReference>>,
     remove_comments: bool,
+    rewrite_relative_import_extensions: bool,
 ) -> Result<EmitResult, EmitError> {
     // Declaration transforms occasionally need to distinguish same-spelled names in
     // different lexical scopes. Keep binding information beside checker types instead
@@ -1723,6 +1725,7 @@ pub fn emit_declaration_file_with_semantics(
         emitted_javascript_class_properties: HashSet::new(),
         canonical_literal_quotes: false,
         remove_comments,
+        rewrite_relative_import_extensions,
         semantic_infer_count: 0,
     };
     let node = printer.node(source_file)?.clone();
@@ -1819,6 +1822,15 @@ pub fn emit_declaration_file_with_semantics(
     for statement in deferred_javascript_namespaces {
         printer.emit_statement(statement, false, source_file)?;
     }
+    if !remove_comments {
+        let trailing_start = data
+            .statements
+            .nodes
+            .last()
+            .and_then(|statement| arena.get(*statement))
+            .map_or(0, |node| node.range.end.get());
+        printer.emit_trailing_jsdoc_comments(trailing_start);
+    }
     if printer.javascript_source {
         printer.emit_jsdoc_typedefs();
     }
@@ -1863,6 +1875,7 @@ struct DeclarationPrinter<'a> {
     emitted_javascript_class_properties: HashSet<(NodeId, String)>,
     canonical_literal_quotes: bool,
     remove_comments: bool,
+    rewrite_relative_import_extensions: bool,
     semantic_infer_count: usize,
 }
 
@@ -1904,6 +1917,29 @@ impl DeclarationPrinter<'_> {
                     .write(&comment.replace("\r\n", "\n").replace('\r', "\n"));
                 self.writer.newline();
             }
+            cursor = comment_end;
+        }
+    }
+
+    fn emit_trailing_jsdoc_comments(&mut self, start: u32) {
+        let start = usize::try_from(start).unwrap_or(usize::MAX);
+        let Some(suffix) = self.source_text.get(start..) else {
+            return;
+        };
+        let mut cursor = 0;
+        while let Some(relative_start) = suffix[cursor..].find("/**") {
+            let comment_start = cursor + relative_start;
+            let Some(relative_end) = suffix[comment_start + 3..].find("*/") else {
+                break;
+            };
+            let comment_end = comment_start + 3 + relative_end + 2;
+            self.writer.write(
+                &suffix[comment_start..comment_end]
+                    .replace("\r\n", "\n")
+                    .replace('\r', "\n"),
+            );
+            self.writer.write(" ");
+            self.writer.newline_preserving_trailing_spaces();
             cursor = comment_end;
         }
     }
@@ -2595,6 +2631,7 @@ impl DeclarationPrinter<'_> {
             && !self.import_is_local_export_dependency(id)
             && !self.statement_is_inferred_class_property_dependency(id)
             && !matches!(&node.data, NodeData::ImportDeclaration(import) if self.import_is_used_by_inferred_return(id, import))
+            && !matches!(&node.data, NodeData::ImportDeclaration(import) if self.import_is_used_by_inferred_semantic_variable_type(id, import))
             && !matches!(&node.data, NodeData::ImportDeclaration(import) if self.import_is_used_by_retained_binding_pattern(id, import))
             && !matches!(&node.data, NodeData::ImportEqualsDeclaration(import) if self.import_equals_is_used_by_inferred_variable_type(id, import))
         {
@@ -3079,6 +3116,7 @@ impl DeclarationPrinter<'_> {
                 }
                 if data.import_clause.is_some()
                     && !self.import_has_retained_declaration_binding_use(id, data)
+                    && !self.import_is_used_by_inferred_semantic_variable_type(id, data)
                     && !self.statement_is_inferred_class_property_dependency(id)
                 {
                     self.writer.write("import ");
@@ -4291,6 +4329,150 @@ impl DeclarationPrinter<'_> {
             }
             false
         })
+    }
+
+    fn import_is_used_by_inferred_semantic_variable_type(
+        &self,
+        import_id: NodeId,
+        import: &ts_ast::ImportDeclarationData,
+    ) -> bool {
+        let Some(NodeData::ImportClause(clause)) = import
+            .import_clause
+            .and_then(|clause| self.arena.get(clause))
+            .map(|node| &node.data)
+        else {
+            return false;
+        };
+        let mut names = clause
+            .name
+            .and_then(|name| declaration_name_text(self.arena, name))
+            .map(str::to_owned)
+            .into_iter()
+            .collect::<HashSet<_>>();
+        if let Some(NodeData::NamedImports(bindings)) = clause
+            .named_bindings
+            .and_then(|bindings| self.arena.get(bindings))
+            .map(|node| &node.data)
+        {
+            names.extend(bindings.elements.nodes.iter().filter_map(|specifier| {
+                let NodeData::ImportSpecifier(specifier) = &self.arena.get(*specifier)?.data else {
+                    return None;
+                };
+                declaration_name_text(self.arena, specifier.name).map(str::to_owned)
+            }));
+        }
+        if names.is_empty() {
+            return false;
+        }
+        self.arena.iter().any(|(statement_id, node)| {
+            let NodeData::VariableStatement(statement) = &node.data else {
+                return false;
+            };
+            if self.node_is_within(statement_id, import_id)
+                || !declaration_has_modifier(self.arena, node, SyntaxKind::ExportKeyword)
+            {
+                return false;
+            }
+            if self.declaration_reachability.is_some_and(|reachability| {
+                !reachability
+                    .values()
+                    .any(|retained| retained.contains(&statement_id))
+            }) {
+                return false;
+            }
+            let Some(NodeData::VariableDeclarationList(list)) = self
+                .arena
+                .get(statement.declaration_list)
+                .map(|node| &node.data)
+            else {
+                return false;
+            };
+            list.declarations.nodes.iter().any(|declaration| {
+                let Some(NodeData::VariableDeclaration(declaration)) =
+                    self.arena.get(*declaration).map(|node| &node.data)
+                else {
+                    return false;
+                };
+                if declaration.type_.is_some() {
+                    return false;
+                }
+                let Some(type_id) = declaration
+                    .initializer
+                    .and_then(|initializer| self.node_types?.get(&initializer).copied())
+                else {
+                    return false;
+                };
+                self.semantic_type_references_names(type_id, &names, &mut HashSet::new())
+            })
+        })
+    }
+
+    fn semantic_type_references_names(
+        &self,
+        type_id: TypeId,
+        names: &HashSet<String>,
+        visiting: &mut HashSet<TypeId>,
+    ) -> bool {
+        if !visiting.insert(type_id) {
+            return false;
+        }
+        if self
+            .named_type_references
+            .and_then(|references| references.get(&type_id))
+            .is_some_and(|reference| {
+                names.iter().any(|name| {
+                    reference.name == *name || reference.name.starts_with(&format!("{name}."))
+                })
+            })
+        {
+            return true;
+        }
+        let children = match self
+            .semantic_types
+            .and_then(|types| types.get(type_id))
+            .map(|type_| &type_.kind)
+        {
+            Some(TypeKind::Array(element)) => vec![*element],
+            Some(
+                TypeKind::Tuple(elements)
+                | TypeKind::ReadonlyTuple(elements)
+                | TypeKind::Union(elements)
+                | TypeKind::Intersection(elements),
+            ) => elements.clone(),
+            Some(TypeKind::Object(object)) => object
+                .properties
+                .values()
+                .copied()
+                .chain(object.string_index_type)
+                .chain(object.number_index_type)
+                .collect(),
+            Some(TypeKind::Function(signature) | TypeKind::Constructor(signature)) => signature
+                .parameters
+                .iter()
+                .copied()
+                .chain(signature.rest_parameter)
+                .chain([signature.return_type])
+                .collect(),
+            Some(TypeKind::Overload(signatures)) => signatures
+                .iter()
+                .flat_map(|signature| {
+                    signature
+                        .parameters
+                        .iter()
+                        .copied()
+                        .chain(signature.rest_parameter)
+                        .chain([signature.return_type])
+                })
+                .collect(),
+            Some(TypeKind::TypeParameter {
+                constraint: Some(constraint),
+                ..
+            }) => vec![*constraint],
+            _ => Vec::new(),
+        };
+        children
+            .into_iter()
+            .any(|child| self.semantic_type_references_names(child, names, visiting))
     }
 
     fn namespace_import_name(&self, expression: NodeId) -> Option<&str> {
@@ -9819,6 +10001,11 @@ impl DeclarationPrinter<'_> {
                 Some(TypeKind::Function(_) | TypeKind::Overload(_))
             )
         {
+            let type_arguments = self
+                .named_type_references
+                .and_then(|references| references.get(&id))
+                .map(|reference| reference.type_arguments.clone())
+                .unwrap_or_default();
             let type_only_value = reference.is_typeof || matches!(
                 self.semantic_types
                     .and_then(|types| types.get(id))
@@ -9835,14 +10022,30 @@ impl DeclarationPrinter<'_> {
             }
             if let Some(local_name) = self.local_named_import_for(reference) {
                 self.writer.write(&local_name);
+                if !type_arguments.is_empty() {
+                    self.writer.write("<");
+                    self.emit_semantic_type_list(&type_arguments, ", ")?;
+                    self.writer.write(">");
+                }
                 return Ok(());
             }
             self.writer.write("import(");
-            write_quoted(&mut self.writer, &reference.module_specifier);
+            write_quoted(
+                &mut self.writer,
+                &rewrite_relative_declaration_import_extension(
+                    &reference.module_specifier,
+                    self.rewrite_relative_import_extensions,
+                ),
+            );
             self.writer.write(")");
             if reference.qualifier != "export=" && !reference.qualifier.is_empty() {
                 self.writer.write(".");
                 self.writer.write(&reference.qualifier);
+            }
+            if !type_arguments.is_empty() {
+                self.writer.write("<");
+                self.emit_semantic_type_list(&type_arguments, ", ")?;
+                self.writer.write(">");
             }
             return Ok(());
         }
@@ -13288,6 +13491,12 @@ impl DeclarationPrinter<'_> {
     }
 
     fn write_source_quoted_string(&mut self, id: NodeId, text: &str) {
+        let rewritten =
+            rewrite_relative_import_extension(text, self.rewrite_relative_import_extensions);
+        if rewritten != text {
+            write_quoted(&mut self.writer, &rewritten);
+            return;
+        }
         let raw = self.arena.get(id).and_then(|node| {
             usize::try_from(node.range.start.get())
                 .ok()
@@ -13363,6 +13572,9 @@ impl DeclarationPrinter<'_> {
         if self.statement_is_inferred_class_property_dependency(import_id) {
             return true;
         }
+        if self.inferred_semantic_variable_types_reference_name(name) {
+            return true;
+        }
         self.declaration_reachability.is_none_or(|reachability| {
             reachability.values().any(|retained| {
                 retained.iter().any(|statement| {
@@ -13375,6 +13587,47 @@ impl DeclarationPrinter<'_> {
                             ) && self.node_is_within(identifier, *statement)
                         })
                 })
+            })
+        })
+    }
+
+    fn inferred_semantic_variable_types_reference_name(&self, name: &str) -> bool {
+        let names = HashSet::from([name.to_owned()]);
+        self.arena.iter().any(|(statement_id, node)| {
+            let NodeData::VariableStatement(statement) = &node.data else {
+                return false;
+            };
+            if !declaration_has_modifier(self.arena, node, SyntaxKind::ExportKeyword)
+                || self.declaration_reachability.is_some_and(|reachability| {
+                    !reachability
+                        .values()
+                        .any(|retained| retained.contains(&statement_id))
+                })
+            {
+                return false;
+            }
+            let Some(NodeData::VariableDeclarationList(list)) = self
+                .arena
+                .get(statement.declaration_list)
+                .map(|node| &node.data)
+            else {
+                return false;
+            };
+            list.declarations.nodes.iter().any(|declaration| {
+                let Some(NodeData::VariableDeclaration(declaration)) =
+                    self.arena.get(*declaration).map(|node| &node.data)
+                else {
+                    return false;
+                };
+                if declaration.type_.is_some() {
+                    return false;
+                }
+                declaration
+                    .initializer
+                    .and_then(|initializer| self.node_types?.get(&initializer).copied())
+                    .is_some_and(|type_id| {
+                        self.semantic_type_references_names(type_id, &names, &mut HashSet::new())
+                    })
             })
         })
     }
@@ -13438,6 +13691,34 @@ impl DeclarationPrinter<'_> {
         }
         self.writer.write(";");
         Ok(())
+    }
+}
+
+fn rewrite_relative_import_extension(specifier: &str, enabled: bool) -> String {
+    if !enabled || !(specifier.starts_with("./") || specifier.starts_with("../")) {
+        return specifier.to_owned();
+    }
+    for (extension, replacement) in [
+        (".tsx", ".jsx"),
+        (".mts", ".mjs"),
+        (".cts", ".cjs"),
+        (".ts", ".js"),
+    ] {
+        if let Some(path) = specifier.strip_suffix(extension) {
+            return format!("{path}{replacement}");
+        }
+    }
+    specifier.to_owned()
+}
+
+fn rewrite_relative_declaration_import_extension(specifier: &str, enabled: bool) -> String {
+    if enabled
+        && (specifier.starts_with("./") || specifier.starts_with("../"))
+        && let Some(path) = specifier.strip_suffix(".ts")
+    {
+        path.to_owned()
+    } else {
+        rewrite_relative_import_extension(specifier, enabled)
     }
 }
 
@@ -30213,6 +30494,7 @@ mod tests {
             Some(&checked.import_type_references),
             Some(&checked.named_type_references),
             remove_comments,
+            false,
         )
         .unwrap()
         .code
@@ -30385,6 +30667,7 @@ mod tests {
             Some(&loose.import_type_references),
             Some(&loose.named_type_references),
             false,
+            false,
         )
         .unwrap()
         .code;
@@ -30423,6 +30706,7 @@ mod tests {
             Some(&strict.node_types),
             Some(&strict.import_type_references),
             Some(&strict.named_type_references),
+            false,
             false,
         )
         .unwrap()
@@ -35912,6 +36196,7 @@ class Board {
             Some(&checked.import_type_references),
             Some(&checked.named_type_references),
             false,
+            false,
         )
         .unwrap()
         .code;
@@ -35958,6 +36243,7 @@ class Board {
             Some(&checked.node_types),
             Some(&checked.import_type_references),
             Some(&checked.named_type_references),
+            false,
             false,
         )
         .unwrap()
@@ -36572,6 +36858,7 @@ class Board {
             Some(&checked.import_type_references),
             Some(&checked.named_type_references),
             false,
+            false,
         )
         .unwrap()
         .code;
@@ -36717,6 +37004,7 @@ class Board {
             Some(&result.node_types),
             Some(&result.import_type_references),
             Some(&result.named_type_references),
+            false,
             false,
         )
         .unwrap()

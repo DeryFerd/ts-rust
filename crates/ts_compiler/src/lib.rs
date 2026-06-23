@@ -564,6 +564,7 @@ impl Program {
                     Some(&source_file.checking.import_type_references),
                     Some(&source_file.checking.named_type_references),
                     settings.remove_comments,
+                    self.options.rewrite_relative_import_extensions,
                 ) {
                     Ok(mut emitted) => {
                         let Some(file_name) = paths.declaration.clone() else {
@@ -802,6 +803,7 @@ impl Program {
                     Some(&source.checking.import_type_references),
                     Some(&source.checking.named_type_references),
                     settings.remove_comments,
+                    self.options.rewrite_relative_import_extensions,
                 ) {
                     Ok(mut emitted) => {
                         if !emitted.code.is_empty() {
