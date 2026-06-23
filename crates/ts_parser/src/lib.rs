@@ -336,6 +336,7 @@ struct Parser<'a> {
     invalid_token_recovery_ranges: Vec<TextRange>,
     amd_dependencies: Vec<AmdDependency>,
     amd_module_names: Vec<AmdModuleName>,
+    disallow_in: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -359,6 +360,7 @@ impl<'a> Parser<'a> {
             invalid_token_recovery_ranges: Vec::new(),
             amd_dependencies,
             amd_module_names,
+            disallow_in: false,
         }
     }
 
@@ -2252,7 +2254,11 @@ impl<'a> Parser<'a> {
                 &[declaration],
             ))
         } else {
-            Some(self.parse_binary_expression(11))
+            let previous_disallow_in = self.disallow_in;
+            self.disallow_in = true;
+            let expression = self.parse_binary_expression(0);
+            self.disallow_in = previous_disallow_in;
+            Some(expression)
         };
         if matches!(
             self.current.kind,
@@ -3327,6 +3333,9 @@ impl<'a> Parser<'a> {
             return self.parse_single_parameter_arrow_function(left);
         }
         loop {
+            if self.disallow_in && self.current.kind == SyntaxKind::InKeyword {
+                break;
+            }
             if self.current.kind == SyntaxKind::GreaterThanToken {
                 self.current = self.scanner.rescan_greater_than_token();
             }
@@ -3446,7 +3455,18 @@ impl<'a> Parser<'a> {
                     token = self.scanner.scan();
                 }
             }
-            self.scanner.scan().kind == SyntaxKind::EqualsGreaterThanToken
+            let mut token = self.scanner.scan();
+            if token.kind == SyntaxKind::ColonToken {
+                while !matches!(
+                    token.kind,
+                    SyntaxKind::EqualsGreaterThanToken
+                        | SyntaxKind::SemicolonToken
+                        | SyntaxKind::EndOfFile
+                ) {
+                    token = self.scanner.scan();
+                }
+            }
+            token.kind == SyntaxKind::EqualsGreaterThanToken
         } else {
             false
         };
@@ -9389,6 +9409,43 @@ mod tests {
             panic!("expected source file");
         };
         &data.statements.nodes
+    }
+
+    #[test]
+    fn parses_typed_async_arrows_and_assignment_for_initializers() {
+        let result = parse_source_file(concat!(
+            "const f = async (): Promise<void> => {};\n",
+            "for (i = 1; i < limit; ++i) {}\n",
+            "for (key in value) {}\n",
+        ));
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert!(result.arena.iter().any(|(_, node)| {
+            matches!(
+                &node.data,
+                NodeData::ArrowFunction(arrow)
+                    if arrow.type_.is_some() && arrow.modifiers.is_some()
+            )
+        }));
+        let for_statements = result
+            .arena
+            .iter()
+            .filter_map(|(_, node)| match &node.data {
+                NodeData::ForStatement(for_) => Some(for_),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(for_statements.len(), 1);
+        let initializer = for_statements[0].initializer.expect("initializer");
+        assert_eq!(
+            result.arena.get(initializer).unwrap().kind,
+            SyntaxKind::BinaryExpression
+        );
+        assert!(
+            result
+                .arena
+                .iter()
+                .any(|(_, node)| matches!(node.data, NodeData::ForInOrOfStatement(_)))
+        );
     }
 
     fn find_descendant_kind(

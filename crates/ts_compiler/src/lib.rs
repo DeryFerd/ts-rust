@@ -3263,7 +3263,7 @@ mod tests {
         for (source, expected) in [
             (
                 "namespace M { namespace N {} export import X = N; }",
-                "\"use strict\";\nvar M;\n(function (M) {\n})(M || (M = {}));\n",
+                "\"use strict\";\n",
             ),
             (
                 "namespace M { namespace N { class C {} } import R = N; export import X = R; }",

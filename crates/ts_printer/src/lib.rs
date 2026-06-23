@@ -5,7 +5,7 @@ use std::error::Error;
 use std::fmt;
 
 use ts_ast::{Node, NodeArena, NodeData, NodeId, NodeList, SymbolId, SyntaxKind};
-use ts_binder::{BindResult, bind_source_file};
+use ts_binder::{BindResult, SymbolFlags, bind_source_file};
 use ts_checker::{FunctionType, ImportTypeReference, ObjectType, TypeArena, TypeId, TypeKind};
 use ts_options::{JsxEmit, ModuleKind, PrinterSettings, ScriptTarget};
 use ts_sourcemap::{SourceMap, SourceMapBuilder};
@@ -329,6 +329,12 @@ pub fn emit_source_file_with_context(
     {
         printer.emit_awaiter_helper();
     }
+    if settings.target < ScriptTarget::Es2018
+        && source_needs_object_rest_helper(arena)
+        && !settings.no_emit_helpers
+    {
+        printer.emit_object_rest_helper();
+    }
     if settings.target < ScriptTarget::Es2015 && source_needs_extends_helper(arena) {
         printer.emit_extends_helper();
     }
@@ -414,6 +420,12 @@ pub fn emit_source_file_with_context(
         }
     }
     printer.emit_automatic_jsx_prelude();
+    if (ScriptTarget::Es2015..ScriptTarget::Es2017).contains(&settings.target)
+        && source_needs_async_static_field_class_temp(arena)
+    {
+        printer.writer.write("var _a;");
+        printer.writer.newline();
+    }
     let mut previous_end = data
         .statements
         .nodes
@@ -516,6 +528,85 @@ fn source_needs_awaiter_helper(arena: &NodeArena) -> bool {
                 && declaration_has_modifier(arena, node, SyntaxKind::AsyncKeyword)
         }
         _ => false,
+    })
+}
+
+fn source_needs_object_rest_helper(arena: &NodeArena) -> bool {
+    arena.iter().any(|(_, node)| {
+        let NodeData::ArrowFunction(function) = &node.data else {
+            return false;
+        };
+        if !function.modifiers.as_ref().is_some_and(|modifiers| {
+            modifiers.list.nodes.iter().any(|modifier| {
+                arena
+                    .get(*modifier)
+                    .is_some_and(|modifier| modifier.kind == SyntaxKind::AsyncKeyword)
+            })
+        }) {
+            return false;
+        }
+        function.parameters.nodes.iter().any(|parameter| {
+            let Some(NodeData::ParameterDeclaration(parameter)) =
+                arena.get(*parameter).map(|node| &node.data)
+            else {
+                return false;
+            };
+            let Some(NodeData::BindingPattern(pattern)) =
+                arena.get(parameter.name).map(|node| &node.data)
+            else {
+                return false;
+            };
+            arena.get(parameter.name).is_some_and(|node| {
+                node.kind == SyntaxKind::ObjectBindingPattern
+                    && pattern.elements.nodes.iter().any(|element| {
+                        matches!(
+                            arena.get(*element).map(|node| &node.data),
+                            Some(NodeData::BindingElement(element))
+                                if element.dot_dot_dot_token.is_some()
+                        )
+                    })
+            })
+        })
+    })
+}
+
+fn source_needs_async_static_field_class_temp(arena: &NodeArena) -> bool {
+    arena.iter().any(|(_, node)| {
+        let NodeData::ClassDeclaration(class) = &node.data else {
+            return false;
+        };
+        class_has_async_static_field(arena, class)
+    })
+}
+
+fn class_has_async_static_field(arena: &NodeArena, class: &ts_ast::ClassDeclarationData) -> bool {
+    class.members.nodes.iter().any(|member| {
+        let Some(member_node) = arena.get(*member) else {
+            return false;
+        };
+        let NodeData::PropertyDeclaration(property) = &member_node.data else {
+            return false;
+        };
+        property.modifiers.as_ref().is_some_and(|modifiers| {
+            modifiers.list.nodes.iter().any(|modifier| {
+                arena
+                    .get(*modifier)
+                    .is_some_and(|modifier| modifier.kind == SyntaxKind::StaticKeyword)
+            })
+        }) && property.initializer.is_some_and(|initializer| {
+            let Some(NodeData::ArrowFunction(arrow)) =
+                arena.get(initializer).map(|node| &node.data)
+            else {
+                return false;
+            };
+            arrow.modifiers.as_ref().is_some_and(|modifiers| {
+                modifiers.list.nodes.iter().any(|modifier| {
+                    arena
+                        .get(*modifier)
+                        .is_some_and(|modifier| modifier.kind == SyntaxKind::AsyncKeyword)
+                })
+            })
+        })
     })
 }
 
@@ -4793,9 +4884,11 @@ impl Printer<'_> {
             .and_then(|statement| self.arena.get(*statement))
             .map_or(0, |node| node.range.start.get());
         let mut reference_owner_start = 0;
+        let mut previous_emitted = false;
         for statement in &data.statements.nodes {
             if let Some(node) = self.arena.get(*statement) {
-                if statement_emits_javascript(self.arena, node) {
+                let current_emitted = statement_emits_javascript(self.arena, node);
+                if current_emitted {
                     self.emit_source_comments_between(previous_end, node.range.start.get());
                 }
                 if self.statement_emits_runtime(*statement, node)
@@ -4808,6 +4901,7 @@ impl Printer<'_> {
                 }
                 previous_end = node.range.end.get();
                 reference_owner_start = node.range.end.get();
+                previous_emitted = current_emitted;
             }
             let skip_import = match self.arena.get(*statement).map(|node| &node.data) {
                 Some(NodeData::ImportDeclaration(_)) => true,
@@ -4821,6 +4915,12 @@ impl Printer<'_> {
             }
             self.emit_statement(*statement)?;
         }
+        self.emit_source_comments_between_with_ownership(
+            previous_end,
+            u32::try_from(self.source_text.len()).unwrap_or(u32::MAX),
+            previous_emitted,
+            false,
+        );
         if let Some(expression) = export_equals_expression {
             self.writer.write("return ");
             self.emit_expression(expression, 0)?;
@@ -5379,6 +5479,25 @@ impl Printer<'_> {
         }
     }
 
+    fn emit_object_rest_helper(&mut self) {
+        for line in [
+            "var __rest = (this && this.__rest) || function (s, e) {",
+            "    var t = {};",
+            "    for (var p in s) if (Object.prototype.hasOwnProperty.call(s, p) && e.indexOf(p) < 0)",
+            "        t[p] = s[p];",
+            "    if (s != null && typeof Object.getOwnPropertySymbols === \"function\")",
+            "        for (var i = 0, p = Object.getOwnPropertySymbols(s); i < p.length; i++) {",
+            "            if (e.indexOf(p[i]) < 0 && Object.prototype.propertyIsEnumerable.call(s, p[i]))",
+            "                t[p[i]] = s[p[i]];",
+            "        }",
+            "    return t;",
+            "};",
+        ] {
+            self.writer.write(line);
+            self.writer.newline();
+        }
+    }
+
     fn emit_extends_helper(&mut self) {
         self.writer
             .write("var __extends = (this && this.__extends) || (function () {");
@@ -5648,8 +5767,7 @@ impl Printer<'_> {
             }
             NodeData::FunctionDeclaration(function) => function.body.is_some(),
             NodeData::ModuleDeclaration(module) => {
-                self.namespace_containers.is_empty()
-                    || self.namespace_has_runtime_contents(module, &mut HashSet::new())
+                self.namespace_has_runtime_contents(module, &mut HashSet::new())
             }
             NodeData::VariableStatement(statement)
                 if self.commonjs_module_transform
@@ -5873,6 +5991,26 @@ impl Printer<'_> {
         }
     }
 
+    fn namespace_has_merged_value_declaration(&self, name: NodeId) -> bool {
+        self.bindings
+            .node_symbols
+            .get(&name)
+            .and_then(|symbol| self.bindings.symbols.get(*symbol))
+            .is_some_and(|symbol| {
+                symbol.flags.intersects(
+                    SymbolFlags::VARIABLE
+                        | SymbolFlags::FUNCTION
+                        | SymbolFlags::CLASS
+                        | SymbolFlags::ENUM,
+                )
+            })
+    }
+
+    fn namespace_needs_local_declaration(&self, name: NodeId, text: &str) -> bool {
+        !self.namespace_has_merged_value_declaration(name)
+            && !self.system_predeclared_names.contains(text)
+    }
+
     fn record_mapping(&mut self, node: &Node) {
         if self.source_map.is_none() {
             return;
@@ -5930,8 +6068,7 @@ impl Printer<'_> {
                 return Ok(());
             }
             NodeData::ModuleDeclaration(module)
-                if !self.namespace_containers.is_empty()
-                    && !self.namespace_has_runtime_contents(module, &mut HashSet::new()) =>
+                if !self.namespace_has_runtime_contents(module, &mut HashSet::new()) =>
             {
                 return Ok(());
             }
@@ -6580,7 +6717,7 @@ impl Printer<'_> {
             let statement_node = self.node(*statement)?.clone();
             if !previous_emitted
                 && previous_end == node.range.start.get().saturating_add(1)
-                && self.is_object_property_arrow_body(id)
+                && self.body_opening_line_comment_is_unowned(id)
             {
                 previous_end = self.position_after_immediate_line_comment(
                     previous_end,
@@ -6669,10 +6806,16 @@ impl Printer<'_> {
         }
     }
 
-    fn is_object_property_arrow_body(&self, block: NodeId) -> bool {
+    fn body_opening_line_comment_is_unowned(&self, block: NodeId) -> bool {
         let Some(arrow) = self.arena.get(block).and_then(|block| block.parent) else {
             return false;
         };
+        if matches!(
+            self.arena.get(arrow).map(|node| &node.data),
+            Some(NodeData::FunctionExpression(_))
+        ) {
+            return true;
+        }
         if !matches!(
             self.arena.get(arrow).map(|node| &node.data),
             Some(NodeData::ArrowFunction(_))
@@ -6752,6 +6895,138 @@ impl Printer<'_> {
         self.await_as_yield = previous;
         result?;
         self.writer.write(")");
+        Ok(())
+    }
+
+    fn async_arrow_object_rest_parameter(
+        &self,
+        data: &ts_ast::ArrowFunctionData,
+    ) -> Option<NodeId> {
+        if data.parameters.nodes.len() != 1 {
+            return None;
+        }
+        let parameter = self.arena.get(data.parameters.nodes[0])?;
+        let NodeData::ParameterDeclaration(parameter) = &parameter.data else {
+            return None;
+        };
+        let pattern_node = self.arena.get(parameter.name)?;
+        let NodeData::BindingPattern(pattern) = &pattern_node.data else {
+            return None;
+        };
+        (pattern_node.kind == SyntaxKind::ObjectBindingPattern
+            && pattern.elements.nodes.iter().any(|element| {
+                matches!(
+                    self.arena.get(*element).map(|node| &node.data),
+                    Some(NodeData::BindingElement(element)) if element.dot_dot_dot_token.is_some()
+                )
+            }))
+        .then_some(parameter.name)
+    }
+
+    fn emit_awaiter_call_with_object_rest_parameter(
+        &mut self,
+        body: NodeId,
+        pattern: NodeId,
+        parameter_temp: &str,
+        this_argument: &str,
+    ) -> Result<(), EmitError> {
+        self.writer.write("__awaiter(");
+        self.writer.write(this_argument);
+        self.writer.write(", void 0, void 0, function* () {");
+        self.writer.newline();
+        self.writer.indent += 1;
+        self.emit_object_rest_parameter_prologue(pattern, parameter_temp)?;
+        if matches!(&self.node(body)?.data, NodeData::Block(_)) {
+            let previous = self.await_as_yield;
+            self.await_as_yield = true;
+            let result = self.emit_block_statements(body);
+            self.await_as_yield = previous;
+            result?;
+        } else {
+            self.writer.write("return ");
+            let previous = self.await_as_yield;
+            self.await_as_yield = true;
+            let result = self.emit_expression(body, 0);
+            self.await_as_yield = previous;
+            result?;
+            self.writer.write(";");
+            self.writer.newline();
+        }
+        self.writer.indent -= 1;
+        self.writer.write("})");
+        Ok(())
+    }
+
+    fn emit_object_rest_parameter_prologue(
+        &mut self,
+        pattern: NodeId,
+        parameter_temp: &str,
+    ) -> Result<(), EmitError> {
+        let pattern_node = self.node(pattern)?.clone();
+        let NodeData::BindingPattern(pattern) = &pattern_node.data else {
+            return Err(Self::unsupported(pattern, pattern_node.kind));
+        };
+        let mut ordinary = Vec::new();
+        let mut rest = None;
+        for element_id in &pattern.elements.nodes {
+            let element_node = self.node(*element_id)?.clone();
+            let NodeData::BindingElement(element) = &element_node.data else {
+                return Err(Self::unsupported(*element_id, element_node.kind));
+            };
+            if element.dot_dot_dot_token.is_some() {
+                rest = element.name;
+            } else {
+                ordinary.push(*element_id);
+            }
+        }
+        self.writer.write("var { ");
+        for (index, element) in ordinary.iter().enumerate() {
+            if index != 0 {
+                self.writer.write(", ");
+            }
+            self.emit_expression(*element, 0)?;
+        }
+        self.writer.write(" } = ");
+        self.writer.write(parameter_temp);
+        if let Some(rest) = rest {
+            self.writer.write(", ");
+            self.emit_expression(rest, 0)?;
+            self.writer.write(" = __rest(");
+            self.writer.write(parameter_temp);
+            self.writer.write(", [");
+            for (index, element_id) in ordinary.iter().enumerate() {
+                if index != 0 {
+                    self.writer.write(", ");
+                }
+                let element_node = self.node(*element_id)?.clone();
+                let NodeData::BindingElement(element) = &element_node.data else {
+                    return Err(Self::unsupported(*element_id, element_node.kind));
+                };
+                let property = element
+                    .property_name
+                    .or(element.name)
+                    .ok_or_else(|| Self::unsupported(*element_id, SyntaxKind::BindingElement))?;
+                let property_text =
+                    declaration_name_text(self.arena, property).ok_or_else(|| {
+                        Self::unsupported(property, self.node(property).unwrap().kind)
+                    })?;
+                write_quoted(&mut self.writer, property_text);
+            }
+            self.writer.write("])");
+        }
+        self.writer.write(";");
+        self.writer.newline();
+        Ok(())
+    }
+
+    fn emit_block_statements(&mut self, body: NodeId) -> Result<(), EmitError> {
+        let body_node = self.node(body)?.clone();
+        let NodeData::Block(block) = &body_node.data else {
+            return Err(Self::unsupported(body, body_node.kind));
+        };
+        for statement in &block.statements.nodes {
+            self.emit_statement(*statement)?;
+        }
         Ok(())
     }
 
@@ -7086,6 +7361,15 @@ impl Printer<'_> {
         self.writer.indent -= 1;
         self.writer.write("}");
         if lower_fields {
+            if (ScriptTarget::Es2015..ScriptTarget::Es2017).contains(&self.settings.target)
+                && class_has_async_static_field(self.arena, data)
+                && let Some(name) = data.name
+            {
+                self.writer.newline();
+                self.writer.write("_a = ");
+                self.emit_expression(name, 0)?;
+                self.writer.write(";");
+            }
             self.emit_native_static_fields(data)?;
         }
         Ok(())
@@ -8150,7 +8434,7 @@ impl Printer<'_> {
             .expect("every namespace has a lexical declaration scope")
             .insert(name.clone());
 
-        if first_declaration && !self.system_predeclared_names.contains(&name) {
+        if first_declaration && self.namespace_needs_local_declaration(data.name, &name) {
             if parent_container.is_some() && self.settings.target >= ScriptTarget::Es2015 {
                 self.writer.write("let ");
             } else {
@@ -9837,7 +10121,12 @@ impl Printer<'_> {
                 if is_async && !downlevel_async {
                     self.writer.write("async ");
                 }
-                if !downlevel_async && self.arrow_uses_bare_parameter(id, data) {
+                let object_rest_parameter = downlevel_async
+                    .then(|| self.async_arrow_object_rest_parameter(data))
+                    .flatten();
+                if object_rest_parameter.is_some() {
+                    self.writer.write("(_a)");
+                } else if !downlevel_async && self.arrow_uses_bare_parameter(id, data) {
                     let parameter_id = data.parameters.nodes[0];
                     let parameter_node = self.node(parameter_id)?.clone();
                     let NodeData::ParameterDeclaration(parameter) = &parameter_node.data else {
@@ -9854,10 +10143,19 @@ impl Printer<'_> {
                     } else {
                         "void 0"
                     };
-                    let expression_body =
-                        (!matches!(&self.node(data.body)?.data, NodeData::Block(_)))
-                            .then_some(data.body);
-                    self.emit_awaiter_call(data.body, expression_body, this_argument)?;
+                    if let Some(pattern) = object_rest_parameter {
+                        self.emit_awaiter_call_with_object_rest_parameter(
+                            data.body,
+                            pattern,
+                            "_a",
+                            this_argument,
+                        )?;
+                    } else {
+                        let expression_body =
+                            (!matches!(&self.node(data.body)?.data, NodeData::Block(_)))
+                                .then_some(data.body);
+                        self.emit_awaiter_call(data.body, expression_body, this_argument)?;
+                    }
                 } else if matches!(&self.node(data.body)?.data, NodeData::Block(_)) {
                     self.emit_function_body(data.body)?;
                 } else {
@@ -11721,6 +12019,36 @@ mod tests {
     }
 
     #[test]
+    fn lowers_es2015_async_object_rest_parameters_and_static_fields() {
+        let object_rest = emit_with(
+            "async ({ foo, bar, ...rest }) => bar(await foo);",
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(object_rest.contains("var __rest = "), "{object_rest}");
+        assert!(
+            object_rest.contains("(_a) => __awaiter(void 0, void 0, void 0, function* () {\n    var { foo, bar } = _a, rest = __rest(_a, [\"foo\", \"bar\"]);\n    return bar(yield foo);\n})"),
+            "{object_rest}"
+        );
+
+        let static_field = emit_with(
+            "class Test { static member = async (x: string) => {}; }",
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(
+            static_field.contains("var _a;\nclass Test"),
+            "{static_field}"
+        );
+        assert!(
+            static_field.contains("}\n_a = Test;\nTest.member = (x) => __awaiter("),
+            "{static_field}"
+        );
+    }
+
+    #[test]
     fn preserves_trailing_spaces_in_source_comments() {
         assert_eq!(
             emit_with(
@@ -12114,7 +12442,7 @@ mod tests {
                 ModuleKind::EsNext,
             )
             .code,
-            "var M;\n(function (M) {\n})(M || (M = {}));\n"
+            ""
         );
         assert_eq!(
             emit_with(
@@ -12124,6 +12452,24 @@ mod tests {
             )
             .code,
             ""
+        );
+    }
+
+    #[test]
+    fn omits_redundant_variable_for_function_namespace_merges() {
+        assert_eq!(
+            emit_with(
+                "function f() {} namespace f { export const value = 1; }",
+                ScriptTarget::Es2015,
+                ModuleKind::EsNext,
+            )
+            .code,
+            concat!(
+                "function f() { }\n",
+                "(function (f) {\n",
+                "    f.value = 1;\n",
+                "})(f || (f = {}));\n",
+            )
         );
     }
 
@@ -13017,6 +13363,30 @@ class Board {
     }
 
     #[test]
+    fn preserves_final_immediate_trailing_statement_comment_in_amd() {
+        let result = emit_with(
+            "import \"file2\"; let a: number; // should not work",
+            ScriptTarget::Es2015,
+            ModuleKind::Amd,
+        );
+        assert!(
+            result.code.contains("    let a; // should not work\n"),
+            "{}",
+            result.code
+        );
+    }
+
+    #[test]
+    fn drops_unowned_function_expression_body_opening_comment() {
+        let result = emit_with(
+            "const f = function () { // diagnostic context\n return 1;\n};",
+            ScriptTarget::Es2015,
+            ModuleKind::EsNext,
+        );
+        assert_eq!(result.code, "const f = function () {\n    return 1;\n};\n");
+    }
+
+    #[test]
     fn defers_reference_directives_until_their_runtime_import_owner() {
         let source = concat!(
             "/*! license */\n",
@@ -13548,7 +13918,7 @@ class Board {
             ScriptTarget::Es2015,
             ModuleKind::EsNext,
         );
-        assert_eq!(empty.code, "var M;\n(function (M) {\n})(M || (M = {}));\n");
+        assert_eq!(empty.code, "");
         let cyclic = emit_with(
             "namespace M { namespace N { import X = N; } export import Y = N; }",
             ScriptTarget::Es2015,
