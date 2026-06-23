@@ -4467,6 +4467,9 @@ impl<'a> Checker<'a> {
         if let Some(existing) = self.result.node_types.get(&node_id) {
             return *existing;
         }
+        if self.has_deep_left_binary_chain(node_id) {
+            return self.type_of_deep_left_binary_chain(node_id);
+        }
         let Some(node) = self.arena.get(node_id) else {
             return self.result.types.unknown();
         };
@@ -4533,44 +4536,7 @@ impl<'a> Checker<'a> {
             NodeData::BinaryExpression(data) => {
                 let left = self.type_of_expression(data.left);
                 let right = self.type_of_expression(data.right);
-                let operator = self
-                    .arena
-                    .get(data.operator_token)
-                    .map_or(SyntaxKind::Unknown, |node| node.kind);
-                let assignment_target = (operator == SyntaxKind::EqualsToken)
-                    .then(|| self.assignment_target_type(data.left))
-                    .flatten()
-                    .unwrap_or(left);
-                if operator == SyntaxKind::EqualsToken
-                    && let Some(symbol) = self.narrowing_subject(data.left)
-                {
-                    let declared = self
-                        .result
-                        .symbol_types
-                        .get(&symbol)
-                        .copied()
-                        .unwrap_or(left);
-                    if !self.is_assignable(right, declared) {
-                        self.assignability_error(node_id, right, declared);
-                    }
-                    self.flow_types.insert(symbol, right);
-                    right
-                } else if operator == SyntaxKind::EqualsToken
-                    && let Some(name) = self.readonly_assignment_name(data.left)
-                {
-                    self.error(node_id, 2540, [name]);
-                    if !self.is_assignable(right, assignment_target) {
-                        self.assignment_target_error(data.left, right, assignment_target);
-                    }
-                    right
-                } else if operator == SyntaxKind::EqualsToken
-                    && !self.is_assignable(right, assignment_target)
-                {
-                    self.assignment_target_error(data.left, right, assignment_target);
-                    assignment_target
-                } else {
-                    self.check_binary(node_id, operator, assignment_target, right)
-                }
+                self.finish_binary_expression(node_id, data, left, right)
             }
             NodeData::ConditionalExpression(data) => {
                 self.type_of_expression(data.condition);
@@ -4719,7 +4685,8 @@ impl<'a> Checker<'a> {
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default();
-                let callee = if let Some(name) = self.property_name(data.expression)
+                let callee = if !type_arguments.is_empty()
+                    && let Some(name) = self.property_name(data.expression)
                     && let Some(symbol) = self.resolve_identifier(data.expression, &name)
                 {
                     self.instantiate_declared_object(symbol, &type_arguments)
@@ -4745,6 +4712,86 @@ impl<'a> Checker<'a> {
         };
         self.result.node_types.insert(node_id, result);
         result
+    }
+
+    fn has_deep_left_binary_chain(&self, mut node_id: NodeId) -> bool {
+        for _ in 0..256 {
+            let Some(NodeData::BinaryExpression(binary)) =
+                self.arena.get(node_id).map(|node| &node.data)
+            else {
+                return false;
+            };
+            node_id = binary.left;
+        }
+        matches!(
+            self.arena.get(node_id).map(|node| &node.data),
+            Some(NodeData::BinaryExpression(_))
+        )
+    }
+
+    fn type_of_deep_left_binary_chain(&mut self, node_id: NodeId) -> TypeId {
+        let mut chain = Vec::new();
+        let mut current = node_id;
+        while let Some(NodeData::BinaryExpression(binary)) =
+            self.arena.get(current).map(|node| &node.data)
+        {
+            chain.push((current, binary.clone()));
+            current = binary.left;
+        }
+        let mut left = self.type_of_expression(current);
+        for (binary_id, binary) in chain.into_iter().rev() {
+            let right = self.type_of_expression(binary.right);
+            left = self.finish_binary_expression(binary_id, &binary, left, right);
+            self.result.node_types.insert(binary_id, left);
+        }
+        left
+    }
+
+    fn finish_binary_expression(
+        &mut self,
+        node_id: NodeId,
+        data: &ts_ast::BinaryExpressionData,
+        left: TypeId,
+        right: TypeId,
+    ) -> TypeId {
+        let operator = self
+            .arena
+            .get(data.operator_token)
+            .map_or(SyntaxKind::Unknown, |node| node.kind);
+        let assignment_target = (operator == SyntaxKind::EqualsToken)
+            .then(|| self.assignment_target_type(data.left))
+            .flatten()
+            .unwrap_or(left);
+        if operator == SyntaxKind::EqualsToken
+            && let Some(symbol) = self.narrowing_subject(data.left)
+        {
+            let declared = self
+                .result
+                .symbol_types
+                .get(&symbol)
+                .copied()
+                .unwrap_or(left);
+            if !self.is_assignable(right, declared) {
+                self.assignability_error(node_id, right, declared);
+            }
+            self.flow_types.insert(symbol, right);
+            right
+        } else if operator == SyntaxKind::EqualsToken
+            && let Some(name) = self.readonly_assignment_name(data.left)
+        {
+            self.error(node_id, 2540, [name]);
+            if !self.is_assignable(right, assignment_target) {
+                self.assignment_target_error(data.left, right, assignment_target);
+            }
+            right
+        } else if operator == SyntaxKind::EqualsToken
+            && !self.is_assignable(right, assignment_target)
+        {
+            self.assignment_target_error(data.left, right, assignment_target);
+            assignment_target
+        } else {
+            self.check_binary(node_id, operator, assignment_target, right)
+        }
     }
 
     fn prefix_unary_type(&mut self, expression: &ts_ast::PrefixUnaryExpressionData) -> TypeId {

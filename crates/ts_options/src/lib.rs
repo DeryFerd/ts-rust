@@ -108,6 +108,7 @@ pub struct CompilerOptions {
     pub skip_lib_check: bool,
     pub strict: bool,
     pub strict_null_checks: bool,
+    pub use_define_for_class_fields: Option<bool>,
     pub use_unknown_in_catch_variables: bool,
     pub verbatim_module_syntax: bool,
     pub lib: Option<Vec<String>>,
@@ -162,6 +163,7 @@ impl Default for CompilerOptions {
             skip_lib_check: false,
             strict: false,
             strict_null_checks: false,
+            use_define_for_class_fields: None,
             use_unknown_in_catch_variables: false,
             verbatim_module_syntax: false,
             lib: None,
@@ -200,6 +202,7 @@ pub struct PrinterSettings {
     pub source_map: bool,
     pub inline_source_map: bool,
     pub no_emit_helpers: bool,
+    pub use_define_for_class_fields: Option<bool>,
 }
 
 /// Result of parsing a `compilerOptions` JSON object.
@@ -295,6 +298,9 @@ impl CompilerOptions {
                 }
                 "strictnullchecks" => self.strict_null_checks = overrides.strict_null_checks,
                 "target" => self.target = overrides.target,
+                "usedefineforclassfields" => {
+                    self.use_define_for_class_fields = overrides.use_define_for_class_fields;
+                }
                 "useunknownincatchvariables" => {
                     self.use_unknown_in_catch_variables = overrides.use_unknown_in_catch_variables;
                 }
@@ -343,6 +349,7 @@ impl CompilerOptions {
                 && !self.emit_declaration_only,
             inline_source_map: self.inline_source_map,
             no_emit_helpers: self.no_emit_helpers,
+            use_define_for_class_fields: self.use_define_for_class_fields,
         }
     }
 }
@@ -481,6 +488,10 @@ pub fn parse_compiler_options_map(options: &BTreeMap<String, JsonValue>) -> Pars
             "strictnullchecks" => {
                 parsed.strict_null_checks = boolean(original_name, value, &mut diagnostics);
             }
+            "usedefineforclassfields" => {
+                parsed.use_define_for_class_fields =
+                    boolean(original_name, value, &mut diagnostics);
+            }
             "verbatimmodulesyntax" => {
                 parsed.verbatim_module_syntax = boolean(original_name, value, &mut diagnostics);
             }
@@ -560,6 +571,7 @@ struct PartialOptions {
     skip_lib_check: Option<bool>,
     strict: Option<bool>,
     strict_null_checks: Option<bool>,
+    use_define_for_class_fields: Option<bool>,
     use_unknown_in_catch_variables: Option<bool>,
     verbatim_module_syntax: Option<bool>,
     lib: Option<Vec<String>>,
@@ -632,6 +644,7 @@ impl PartialOptions {
             skip_lib_check: self.skip_lib_check.unwrap_or(false),
             strict,
             strict_null_checks: self.strict_null_checks.unwrap_or(strict),
+            use_define_for_class_fields: self.use_define_for_class_fields,
             use_unknown_in_catch_variables: self.use_unknown_in_catch_variables.unwrap_or(strict),
             verbatim_module_syntax: self.verbatim_module_syntax.unwrap_or(false),
             lib: self.lib,

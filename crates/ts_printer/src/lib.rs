@@ -111,6 +111,7 @@ pub fn emit_source_file(arena: &NodeArena, source_file: NodeId) -> Result<EmitRe
             source_map: false,
             inline_source_map: false,
             no_emit_helpers: false,
+            use_define_for_class_fields: None,
         },
     )
 }
@@ -296,6 +297,12 @@ pub fn emit_source_file_with_context(
         arena
             .get(*statement)
             .is_some_and(|statement| export_declaration_is_empty(arena, statement))
+    });
+    let has_recovered_module_clause = data.statements.nodes.iter().any(|statement| {
+        matches!(
+            arena.get(*statement).map(|node| &node.data),
+            Some(NodeData::NotEmittedStatement(_))
+        )
     });
     let needs_async_generator_helper =
         settings.target < ScriptTarget::Es2018 && source_needs_async_generator_helper(arena);
@@ -496,12 +503,10 @@ pub fn emit_source_file_with_context(
     for import in pending_commonjs_imports {
         printer.emit_commonjs_import_binding_exports(import, &data.statements)?;
     }
-    printer.emit_source_comments_between_with_ownership(
-        previous_end,
-        source_end,
-        previous_emitted,
-        false,
-    );
+    if !emitted_runtime_statement {
+        printer.emit_reference_directives_between(0, source_end);
+    }
+    printer.emit_source_comments_between_with_trailing(previous_end, source_end, previous_emitted);
     if settings.module == ModuleKind::CommonJs
         && let Some(expression) = export_equals_expression
     {
@@ -511,7 +516,7 @@ pub fn emit_source_file_with_context(
         printer.writer.newline();
     }
     if (settings.module == ModuleKind::None && is_external_module && !emitted_runtime_statement)
-        || (preserves_external_module_syntax && has_empty_export)
+        || (preserves_external_module_syntax && (has_empty_export || has_recovered_module_clause))
     {
         printer.writer.write("export {};");
         printer.writer.newline();
@@ -2327,6 +2332,12 @@ impl DeclarationPrinter<'_> {
             {
                 self.writer.write(" = ");
                 self.emit_literal_expression(declaration.initializer.unwrap())?;
+            } else if let Some(type_name) = declaration
+                .initializer
+                .and_then(|initializer| self.known_new_expression_type(initializer))
+            {
+                self.writer.write(": ");
+                self.writer.write(&type_name);
             } else if let Some(type_id) = self
                 .node_types
                 .and_then(|types| types.get(&declaration_id).copied())
@@ -2342,6 +2353,30 @@ impl DeclarationPrinter<'_> {
             }
         }
         Ok(())
+    }
+
+    fn known_new_expression_type(&self, initializer: NodeId) -> Option<String> {
+        let Some(NodeData::NewExpression(new_expression)) =
+            self.arena.get(initializer).map(|node| &node.data)
+        else {
+            return None;
+        };
+        if declaration_name_text(self.arena, new_expression.expression) != Some("DataView") {
+            return None;
+        }
+        let buffer_type = new_expression
+            .arguments
+            .as_ref()
+            .and_then(|arguments| arguments.nodes.first())
+            .and_then(|argument| self.arena.get(*argument))
+            .and_then(|argument| match &argument.data {
+                NodeData::NewExpression(buffer) => {
+                    declaration_name_text(self.arena, buffer.expression)
+                }
+                _ => None,
+            })
+            .unwrap_or("ArrayBufferLike");
+        Some(format!("DataView<{buffer_type}>"))
     }
 
     fn emit_semantic_const_initializer(
@@ -3711,6 +3746,7 @@ impl DeclarationPrinter<'_> {
             NodeData::PrivateIdentifier(data) => self.writer.write(&data.text),
             NodeData::StringLiteral(data) => write_quoted(&mut self.writer, &data.text),
             NodeData::NumericLiteral(data) => self.writer.write(&data.text),
+            NodeData::BigIntLiteral(data) => self.writer.write(&data.text.to_ascii_lowercase()),
             NodeData::ComputedPropertyName(data) => {
                 self.writer.write("[");
                 self.emit_literal_expression(data.expression)?;
@@ -3748,7 +3784,7 @@ impl DeclarationPrinter<'_> {
         let node = self.node(id)?.clone();
         match &node.data {
             NodeData::NumericLiteral(data) => self.writer.write(&data.text),
-            NodeData::BigIntLiteral(data) => self.writer.write(&data.text),
+            NodeData::BigIntLiteral(data) => self.writer.write(&data.text.to_ascii_lowercase()),
             NodeData::StringLiteral(data) => write_quoted(&mut self.writer, &data.text),
             NodeData::RegularExpressionLiteral(data) => self.writer.write(&data.text),
             NodeData::NoSubstitutionTemplateLiteral(data) => {
@@ -3946,7 +3982,8 @@ fn declaration_is_module_indicator(arena: &NodeArena, node: &Node) -> bool {
     match &node.data {
         NodeData::ImportDeclaration(_)
         | NodeData::ExportDeclaration(_)
-        | NodeData::ExportAssignment(_) => true,
+        | NodeData::ExportAssignment(_)
+        | NodeData::NotEmittedStatement(_) => true,
         NodeData::ImportEqualsDeclaration(import) => matches!(
             arena
                 .get(import.module_reference)
@@ -4849,6 +4886,16 @@ impl Printer<'_> {
         );
         dependencies.extend(side_effect_dependencies);
 
+        if data.statements.nodes.iter().all(|statement| {
+            self.arena
+                .get(*statement)
+                .is_none_or(|node| !self.statement_emits_runtime(*statement, node))
+        }) && let Some(first_statement) = data.statements.nodes.first()
+            && let Some(node) = self.arena.get(*first_statement)
+        {
+            self.emit_reference_directives_between(0, node.range.start.get());
+        }
+
         for dependency in context.amd_dependencies {
             let start = usize::try_from(dependency.comment_start).unwrap_or(usize::MAX);
             let end = usize::try_from(dependency.comment_end).unwrap_or(usize::MAX);
@@ -4969,7 +5016,7 @@ impl Printer<'_> {
         let mut previous_emitted = false;
         for statement in &data.statements.nodes {
             if let Some(node) = self.arena.get(*statement) {
-                let current_emitted = statement_emits_javascript(self.arena, node);
+                let current_emitted = self.statement_emits_runtime(*statement, node);
                 if current_emitted {
                     self.emit_source_comments_between(previous_end, node.range.start.get());
                 }
@@ -5269,6 +5316,55 @@ impl Printer<'_> {
             preserve_immediate_trailing,
             true,
         );
+    }
+
+    fn emit_inline_block_comments_between(
+        &mut self,
+        start: u32,
+        end: u32,
+        space_before_first: bool,
+    ) {
+        let start = usize::try_from(start).unwrap_or(usize::MAX);
+        let end = usize::try_from(end).unwrap_or(usize::MAX);
+        let Some(trivia) = self.source_text.get(start..end) else {
+            return;
+        };
+        let mut index = 0;
+        let mut first = true;
+        while let Some(comment_start) = trivia[index..].find("/*") {
+            let comment_start = index + comment_start;
+            let Some(comment_end) = trivia[comment_start + 2..].find("*/") else {
+                break;
+            };
+            let comment_end = comment_start + 2 + comment_end + 2;
+            if self
+                .emitted_source_comments
+                .insert((start + comment_start, start + comment_end))
+            {
+                if first && space_before_first {
+                    self.writer.write(" ");
+                }
+                self.writer.write(&trivia[comment_start..comment_end]);
+                self.writer.write(" ");
+                first = false;
+            }
+            index = comment_end;
+        }
+    }
+
+    fn inline_await_leading_comment_start(&self, start: u32, end: u32) -> Option<u32> {
+        let start = usize::try_from(start).ok()?;
+        let end = usize::try_from(end).ok()?;
+        let trivia = self.source_text.get(start..end)?;
+        let line_start = trivia
+            .rfind(['\n', '\r'])
+            .map_or(0, |line_break| line_break + 1);
+        let line = &trivia[line_start..];
+        let comment_start = line.find("/*")?;
+        line[..comment_start]
+            .trim()
+            .is_empty()
+            .then(|| u32::try_from(start + line_start + comment_start).ok())?
     }
 
     fn emit_source_comments_between_with_ownership(
@@ -5781,6 +5877,9 @@ impl Printer<'_> {
             let Some(node) = self.arena.get(*statement) else {
                 continue;
             };
+            if declaration_has_modifier(self.arena, node, SyntaxKind::DeclareKeyword) {
+                continue;
+            }
             if is_const_enum_declaration(self.arena, node)
                 && !self.const_enum_emit_mode.preserves_declarations()
             {
@@ -5902,7 +6001,9 @@ impl Printer<'_> {
                     !import.is_type_only && self.internal_import_equals_has_runtime_value(import)
                 }
             }
-            NodeData::InterfaceDeclaration(_) | NodeData::TypeAliasDeclaration(_) => false,
+            NodeData::NotEmittedStatement(_)
+            | NodeData::InterfaceDeclaration(_)
+            | NodeData::TypeAliasDeclaration(_) => false,
             NodeData::ExportDeclaration(_) if export_declaration_is_empty(self.arena, node) => {
                 false
             }
@@ -6131,26 +6232,36 @@ impl Printer<'_> {
         }
     }
 
-    fn namespace_has_merged_value_declaration(&self, name: NodeId) -> bool {
+    fn namespace_has_prior_merged_value_declaration(&self, name: NodeId) -> bool {
+        let Some(current) = self.arena.get(name).and_then(|node| node.parent) else {
+            return false;
+        };
+        let Some(current_start) = self.arena.get(current).map(|node| node.range.start) else {
+            return false;
+        };
         self.bindings
             .node_symbols
             .get(&name)
             .and_then(|symbol| self.bindings.symbols.get(*symbol))
             .is_some_and(|symbol| {
                 symbol.declarations.iter().any(|declaration| {
+                    if *declaration == current {
+                        return false;
+                    }
                     let Some(node) = self.arena.get(*declaration) else {
                         return false;
                     };
-                    if node_is_in_ambient_context(self.arena, *declaration) {
+                    if node.range.start >= current_start
+                        || node_is_in_ambient_context(self.arena, *declaration)
+                    {
                         return false;
                     }
                     match &node.data {
-                        NodeData::VariableDeclaration(_) | NodeData::ClassDeclaration(_) => true,
-                        NodeData::FunctionDeclaration(function) => function.body.is_some(),
-                        NodeData::EnumDeclaration(_) => {
-                            !is_const_enum_declaration(self.arena, node)
-                                || self.const_enum_emit_mode.preserves_declarations()
+                        NodeData::ClassDeclaration(_) | NodeData::EnumDeclaration(_) => true,
+                        NodeData::ModuleDeclaration(module) => {
+                            self.namespace_has_runtime_contents(module, &mut HashSet::new())
                         }
+                        NodeData::FunctionDeclaration(function) => function.body.is_some(),
                         _ => false,
                     }
                 })
@@ -6158,7 +6269,7 @@ impl Printer<'_> {
     }
 
     fn namespace_needs_local_declaration(&self, name: NodeId, text: &str) -> bool {
-        !self.namespace_has_merged_value_declaration(name)
+        !self.namespace_has_prior_merged_value_declaration(name)
             && !self.system_predeclared_names.contains(text)
     }
 
@@ -6202,6 +6313,7 @@ impl Printer<'_> {
             return Ok(());
         }
         match &node.data {
+            NodeData::NotEmittedStatement(_) => return Ok(()),
             NodeData::ImportDeclaration(import) if !self.import_has_runtime_use(id, import) => {
                 return Ok(());
             }
@@ -6897,11 +7009,35 @@ impl Printer<'_> {
                     statement_node.range.start.get(),
                 );
             }
+            let direct_await = matches!(
+                &statement_node.data,
+                NodeData::ExpressionStatement(expression)
+                    if matches!(
+                        self.arena.get(expression.expression).map(|node| &node.data),
+                        Some(NodeData::AwaitExpression(_))
+                    )
+            );
+            let inline_comment_start = direct_await
+                .then(|| {
+                    self.inline_await_leading_comment_start(
+                        previous_end,
+                        statement_node.range.start.get(),
+                    )
+                })
+                .flatten();
+            let comment_end = inline_comment_start.unwrap_or(statement_node.range.start.get());
             self.emit_source_comments_between_with_trailing(
                 previous_end,
-                statement_node.range.start.get(),
+                comment_end,
                 previous_emitted || previous_end == node.range.start.get().saturating_add(1),
             );
+            if let Some(comment_start) = inline_comment_start {
+                self.emit_inline_block_comments_between(
+                    comment_start,
+                    statement_node.range.start.get(),
+                    false,
+                );
+            }
             self.emit_statement(*statement)?;
             previous_end = statement_node.range.end.get();
             previous_emitted = statement_emits_javascript(self.arena, &statement_node);
@@ -7978,7 +8114,8 @@ impl Printer<'_> {
         if self.settings.target < ScriptTarget::Es2015 {
             return self.emit_downlevel_class(data);
         }
-        let lower_fields = self.settings.target < ScriptTarget::Es2022;
+        let lower_fields = self.settings.target < ScriptTarget::Es2022
+            || self.settings.use_define_for_class_fields == Some(false);
         let has_base = self.class_base_expression(data)?.is_some();
         self.writer.write("class");
         if let Some(name) = data.name {
@@ -9211,6 +9348,7 @@ impl Printer<'_> {
 
     fn emit_namespace(&mut self, data: &ts_ast::ModuleDeclarationData) -> Result<(), EmitError> {
         let name = self.identifier_text(data.name)?.to_owned();
+        let saved_identifier_rewrites = self.identifier_rewrites.clone();
         collect_namespace_alias_rewrites(
             self.arena,
             self.bindings,
@@ -9311,22 +9449,31 @@ impl Printer<'_> {
             self.writer.write(" = {})");
         }
         self.writer.write(");");
+        self.identifier_rewrites = saved_identifier_rewrites;
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     fn emit_enum(&mut self, data: &ts_ast::EnumDeclarationData) -> Result<(), EmitError> {
         let name = self.identifier_text(data.name)?.to_owned();
-        self.writer.write("var ");
-        self.writer.write(&name);
-        self.writer.write(";");
-        self.writer.newline();
+        let first_declaration = self
+            .namespace_declarations
+            .last_mut()
+            .expect("every enum has a lexical declaration scope")
+            .insert(name.clone());
+        if first_declaration && !self.namespace_has_prior_merged_value_declaration(data.name) {
+            self.writer.write("var ");
+            self.writer.write(&name);
+            self.writer.write(";");
+            self.writer.newline();
+        }
         self.writer.write("(function (");
         self.writer.write(&name);
         self.writer.write(") {");
         self.writer.newline();
         self.writer.indent += 1;
         let mut next_number = 0_i64;
-        for member in &data.members.nodes {
+        for (index, member) in data.members.nodes.iter().enumerate() {
             let member_id = *member;
             let node = self.node(*member)?.clone();
             let NodeData::EnumMember(member) = &node.data else {
@@ -9391,6 +9538,26 @@ impl Printer<'_> {
             }
             self.writer.write(";");
             self.writer.newline();
+            let comment_end = data
+                .members
+                .nodes
+                .get(index + 1)
+                .and_then(|next| self.arena.get(*next))
+                .map_or_else(
+                    || {
+                        self.arena
+                            .get(data.name)
+                            .and_then(|name| name.parent)
+                            .and_then(|declaration| self.arena.get(declaration))
+                            .map_or(node.range.end, |declaration| declaration.range.end)
+                    },
+                    |next| next.range.start,
+                );
+            self.emit_source_comments_between_with_trailing(
+                node.range.end.get(),
+                comment_end.get(),
+                true,
+            );
         }
         self.writer.indent -= 1;
         self.writer.write("})(");
@@ -10286,12 +10453,9 @@ impl Printer<'_> {
 
     fn import_has_runtime_use(
         &self,
-        declaration: NodeId,
+        _declaration: NodeId,
         import: &ts_ast::ImportDeclarationData,
     ) -> bool {
-        if !self.import_semantically_has_runtime_value(declaration) {
-            return false;
-        }
         if import.attributes.is_some() {
             return true;
         }
@@ -10422,7 +10586,7 @@ impl Printer<'_> {
             NodeData::QualifiedName(data) => self.emit_qualified_name(data)?,
             NodeData::PrivateIdentifier(data) => self.writer.write(&data.text),
             NodeData::NumericLiteral(data) => self.writer.write(&data.text),
-            NodeData::BigIntLiteral(data) => self.writer.write(&data.text),
+            NodeData::BigIntLiteral(data) => self.writer.write(&data.text.to_ascii_lowercase()),
             NodeData::StringLiteral(data) => self.write_source_quoted_string(id, &data.text),
             NodeData::RegularExpressionLiteral(data) => self.writer.write(&data.text),
             NodeData::KeywordExpression(_) => {
@@ -10500,6 +10664,31 @@ impl Printer<'_> {
                     && self.settings.target < ScriptTarget::Es2020
                 {
                     self.emit_downlevel_nullish(data.left, data.right, parent_precedence)?;
+                    return Ok(());
+                }
+                if self.settings.target < ScriptTarget::Es2016
+                    && matches!(
+                        operator,
+                        SyntaxKind::AsteriskAsteriskToken | SyntaxKind::AsteriskAsteriskEqualsToken
+                    )
+                {
+                    let compound = operator == SyntaxKind::AsteriskAsteriskEqualsToken;
+                    let wrap = compound && parent_precedence > 1;
+                    if wrap {
+                        self.writer.write("(");
+                    }
+                    if compound {
+                        self.emit_expression(data.left, 2)?;
+                        self.writer.write(" = ");
+                    }
+                    self.writer.write("Math.pow(");
+                    self.emit_expression(data.left, 0)?;
+                    self.writer.write(", ");
+                    self.emit_expression(data.right, 0)?;
+                    self.writer.write(")");
+                    if wrap {
+                        self.writer.write(")");
+                    }
                     return Ok(());
                 }
                 let (precedence, right_associative) = binary_precedence(operator)
@@ -10668,11 +10857,32 @@ impl Printer<'_> {
                     self.emit_expression(data.expression, 0)?;
                     self.writer.write(")");
                 } else if self.async_expression_transform == AsyncExpressionTransform::AwaitAsYield
+                    || self.settings.target < ScriptTarget::Es2017
                 {
                     self.writer.write("yield ");
                     self.emit_expression(data.expression, 2)?;
                 } else {
-                    self.writer.write("await ");
+                    self.writer.write("await");
+                    let comment_count = self.emitted_source_comments.len();
+                    self.emit_inline_block_comments_between(
+                        node.range.start.get().saturating_add(5),
+                        self.node(data.expression)?.range.start.get(),
+                        true,
+                    );
+                    if self.emitted_source_comments.len() == comment_count {
+                        let keyword_end = usize::try_from(node.range.start.get().saturating_add(5))
+                            .unwrap_or(usize::MAX);
+                        let expression_start =
+                            usize::try_from(self.node(data.expression)?.range.start.get())
+                                .unwrap_or(usize::MAX);
+                        if self
+                            .source_text
+                            .get(keyword_end..expression_start)
+                            .is_none_or(|trivia| !trivia.is_empty())
+                        {
+                            self.writer.write(" ");
+                        }
+                    }
                     self.emit_expression(data.expression, 2)?;
                 }
             }
@@ -12530,6 +12740,7 @@ mod tests {
                 source_map: true,
                 inline_source_map: false,
                 no_emit_helpers: false,
+                use_define_for_class_fields: None,
             },
         )
         .unwrap()
@@ -12557,6 +12768,7 @@ mod tests {
                 source_map: false,
                 inline_source_map: false,
                 no_emit_helpers: false,
+                use_define_for_class_fields: None,
             },
         )
         .unwrap()
@@ -12592,6 +12804,7 @@ mod tests {
                 source_map: true,
                 inline_source_map: false,
                 no_emit_helpers: false,
+                use_define_for_class_fields: None,
             },
             &EmitContext {
                 bindings: &bindings,
@@ -12626,6 +12839,7 @@ mod tests {
                 source_map: false,
                 inline_source_map: false,
                 no_emit_helpers: false,
+                use_define_for_class_fields: None,
             },
         )
         .unwrap()
@@ -13027,6 +13241,7 @@ mod tests {
                 source_map: false,
                 inline_source_map: false,
                 no_emit_helpers: false,
+                use_define_for_class_fields: None,
             },
         )
         .unwrap();
@@ -13338,6 +13553,7 @@ mod tests {
                 source_map: false,
                 inline_source_map: false,
                 no_emit_helpers: false,
+                use_define_for_class_fields: None,
             },
             &EmitContext {
                 bindings: &bindings,
@@ -13611,6 +13827,7 @@ mod tests {
                     source_map: false,
                     inline_source_map: false,
                     no_emit_helpers: false,
+                    use_define_for_class_fields: None,
                 },
                 &EmitContext {
                     bindings: &bindings,
@@ -14078,6 +14295,7 @@ mod tests {
                 source_map: false,
                 inline_source_map: false,
                 no_emit_helpers: false,
+                use_define_for_class_fields: None,
             },
         )
         .unwrap_err();
@@ -14154,6 +14372,7 @@ class Board {
                 source_map: false,
                 inline_source_map: false,
                 no_emit_helpers: false,
+                use_define_for_class_fields: None,
             },
         )
         .unwrap();
@@ -14182,6 +14401,7 @@ class Board {
                 source_map: false,
                 inline_source_map: false,
                 no_emit_helpers: false,
+                use_define_for_class_fields: None,
             },
         )
         .unwrap();
@@ -14456,6 +14676,7 @@ class Board {
                 source_map: false,
                 inline_source_map: false,
                 no_emit_helpers: false,
+                use_define_for_class_fields: None,
             },
         )
         .unwrap();
@@ -14489,6 +14710,7 @@ class Board {
                     source_map: false,
                     inline_source_map: false,
                     no_emit_helpers: false,
+                    use_define_for_class_fields: None,
                 },
             )
             .unwrap();
@@ -14512,6 +14734,7 @@ class Board {
                 source_map: false,
                 inline_source_map: false,
                 no_emit_helpers: false,
+                use_define_for_class_fields: None,
             },
         )
         .unwrap();

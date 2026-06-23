@@ -674,7 +674,40 @@ impl<'a> Binder<'a> {
                 self.declare_export_alias(node_id, name, None, parent_symbol);
                 self.bind_node(data.expression, scope, container, parent_symbol);
             }
+            NodeData::BinaryExpression(_) => {
+                self.bind_binary_expression_children(node_id, scope, container, parent_symbol);
+            }
             _ => self.bind_children(node_id, scope, container, parent_symbol),
+        }
+    }
+
+    fn bind_binary_expression_children(
+        &mut self,
+        node_id: NodeId,
+        scope: ScopeId,
+        container: NodeId,
+        parent_symbol: Option<SymbolId>,
+    ) {
+        let mut pending = self
+            .children
+            .get(&node_id)
+            .into_iter()
+            .flatten()
+            .rev()
+            .copied()
+            .collect::<Vec<_>>();
+        while let Some(child) = pending.pop() {
+            if matches!(
+                self.arena.get(child).map(|node| &node.data),
+                Some(NodeData::BinaryExpression(_))
+            ) {
+                self.result.containers.insert(child, container);
+                if let Some(children) = self.children.get(&child) {
+                    pending.extend(children.iter().rev().copied());
+                }
+            } else {
+                self.bind_node(child, scope, container, parent_symbol);
+            }
         }
     }
 
@@ -930,7 +963,7 @@ impl<'a> Binder<'a> {
             else {
                 continue;
             };
-            let Some(name) = self.identifier_text(data.name).map(str::to_owned) else {
+            let Some(name) = self.declaration_name_text(data.name) else {
                 continue;
             };
             let local_name_node = data.property_name.unwrap_or(data.name);

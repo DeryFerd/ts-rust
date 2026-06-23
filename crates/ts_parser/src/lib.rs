@@ -26,18 +26,19 @@ use ts_ast::{
     MethodSignatureDeclarationData, ModifierList, ModuleBlockData, ModuleDeclarationData,
     NamedExportsData, NamedImportsData, NamespaceExportDeclarationData, NamespaceImportData,
     NewExpressionData, NoSubstitutionTemplateLiteralData, Node, NodeArena, NodeData, NodeFlags,
-    NodeId, NodeList, NonNullExpressionData, NumericLiteralData, ObjectLiteralExpressionData,
-    OmittedExpressionData, ParameterDeclarationData, ParenthesizedExpressionData,
-    ParenthesizedTypeNodeData, PostfixUnaryExpressionData, PrefixUnaryExpressionData,
-    PrivateIdentifierData, PropertyAccessExpressionData, PropertyAssignmentData,
-    PropertyDeclarationData, QualifiedNameData, RegularExpressionLiteralData, RestTypeNodeData,
-    ReturnStatementData, SatisfiesExpressionData, SetAccessorDeclarationData,
-    ShorthandPropertyAssignmentData, SourceFileData, SpreadAssignmentData, SpreadElementData,
-    StringLiteralData, SwitchStatementData, SymbolTable, SyntaxKind, TemplateExpressionData,
-    TemplateHeadData, TemplateLiteralTypeNodeData, TemplateLiteralTypeSpanData, TemplateMiddleData,
-    TemplateSpanData, TemplateTailData, ThisTypeNodeData, ThrowStatementData, TokenData,
-    TokenFlags, TryStatementData, TupleTypeNodeData, TypeAliasDeclarationData, TypeAssertionData,
-    TypeLiteralNodeData, TypeOfExpressionData, TypeOperatorNodeData, TypeParameterDeclarationData,
+    NodeId, NodeList, NonNullExpressionData, NotEmittedStatementData, NumericLiteralData,
+    ObjectLiteralExpressionData, OmittedExpressionData, ParameterDeclarationData,
+    ParenthesizedExpressionData, ParenthesizedTypeNodeData, PostfixUnaryExpressionData,
+    PrefixUnaryExpressionData, PrivateIdentifierData, PropertyAccessExpressionData,
+    PropertyAssignmentData, PropertyDeclarationData, QualifiedNameData,
+    RegularExpressionLiteralData, RestTypeNodeData, ReturnStatementData, SatisfiesExpressionData,
+    SetAccessorDeclarationData, ShorthandPropertyAssignmentData, SourceFileData,
+    SpreadAssignmentData, SpreadElementData, StringLiteralData, SwitchStatementData, SymbolTable,
+    SyntaxKind, TemplateExpressionData, TemplateHeadData, TemplateLiteralTypeNodeData,
+    TemplateLiteralTypeSpanData, TemplateMiddleData, TemplateSpanData, TemplateTailData,
+    ThisTypeNodeData, ThrowStatementData, TokenData, TokenFlags, TryStatementData,
+    TupleTypeNodeData, TypeAliasDeclarationData, TypeAssertionData, TypeLiteralNodeData,
+    TypeOfExpressionData, TypeOperatorNodeData, TypeParameterDeclarationData,
     TypePredicateNodeData, TypeQueryNodeData, TypeReferenceNodeData, UnionTypeNodeData,
     VariableDeclarationData, VariableDeclarationListData, VariableStatementData,
     WhileStatementData, WithStatementData, YieldExpressionData,
@@ -506,6 +507,11 @@ impl<'a> Parser<'a> {
             && self.next_token_kind() == SyntaxKind::FunctionKeyword;
         let import_starts_call = self.current.kind == SyntaxKind::ImportKeyword
             && self.next_token_kind() == SyntaxKind::OpenParenToken;
+        let recovered_bigint_module_clause = match self.current.kind {
+            SyntaxKind::ImportKeyword => self.module_clause_has_unquoted_bigint(false),
+            SyntaxKind::ExportKeyword => self.module_clause_has_unquoted_bigint(true),
+            _ => false,
+        };
         match self.current.kind {
             SyntaxKind::OpenBraceToken => self.parse_block(),
             SyntaxKind::ConstKeyword if is_const_enum => self.parse_const_enum_declaration(),
@@ -548,12 +554,67 @@ impl<'a> Parser<'a> {
                 self.parse_modified_statement()
             }
             SyntaxKind::ImportKeyword if import_starts_call => self.parse_expression_statement(),
+            SyntaxKind::ImportKeyword if recovered_bigint_module_clause => {
+                self.parse_recovered_bigint_module_clause(false)
+            }
             SyntaxKind::ImportKeyword => self.parse_import_declaration(),
+            SyntaxKind::ExportKeyword if recovered_bigint_module_clause => {
+                self.parse_recovered_bigint_module_clause(true)
+            }
             SyntaxKind::ExportKeyword => self.parse_export_declaration(),
             SyntaxKind::SemicolonToken => self.parse_empty_statement(),
             SyntaxKind::Identifier if is_labeled_statement => self.parse_labeled_statement(),
             _ => self.parse_expression_statement(),
         }
+    }
+
+    fn module_clause_has_unquoted_bigint(&mut self, require_first: bool) -> bool {
+        let checkpoint = self.scanner.mark();
+        let mut token = self.scanner.scan();
+        if token.kind != SyntaxKind::OpenBraceToken {
+            self.scanner.rewind(checkpoint);
+            return false;
+        }
+        token = self.scanner.scan();
+        let result = if require_first {
+            token.kind == SyntaxKind::BigIntLiteral
+        } else {
+            let mut found = token.kind == SyntaxKind::BigIntLiteral;
+            while !found
+                && !matches!(
+                    token.kind,
+                    SyntaxKind::CloseBraceToken | SyntaxKind::EndOfFile
+                )
+            {
+                token = self.scanner.scan();
+                found = token.kind == SyntaxKind::BigIntLiteral;
+            }
+            found
+        };
+        self.scanner.rewind(checkpoint);
+        result
+    }
+
+    fn parse_recovered_bigint_module_clause(&mut self, leave_bigint: bool) -> NodeId {
+        let start = self.consume().range.start;
+        self.expect_and_bump(SyntaxKind::OpenBraceToken, "Expected '{'.");
+        if !leave_bigint {
+            while !matches!(
+                self.current.kind,
+                SyntaxKind::CloseBraceToken | SyntaxKind::EndOfFile
+            ) {
+                self.bump();
+            }
+            if self.current.kind == SyntaxKind::CloseBraceToken {
+                self.bump();
+            }
+        }
+        self.alloc_node(
+            SyntaxKind::NotEmittedStatement,
+            TextRange::new(start, self.current.range.start),
+            NodeData::NotEmittedStatement(Box::new(NotEmittedStatementData { flow_node: None })),
+            &[],
+        )
     }
 
     fn parse_block(&mut self) -> NodeId {
@@ -1104,7 +1165,7 @@ impl<'a> Parser<'a> {
             } else {
                 None
             };
-            let first_name = self.parse_identifier_name("Expected a binding name.");
+            let first_name = self.parse_property_name("Expected a binding name.");
             let (property_name, name) = if self.current.kind == SyntaxKind::ColonToken {
                 self.bump();
                 (
@@ -5055,6 +5116,7 @@ impl<'a> Parser<'a> {
         match self.current.kind {
             SyntaxKind::StringLiteral => self.parse_string_literal(),
             SyntaxKind::NumericLiteral => self.parse_numeric_literal(),
+            SyntaxKind::BigIntLiteral => self.parse_bigint_literal(),
             SyntaxKind::PrivateIdentifier => self.parse_private_identifier(),
             SyntaxKind::OpenBracketToken => {
                 let start = self.consume().range.start;
