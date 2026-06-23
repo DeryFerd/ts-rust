@@ -237,6 +237,8 @@ pub fn emit_source_file_with_context(
         async_expression_transform: AsyncExpressionTransform::None,
         async_loop_counter: 0,
         async_control_counter: 0,
+        commonjs_empty_binding_temps: HashMap::new(),
+        commonjs_empty_binding_hoists: Vec::new(),
     };
     let node = printer.node(source_file)?.clone();
     let NodeData::SourceFile(data) = &node.data else {
@@ -318,6 +320,16 @@ pub fn emit_source_file_with_context(
         printer.writer.write("\"use strict\";");
         printer.writer.newline();
     }
+    if settings.module == ModuleKind::CommonJs && is_external_module {
+        printer.prepare_commonjs_empty_binding_temps(&data.statements);
+        let temps = printer.commonjs_empty_binding_hoists.clone();
+        if !temps.is_empty() {
+            printer.writer.write("var ");
+            printer.writer.write(&temps.join(", "));
+            printer.writer.write(";");
+            printer.writer.newline();
+        }
+    }
     let first_statement_start = data
         .statements
         .nodes
@@ -353,10 +365,16 @@ pub fn emit_source_file_with_context(
         printer.emit_awaiter_helper();
     }
     if settings.target < ScriptTarget::Es2015
-        && source_needs_awaiter_helper(arena)
+        && (source_needs_awaiter_helper(arena) || source_needs_downlevel_generator_helper(arena))
         && !settings.no_emit_helpers
     {
         printer.emit_generator_helper();
+    }
+    if settings.target < ScriptTarget::Es2015
+        && source_needs_downlevel_generator_helper(arena)
+        && !settings.no_emit_helpers
+    {
+        printer.emit_values_helper();
     }
     if settings.target < ScriptTarget::Es2018
         && source_needs_object_rest_helper(arena)
@@ -560,6 +578,52 @@ fn source_needs_awaiter_helper(arena: &NodeArena) -> bool {
                 && declaration_has_modifier(arena, node, SyntaxKind::AsyncKeyword)
         }
         _ => false,
+    })
+}
+
+fn source_needs_downlevel_generator_helper(arena: &NodeArena) -> bool {
+    arena.iter().any(|(_, node)| {
+        let NodeData::FunctionDeclaration(function) = &node.data else {
+            return false;
+        };
+        function.asterisk_token.is_some()
+            && !declaration_has_modifier(arena, node, SyntaxKind::AsyncKeyword)
+            && function
+                .body
+                .is_some_and(|body| is_downlevel_generator_for_of_body(arena, body))
+    })
+}
+
+fn is_downlevel_generator_for_of_body(arena: &NodeArena, body: NodeId) -> bool {
+    let Some(NodeData::Block(block)) = arena.get(body).map(|node| &node.data) else {
+        return false;
+    };
+    let [loop_id] = block.statements.nodes.as_slice() else {
+        return false;
+    };
+    let Some(loop_node) = arena.get(*loop_id) else {
+        return false;
+    };
+    let NodeData::ForInOrOfStatement(for_of) = &loop_node.data else {
+        return false;
+    };
+    if loop_node.kind != SyntaxKind::ForOfStatement || for_of.await_modifier.is_some() {
+        return false;
+    }
+    let Some(NodeData::Block(loop_body)) = arena.get(for_of.statement).map(|node| &node.data)
+    else {
+        return false;
+    };
+    loop_body.statements.nodes.last().is_some_and(|statement| {
+        let Some(NodeData::ExpressionStatement(statement)) =
+            arena.get(*statement).map(|node| &node.data)
+        else {
+            return false;
+        };
+        matches!(
+            arena.get(statement.expression).map(|node| &node.data),
+            Some(NodeData::YieldExpression(yielded)) if yielded.expression.is_some()
+        )
     })
 }
 
@@ -4324,6 +4388,14 @@ struct Es5AsyncCapturedLoop {
     control: Es5AsyncLoopControl,
 }
 
+#[derive(Clone)]
+struct Es5GeneratorForOf {
+    loop_variable: String,
+    iterable: NodeId,
+    before_yield: Vec<NodeId>,
+    yielded: NodeId,
+}
+
 #[derive(Clone, Copy)]
 enum Es5AsyncLoopControl {
     None,
@@ -4726,6 +4798,8 @@ struct Printer<'a> {
     async_expression_transform: AsyncExpressionTransform,
     async_loop_counter: u32,
     async_control_counter: u32,
+    commonjs_empty_binding_temps: HashMap<NodeId, Vec<String>>,
+    commonjs_empty_binding_hoists: Vec<String>,
 }
 
 impl Printer<'_> {
@@ -5752,6 +5826,25 @@ impl Printer<'_> {
         }
     }
 
+    fn emit_values_helper(&mut self) {
+        for line in [
+            "var __values = (this && this.__values) || function(o) {",
+            "    var s = typeof Symbol === \"function\" && Symbol.iterator, m = s && o[s], i = 0;",
+            "    if (m) return m.call(o);",
+            "    if (o && typeof o.length === \"number\") return {",
+            "        next: function () {",
+            "            if (o && i >= o.length) o = void 0;",
+            "            return { value: o && o[i++], done: !o };",
+            "        }",
+            "    };",
+            "    throw new TypeError(s ? \"Object is not iterable.\" : \"Symbol.iterator is not defined.\");",
+            "};",
+        ] {
+            self.writer.write(line);
+            self.writer.newline();
+        }
+    }
+
     fn emit_object_rest_helper(&mut self) {
         for line in [
             "var __rest = (this && this.__rest) || function (s, e) {",
@@ -6411,7 +6504,9 @@ impl Printer<'_> {
             NodeData::Block(_) => self.emit_block(id)?,
             NodeData::EmptyStatement(_) => self.writer.write(";"),
             NodeData::VariableStatement(data) => {
-                if !self.emit_namespace_export_variable_initializers(data)?
+                if self.commonjs_empty_binding_temps.contains_key(&id) {
+                    self.emit_commonjs_empty_binding_initializer(id, data)?;
+                } else if !self.emit_namespace_export_variable_initializers(data)?
                     && !self.emit_commonjs_export_variable_initializer(data)?
                 {
                     self.emit_runtime_declaration_modifiers(data.modifiers.as_ref());
@@ -6431,11 +6526,20 @@ impl Printer<'_> {
                 let downlevel_async = self.settings.target < ScriptTarget::Es2017
                     && data.asterisk_token.is_none()
                     && is_async;
+                let downlevel_generator = self.settings.target < ScriptTarget::Es2015
+                    && data.asterisk_token.is_some()
+                    && !is_async
+                    && self
+                        .es5_generator_for_of(data.body.expect("body checked above"))?
+                        .is_some();
                 if !downlevel_async && !downlevel_async_generator && is_async {
                     self.writer.write("async ");
                 }
                 self.writer.write("function");
-                if data.asterisk_token.is_some() && !downlevel_async_generator {
+                if data.asterisk_token.is_some()
+                    && !downlevel_async_generator
+                    && !downlevel_generator
+                {
                     self.writer.write("*");
                 }
                 self.writer.write(" ");
@@ -6461,6 +6565,8 @@ impl Printer<'_> {
                         data.body.expect("body checked above"),
                         &inner_name,
                     )?;
+                } else if downlevel_generator {
+                    self.emit_es5_generator_for_of_body(data.body.expect("body checked above"))?;
                 } else {
                     self.emit_function_body(data.body.expect("body checked above"))?;
                 }
@@ -7023,6 +7129,164 @@ impl Printer<'_> {
         Ok(())
     }
 
+    fn prepare_commonjs_empty_binding_temps(&mut self, statements: &NodeList) {
+        for statement in &statements.nodes {
+            let Some(node) = self.arena.get(*statement) else {
+                continue;
+            };
+            let NodeData::VariableStatement(variable) = &node.data else {
+                continue;
+            };
+            if !self.has_modifier(variable.modifiers.as_ref(), SyntaxKind::ExportKeyword) {
+                continue;
+            }
+            let Some(NodeData::VariableDeclarationList(list)) = self
+                .arena
+                .get(variable.declaration_list)
+                .map(|node| &node.data)
+            else {
+                continue;
+            };
+            let [declaration_id] = list.declarations.nodes.as_slice() else {
+                continue;
+            };
+            let Some(NodeData::VariableDeclaration(declaration)) =
+                self.arena.get(*declaration_id).map(|node| &node.data)
+            else {
+                continue;
+            };
+            if self
+                .arena
+                .get(declaration.name)
+                .is_none_or(|node| node.kind != SyntaxKind::ArrayBindingPattern)
+                || declaration.initializer.is_none()
+                || !self.binding_pattern_has_no_identifiers(declaration.name)
+            {
+                continue;
+            }
+            let mut pattern_count = 0;
+            self.count_array_binding_patterns(declaration.name, &mut pattern_count);
+            if pattern_count == 0 {
+                continue;
+            }
+            let temps = (0..pattern_count)
+                .map(|_| self.generated_names.generate_temp())
+                .collect::<Vec<_>>();
+            self.commonjs_empty_binding_hoists
+                .extend(temps.iter().cloned());
+            self.commonjs_empty_binding_temps.insert(*statement, temps);
+        }
+    }
+
+    fn binding_pattern_has_no_identifiers(&self, name: NodeId) -> bool {
+        let Some(node) = self.arena.get(name) else {
+            return false;
+        };
+        let NodeData::BindingPattern(pattern) = &node.data else {
+            return false;
+        };
+        pattern.elements.nodes.iter().all(|element| {
+            let Some(element) = self.arena.get(*element) else {
+                return false;
+            };
+            match &element.data {
+                NodeData::OmittedExpression(_) => true,
+                NodeData::BindingElement(element) => element
+                    .name
+                    .is_some_and(|name| self.binding_pattern_has_no_identifiers(name)),
+                _ => false,
+            }
+        })
+    }
+
+    fn count_array_binding_patterns(&self, name: NodeId, count: &mut usize) {
+        let Some(node) = self.arena.get(name) else {
+            return;
+        };
+        let NodeData::BindingPattern(pattern) = &node.data else {
+            return;
+        };
+        if node.kind == SyntaxKind::ArrayBindingPattern {
+            *count += 1;
+        }
+        for element in &pattern.elements.nodes {
+            if let Some(NodeData::BindingElement(element)) =
+                self.arena.get(*element).map(|node| &node.data)
+                && let Some(name) = element.name
+            {
+                self.count_array_binding_patterns(name, count);
+            }
+        }
+    }
+
+    fn emit_commonjs_empty_binding_initializer(
+        &mut self,
+        statement: NodeId,
+        variable: &ts_ast::VariableStatementData,
+    ) -> Result<(), EmitError> {
+        let temps = self
+            .commonjs_empty_binding_temps
+            .get(&statement)
+            .cloned()
+            .unwrap_or_default();
+        let list = self.node(variable.declaration_list)?.clone();
+        let NodeData::VariableDeclarationList(list) = &list.data else {
+            return Err(Self::unsupported(variable.declaration_list, list.kind));
+        };
+        let declaration_id = list.declarations.nodes[0];
+        let declaration = self.node(declaration_id)?.clone();
+        let NodeData::VariableDeclaration(declaration) = &declaration.data else {
+            return Err(Self::unsupported(declaration_id, declaration.kind));
+        };
+        let mut temps = temps.iter();
+        let root = temps.next().expect("prepared empty binding root");
+        self.writer.write(root);
+        self.writer.write(" = ");
+        self.emit_expression(declaration.initializer.expect("initializer checked"), 1)?;
+        self.emit_empty_binding_children(declaration.name, root, &mut temps)?;
+        self.writer.write(";");
+        Ok(())
+    }
+
+    fn emit_empty_binding_children<'a>(
+        &mut self,
+        pattern_id: NodeId,
+        parent_temp: &str,
+        temps: &mut impl Iterator<Item = &'a String>,
+    ) -> Result<(), EmitError> {
+        let pattern_node = self.node(pattern_id)?.clone();
+        let NodeData::BindingPattern(pattern) = &pattern_node.data else {
+            return Ok(());
+        };
+        let mut index = 0_usize;
+        let mut previous_end = pattern_node.range.start.get().saturating_add(1);
+        for element_id in &pattern.elements.nodes {
+            let element_node = self.node(*element_id)?.clone();
+            index += self.array_binding_comma_count(previous_end, element_node.range.start.get());
+            let NodeData::BindingElement(element) = &element_node.data else {
+                previous_end = element_node.range.end.get();
+                continue;
+            };
+            let Some(name) = element.name else {
+                previous_end = element_node.range.end.get();
+                continue;
+            };
+            if self.node(name)?.kind == SyntaxKind::ArrayBindingPattern {
+                let temp = temps.next().expect("prepared nested empty binding temp");
+                self.writer.write(", ");
+                self.writer.write(temp);
+                self.writer.write(" = ");
+                self.writer.write(parent_temp);
+                self.writer.write("[");
+                self.writer.write(&index.to_string());
+                self.writer.write("]");
+                self.emit_empty_binding_children(name, temp, temps)?;
+            }
+            previous_end = element_node.range.end.get();
+        }
+        Ok(())
+    }
+
     fn emit_block(&mut self, id: NodeId) -> Result<(), EmitError> {
         let node = self.node(id)?.clone();
         let NodeData::Block(data) = &node.data else {
@@ -7228,6 +7492,187 @@ impl Printer<'_> {
         self.writer.write("return ");
         self.emit_awaiter_call(body, None, this_argument)?;
         self.writer.write(";");
+        self.writer.newline();
+        self.writer.indent -= 1;
+        self.writer.write("}");
+        Ok(())
+    }
+
+    fn es5_generator_for_of(&self, body: NodeId) -> Result<Option<Es5GeneratorForOf>, EmitError> {
+        let body_node = self.node(body)?;
+        let NodeData::Block(block) = &body_node.data else {
+            return Ok(None);
+        };
+        let [loop_id] = block.statements.nodes.as_slice() else {
+            return Ok(None);
+        };
+        let loop_node = self.node(*loop_id)?;
+        let NodeData::ForInOrOfStatement(for_of) = &loop_node.data else {
+            return Ok(None);
+        };
+        if loop_node.kind != SyntaxKind::ForOfStatement || for_of.await_modifier.is_some() {
+            return Ok(None);
+        }
+        let initializer = self.node(for_of.initializer)?;
+        let NodeData::VariableDeclarationList(declarations) = &initializer.data else {
+            return Ok(None);
+        };
+        let [declaration_id] = declarations.declarations.nodes.as_slice() else {
+            return Ok(None);
+        };
+        let declaration = self.node(*declaration_id)?;
+        let NodeData::VariableDeclaration(declaration) = &declaration.data else {
+            return Ok(None);
+        };
+        let Ok(loop_variable) = self.identifier_text(declaration.name) else {
+            return Ok(None);
+        };
+        let loop_variable = loop_variable.to_owned();
+        let loop_body = self.node(for_of.statement)?;
+        let NodeData::Block(loop_body) = &loop_body.data else {
+            return Ok(None);
+        };
+        let Some((last, before_yield)) = loop_body.statements.nodes.split_last() else {
+            return Ok(None);
+        };
+        let last = self.node(*last)?;
+        let NodeData::ExpressionStatement(last) = &last.data else {
+            return Ok(None);
+        };
+        let yielded = self.node(last.expression)?;
+        let NodeData::YieldExpression(yielded) = &yielded.data else {
+            return Ok(None);
+        };
+        let Some(yielded) = yielded.expression else {
+            return Ok(None);
+        };
+        Ok(Some(Es5GeneratorForOf {
+            loop_variable,
+            iterable: for_of.expression,
+            before_yield: before_yield.to_vec(),
+            yielded,
+        }))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn emit_es5_generator_for_of_body(&mut self, body: NodeId) -> Result<(), EmitError> {
+        let info = self
+            .es5_generator_for_of(body)?
+            .expect("downlevel generator shape checked");
+        self.writer.write("{");
+        self.writer.newline();
+        self.writer.indent += 1;
+        self.writer.write("var _loop_1, _a, _b, ");
+        self.writer.write(&info.loop_variable);
+        self.writer.write(", e_1_1;");
+        self.writer.newline();
+        self.writer.write("var e_1, _c;");
+        self.writer.newline();
+        self.writer
+            .write("return __generator(this, function (_d) {");
+        self.writer.newline();
+        self.writer.indent += 1;
+        self.writer.write("switch (_d.label) {");
+        self.writer.newline();
+        self.writer.indent += 1;
+        self.writer.write("case 0:");
+        self.writer.newline();
+        self.writer.indent += 1;
+        self.writer.write("_loop_1 = function (");
+        self.writer.write(&info.loop_variable);
+        self.writer.write(") {");
+        self.writer.newline();
+        self.writer.indent += 1;
+        self.writer
+            .write("return __generator(this, function (_e) {");
+        self.writer.newline();
+        self.writer.indent += 1;
+        self.writer.write("switch (_e.label) {");
+        self.writer.newline();
+        self.writer.indent += 1;
+        self.writer.write("case 0:");
+        self.writer.newline();
+        self.writer.indent += 1;
+        for statement in &info.before_yield {
+            self.emit_statement(*statement)?;
+        }
+        self.writer.write("return [4 /*yield*/, ");
+        self.emit_expression(info.yielded, 0)?;
+        self.writer.write("];");
+        self.writer.newline();
+        self.writer.indent -= 1;
+        self.writer.write("case 1:");
+        self.writer.newline();
+        self.writer.indent += 1;
+        self.writer.write("_e.sent();");
+        self.writer.newline();
+        self.writer.write("return [2 /*return*/];");
+        self.writer.newline();
+        self.writer.indent -= 2;
+        self.writer.write("}");
+        self.writer.newline();
+        self.writer.indent -= 1;
+        self.writer.write("});");
+        self.writer.newline();
+        self.writer.indent -= 1;
+        self.writer.write("};");
+        self.writer.newline();
+        self.writer.write("_d.label = 1;");
+        self.writer.newline();
+        self.writer.indent -= 1;
+        for line in ["case 1:", "    _d.trys.push([1, 6, 7, 8]);"] {
+            self.writer.write(line);
+            self.writer.newline();
+        }
+        self.writer.indent += 1;
+        self.writer.write("_a = __values(");
+        self.emit_expression(info.iterable, 0)?;
+        self.writer.write("), _b = _a.next();");
+        self.writer.newline();
+        self.writer.write("_d.label = 2;");
+        self.writer.newline();
+        self.writer.indent -= 1;
+        self.writer.write("case 2:");
+        self.writer.newline();
+        self.writer.indent += 1;
+        self.writer.write("if (!!_b.done) return [3 /*break*/, 5];");
+        self.writer.newline();
+        self.writer.write(&info.loop_variable);
+        self.writer.write(" = _b.value;");
+        self.writer.newline();
+        self.writer.write("return [5 /*yield**/, _loop_1(");
+        self.writer.write(&info.loop_variable);
+        self.writer.write(")];");
+        self.writer.newline();
+        self.writer.indent -= 1;
+        for line in [
+            "case 3:",
+            "    _d.sent();",
+            "    _d.label = 4;",
+            "case 4:",
+            "    _b = _a.next();",
+            "    return [3 /*break*/, 2];",
+            "case 5: return [3 /*break*/, 8];",
+            "case 6:",
+            "    e_1_1 = _d.sent();",
+            "    e_1 = { error: e_1_1 };",
+            "    return [3 /*break*/, 8];",
+            "case 7:",
+            "    try {",
+            "        if (_b && !_b.done && (_c = _a.return)) _c.call(_a);",
+            "    }",
+            "    finally { if (e_1) throw e_1.error; }",
+            "    return [7 /*endfinally*/];",
+            "case 8: return [2 /*return*/];",
+        ] {
+            self.writer.write(line);
+            self.writer.newline();
+        }
+        self.writer.indent -= 1;
+        self.writer.write("}");
+        self.writer.newline();
+        self.writer.indent -= 1;
+        self.writer.write("});");
         self.writer.newline();
         self.writer.indent -= 1;
         self.writer.write("}");
