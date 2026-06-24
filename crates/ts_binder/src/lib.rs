@@ -348,6 +348,27 @@ impl<'a> Binder<'a> {
                 }
                 self.bind_node(data.block, catch_scope, node_id, parent_symbol);
             }
+            NodeData::ForStatement(data) => {
+                let loop_scope = self.create_scope(ScopeKind::Block, node_id, Some(scope));
+                self.result.node_scopes.insert(node_id, loop_scope);
+                if let Some(initializer) = data.initializer {
+                    self.bind_node(initializer, loop_scope, node_id, parent_symbol);
+                }
+                if let Some(condition) = data.condition {
+                    self.bind_node(condition, loop_scope, node_id, parent_symbol);
+                }
+                if let Some(incrementor) = data.incrementor {
+                    self.bind_node(incrementor, loop_scope, node_id, parent_symbol);
+                }
+                self.bind_node(data.statement, loop_scope, node_id, parent_symbol);
+            }
+            NodeData::ForInOrOfStatement(data) => {
+                let loop_scope = self.create_scope(ScopeKind::Block, node_id, Some(scope));
+                self.result.node_scopes.insert(node_id, loop_scope);
+                self.bind_node(data.initializer, loop_scope, node_id, parent_symbol);
+                self.bind_node(data.expression, loop_scope, node_id, parent_symbol);
+                self.bind_node(data.statement, loop_scope, node_id, parent_symbol);
+            }
             NodeData::ModuleBlock(data) => {
                 self.result.node_scopes.insert(node_id, scope);
                 for statement in &data.statements.nodes {

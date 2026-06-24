@@ -5,7 +5,7 @@ use std::error::Error;
 use std::fmt;
 
 use ts_ast::{Node, NodeArena, NodeData, NodeId, NodeList, SymbolId, SyntaxKind};
-use ts_binder::{BindResult, SymbolFlags, bind_source_file};
+use ts_binder::{BindResult, ScopeId, ScopeKind, SymbolFlags, bind_source_file};
 use ts_checker::{
     FunctionType, ImportTypeReference, NamedTypeReference, ObjectType, TypeArena, TypeId, TypeKind,
 };
@@ -240,6 +240,7 @@ pub fn emit_source_file_with_context(
         commonjs_named_import_temps: HashMap::new(),
         commonjs_named_import_text_rewrites: HashMap::new(),
         commonjs_export_text_rewrites: HashMap::new(),
+        commonjs_anonymous_default_names: HashMap::new(),
         decorator_metadata_guard_temps: HashMap::new(),
         import_helpers_namespace: None,
         has_runtime_export_equals: false,
@@ -338,6 +339,7 @@ pub fn emit_source_file_with_context(
         printer.commonjs_named_import_text_rewrites = text_rewrites;
         printer.identifier_rewrites.extend(rewrites);
     }
+    printer.prepare_es5_block_scoped_rewrites();
     let has_explicit_module_indicator = data.statements.nodes.iter().any(|statement| {
         arena
             .get(*statement)
@@ -415,23 +417,6 @@ pub fn emit_source_file_with_context(
         printer.writer.write("\"use strict\";");
         printer.writer.newline();
     }
-    if settings.module == ModuleKind::CommonJs && is_external_module {
-        printer.prepare_commonjs_empty_binding_temps(&data.statements);
-        printer.prepare_commonjs_destructuring_assignment_temps();
-        let mut temps = printer.commonjs_empty_binding_hoists.clone();
-        temps.extend(
-            printer
-                .commonjs_destructuring_assignment_hoists
-                .iter()
-                .cloned(),
-        );
-        if !temps.is_empty() {
-            printer.writer.write("var ");
-            printer.writer.write(&temps.join(", "));
-            printer.writer.write(";");
-            printer.writer.newline();
-        }
-    }
     let first_statement_start = data
         .statements
         .nodes
@@ -443,7 +428,7 @@ pub fn emit_source_file_with_context(
         && !settings.no_emit_helpers;
     if let Some(start) = first_statement_start {
         printer.emit_leading_detached_source_comments(start);
-        if needs_extends_helper {
+        if needs_extends_helper || (settings.module == ModuleKind::CommonJs && is_external_module) {
             let source_prologues = data
                 .statements
                 .nodes
@@ -466,6 +451,23 @@ pub fn emit_source_file_with_context(
                 .is_some_and(|node| printer.statement_emits_in_place(*statement, node))
         }) {
             printer.emit_leading_pinned_source_comments(start);
+        }
+    }
+    if settings.module == ModuleKind::CommonJs && is_external_module {
+        printer.prepare_commonjs_empty_binding_temps(&data.statements);
+        printer.prepare_commonjs_destructuring_assignment_temps();
+        let mut temps = printer.commonjs_empty_binding_hoists.clone();
+        temps.extend(
+            printer
+                .commonjs_destructuring_assignment_hoists
+                .iter()
+                .cloned(),
+        );
+        if !temps.is_empty() {
+            printer.writer.write("var ");
+            printer.writer.write(&temps.join(", "));
+            printer.writer.write(";");
+            printer.writer.newline();
         }
     }
     if needs_dynamic_import_helpers && !settings.no_emit_helpers {
@@ -662,10 +664,18 @@ pub fn emit_source_file_with_context(
                 if !declaration_has_modifier(arena, node, SyntaxKind::ExportKeyword) {
                     continue;
                 }
-                let Some(name) = function
+                let name = if let Some(name) = function
                     .name
                     .and_then(|name| declaration_name_text(arena, name))
-                else {
+                {
+                    name.to_owned()
+                } else if declaration_has_modifier(arena, node, SyntaxKind::DefaultKeyword) {
+                    let name = printer.generated_names.generate("default");
+                    printer
+                        .commonjs_anonymous_default_names
+                        .insert(*statement, name.clone());
+                    name
+                } else {
                     continue;
                 };
                 printer.writer.write("exports.");
@@ -673,11 +683,11 @@ pub fn emit_source_file_with_context(
                     if declaration_has_modifier(arena, node, SyntaxKind::DefaultKeyword) {
                         "default"
                     } else {
-                        name
+                        &name
                     },
                 );
                 printer.writer.write(" = ");
-                printer.writer.write(name);
+                printer.writer.write(&name);
                 printer.writer.write(";");
                 printer.writer.newline();
             }
@@ -17622,6 +17632,7 @@ struct Printer<'a> {
     commonjs_named_import_temps: HashMap<NodeId, String>,
     commonjs_named_import_text_rewrites: HashMap<String, String>,
     commonjs_export_text_rewrites: HashMap<String, String>,
+    commonjs_anonymous_default_names: HashMap<NodeId, String>,
     decorator_metadata_guard_temps: HashMap<NodeId, String>,
     import_helpers_namespace: Option<String>,
     has_runtime_export_equals: bool,
@@ -20790,17 +20801,7 @@ impl Printer<'_> {
                 }
             }
             NodeData::FunctionDeclaration(data) => {
-                let commonjs_default_name = (self.commonjs_module_transform
-                    && data.name.is_none()
-                    && self.has_modifier(data.modifiers.as_ref(), SyntaxKind::ExportKeyword)
-                    && self.has_modifier(data.modifiers.as_ref(), SyntaxKind::DefaultKeyword))
-                .then(|| self.generated_names.generate("default"));
-                if let Some(name) = commonjs_default_name.as_deref() {
-                    self.writer.write("exports.default = ");
-                    self.writer.write(name);
-                    self.writer.write(";");
-                    self.writer.newline();
-                }
+                let commonjs_default_name = self.commonjs_anonymous_default_names.get(&id).cloned();
                 self.emit_runtime_declaration_modifiers(data.modifiers.as_ref());
                 let is_async = self.has_modifier(data.modifiers.as_ref(), SyntaxKind::AsyncKeyword);
                 let downlevel_async_generator = self.settings.target < ScriptTarget::Es2018
@@ -20812,11 +20813,11 @@ impl Printer<'_> {
                 let downlevel_generator = self.settings.target < ScriptTarget::Es2015
                     && data.asterisk_token.is_some()
                     && !is_async;
-                let object_rest_parameters = if self.settings.target < ScriptTarget::Es2018
+                let downlevel_binding_parameters = if self.settings.target < ScriptTarget::Es2018
                     && !is_async
                     && data.asterisk_token.is_none()
                 {
-                    self.object_rest_parameters(&data.parameters, id)
+                    self.downlevel_binding_parameters(&data.parameters, id)
                 } else {
                     Vec::new()
                 };
@@ -20852,11 +20853,11 @@ impl Printer<'_> {
                                 if parameter.initializer.is_some()
                         )
                     });
-                if !object_rest_parameters.is_empty() {
+                if !downlevel_binding_parameters.is_empty() {
                     self.emit_parameters_with_name_overrides(
                         &data.parameters,
-                        true,
-                        &object_rest_parameters,
+                        false,
+                        &downlevel_binding_parameters,
                     )?;
                 } else if downlevel_parameter_defaults && parameter_class_temps.is_empty() {
                     self.emit_parameters_without_initializers(&data.parameters)?;
@@ -20888,13 +20889,13 @@ impl Printer<'_> {
                     }
                 } else if downlevel_generator {
                     self.emit_es5_generator_body(data.body.expect("body checked above"))?;
-                } else if !object_rest_parameters.is_empty() {
-                    self.emit_function_body_with_object_rest_parameters(
+                } else if !downlevel_binding_parameters.is_empty() {
+                    self.emit_function_body_with_binding_parameters(
                         data.body.expect("body checked above"),
                         &data.parameters,
                         &parameter_class_temps,
                         downlevel_parameter_defaults,
-                        &object_rest_parameters,
+                        &downlevel_binding_parameters,
                     )?;
                 } else if !parameter_class_temps.is_empty() || downlevel_parameter_defaults {
                     self.emit_function_body_with_parameter_defaults(
@@ -21095,7 +21096,7 @@ impl Printer<'_> {
                     if self.downlevel_iteration {
                         self.emit_downlevel_iterable_for_of(data)?;
                     } else {
-                        self.emit_downlevel_for_of(data)?;
+                        self.emit_downlevel_for_of(id, data)?;
                     }
                     self.writer.newline();
                     return Ok(());
@@ -22000,13 +22001,11 @@ impl Printer<'_> {
 
     fn emit_downlevel_for_of(
         &mut self,
+        statement: NodeId,
         data: &ts_ast::ForInOrOfStatementData,
     ) -> Result<(), EmitError> {
-        let counter = self.generated_names.generate_loop_variable();
-        let rhs = match self.node(data.expression)?.data.clone() {
-            NodeData::Identifier(identifier) => self.generated_names.generate(&identifier.text),
-            _ => self.generated_names.generate_temp(),
-        };
+        let (counter, rhs, binding_temp) =
+            self.scoped_downlevel_for_of_names(statement, data.expression);
         self.writer.write("for (var ");
         self.writer.write(&counter);
         self.writer.write(" = 0, ");
@@ -22024,7 +22023,120 @@ impl Printer<'_> {
             Box::new(DownlevelBindingValue::Name(rhs)),
             DownlevelBindingIndex::Name(counter),
         );
-        self.emit_downlevel_for_of_body(data.statement, data.initializer, &value)
+        self.emit_downlevel_for_of_body(
+            data.statement,
+            data.initializer,
+            &value,
+            binding_temp.as_deref(),
+        )
+    }
+
+    fn scoped_downlevel_for_of_names(
+        &self,
+        statement: NodeId,
+        expression: NodeId,
+    ) -> (String, String, Option<String>) {
+        let container = self.nearest_function_like_container(statement);
+        let mut used = self
+            .arena
+            .iter()
+            .filter_map(|(id, node)| {
+                (self.nearest_function_like_container(id) == container)
+                    .then_some(node)
+                    .and_then(|node| match &node.data {
+                        NodeData::Identifier(identifier) => Some(identifier.text.clone()),
+                        _ => None,
+                    })
+            })
+            .collect::<HashSet<_>>();
+        let mut loops = self
+            .arena
+            .iter()
+            .filter(|(id, node)| {
+                node.kind == SyntaxKind::ForOfStatement
+                    && self.nearest_function_like_container(*id) == container
+                    && node.range.start.get()
+                        <= self
+                            .arena
+                            .get(statement)
+                            .map_or(u32::MAX, |statement| statement.range.start.get())
+            })
+            .map(|(id, node)| (node.range.start.get(), id))
+            .collect::<Vec<_>>();
+        loops.sort_by_key(|(start, _)| *start);
+
+        let mut current = (String::new(), String::new(), None);
+        for (_, loop_id) in loops {
+            let counter = if used.insert("_i".to_owned()) {
+                "_i".to_owned()
+            } else {
+                Self::generate_scoped_temp(&mut used)
+            };
+            let loop_expression = if loop_id == statement {
+                expression
+            } else {
+                match self.arena.get(loop_id).map(|node| &node.data) {
+                    Some(NodeData::ForInOrOfStatement(data)) => data.expression,
+                    _ => expression,
+                }
+            };
+            let rhs = match self.arena.get(loop_expression).map(|node| &node.data) {
+                Some(NodeData::Identifier(identifier)) => {
+                    let mut index = 1_u32;
+                    loop {
+                        let candidate = format!("{}_{}", identifier.text, index);
+                        if used.insert(candidate.clone()) {
+                            break candidate;
+                        }
+                        index += 1;
+                    }
+                }
+                _ => Self::generate_scoped_temp(&mut used),
+            };
+            let binding_temp = match self.arena.get(loop_id).map(|node| &node.data) {
+                Some(NodeData::ForInOrOfStatement(data))
+                    if self.downlevel_for_of_initializer_needs_temp(data.initializer) =>
+                {
+                    Some(Self::generate_scoped_temp(&mut used))
+                }
+                _ => None,
+            };
+            current = (counter, rhs, binding_temp);
+        }
+        current
+    }
+
+    fn downlevel_for_of_initializer_needs_temp(&self, initializer: NodeId) -> bool {
+        let Some(NodeData::VariableDeclarationList(list)) =
+            self.arena.get(initializer).map(|node| &node.data)
+        else {
+            return false;
+        };
+        let Some(NodeData::VariableDeclaration(declaration)) = list
+            .declarations
+            .nodes
+            .first()
+            .and_then(|declaration| self.arena.get(*declaration))
+            .map(|node| &node.data)
+        else {
+            return false;
+        };
+        matches!(
+            self.arena.get(declaration.name).map(|node| node.kind),
+            Some(SyntaxKind::ArrayBindingPattern | SyntaxKind::ObjectBindingPattern)
+        ) && !self.binding_pattern_has_single_simple_leaf(declaration.name)
+    }
+
+    fn generate_scoped_temp(used: &mut HashSet<String>) -> String {
+        let mut count = 0_u32;
+        loop {
+            if let Some(candidate) = generated_temp_name(count)
+                && used.insert(candidate.clone())
+            {
+                return candidate;
+            }
+            count += 1;
+        }
     }
 
     fn emit_downlevel_iterable_for_of(
@@ -22068,7 +22180,7 @@ impl Printer<'_> {
             Box::new(DownlevelBindingValue::Name(step.clone())),
             DownlevelBindingIndex::String("value".to_owned()),
         );
-        self.emit_downlevel_for_of_body(data.statement, data.initializer, &value)?;
+        self.emit_downlevel_for_of_body(data.statement, data.initializer, &value, None)?;
         self.writer.newline();
         self.writer.indent -= 1;
         self.writer.write("}");
@@ -22120,11 +22232,12 @@ impl Printer<'_> {
         body: NodeId,
         initializer: NodeId,
         value: &DownlevelBindingValue,
+        binding_temp: Option<&str>,
     ) -> Result<(), EmitError> {
         self.writer.write("{");
         self.writer.newline();
         self.writer.indent += 1;
-        self.emit_downlevel_for_of_binding(initializer, value)?;
+        self.emit_downlevel_for_of_binding(initializer, value, binding_temp)?;
 
         let body_node = self.node(body)?.clone();
         if let NodeData::Block(block) = &body_node.data {
@@ -22158,6 +22271,7 @@ impl Printer<'_> {
         &mut self,
         initializer: NodeId,
         value: &DownlevelBindingValue,
+        binding_temp: Option<&str>,
     ) -> Result<(), EmitError> {
         let initializer_node = self.node(initializer)?.clone();
         if let NodeData::VariableDeclarationList(list) = &initializer_node.data {
@@ -22168,22 +22282,28 @@ impl Printer<'_> {
                 let NodeData::VariableDeclaration(declaration) = &declaration_node.data else {
                     return Err(Self::unsupported(*declaration_id, declaration_node.kind));
                 };
-                let binding_value =
-                    if self.node(declaration.name)?.kind == SyntaxKind::ArrayBindingPattern {
-                        let temp = self.generated_names.generate_temp();
-                        self.emit_downlevel_declarator_start(&mut emitted);
-                        self.writer.write(&temp);
-                        self.writer.write(" = ");
-                        self.emit_downlevel_binding_value(value)?;
-                        DownlevelBindingValue::Name(temp)
-                    } else {
-                        (*value).clone()
-                    };
+                let binding_value = if matches!(
+                    self.node(declaration.name)?.kind,
+                    SyntaxKind::ArrayBindingPattern | SyntaxKind::ObjectBindingPattern
+                ) && !self
+                    .binding_pattern_has_single_simple_leaf(declaration.name)
+                {
+                    let temp = binding_temp
+                        .map_or_else(|| self.generated_names.generate_temp(), str::to_owned);
+                    self.emit_downlevel_declarator_start(&mut emitted);
+                    self.writer.write(&temp);
+                    self.writer.write(" = ");
+                    self.emit_downlevel_binding_value(value)?;
+                    DownlevelBindingValue::Name(temp)
+                } else {
+                    (*value).clone()
+                };
                 self.emit_downlevel_binding_declarators(
                     declaration.name,
                     binding_value,
                     None,
                     &mut emitted,
+                    true,
                 )?;
             }
             if !emitted {
@@ -22211,6 +22331,7 @@ impl Printer<'_> {
         value: DownlevelBindingValue,
         initializer: Option<NodeId>,
         emitted: &mut bool,
+        inline_single_leaf_nested: bool,
     ) -> Result<(), EmitError> {
         let value = if let Some(initializer) = initializer {
             let temp = self.generated_names.generate_temp();
@@ -22267,8 +22388,14 @@ impl Printer<'_> {
                             DownlevelBindingIndex::Number(index),
                         )
                     };
+                    let nested_kind = self.node(element_name)?.kind;
+                    let nested_single_leaf =
+                        self.binding_pattern_has_single_simple_leaf(element_name);
                     if element.initializer.is_none()
-                        && self.node(element_name)?.kind == SyntaxKind::ArrayBindingPattern
+                        && ((nested_kind == SyntaxKind::ArrayBindingPattern
+                            && !(inline_single_leaf_nested && nested_single_leaf))
+                            || (nested_kind == SyntaxKind::ObjectBindingPattern
+                                && !nested_single_leaf))
                     {
                         let temp = self.generated_names.generate_temp();
                         self.emit_downlevel_declarator_start(emitted);
@@ -22282,6 +22409,7 @@ impl Printer<'_> {
                         element_value,
                         element.initializer,
                         emitted,
+                        inline_single_leaf_nested,
                     )?;
                     previous_end = element_node.range.end.get();
                 }
@@ -22329,6 +22457,7 @@ impl Printer<'_> {
                         element_value,
                         element.initializer,
                         emitted,
+                        inline_single_leaf_nested,
                     )?;
                 }
             }
@@ -23414,7 +23543,7 @@ impl Printer<'_> {
         Ok(())
     }
 
-    fn object_rest_parameters(
+    fn downlevel_binding_parameters(
         &self,
         parameters: &NodeList,
         function: NodeId,
@@ -23427,20 +23556,18 @@ impl Printer<'_> {
             else {
                 continue;
             };
-            let Some(pattern_node) = self.arena.get(parameter.name) else {
+            if !matches!(
+                self.arena.get(parameter.name).map(|node| &node.data),
+                Some(NodeData::BindingPattern(_))
+            ) {
                 continue;
-            };
-            let NodeData::BindingPattern(pattern) = &pattern_node.data else {
-                continue;
-            };
-            if pattern_node.kind != SyntaxKind::ObjectBindingPattern
-                || !pattern.elements.nodes.iter().any(|element| {
-                    matches!(
-                        self.arena.get(*element).map(|node| &node.data),
-                        Some(NodeData::BindingElement(element))
-                            if element.dot_dot_dot_token.is_some()
-                    )
-                })
+            }
+            if self.settings.target >= ScriptTarget::Es2015
+                && !(self
+                    .arena
+                    .get(parameter.name)
+                    .is_some_and(|node| node.kind == SyntaxKind::ObjectBindingPattern)
+                    && self.object_binding_pattern_has_rest(parameter.name))
             {
                 continue;
             }
@@ -23451,13 +23578,13 @@ impl Printer<'_> {
         result
     }
 
-    fn emit_function_body_with_object_rest_parameters(
+    fn emit_function_body_with_binding_parameters(
         &mut self,
         body: NodeId,
         parameters: &NodeList,
         class_temps: &[String],
         downlevel_parameter_defaults: bool,
-        object_rest_parameters: &[(NodeId, NodeId, String)],
+        binding_parameters: &[(NodeId, NodeId, String)],
     ) -> Result<(), EmitError> {
         self.writer.write("{");
         self.writer.newline();
@@ -23469,13 +23596,29 @@ impl Printer<'_> {
             self.writer.newline();
         }
         if downlevel_parameter_defaults {
-            self.emit_parameter_default_prologues_with_overrides(
-                parameters,
-                object_rest_parameters,
-            )?;
+            self.emit_parameter_default_prologues_with_overrides(parameters, binding_parameters)?;
         }
-        for (_, pattern, temp) in object_rest_parameters {
-            self.emit_object_rest_parameter_prologue(*pattern, temp)?;
+        for (_, pattern, temp) in binding_parameters {
+            if self.node(*pattern)?.kind == SyntaxKind::ObjectBindingPattern
+                && self.object_binding_pattern_has_rest(*pattern)
+            {
+                self.emit_object_rest_parameter_prologue(*pattern, temp)?;
+            } else {
+                self.writer.write("var ");
+                let mut emitted = false;
+                self.emit_downlevel_binding_declarators(
+                    *pattern,
+                    DownlevelBindingValue::Name(temp.clone()),
+                    None,
+                    &mut emitted,
+                    true,
+                )?;
+                self.writer.write(";");
+                self.writer.newline();
+            }
+        }
+        if self.parameters_have_rest_parameter(parameters) {
+            self.emit_downlevel_rest_parameter_prologue(parameters)?;
         }
         self.emit_block_statements(body)?;
         self.writer.indent -= 1;
@@ -25023,6 +25166,7 @@ impl Printer<'_> {
                 DownlevelBindingValue::Name(temp.clone()),
                 None,
                 &mut emitted,
+                true,
             )?;
             self.writer.write(";");
             self.writer.newline();
@@ -25339,10 +25483,13 @@ impl Printer<'_> {
                 return Err(Self::unsupported(*declaration, declaration_node.kind));
             };
             if self.settings.target < ScriptTarget::Es2015
-                && self.node(declaration.name)?.kind == SyntaxKind::ArrayBindingPattern
+                && matches!(
+                    self.node(declaration.name)?.kind,
+                    SyntaxKind::ArrayBindingPattern | SyntaxKind::ObjectBindingPattern
+                )
             {
                 let value = if let Some(initializer) = declaration.initializer {
-                    if self.array_binding_can_inline_initializer(declaration.name)
+                    if self.binding_pattern_has_single_simple_leaf(declaration.name)
                         || matches!(
                             &self.node(initializer)?.data,
                             NodeData::Identifier(identifier)
@@ -25370,6 +25517,7 @@ impl Printer<'_> {
                     value,
                     None,
                     &mut emitted,
+                    false,
                 )?;
                 continue;
             }
@@ -25428,9 +25576,70 @@ impl Printer<'_> {
                     }
                 }
                 result?;
+            } else if self.es5_block_scoped_declaration_needs_reset(id, declaration.name) {
+                self.writer.write(" = void 0");
             }
         }
+        if keyword != "const" {
+            self.writer.remove_trailing_spaces();
+        }
         Ok(())
+    }
+
+    fn es5_block_scoped_declaration_needs_reset(&self, list: NodeId, name: NodeId) -> bool {
+        if self.settings.target >= ScriptTarget::Es2015
+            || self
+                .arena
+                .get(list)
+                .is_none_or(|list| !variable_list_is_block_scoped(list))
+        {
+            return false;
+        }
+        if let Some(parent) = self.arena.get(list).and_then(|list| list.parent)
+            && let Some(NodeData::ForStatement(for_statement)) =
+                self.arena.get(parent).map(|node| &node.data)
+            && for_statement.initializer == Some(list)
+        {
+            return self.block_scoped_declaration_is_captured(name, for_statement.statement);
+        }
+
+        let mut current = list;
+        while let Some(parent) = self.arena.get(current).and_then(|node| node.parent) {
+            match self.arena.get(parent).map(|node| &node.data) {
+                Some(NodeData::ForStatement(for_statement))
+                    if self.node_is_within(list, for_statement.statement) =>
+                {
+                    return true;
+                }
+                Some(NodeData::ForInOrOfStatement(for_statement))
+                    if self.node_is_within(list, for_statement.statement) =>
+                {
+                    return true;
+                }
+                Some(NodeData::WhileStatement(while_statement))
+                    if self.node_is_within(list, while_statement.statement) =>
+                {
+                    return true;
+                }
+                Some(NodeData::DoStatement(do_statement))
+                    if self.node_is_within(list, do_statement.statement) =>
+                {
+                    return true;
+                }
+                Some(
+                    NodeData::FunctionDeclaration(_)
+                    | NodeData::FunctionExpression(_)
+                    | NodeData::ArrowFunction(_)
+                    | NodeData::MethodDeclaration(_)
+                    | NodeData::ConstructorDeclaration(_)
+                    | NodeData::GetAccessorDeclaration(_)
+                    | NodeData::SetAccessorDeclaration(_),
+                ) => return false,
+                _ => {}
+            }
+            current = parent;
+        }
+        false
     }
 
     fn object_binding_pattern_has_rest(&self, pattern: NodeId) -> bool {
@@ -25600,6 +25809,295 @@ impl Printer<'_> {
         None
     }
 
+    fn prepare_es5_block_scoped_rewrites(&mut self) {
+        if self.settings.target >= ScriptTarget::Es2015 {
+            return;
+        }
+
+        let runtime_var_symbols = SymbolFlags::FUNCTION_SCOPED_VARIABLE
+            | SymbolFlags::FUNCTION
+            | SymbolFlags::CLASS
+            | SymbolFlags::REGULAR_ENUM
+            | SymbolFlags::VALUE_MODULE
+            | SymbolFlags::ALIAS;
+        let mut claimed = HashMap::<ScopeId, HashSet<String>>::new();
+        for scope in &self.bindings.scopes {
+            if !matches!(
+                scope.kind,
+                ScopeKind::SourceFile | ScopeKind::Function | ScopeKind::Module
+            ) {
+                continue;
+            }
+            let names = claimed.entry(scope.id).or_default();
+            for (name, symbol) in scope.symbols.iter() {
+                if self
+                    .bindings
+                    .symbols
+                    .get(symbol)
+                    .is_some_and(|symbol| symbol.flags.intersects(runtime_var_symbols))
+                {
+                    names.insert(name.to_owned());
+                }
+            }
+        }
+
+        let mut declarations = Vec::<(u32, NodeId)>::new();
+        for (_, node) in self.arena.iter() {
+            let NodeData::VariableDeclarationList(list) = &node.data else {
+                continue;
+            };
+            if !variable_list_is_block_scoped(node) {
+                continue;
+            }
+            for declaration in &list.declarations.nodes {
+                let Some(NodeData::VariableDeclaration(declaration)) =
+                    self.arena.get(*declaration).map(|node| &node.data)
+                else {
+                    continue;
+                };
+                self.collect_binding_identifier_nodes(declaration.name, &mut declarations);
+            }
+        }
+        declarations.sort_by_key(|(start, _)| *start);
+
+        let mut processed = HashSet::new();
+        for (_, name_id) in declarations {
+            if self.es5_binding_is_captured_for_initializer(name_id) {
+                continue;
+            }
+            let Some(name) = declaration_name_text(self.arena, name_id).map(str::to_owned) else {
+                continue;
+            };
+            let Some(symbol) = self.bindings.node_symbols.get(&name_id).copied() else {
+                continue;
+            };
+            if !processed.insert(symbol) {
+                continue;
+            }
+            let Some(lexical_scope) = self.symbol_declaration_scope(symbol) else {
+                continue;
+            };
+            let Some(var_scope) = self.nearest_var_scope(lexical_scope) else {
+                continue;
+            };
+            let collision = claimed.entry(var_scope).or_default().contains(&name)
+                || self.block_scoped_binding_collides_with_ancestor(
+                    symbol,
+                    &name,
+                    lexical_scope,
+                    var_scope,
+                )
+                || self.block_scoped_binding_shadows_outer_reference(
+                    symbol,
+                    &name,
+                    lexical_scope,
+                    var_scope,
+                );
+            if collision {
+                let generated = self.generated_names.generate(&name);
+                claimed
+                    .entry(var_scope)
+                    .or_default()
+                    .insert(generated.clone());
+                self.identifier_rewrites.insert(symbol, generated);
+            } else {
+                claimed.entry(var_scope).or_default().insert(name);
+            }
+        }
+    }
+
+    fn es5_binding_is_captured_for_initializer(&self, name: NodeId) -> bool {
+        let mut current = name;
+        let declaration = loop {
+            let Some(parent) = self.arena.get(current).and_then(|node| node.parent) else {
+                return false;
+            };
+            if matches!(
+                self.arena.get(parent).map(|node| &node.data),
+                Some(NodeData::VariableDeclaration(_))
+            ) {
+                break parent;
+            }
+            current = parent;
+        };
+        let Some(NodeData::VariableDeclaration(declaration_data)) =
+            self.arena.get(declaration).map(|node| &node.data)
+        else {
+            return false;
+        };
+        let Some(list) = self.arena.get(declaration).and_then(|node| node.parent) else {
+            return false;
+        };
+        let Some(for_statement) = self.arena.get(list).and_then(|node| node.parent) else {
+            return false;
+        };
+        matches!(
+            self.arena.get(for_statement).map(|node| &node.data),
+            Some(NodeData::ForStatement(data))
+                if data.initializer == Some(list)
+                    && self.block_scoped_declaration_is_captured(
+                        declaration_data.name,
+                        data.statement,
+                    )
+        )
+    }
+
+    fn collect_binding_identifier_nodes(
+        &self,
+        name: NodeId,
+        declarations: &mut Vec<(u32, NodeId)>,
+    ) {
+        match self.arena.get(name).map(|node| &node.data) {
+            Some(NodeData::Identifier(_)) => {
+                let start = self
+                    .arena
+                    .get(name)
+                    .map_or(u32::MAX, |node| node.range.start.get());
+                declarations.push((start, name));
+            }
+            Some(NodeData::BindingPattern(pattern)) => {
+                for element in &pattern.elements.nodes {
+                    if let Some(NodeData::BindingElement(element)) =
+                        self.arena.get(*element).map(|node| &node.data)
+                        && let Some(name) = element.name
+                    {
+                        self.collect_binding_identifier_nodes(name, declarations);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn symbol_declaration_scope(&self, symbol: SymbolId) -> Option<ScopeId> {
+        let name = &self.bindings.symbols.get(symbol)?.name;
+        self.bindings
+            .scopes
+            .iter()
+            .find(|scope| scope.symbols.get(name) == Some(symbol))
+            .map(|scope| scope.id)
+    }
+
+    fn nearest_var_scope(&self, mut scope: ScopeId) -> Option<ScopeId> {
+        loop {
+            let current = self.bindings.scope(scope)?;
+            if matches!(
+                current.kind,
+                ScopeKind::SourceFile | ScopeKind::Function | ScopeKind::Module
+            ) {
+                return Some(scope);
+            }
+            scope = current.parent?;
+        }
+    }
+
+    fn node_lexical_scope(&self, node: NodeId) -> Option<ScopeId> {
+        let mut current = self.bindings.containers.get(&node).copied().unwrap_or(node);
+        loop {
+            if let Some(scope) = self.bindings.node_scopes.get(&current).copied() {
+                return Some(scope);
+            }
+            current = self.arena.get(current)?.parent?;
+        }
+    }
+
+    fn scope_is_within(&self, mut scope: ScopeId, ancestor: ScopeId) -> bool {
+        loop {
+            if scope == ancestor {
+                return true;
+            }
+            let Some(parent) = self.bindings.scope(scope).and_then(|scope| scope.parent) else {
+                return false;
+            };
+            scope = parent;
+        }
+    }
+
+    fn block_scoped_binding_shadows_outer_reference(
+        &self,
+        symbol: SymbolId,
+        name: &str,
+        lexical_scope: ScopeId,
+        var_scope: ScopeId,
+    ) -> bool {
+        self.arena.iter().any(|(id, node)| {
+            if !matches!(&node.data, NodeData::Identifier(identifier) if identifier.text == name)
+                || !identifier_is_unqualified_value_reference(self.arena, id)
+            {
+                return false;
+            }
+            let Some(reference_scope) = self.node_lexical_scope(id) else {
+                return false;
+            };
+            if self.nearest_var_scope(reference_scope) != Some(var_scope)
+                || self.scope_is_within(reference_scope, lexical_scope)
+            {
+                return false;
+            }
+            let Some(reference_symbol) = self.bindings.resolve_name_at(id, name) else {
+                return true;
+            };
+            if reference_symbol == symbol {
+                return false;
+            }
+            let reference_is_peer_block_binding = self
+                .bindings
+                .symbols
+                .get(reference_symbol)
+                .is_some_and(|symbol| {
+                    symbol.flags.intersects(SymbolFlags::BLOCK_SCOPED_VARIABLE)
+                        && !symbol
+                            .flags
+                            .intersects(SymbolFlags::FUNCTION_SCOPED_VARIABLE)
+                })
+                && self
+                    .symbol_declaration_scope(reference_symbol)
+                    .and_then(|scope| self.nearest_var_scope(scope))
+                    == Some(var_scope);
+            !reference_is_peer_block_binding
+        })
+    }
+
+    fn block_scoped_binding_collides_with_ancestor(
+        &self,
+        symbol: SymbolId,
+        name: &str,
+        lexical_scope: ScopeId,
+        var_scope: ScopeId,
+    ) -> bool {
+        if lexical_scope == var_scope {
+            return false;
+        }
+        let Some(lexical) = self.bindings.scope(lexical_scope) else {
+            return false;
+        };
+        let is_function_body_scope = self
+            .bindings
+            .scope(var_scope)
+            .is_some_and(|scope| scope.kind == ScopeKind::Function)
+            && lexical.kind == ScopeKind::Block
+            && lexical.parent == Some(var_scope)
+            && self.arena.get(lexical.owner).and_then(|node| node.parent)
+                == self.bindings.scope(var_scope).map(|scope| scope.owner);
+        if is_function_body_scope {
+            return false;
+        }
+
+        let mut current = lexical.parent;
+        while let Some(scope_id) = current {
+            let Some(scope) = self.bindings.scope(scope_id) else {
+                break;
+            };
+            if let Some(other) = scope.symbols.get(name)
+                && other != symbol
+            {
+                return true;
+            }
+            current = scope.parent;
+        }
+        false
+    }
+
     fn emit_initializer_leading_block_comments(&mut self, name: NodeId, initializer: NodeId) {
         let Some(start) = self.arena.get(name).map(|node| node.range.end.get()) else {
             return;
@@ -25651,26 +26149,30 @@ impl Printer<'_> {
         }
     }
 
-    fn array_binding_can_inline_initializer(&self, name: NodeId) -> bool {
-        let Some(NodeData::BindingPattern(pattern)) = self.arena.get(name).map(|node| &node.data)
-        else {
-            return false;
-        };
-        let [element] = pattern.elements.nodes.as_slice() else {
-            return false;
-        };
-        matches!(
-            self.arena.get(*element).map(|node| &node.data),
-            Some(NodeData::BindingElement(element))
-                if element.dot_dot_dot_token.is_none()
-                    && element.initializer.is_none()
-                    && element.name.is_some_and(|name| {
-                        matches!(
-                            self.arena.get(name).map(|node| &node.data),
-                            Some(NodeData::Identifier(_))
-                        )
-                    })
-        )
+    fn binding_pattern_has_single_simple_leaf(&self, name: NodeId) -> bool {
+        fn leaf_count(arena: &NodeArena, name: NodeId) -> Option<usize> {
+            match arena.get(name).map(|node| &node.data) {
+                Some(NodeData::Identifier(_)) => Some(1),
+                Some(NodeData::BindingPattern(pattern)) => {
+                    let mut count = 0;
+                    for element in &pattern.elements.nodes {
+                        match arena.get(*element).map(|node| &node.data) {
+                            Some(NodeData::OmittedExpression(_)) => {}
+                            Some(NodeData::BindingElement(element))
+                                if element.dot_dot_dot_token.is_none()
+                                    && element.initializer.is_none() =>
+                            {
+                                count += leaf_count(arena, element.name?)?;
+                            }
+                            _ => return None,
+                        }
+                    }
+                    Some(count)
+                }
+                _ => None,
+            }
+        }
+        leaf_count(self.arena, name) == Some(1)
     }
 
     fn binding_name_contains_identifier(
@@ -29301,15 +29803,17 @@ impl Printer<'_> {
                             continue;
                         };
                         if list.declarations.nodes.iter().any(|declaration| {
-                            matches!(
-                                self.arena.get(*declaration).map(|node| &node.data),
-                                Some(NodeData::VariableDeclaration(declaration))
-                                    if declaration.initializer.is_some()
-                                        && matches!(
-                                            self.arena.get(declaration.name).map(|node| &node.data),
-                                            Some(NodeData::BindingPattern(_))
-                                        )
-                            )
+                            let Some(NodeData::VariableDeclaration(declaration)) =
+                                self.arena.get(*declaration).map(|node| &node.data)
+                            else {
+                                return false;
+                            };
+                            declaration.initializer.is_some()
+                                && matches!(
+                                    self.arena.get(declaration.name).map(|node| &node.data),
+                                    Some(NodeData::BindingPattern(_))
+                                )
+                                && !self.binding_pattern_has_single_simple_leaf(declaration.name)
                         }) {
                             let temp = self.generated_names.generate_temp();
                             self.namespace_destructuring_temps
@@ -30676,6 +31180,44 @@ impl Printer<'_> {
             }
             self.emit_downlevel_member_access(property)?;
             self.writer.write(";");
+            self.install_commonjs_binding_rewrites(declaration.name);
+            return Ok(true);
+        }
+        if matches!(
+            self.arena.get(declaration.name).map(|node| &node.data),
+            Some(NodeData::BindingPattern(_))
+        ) {
+            self.install_commonjs_binding_rewrites(declaration.name);
+            let reusable_initializer = self
+                .binding_pattern_has_single_simple_leaf(declaration.name)
+                || matches!(
+                    &self.node(initializer)?.data,
+                    NodeData::Identifier(identifier)
+                        if !self.binding_name_contains_identifier(
+                            declaration.name,
+                            &identifier.text,
+                        )?
+                );
+            let mut emitted = false;
+            let value = if reusable_initializer {
+                DownlevelBindingValue::Node(initializer)
+            } else {
+                self.writer.write("var ");
+                let temp = self.generated_names.generate_temp();
+                self.emit_downlevel_declarator_start(&mut emitted);
+                self.writer.write(&temp);
+                self.writer.write(" = ");
+                self.emit_expression(initializer, 1)?;
+                DownlevelBindingValue::Name(temp)
+            };
+            self.emit_downlevel_binding_declarators(
+                declaration.name,
+                value,
+                None,
+                &mut emitted,
+                false,
+            )?;
+            self.writer.write(";");
             return Ok(true);
         }
         let Some(name) = declaration_name_text(self.arena, declaration.name) else {
@@ -30803,37 +31345,40 @@ impl Printer<'_> {
         let NodeData::VariableDeclarationList(list) = &list_node.data else {
             return Ok(false);
         };
-        let namespace_destructuring = list_node
-            .parent
-            .and_then(|statement| self.namespace_destructuring_temps.get(&statement))
-            .cloned()
-            .and_then(|temp| {
-                let [declaration_id] = list.declarations.nodes.as_slice() else {
-                    return None;
-                };
-                let NodeData::VariableDeclaration(declaration) =
-                    &self.arena.get(*declaration_id)?.data
-                else {
-                    return None;
-                };
-                matches!(
-                    self.arena.get(declaration.name).map(|node| &node.data),
-                    Some(NodeData::BindingPattern(_))
-                )
-                .then_some((temp, declaration.name, declaration.initializer?))
-            });
+        let namespace_destructuring = (|| {
+            let [declaration_id] = list.declarations.nodes.as_slice() else {
+                return None;
+            };
+            let NodeData::VariableDeclaration(declaration) = &self.arena.get(*declaration_id)?.data
+            else {
+                return None;
+            };
+            matches!(
+                self.arena.get(declaration.name).map(|node| &node.data),
+                Some(NodeData::BindingPattern(_))
+            )
+            .then_some((
+                list_node
+                    .parent
+                    .and_then(|statement| self.namespace_destructuring_temps.get(&statement))
+                    .cloned(),
+                declaration.name,
+                declaration.initializer?,
+            ))
+        })();
         if let Some((temp, name, initializer)) = namespace_destructuring {
             self.install_namespace_binding_rewrites(name, &container);
-            self.writer.write(&temp);
-            self.writer.write(" = ");
-            self.emit_expression(initializer, 1)?;
-            let mut emitted = true;
-            self.emit_downlevel_binding_declarators(
-                name,
-                DownlevelBindingValue::Name(temp),
-                None,
-                &mut emitted,
-            )?;
+            let mut emitted = false;
+            let value = if let Some(temp) = temp {
+                self.writer.write(&temp);
+                self.writer.write(" = ");
+                self.emit_expression(initializer, 1)?;
+                emitted = true;
+                DownlevelBindingValue::Name(temp)
+            } else {
+                DownlevelBindingValue::Node(initializer)
+            };
+            self.emit_downlevel_binding_declarators(name, value, None, &mut emitted, false)?;
             self.writer.write(";");
             return Ok(true);
         }
@@ -30907,6 +31452,44 @@ impl Printer<'_> {
                     .collect::<Vec<_>>();
                 for child in children {
                     self.install_namespace_binding_rewrites(child, container);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn install_commonjs_binding_rewrites(&mut self, name: NodeId) {
+        let Some(node) = self.arena.get(name) else {
+            return;
+        };
+        match &node.data {
+            NodeData::Identifier(identifier) => {
+                if let Some(symbol) = self
+                    .bindings
+                    .node_symbols
+                    .get(&name)
+                    .copied()
+                    .or_else(|| self.bindings.resolve_name_at(name, &identifier.text))
+                {
+                    self.identifier_rewrites
+                        .insert(symbol, format!("exports.{}", identifier.text));
+                }
+            }
+            NodeData::BindingPattern(pattern) => {
+                let children = pattern
+                    .elements
+                    .nodes
+                    .iter()
+                    .filter_map(|element| {
+                        let NodeData::BindingElement(element) = &self.arena.get(*element)?.data
+                        else {
+                            return None;
+                        };
+                        element.name
+                    })
+                    .collect::<Vec<_>>();
+                for child in children {
+                    self.install_commonjs_binding_rewrites(child);
                 }
             }
             _ => {}
