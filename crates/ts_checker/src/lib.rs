@@ -14190,6 +14190,9 @@ fn is_homomorphic_identity_alias(
         else {
             return false;
         };
+        if parameter.constraint.is_some() {
+            return false;
+        }
         let Some(parameter_name) = checker.property_name(parameter.name) else {
             return false;
         };

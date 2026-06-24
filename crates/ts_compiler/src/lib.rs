@@ -544,7 +544,7 @@ impl Program {
                     || source_file.checking.diagnostics.iter().any(|diagnostic| {
                         matches!(
                             diagnostic.diagnostic.code(),
-                            2527 | 2883 | 4023 | 4032 | 4081 | 4094 | 5088 | 9010
+                            2527 | 2883 | 4023 | 4032 | 4081 | 4094 | 4118 | 5088 | 9010
                         )
                     })
                 {
@@ -1273,7 +1273,7 @@ impl Program {
         };
         let check_declaration_portability = self.options.declaration && !self.options.no_check;
         let portability_diagnostics = if check_declaration_portability {
-            self.nonportable_nested_package_diagnostics()
+            self.declaration_portability_diagnostics()
         } else {
             vec![Vec::new(); self.source_files.len()]
         };
@@ -1309,6 +1309,18 @@ impl Program {
         }
     }
 
+    fn declaration_portability_diagnostics(&self) -> Vec<Vec<CheckDiagnostic>> {
+        let mut diagnostics = self.nonportable_nested_package_diagnostics();
+        for (target, additional) in diagnostics
+            .iter_mut()
+            .zip(self.unserializable_mapped_import_diagnostics())
+        {
+            target.extend(additional);
+        }
+        diagnostics
+    }
+
+    #[allow(clippy::too_many_lines)]
     fn nonportable_nested_package_diagnostics(&self) -> Vec<Vec<CheckDiagnostic>> {
         let mut diagnostics = vec![Vec::new(); self.source_files.len()];
         for (source_index, source) in self.source_files.iter().enumerate() {
@@ -1327,6 +1339,15 @@ impl Program {
                 continue;
             };
             for statement in &file.statements.nodes {
+                if let Some(diagnostic) = self.nonportable_default_export_assignment_diagnostic(
+                    source,
+                    &containing,
+                    &imports,
+                    *statement,
+                ) {
+                    diagnostics[source_index].push(diagnostic);
+                    continue;
+                }
                 let Some(NodeData::VariableStatement(variable)) =
                     source.parse.arena.get(*statement).map(|node| &node.data)
                 else {
@@ -1403,6 +1424,136 @@ impl Program {
                             message,
                             [name.to_owned(), qualifier, module],
                         ),
+                    });
+                }
+            }
+        }
+        diagnostics
+    }
+
+    fn nonportable_default_export_assignment_diagnostic(
+        &self,
+        source: &SourceFile,
+        containing: &str,
+        imports: &[(String, String, String)],
+        statement: NodeId,
+    ) -> Option<CheckDiagnostic> {
+        let NodeData::ExportAssignment(export) = &source.parse.arena.get(statement)?.data else {
+            return None;
+        };
+        if export.is_export_equals || !export_assignment_is_object_assign(source, export.expression)
+        {
+            return None;
+        }
+        let (_, _, specifier) = imports
+            .iter()
+            .find(|(_, imported, _)| imported == "default")?;
+        let target_name = self
+            .resolved_modules
+            .get(&(containing.to_owned(), specifier.clone()))?;
+        let target = self
+            .file_index
+            .get(target_name)
+            .and_then(|index| self.source_files.get(*index))?;
+        let (qualifier, module) = nested_namespace_import_reference(self, target)?;
+        let message = message_by_code(2883).expect("TS2883 must be in the diagnostic catalog");
+        Some(CheckDiagnostic {
+            node: statement,
+            diagnostic: Diagnostic::with_arguments(message, ["default".into(), qualifier, module]),
+        })
+    }
+
+    fn unserializable_mapped_import_diagnostics(&self) -> Vec<Vec<CheckDiagnostic>> {
+        let mut diagnostics = vec![Vec::new(); self.source_files.len()];
+        for (source_index, source) in self.source_files.iter().enumerate() {
+            let containing = canonicalize(
+                &source.file_name,
+                &self.current_directory,
+                self.case_sensitivity,
+            );
+            let imports = source_import_bindings(source);
+            let Some(NodeData::SourceFile(file)) = source
+                .parse
+                .arena
+                .get(source.parse.source_file)
+                .map(|node| &node.data)
+            else {
+                continue;
+            };
+            for statement in &file.statements.nodes {
+                let Some(NodeData::VariableStatement(variable)) =
+                    source.parse.arena.get(*statement).map(|node| &node.data)
+                else {
+                    continue;
+                };
+                if !node_has_modifier(
+                    &source.parse.arena,
+                    variable.modifiers.as_ref(),
+                    ts_ast::SyntaxKind::ExportKeyword,
+                ) {
+                    continue;
+                }
+                let Some(NodeData::VariableDeclarationList(list)) = source
+                    .parse
+                    .arena
+                    .get(variable.declaration_list)
+                    .map(|node| &node.data)
+                else {
+                    continue;
+                };
+                for declaration_id in &list.declarations.nodes {
+                    let Some(NodeData::VariableDeclaration(declaration)) = source
+                        .parse
+                        .arena
+                        .get(*declaration_id)
+                        .map(|node| &node.data)
+                    else {
+                        continue;
+                    };
+                    if declaration.type_.is_some() {
+                        continue;
+                    }
+                    let Some((local, member)) = declaration
+                        .initializer
+                        .and_then(|initializer| imported_call_target(source, initializer))
+                    else {
+                        continue;
+                    };
+                    let Some((_, imported, specifier)) =
+                        imports.iter().find(|(candidate, _, _)| candidate == &local)
+                    else {
+                        continue;
+                    };
+                    let imported = if imported == "*" {
+                        let Some(member) = member.as_deref() else {
+                            continue;
+                        };
+                        member
+                    } else {
+                        imported
+                    };
+                    let Some(target_name) = self
+                        .resolved_modules
+                        .get(&(containing.clone(), specifier.clone()))
+                    else {
+                        continue;
+                    };
+                    let Some(target) = self
+                        .file_index
+                        .get(target_name)
+                        .and_then(|index| self.source_files.get(*index))
+                    else {
+                        continue;
+                    };
+                    let Some(property) = imported_function_mapped_symbol_property(target, imported)
+                    else {
+                        continue;
+                    };
+                    let message =
+                        message_by_code(4118).expect("TS4118 must be in the diagnostic catalog");
+                    diagnostics[source_index].push(CheckDiagnostic {
+                        node: declaration.name,
+                        diagnostic: Diagnostic::with_arguments(message, [format!("[{property}]")]),
                     });
                 }
             }
@@ -2500,6 +2651,117 @@ fn source_import_bindings(source: &SourceFile) -> Vec<(String, String, String)> 
         }
     }
     imports
+}
+
+fn imported_call_target(
+    source: &SourceFile,
+    initializer: NodeId,
+) -> Option<(String, Option<String>)> {
+    let NodeData::CallExpression(call) = &source.parse.arena.get(initializer)?.data else {
+        return None;
+    };
+    match &source.parse.arena.get(call.expression)?.data {
+        NodeData::Identifier(identifier) => Some((identifier.text.clone(), None)),
+        NodeData::PropertyAccessExpression(access) => Some((
+            identifier_text(&source.parse.arena, access.expression)?.to_owned(),
+            Some(identifier_text(&source.parse.arena, access.name)?.to_owned()),
+        )),
+        _ => None,
+    }
+}
+
+fn imported_function_mapped_symbol_property(
+    source: &SourceFile,
+    function_name: &str,
+) -> Option<String> {
+    let return_name = source.parse.arena.iter().find_map(|(_, node)| {
+        let NodeData::FunctionDeclaration(function) = &node.data else {
+            return None;
+        };
+        (function
+            .name
+            .and_then(|name| identifier_text(&source.parse.arena, name))
+            == Some(function_name))
+        .then(|| {
+            let NodeData::TypeQueryNode(query) = &source.parse.arena.get(function.type_?)?.data
+            else {
+                return None;
+            };
+            identifier_text(&source.parse.arena, query.expr_name).map(str::to_owned)
+        })
+        .flatten()
+    })?;
+    source.parse.arena.iter().find_map(|(_, node)| {
+        let NodeData::VariableDeclaration(variable) = &node.data else {
+            return None;
+        };
+        if identifier_text(&source.parse.arena, variable.name) != Some(&return_name) {
+            return None;
+        }
+        let NodeData::MappedTypeNode(mapped) = &source.parse.arena.get(variable.type_?)?.data
+        else {
+            return None;
+        };
+        let NodeData::TypeParameterDeclaration(parameter) =
+            &source.parse.arena.get(mapped.type_parameter)?.data
+        else {
+            return None;
+        };
+        let NodeData::TypeQueryNode(query) = &source.parse.arena.get(parameter.constraint?)?.data
+        else {
+            return None;
+        };
+        identifier_text(&source.parse.arena, query.expr_name).map(str::to_owned)
+    })
+}
+
+fn export_assignment_is_object_assign(source: &SourceFile, expression: NodeId) -> bool {
+    let Some(NodeData::CallExpression(call)) =
+        source.parse.arena.get(expression).map(|node| &node.data)
+    else {
+        return false;
+    };
+    matches!(
+        source.parse.arena.get(call.expression).map(|node| &node.data),
+        Some(NodeData::PropertyAccessExpression(access))
+            if identifier_text(&source.parse.arena, access.expression) == Some("Object")
+                && identifier_text(&source.parse.arena, access.name) == Some("assign")
+    )
+}
+
+fn nested_namespace_import_reference(
+    program: &Program,
+    target: &SourceFile,
+) -> Option<(String, String)> {
+    let containing = canonicalize(
+        &target.file_name,
+        &program.current_directory,
+        program.case_sensitivity,
+    );
+    source_import_bindings(target)
+        .into_iter()
+        .filter(|(_, imported, _)| imported == "*")
+        .find_map(|(local, _, specifier)| {
+            let resolved = program
+                .resolved_modules
+                .get(&(containing.clone(), specifier))?;
+            if resolved.match_indices("/node_modules/").count() < 2 {
+                return None;
+            }
+            let qualifier = target.parse.arena.iter().find_map(|(_, node)| {
+                let NodeData::QualifiedName(name) = &node.data else {
+                    return None;
+                };
+                (identifier_text(&target.parse.arena, name.left) == Some(&local))
+                    .then(|| identifier_text(&target.parse.arena, name.right).map(str::to_owned))
+                    .flatten()
+            })?;
+            let relative = resolved.split_once("/node_modules/")?.1;
+            let module = ts_path::remove_file_extension(relative)
+                .trim_end_matches("/index")
+                .to_owned();
+            Some((qualifier, module))
+        })
 }
 
 fn nonportable_return_import(

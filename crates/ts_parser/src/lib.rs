@@ -1343,6 +1343,19 @@ impl<'a> Parser<'a> {
             && self.current.kind != SyntaxKind::EndOfFile
         {
             let parameter_start = self.current.range.start;
+            let modifier_nodes = if self.current.kind == SyntaxKind::ConstKeyword {
+                vec![self.consume_token_node()]
+            } else {
+                Vec::new()
+            };
+            let modifiers = (!modifier_nodes.is_empty()).then(|| ModifierList {
+                list: NodeList {
+                    range: TextRange::new(parameter_start, self.current.range.start),
+                    nodes: modifier_nodes.clone(),
+                    has_trailing_comma: false,
+                },
+                flags: ts_ast::ModifierFlags::default(),
+            });
             // Contextual and reserved words are still identifier names for recovery here.  In
             // particular, consuming them keeps a malformed list such as `<implements,
             // interface>` synchronized through its closing `>` instead of abandoning the
@@ -1363,7 +1376,8 @@ impl<'a> Parser<'a> {
             let end = default_type
                 .or(constraint)
                 .map_or_else(|| self.node_end(name), |id| self.node_end(id));
-            let mut children = vec![name];
+            let mut children = modifier_nodes;
+            children.push(name);
             children.extend(constraint);
             children.extend(default_type);
             parameters.push(self.alloc_node(
@@ -1374,7 +1388,7 @@ impl<'a> Parser<'a> {
                     default_type,
                     expression: None,
                     symbol: None,
-                    modifiers: None,
+                    modifiers,
                     name,
                 })),
                 &children,

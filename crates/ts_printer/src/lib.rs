@@ -4988,11 +4988,11 @@ impl DeclarationPrinter<'_> {
             }
             return Ok(());
         }
-        if let Some(type_) = function
+        if let Some((body, type_)) = function
             .body
             .and_then(|body| self.returned_local_type_alias_body(body))
         {
-            self.emit_type(type_)?;
+            self.emit_compact_local_alias_type(body, type_, &mut HashSet::new())?;
             return Ok(());
         }
         if let Some((body, alias, parameter, argument)) =
@@ -10079,6 +10079,9 @@ impl DeclarationPrinter<'_> {
                 return Err(Self::unsupported(*parameter, node.kind));
             };
             self.emit_declaration_parameter_comments(previous_end, node.range.start.get());
+            if self.member_has_modifier(data.modifiers.as_ref(), SyntaxKind::ConstKeyword) {
+                self.writer.write("const ");
+            }
             self.emit_name(data.name)?;
             if let Some(constraint) = data.constraint {
                 self.writer.write(" extends ");
@@ -12628,7 +12631,7 @@ impl DeclarationPrinter<'_> {
         renames
     }
 
-    fn returned_local_type_alias_body(&self, body: NodeId) -> Option<NodeId> {
+    fn returned_local_type_alias_body(&self, body: NodeId) -> Option<(NodeId, NodeId)> {
         let NodeData::Block(block) = &self.arena.get(body)?.data else {
             return None;
         };
@@ -12651,8 +12654,132 @@ impl DeclarationPrinter<'_> {
             let NodeData::TypeAliasDeclaration(alias) = &self.arena.get(*statement)?.data else {
                 return None;
             };
-            (declaration_name_text(self.arena, alias.name) == Some(name)).then_some(alias.type_)
+            (declaration_name_text(self.arena, alias.name) == Some(name))
+                .then_some((body, alias.type_))
         })
+    }
+
+    fn emit_compact_local_alias_type(
+        &mut self,
+        body: NodeId,
+        type_node: NodeId,
+        active: &mut HashSet<String>,
+    ) -> Result<(), EmitError> {
+        let node = self.node(type_node)?.clone();
+        match &node.data {
+            NodeData::TypeReferenceNode(reference) => {
+                let name = declaration_name_text(self.arena, reference.type_name);
+                let alias = name.and_then(|name| {
+                    let NodeData::Block(block) = &self.arena.get(body)?.data else {
+                        return None;
+                    };
+                    block.statements.nodes.iter().find_map(|statement| {
+                        let NodeData::TypeAliasDeclaration(alias) =
+                            &self.arena.get(*statement)?.data
+                        else {
+                            return None;
+                        };
+                        (declaration_name_text(self.arena, alias.name) == Some(name))
+                            .then_some(alias.type_)
+                    })
+                });
+                if let (Some(name), Some(alias)) = (name, alias)
+                    && active.insert(name.to_owned())
+                {
+                    self.emit_compact_local_alias_type(body, alias, active)?;
+                    active.remove(name);
+                } else {
+                    self.emit_name(reference.type_name)?;
+                    if let Some(arguments) = &reference.type_arguments {
+                        self.writer.write("<");
+                        for (index, argument) in arguments.nodes.iter().enumerate() {
+                            if index != 0 {
+                                self.writer.write(", ");
+                            }
+                            self.emit_compact_local_alias_type(body, *argument, active)?;
+                        }
+                        self.writer.write(">");
+                    }
+                }
+            }
+            NodeData::MappedTypeNode(mapped) => {
+                self.emit_compact_local_mapped_type(body, mapped, active)?;
+            }
+            NodeData::TypeOperatorNode(operator) => {
+                self.writer.write(match operator.operator {
+                    SyntaxKind::KeyOfKeyword => "keyof ",
+                    SyntaxKind::ReadonlyKeyword => "readonly ",
+                    SyntaxKind::UniqueKeyword => "unique ",
+                    _ => "",
+                });
+                self.emit_compact_local_alias_type(body, operator.type_, active)?;
+            }
+            NodeData::IndexedAccessTypeNode(indexed) => {
+                self.emit_compact_local_alias_type(body, indexed.object_type, active)?;
+                self.writer.write("[");
+                self.emit_compact_local_alias_type(body, indexed.index_type, active)?;
+                self.writer.write("]");
+            }
+            NodeData::ConditionalTypeNode(conditional) => {
+                self.emit_compact_local_alias_type(body, conditional.check_type, active)?;
+                self.writer.write(" extends ");
+                self.emit_compact_local_alias_type(body, conditional.extends_type, active)?;
+                self.writer.write(" ? ");
+                self.emit_compact_local_alias_type(body, conditional.true_type, active)?;
+                self.writer.write(" : ");
+                self.emit_compact_local_alias_type(body, conditional.false_type, active)?;
+            }
+            _ => self.emit_type(type_node)?,
+        }
+        Ok(())
+    }
+
+    fn emit_compact_local_mapped_type(
+        &mut self,
+        body: NodeId,
+        mapped: &ts_ast::MappedTypeNodeData,
+        active: &mut HashSet<String>,
+    ) -> Result<(), EmitError> {
+        self.writer.write("{ ");
+        if let Some(readonly) = mapped.readonly_token {
+            match self.node(readonly)?.kind {
+                SyntaxKind::PlusToken => self.writer.write("+"),
+                SyntaxKind::MinusToken => self.writer.write("-"),
+                _ => {}
+            }
+            self.writer.write("readonly ");
+        }
+        self.writer.write("[");
+        let parameter = self.node(mapped.type_parameter)?.clone();
+        let NodeData::TypeParameterDeclaration(parameter) = &parameter.data else {
+            return Err(Self::unsupported(mapped.type_parameter, parameter.kind));
+        };
+        self.emit_name(parameter.name)?;
+        if let Some(constraint) = parameter.constraint {
+            self.writer.write(" in ");
+            self.emit_compact_local_alias_type(body, constraint, active)?;
+        }
+        if let Some(name_type) = mapped.name_type {
+            self.writer.write(" as ");
+            self.emit_compact_local_alias_type(body, name_type, active)?;
+        }
+        self.writer.write("]");
+        if let Some(question) = mapped.question_token {
+            match self.node(question)?.kind {
+                SyntaxKind::PlusToken => self.writer.write("+"),
+                SyntaxKind::MinusToken => self.writer.write("-"),
+                _ => {}
+            }
+            self.writer.write("?");
+        }
+        self.writer.write(": ");
+        if let Some(value) = mapped.type_ {
+            self.emit_compact_local_alias_type(body, value, active)?;
+        } else {
+            self.writer.write("any");
+        }
+        self.writer.write("; }");
+        Ok(())
     }
 
     fn returned_local_recursive_alias_instantiation(
