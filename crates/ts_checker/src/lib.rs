@@ -5290,6 +5290,8 @@ impl<'a> Checker<'a> {
         let contextual_object =
             contextual_type.and_then(|type_id| self.contextual_object_type(type_id));
         let mut properties = BTreeMap::new();
+        let mut property_order = Vec::new();
+        let mut numeric_properties = BTreeSet::new();
         let mut optional_properties = BTreeSet::new();
         let readonly_properties = BTreeSet::new();
         let mut getter_properties = BTreeSet::new();
@@ -5349,6 +5351,12 @@ impl<'a> Checker<'a> {
                     {
                         self.assignability_error(*property, actual, expected);
                     }
+                    if !properties.contains_key(&contextual_name) {
+                        property_order.push(contextual_name.clone());
+                    }
+                    if self.type_property_name_is_numeric(data.name) {
+                        numeric_properties.insert(contextual_name.clone());
+                    }
                     properties.insert(contextual_name, actual);
                 }
                 NodeData::ShorthandPropertyAssignment(data) => {
@@ -5357,6 +5365,9 @@ impl<'a> Checker<'a> {
                     };
                     let actual = self.type_of_expression(data.name);
                     let actual = self.structural_object_literal_property_type(data.name, actual);
+                    if !properties.contains_key(&name) {
+                        property_order.push(name.clone());
+                    }
                     properties.insert(name, actual);
                 }
                 NodeData::GetAccessorDeclaration(data) => {
@@ -5367,6 +5378,12 @@ impl<'a> Checker<'a> {
                         Some(annotation) => self.type_from_type_node(annotation),
                         None => self.result.types.any(),
                     };
+                    if !properties.contains_key(&name) {
+                        property_order.push(name.clone());
+                    }
+                    if self.type_property_name_is_numeric(data.name) {
+                        numeric_properties.insert(name.clone());
+                    }
                     properties.insert(name.clone(), type_id);
                     getter_properties.insert(name);
                 }
@@ -5377,6 +5394,12 @@ impl<'a> Checker<'a> {
                     let type_id = self
                         .object_literal_explicit_setter_type(*property, data)
                         .unwrap_or_else(|| self.result.types.any());
+                    if !properties.contains_key(&name) {
+                        property_order.push(name.clone());
+                    }
+                    if self.type_property_name_is_numeric(data.name) {
+                        numeric_properties.insert(name.clone());
+                    }
                     properties.entry(name.clone()).or_insert(type_id);
                     setter_property_types.insert(name.clone(), type_id);
                     setter_properties.insert(name);
@@ -5387,6 +5410,12 @@ impl<'a> Checker<'a> {
                     };
                     let signature = self.inferred_method_type(data);
                     self.result.node_types.insert(*property, signature);
+                    if !properties.contains_key(&name) {
+                        property_order.push(name.clone());
+                    }
+                    if self.type_property_name_is_numeric(data.name) {
+                        numeric_properties.insert(name.clone());
+                    }
                     self.insert_callable_property(&mut properties, name, signature);
                 }
                 NodeData::SpreadAssignment(data) => {
@@ -5399,7 +5428,18 @@ impl<'a> Checker<'a> {
                     else {
                         continue;
                     };
+                    for name in &spread.property_order {
+                        if !properties.contains_key(name) {
+                            property_order.push(name.clone());
+                        }
+                    }
+                    for name in spread.properties.keys() {
+                        if !properties.contains_key(name) && !property_order.contains(name) {
+                            property_order.push(name.clone());
+                        }
+                    }
                     properties.extend(spread.properties);
+                    numeric_properties.extend(spread.numeric_properties);
                     optional_properties.extend(spread.optional_properties);
                     getter_properties.extend(spread.getter_properties);
                     setter_properties.extend(spread.setter_properties);
@@ -5412,6 +5452,8 @@ impl<'a> Checker<'a> {
         }
         ObjectType {
             properties,
+            property_order,
+            numeric_properties,
             optional_properties,
             readonly_properties: readonly_properties
                 .into_iter()
@@ -7416,6 +7458,13 @@ impl<'a> Checker<'a> {
             }
             NodeData::ElementAccessExpression(data) => {
                 let receiver = self.type_of_expression(data.expression);
+                if let Some((property, _)) =
+                    self.canonical_computed_key(data.argument_expression, &mut HashSet::new())
+                    && let Some(value) = self.lookup_property_type(receiver, &property)
+                {
+                    self.record_const_enum_access(node_id, receiver, value);
+                    return value;
+                }
                 if self.result.const_enum_types.contains(&receiver)
                     && !matches!(
                         self.arena
@@ -13343,7 +13392,7 @@ impl<'a> Checker<'a> {
             return self.property_name(node);
         };
         let expression = computed.expression;
-        if let Some(name) = self.computed_property_name(expression) {
+        if let Some((name, _)) = self.canonical_computed_key(expression, &mut HashSet::new()) {
             return Some(name);
         }
         let type_id = self.type_of_expression(expression);
@@ -13374,50 +13423,119 @@ impl<'a> Checker<'a> {
                 _ => None,
             };
         }
-        let text = self.value_expression_text(computed.expression)?;
-        if let Some((root, name)) = self.value_expression_root(computed.expression)
-            && self.resolve_identifier(root, name).is_none()
-        {
-            return Some(format!("[{text}]"));
-        }
-        let Some(symbol) = self.resolve_computed_type_key_symbol(computed.expression) else {
-            return Some(format!("[{text}]"));
-        };
-        let unique_symbol = self.bindings.symbols.get(symbol).is_some_and(|symbol| {
-            symbol.declarations.iter().any(|declaration| {
-                let Some(NodeData::VariableDeclaration(variable)) =
-                    self.arena.get(*declaration).map(|node| &node.data)
-                else {
-                    return false;
-                };
-                variable
-                    .initializer
-                    .is_some_and(|initializer| self.is_symbol_factory_call(initializer))
-            })
-        });
-        if unique_symbol {
-            return Some(format!("[#{text}]"));
-        }
-        let enum_object = self.bindings.symbols.get(symbol).is_some_and(|symbol| {
-            symbol.declarations.iter().any(|declaration| {
-                matches!(
-                    self.arena.get(*declaration).map(|node| &node.data),
-                    Some(NodeData::EnumDeclaration(_))
-                )
-            })
-        });
-        (!enum_object).then(|| format!("[{text}]"))
+        self.canonical_computed_key(computed.expression, &mut HashSet::new())
+            .map(|(name, _)| name)
     }
 
     fn type_property_name_is_numeric(&self, node: NodeId) -> bool {
         match &self.arena.get(node).map(|node| &node.data) {
             Some(NodeData::NumericLiteral(_)) => true,
-            Some(NodeData::ComputedPropertyName(computed)) => matches!(
-                self.enum_external_constant(computed.expression),
-                Some(Value::Number(_))
-            ),
+            Some(NodeData::ComputedPropertyName(computed)) => {
+                self.canonical_computed_key(computed.expression, &mut HashSet::new())
+                    .is_some_and(|(_, numeric)| numeric)
+                    || matches!(
+                        self.enum_external_constant(computed.expression),
+                        Some(Value::Number(_))
+                    )
+            }
             _ => false,
         }
+    }
+
+    fn canonical_computed_key(
+        &self,
+        expression: NodeId,
+        visited: &mut HashSet<SymbolId>,
+    ) -> Option<(String, bool)> {
+        match &self.arena.get(expression)?.data {
+            NodeData::StringLiteral(literal) => {
+                return Some((literal.text.clone(), false));
+            }
+            NodeData::NoSubstitutionTemplateLiteral(literal) => {
+                return Some((literal.text.clone(), false));
+            }
+            NodeData::NumericLiteral(literal) => {
+                return Some((literal.text.clone(), true));
+            }
+            NodeData::PrefixUnaryExpression(prefix)
+                if matches!(
+                    prefix.operator,
+                    SyntaxKind::PlusToken | SyntaxKind::MinusToken
+                ) =>
+            {
+                let NodeData::NumericLiteral(literal) = &self.arena.get(prefix.operand)?.data
+                else {
+                    return None;
+                };
+                return Some((
+                    format!(
+                        "{}{}",
+                        if prefix.operator == SyntaxKind::MinusToken {
+                            "-"
+                        } else {
+                            "+"
+                        },
+                        literal.text
+                    ),
+                    true,
+                ));
+            }
+            NodeData::ParenthesizedExpression(parenthesized) => {
+                return self.canonical_computed_key(parenthesized.expression, visited);
+            }
+            NodeData::AsExpression(assertion) => {
+                return self.canonical_computed_key(assertion.expression, visited);
+            }
+            NodeData::TypeAssertion(assertion) => {
+                return self.canonical_computed_key(assertion.expression, visited);
+            }
+            NodeData::SatisfiesExpression(assertion) => {
+                return self.canonical_computed_key(assertion.expression, visited);
+            }
+            NodeData::NonNullExpression(non_null) => {
+                return self.canonical_computed_key(non_null.expression, visited);
+            }
+            _ => {}
+        }
+        let text = self.value_expression_text(expression)?;
+        let Some(symbol) = self.resolve_computed_type_key_symbol(expression) else {
+            return Some((format!("[{text}]"), false));
+        };
+        if !visited.insert(symbol) {
+            return Some((format!("[{text}]"), false));
+        }
+        let symbol_data = self.bindings.symbols.get(symbol)?;
+        for declaration in &symbol_data.declarations {
+            let Some(NodeData::VariableDeclaration(variable)) =
+                self.arena.get(*declaration).map(|node| &node.data)
+            else {
+                continue;
+            };
+            if !self.is_const_declaration(*declaration) {
+                continue;
+            }
+            if let Some(NodeData::TypeQueryNode(query)) = variable
+                .type_
+                .and_then(|type_| self.arena.get(type_))
+                .map(|node| &node.data)
+                && let Some(root) = self.value_expression_text(query.expr_name)
+            {
+                return Some((format!("[#{root}]"), false));
+            }
+            let Some(initializer) = variable.initializer else {
+                continue;
+            };
+            if self.is_symbol_factory_call(initializer) {
+                let declaration_name = self
+                    .property_name(variable.name)
+                    .unwrap_or_else(|| text.clone());
+                return Some((format!("[#{declaration_name}]"), false));
+            }
+            if let Some(key) = self.canonical_computed_key(initializer, visited) {
+                return Some(key);
+            }
+        }
+        Some((format!("[{text}]"), false))
     }
 
     fn resolve_computed_type_key_symbol(&self, expression: NodeId) -> Option<SymbolId> {
@@ -13495,19 +13613,6 @@ impl<'a> Checker<'a> {
             })
     }
 
-    fn value_expression_root(&self, expression: NodeId) -> Option<(NodeId, &str)> {
-        match &self.arena.get(expression)?.data {
-            NodeData::Identifier(identifier) => Some((expression, &identifier.text)),
-            NodeData::PropertyAccessExpression(access) => {
-                self.value_expression_root(access.expression)
-            }
-            NodeData::ParenthesizedExpression(parenthesized) => {
-                self.value_expression_root(parenthesized.expression)
-            }
-            _ => None,
-        }
-    }
-
     fn is_symbol_factory_call(&self, expression: NodeId) -> bool {
         let Some(NodeData::CallExpression(call)) =
             self.arena.get(expression).map(|node| &node.data)
@@ -13521,19 +13626,8 @@ impl<'a> Checker<'a> {
     }
 
     fn computed_property_name(&self, node: NodeId) -> Option<String> {
-        match &self.arena.get(node)?.data {
-            NodeData::StringLiteral(data) => Some(data.text.clone()),
-            NodeData::NumericLiteral(data) => Some(data.text.clone()),
-            NodeData::NoSubstitutionTemplateLiteral(data) => Some(data.text.clone()),
-            NodeData::ParenthesizedExpression(parenthesized) => {
-                self.computed_property_name(parenthesized.expression)
-            }
-            // Preserve a dynamic symbol-like key in inferred object types. The bracket marker is
-            // intentionally retained for declaration serialization and cannot collide with an
-            // ordinary identifier property.
-            NodeData::Identifier(identifier) => Some(format!("[{}]", identifier.text)),
-            _ => None,
-        }
+        self.canonical_computed_key(node, &mut HashSet::new())
+            .map(|(name, _)| name)
     }
 
     fn assignability_error(&mut self, node: NodeId, actual: TypeId, expected: TypeId) {
@@ -13812,6 +13906,20 @@ impl<'a> DeclarationReachability<'a> {
     #[allow(clippy::too_many_lines)]
     fn trace_dependencies(&mut self) {
         while let Some(declaration) = self.pending.pop_front() {
+            if let Some(owner) = self
+                .arena
+                .get(declaration)
+                .and_then(|node| node.parent)
+                .and_then(|scope| self.declaration_statement(scope))
+                && !self
+                    .arena
+                    .get(owner)
+                    .and_then(|node| node.parent)
+                    .and_then(|scope| self.retained.get(&scope))
+                    .is_some_and(|retained| retained.contains(&owner))
+            {
+                continue;
+            }
             let mut stack = vec![declaration];
             while let Some(node_id) = stack.pop() {
                 let Some(node) = self.arena.get(node_id) else {
@@ -13885,7 +13993,9 @@ impl<'a> DeclarationReachability<'a> {
                         self.retain_entity(expression.expression);
                     }
                     NodeData::ComputedPropertyName(computed) => {
-                        self.retain_expression_root(computed.expression);
+                        if !self.computed_property_is_const_literal(computed.expression) {
+                            self.retain_expression_root(computed.expression);
+                        }
                     }
                     NodeData::ElementAccessExpression(access) => {
                         self.retain_expression_root(access.expression);
@@ -13986,6 +14096,41 @@ impl<'a> DeclarationReachability<'a> {
                 }
             }
         }
+    }
+
+    fn computed_property_is_const_literal(&self, expression: NodeId) -> bool {
+        let Some((identifier, name)) = self.leftmost_entity_name(expression) else {
+            return false;
+        };
+        let Some(symbol) = self.bindings.resolve_name_at(identifier, &name) else {
+            return false;
+        };
+        self.bindings.symbols.get(symbol).is_some_and(|symbol| {
+            symbol.declarations.iter().any(|declaration| {
+                let Some(NodeData::VariableDeclaration(variable)) =
+                    self.arena.get(*declaration).map(|node| &node.data)
+                else {
+                    return false;
+                };
+                let is_const = self
+                    .arena
+                    .get(*declaration)
+                    .and_then(|node| node.parent)
+                    .and_then(|list| self.arena.get(list))
+                    .is_some_and(|list| list.flags.0 & (1 << 1) != 0);
+                is_const
+                    && variable.initializer.is_some_and(|initializer| {
+                        matches!(
+                            self.arena.get(initializer).map(|node| &node.data),
+                            Some(
+                                NodeData::StringLiteral(_)
+                                    | NodeData::NumericLiteral(_)
+                                    | NodeData::NoSubstitutionTemplateLiteral(_)
+                            )
+                        )
+                    })
+            })
+        })
     }
 
     fn type_reference_is_structural_assertion(&self, node: NodeId, entity: NodeId) -> bool {
