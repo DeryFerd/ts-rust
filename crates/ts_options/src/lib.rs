@@ -130,6 +130,7 @@ pub struct CompilerOptions {
     pub resolve_json_module: bool,
     pub source_map: bool,
     pub inline_source_map: bool,
+    pub inline_sources: bool,
     pub map_root: Option<String>,
     pub source_root: Option<String>,
     pub incremental: bool,
@@ -197,6 +198,7 @@ impl Default for CompilerOptions {
             resolve_json_module: false,
             source_map: false,
             inline_source_map: false,
+            inline_sources: false,
             map_root: None,
             source_root: None,
             incremental: false,
@@ -335,6 +337,8 @@ impl CompilerOptions {
                 "rootdir" => self.root_dir.clone_from(&overrides.root_dir),
                 "skiplibcheck" => self.skip_lib_check = overrides.skip_lib_check,
                 "sourcemap" => self.source_map = overrides.source_map,
+                "inlinesourcemap" => self.inline_source_map = overrides.inline_source_map,
+                "inlinesources" => self.inline_sources = overrides.inline_sources,
                 "maproot" => self.map_root.clone_from(&overrides.map_root),
                 "sourceroot" => self.source_root.clone_from(&overrides.source_root),
                 "strict" => {
@@ -598,6 +602,9 @@ pub fn parse_compiler_options_map(options: &BTreeMap<String, JsonValue>) -> Pars
             "inlinesourcemap" => {
                 parsed.inline_source_map = boolean(original_name, value, &mut diagnostics);
             }
+            "inlinesources" => {
+                parsed.inline_sources = boolean(original_name, value, &mut diagnostics);
+            }
             "maproot" => parsed.map_root = string(original_name, value, &mut diagnostics),
             "sourceroot" => parsed.source_root = string(original_name, value, &mut diagnostics),
             "incremental" => parsed.incremental = boolean(original_name, value, &mut diagnostics),
@@ -686,6 +693,7 @@ struct PartialOptions {
     resolve_json_module: Option<bool>,
     source_map: Option<bool>,
     inline_source_map: Option<bool>,
+    inline_sources: Option<bool>,
     map_root: Option<String>,
     source_root: Option<String>,
     incremental: Option<bool>,
@@ -774,6 +782,7 @@ impl PartialOptions {
             resolve_json_module: self.resolve_json_module.unwrap_or(false),
             source_map: self.source_map.unwrap_or(false),
             inline_source_map: self.inline_source_map.unwrap_or(false),
+            inline_sources: self.inline_sources.unwrap_or(false),
             map_root: self.map_root,
             source_root: self.source_root,
             incremental: self.incremental.unwrap_or(false),
@@ -809,6 +818,15 @@ fn validate_options(options: &PartialOptions, diagnostics: &mut Vec<Diagnostic>)
     }
     if options.source_map == Some(true) && options.inline_source_map == Some(true) {
         diagnostics.push(diagnostic(5053, ["sourceMap", "inlineSourceMap"]));
+    }
+    if options.inline_sources == Some(true)
+        && options.source_map != Some(true)
+        && options.inline_source_map != Some(true)
+    {
+        diagnostics.push(diagnostic(5051, ["inlineSources"]));
+    }
+    if options.inline_source_map == Some(true) && options.map_root.is_some() {
+        diagnostics.push(diagnostic(5053, ["mapRoot", "inlineSourceMap"]));
     }
     if options.no_lib == Some(true) && options.lib.is_some() {
         diagnostics.push(diagnostic(5053, ["lib", "noLib"]));

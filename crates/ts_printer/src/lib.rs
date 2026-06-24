@@ -12999,6 +12999,49 @@ impl DeclarationPrinter<'_> {
         self.emit_semantic_type_with_precedence(id, SemanticTypePrecedence::Function)
     }
 
+    fn semantic_type_contains_type_parameter(&self, id: TypeId) -> bool {
+        fn visit(
+            printer: &DeclarationPrinter<'_>,
+            id: TypeId,
+            visited: &mut HashSet<TypeId>,
+        ) -> bool {
+            if !visited.insert(id) {
+                return false;
+            }
+            if printer
+                .named_type_references
+                .and_then(|references| references.get(&id))
+                .is_some_and(|reference| {
+                    reference
+                        .type_arguments
+                        .iter()
+                        .any(|argument| visit(printer, *argument, visited))
+                })
+            {
+                return true;
+            }
+            match printer
+                .semantic_types
+                .and_then(|types| types.get(id))
+                .map(|type_| &type_.kind)
+            {
+                Some(TypeKind::TypeParameter { .. }) => true,
+                Some(TypeKind::Array(element)) => visit(printer, *element, visited),
+                Some(
+                    TypeKind::Tuple(members)
+                    | TypeKind::ReadonlyTuple(members)
+                    | TypeKind::Union(members)
+                    | TypeKind::Intersection(members),
+                ) => members
+                    .iter()
+                    .any(|member| visit(printer, *member, visited)),
+                _ => false,
+            }
+        }
+
+        visit(self, id, &mut HashSet::new())
+    }
+
     fn emit_semantic_type_with_precedence(
         &mut self,
         id: TypeId,
@@ -13205,6 +13248,30 @@ impl DeclarationPrinter<'_> {
         if let Some(reference) = self
             .named_type_references
             .and_then(|references| references.get(&id))
+            && reference.name == "__private_pick_mapped"
+            && let [argument, constraint, object] = reference.type_arguments.as_slice()
+            && reference
+                .type_arguments
+                .iter()
+                .any(|argument| self.semantic_type_contains_type_parameter(*argument))
+        {
+            self.semantic_infer_count += 1;
+            let infer = format!("T_{}", self.semantic_infer_count);
+            self.emit_semantic_type(*argument)?;
+            self.writer.write(" extends infer ");
+            self.writer.write(&infer);
+            self.writer.write(" extends ");
+            self.emit_semantic_type(*constraint)?;
+            self.writer.write(" ? { [P in ");
+            self.writer.write(&infer);
+            self.writer.write("]: ");
+            self.emit_semantic_type(*object)?;
+            self.writer.write("[P]; } : never");
+            return Ok(());
+        }
+        if let Some(reference) = self
+            .named_type_references
+            .and_then(|references| references.get(&id))
             && let Some(mode) = reference.name.strip_prefix("__private_constrained_mapped:")
             && let [argument, constraint] = reference.type_arguments.as_slice()
         {
@@ -13291,6 +13358,7 @@ impl DeclarationPrinter<'_> {
         if let Some(reference) = self
             .named_type_references
             .and_then(|references| references.get(&id))
+            && reference.name != "__private_pick_mapped"
             && self.named_type_reference_is_declaration_visible(&reference.name)
             && !matches!(
                 self.semantic_types
@@ -24051,6 +24119,10 @@ impl Printer<'_> {
     }
 
     fn record_mapping(&mut self, node: &Node) {
+        self.record_mapping_at(node.range.start.get());
+    }
+
+    fn record_mapping_at(&mut self, source_position: u32) {
         if self.source_map.is_none() {
             return;
         }
@@ -24060,7 +24132,7 @@ impl Printer<'_> {
             self.source_line_starts
                 .as_deref()
                 .expect("source line starts exist when source maps are enabled"),
-            node.range.start.get(),
+            source_position,
         );
         if let Some(builder) = &mut self.source_map {
             let _ = builder.add_mapping(line, column, 0, original_line, original_column);
@@ -24746,6 +24818,7 @@ impl Printer<'_> {
             }
             _ => return Err(Self::unsupported(id, node.kind)),
         }
+        self.record_mapping_at(node.range.end.get());
         for (range, comment) in std::mem::take(&mut self.pending_statement_line_comments) {
             if self.emitted_source_comments.insert(range) {
                 self.writer.write(" ");
@@ -44364,8 +44437,22 @@ impl Printer<'_> {
         self.writer.write(source.as_deref().unwrap_or(text));
     }
 
-    #[allow(clippy::too_many_lines)]
     fn emit_expression(&mut self, id: NodeId, parent_precedence: u8) -> Result<(), EmitError> {
+        let range = self.node(id)?.range;
+        self.record_mapping_at(range.start.get());
+        let result = self.emit_expression_worker(id, parent_precedence);
+        if result.is_ok() {
+            self.record_mapping_at(range.end.get());
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn emit_expression_worker(
+        &mut self,
+        id: NodeId,
+        parent_precedence: u8,
+    ) -> Result<(), EmitError> {
         if let Some(rewrite) = self.es5_async_expression_rewrites.get(&id).cloned() {
             self.writer.write(&rewrite);
             return Ok(());
@@ -44792,6 +44879,7 @@ impl Printer<'_> {
                         self.pending_statement_line_comments
                             .push((range, trivia[comment_start..comment_end].to_owned()));
                     }
+                    self.record_mapping_at(name.range.start.get());
                     match &name.data {
                         NodeData::Identifier(name) => {
                             self.write_source_identifier(data.name, &name.text);
@@ -44799,6 +44887,7 @@ impl Printer<'_> {
                         NodeData::PrivateIdentifier(name) => self.writer.write(&name.text),
                         _ => self.emit_expression(data.name, 18)?,
                     }
+                    self.record_mapping_at(name.range.end.get());
                     if break_after_dot {
                         self.writer.indent -= usize::from(!missing_name);
                     }

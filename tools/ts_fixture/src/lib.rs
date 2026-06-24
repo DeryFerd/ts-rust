@@ -1030,6 +1030,7 @@ const SCALAR_OPTION_NAMES: &[&str] = &[
     "incremental",
     "importHelpers",
     "inlineSourceMap",
+    "inlineSources",
     "isolatedDeclarations",
     "isolatedModules",
     "jsx",
@@ -1448,9 +1449,16 @@ impl UnitBuilder {
     }
 
     fn finish(self) -> Unit {
+        let source_text = SourceText::from_bytes(self.source_bytes);
+        let normalized = normalize_newlines(source_text.as_scannable_str());
+        let normalized = normalized.strip_prefix('\n').unwrap_or(&normalized);
+        let mut normalized = normalized.trim_end_matches('\n').to_owned();
+        if !normalized.is_empty() {
+            normalized.push('\n');
+        }
         Unit {
             path: self.path,
-            source_text: SourceText::from_bytes(self.source_bytes),
+            source_text: SourceText::from(normalized),
             start_line: self.start_line,
         }
     }

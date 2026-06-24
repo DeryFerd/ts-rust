@@ -10,6 +10,7 @@ pub struct SourceMap {
     pub sources: Vec<String>,
     pub names: Vec<String>,
     pub mappings: String,
+    pub sources_content: Option<Vec<String>>,
 }
 
 /// Error returned when generated mappings are added out of order.
@@ -65,6 +66,15 @@ impl SourceMapBuilder {
         original_line: u32,
         original_column: u32,
     ) -> Result<(), MappingOrderError> {
+        if self.has_mapping
+            && generated_line == self.generated_line
+            && generated_column == self.generated_column
+            && i64::from(source) == self.previous_source
+            && i64::from(original_line) == self.previous_original_line
+            && i64::from(original_column) == self.previous_original_column
+        {
+            return Ok(());
+        }
         if generated_line < self.generated_line
             || (self.has_mapping
                 && generated_line == self.generated_line
@@ -103,6 +113,51 @@ impl SourceMapBuilder {
         Ok(())
     }
 
+    /// Appends delta-encoded mappings at a generated-line and source-index offset.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an appended generated position precedes an existing mapping.
+    pub fn append_mappings(
+        &mut self,
+        mappings: &str,
+        generated_line_offset: u32,
+        source_offset: u32,
+    ) -> Result<(), MappingOrderError> {
+        let mut source = 0_i64;
+        let mut original_line = 0_i64;
+        let mut original_column = 0_i64;
+        for (line_index, line) in mappings.split(';').enumerate() {
+            let mut generated_column = 0_i64;
+            for segment in line.split(',').filter(|segment| !segment.is_empty()) {
+                let mut values = decode_segment(segment);
+                let Some(generated_delta) = values.next() else {
+                    continue;
+                };
+                generated_column += generated_delta;
+                let (Some(source_delta), Some(line_delta), Some(column_delta)) =
+                    (values.next(), values.next(), values.next())
+                else {
+                    continue;
+                };
+                source += source_delta;
+                original_line += line_delta;
+                original_column += column_delta;
+                let generated_line = generated_line_offset
+                    .saturating_add(u32::try_from(line_index).unwrap_or(u32::MAX));
+                let source = i64::from(source_offset).saturating_add(source);
+                self.add_mapping(
+                    generated_line,
+                    u32::try_from(generated_column).unwrap_or(0),
+                    u32::try_from(source).unwrap_or(0),
+                    u32::try_from(original_line).unwrap_or(0),
+                    u32::try_from(original_column).unwrap_or(0),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub fn finish(self, file: Option<String>, sources: Vec<String>) -> SourceMap {
         SourceMap {
@@ -111,6 +166,7 @@ impl SourceMapBuilder {
             sources,
             names: Vec::new(),
             mappings: self.mappings,
+            sources_content: None,
         }
     }
 }
@@ -137,6 +193,24 @@ fn encode_vlq(value: i64, output: &mut String) {
     }
 }
 
+fn decode_segment(segment: &str) -> impl Iterator<Item = i64> + '_ {
+    let mut bytes = segment.bytes();
+    std::iter::from_fn(move || {
+        let mut value = 0_u64;
+        let mut shift = 0_u32;
+        loop {
+            let byte = bytes.next()?;
+            let digit = BASE64.iter().position(|candidate| *candidate == byte)? as u64;
+            value |= (digit & 31) << shift;
+            if digit & 32 == 0 {
+                let magnitude = i64::try_from(value >> 1).ok()?;
+                return Some(if value & 1 == 0 { magnitude } else { -magnitude });
+            }
+            shift += 5;
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{MappingOrderError, SourceMapBuilder};
@@ -158,5 +232,13 @@ mod tests {
         builder.add_mapping(1, 4, 0, 0, 0).unwrap();
         assert_eq!(builder.add_mapping(1, 3, 0, 0, 0), Err(MappingOrderError));
         assert_eq!(builder.add_mapping(0, 9, 0, 0, 0), Err(MappingOrderError));
+    }
+
+    #[test]
+    fn appends_existing_mappings_with_offsets() {
+        let mut builder = SourceMapBuilder::new();
+        builder.append_mappings("AAAA,IAAI;AACJ", 2, 3).unwrap();
+        let map = builder.finish(None, vec![]);
+        assert_eq!(map.mappings, ";;AGAA,IAAI;AACJ");
     }
 }

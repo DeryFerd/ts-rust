@@ -2653,6 +2653,74 @@ fn descriptor_contains_serialized_reference(descriptor: &TypeDescriptor) -> bool
     }
 }
 
+fn descriptor_contains_type_parameter(descriptor: &TypeDescriptor) -> bool {
+    match descriptor {
+        TypeDescriptor::TypeParameter(_) => true,
+        TypeDescriptor::Import { target, .. } | TypeDescriptor::ConstEnum(target) => {
+            descriptor_contains_type_parameter(target)
+        }
+        TypeDescriptor::Named {
+            type_arguments,
+            target,
+            ..
+        } => {
+            type_arguments
+                .iter()
+                .any(descriptor_contains_type_parameter)
+                || descriptor_contains_type_parameter(target)
+        }
+        TypeDescriptor::Alias { body, .. } | TypeDescriptor::Array(body) => {
+            descriptor_contains_type_parameter(body)
+        }
+        TypeDescriptor::Tuple(members)
+        | TypeDescriptor::ReadonlyTuple(members)
+        | TypeDescriptor::Union(members)
+        | TypeDescriptor::Intersection(members)
+        | TypeDescriptor::Overload(members) => {
+            members.iter().any(descriptor_contains_type_parameter)
+        }
+        TypeDescriptor::Object {
+            properties,
+            string_index_type,
+            number_index_type,
+            call_signatures,
+            construct_signatures,
+            ..
+        } => {
+            properties.values().any(descriptor_contains_type_parameter)
+                || string_index_type
+                    .as_deref()
+                    .is_some_and(descriptor_contains_type_parameter)
+                || number_index_type
+                    .as_deref()
+                    .is_some_and(descriptor_contains_type_parameter)
+                || call_signatures
+                    .iter()
+                    .chain(construct_signatures)
+                    .any(descriptor_contains_type_parameter)
+        }
+        TypeDescriptor::Function {
+            parameters,
+            rest_parameter,
+            return_type,
+            ..
+        }
+        | TypeDescriptor::Constructor {
+            parameters,
+            rest_parameter,
+            return_type,
+            ..
+        } => {
+            parameters.iter().any(descriptor_contains_type_parameter)
+                || rest_parameter
+                    .as_deref()
+                    .is_some_and(descriptor_contains_type_parameter)
+                || descriptor_contains_type_parameter(return_type)
+        }
+        _ => false,
+    }
+}
+
 fn add_implicit_undefined_to_optional_properties(descriptor: &mut TypeDescriptor) {
     match descriptor {
         TypeDescriptor::Import { target, .. }
@@ -11442,6 +11510,12 @@ impl<'a> Checker<'a> {
         name: &str,
         arguments: &[TypeId],
     ) -> Option<TypeId> {
+        if name == "__indexed_access" {
+            return self.instantiate_synthetic_indexed_access(arguments);
+        }
+        if name == "__private_pick_mapped" {
+            return self.instantiate_private_pick_mapped(arguments);
+        }
         if name == "__keyof" {
             let [target] = arguments else {
                 return None;
@@ -11492,6 +11566,63 @@ impl<'a> Checker<'a> {
             return Some(self.result.types.union(mapped));
         }
         self.instantiate_synthetic_mapped_type(name.strip_prefix("__mapped:")?, arguments)
+    }
+
+    fn instantiate_synthetic_indexed_access(&mut self, arguments: &[TypeId]) -> Option<TypeId> {
+        let [object, index] = arguments else {
+            return None;
+        };
+        let TypeKind::Object(object) = self.result.types.get(*object)?.kind.clone() else {
+            return None;
+        };
+        let properties = self
+            .literal_keys(*index)
+            .into_iter()
+            .filter_map(|(name, _)| object.properties.get(&name).copied())
+            .collect::<Vec<_>>();
+        (!properties.is_empty()).then(|| self.result.types.union(properties))
+    }
+
+    fn instantiate_private_pick_mapped(&mut self, arguments: &[TypeId]) -> Option<TypeId> {
+        let [keys, _, object] = arguments else {
+            return None;
+        };
+        let selected = self
+            .literal_keys(*keys)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<BTreeSet<_>>();
+        if selected.is_empty() {
+            return None;
+        }
+        let TypeKind::Object(mut object) = self.result.types.get(*object)?.kind.clone() else {
+            return None;
+        };
+        object
+            .properties
+            .retain(|property, _| selected.contains(property));
+        object
+            .property_order
+            .retain(|property| selected.contains(property));
+        object
+            .numeric_properties
+            .retain(|property| selected.contains(property));
+        object
+            .optional_properties
+            .retain(|property| selected.contains(property));
+        object
+            .readonly_properties
+            .retain(|property| selected.contains(property));
+        object
+            .getter_properties
+            .retain(|property| selected.contains(property));
+        object
+            .setter_properties
+            .retain(|property| selected.contains(property));
+        object
+            .setter_property_types
+            .retain(|property, _| selected.contains(property));
+        Some(self.result.types.alloc(TypeKind::Object(object)))
     }
 
     fn instantiate_synthetic_mapped_type(
@@ -13704,6 +13835,21 @@ impl<'a> Checker<'a> {
     }
 
     fn literal_keys(&self, type_id: TypeId) -> Vec<(String, TypeId)> {
+        if let Some(reference) = self.result.named_type_references.get(&type_id)
+            && reference.name == "Exclude"
+            && let [members, excluded] = reference.type_arguments.as_slice()
+        {
+            let excluded = self
+                .literal_keys(*excluded)
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect::<BTreeSet<_>>();
+            return self
+                .literal_keys(*members)
+                .into_iter()
+                .filter(|(name, _)| !excluded.contains(name))
+                .collect();
+        }
         match &self.result.types.get(type_id).unwrap().kind {
             TypeKind::StringLiteral(name) | TypeKind::NumberLiteral(name) => {
                 vec![(name.clone(), type_id)]
@@ -16919,6 +17065,64 @@ fn describe_type_node_syntax(
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
+            if !exported_names.contains(&name)
+                && type_arguments
+                    .iter()
+                    .any(descriptor_contains_type_parameter)
+                && let Some(symbol) = checker.resolve_identifier(reference.type_name, &name)
+                && let Some(alias) = checker.bindings.symbols.get(symbol).and_then(|symbol| {
+                    symbol.declarations.iter().find_map(|declaration| {
+                        let NodeData::TypeAliasDeclaration(alias) =
+                            &source.arena.get(*declaration)?.data
+                        else {
+                            return None;
+                        };
+                        let body = source.arena.get(alias.type_)?;
+                        matches!(body.data, NodeData::MappedTypeNode(_))
+                            .then_some(alias.as_ref())
+                            .or_else(|| {
+                                let NodeData::TypeReferenceNode(reference) = &body.data else {
+                                    return None;
+                                };
+                                (checker.property_name(reference.type_name).as_deref()
+                                    == Some("Pick"))
+                                .then_some(alias.as_ref())
+                            })
+                    })
+                })
+            {
+                let TypeDescriptor::Alias { parameters, body } = describe_alias(source, alias)
+                else {
+                    unreachable!("describe_alias always returns an alias descriptor");
+                };
+                if parameters.len() == type_arguments.len() {
+                    let substitutions = parameters
+                        .into_iter()
+                        .zip(type_arguments.iter().cloned())
+                        .collect::<BTreeMap<_, _>>();
+                    let instantiated = substitute_descriptor(&body, &substitutions);
+                    if let TypeDescriptor::Named {
+                        name,
+                        type_arguments: pick_arguments,
+                        ..
+                    } = &instantiated
+                        && name == "Pick"
+                        && let [object, keys] = pick_arguments.as_slice()
+                    {
+                        let constraint = TypeDescriptor::Named {
+                            name: "__keyof".into(),
+                            type_arguments: vec![object.clone()],
+                            target: Box::new(TypeDescriptor::Unknown),
+                        };
+                        return TypeDescriptor::Named {
+                            name: "__private_pick_mapped".into(),
+                            type_arguments: vec![keys.clone(), constraint, object.clone()],
+                            target: Box::new(semantic_target),
+                        };
+                    }
+                    return instantiated;
+                }
+            }
             if !exported_names.contains(&name)
                 && let [argument] = type_arguments.as_slice()
                 && is_homomorphic_identity_alias(source, checker, &name)

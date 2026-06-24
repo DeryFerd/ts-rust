@@ -644,6 +644,10 @@ impl Program {
                             continue;
                         };
                         if let Some(mut source_map) = emitted.source_map {
+                            if self.options.inline_sources {
+                                source_map.sources_content =
+                                    Some(vec![source_file.source_text.clone()]);
+                            }
                             source_map.file = file_name.rsplit('/').next().map(str::to_owned);
                             make_source_map_sources_relative(
                                 &mut source_map,
@@ -740,6 +744,10 @@ impl Program {
                             emitted.code.insert_str(0, &reference_directives);
                         }
                         if let Some(mut source_map) = emitted.source_map {
+                            if self.options.inline_sources {
+                                source_map.sources_content =
+                                    Some(vec![source_file.source_text.clone()]);
+                            }
                             source_map.file = file_name.rsplit('/').next().map(str::to_owned);
                             if let Some(map_file_name) = paths.declaration_map.clone() {
                                 emitted.code.push_str("//# sourceMappingURL=");
@@ -801,6 +809,7 @@ impl Program {
             let mut code = String::new();
             let mut map_builder = settings.source_map.then(SourceMapBuilder::new);
             let mut map_sources = Vec::new();
+            let mut map_sources_content = Vec::new();
             let mut amd_generated_name_offsets = BTreeMap::new();
             if let Some(shebang) = sources.iter().find_map(|source| source_shebang(source)) {
                 code.push_str(shebang);
@@ -842,10 +851,34 @@ impl Program {
                 code.push_str(BUNDLE_EXTENDS_HELPER);
             }
             for (source_index, source) in sources.iter().enumerate() {
+                let map_source_offset = map_builder.as_ref().map(|_| {
+                    let offset = u32::try_from(map_sources.len()).unwrap_or(u32::MAX);
+                    map_sources.push(
+                        strip_directory_prefix(&source.file_name, &bundle_root)
+                            .unwrap_or_else(|| source.file_name.clone()),
+                    );
+                    if self.options.inline_sources {
+                        map_sources_content.push(source.source_text.clone());
+                    }
+                    offset
+                });
+                let source_detached_comment = bundle_detached_comment(source);
                 let detached_comment = (settings.module == ModuleKind::Amd
                     && source_is_external_module(source))
-                .then(|| bundle_detached_comment(source))
+                .then(|| source_detached_comment.clone())
                 .flatten();
+                if let Some((comment, _)) = &source_detached_comment
+                    && let (Some(builder), Some(source_offset)) =
+                        (&mut map_builder, map_source_offset)
+                {
+                    let line = u32::try_from(code.bytes().filter(|byte| *byte == b'\n').count())
+                        .unwrap_or(u32::MAX);
+                    let comment = comment.trim_end_matches(['\n', '\r']);
+                    let column =
+                        u32::try_from(comment.encode_utf16().count()).unwrap_or(u32::MAX);
+                    let _ = builder.add_mapping(line, 0, source_offset, 0, 0);
+                    let _ = builder.add_mapping(line, column, source_offset, 0, column);
+                }
                 if let Some((comment, _)) = &detached_comment {
                     code.push_str(comment);
                 }
@@ -853,7 +886,7 @@ impl Program {
                     u32::try_from(code.bytes().filter(|byte| *byte == b'\n').count())
                         .unwrap_or(u32::MAX);
                 let mut source_settings = settings;
-                source_settings.source_map = false;
+                source_settings.source_map = settings.source_map;
                 source_settings.inline_source_map = false;
                 source_settings.always_strict = false;
                 let enum_member_values = enum_values_for_emit(&source.checking.enum_member_values);
@@ -939,11 +972,23 @@ impl Program {
                         emitted_uses_tslib_dependency = emitted.code.contains("\"tslib\"");
                         if !emitted.code.is_empty() {
                             if let Some(builder) = &mut map_builder {
-                                let source_index =
-                                    u32::try_from(map_sources.len()).unwrap_or(u32::MAX);
-                                let _ = builder.add_mapping(generated_line, 0, source_index, 0, 0);
+                                let source_offset = map_source_offset.unwrap_or(0);
+                                if let Some(source_map) = &emitted.source_map {
+                                    let _ = builder.append_mappings(
+                                        &source_map.mappings,
+                                        generated_line,
+                                        source_offset,
+                                    );
+                                } else {
+                                    let _ = builder.add_mapping(
+                                        generated_line,
+                                        0,
+                                        source_offset,
+                                        0,
+                                        0,
+                                    );
+                                }
                             }
-                            map_sources.push(source.file_name.clone());
                             code.push_str(&emitted.code);
                         }
                     }
@@ -963,6 +1008,9 @@ impl Program {
                     return output;
                 };
                 map.file = file_name.rsplit('/').next().map(str::to_owned);
+                if self.options.inline_sources {
+                    map.sources_content = Some(map_sources_content);
+                }
                 let serialized = serialize_source_map(&map, self.options.source_root.as_deref());
                 if settings.inline_source_map {
                     code.push_str("//# sourceMappingURL=data:application/json;base64,");
@@ -2131,6 +2179,8 @@ fn serialize_source_map(source_map: &SourceMap, source_root: Option<&str>) -> St
         sources: &'a [String],
         names: &'a [String],
         mappings: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sources_content: &'a Option<Vec<String>>,
     }
 
     let source_root = source_root.map_or_else(String::new, |source_root| {
@@ -2147,6 +2197,7 @@ fn serialize_source_map(source_map: &SourceMap, source_root: Option<&str>) -> St
         sources: &source_map.sources,
         names: &source_map.names,
         mappings: &source_map.mappings,
+        sources_content: &source_map.sources_content,
     })
     .expect("source map fields are JSON-serializable")
 }
@@ -2160,7 +2211,9 @@ fn make_source_map_sources_relative(source_map: &mut SourceMap, source_directory
 
 fn strip_directory_prefix(path: &str, directory: &str) -> Option<String> {
     let path = ts_path::normalize_path(path);
-    let directory = ts_path::normalize_path(directory);
+    let directory = ts_path::normalize_path(directory)
+        .trim_end_matches('/')
+        .to_owned();
     let remainder = path.strip_prefix(&directory)?;
     if remainder.is_empty() {
         Some(String::new())
