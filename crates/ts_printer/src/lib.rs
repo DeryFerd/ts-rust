@@ -326,6 +326,7 @@ pub fn emit_source_file_with_context(
         downlevel_iteration: context.downlevel_iteration,
         context_preserves_top_of_file_reference_directive: context
             .preserve_top_of_file_reference_directive,
+        pending_statement_line_comments: Vec::new(),
     };
     let node = printer.node(source_file)?.clone();
     let NodeData::SourceFile(data) = &node.data else {
@@ -3535,8 +3536,7 @@ impl DeclarationPrinter<'_> {
                 }
                 let is_const =
                     declaration_has_modifier(self.arena, &node, SyntaxKind::ConstKeyword);
-                let is_ambient =
-                    declaration_has_modifier(self.arena, &node, SyntaxKind::DeclareKeyword);
+                let is_ambient = node_is_in_ambient_context(self.arena, id);
                 if is_const {
                     self.writer.write("const ");
                 }
@@ -7975,18 +7975,51 @@ impl DeclarationPrinter<'_> {
         let NodeData::PropertyAccessExpression(access) = &self.arena.get(initializer)?.data else {
             return None;
         };
-        let symbol = self.resolve_entity_expression_symbol(initializer)?;
-        self.bindings
-            .symbols
-            .get(symbol)?
-            .declarations
-            .iter()
-            .any(|declaration| {
-                matches!(
-                    self.arena.get(*declaration).map(|node| &node.data),
-                    Some(NodeData::EnumMember(_))
-                )
+        if self
+            .resolve_entity_expression_symbol(initializer)
+            .and_then(|symbol| self.bindings.symbols.get(symbol))
+            .is_some_and(|symbol| {
+                symbol.declarations.iter().any(|declaration| {
+                    matches!(
+                        self.arena.get(*declaration).map(|node| &node.data),
+                        Some(NodeData::EnumMember(_))
+                    )
+                })
             })
+        {
+            return Some(access.expression);
+        }
+        let root = self.entity_expression_root_identifier(initializer)?;
+        let root_name = declaration_name_text(self.arena, root)?;
+        let root_symbol = self.bindings.resolve_name_at(root, root_name)?;
+        let external_import = self
+            .bindings
+            .symbols
+            .get(root_symbol)
+            .is_some_and(|symbol| {
+                symbol.declarations.iter().any(|declaration| {
+                    matches!(
+                        self.arena.get(*declaration).map(|node| &node.data),
+                        Some(NodeData::ImportEqualsDeclaration(_))
+                    )
+                })
+            });
+        if !external_import {
+            return None;
+        }
+        let receiver_type = self
+            .node_types
+            .and_then(|types| types.get(&access.expression))
+            .and_then(|type_id| self.semantic_types.and_then(|types| types.get(*type_id)))?;
+        let TypeKind::Object(object) = &receiver_type.kind else {
+            return None;
+        };
+        let number_index_is_string = object
+            .number_index_type
+            .and_then(|type_id| self.semantic_types?.get(type_id))
+            .is_some_and(|type_| matches!(type_.kind, TypeKind::String));
+        let member_name = declaration_name_text(self.arena, access.name)?;
+        (number_index_is_string && object.properties.contains_key(member_name))
             .then_some(access.expression)
     }
 
@@ -13200,7 +13233,11 @@ impl DeclarationPrinter<'_> {
                     write_quoted(&mut self.writer, "new");
                 } else if !self.emit_computed_literal_property_name(name_node)? {
                     if syntactic_name.is_some() {
-                        self.emit_name(name_node)?;
+                        let previous = self.canonical_literal_quotes;
+                        self.canonical_literal_quotes = false;
+                        let result = self.emit_name(name_node);
+                        self.canonical_literal_quotes = previous;
+                        result?;
                     } else {
                         self.emit_semantic_property_name(&name);
                     }
@@ -13223,7 +13260,11 @@ impl DeclarationPrinter<'_> {
                 write_quoted(&mut self.writer, "new");
             } else if !self.emit_computed_literal_property_name(name_node)? {
                 if syntactic_name.is_some() {
-                    self.emit_name(name_node)?;
+                    let previous = self.canonical_literal_quotes;
+                    self.canonical_literal_quotes = false;
+                    let result = self.emit_name(name_node);
+                    self.canonical_literal_quotes = previous;
+                    result?;
                 } else {
                     self.emit_semantic_property_name(&name);
                 }
@@ -18172,6 +18213,7 @@ struct Printer<'a> {
     jsx_factory: Option<String>,
     downlevel_iteration: bool,
     context_preserves_top_of_file_reference_directive: bool,
+    pending_statement_line_comments: Vec<((usize, usize), String)>,
 }
 
 impl Printer<'_> {
@@ -21788,6 +21830,12 @@ impl Printer<'_> {
                 self.writer.write(";");
             }
             _ => return Err(Self::unsupported(id, node.kind)),
+        }
+        for (range, comment) in std::mem::take(&mut self.pending_statement_line_comments) {
+            if self.emitted_source_comments.insert(range) {
+                self.writer.write(" ");
+                self.writer.write(&comment);
+            }
         }
         self.writer.newline();
         Ok(())
@@ -30679,7 +30727,17 @@ impl Printer<'_> {
         self.writer.write(") {");
         self.writer.newline();
         self.writer.indent += 1;
-        let mut next_number = 0_i64;
+        for member in &data.members.nodes {
+            let Some(NodeData::EnumMember(member_data)) =
+                self.arena.get(*member).map(|node| &node.data)
+            else {
+                continue;
+            };
+            let (member_name, _) = self.enum_member_name_text(member_data.name)?;
+            self.enum_member_identifier_rewrites
+                .insert(member_name.clone(), format!("{name}.{member_name}"));
+        }
+        let mut next_number = Some(0.0_f64);
         let mut syntactically_string_members = HashSet::new();
         let mut previous_end = data.members.range.start.get();
         for (index, member) in data.members.nodes.iter().enumerate() {
@@ -30711,6 +30769,7 @@ impl Printer<'_> {
                     )
                 });
             if is_string_member {
+                next_number = None;
                 if numeric_name {
                     self.writer.write(&member_name);
                 } else {
@@ -30736,16 +30795,23 @@ impl Printer<'_> {
                 self.writer.write("] = ");
                 if let Some(constant) = constant {
                     write_enum_constant(&mut self.writer, constant);
+                    next_number = match constant {
+                        EmitConstantValue::Number(value) => Some(value + 1.0),
+                        EmitConstantValue::String(_) => None,
+                    };
                 } else if let Some(initializer) = member.initializer {
                     self.emit_expression(initializer, 1)?;
-                    if let NodeData::NumericLiteral(literal) = &self.node(initializer)?.data
-                        && let Ok(value) = literal.text.parse::<i64>()
-                    {
-                        next_number = value.saturating_add(1);
-                    }
+                    next_number = match &self.node(initializer)?.data {
+                        NodeData::NumericLiteral(literal) => {
+                            Some(ts_jsnum::Number::from_string(&literal.text).value() + 1.0)
+                        }
+                        _ => None,
+                    };
+                } else if let Some(value) = next_number {
+                    self.writer.write(&value.to_string());
+                    next_number = Some(value + 1.0);
                 } else {
-                    self.writer.write(&next_number.to_string());
-                    next_number = next_number.saturating_add(1);
+                    self.writer.write("void 0");
                 }
                 self.writer.write("] = ");
                 if numeric_name {
@@ -30762,8 +30828,6 @@ impl Printer<'_> {
                 self.identifier_rewrites
                     .insert(symbol, format!("{name}.{member_name}"));
             }
-            self.enum_member_identifier_rewrites
-                .insert(member_name.clone(), format!("{name}.{member_name}"));
             self.writer.newline();
             let comment_end = data
                 .members
@@ -33365,6 +33429,26 @@ impl Printer<'_> {
                         self.writer.newline();
                     }
                     let name = self.node(data.name)?.clone();
+                    let missing_name = matches!(
+                        &name.data,
+                        NodeData::Identifier(identifier) if identifier.text.is_empty()
+                    );
+                    if missing_name
+                        && let Some((start, trivia)) = usize::try_from(expression_end)
+                            .ok()
+                            .zip(usize::try_from(name_start).ok())
+                            .and_then(|(start, end)| {
+                                self.source_text.get(start..end).map(|text| (start, text))
+                            })
+                        && let Some(comment_start) = trivia.find("//")
+                    {
+                        let comment_end = trivia[comment_start..]
+                            .find(['\n', '\r'])
+                            .map_or(trivia.len(), |end| comment_start + end);
+                        let range = (start + comment_start, start + comment_end);
+                        self.pending_statement_line_comments
+                            .push((range, trivia[comment_start..comment_end].to_owned()));
+                    }
                     match &name.data {
                         NodeData::Identifier(name) => self.writer.write(&name.text),
                         NodeData::PrivateIdentifier(name) => self.writer.write(&name.text),
@@ -36719,7 +36803,10 @@ impl Printer<'_> {
         match &node.data {
             NodeData::Identifier(data) => Ok((data.text.clone(), false)),
             NodeData::StringLiteral(data) => Ok((data.text.clone(), false)),
-            NodeData::NumericLiteral(data) => Ok((data.text.clone(), true)),
+            NodeData::NumericLiteral(data) => {
+                Ok((ts_jsnum::Number::from_string(&data.text).to_string(), true))
+            }
+            NodeData::BigIntLiteral(data) => Ok((data.text.to_ascii_lowercase(), true)),
             NodeData::ComputedPropertyName(data) => self.enum_member_name_text(data.expression),
             _ => Err(Self::unsupported(id, node.kind)),
         }

@@ -3374,6 +3374,16 @@ impl<'a> Checker<'a> {
             self.error(initializer, 2474, std::iter::empty());
             return None;
         }
+        if !is_const
+            && self.enum_initializer_requires_runtime(
+                initializer,
+                enum_name,
+                member_names,
+                resolved_values,
+            )
+        {
+            return None;
+        }
         let mut forward_reference = false;
         let evaluation = evaluate_with(self.arena, initializer, &mut |reference| {
             if let Some(reference_name) =
@@ -3415,6 +3425,68 @@ impl<'a> Checker<'a> {
         }
     }
 
+    fn enum_initializer_requires_runtime(
+        &self,
+        initializer: NodeId,
+        enum_name: &str,
+        member_names: &BTreeSet<String>,
+        resolved_values: &BTreeMap<String, Value>,
+    ) -> bool {
+        match self.arena.get(initializer).map(|node| &node.data) {
+            Some(NodeData::ParenthesizedExpression(parenthesized)) => self
+                .enum_initializer_requires_runtime(
+                    parenthesized.expression,
+                    enum_name,
+                    member_names,
+                    resolved_values,
+                ),
+            Some(
+                NodeData::AsExpression(_)
+                | NodeData::TypeAssertion(_)
+                | NodeData::NonNullExpression(_)
+                | NodeData::SatisfiesExpression(_),
+            ) => true,
+            Some(NodeData::PropertyAccessExpression(access)) => {
+                matches!(
+                    self.arena.get(access.expression).map(|node| &node.data),
+                    Some(NodeData::StringLiteral(_) | NodeData::NoSubstitutionTemplateLiteral(_))
+                ) || enum_member_reference_name(self.arena, initializer, enum_name).is_some_and(
+                    |name| member_names.contains(&name) && !resolved_values.contains_key(&name),
+                )
+            }
+            Some(NodeData::ElementAccessExpression(_)) => {
+                enum_member_reference_name(self.arena, initializer, enum_name).is_some_and(|name| {
+                    member_names.contains(&name) && !resolved_values.contains_key(&name)
+                })
+            }
+            Some(NodeData::Identifier(identifier)) => {
+                member_names.contains(&identifier.text)
+                    && !resolved_values.contains_key(&identifier.text)
+            }
+            Some(NodeData::BinaryExpression(binary)) => {
+                self.enum_initializer_requires_runtime(
+                    binary.left,
+                    enum_name,
+                    member_names,
+                    resolved_values,
+                ) || self.enum_initializer_requires_runtime(
+                    binary.right,
+                    enum_name,
+                    member_names,
+                    resolved_values,
+                )
+            }
+            Some(NodeData::PrefixUnaryExpression(prefix)) => self
+                .enum_initializer_requires_runtime(
+                    prefix.operand,
+                    enum_name,
+                    member_names,
+                    resolved_values,
+                ),
+            _ => false,
+        }
+    }
+
     fn enum_external_constant(&self, reference: NodeId) -> Option<Value> {
         let (name_node, name) = match &self.arena.get(reference)?.data {
             NodeData::Identifier(identifier) => (reference, identifier.text.as_str()),
@@ -3427,21 +3499,64 @@ impl<'a> Checker<'a> {
             ),
             _ => return None,
         };
-        let symbol = self.resolve_identifier(name_node, name).or_else(|| {
-            self.bindings.symbols.iter().find_map(|symbol| {
-                (symbol.name == name && symbol.flags.contains(ts_binder::SymbolFlags::ENUM_MEMBER))
+        let entity_symbol = matches!(
+            self.arena.get(reference).map(|node| &node.data),
+            Some(NodeData::PropertyAccessExpression(_))
+        )
+        .then(|| self.resolve_value_expression_symbol(reference))
+        .flatten();
+        let qualified_enum_member = match self.arena.get(reference).map(|node| &node.data) {
+            Some(NodeData::PropertyAccessExpression(access)) => {
+                let enum_name = match self.arena.get(access.expression).map(|node| &node.data) {
+                    Some(NodeData::PropertyAccessExpression(receiver)) => {
+                        self.property_name(receiver.name)
+                    }
+                    Some(NodeData::Identifier(identifier)) => Some(identifier.text.clone()),
+                    _ => None,
+                }?;
+                self.bindings.symbols.iter().find_map(|symbol| {
+                    (symbol.name == name
+                        && symbol.flags.contains(ts_binder::SymbolFlags::ENUM_MEMBER)
+                        && symbol.declarations.iter().any(|declaration| {
+                            self.arena
+                                .get(*declaration)
+                                .and_then(|node| node.parent)
+                                .and_then(|parent| self.arena.get(parent))
+                                .is_some_and(|parent| {
+                                    matches!(
+                                        &parent.data,
+                                        NodeData::EnumDeclaration(enumeration)
+                                            if self.property_name(enumeration.name).as_deref()
+                                                == Some(enum_name.as_str())
+                                    )
+                                })
+                        }))
                     .then_some(symbol.id)
-            })
-        })?;
-        if let Some(descriptor) = self.external_aliases.get(&symbol)
-            && let Some(value) = enum_constant_from_descriptor(descriptor)
-        {
-            return Some(value);
-        }
-        if let Some(type_id) = self.result.symbol_types.get(&symbol)
-            && let Some(value) = enum_constant_from_type(&self.result.types, *type_id)
-        {
-            return Some(value);
+                })
+            }
+            _ => None,
+        };
+        let symbol = entity_symbol
+            .or(qualified_enum_member)
+            .or_else(|| self.bindings.node_symbols.get(&name_node).copied())
+            .or_else(|| self.bindings.resolve_name_at(name_node, name))
+            .or_else(|| self.enum_import_symbol(name_node, name))?;
+        let target = self
+            .bindings
+            .symbols
+            .get(symbol)
+            .and_then(|symbol| symbol.target);
+        for candidate in [Some(symbol), target].into_iter().flatten() {
+            if let Some(descriptor) = self.external_aliases.get(&candidate)
+                && let Some(value) = enum_constant_from_descriptor(descriptor)
+            {
+                return Some(value);
+            }
+            if let Some(type_id) = self.result.symbol_types.get(&candidate)
+                && let Some(value) = enum_constant_from_type(&self.result.types, *type_id)
+            {
+                return Some(value);
+            }
         }
         self.bindings
             .symbols
@@ -3455,6 +3570,27 @@ impl<'a> Checker<'a> {
                 };
                 enum_constant_literal(self.arena, variable.initializer?)
             })
+    }
+
+    fn enum_import_symbol(&self, name_node: NodeId, name: &str) -> Option<ts_ast::SymbolId> {
+        let symbol = self.resolve_identifier(name_node, name)?;
+        self.bindings
+            .symbols
+            .get(symbol)?
+            .declarations
+            .iter()
+            .any(|declaration| {
+                matches!(
+                    self.arena.get(*declaration).map(|node| &node.data),
+                    Some(
+                        NodeData::ImportSpecifier(_)
+                            | NodeData::ImportClause(_)
+                            | NodeData::ImportEqualsDeclaration(_)
+                            | NodeData::NamespaceImport(_)
+                    )
+                )
+            })
+            .then_some(symbol)
     }
 
     fn enum_constant_type(&mut self, value: &Value) -> TypeId {

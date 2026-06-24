@@ -2480,7 +2480,7 @@ impl<'a> Parser<'a> {
 
     fn parse_enum_declaration(&mut self) -> NodeId {
         let start = self.consume().range.start;
-        let name = self.parse_identifier("Expected an enum name.");
+        let name = self.parse_identifier_name("Expected an enum name.");
         let body_start = self.current.range.start;
         if self.current.kind == SyntaxKind::OpenBraceToken {
             self.bump();
@@ -2552,7 +2552,10 @@ impl<'a> Parser<'a> {
     fn parse_enum_member_name(&mut self) -> NodeId {
         if matches!(
             self.current.kind,
-            SyntaxKind::StringLiteral | SyntaxKind::NumericLiteral | SyntaxKind::OpenBracketToken
+            SyntaxKind::StringLiteral
+                | SyntaxKind::NumericLiteral
+                | SyntaxKind::BigIntLiteral
+                | SyntaxKind::OpenBracketToken
         ) {
             self.parse_property_name("Expected an enum member name.")
         } else {
@@ -4427,7 +4430,7 @@ impl<'a> Parser<'a> {
             match self.current.kind {
                 SyntaxKind::DotToken => {
                     self.bump();
-                    let name = self.parse_property_name("Expected a property name.");
+                    let name = self.parse_property_name_after_dot();
                     expression = self.alloc_node(
                         SyntaxKind::PropertyAccessExpression,
                         TextRange::new(self.node_start(expression), self.node_end(name)),
@@ -4760,7 +4763,7 @@ impl<'a> Parser<'a> {
             match self.current.kind {
                 SyntaxKind::DotToken => {
                     self.bump();
-                    let name = self.parse_property_name("Expected a property name.");
+                    let name = self.parse_property_name_after_dot();
                     expression = self.alloc_node(
                         SyntaxKind::PropertyAccessExpression,
                         TextRange::new(self.node_start(expression), self.node_end(name)),
@@ -6083,6 +6086,24 @@ impl<'a> Parser<'a> {
                 )
             }
             _ => self.parse_identifier_name(message),
+        }
+    }
+
+    fn parse_property_name_after_dot(&mut self) -> NodeId {
+        if self
+            .current
+            .flags
+            .contains(ScannerTokenFlags::PRECEDING_LINE_BREAK)
+            && matches!(
+                self.current.kind,
+                SyntaxKind::VarKeyword | SyntaxKind::LetKeyword | SyntaxKind::ConstKeyword
+            )
+        {
+            let position = self.current.range.start;
+            self.error_current("Expected a property name.");
+            self.missing_identifier(position)
+        } else {
+            self.parse_property_name("Expected a property name.")
         }
     }
 
