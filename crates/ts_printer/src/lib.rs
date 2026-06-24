@@ -439,6 +439,7 @@ pub fn emit_source_file_with_context(
     if settings.import_helpers
         && !settings.no_emit_helpers
         && settings.module == ModuleKind::CommonJs
+        && is_external_module
         && ((settings.target < ScriptTarget::Es2017 && source_needs_awaiter_helper(arena))
             || (settings.target < ScriptTarget::Es2015
                 && source_needs_downlevel_generator_helper(arena)))
@@ -818,7 +819,13 @@ pub fn emit_source_file_with_context(
         }
     }
     if let Some(namespace) = printer.import_helpers_namespace.clone() {
-        printer.writer.write("const ");
+        printer
+            .writer
+            .write(if settings.target < ScriptTarget::Es2015 {
+                "var "
+            } else {
+                "const "
+            });
         printer.writer.write(&namespace);
         printer.writer.write(" = require(\"tslib\");");
         printer.writer.newline();
@@ -19609,7 +19616,11 @@ impl Printer<'_> {
                 let name = self.identifier_text(name_id)?.to_owned();
                 self.writer.write(&name);
                 self.writer.write(" = ");
-                self.emit_class(class)?;
+                if self.settings.target < ScriptTarget::Es2015 {
+                    self.emit_downlevel_class_value(class, &name)?;
+                } else {
+                    self.emit_class(class)?;
+                }
                 self.writer.write(";");
                 self.emit_auto_accessor_storage_initializers(class);
                 self.writer.newline();
