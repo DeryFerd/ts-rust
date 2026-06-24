@@ -507,6 +507,7 @@ impl Program {
                             | ModuleKind::Node20
                             | ModuleKind::NodeNext
                     ),
+                    isolated_modules: self.options.isolated_modules,
                     strict_null_checks: self.options.strict_null_checks,
                     jsx_factory: self.options.jsx_factory.as_deref(),
                     downlevel_iteration: self.options.downlevel_iteration,
@@ -733,6 +734,7 @@ impl Program {
                             | ModuleKind::Node20
                             | ModuleKind::NodeNext
                     ),
+                    isolated_modules: self.options.isolated_modules,
                     strict_null_checks: self.options.strict_null_checks,
                     jsx_factory: self.options.jsx_factory.as_deref(),
                     downlevel_iteration: self.options.downlevel_iteration,

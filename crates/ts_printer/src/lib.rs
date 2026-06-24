@@ -57,6 +57,7 @@ pub struct EmitContext<'a> {
     pub inline_const_enums: bool,
     pub emit_decorator_metadata: bool,
     pub preserve_dynamic_import: bool,
+    pub isolated_modules: bool,
     pub strict_null_checks: bool,
     pub jsx_factory: Option<&'a str>,
     pub downlevel_iteration: bool,
@@ -190,6 +191,7 @@ pub fn emit_source_file_with_settings_and_bindings(
             inline_const_enums: false,
             emit_decorator_metadata: false,
             preserve_dynamic_import: false,
+            isolated_modules: false,
             strict_null_checks: false,
             jsx_factory: None,
             downlevel_iteration: false,
@@ -290,6 +292,7 @@ pub fn emit_source_file_with_context(
         is_external_module: false,
         emit_decorator_metadata: context.emit_decorator_metadata,
         preserve_dynamic_import: context.preserve_dynamic_import,
+        isolated_modules: context.isolated_modules,
         strict_null_checks: context.strict_null_checks,
         jsx_factory: context.jsx_factory.map(str::to_owned),
         downlevel_iteration: context.downlevel_iteration,
@@ -482,13 +485,23 @@ pub fn emit_source_file_with_context(
             printer.writer.newline();
         }
     }
+    let preemit_isolated_metadata_import_star = context.isolated_modules
+        && context.emit_decorator_metadata
+        && settings.module == ModuleKind::CommonJs
+        && is_external_module
+        && !settings.no_emit_helpers
+        && printer.source_needs_import_star_helper(&data.statements);
+    if preemit_isolated_metadata_import_star {
+        printer.emit_create_binding_helper();
+        printer.emit_set_module_default_helper();
+    }
     if needs_dynamic_import_helpers && !settings.no_emit_helpers {
         printer.emit_create_binding_helper();
         printer.emit_import_star_helper();
     }
     if source_needs_legacy_decorate_helper(arena) && !settings.no_emit_helpers {
         printer.emit_decorate_helper();
-        if printer.emit_decorator_metadata {
+        if printer.emit_decorator_metadata && !preemit_isolated_metadata_import_star {
             printer.emit_metadata_helper();
         }
         if source_needs_legacy_param_helper(arena) {
@@ -632,11 +645,20 @@ pub fn emit_source_file_with_context(
     if settings.module == ModuleKind::CommonJs && is_external_module {
         let needs_import_star_helper = printer.source_needs_import_star_helper(&data.statements);
         let needs_export_star_helper = source_needs_export_star_helper(arena, &data.statements);
-        if (needs_import_star_helper || needs_export_star_helper) && !needs_dynamic_import_helpers {
+        if (needs_import_star_helper || needs_export_star_helper)
+            && !needs_dynamic_import_helpers
+            && !preemit_isolated_metadata_import_star
+            && !settings.no_emit_helpers
+        {
             printer.emit_create_binding_helper();
         }
-        if needs_import_star_helper && !needs_dynamic_import_helpers {
-            printer.emit_import_star_helper();
+        if needs_import_star_helper && !needs_dynamic_import_helpers && !settings.no_emit_helpers {
+            if preemit_isolated_metadata_import_star {
+                printer.emit_import_star_helper_body();
+                printer.emit_metadata_helper();
+            } else {
+                printer.emit_import_star_helper();
+            }
         }
         if needs_export_star_helper {
             printer.emit_export_star_helper();
@@ -18038,6 +18060,7 @@ struct Printer<'a> {
     is_external_module: bool,
     emit_decorator_metadata: bool,
     preserve_dynamic_import: bool,
+    isolated_modules: bool,
     strict_null_checks: bool,
     jsx_factory: Option<String>,
     downlevel_iteration: bool,
@@ -18101,8 +18124,21 @@ impl Printer<'_> {
     }
 
     fn decorator_metadata_runtime_name_has_value(&self, name: &str) -> bool {
+        if self.isolated_modules && self.decorator_metadata_name_is_namespace_import(name) {
+            return true;
+        }
         self.decorator_metadata_import_runtime_value(name)
             .unwrap_or(true)
+    }
+
+    fn decorator_metadata_name_is_namespace_import(&self, name: &str) -> bool {
+        self.arena.iter().any(|(_, node)| {
+            matches!(
+                &node.data,
+                NodeData::NamespaceImport(import)
+                    if declaration_name_text(self.arena, import.name) == Some(name)
+            )
+        })
     }
 
     fn decorator_metadata_import_runtime_value(&self, name: &str) -> Option<bool> {
@@ -19874,12 +19910,25 @@ impl Printer<'_> {
     }
 
     fn emit_import_star_helper(&mut self) {
+        self.emit_set_module_default_helper();
+        self.emit_import_star_helper_body();
+    }
+
+    fn emit_set_module_default_helper(&mut self) {
         for line in [
             "var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {",
             "    Object.defineProperty(o, \"default\", { enumerable: true, value: v });",
             "}) : function(o, v) {",
             "    o[\"default\"] = v;",
             "});",
+        ] {
+            self.writer.write(line);
+            self.writer.newline();
+        }
+    }
+
+    fn emit_import_star_helper_body(&mut self) {
+        for line in [
             "var __importStar = (this && this.__importStar) || (function () {",
             "    var ownKeys = function(o) {",
             "        ownKeys = Object.getOwnPropertyNames || function (o) {",
@@ -27344,6 +27393,14 @@ impl Printer<'_> {
                 self.emit_runtime_metadata_type(Some(parenthesized.type_), fallback)?;
             }
             NodeData::TypeReferenceNode(reference) => {
+                let root_name = entity_root_identifier_text(self.arena, reference.type_name);
+                if self.isolated_modules
+                    && root_name
+                        .is_some_and(|name| self.decorator_metadata_name_is_namespace_import(name))
+                {
+                    self.writer.write("Object");
+                    return Ok(());
+                }
                 if let Some(temp) = self.decorator_metadata_guard_temps.get(&type_node).cloned() {
                     self.writer.write("typeof (");
                     self.writer.write(&temp);
@@ -27380,7 +27437,11 @@ impl Printer<'_> {
                 } else if declaration_name_text(self.arena, reference.type_name).is_some_and(
                     |name| self.decorator_metadata_import_runtime_value(name) == Some(false),
                 ) {
-                    self.writer.write("Function");
+                    self.writer.write(if self.isolated_modules {
+                        "Object"
+                    } else {
+                        "Function"
+                    });
                 } else if let Some(name) = declaration_name_text(self.arena, reference.type_name)
                     && let Some(temp) = self.commonjs_default_imports.get(name)
                 {
@@ -37643,6 +37704,7 @@ mod tests {
                 inline_const_enums: false,
                 emit_decorator_metadata: false,
                 preserve_dynamic_import: false,
+                isolated_modules: false,
                 strict_null_checks: false,
                 jsx_factory: None,
                 downlevel_iteration: false,
@@ -37764,6 +37826,7 @@ mod tests {
                 inline_const_enums: false,
                 emit_decorator_metadata: false,
                 preserve_dynamic_import: false,
+                isolated_modules: false,
                 strict_null_checks: false,
                 jsx_factory: None,
                 downlevel_iteration: false,
@@ -39483,6 +39546,7 @@ mod tests {
                 inline_const_enums: true,
                 emit_decorator_metadata: false,
                 preserve_dynamic_import: false,
+                isolated_modules: false,
                 strict_null_checks: false,
                 jsx_factory: None,
                 downlevel_iteration: false,
@@ -40001,6 +40065,7 @@ mod tests {
                     inline_const_enums: false,
                     emit_decorator_metadata: false,
                     preserve_dynamic_import: false,
+                    isolated_modules: false,
                     strict_null_checks: false,
                     jsx_factory: None,
                     downlevel_iteration: false,
@@ -42134,6 +42199,7 @@ class Board {
                 inline_const_enums: false,
                 emit_decorator_metadata: false,
                 preserve_dynamic_import: false,
+                isolated_modules: false,
                 strict_null_checks: false,
                 jsx_factory: None,
                 downlevel_iteration: false,
