@@ -813,6 +813,19 @@ impl<'a> ProgramChecker<'a> {
                 descriptor.map(|descriptor| (name, descriptor))
             })
             .collect::<BTreeMap<_, _>>();
+        let local_export_renames = export_symbols
+            .iter()
+            .filter_map(|(exported, symbol)| {
+                let target = source.bindings.symbols.get(*symbol)?.target?;
+                let local = &source.bindings.symbols.get(target)?.name;
+                (local != exported).then(|| (local.clone(), exported.clone()))
+            })
+            .collect::<BTreeMap<_, _>>();
+        if !local_export_renames.is_empty() {
+            for descriptor in exports.values_mut() {
+                rename_descriptor_reference_roots(descriptor, &local_export_renames);
+            }
+        }
         if let Some(export_equals) = export_symbols.get("export=").copied() {
             let export_equals = source
                 .bindings
@@ -1046,7 +1059,7 @@ impl<'a> ProgramChecker<'a> {
                         .get(direct_target)
                         .or_else(|| preliminary.get(direct_target))?;
                     let mut branch = visited.clone();
-                    let descriptors = self.resolved_module_exports_inner(
+                    let mut descriptors = self.resolved_module_exports_inner(
                         direct_target,
                         specifier,
                         result,
@@ -1054,6 +1067,34 @@ impl<'a> ProgramChecker<'a> {
                         completed,
                         &mut branch,
                     );
+                    let renames = named
+                        .elements
+                        .nodes
+                        .iter()
+                        .filter_map(|specifier| {
+                            let NodeData::ExportSpecifier(specifier) =
+                                &source.arena.get(*specifier)?.data
+                            else {
+                                return None;
+                            };
+                            let local = module_export_name_text(
+                                source.arena,
+                                specifier.property_name.unwrap_or(specifier.name),
+                            )?;
+                            let exported = module_export_name_text(source.arena, specifier.name)?;
+                            (local != exported).then(|| (local.to_owned(), exported.to_owned()))
+                        })
+                        .collect::<BTreeMap<_, _>>();
+                    if !renames.is_empty() {
+                        for descriptor in descriptors.values_mut() {
+                            rename_descriptor_reference_roots(descriptor, &renames);
+                        }
+                        for (local, exported) in &renames {
+                            if let Some(descriptor) = descriptors.remove(local) {
+                                descriptors.insert(exported.clone(), descriptor);
+                            }
+                        }
+                    }
                     let reference = self
                         .source_paths
                         .and_then(|paths| Some((paths.get(direct_target)?, paths.get(target)?)))
@@ -1087,13 +1128,13 @@ impl<'a> ProgramChecker<'a> {
                     };
                     if let Some(descriptor) = direct
                         .as_ref()
-                        .and_then(|(_, descriptors)| descriptors.get(local))
+                        .and_then(|(_, descriptors)| descriptors.get(exported))
                         .or_else(|| imported.get(local))
                     {
                         let mut descriptor = descriptor.clone();
                         if let Some((reference, descriptors)) = direct.as_ref() {
                             let mut dependencies = descriptors.clone();
-                            dependencies.remove(local);
+                            dependencies.remove(exported);
                             paint_exported_named_descriptor_imports(
                                 &mut descriptor,
                                 reference,
@@ -4942,10 +4983,7 @@ impl<'a> Checker<'a> {
         contextual_type: Option<TypeId>,
     ) -> ObjectType {
         let contextual_object =
-            contextual_type.and_then(|type_id| match &self.result.types.get(type_id)?.kind {
-                TypeKind::Object(object) => Some(object.clone()),
-                _ => None,
-            });
+            contextual_type.and_then(|type_id| self.contextual_object_type(type_id));
         let mut properties = BTreeMap::new();
         let mut optional_properties = BTreeSet::new();
         let readonly_properties = BTreeSet::new();
@@ -5081,6 +5119,65 @@ impl<'a> Checker<'a> {
             number_index_type,
             ..ObjectType::default()
         }
+    }
+
+    fn contextual_object_type(&mut self, type_id: TypeId) -> Option<ObjectType> {
+        let kind = self.result.types.get(type_id)?.kind.clone();
+        match kind {
+            TypeKind::Object(object) => Some(object),
+            TypeKind::Union(members) => self.combine_contextual_objects(members, false),
+            TypeKind::Intersection(members) => self.combine_contextual_objects(members, true),
+            _ => None,
+        }
+    }
+
+    fn combine_contextual_objects(
+        &mut self,
+        members: Vec<TypeId>,
+        intersection: bool,
+    ) -> Option<ObjectType> {
+        let objects = members
+            .into_iter()
+            .filter_map(|member| self.contextual_object_type(member))
+            .collect::<Vec<_>>();
+        let mut objects = objects.into_iter();
+        let mut combined = objects.next()?;
+        for object in objects {
+            for (name, property) in object.properties {
+                if let Some(existing) = combined.properties.get(&name).copied() {
+                    let property = if intersection {
+                        self.result.types.intersection([existing, property])
+                    } else {
+                        self.result.types.union([existing, property])
+                    };
+                    combined.properties.insert(name, property);
+                } else {
+                    combined.properties.insert(name, property);
+                }
+            }
+            combined.property_order.extend(object.property_order);
+            combined
+                .numeric_properties
+                .extend(object.numeric_properties);
+            combined
+                .optional_properties
+                .extend(object.optional_properties);
+            combined
+                .readonly_properties
+                .extend(object.readonly_properties);
+            combined.getter_properties.extend(object.getter_properties);
+            combined.setter_properties.extend(object.setter_properties);
+            combined
+                .setter_property_types
+                .extend(object.setter_property_types);
+            combined.call_signatures.extend(object.call_signatures);
+            combined
+                .construct_signatures
+                .extend(object.construct_signatures);
+            combined.string_index_type = combined.string_index_type.or(object.string_index_type);
+            combined.number_index_type = combined.number_index_type.or(object.number_index_type);
+        }
+        Some(combined)
     }
 
     fn matching_object_property_name(object: &ObjectType, name: &str) -> Option<String> {
@@ -7644,6 +7741,17 @@ impl<'a> Checker<'a> {
         })
     }
 
+    fn contextual_function_signature(&self, type_id: TypeId) -> Option<FunctionType> {
+        match &self.result.types.get(type_id)?.kind {
+            TypeKind::Function(signature) => Some(signature.clone()),
+            TypeKind::Overload(signatures) => signatures.first().cloned(),
+            TypeKind::Union(members) | TypeKind::Intersection(members) => members
+                .iter()
+                .find_map(|member| self.contextual_function_signature(*member)),
+            _ => None,
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     fn arrow_type(
         &mut self,
@@ -7680,11 +7788,7 @@ impl<'a> Checker<'a> {
             }
         }
         let contextual_signature =
-            contextual_type.and_then(|type_id| match &self.result.types.get(type_id)?.kind {
-                TypeKind::Function(signature) => Some(signature.clone()),
-                TypeKind::Overload(signatures) => signatures.first().cloned(),
-                _ => None,
-            });
+            contextual_type.and_then(|type_id| self.contextual_function_signature(type_id));
         let jsdoc = self.jsdoc_signature_types(node_id);
         let mut parameters = Vec::with_capacity(data.parameters.nodes.len());
         let mut local_scope = HashMap::new();
@@ -7853,11 +7957,7 @@ impl<'a> Checker<'a> {
         contextual_type: Option<TypeId>,
     ) -> TypeId {
         let contextual_signature =
-            contextual_type.and_then(|type_id| match &self.result.types.get(type_id)?.kind {
-                TypeKind::Function(signature) => Some(signature.clone()),
-                TypeKind::Overload(signatures) => signatures.first().cloned(),
-                _ => None,
-            });
+            contextual_type.and_then(|type_id| self.contextual_function_signature(type_id));
         let jsdoc = self.jsdoc_signature_types(node_id);
         let mut parameters = Vec::with_capacity(data.parameters.nodes.len());
         let mut local_scope = HashMap::new();
@@ -8753,15 +8853,20 @@ impl<'a> Checker<'a> {
                 self.type_of_expression(*argument);
                 continue;
             };
+            let inferred_object_properties =
+                self.infer_object_literal_properties(parameter, *argument, &mut inference);
             let actual = if self.mapped_return_templates.contains_key(&parameter) {
                 self.type_of_expression(*argument)
             } else {
-                self.type_of_expression_context(*argument, Some(parameter))
+                let contextual_parameter = self.substitute_type(parameter, &inference);
+                self.type_of_expression_context(*argument, Some(contextual_parameter))
             };
             let preserve_literal_inference = self.preserve_literal_inference;
             self.preserve_literal_inference &=
                 self.signature_return_depends_on_parameter(signature, parameter);
-            self.infer_type_parameters(parameter, actual, &mut inference);
+            if !inferred_object_properties {
+                self.infer_type_parameters(parameter, actual, &mut inference);
+            }
             self.preserve_literal_inference = preserve_literal_inference;
             self.infer_named_type_parameters_from_argument(parameter, *argument, &mut inference);
             let expected = self.substitute_type(parameter, &inference);
@@ -9060,7 +9165,15 @@ impl<'a> Checker<'a> {
                 };
                 inference
                     .entry(parameter)
-                    .and_modify(|current| *current = self.result.types.union([*current, actual]))
+                    .and_modify(|current| {
+                        let current_uninformative = self.inference_type_is_uninformative(*current);
+                        let actual_uninformative = self.inference_type_is_uninformative(actual);
+                        if current_uninformative && !actual_uninformative {
+                            *current = actual;
+                        } else if !actual_uninformative {
+                            *current = self.result.types.union([*current, actual]);
+                        }
+                    })
                     .or_insert(actual);
             }
             TypeKind::Array(parameter_element) => {
@@ -9077,6 +9190,40 @@ impl<'a> Checker<'a> {
                     for (parameter, actual) in parameter_elements.iter().zip(&actual_elements) {
                         self.infer_type_parameters(*parameter, *actual, inference);
                     }
+                }
+            }
+            TypeKind::Union(members) => {
+                if let Some(reference) = self.result.named_type_references.get(&actual).cloned()
+                    && matches!(reference.name.as_str(), "Promise" | "PromiseLike")
+                    && let [payload] = reference.type_arguments.as_slice()
+                    && members
+                        .iter()
+                        .any(|member| self.type_is_promise_like(*member))
+                {
+                    for member in &members {
+                        if matches!(
+                            self.result.types.get(*member).map(|type_| &type_.kind),
+                            Some(TypeKind::TypeParameter { .. })
+                        ) {
+                            self.infer_type_parameters(*member, *payload, inference);
+                        }
+                    }
+                    return;
+                }
+                let scores = members
+                    .iter()
+                    .map(|member| (*member, self.inference_shape_score(*member, actual)))
+                    .collect::<Vec<_>>();
+                let best = scores.iter().map(|(_, score)| *score).max().unwrap_or(0);
+                for (member, score) in scores {
+                    if score == best {
+                        self.infer_type_parameters(member, actual, inference);
+                    }
+                }
+            }
+            TypeKind::Intersection(members) => {
+                for member in members {
+                    self.infer_type_parameters(member, actual, inference);
                 }
             }
             TypeKind::Object(parameter_object) => {
@@ -9127,6 +9274,109 @@ impl<'a> Checker<'a> {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn inference_type_is_uninformative(&self, type_id: TypeId) -> bool {
+        matches!(
+            self.result.types.get(type_id).map(|type_| &type_.kind),
+            Some(TypeKind::Any | TypeKind::Unknown)
+        )
+    }
+
+    fn type_is_promise_like(&self, type_id: TypeId) -> bool {
+        self.result
+            .named_type_references
+            .get(&type_id)
+            .is_some_and(|reference| matches!(reference.name.as_str(), "Promise" | "PromiseLike"))
+            || matches!(
+                self.result.types.get(type_id).map(|type_| &type_.kind),
+                Some(TypeKind::Object(object)) if object.properties.contains_key("then")
+            )
+    }
+
+    fn infer_object_literal_properties(
+        &mut self,
+        parameter: TypeId,
+        argument: NodeId,
+        inference: &mut HashMap<TypeId, TypeId>,
+    ) -> bool {
+        let Some(NodeData::ObjectLiteralExpression(object)) =
+            self.arena.get(argument).map(|node| &node.data)
+        else {
+            return false;
+        };
+        let properties = object.properties.nodes.clone();
+        let Some(context) = self.contextual_object_type(parameter) else {
+            return false;
+        };
+        for property in properties {
+            let Some(NodeData::PropertyAssignment(property)) =
+                self.arena.get(property).map(|node| &node.data)
+            else {
+                continue;
+            };
+            let Some(name) = self.property_name(property.name) else {
+                continue;
+            };
+            let Some(expected) = context.properties.get(&name).copied() else {
+                continue;
+            };
+            let initializer = property.initializer;
+            let contextual = self.substitute_type(expected, inference);
+            self.clear_cached_expression_types(initializer);
+            let actual = self.type_of_expression_context(initializer, Some(contextual));
+            self.infer_type_parameters(expected, actual, inference);
+        }
+        true
+    }
+
+    fn clear_cached_expression_types(&mut self, node: NodeId) {
+        self.result.node_types.remove(&node);
+        if let Some(children) = self.children.get(&node).cloned() {
+            for child in children {
+                self.clear_cached_expression_types(child);
+            }
+        }
+    }
+
+    fn inference_shape_score(&self, parameter: TypeId, actual: TypeId) -> u8 {
+        if let (Some(parameter), Some(actual)) = (
+            self.result.named_type_references.get(&parameter),
+            self.result.named_type_references.get(&actual),
+        ) && parameter.name == actual.name
+        {
+            return 3;
+        }
+        let parameter = self.result.types.get(parameter).map(|type_| &type_.kind);
+        let actual = self.result.types.get(actual).map(|type_| &type_.kind);
+        if matches!(parameter, Some(TypeKind::TypeParameter { .. })) {
+            return 1;
+        }
+        match (parameter, actual) {
+            (Some(TypeKind::Array(_)), Some(TypeKind::Array(_)))
+            | (Some(TypeKind::Tuple(_)), Some(TypeKind::Tuple(_)))
+            | (Some(TypeKind::ReadonlyTuple(_)), Some(TypeKind::ReadonlyTuple(_)))
+            | (Some(TypeKind::Object(_)), Some(TypeKind::Object(_)))
+            | (Some(TypeKind::Function(_)), Some(TypeKind::Function(_)))
+            | (Some(TypeKind::Constructor(_)), Some(TypeKind::Constructor(_)))
+            | (
+                Some(TypeKind::String | TypeKind::StringLiteral(_)),
+                Some(TypeKind::String | TypeKind::StringLiteral(_)),
+            )
+            | (
+                Some(TypeKind::Number | TypeKind::NumberLiteral(_)),
+                Some(TypeKind::Number | TypeKind::NumberLiteral(_)),
+            )
+            | (
+                Some(TypeKind::BigInt | TypeKind::BigIntLiteral(_)),
+                Some(TypeKind::BigInt | TypeKind::BigIntLiteral(_)),
+            )
+            | (
+                Some(TypeKind::Boolean | TypeKind::BooleanLiteral(_)),
+                Some(TypeKind::Boolean | TypeKind::BooleanLiteral(_)),
+            ) => 2,
+            _ => 0,
         }
     }
 
@@ -13195,6 +13445,17 @@ fn paint_exported_named_descriptor_import(
     module_name: &str,
     exports: &BTreeMap<String, TypeDescriptor>,
 ) -> bool {
+    if let TypeDescriptor::Import { reference, target } = descriptor {
+        let exported_root = reference
+            .qualifier
+            .split_once('.')
+            .map_or(reference.qualifier.as_str(), |(root, _)| root);
+        if exports.contains_key(exported_root) {
+            module_name.clone_into(&mut reference.module_specifier);
+            paint_exported_named_descriptor_imports(target, module_name, exports);
+            return true;
+        }
+    }
     if let TypeDescriptor::Named { name, .. } = descriptor {
         let (is_typeof, referenced_name) = name
             .strip_prefix("typeof ")
@@ -13346,6 +13607,36 @@ fn resolve_imported_type_queries(
     }
     visit_descriptor_children(descriptor, |child| {
         resolve_imported_type_queries(child, imports);
+    });
+}
+
+fn rename_descriptor_reference_roots(
+    descriptor: &mut TypeDescriptor,
+    renames: &BTreeMap<String, String>,
+) {
+    let rename = |name: &mut String| {
+        let (prefix, reference) = name
+            .strip_prefix("typeof ")
+            .map_or(("", name.as_str()), |reference| ("typeof ", reference));
+        let (root, suffix) = reference
+            .split_once('.')
+            .map_or((reference, ""), |(root, suffix)| (root, suffix));
+        let Some(replacement) = renames.get(root) else {
+            return;
+        };
+        *name = if suffix.is_empty() {
+            format!("{prefix}{replacement}")
+        } else {
+            format!("{prefix}{replacement}.{suffix}")
+        };
+    };
+    match descriptor {
+        TypeDescriptor::Import { reference, .. } => rename(&mut reference.qualifier),
+        TypeDescriptor::Named { name, .. } => rename(name),
+        _ => {}
+    }
+    visit_descriptor_children(descriptor, |child| {
+        rename_descriptor_reference_roots(child, renames);
     });
 }
 
@@ -13639,18 +13930,34 @@ fn describe_alias(
     checker.type_parameter_scopes.push(parameter_scope);
     let body = checker.type_from_type_node(alias.type_);
     let body = describe_source_type(source, &checker.result, body);
-    let exported_names = source
-        .bindings
-        .exports
-        .iter()
-        .map(|(name, _)| name.to_owned())
-        .collect::<BTreeSet<_>>();
+    let exported_names = exported_reference_names(source);
     let body = describe_type_node_syntax(source, &mut checker, alias.type_, body, &exported_names);
     checker.type_parameter_scopes.pop();
     TypeDescriptor::Alias {
         parameters,
         body: Box::new(body),
     }
+}
+
+fn exported_reference_names(source: &ProgramSource<'_>) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for (exported, symbol) in source.bindings.exports.iter() {
+        names.insert(exported.to_owned());
+        let mut current = symbol;
+        while let Some(target) = source
+            .bindings
+            .symbols
+            .get(current)
+            .and_then(|symbol| symbol.target)
+        {
+            let Some(symbol) = source.bindings.symbols.get(target) else {
+                break;
+            };
+            names.insert(symbol.name.clone());
+            current = target;
+        }
+    }
+    names
 }
 
 fn describe_source_type(
@@ -13762,12 +14069,7 @@ fn describe_explicit_function_value(
     else {
         return descriptor;
     };
-    let exported_names = source
-        .bindings
-        .exports
-        .iter()
-        .map(|(name, _)| name.to_owned())
-        .collect::<BTreeSet<_>>();
+    let exported_names = exported_reference_names(source);
     let mut checker =
         Checker::new(source.arena, source.bindings).with_options(source.checker_options);
     checker.seed_symbol_types();
@@ -14026,7 +14328,7 @@ fn describe_type_node_syntax(
                     target: Box::new(semantic_target),
                 };
             }
-            if qualified || name == "Omit" || exported_names.contains(&name) {
+            if qualified || is_core_library_name(&name) || exported_names.contains(&name) {
                 TypeDescriptor::Named {
                     name,
                     type_arguments,
@@ -14624,13 +14926,9 @@ fn describe_declaration_symbol(
                 let mut checker = Checker::new(source.arena, source.bindings)
                     .with_options(source.checker_options);
                 checker.seed_symbol_types();
-                let mut exported_names = source
-                    .bindings
-                    .exports
-                    .iter()
-                    .map(|(name, _)| name.to_owned())
-                    .collect::<BTreeSet<_>>();
+                let mut exported_names = exported_reference_names(source);
                 let mut type_parameter_scope = HashMap::new();
+                let mut defaults = Vec::new();
                 if let Some(type_parameters) = &declaration.type_parameters {
                     for parameter in &type_parameters.nodes {
                         let NodeData::TypeParameterDeclaration(parameter) =
@@ -14646,7 +14944,24 @@ fn describe_declaration_symbol(
                             name: name.clone(),
                             constraint: None,
                         });
-                        type_parameter_scope.insert(name, type_id);
+                        type_parameter_scope.insert(name.clone(), type_id);
+                        if let Some(default_node) = parameter.default_type {
+                            checker
+                                .type_parameter_scopes
+                                .push(type_parameter_scope.clone());
+                            let default_id = checker.type_from_type_node(default_node);
+                            let default_target =
+                                describe_source_type(source, &checker.result, default_id);
+                            let default = describe_type_node_syntax(
+                                source,
+                                &mut checker,
+                                default_node,
+                                default_target,
+                                &exported_names,
+                            );
+                            checker.type_parameter_scopes.pop();
+                            defaults.push((name, default));
+                        }
                     }
                 }
                 checker.type_parameter_scopes.push(type_parameter_scope);
@@ -14679,6 +14994,17 @@ fn describe_declaration_symbol(
                     );
                 }
                 checker.type_parameter_scopes.pop();
+                for (parameter, default) in defaults {
+                    let replacement = TypeDescriptor::Named {
+                        name: "__default_type_parameter".into(),
+                        type_arguments: vec![default],
+                        target: Box::new(TypeDescriptor::TypeParameter(parameter.clone())),
+                    };
+                    descriptor = substitute_descriptor(
+                        &descriptor,
+                        &BTreeMap::from([(parameter, replacement)]),
+                    );
+                }
             }
             if let Some(declaration) = function_declarations.first()
                 && let Some(type_parameters) = &declaration.type_parameters
@@ -14696,12 +15022,7 @@ fn describe_declaration_symbol(
                 let mut checker = Checker::new(source.arena, source.bindings)
                     .with_options(source.checker_options);
                 checker.seed_symbol_types();
-                let mut exported_names = source
-                    .bindings
-                    .exports
-                    .iter()
-                    .map(|(name, _)| name.to_owned())
-                    .collect::<BTreeSet<_>>();
+                let mut exported_names = exported_reference_names(source);
                 exported_names.extend(type_parameters.nodes.iter().filter_map(|parameter| {
                     let NodeData::TypeParameterDeclaration(parameter) =
                         &source.arena.get(*parameter)?.data
@@ -14860,12 +15181,7 @@ fn describe_declaration_symbol(
                 let mut checker = Checker::new(source.arena, source.bindings)
                     .with_options(source.checker_options);
                 checker.seed_symbol_types();
-                let exported_names = source
-                    .bindings
-                    .exports
-                    .iter()
-                    .map(|(name, _)| name.to_owned())
-                    .collect::<BTreeSet<_>>();
+                let exported_names = exported_reference_names(source);
                 descriptor = describe_type_node_syntax(
                     source,
                     &mut checker,
@@ -14904,12 +15220,7 @@ fn describe_declaration_symbol(
         &arguments,
     );
     let mut body = describe_source_type(source, &checker.result, object);
-    let mut exported_names = source
-        .bindings
-        .exports
-        .iter()
-        .map(|(name, _)| name.to_owned())
-        .collect::<BTreeSet<_>>();
+    let mut exported_names = exported_reference_names(source);
     exported_names.extend(parameters.iter().cloned());
     if let TypeDescriptor::Object { properties, .. } = &mut body {
         for member in &class.members.nodes {
@@ -15056,6 +15367,8 @@ fn is_core_library_name(name: &str) -> bool {
             | "Promise"
             | "PromiseLike"
             | "PromiseConstructor"
+            | "Error"
+            | "ErrorConstructor"
             | "String"
             | "StringConstructor"
             | "ArrayConstructor"
@@ -15955,7 +16268,8 @@ mod tests {
         Checker, CheckerOptions, EnumConstantValue, FunctionType, ImportTypeReference,
         NamedTypeReference, ObjectType, ProgramChecker, ProgramSource, TypeArena, TypeDescriptor,
         TypeKind, check_program, check_source_file, check_source_file_with_options,
-        describe_type_with_imports_bounded, identifier_text, rebase_module_specifier,
+        describe_type_with_imports_bounded, identifier_text,
+        paint_exported_named_descriptor_imports, rebase_module_specifier,
         rebase_module_specifier_between_files,
     };
 
@@ -20111,6 +20425,100 @@ mod tests {
     }
 
     #[test]
+    fn preserves_public_return_alias_through_reexported_generic_calls() {
+        let implementation = parse_source_file(concat!(
+            "type Result<T, E> = { data: T; error: E };\n",
+            "type Box<T> = { value: T };\n",
+            "declare function create<T, E = string, D = T>(options: { queryFn: () => T | Box<T>; select: (value: T) => D } & { tag?: string }): Result<D, E>;\n",
+            "export { type Result as b, type Box as x, create as u };\n",
+        ));
+        let entry = parse_source_file(
+            "export { type b as Result, type x as Box, u as create } from './implementation';\n",
+        );
+        let consumer = parse_source_file(concat!(
+            "import { create, type Box } from 'pkg';\n",
+            "declare const box: Box<number>;\n",
+            "declare const boxFn: () => Box<number>;\n",
+            "export const read = () => create({ queryFn: boxFn, select: value => value });\n",
+        ));
+        let implementation_bindings =
+            bind_source_file(&implementation.arena, implementation.source_file);
+        let entry_bindings = bind_source_file(&entry.arena, entry.source_file);
+        let consumer_bindings = bind_source_file(&consumer.arena, consumer.source_file);
+        let no_modules = BTreeMap::new();
+        let entry_modules = BTreeMap::from([("./implementation".into(), 0)]);
+        let consumer_modules = BTreeMap::from([("pkg".into(), 1)]);
+        let checked = check_program(&[
+            ProgramSource {
+                arena: &implementation.arena,
+                source_file: implementation.source_file,
+                bindings: &implementation_bindings,
+                resolved_modules: &no_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+            ProgramSource {
+                arena: &entry.arena,
+                source_file: entry.source_file,
+                bindings: &entry_bindings,
+                resolved_modules: &entry_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+            ProgramSource {
+                arena: &consumer.arena,
+                source_file: consumer.source_file,
+                bindings: &consumer_bindings,
+                resolved_modules: &consumer_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+        ]);
+        let read = consumer_bindings
+            .root_scope()
+            .unwrap()
+            .symbols
+            .get("read")
+            .unwrap();
+        let read_type = checked.files[2].type_of_symbol(read).unwrap();
+        let TypeKind::Function(read) = &checked.files[2].types.get(read_type).unwrap().kind else {
+            panic!("expected function type");
+        };
+        assert_eq!(
+            checked.files[2]
+                .import_type_references
+                .get(&read.return_type),
+            Some(&ImportTypeReference {
+                module_specifier: "pkg".into(),
+                qualifier: "Result".into(),
+                is_typeof: false,
+            }),
+            "return type: {}; named reference: {:?}; imports: {:?}",
+            checked.files[2].types.display(read.return_type),
+            checked.files[2]
+                .named_type_references
+                .get(&read.return_type),
+            checked.files[2].import_type_references,
+        );
+        let reference = checked.files[2]
+            .named_type_references
+            .get(&read.return_type)
+            .expect("public return alias should retain its type arguments");
+        assert_eq!(reference.name, "Result");
+        assert_eq!(
+            reference
+                .type_arguments
+                .iter()
+                .map(|argument| checked.files[2].types.display(*argument))
+                .collect::<Vec<_>>(),
+            ["number", "string"],
+        );
+    }
+
+    #[test]
     fn rebases_nested_relative_imports_through_package_specifiers() {
         assert_eq!(
             rebase_module_specifier("@scope/core/utils", "./SvgIcon"),
@@ -20130,6 +20538,24 @@ mod tests {
             ),
             "../projA"
         );
+    }
+
+    #[test]
+    fn public_reexports_repaint_nested_import_references() {
+        let mut descriptor = TypeDescriptor::Import {
+            reference: ImportTypeReference {
+                module_specifier: "some-dep/other".into(),
+                qualifier: "marker".into(),
+                is_typeof: true,
+            },
+            target: Box::new(TypeDescriptor::Unknown),
+        };
+        let exports = BTreeMap::from([("marker".into(), TypeDescriptor::Unknown)]);
+        paint_exported_named_descriptor_imports(&mut descriptor, "some-dep", &exports);
+        let TypeDescriptor::Import { reference, .. } = descriptor else {
+            panic!("expected import descriptor");
+        };
+        assert_eq!(reference.module_specifier, "some-dep");
     }
 
     #[test]

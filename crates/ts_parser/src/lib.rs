@@ -3589,6 +3589,14 @@ impl<'a> Parser<'a> {
             NodeData::Token(Box::new(TokenData)),
             &[],
         );
+        let is_type_only = self.current.kind == SyntaxKind::TypeKeyword
+            && matches!(
+                self.next_token_kind(),
+                SyntaxKind::OpenBraceToken | SyntaxKind::AsteriskToken
+            );
+        if is_type_only {
+            self.bump();
+        }
         if matches!(
             self.current.kind,
             SyntaxKind::FunctionKeyword
@@ -3747,7 +3755,7 @@ impl<'a> Parser<'a> {
                 attributes,
                 export_clause,
                 flow_node: None,
-                is_type_only: false,
+                is_type_only,
                 module_specifier,
                 symbol: None,
                 facts: 0,
@@ -3771,6 +3779,14 @@ impl<'a> Parser<'a> {
             && self.current.kind != SyntaxKind::EndOfFile
         {
             let specifier_start = self.current.range.start;
+            let is_type_only = self.current.kind == SyntaxKind::TypeKeyword
+                && !matches!(
+                    self.next_token_kind(),
+                    SyntaxKind::AsKeyword | SyntaxKind::CommaToken | SyntaxKind::CloseBraceToken
+                );
+            if is_type_only {
+                self.bump();
+            }
             let first = self.parse_module_export_name("Expected an export name.");
             let (property_name, name) = if self.current.kind == SyntaxKind::AsKeyword {
                 self.bump();
@@ -3787,7 +3803,7 @@ impl<'a> Parser<'a> {
                 SyntaxKind::ExportSpecifier,
                 TextRange::new(specifier_start, self.node_end(name)),
                 NodeData::ExportSpecifier(Box::new(ExportSpecifierData {
-                    is_type_only: false,
+                    is_type_only,
                     local_symbol: None,
                     property_name,
                     symbol: None,
@@ -8878,6 +8894,83 @@ mod tests {
                 (SyntaxKind::StringLiteral, SyntaxKind::Identifier),
             ]
         );
+    }
+
+    #[test]
+    fn parses_type_only_export_declarations_and_specifiers() {
+        let result = parse_source_file(concat!(
+            "export { type Foo, type as renamed, type };\n",
+            "export type { Foo, Bar as Baz } from './mod';\n",
+        ));
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let statements = source_statements(&result);
+        assert_eq!(statements.len(), 2);
+
+        let NodeData::ExportDeclaration(inline) = &result.arena.get(statements[0]).unwrap().data
+        else {
+            panic!("expected export declaration");
+        };
+        assert!(!inline.is_type_only);
+        let NodeData::NamedExports(inline_exports) = &result
+            .arena
+            .get(inline.export_clause.unwrap())
+            .unwrap()
+            .data
+        else {
+            panic!("expected named exports");
+        };
+        let identifier = |id| {
+            let NodeData::Identifier(identifier) = &result.arena.get(id).unwrap().data else {
+                panic!("expected identifier");
+            };
+            identifier.text.clone()
+        };
+        let inline_specifiers = inline_exports
+            .elements
+            .nodes
+            .iter()
+            .map(|specifier| {
+                let NodeData::ExportSpecifier(specifier) =
+                    &result.arena.get(*specifier).unwrap().data
+                else {
+                    panic!("expected export specifier");
+                };
+                (
+                    specifier.is_type_only,
+                    specifier.property_name.map(&identifier),
+                    identifier(specifier.name),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            inline_specifiers,
+            [
+                (true, None, "Foo".into()),
+                (false, Some("type".into()), "renamed".into()),
+                (false, None, "type".into()),
+            ]
+        );
+
+        let NodeData::ExportDeclaration(declaration) =
+            &result.arena.get(statements[1]).unwrap().data
+        else {
+            panic!("expected export declaration");
+        };
+        assert!(declaration.is_type_only);
+        let NodeData::NamedExports(exports) = &result
+            .arena
+            .get(declaration.export_clause.unwrap())
+            .unwrap()
+            .data
+        else {
+            panic!("expected named exports");
+        };
+        assert!(exports.elements.nodes.iter().all(|specifier| {
+            matches!(
+                &result.arena.get(*specifier).unwrap().data,
+                NodeData::ExportSpecifier(specifier) if !specifier.is_type_only
+            )
+        }));
     }
 
     #[test]
