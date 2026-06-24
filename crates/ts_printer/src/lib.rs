@@ -2906,6 +2906,21 @@ struct DeclarationPrinter<'a> {
     jsdoc_typedefs_emitted: bool,
 }
 
+#[derive(Clone)]
+struct JsDocOverloadParameter {
+    name: String,
+    type_text: String,
+    optional: bool,
+}
+
+#[derive(Clone)]
+struct JsDocOverload {
+    comment: String,
+    type_parameters: Vec<String>,
+    parameters: Vec<JsDocOverloadParameter>,
+    return_type: String,
+}
+
 impl DeclarationPrinter<'_> {
     fn node(&self, id: NodeId) -> Result<&Node, EmitError> {
         self.arena.get(id).ok_or(EmitError {
@@ -3955,6 +3970,18 @@ impl DeclarationPrinter<'_> {
             self.writer.newline();
             self.emit_jsdoc_typedefs();
         }
+        if self.javascript_source
+            && self.emit_javascript_overload_statement(
+                id,
+                &node,
+                in_namespace,
+                namespace_export,
+                exported,
+            )?
+        {
+            self.writer.newline();
+            return Ok(());
+        }
         if !matches!(&node.data, NodeData::ExpressionStatement(statement)
             if self.is_javascript_commonjs_declaration_assignment(statement.expression))
         {
@@ -4130,6 +4157,14 @@ impl DeclarationPrinter<'_> {
                         self.writer.write(";");
                     }
                 }
+                if self.javascript_source
+                    && let Some(name) = data.name
+                {
+                    self.emit_javascript_prototype_overload_class(
+                        name,
+                        exported && !synthesized_default_namespace,
+                    )?;
+                }
             }
             NodeData::ClassDeclaration(data) => {
                 let syntactic_base = self.syntactic_curried_class_base(data);
@@ -4196,6 +4231,9 @@ impl DeclarationPrinter<'_> {
                     self.emit_name(name)?;
                 }
                 self.emit_type_parameters(data.type_parameters.as_ref())?;
+                if self.javascript_source && data.type_parameters.is_none() {
+                    self.emit_jsdoc_template_parameters(id);
+                }
                 if let Some((name, _, _, _)) = &syntactic_base {
                     self.writer.write(" extends ");
                     self.writer.write(name);
@@ -12188,6 +12226,374 @@ impl DeclarationPrinter<'_> {
         )
     }
 
+    fn emit_javascript_overload_statement(
+        &mut self,
+        id: NodeId,
+        node: &Node,
+        in_namespace: bool,
+        namespace_export: bool,
+        exported: bool,
+    ) -> Result<bool, EmitError> {
+        let (name, variable_function) = match &node.data {
+            NodeData::FunctionDeclaration(function) => (function.name, false),
+            NodeData::VariableStatement(statement) => {
+                let Some(NodeData::VariableDeclarationList(list)) = self
+                    .arena
+                    .get(statement.declaration_list)
+                    .map(|node| &node.data)
+                else {
+                    return Ok(false);
+                };
+                let [declaration] = list.declarations.nodes.as_slice() else {
+                    return Ok(false);
+                };
+                let Some(NodeData::VariableDeclaration(variable)) =
+                    self.arena.get(*declaration).map(|node| &node.data)
+                else {
+                    return Ok(false);
+                };
+                if !variable.initializer.is_some_and(|initializer| {
+                    matches!(
+                        self.arena.get(initializer).map(|node| &node.data),
+                        Some(NodeData::ArrowFunction(_) | NodeData::FunctionExpression(_))
+                    )
+                }) {
+                    return Ok(false);
+                }
+                (Some(variable.name), true)
+            }
+            _ => return Ok(false),
+        };
+        let Some(name) = name else {
+            return Ok(false);
+        };
+        let mut overloads = self.jsdoc_overloads(id);
+        if overloads.is_empty()
+            && variable_function
+            && let Some(signature) = self.jsdoc_function_signature(id)
+            && !signature.type_parameters.is_empty()
+        {
+            overloads.push(signature);
+        }
+        if overloads.is_empty() {
+            return Ok(false);
+        }
+        for (index, overload) in overloads.iter().enumerate() {
+            if index != 0 {
+                self.writer.newline();
+            }
+            self.emit_jsdoc_comment_text(&overload.comment);
+            if !in_namespace {
+                self.emit_declaration_prefix(node, !(self.javascript_source && exported));
+            } else if namespace_export {
+                self.writer.write("export ");
+            }
+            self.writer.write("function ");
+            self.emit_name(name)?;
+            self.emit_jsdoc_overload_signature_tail(overload);
+            self.writer.write(";");
+        }
+        Ok(true)
+    }
+
+    fn emit_javascript_method_overloads(
+        &mut self,
+        id: NodeId,
+        method: &ts_ast::MethodDeclarationData,
+    ) -> Result<bool, EmitError> {
+        let overloads = self.jsdoc_overloads(id);
+        if overloads.is_empty() {
+            return Ok(false);
+        }
+        for overload in &overloads {
+            self.emit_jsdoc_comment_text(&overload.comment);
+            self.emit_declaration_member_modifiers(method.modifiers.as_ref());
+            self.emit_name(method.name)?;
+            self.emit_jsdoc_overload_signature_tail(overload);
+            self.writer.write(";");
+            self.writer.newline();
+        }
+        Ok(true)
+    }
+
+    fn emit_javascript_prototype_overload_class(
+        &mut self,
+        function_name: NodeId,
+        exported: bool,
+    ) -> Result<(), EmitError> {
+        let Some(function_name_text) = declaration_name_text(self.arena, function_name) else {
+            return Ok(());
+        };
+        let mut methods = self
+            .arena
+            .iter()
+            .filter_map(|(statement_id, node)| {
+                let NodeData::ExpressionStatement(statement) = &node.data else {
+                    return None;
+                };
+                let NodeData::BinaryExpression(assignment) =
+                    &self.arena.get(statement.expression)?.data
+                else {
+                    return None;
+                };
+                if self.arena.get(assignment.operator_token)?.kind != SyntaxKind::EqualsToken {
+                    return None;
+                }
+                let NodeData::PropertyAccessExpression(method) =
+                    &self.arena.get(assignment.left)?.data
+                else {
+                    return None;
+                };
+                let NodeData::PropertyAccessExpression(prototype) =
+                    &self.arena.get(method.expression)?.data
+                else {
+                    return None;
+                };
+                if declaration_name_text(self.arena, prototype.expression)
+                    != Some(function_name_text)
+                    || declaration_name_text(self.arena, prototype.name) != Some("prototype")
+                {
+                    return None;
+                }
+                let overloads = self.jsdoc_overloads(statement_id);
+                if overloads.is_empty() {
+                    return None;
+                }
+                let method_name =
+                    declaration_name_text(self.arena, method.name)?.to_owned();
+                Some((node.range.start, method_name, overloads))
+            })
+            .collect::<Vec<_>>();
+        if methods.is_empty() {
+            return Ok(());
+        }
+        methods.sort_by_key(|(start, _, _)| *start);
+        self.writer.newline();
+        self.writer.write(if exported { "export class " } else { "declare class " });
+        self.emit_name(function_name)?;
+        self.writer.write(" {");
+        self.writer.newline();
+        self.writer.indent += 1;
+        for (_, method_name, overloads) in methods {
+            for overload in overloads {
+                self.emit_jsdoc_comment_text(&overload.comment);
+                self.emit_semantic_property_name(&method_name);
+                self.emit_jsdoc_overload_signature_tail(&overload);
+                self.writer.write(";");
+                self.writer.newline();
+            }
+        }
+        self.writer.indent -= 1;
+        self.writer.write("}");
+        Ok(())
+    }
+
+    fn emit_jsdoc_template_parameters(&mut self, node: NodeId) {
+        let parameters = self
+            .leading_jsdoc_comments(node)
+            .into_iter()
+            .flat_map(|(_, comment)| Self::jsdoc_template_names(&comment))
+            .collect::<Vec<_>>();
+        if parameters.is_empty() {
+            return;
+        }
+        self.writer.write("<");
+        self.writer.write(&parameters.join(", "));
+        self.writer.write(">");
+    }
+
+    fn emit_jsdoc_overload_signature_tail(&mut self, overload: &JsDocOverload) {
+        if !overload.type_parameters.is_empty() {
+            self.writer.write("<");
+            self.writer.write(&overload.type_parameters.join(", "));
+            self.writer.write(">");
+        }
+        self.writer.write("(");
+        for (index, parameter) in overload.parameters.iter().enumerate() {
+            if index != 0 {
+                self.writer.write(", ");
+            }
+            self.emit_semantic_property_name(&parameter.name);
+            if parameter.optional {
+                self.writer.write("?");
+            }
+            self.writer.write(": ");
+            self.emit_jsdoc_overload_type(&parameter.type_text);
+            if parameter.optional && !parameter.type_text.contains("undefined") {
+                self.writer.write(" | undefined");
+            }
+        }
+        self.writer.write("): ");
+        self.emit_jsdoc_overload_type(&overload.return_type);
+    }
+
+    fn emit_jsdoc_overload_type(&mut self, type_text: &str) {
+        let type_text = type_text.trim();
+        if let Some(literal) = type_text
+            .strip_prefix('\'')
+            .and_then(|text| text.strip_suffix('\''))
+        {
+            write_quoted(&mut self.writer, literal);
+        } else {
+            self.emit_jsdoc_type_hint(type_text);
+        }
+    }
+
+    fn emit_jsdoc_comment_text(&mut self, comment: &str) {
+        if self.remove_comments {
+            return;
+        }
+        for (index, line) in comment.lines().enumerate() {
+            let line = line.trim();
+            if index != 0 && line.starts_with('*') {
+                self.writer.write(" ");
+            }
+            self.writer.write(line);
+            self.writer.newline();
+        }
+    }
+
+    fn jsdoc_overloads(&self, node: NodeId) -> Vec<JsDocOverload> {
+        let mut overloads = Vec::new();
+        for (_, comment) in self.leading_jsdoc_comments(node) {
+            let starts = comment
+                .match_indices("@overload")
+                .map(|(start, _)| start)
+                .collect::<Vec<_>>();
+            if starts.is_empty() {
+                continue;
+            }
+            let type_parameters = Self::jsdoc_template_names(&comment);
+            for (index, start) in starts.iter().enumerate() {
+                let start = start + "@overload".len();
+                let end = starts.get(index + 1).copied().unwrap_or(comment.len());
+                let segment = &comment[start..end];
+                let mut parameters = Vec::new();
+                let mut return_type = None;
+                let mut saw_tag = false;
+                for line in segment.lines() {
+                    let tag = Self::jsdoc_tag_line(line);
+                    if tag.is_empty() {
+                        if saw_tag {
+                            break;
+                        }
+                        continue;
+                    }
+                    if let Some(parameter) = Self::jsdoc_overload_parameter(tag) {
+                        parameters.push(parameter);
+                        saw_tag = true;
+                    } else if let Some(type_text) = Self::jsdoc_return_type(tag) {
+                        return_type = Some(type_text);
+                        saw_tag = true;
+                    }
+                }
+                overloads.push(JsDocOverload {
+                    comment: comment.clone(),
+                    type_parameters: type_parameters.clone(),
+                    parameters,
+                    return_type: return_type.unwrap_or_else(|| "any".to_owned()),
+                });
+            }
+        }
+        overloads
+    }
+
+    fn jsdoc_function_signature(&self, node: NodeId) -> Option<JsDocOverload> {
+        let (_, comment) = self.leading_jsdoc_comments(node).into_iter().next_back()?;
+        let type_parameters = Self::jsdoc_template_names(&comment);
+        let parameters = comment
+            .lines()
+            .filter_map(|line| Self::jsdoc_overload_parameter(Self::jsdoc_tag_line(line)))
+            .collect::<Vec<_>>();
+        let return_type = comment
+            .lines()
+            .find_map(|line| Self::jsdoc_return_type(Self::jsdoc_tag_line(line)))
+            .unwrap_or_else(|| "any".to_owned());
+        Some(JsDocOverload {
+            comment,
+            type_parameters,
+            parameters,
+            return_type,
+        })
+    }
+
+    fn jsdoc_template_names(comment: &str) -> Vec<String> {
+        comment
+            .lines()
+            .filter_map(|line| {
+                let tag = Self::jsdoc_tag_line(line).strip_prefix("@template")?.trim();
+                let tag = if tag.starts_with('{') {
+                    let (_, rest) = Self::jsdoc_braced_type(tag)?;
+                    rest
+                } else {
+                    tag
+                };
+                Some(
+                    tag.split([',', ' ', '\t'])
+                        .filter(|name| !name.is_empty())
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .flatten()
+            .collect()
+    }
+
+    fn jsdoc_overload_parameter(tag: &str) -> Option<JsDocOverloadParameter> {
+        let tag = tag.strip_prefix("@param")?.trim();
+        let (type_text, rest) = Self::jsdoc_braced_type(tag)?;
+        let raw_name = rest.split_whitespace().next()?;
+        let optional = raw_name.starts_with('[');
+        let name = raw_name
+            .trim_matches(['[', ']'])
+            .split_once('=')
+            .map_or_else(
+                || raw_name.trim_matches(['[', ']']),
+                |(name, _)| name,
+            )
+            .to_owned();
+        Some(JsDocOverloadParameter {
+            name,
+            type_text: type_text.to_owned(),
+            optional,
+        })
+    }
+
+    fn jsdoc_return_type(tag: &str) -> Option<String> {
+        let tag = tag
+            .strip_prefix("@returns")
+            .or_else(|| tag.strip_prefix("@return"))?
+            .trim();
+        let (type_text, _) = Self::jsdoc_braced_type(tag)?;
+        Some(type_text.to_owned())
+    }
+
+    fn jsdoc_braced_type(text: &str) -> Option<(&str, &str)> {
+        let text = text.strip_prefix('{')?;
+        let mut depth = 1_u32;
+        let end = text.char_indices().find_map(|(index, character)| match character {
+            '{' => {
+                depth += 1;
+                None
+            }
+            '}' => {
+                depth = depth.saturating_sub(1);
+                (depth == 0).then_some(index)
+            }
+            _ => None,
+        })?;
+        Some((text[..end].trim(), text[end + 1..].trim()))
+    }
+
+    fn jsdoc_tag_line(line: &str) -> &str {
+        line.trim()
+            .trim_start_matches("/**")
+            .trim_start_matches('*')
+            .trim()
+            .trim_end_matches("*/")
+            .trim()
+    }
+
     fn leading_jsdoc_comment(&self, node: NodeId) -> Option<&str> {
         let start = usize::try_from(self.arena.get(node)?.range.start.get()).ok()?;
         let prefix = self.source_text.get(..start)?.trim_end();
@@ -13132,6 +13538,12 @@ impl DeclarationPrinter<'_> {
     #[allow(clippy::too_many_lines)]
     fn emit_member(&mut self, id: NodeId) -> Result<(), EmitError> {
         let node = self.node(id)?.clone();
+        if self.javascript_source
+            && let NodeData::MethodDeclaration(method) = &node.data
+            && self.emit_javascript_method_overloads(id, method)?
+        {
+            return Ok(());
+        }
         self.emit_leading_jsdoc(id);
         match &node.data {
             NodeData::PropertyDeclaration(data) => {
@@ -13946,6 +14358,10 @@ impl DeclarationPrinter<'_> {
             let mut jsdoc_optional = false;
             if let Some(hint) = self.jsdoc_type_hint(assignment) {
                 self.writer.write(&hint);
+            } else if let Some(hint) =
+                self.javascript_assignment_parameter_hint(assignment, member_id)
+            {
+                self.emit_jsdoc_type_hint(&hint);
             } else if let Some((hint, optional)) = self.jsdoc_typedef_property_hint(&name) {
                 let constructed = matches!(
                     self.arena.get(assignment).map(|node| &node.data),
@@ -13973,6 +14389,17 @@ impl DeclarationPrinter<'_> {
             self.writer.newline();
         }
         Ok(())
+    }
+
+    fn javascript_assignment_parameter_hint(
+        &self,
+        assignment: NodeId,
+        member: NodeId,
+    ) -> Option<String> {
+        let NodeData::BinaryExpression(assignment) = &self.arena.get(assignment)?.data else {
+            return None;
+        };
+        self.jsdoc_parameter_type_hint(member, assignment.right)
     }
 
     fn javascript_instance_property_is_declarable(name: &str) -> bool {
@@ -46983,6 +47410,12 @@ impl Printer<'_> {
                     if data.question_dot_token.is_some() {
                         self.writer.write("?.");
                     }
+                    if self.source_is_javascript_input()
+                        && let Some(type_arguments) = &data.type_arguments
+                    {
+                        self.emit_javascript_type_arguments_as_operators(type_arguments)?;
+                        self.writer.write(" ");
+                    }
                     self.writer.write("(");
                     self.emit_expression_list(&data.arguments)?;
                     self.writer.write(")");
@@ -47168,7 +47601,17 @@ impl Printer<'_> {
                 self.emit_expression(data.expression, parent_precedence)?;
             }
             NodeData::TypeAssertion(data) => {
+                if self.source_is_javascript_input() {
+                    self.writer.write("<");
+                    self.emit_javascript_type_source(data.type_)?;
+                    self.writer.write(">");
+                }
                 self.emit_expression(data.expression, parent_precedence)?;
+                if self.source_is_javascript_input() && self.settings.jsx == JsxEmit::None {
+                    self.writer.write(";");
+                    self.writer.newline();
+                    self.writer.write("</>");
+                }
             }
             NodeData::NewExpression(data) => {
                 if self.settings.target < ScriptTarget::Es2015
@@ -47891,6 +48334,11 @@ impl Printer<'_> {
                     self.emit_downlevel_tagged_template(id, data)?;
                 } else {
                     self.emit_expression(data.tag, 18)?;
+                    if self.source_is_javascript_input()
+                        && let Some(type_arguments) = &data.type_arguments
+                    {
+                        self.emit_javascript_type_arguments_as_operators(type_arguments)?;
+                    }
                     if data.question_dot_token.is_some() {
                         self.writer.write("?.");
                     } else {
@@ -47904,6 +48352,37 @@ impl Printer<'_> {
             NodeData::JsxFragment(data) => self.emit_jsx_fragment(data)?,
             _ => return Err(Self::unsupported(id, node.kind)),
         }
+        Ok(())
+    }
+
+    fn source_is_javascript_input(&self) -> bool {
+        let source_name = self.source_name.to_ascii_lowercase();
+        [".js", ".jsx", ".mjs", ".cjs"]
+            .iter()
+            .any(|extension| source_name.ends_with(extension))
+    }
+
+    fn emit_javascript_type_arguments_as_operators(
+        &mut self,
+        arguments: &NodeList,
+    ) -> Result<(), EmitError> {
+        self.writer.write(" < ");
+        for (index, argument) in arguments.nodes.iter().enumerate() {
+            if index != 0 {
+                self.writer.write(", ");
+            }
+            self.emit_javascript_type_source(*argument)?;
+        }
+        self.writer.write(" >");
+        Ok(())
+    }
+
+    fn emit_javascript_type_source(&mut self, type_node: NodeId) -> Result<(), EmitError> {
+        let node = self.node(type_node)?;
+        let start = usize::try_from(node.range.start.get()).unwrap_or(usize::MAX);
+        let end = usize::try_from(node.range.end.get()).unwrap_or(usize::MAX);
+        let text = self.source_text.get(start..end).unwrap_or("any").trim();
+        self.writer.write(text);
         Ok(())
     }
 
@@ -48047,6 +48526,16 @@ impl Printer<'_> {
             self.writer.write("<");
             self.emit_expression(opening.tag_name, 0)?;
             self.emit_jsx_attributes(opening.attributes, true)?;
+            if self.source_is_javascript_input()
+                && let Some(type_arguments) = &opening.type_arguments
+            {
+                self.writer.write(" />");
+                for argument in &type_arguments.nodes {
+                    self.writer.write(", <");
+                    self.emit_javascript_type_source(*argument)?;
+                    self.writer.write(">");
+                }
+            }
             self.writer.write(">");
             for child in &data.children.nodes {
                 self.emit_jsx_child(*child, true)?;
@@ -48087,12 +48576,30 @@ impl Printer<'_> {
             self.writer.write("<");
             self.emit_expression(data.tag_name, 0)?;
             self.emit_jsx_attributes(data.attributes, true)?;
-            self.writer
-                .write(if self.settings.jsx == JsxEmit::Preserve {
+            let recovered_type_arguments = self.source_is_javascript_input()
+                && data.type_arguments.is_some();
+            if recovered_type_arguments
+                && let Some(type_arguments) = &data.type_arguments
+            {
+                self.writer.write(" />");
+                for argument in &type_arguments.nodes {
+                    self.writer.write(", <");
+                    self.emit_javascript_type_source(*argument)?;
+                    self.writer.write(">");
+                }
+            }
+            self.writer.write(if recovered_type_arguments
+                || self.settings.jsx == JsxEmit::Preserve
+            {
                     "/>"
                 } else {
                     " />"
                 });
+            if recovered_type_arguments && self.settings.jsx == JsxEmit::None {
+                self.writer.write(";");
+                self.writer.newline();
+                self.writer.write("</>");
+            }
             return Ok(());
         }
         if self.settings.jsx == JsxEmit::React {

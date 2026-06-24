@@ -796,7 +796,18 @@ impl Program {
             self.case_sensitivity,
         );
 
-        if settings.emit_javascript {
+        let javascript_output_overwrites_input = paths
+            .javascript
+            .as_deref()
+            .is_some_and(|file_name| self.output_overwrites_input(file_name));
+        if javascript_output_overwrites_input
+            && let Some(file_name) = paths.javascript.as_deref()
+        {
+            output
+                .diagnostics
+                .push(output_overwrites_input_diagnostic(file_name));
+        }
+        if settings.emit_javascript && !javascript_output_overwrites_input {
             let mut code = String::new();
             let mut map_builder = settings.source_map.then(SourceMapBuilder::new);
             let mut map_sources = Vec::new();
