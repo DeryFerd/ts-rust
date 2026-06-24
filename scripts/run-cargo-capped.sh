@@ -8,6 +8,10 @@ repo_root="$(cd -- "${script_dir}/.." && pwd)"
 # build/test worker keeps separate rustc and test processes from multiplying
 # that limit across this repository.
 max_memory_limit_kib=1048576
+# LLVM reserves substantially more address space than it commits as resident
+# memory. Keep that reservation bounded without making it compete with the
+# cgroup's stricter 1 GiB aggregate RAM limit.
+max_virtual_memory_limit_kib=4194304
 memory_limit_kib="${TS_CARGO_MEMORY_LIMIT_KIB:-$max_memory_limit_kib}"
 if [[ ! "$memory_limit_kib" =~ ^[1-9][0-9]*$ ]]; then
   echo "TS_CARGO_MEMORY_LIMIT_KIB must be a positive integer" >&2
@@ -33,7 +37,8 @@ fi
 exec 9>"${TMPDIR:-/tmp}/ts-rust-cargo-${lock_id}.lock"
 flock 9
 
-ulimit -v "$memory_limit_kib"
+ulimit -v "$max_virtual_memory_limit_kib"
+ulimit -c 0
 export CARGO_BUILD_JOBS=1
 export CARGO_INCREMENTAL=0
 export RUST_TEST_THREADS=1

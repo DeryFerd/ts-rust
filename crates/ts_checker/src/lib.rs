@@ -1394,7 +1394,7 @@ impl<'a> ProgramChecker<'a> {
                 let specifier = string_literal_text(source.arena, export.module_specifier?)?;
                 let target = source.resolved_modules.get(specifier).copied()?;
                 let Some(clause) = export.export_clause else {
-                    return Some(self.module_has_runtime_export(target, &mut HashSet::new()));
+                    return Some(true);
                 };
                 let NodeData::NamedExports(named) = &source.arena.get(clause)?.data else {
                     return Some(true);
@@ -1906,7 +1906,8 @@ impl<'a> ProgramChecker<'a> {
         else {
             return (symbols, import_references, diagnostics, runtime_meanings);
         };
-        runtime_meanings = self.collect_import_runtime_meanings(source, &file.statements.nodes);
+        runtime_meanings =
+            self.collect_import_runtime_meanings(source_index, source, &file.statements.nodes);
         for statement in &file.statements.nodes {
             if let Some(NodeData::ImportEqualsDeclaration(import)) =
                 source.arena.get(*statement).map(|node| &node.data)
@@ -2148,6 +2149,7 @@ impl<'a> ProgramChecker<'a> {
 
     fn collect_import_runtime_meanings(
         &self,
+        source_index: usize,
         source: &ProgramSource<'_>,
         statements: &[NodeId],
     ) -> BTreeMap<NodeId, bool> {
@@ -2170,7 +2172,7 @@ impl<'a> ProgramChecker<'a> {
             };
             for specifier in &exports.elements.nodes {
                 if let Some(meaning) =
-                    self.export_specifier_runtime_meaning(source, export, *specifier)
+                    self.export_specifier_runtime_meaning(source_index, source, export, *specifier)
                 {
                     meanings.insert(*specifier, meaning);
                 }
@@ -2181,6 +2183,7 @@ impl<'a> ProgramChecker<'a> {
 
     fn export_specifier_runtime_meaning(
         &self,
+        source_index: usize,
         source: &ProgramSource<'_>,
         export: &ts_ast::ExportDeclarationData,
         specifier: NodeId,
@@ -2193,6 +2196,43 @@ impl<'a> ProgramChecker<'a> {
         };
         if specifier.is_type_only {
             return Some(false);
+        }
+        if export.module_specifier.is_none() {
+            let local = specifier.property_name.unwrap_or(specifier.name);
+            let name = module_export_name_text(source.arena, local)?;
+            if let Some(symbol) = source.bindings.resolve_name_at(local, name)
+                && source.bindings.symbols.get(symbol).is_some_and(|symbol| {
+                    symbol.declarations.iter().any(|declaration| {
+                        !matches!(
+                            source.arena.get(*declaration).map(|node| &node.data),
+                            Some(NodeData::ExportSpecifier(_))
+                        )
+                    })
+                })
+            {
+                return Some(self.symbol_has_runtime_value(
+                    source_index,
+                    symbol,
+                    &mut HashSet::new(),
+                ));
+            }
+            let mut found = false;
+            let runtime = self
+                .sources
+                .iter()
+                .enumerate()
+                .filter(|(_, candidate)| !is_external_module(candidate))
+                .filter_map(|(candidate_index, candidate)| {
+                    let symbol = candidate.bindings.root_scope()?.symbols.get(name)?;
+                    found = true;
+                    Some(self.symbol_has_runtime_value(
+                        candidate_index,
+                        symbol,
+                        &mut HashSet::new(),
+                    ))
+                })
+                .any(|runtime| runtime);
+            return found.then_some(runtime);
         }
         let module = string_literal_text(source.arena, export.module_specifier?)?;
         let target = source.resolved_modules.get(module).copied()?;
@@ -14137,20 +14177,6 @@ impl<'a> DeclarationReachability<'a> {
     #[allow(clippy::too_many_lines)]
     fn trace_dependencies(&mut self) {
         while let Some(declaration) = self.pending.pop_front() {
-            if let Some(owner) = self
-                .arena
-                .get(declaration)
-                .and_then(|node| node.parent)
-                .and_then(|scope| self.declaration_statement(scope))
-                && !self
-                    .arena
-                    .get(owner)
-                    .and_then(|node| node.parent)
-                    .and_then(|scope| self.retained.get(&scope))
-                    .is_some_and(|retained| retained.contains(&owner))
-            {
-                continue;
-            }
             let mut stack = vec![declaration];
             while let Some(node_id) = stack.pop() {
                 let Some(node) = self.arena.get(node_id) else {
