@@ -485,6 +485,8 @@ impl Program {
                         && !self.options.verbatim_module_syntax,
                     emit_decorator_metadata: self.options.emit_decorator_metadata,
                     strict_null_checks: self.options.strict_null_checks,
+                    jsx_factory: self.options.jsx_factory.as_deref(),
+                    downlevel_iteration: self.options.downlevel_iteration,
                     module_detection: self.options.module_detection,
                 };
                 match emit_source_file_with_context(
@@ -696,6 +698,8 @@ impl Program {
                         && !self.options.verbatim_module_syntax,
                     emit_decorator_metadata: self.options.emit_decorator_metadata,
                     strict_null_checks: self.options.strict_null_checks,
+                    jsx_factory: self.options.jsx_factory.as_deref(),
+                    downlevel_iteration: self.options.downlevel_iteration,
                     module_detection: self.options.module_detection,
                 };
                 match emit_source_file_with_context(

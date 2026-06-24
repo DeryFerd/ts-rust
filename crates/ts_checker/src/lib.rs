@@ -11552,7 +11552,7 @@ impl<'a> Checker<'a> {
                 let recursive_alias =
                     symbol.is_some_and(|symbol| self.type_alias_is_recursive(symbol, &name));
                 let mut type_id = if let Some(symbol) = symbol {
-                    let type_id = if !self.options.is_declaration_file
+                    let mut type_id = if !self.options.is_declaration_file
                         && self.class_value_stack.contains(&symbol)
                     {
                         let placeholder = self
@@ -11580,6 +11580,12 @@ impl<'a> Checker<'a> {
                                     .unwrap_or_else(|| self.result.types.unknown())
                             })
                     };
+                    if self.external_imports.contains_key(&symbol)
+                        && !self.external_aliases.contains_key(&symbol)
+                        && !self.structural_external_symbols.contains(&symbol)
+                    {
+                        type_id = self.constructor_instance_type(type_id).unwrap_or(type_id);
+                    }
                     if let Some(reference) = self.external_imports.get(&symbol).cloned() {
                         self.result
                             .import_type_references

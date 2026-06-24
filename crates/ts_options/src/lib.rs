@@ -90,6 +90,7 @@ pub struct CompilerOptions {
     pub composite: bool,
     pub declaration: bool,
     pub declaration_map: bool,
+    pub downlevel_iteration: bool,
     pub emit_declaration_only: bool,
     pub emit_decorator_metadata: bool,
     pub es_module_interop: bool,
@@ -123,6 +124,7 @@ pub struct CompilerOptions {
     pub module_resolution: ModuleResolutionKind,
     pub target: ScriptTarget,
     pub jsx: JsxEmit,
+    pub jsx_factory: Option<String>,
     pub resolve_json_module: bool,
     pub source_map: bool,
     pub inline_source_map: bool,
@@ -153,6 +155,7 @@ impl Default for CompilerOptions {
             composite: false,
             declaration: false,
             declaration_map: false,
+            downlevel_iteration: false,
             emit_declaration_only: false,
             emit_decorator_metadata: false,
             es_module_interop: false,
@@ -186,6 +189,7 @@ impl Default for CompilerOptions {
             module_resolution: ModuleResolutionKind::Node10,
             target: ScriptTarget::Es5,
             jsx: JsxEmit::None,
+            jsx_factory: None,
             resolve_json_module: false,
             source_map: false,
             inline_source_map: false,
@@ -262,6 +266,9 @@ impl CompilerOptions {
                     }
                 }
                 "declaration" => self.declaration = overrides.declaration,
+                "downleveliteration" => {
+                    self.downlevel_iteration = overrides.downlevel_iteration;
+                }
                 "esmoduleinterop" => {
                     self.es_module_interop = overrides.es_module_interop;
                     if !names.contains("allowsyntheticdefaultimports") {
@@ -285,6 +292,7 @@ impl CompilerOptions {
                 }
                 "importhelpers" => self.import_helpers = overrides.import_helpers,
                 "jsx" => self.jsx = overrides.jsx,
+                "jsxfactory" => self.jsx_factory.clone_from(&overrides.jsx_factory),
                 "module" => {
                     self.module = overrides.module;
                     if !names.contains("moduleresolution") {
@@ -480,6 +488,9 @@ pub fn parse_compiler_options_map(options: &BTreeMap<String, JsonValue>) -> Pars
             "declarationmap" => {
                 parsed.declaration_map = boolean(original_name, value, &mut diagnostics);
             }
+            "downleveliteration" => {
+                parsed.downlevel_iteration = boolean(original_name, value, &mut diagnostics);
+            }
             "emitdeclarationonly" => {
                 parsed.emit_declaration_only = boolean(original_name, value, &mut diagnostics);
             }
@@ -597,6 +608,7 @@ pub fn parse_compiler_options_map(options: &BTreeMap<String, JsonValue>) -> Pars
             }
             "target" => parsed.target = enum_value(original_name, value, &mut diagnostics, target),
             "jsx" => parsed.jsx = enum_value(original_name, value, &mut diagnostics, jsx),
+            "jsxfactory" => parsed.jsx_factory = string(original_name, value, &mut diagnostics),
             _ => diagnostics.push(diagnostic(5023, [original_name.as_str()])),
         }
     }
@@ -618,6 +630,7 @@ struct PartialOptions {
     composite: Option<bool>,
     declaration: Option<bool>,
     declaration_map: Option<bool>,
+    downlevel_iteration: Option<bool>,
     emit_declaration_only: Option<bool>,
     emit_decorator_metadata: Option<bool>,
     es_module_interop: Option<bool>,
@@ -651,6 +664,7 @@ struct PartialOptions {
     module_resolution: Option<ModuleResolutionKind>,
     target: Option<ScriptTarget>,
     jsx: Option<JsxEmit>,
+    jsx_factory: Option<String>,
     resolve_json_module: Option<bool>,
     source_map: Option<bool>,
     inline_source_map: Option<bool>,
@@ -698,6 +712,7 @@ impl PartialOptions {
             composite,
             declaration: self.declaration.unwrap_or(composite),
             declaration_map: self.declaration_map.unwrap_or(false),
+            downlevel_iteration: self.downlevel_iteration.unwrap_or(false),
             emit_declaration_only,
             emit_decorator_metadata: self.emit_decorator_metadata.unwrap_or(false),
             es_module_interop,
@@ -735,6 +750,7 @@ impl PartialOptions {
             module_resolution,
             target: self.target.unwrap_or_default(),
             jsx: self.jsx.unwrap_or_default(),
+            jsx_factory: self.jsx_factory,
             resolve_json_module: self.resolve_json_module.unwrap_or(false),
             source_map: self.source_map.unwrap_or(false),
             inline_source_map: self.inline_source_map.unwrap_or(false),

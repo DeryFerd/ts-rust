@@ -57,6 +57,8 @@ pub struct EmitContext<'a> {
     pub inline_const_enums: bool,
     pub emit_decorator_metadata: bool,
     pub strict_null_checks: bool,
+    pub jsx_factory: Option<&'a str>,
+    pub downlevel_iteration: bool,
     /// Controls whether JSX-generated runtime imports make an otherwise-script file a module.
     pub module_detection: ModuleDetectionKind,
 }
@@ -187,6 +189,8 @@ pub fn emit_source_file_with_settings_and_bindings(
             inline_const_enums: false,
             emit_decorator_metadata: false,
             strict_null_checks: false,
+            jsx_factory: None,
+            downlevel_iteration: false,
             module_detection: ModuleDetectionKind::Auto,
         },
     )
@@ -281,6 +285,8 @@ pub fn emit_source_file_with_context(
         is_external_module: false,
         emit_decorator_metadata: context.emit_decorator_metadata,
         strict_null_checks: context.strict_null_checks,
+        jsx_factory: context.jsx_factory.map(str::to_owned),
+        downlevel_iteration: context.downlevel_iteration,
     };
     let node = printer.node(source_file)?.clone();
     let NodeData::SourceFile(data) = &node.data else {
@@ -300,11 +306,18 @@ pub fn emit_source_file_with_context(
         printer.runtime_identifier_uses.extend(metadata_names);
         printer.prepare_decorator_metadata_guard_temps();
     }
-    // The classic JSX transform synthesizes `React.createElement` calls, so a default
-    // `React` import is a runtime dependency even when every source-level reference is
-    // confined to type positions.
+    // The classic JSX transform synthesizes factory calls, so the configured factory root is a
+    // runtime dependency even when every source-level reference is confined to type positions.
     if settings.jsx == JsxEmit::React && source_has_jsx(arena) {
-        printer.runtime_identifier_uses.insert("React".to_owned());
+        let factory_root = context
+            .jsx_factory
+            .unwrap_or("React.createElement")
+            .split('.')
+            .next()
+            .unwrap_or("React");
+        printer
+            .runtime_identifier_uses
+            .insert(factory_root.to_owned());
     }
     if settings.module == ModuleKind::CommonJs {
         printer.commonjs_default_imports = commonjs_default_imports(
@@ -498,7 +511,7 @@ pub fn emit_source_file_with_context(
         printer.emit_async_generator_helper();
     }
     if settings.target < ScriptTarget::Es2015
-        && source_needs_downlevel_values_helper(arena)
+        && source_needs_downlevel_values_helper(arena, context.downlevel_iteration)
         && !settings.no_emit_helpers
     {
         printer.emit_values_helper();
@@ -878,8 +891,17 @@ fn source_needs_downlevel_generator_helper(arena: &NodeArena) -> bool {
     })
 }
 
-fn source_needs_downlevel_values_helper(arena: &NodeArena) -> bool {
+fn source_needs_downlevel_values_helper(arena: &NodeArena, downlevel_iteration: bool) -> bool {
     arena.iter().any(|(_, node)| {
+        if downlevel_iteration
+            && node.kind == SyntaxKind::ForOfStatement
+            && matches!(
+                &node.data,
+                NodeData::ForInOrOfStatement(for_of) if for_of.await_modifier.is_none()
+            )
+        {
+            return true;
+        }
         if matches!(&node.data, NodeData::YieldExpression(yielded) if yielded.asterisk_token.is_some())
         {
             return true;
@@ -17642,6 +17664,8 @@ struct Printer<'a> {
     is_external_module: bool,
     emit_decorator_metadata: bool,
     strict_null_checks: bool,
+    jsx_factory: Option<String>,
+    downlevel_iteration: bool,
 }
 
 impl Printer<'_> {
@@ -18927,6 +18951,9 @@ impl Printer<'_> {
         include_owned: bool,
         include_compact_owned: bool,
     ) {
+        if self.settings.remove_comments {
+            return;
+        }
         let start = usize::try_from(start).unwrap_or(usize::MAX);
         let end = usize::try_from(end).unwrap_or(usize::MAX);
         let Some(trivia) = self.source_text.get(start..end) else {
@@ -18962,6 +18989,9 @@ impl Printer<'_> {
     }
 
     fn emit_exported_import_reference_directives_between(&mut self, start: u32, end: u32) {
+        if self.settings.remove_comments {
+            return;
+        }
         let start = usize::try_from(start).unwrap_or(usize::MAX);
         let end = usize::try_from(end).unwrap_or(usize::MAX);
         let Some(trivia) = self.source_text.get(start..end) else {
@@ -19252,7 +19282,7 @@ impl Printer<'_> {
                 let comment_range = (index, comment_end);
                 let pinned = comment.starts_with("//!")
                     || comment.contains("@license")
-                    || is_amd_dependency_directive(comment);
+                    || (!self.settings.remove_comments && is_amd_dependency_directive(comment));
                 if (!pinned_only || pinned)
                     && !is_reference_directive(comment)
                     && !excluded.iter().any(|(start, end)| {
@@ -20455,15 +20485,28 @@ impl Printer<'_> {
     }
 
     fn namespace_local_declaration_is_block_scoped(&self, name: NodeId) -> bool {
-        self.settings.target >= ScriptTarget::Es2015
-            && self
+        if self.settings.target < ScriptTarget::Es2015 {
+            return false;
+        }
+        let mut declaration = self.arena.get(name).and_then(|name| name.parent);
+        while let Some(id) = declaration {
+            let Some(parent_id) = self
                 .arena
-                .get(name)
-                .and_then(|name| name.parent)
-                .and_then(|declaration| self.arena.get(declaration))
+                .get(id)
                 .and_then(|declaration| declaration.parent)
-                .and_then(|parent| self.arena.get(parent))
-                .is_some_and(|parent| matches!(parent.data, NodeData::ModuleBlock(_)))
+            else {
+                return false;
+            };
+            let Some(parent) = self.arena.get(parent_id) else {
+                return false;
+            };
+            match parent.data {
+                NodeData::ModuleBlock(_) => return true,
+                NodeData::ModuleDeclaration(_) => declaration = Some(parent_id),
+                _ => return false,
+            }
+        }
+        false
     }
 
     fn identifier_is_qualified_enclosing_namespace_root(
@@ -20516,6 +20559,8 @@ impl Printer<'_> {
         }
         let value_flags = SymbolFlags::FUNCTION
             | SymbolFlags::CLASS
+            | SymbolFlags::FUNCTION_SCOPED_VARIABLE
+            | SymbolFlags::BLOCK_SCOPED_VARIABLE
             | SymbolFlags::REGULAR_ENUM
             | SymbolFlags::CONST_ENUM
             | SymbolFlags::VALUE_MODULE
@@ -21047,7 +21092,11 @@ impl Printer<'_> {
                     && data.await_modifier.is_none()
                     && self.settings.target < ScriptTarget::Es2015
                 {
-                    self.emit_downlevel_for_of(data)?;
+                    if self.downlevel_iteration {
+                        self.emit_downlevel_iterable_for_of(data)?;
+                    } else {
+                        self.emit_downlevel_for_of(data)?;
+                    }
                     self.writer.newline();
                     return Ok(());
                 }
@@ -21976,6 +22025,94 @@ impl Printer<'_> {
             DownlevelBindingIndex::Name(counter),
         );
         self.emit_downlevel_for_of_body(data.statement, data.initializer, &value)
+    }
+
+    fn emit_downlevel_iterable_for_of(
+        &mut self,
+        data: &ts_ast::ForInOrOfStatementData,
+    ) -> Result<(), EmitError> {
+        let iterator = match self.node(data.expression)?.data.clone() {
+            NodeData::Identifier(identifier) => self.generated_names.generate(&identifier.text),
+            _ => self.generated_names.generate_temp(),
+        };
+        let step = self.generated_names.generate(&iterator);
+        let error = self.generated_names.generate("e");
+        let caught = self.generated_names.generate(&error);
+        let return_method = self.generated_names.generate_temp();
+
+        self.writer.write("var ");
+        self.writer.write(&error);
+        self.writer.write(", ");
+        self.writer.write(&return_method);
+        self.writer.write(";");
+        self.writer.newline();
+        self.writer.write("try {");
+        self.writer.newline();
+        self.writer.indent += 1;
+        self.writer.write("for (var ");
+        self.writer.write(&iterator);
+        self.writer.write(" = __values(");
+        self.emit_expression(data.expression, 1)?;
+        self.writer.write("), ");
+        self.writer.write(&step);
+        self.writer.write(" = ");
+        self.writer.write(&iterator);
+        self.writer.write(".next(); !");
+        self.writer.write(&step);
+        self.writer.write(".done; ");
+        self.writer.write(&step);
+        self.writer.write(" = ");
+        self.writer.write(&iterator);
+        self.writer.write(".next()) ");
+        let value = DownlevelBindingValue::Element(
+            Box::new(DownlevelBindingValue::Name(step.clone())),
+            DownlevelBindingIndex::String("value".to_owned()),
+        );
+        self.emit_downlevel_for_of_body(data.statement, data.initializer, &value)?;
+        self.writer.newline();
+        self.writer.indent -= 1;
+        self.writer.write("}");
+        self.writer.newline();
+        self.writer.write("catch (");
+        self.writer.write(&caught);
+        self.writer.write(") { ");
+        self.writer.write(&error);
+        self.writer.write(" = { error: ");
+        self.writer.write(&caught);
+        self.writer.write(" }; }");
+        self.writer.newline();
+        self.writer.write("finally {");
+        self.writer.newline();
+        self.writer.indent += 1;
+        self.writer.write("try {");
+        self.writer.newline();
+        self.writer.indent += 1;
+        self.writer.write("if (");
+        self.writer.write(&step);
+        self.writer.write(" && !");
+        self.writer.write(&step);
+        self.writer.write(".done && (");
+        self.writer.write(&return_method);
+        self.writer.write(" = ");
+        self.writer.write(&iterator);
+        self.writer.write(".return)) ");
+        self.writer.write(&return_method);
+        self.writer.write(".call(");
+        self.writer.write(&iterator);
+        self.writer.write(");");
+        self.writer.newline();
+        self.writer.indent -= 1;
+        self.writer.write("}");
+        self.writer.newline();
+        self.writer.write("finally { if (");
+        self.writer.write(&error);
+        self.writer.write(") throw ");
+        self.writer.write(&error);
+        self.writer.write(".error; }");
+        self.writer.newline();
+        self.writer.indent -= 1;
+        self.writer.write("}");
+        Ok(())
     }
 
     fn emit_downlevel_for_of_body(
@@ -24222,6 +24359,20 @@ impl Printer<'_> {
         {
             self.emit_es5_async_captured_loop_hoists(&loop_info)?;
         }
+        if expression_body.is_none() {
+            let hoisted_await_bindings = self.es5_async_await_binding_names(body);
+            if !hoisted_await_bindings.is_empty() {
+                self.writer.write("var ");
+                for (index, name) in hoisted_await_bindings.iter().enumerate() {
+                    if index != 0 {
+                        self.writer.write(", ");
+                    }
+                    self.emit_expression(*name, 0)?;
+                }
+                self.writer.write(";");
+                self.writer.newline();
+            }
+        }
 
         self.writer.write("return ");
         self.emit_generator_reference();
@@ -24335,11 +24486,8 @@ impl Printer<'_> {
         }
         // The general sequential form covers ordinary statements and direct awaits.
         let await_index = block.statements.nodes.iter().position(|statement| {
-            matches!(
-                self.arena.get(*statement).map(|node| &node.data),
-                Some(NodeData::ExpressionStatement(expression))
-                    if matches!(self.arena.get(expression.expression).map(|node| &node.data), Some(NodeData::AwaitExpression(_)))
-            )
+            self.direct_await_expression(*statement).is_some()
+                || self.direct_await_binding(*statement).is_some()
         });
         let Some(await_index) = await_index else {
             for statement in &block.statements.nodes {
@@ -24357,8 +24505,10 @@ impl Printer<'_> {
                     self.emit_statement(*statement)?;
                 }
             }
-            self.writer.write("return [2 /*return*/];");
-            self.writer.newline();
+            if !self.statements_end_in_return(&block.statements.nodes) {
+                self.writer.write("return [2 /*return*/];");
+                self.writer.newline();
+            }
             return Ok(());
         };
         self.writer.write("switch (");
@@ -24367,39 +24517,93 @@ impl Printer<'_> {
         self.writer.newline();
         self.writer.indent += 1;
         self.writer.write("case 0:");
-        self.writer.newline();
         self.writer.indent += 1;
-        for statement in &block.statements.nodes[..await_index] {
+        let prefix = &block.statements.nodes[..await_index];
+        if prefix.is_empty() {
+            self.writer.write(" ");
+        } else {
+            self.writer.newline();
+        }
+        for statement in prefix {
             self.emit_statement(*statement)?;
         }
-        let statement = self.node(block.statements.nodes[await_index])?.clone();
-        let NodeData::ExpressionStatement(expression) = &statement.data else {
-            unreachable!()
-        };
-        let awaited = self.node(expression.expression)?.clone();
-        let NodeData::AwaitExpression(awaited) = &awaited.data else {
-            unreachable!()
-        };
+        let await_statement = block.statements.nodes[await_index];
+        let direct_binding = self.direct_await_binding(await_statement);
+        let awaited = direct_binding
+            .map(|(_, awaited)| awaited)
+            .or_else(|| self.direct_await_expression(await_statement))
+            .expect("await statement was identified above");
         self.writer.write("return [4 /*yield*/, ");
-        self.emit_expression(awaited.expression, 0)?;
+        self.emit_expression(awaited, 0)?;
         self.writer.write("];");
         self.writer.newline();
         self.writer.indent -= 1;
         self.writer.write("case 1:");
         self.writer.newline();
         self.writer.indent += 1;
+        if let Some((name, _)) = direct_binding {
+            self.emit_expression(name, 0)?;
+            self.writer.write(" = ");
+        }
         self.writer.write(state);
         self.writer.write(".sent();");
         self.writer.newline();
-        for statement in &block.statements.nodes[await_index + 1..] {
-            self.emit_statement(*statement)?;
+        let suffix = &block.statements.nodes[await_index + 1..];
+        for statement in suffix {
+            if let Some(NodeData::ReturnStatement(return_statement)) =
+                self.arena.get(*statement).map(|node| &node.data)
+            {
+                self.emit_es5_generator_return(return_statement.expression)?;
+            } else {
+                self.emit_statement(*statement)?;
+            }
         }
-        self.writer.write("return [2 /*return*/];");
-        self.writer.newline();
+        if !self.statements_end_in_return(suffix) {
+            self.writer.write("return [2 /*return*/];");
+            self.writer.newline();
+        }
         self.writer.indent -= 2;
         self.writer.write("}");
         self.writer.newline();
         Ok(())
+    }
+
+    fn es5_async_await_binding_names(&self, body: NodeId) -> Vec<NodeId> {
+        let Some(NodeData::Block(block)) = self.arena.get(body).map(|node| &node.data) else {
+            return Vec::new();
+        };
+        block
+            .statements
+            .nodes
+            .iter()
+            .filter_map(|statement| self.direct_await_binding(*statement).map(|(name, _)| name))
+            .collect()
+    }
+
+    fn direct_await_binding(&self, statement: NodeId) -> Option<(NodeId, NodeId)> {
+        let NodeData::VariableStatement(variable) = &self.arena.get(statement)?.data else {
+            return None;
+        };
+        let NodeData::VariableDeclarationList(list) =
+            &self.arena.get(variable.declaration_list)?.data
+        else {
+            return None;
+        };
+        let [declaration] = list.declarations.nodes.as_slice() else {
+            return None;
+        };
+        let NodeData::VariableDeclaration(declaration) = &self.arena.get(*declaration)?.data else {
+            return None;
+        };
+        let initializer = declaration.initializer?;
+        let NodeData::AwaitExpression(awaited) = &self.arena.get(initializer)?.data else {
+            return None;
+        };
+        matches!(
+            self.arena.get(declaration.name).map(|node| &node.data),
+            Some(NodeData::Identifier(_))
+        )
+        .then_some((declaration.name, awaited.expression))
     }
 
     fn es5_async_captured_for_loop(
@@ -29172,6 +29376,15 @@ impl Printer<'_> {
                 self.writer.write(&name);
                 self.writer.write(" = {})");
             }
+        } else if exported && let Some(export_function) = self.system_export_function.clone() {
+            self.writer.write(&name);
+            self.writer.write(" || (");
+            self.writer.write(&export_function);
+            self.writer.write("(");
+            write_quoted(&mut self.writer, &name);
+            self.writer.write(", ");
+            self.writer.write(&name);
+            self.writer.write(" = {}))");
         } else if exported && self.commonjs_module_transform {
             self.writer.write(&name);
             self.writer.write(" || (exports.");
@@ -32545,7 +32758,7 @@ impl Printer<'_> {
             }
             NodeData::FunctionExpression(data) => {
                 let previous_static_capture = self.class_static_this_capture.take();
-                let wrap = parent_precedence >= 18;
+                let wrap = parent_precedence > 18;
                 if wrap {
                     self.writer.write("(");
                 }
@@ -32751,8 +32964,12 @@ impl Printer<'_> {
             return Ok(());
         }
         if self.settings.jsx == JsxEmit::React {
-            self.writer
-                .write("React.createElement(React.Fragment, null");
+            let factory = self
+                .jsx_factory
+                .clone()
+                .unwrap_or_else(|| "React.createElement".to_owned());
+            self.writer.write(&factory);
+            self.writer.write("(React.Fragment, null");
             for child in semantic_jsx_children(self.arena, &data.children) {
                 self.writer.write(", ");
                 self.emit_jsx_child(child, false)?;
@@ -32772,7 +32989,12 @@ impl Printer<'_> {
         attributes: NodeId,
         children: Option<&NodeList>,
     ) -> Result<(), EmitError> {
-        self.writer.write("React.createElement(");
+        let factory = self
+            .jsx_factory
+            .clone()
+            .unwrap_or_else(|| "React.createElement".to_owned());
+        self.writer.write(&factory);
+        self.writer.write("(");
         let tag = self.node(tag_name)?.clone();
         if let NodeData::Identifier(identifier) = &tag.data
             && identifier
@@ -36069,6 +36291,8 @@ mod tests {
                 inline_const_enums: false,
                 emit_decorator_metadata: false,
                 strict_null_checks: false,
+                jsx_factory: None,
+                downlevel_iteration: false,
                 module_detection: ModuleDetectionKind::Auto,
             },
         )
@@ -36187,6 +36411,8 @@ mod tests {
                 inline_const_enums: false,
                 emit_decorator_metadata: false,
                 strict_null_checks: false,
+                jsx_factory: None,
+                downlevel_iteration: false,
                 module_detection: ModuleDetectionKind::Auto,
             },
         )
@@ -37903,6 +38129,8 @@ mod tests {
                 inline_const_enums: true,
                 emit_decorator_metadata: false,
                 strict_null_checks: false,
+                jsx_factory: None,
+                downlevel_iteration: false,
                 module_detection: ModuleDetectionKind::Auto,
             },
         )
@@ -38418,6 +38646,8 @@ mod tests {
                     inline_const_enums: false,
                     emit_decorator_metadata: false,
                     strict_null_checks: false,
+                    jsx_factory: None,
+                    downlevel_iteration: false,
                     module_detection: ModuleDetectionKind::Auto,
                 },
             )
@@ -40548,6 +40778,8 @@ class Board {
                 inline_const_enums: false,
                 emit_decorator_metadata: false,
                 strict_null_checks: false,
+                jsx_factory: None,
+                downlevel_iteration: false,
                 module_detection: ModuleDetectionKind::Auto,
             },
         )

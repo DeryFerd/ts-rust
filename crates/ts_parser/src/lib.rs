@@ -461,6 +461,7 @@ impl<'a> Parser<'a> {
                     | SyntaxKind::CloseBracketToken
                     | SyntaxKind::QuestionToken
                     | SyntaxKind::DotToken
+                    | SyntaxKind::EqualsGreaterThanToken
             ) {
                 self.error_current("Declaration or statement expected.");
                 self.bump();
@@ -1796,6 +1797,12 @@ impl<'a> Parser<'a> {
             } else {
                 self.parse_class_member(false)
             });
+            if signature_only
+                && before.0 == SyntaxKind::LessThanToken
+                && self.current.kind == SyntaxKind::MinusToken
+            {
+                break;
+            }
             if before == (self.current.kind, self.current.range) {
                 self.error_current("Parser made no progress while parsing a member.");
                 self.bump();
