@@ -4319,6 +4319,9 @@ impl DeclarationPrinter<'_> {
             {
                 return false;
             }
+            if self.identifier_is_in_returned_type_assertion(id) {
+                return true;
+            }
             let Some(parent) = node.parent else {
                 return false;
             };
@@ -4347,6 +4350,31 @@ impl DeclarationPrinter<'_> {
             }
             false
         })
+    }
+
+    fn identifier_is_in_returned_type_assertion(&self, identifier: NodeId) -> bool {
+        let mut current = identifier;
+        let mut in_type_assertion = false;
+        while let Some(parent) = self.arena.get(current).and_then(|node| node.parent) {
+            match self.arena.get(parent).map(|node| &node.data) {
+                Some(NodeData::AsExpression(_) | NodeData::TypeAssertion(_)) => {
+                    in_type_assertion = true;
+                }
+                Some(NodeData::ReturnStatement(return_)) => {
+                    return in_type_assertion && return_.expression == Some(current);
+                }
+                Some(
+                    NodeData::FunctionDeclaration(_)
+                    | NodeData::FunctionExpression(_)
+                    | NodeData::ArrowFunction(_)
+                    | NodeData::MethodDeclaration(_)
+                    | NodeData::SourceFile(_),
+                ) => return false,
+                _ => {}
+            }
+            current = parent;
+        }
+        false
     }
 
     fn import_is_used_by_inferred_semantic_variable_type(
@@ -13849,6 +13877,9 @@ impl DeclarationPrinter<'_> {
                 NodeData::Identifier(identifier) if identifier.text == name
             ) {
                 return false;
+            }
+            if self.identifier_is_in_returned_type_assertion(id) {
+                return true;
             }
             let Some(parent) = node.parent else {
                 return false;
@@ -37160,6 +37191,20 @@ class Board {
             output.starts_with(
                 "/** dependency */\nimport dep = require(\"./dep\");\nexport declare var value: dep.C;"
             ),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn declaration_emit_retains_import_used_by_returned_type_assertion() {
+        let output = emit_declarations_with_semantics(concat!(
+            "import { TypeB } from './type-b';\n",
+            "export class Broken {\n",
+            "    method() { return {} as TypeB; }\n",
+            "}\n",
+        ));
+        assert!(
+            output.starts_with("import { TypeB } from './type-b';"),
             "{output}"
         );
     }
