@@ -4448,11 +4448,7 @@ impl DeclarationPrinter<'_> {
                 }
             }
             NodeData::ImportEqualsDeclaration(data) => {
-                if exported
-                    && (!in_namespace
-                        || namespace_export
-                        || self.namespace_scope_allows_explicit_exports(scope))
-                {
+                if exported {
                     self.writer.write("export ");
                 }
                 self.writer.write("import ");
@@ -7702,12 +7698,16 @@ impl DeclarationPrinter<'_> {
             {
                 self.writer.write(": ");
                 self.emit_name(enum_type)?;
-            } else if let Some((class_name, type_arguments)) = declaration
+            } else if let Some((class_name, canonical_name, type_arguments)) = declaration
                 .initializer
                 .and_then(|initializer| self.local_class_new_expression_type(initializer))
             {
                 self.writer.write(": ");
-                self.emit_name(class_name)?;
+                if let Some(canonical_name) = canonical_name {
+                    self.writer.write(&canonical_name);
+                } else {
+                    self.emit_name(class_name)?;
+                }
                 if type_arguments.is_some() {
                     self.emit_type_arguments(type_arguments.as_ref())?;
                 } else if let Some(arguments) = declaration
@@ -8917,7 +8917,7 @@ impl DeclarationPrinter<'_> {
     fn local_class_new_expression_type(
         &self,
         initializer: NodeId,
-    ) -> Option<(NodeId, Option<NodeList>)> {
+    ) -> Option<(NodeId, Option<String>, Option<NodeList>)> {
         let NodeData::NewExpression(new_expression) = &self.arena.get(initializer)?.data else {
             return None;
         };
@@ -8960,8 +8960,30 @@ impl DeclarationPrinter<'_> {
             });
         let has_nominal_type = root_is_import || root_is_namespace || expression_is_class;
         has_nominal_type.then(|| {
+            let canonical_name = root_is_namespace
+                .then(|| {
+                    let symbol = self.resolve_entity_expression_symbol_following_aliases(
+                        new_expression.expression,
+                    )?;
+                    self.bindings
+                        .symbols
+                        .get(symbol)?
+                        .declarations
+                        .iter()
+                        .any(|declaration| {
+                            matches!(
+                                self.arena.get(*declaration).map(|node| &node.data),
+                                Some(NodeData::ImportEqualsDeclaration(_))
+                            )
+                        })
+                        .then(|| self.runtime_symbol_declaration_path(symbol))
+                        .flatten()
+                })
+                .flatten()
+                .map(|path| path.join("."));
             (
                 new_expression.expression,
+                canonical_name,
                 new_expression.type_arguments.clone(),
             )
         })
@@ -55025,6 +55047,23 @@ class Board {
             "{private_alias}"
         );
         assert!(private_alias.contains("export {};"), "{private_alias}");
+
+        let nested_alias = emit_declarations_with_semantics(concat!(
+            "export namespace x { export class c {} }\n",
+            "export namespace m2 { export namespace m3 {\n",
+            "    export import c = x.c; export var cProp = new c();\n",
+            "} }\n",
+            "export var d = new m2.m3.c();\n",
+            "export namespace Private { import local = x.c; export var value = new local(); }\n",
+        ));
+        assert!(nested_alias.contains("export import c = x.c;"), "{nested_alias}");
+        assert!(nested_alias.contains("var cProp: c;"), "{nested_alias}");
+        assert!(
+            nested_alias.contains("export declare var d: x.c;"),
+            "{nested_alias}"
+        );
+        assert!(nested_alias.contains("import local = x.c;"), "{nested_alias}");
+        assert!(!nested_alias.contains("export import local"), "{nested_alias}");
 
         let class_visibility = emit_declarations_with_semantics(concat!(
             "namespace M {\n",
