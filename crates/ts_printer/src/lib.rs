@@ -40342,9 +40342,31 @@ impl Printer<'_> {
                         NodeData::SetAccessorDeclaration(accessor) => {
                             self.writer.write("set ");
                             self.emit_expression(accessor.name, 0)?;
-                            self.emit_parameters(&accessor.parameters)?;
+                            let binding_parameters = if self.settings.target < ScriptTarget::Es2015
+                            {
+                                self.downlevel_binding_parameters(&accessor.parameters, *property)
+                            } else {
+                                Vec::new()
+                            };
+                            if binding_parameters.is_empty() {
+                                self.emit_parameters(&accessor.parameters)?;
+                            } else {
+                                self.emit_parameters_with_name_overrides(
+                                    &accessor.parameters,
+                                    false,
+                                    &binding_parameters,
+                                )?;
+                            }
                             self.writer.write(" ");
-                            if self.settings.target < ScriptTarget::Es2015 {
+                            if !binding_parameters.is_empty() {
+                                self.emit_function_body_with_binding_parameters(
+                                    accessor.body.expect("setter body"),
+                                    &accessor.parameters,
+                                    &[],
+                                    true,
+                                    &binding_parameters,
+                                )?;
+                            } else if self.settings.target < ScriptTarget::Es2015 {
                                 self.emit_downlevel_accessor_body(
                                     &accessor.parameters,
                                     accessor.body,
