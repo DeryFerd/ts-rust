@@ -519,9 +519,10 @@ impl<F: FileSystem + ?Sized> ResolutionState<'_, '_, F> {
     ) -> Option<ResolvedModule> {
         for path in self.file_candidates(candidate) {
             if self.resolver.file_system.file_exists(&path) {
+                let resolved_file_name = self.resolver.file_system.realpath(&path);
                 return Some(ResolvedModule {
-                    extension: ts_path::extension_from_path(&path),
-                    resolved_file_name: path,
+                    extension: ts_path::extension_from_path(&resolved_file_name),
+                    resolved_file_name,
                     is_external_library_import: external,
                     package_json: package_json.map(str::to_owned),
                 });

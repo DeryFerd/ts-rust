@@ -679,19 +679,29 @@ fn compile_case_variant(case: &Case, variant: &OptionVariant) -> std::io::Result
             )
         })
         .collect::<Vec<_>>();
+    for (source, alias) in &links {
+        let nested_dependency = links.iter().any(|(containing_source, _)| {
+            alias != containing_source
+                && alias
+                    .strip_prefix(containing_source)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        });
+        let exposes_nested_dependency = links.iter().any(|(_, nested_alias)| {
+            nested_alias != source
+                && nested_alias
+                    .strip_prefix(source)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        });
+        if !nested_dependency && exposes_nested_dependency {
+            file_system.add_directory_link(source, alias);
+        }
+    }
     let mut roots = Vec::with_capacity(case.units.len());
     for (index, unit) in case.units.iter().enumerate() {
         let path = virtual_unit_path(case, unit, index);
         file_system.write_file(&path, unit.source_text.as_scannable_str())?;
-        for (source, target) in &links {
-            if path == *source
-                || path
-                    .strip_prefix(source)
-                    .is_some_and(|rest| rest.starts_with('/'))
-            {
-                let alias = format!("{target}{}", &path[source.len()..]);
-                file_system.write_file(&alias, unit.source_text.as_scannable_str())?;
-            }
+        for alias in linked_aliases(&path, &links) {
+            file_system.write_file(&alias, unit.source_text.as_scannable_str())?;
         }
         let next_unit_line = case
             .units
@@ -781,6 +791,26 @@ fn virtual_harness_path(path: &str) -> String {
     } else {
         ts_path::resolve_path("/case", &[path])
     }
+}
+
+fn linked_aliases(path: &str, links: &[(String, String)]) -> BTreeSet<String> {
+    let mut paths = BTreeSet::from([path.to_owned()]);
+    for _ in 0..links.len() {
+        let candidates = paths.iter().cloned().collect::<Vec<_>>();
+        for candidate in candidates {
+            for (source, target) in links {
+                if candidate == *source
+                    || candidate
+                        .strip_prefix(source)
+                        .is_some_and(|rest| rest.starts_with('/'))
+                {
+                    paths.insert(format!("{target}{}", &candidate[source.len()..]));
+                }
+            }
+        }
+    }
+    paths.remove(path);
+    paths
 }
 
 fn virtual_unit_path(case: &Case, unit: &Unit, index: usize) -> String {

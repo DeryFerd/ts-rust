@@ -2181,9 +2181,12 @@ fn has_unserializable_exported_class_property_type(source: &SourceFile) -> bool 
             }) else {
                 return false;
             };
-            inaccessible_named_type_reference(&source.checking, type_id, &mut BTreeSet::new())
-                .or_else(|| cyclic_alias_type_name(&source.checking, type_id, &mut BTreeSet::new()))
-                .is_some_and(|name| !source_declares_type_name(source, &name))
+            let inaccessible =
+                inaccessible_named_type_reference(&source.checking, type_id, &mut BTreeSet::new())
+                    .or_else(|| {
+                        cyclic_alias_type_name(&source.checking, type_id, &mut BTreeSet::new())
+                    });
+            inaccessible.is_some_and(|name| !source_declares_type_name(source, &name))
         })
     })
 }
@@ -2845,6 +2848,14 @@ fn nonportable_import_type_reference(
             reference.module_specifier.clone(),
         ));
     }
+    if let Some(reference) = checking.named_type_references.get(&type_id)
+        && let Some(nonportable) = reference
+            .type_arguments
+            .iter()
+            .find_map(|argument| nonportable_import_type_reference(checking, *argument, visited))
+    {
+        return Some(nonportable);
+    }
     let kind = &checking.types.get(type_id)?.kind;
     let mut children = Vec::new();
     match kind {
@@ -2944,7 +2955,9 @@ fn inaccessible_named_type_reference(
     if !visited.insert(type_id) || checking.import_type_references.contains_key(&type_id) {
         return None;
     }
-    if let Some(reference) = checking.named_type_references.get(&type_id) {
+    if let Some(reference) = checking.named_type_references.get(&type_id)
+        && !is_global_library_type_name(&reference.name)
+    {
         return Some(reference.name.clone());
     }
     let kind = &checking.types.get(type_id)?.kind;
@@ -2978,6 +2991,39 @@ fn inaccessible_named_type_reference(
     children
         .into_iter()
         .find_map(|child| inaccessible_named_type_reference(checking, child, visited))
+}
+
+fn is_global_library_type_name(name: &str) -> bool {
+    matches!(
+        name,
+        "Array"
+            | "ReadonlyArray"
+            | "Promise"
+            | "PromiseLike"
+            | "PromiseConstructor"
+            | "String"
+            | "StringConstructor"
+            | "Number"
+            | "Boolean"
+            | "Object"
+            | "Function"
+            | "CallableFunction"
+            | "NewableFunction"
+            | "IArguments"
+            | "Record"
+            | "Omit"
+            | "Pick"
+            | "Partial"
+            | "Required"
+            | "Readonly"
+            | "Exclude"
+            | "Extract"
+            | "NonNullable"
+            | "Parameters"
+            | "ConstructorParameters"
+            | "ReturnType"
+            | "InstanceType"
+    )
 }
 
 fn cyclic_alias_type_name(

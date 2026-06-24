@@ -25,6 +25,11 @@ pub trait FileSystem: Send + Sync {
 
     fn directory_exists(&self, path: &str) -> bool;
 
+    /// Resolves symbolic-link aliases when the file system can identify them.
+    fn realpath(&self, path: &str) -> String {
+        normalize_path(path)
+    }
+
     /// Returns a monotonically comparable last-modified value for a file.
     fn modified_time(&self, path: &str) -> Option<u128>;
 
@@ -133,6 +138,13 @@ impl FileSystem for OsFileSystem {
         fs::metadata(normalize_path(path)).is_ok_and(|metadata| metadata.is_dir())
     }
 
+    fn realpath(&self, path: &str) -> String {
+        fs::canonicalize(normalize_path(path))
+            .ok()
+            .and_then(|path| path.to_str().map(normalize_path))
+            .unwrap_or_else(|| normalize_path(path))
+    }
+
     fn modified_time(&self, path: &str) -> Option<u128> {
         fs::metadata(normalize_path(path))
             .ok()?
@@ -213,6 +225,7 @@ struct MemoryFile {
 pub struct MemoryFileSystem {
     case_sensitive: bool,
     files: RwLock<BTreeMap<String, MemoryFile>>,
+    directory_links: RwLock<Vec<(String, String)>>,
     clock: AtomicU64,
 }
 
@@ -222,7 +235,18 @@ impl MemoryFileSystem {
         Self {
             case_sensitive,
             files: RwLock::new(BTreeMap::new()),
+            directory_links: RwLock::new(Vec::new()),
             clock: AtomicU64::new(0),
+        }
+    }
+
+    /// Registers a directory alias whose contents physically live at `source`.
+    pub fn add_directory_link(&self, source: &str, alias: &str) {
+        let source = normalize_path(source);
+        let alias = normalize_path(alias);
+        if let Ok(mut links) = self.directory_links.write() {
+            links.push((alias, source));
+            links.sort_by(|left, right| right.0.len().cmp(&left.0.len()));
         }
     }
 
@@ -289,6 +313,25 @@ impl FileSystem for MemoryFileSystem {
 
     fn directory_exists(&self, path: &str) -> bool {
         self.normalized_directory_exists(&normalize_path(path))
+    }
+
+    fn realpath(&self, path: &str) -> String {
+        let mut path = normalize_path(path);
+        let Ok(links) = self.directory_links.read() else {
+            return path;
+        };
+        for _ in 0..links.len() {
+            let Some((alias, source)) = links.iter().find(|(alias, _)| {
+                path == *alias
+                    || path
+                        .strip_prefix(alias)
+                        .is_some_and(|rest| rest.starts_with('/'))
+            }) else {
+                break;
+            };
+            path = format!("{source}{}", &path[alias.len()..]);
+        }
+        path
     }
 
     fn modified_time(&self, path: &str) -> Option<u128> {
