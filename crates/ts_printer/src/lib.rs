@@ -17504,6 +17504,26 @@ struct Es5AsyncForInPlan {
 }
 
 #[derive(Clone)]
+struct Es5AsyncForOfPlan {
+    counter: String,
+    rhs: String,
+    pattern_temp: Option<String>,
+    value_temp: Option<String>,
+}
+
+enum Es5AsyncForOfBinding {
+    Direct(NodeId),
+    Array {
+        target: NodeId,
+        default: Option<NodeId>,
+    },
+    Object {
+        target: NodeId,
+        default: Option<NodeId>,
+    },
+}
+
+#[derive(Clone)]
 struct Es5AsyncObjectPlan {
     temp: String,
     key_temps: HashMap<NodeId, String>,
@@ -18276,7 +18296,7 @@ struct Printer<'a> {
     es5_async_control_targets: Vec<Es5AsyncControlTarget>,
     es5_async_hoisted_variable_lists: HashSet<NodeId>,
     es5_async_hoisted_function_declarations: HashSet<NodeId>,
-    es5_async_for_of_names: HashMap<NodeId, (String, String, Option<String>)>,
+    es5_async_for_of_names: HashMap<NodeId, Es5AsyncForOfPlan>,
     es5_async_for_in_plans: HashMap<NodeId, Es5AsyncForInPlan>,
     async_loop_counter: u32,
     async_control_counter: u32,
@@ -22741,9 +22761,15 @@ impl Printer<'_> {
         data: &ts_ast::ForInOrOfStatementData,
     ) -> Result<(), EmitError> {
         let planned = self.es5_async_for_of_names.get(&statement).cloned();
-        let (counter, rhs, binding_temp) = planned
-            .clone()
-            .unwrap_or_else(|| self.scoped_downlevel_for_of_names(statement, data.expression));
+        let (counter, rhs, binding_temp) = if let Some(plan) = &planned {
+            (
+                plan.counter.clone(),
+                plan.rhs.clone(),
+                plan.pattern_temp.clone(),
+            )
+        } else {
+            self.scoped_downlevel_for_of_names(statement, data.expression)
+        };
         self.writer.write("for (");
         if planned.is_none() {
             self.writer.write("var ");
@@ -25473,6 +25499,301 @@ impl Printer<'_> {
     }
 
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn emit_es5_async_for_of_statement(
+        &mut self,
+        statement_id: NodeId,
+        statement: &ts_ast::ForInOrOfStatementData,
+        label: Option<NodeId>,
+        plan: &Es5AsyncForOfPlan,
+        state: &str,
+        case: &mut usize,
+        is_last: bool,
+    ) -> Result<(), EmitError> {
+        let binding = self.es5_async_for_of_binding(statement.initializer)?;
+        let expression_await = self.es5_async_simple_await_in_expression(statement.expression);
+        let initializer_await = self.es5_async_simple_await_in_expression(statement.initializer);
+        let binding_advance = self.es5_async_for_of_binding_case_advance(statement.initializer);
+        let start_case = *case;
+        let head_case = start_case + usize::from(expression_await.is_some()) + 1;
+        let increment_case =
+            head_case + binding_advance + self.es5_async_case_advance(statement.statement) + 1;
+        let exit_case = increment_case + 1;
+
+        if !self.writer.line_start {
+            self.writer.newline();
+        }
+        self.writer.write(&plan.counter);
+        self.writer.write(" = 0");
+        if let Some(await_id) = expression_await {
+            self.writer.write(";");
+            self.writer.newline();
+            let NodeData::AwaitExpression(awaited) = &self.node(await_id)?.data else {
+                unreachable!("await expression identified above")
+            };
+            let awaited_expression = awaited.expression;
+            self.emit_es5_async_yield(awaited_expression, case, false)?;
+            let previous = self
+                .es5_async_expression_rewrites
+                .insert(await_id, format!("{state}.sent()"));
+            self.writer.write(&plan.rhs);
+            self.writer.write(" = ");
+            self.emit_expression(statement.expression, 1)?;
+            self.writer.write(";");
+            self.writer.newline();
+            self.restore_es5_async_expression_rewrite(await_id, previous);
+        } else {
+            self.writer.write(", ");
+            self.writer.write(&plan.rhs);
+            self.writer.write(" = ");
+            self.emit_expression(statement.expression, 1)?;
+            self.writer.write(";");
+            self.writer.newline();
+        }
+        self.writer.write(state);
+        self.writer.write(".label = ");
+        self.writer.write(&head_case.to_string());
+        self.writer.write(";");
+        self.writer.newline();
+
+        self.emit_es5_async_case_label(head_case, false);
+        *case = head_case;
+        self.writer.write("if (!(");
+        self.writer.write(&plan.counter);
+        self.writer.write(" < ");
+        self.writer.write(&plan.rhs);
+        self.writer.write(".length)) return [3 /*break*/, ");
+        self.writer.write(&exit_case.to_string());
+        self.writer.write("];");
+        self.writer.newline();
+
+        if let Some(default) = self.es5_async_for_of_binding_default(statement.initializer)
+            && let Some(await_id) = self.es5_async_simple_await_in_expression(default)
+        {
+            let pattern_temp = plan
+                .pattern_temp
+                .as_deref()
+                .expect("awaited default pattern temp");
+            let value_temp = plan
+                .value_temp
+                .as_deref()
+                .expect("awaited default value temp");
+            let non_default_case = head_case + 2;
+            let join_case = head_case + 3;
+            self.writer.write(pattern_temp);
+            self.writer.write(" = ");
+            self.emit_es5_async_for_of_value(plan, &binding)?;
+            self.writer.write(";");
+            self.writer.newline();
+            self.writer.write("if (!(");
+            self.writer.write(pattern_temp);
+            self.writer.write(" === void 0)) return [3 /*break*/, ");
+            self.writer.write(&non_default_case.to_string());
+            self.writer.write("];");
+            self.writer.newline();
+            let NodeData::AwaitExpression(awaited) = &self.node(await_id)?.data else {
+                unreachable!("await expression identified above")
+            };
+            let awaited_expression = awaited.expression;
+            self.emit_es5_async_yield(awaited_expression, case, false)?;
+            let previous = self
+                .es5_async_expression_rewrites
+                .insert(await_id, format!("{state}.sent()"));
+            self.writer.write(value_temp);
+            self.writer.write(" = ");
+            self.emit_expression(default, 1)?;
+            self.writer.write(";");
+            self.writer.newline();
+            self.restore_es5_async_expression_rewrite(await_id, previous);
+            self.writer.write("return [3 /*break*/, ");
+            self.writer.write(&join_case.to_string());
+            self.writer.write("];");
+            self.writer.newline();
+            self.emit_es5_async_case_label(non_default_case, false);
+            *case = non_default_case;
+            self.writer.write(value_temp);
+            self.writer.write(" = ");
+            self.writer.write(pattern_temp);
+            self.writer.write(";");
+            self.writer.newline();
+            self.writer.write(state);
+            self.writer.write(".label = ");
+            self.writer.write(&join_case.to_string());
+            self.writer.write(";");
+            self.writer.newline();
+            self.emit_es5_async_case_label(join_case, false);
+            *case = join_case;
+            self.emit_expression(Self::es5_async_for_of_binding_target(&binding), 1)?;
+            self.writer.write(" = ");
+            self.writer.write(value_temp);
+            self.writer.write(";");
+            self.writer.newline();
+        } else if let Some(await_id) = initializer_await {
+            let NodeData::AwaitExpression(awaited) = &self.node(await_id)?.data else {
+                unreachable!("await expression identified above")
+            };
+            let awaited_expression = awaited.expression;
+            self.emit_es5_async_yield(awaited_expression, case, false)?;
+            let previous = self
+                .es5_async_expression_rewrites
+                .insert(await_id, format!("{state}.sent()"));
+            self.emit_es5_async_for_of_binding_assignment(plan, &binding)?;
+            self.restore_es5_async_expression_rewrite(await_id, previous);
+        } else {
+            self.emit_es5_async_for_of_binding_assignment(plan, &binding)?;
+        }
+
+        let mut nodes = vec![statement_id];
+        nodes.extend(label);
+        self.es5_async_control_targets.push(Es5AsyncControlTarget {
+            nodes,
+            break_case: exit_case,
+            continue_case: increment_case,
+        });
+        let body_result = self.emit_es5_async_branch(statement.statement, state, case);
+        self.es5_async_control_targets.pop();
+        body_result?;
+        if self.es5_async_statement_may_complete_normally(statement.statement) {
+            self.writer.write(state);
+            self.writer.write(".label = ");
+            self.writer.write(&increment_case.to_string());
+            self.writer.write(";");
+            self.writer.newline();
+        }
+
+        self.emit_es5_async_case_label(increment_case, false);
+        *case = increment_case;
+        self.writer.write(&plan.counter);
+        self.writer.write("++;");
+        self.writer.newline();
+        self.writer.write("return [3 /*break*/, ");
+        self.writer.write(&head_case.to_string());
+        self.writer.write("];");
+        self.writer.newline();
+        self.emit_es5_async_case_label(exit_case, is_last);
+        if is_last {
+            self.writer.write(" ");
+        }
+        *case = exit_case;
+        Ok(())
+    }
+
+    fn es5_async_for_of_binding(
+        &self,
+        initializer: NodeId,
+    ) -> Result<Es5AsyncForOfBinding, EmitError> {
+        let node = self.node(initializer)?;
+        match &node.data {
+            NodeData::VariableDeclarationList(list) => {
+                let Some(declaration) = list.declarations.nodes.first() else {
+                    return Ok(Es5AsyncForOfBinding::Direct(initializer));
+                };
+                let declaration_node = self.node(*declaration)?;
+                let NodeData::VariableDeclaration(declaration) = &declaration_node.data else {
+                    return Err(Self::unsupported(*declaration, declaration_node.kind));
+                };
+                Ok(Es5AsyncForOfBinding::Direct(declaration.name))
+            }
+            NodeData::ArrayLiteralExpression(array) => {
+                let Some(element) = array.elements.nodes.first().copied() else {
+                    return Ok(Es5AsyncForOfBinding::Direct(initializer));
+                };
+                if let NodeData::BinaryExpression(binary) = &self.node(element)?.data
+                    && self
+                        .arena
+                        .get(binary.operator_token)
+                        .is_some_and(|node| node.kind == SyntaxKind::EqualsToken)
+                {
+                    Ok(Es5AsyncForOfBinding::Array {
+                        target: binary.left,
+                        default: Some(binary.right),
+                    })
+                } else {
+                    Ok(Es5AsyncForOfBinding::Array {
+                        target: element,
+                        default: None,
+                    })
+                }
+            }
+            NodeData::ObjectLiteralExpression(object) => {
+                let Some(property) = object.properties.nodes.first().copied() else {
+                    return Ok(Es5AsyncForOfBinding::Direct(initializer));
+                };
+                let property_node = self.node(property)?;
+                let NodeData::ShorthandPropertyAssignment(property) = &property_node.data else {
+                    return Ok(Es5AsyncForOfBinding::Direct(initializer));
+                };
+                Ok(Es5AsyncForOfBinding::Object {
+                    target: property.name,
+                    default: property.object_assignment_initializer,
+                })
+            }
+            _ => Ok(Es5AsyncForOfBinding::Direct(initializer)),
+        }
+    }
+
+    const fn es5_async_for_of_binding_target(binding: &Es5AsyncForOfBinding) -> NodeId {
+        match binding {
+            Es5AsyncForOfBinding::Direct(target)
+            | Es5AsyncForOfBinding::Array { target, .. }
+            | Es5AsyncForOfBinding::Object { target, .. } => *target,
+        }
+    }
+
+    fn emit_es5_async_for_of_value(
+        &mut self,
+        plan: &Es5AsyncForOfPlan,
+        binding: &Es5AsyncForOfBinding,
+    ) -> Result<(), EmitError> {
+        self.writer.write(&plan.rhs);
+        self.writer.write("[");
+        self.writer.write(&plan.counter);
+        self.writer.write("]");
+        match binding {
+            Es5AsyncForOfBinding::Array { .. } => self.writer.write("[0]"),
+            Es5AsyncForOfBinding::Object { .. } => {
+                self.writer.write(".");
+                self.emit_expression(Self::es5_async_for_of_binding_target(binding), 0)?;
+            }
+            Es5AsyncForOfBinding::Direct(_) => {}
+        }
+        Ok(())
+    }
+
+    fn emit_es5_async_for_of_binding_assignment(
+        &mut self,
+        plan: &Es5AsyncForOfPlan,
+        binding: &Es5AsyncForOfBinding,
+    ) -> Result<(), EmitError> {
+        let target = Self::es5_async_for_of_binding_target(binding);
+        let default = match binding {
+            Es5AsyncForOfBinding::Array { default, .. }
+            | Es5AsyncForOfBinding::Object { default, .. } => *default,
+            Es5AsyncForOfBinding::Direct(_) => None,
+        };
+        if let Some(default) = default {
+            let temp = plan.pattern_temp.as_deref().expect("default pattern temp");
+            self.writer.write(temp);
+            self.writer.write(" = ");
+            self.emit_es5_async_for_of_value(plan, binding)?;
+            self.writer.write(", ");
+            self.emit_expression(target, 1)?;
+            self.writer.write(" = ");
+            self.writer.write(temp);
+            self.writer.write(" === void 0 ? ");
+            self.emit_expression(default, 2)?;
+            self.writer.write(" : ");
+            self.writer.write(temp);
+        } else {
+            self.emit_expression(target, 1)?;
+            self.writer.write(" = ");
+            self.emit_es5_async_for_of_value(plan, binding)?;
+        }
+        self.writer.write(";");
+        self.writer.newline();
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn emit_es5_async_function_body(
         &mut self,
         body: NodeId,
@@ -25505,8 +25826,20 @@ impl Printer<'_> {
         let previous_for_in_plans = std::mem::take(&mut self.es5_async_for_in_plans);
         let mut hoisted_names = Vec::new();
         let mut hoisted_functions = Vec::new();
+        let mut for_of_pattern_hoists = Vec::new();
         if expression_body.is_none() {
             self.es5_async_for_of_names = self.prepare_es5_async_for_of_names(body);
+            let mut for_of_nodes = Vec::new();
+            self.collect_es5_async_for_of_nodes(body, &mut for_of_nodes);
+            for statement in for_of_nodes {
+                if let Some(temp) = self
+                    .es5_async_for_of_names
+                    .get(&statement)
+                    .and_then(|plan| plan.pattern_temp.clone())
+                {
+                    for_of_pattern_hoists.push(temp);
+                }
+            }
             let mut hoisted_lists = HashSet::new();
             self.collect_es5_async_variable_hoists(body, &mut hoisted_lists, &mut hoisted_names);
             self.collect_es5_async_for_hoists(body, &mut hoisted_lists, &mut hoisted_names);
@@ -25649,6 +25982,12 @@ impl Printer<'_> {
                 self.writer.write(name);
                 index += 1;
             }
+            self.writer.write(";");
+            self.writer.newline();
+        }
+        for temp in &for_of_pattern_hoists {
+            self.writer.write("var ");
+            self.writer.write(temp);
             self.writer.write(";");
             self.writer.newline();
         }
@@ -25795,6 +26134,26 @@ impl Printer<'_> {
             }
         }
         let mut claimed = HashSet::new();
+        let mut for_of_nodes = Vec::new();
+        self.collect_es5_async_for_of_nodes(body, &mut for_of_nodes);
+        let mut has_suspending_for_of = false;
+        for statement in for_of_nodes {
+            if let Some(plan) = self.es5_async_for_of_names.get(&statement) {
+                claimed.insert(plan.counter.clone());
+                claimed.insert(plan.rhs.clone());
+                if let Some(temp) = &plan.value_temp {
+                    claimed.insert(temp.clone());
+                }
+                if let Some(temp) = &plan.pattern_temp {
+                    claimed.insert(temp.clone());
+                }
+            }
+            if let Some(NodeData::ForInOrOfStatement(statement)) =
+                self.arena.get(statement).map(|node| &node.data)
+            {
+                has_suspending_for_of |= self.es5_async_for_of_suspension_count(statement) != 0;
+            }
+        }
         let mut temps = Vec::new();
         let mut captures = HashMap::new();
         for (await_id, capture_nodes) in await_captures {
@@ -25951,7 +26310,8 @@ impl Printer<'_> {
                 },
             );
         }
-        let state_parameter = (!temps.is_empty()).then(|| self.generate_block_temp(body, &claimed));
+        let state_parameter = (!temps.is_empty() || has_suspending_for_of)
+            .then(|| self.generate_block_temp(body, &claimed));
         Es5AsyncCapturePlan {
             temps,
             captures,
@@ -26763,6 +27123,24 @@ impl Printer<'_> {
                         is_last,
                     )
                 }
+                NodeData::ForInOrOfStatement(for_statement)
+                    if labeled_node.kind == SyntaxKind::ForOfStatement =>
+                {
+                    let plan = self
+                        .es5_async_for_of_names
+                        .get(&labeled.statement)
+                        .cloned()
+                        .expect("suspending for-of plan");
+                    self.emit_es5_async_for_of_statement(
+                        labeled.statement,
+                        for_statement,
+                        Some(statement),
+                        &plan,
+                        state,
+                        case,
+                        is_last,
+                    )
+                }
                 _ => self.emit_es5_async_planned_statement(labeled.statement, state, case, is_last),
             };
         }
@@ -26812,6 +27190,25 @@ impl Printer<'_> {
                 .cloned()
                 .expect("suspending for-in plan");
             return self.emit_es5_async_for_in_statement(
+                statement,
+                for_statement,
+                None,
+                &plan,
+                state,
+                case,
+                is_last,
+            );
+        }
+        if let NodeData::ForInOrOfStatement(for_statement) = &node.data
+            && node.kind == SyntaxKind::ForOfStatement
+            && self.es5_async_for_of_suspension_count(for_statement) != 0
+        {
+            let plan = self
+                .es5_async_for_of_names
+                .get(&statement)
+                .cloned()
+                .expect("suspending for-of plan");
+            return self.emit_es5_async_for_of_statement(
                 statement,
                 for_statement,
                 None,
@@ -29699,6 +30096,38 @@ impl Printer<'_> {
         ) + self.es5_async_simple_suspension_count(statement.statement)
     }
 
+    fn es5_async_for_of_suspension_count(
+        &self,
+        statement: &ts_ast::ForInOrOfStatementData,
+    ) -> usize {
+        let default = self.es5_async_for_of_binding_default(statement.initializer);
+        usize::from(
+            self.es5_async_simple_await_in_expression(statement.expression)
+                .is_some(),
+        ) + usize::from(
+            self.es5_async_simple_await_in_expression(statement.initializer)
+                .is_some(),
+        ) + usize::from(
+            default.is_some_and(|default| {
+                self.es5_async_simple_await_in_expression(default).is_some()
+            }),
+        ) + self.es5_async_simple_suspension_count(statement.statement)
+    }
+
+    fn es5_async_for_of_binding_case_advance(&self, initializer: NodeId) -> usize {
+        if self
+            .es5_async_for_of_binding_default(initializer)
+            .is_some_and(|default| self.es5_async_simple_await_in_expression(default).is_some())
+        {
+            3
+        } else {
+            usize::from(
+                self.es5_async_simple_await_in_expression(initializer)
+                    .is_some(),
+            )
+        }
+    }
+
     fn es5_async_statement_ends_in_transformed_with(&self, statement: NodeId) -> bool {
         match self.arena.get(statement).map(|node| &node.data) {
             Some(NodeData::Block(block)) => {
@@ -29830,6 +30259,14 @@ impl Printer<'_> {
             {
                 self.es5_async_for_in_suspension_count(for_statement)
             }
+            Some(NodeData::ForInOrOfStatement(for_statement))
+                if self
+                    .arena
+                    .get(statement)
+                    .is_some_and(|node| node.kind == SyntaxKind::ForOfStatement) =>
+            {
+                self.es5_async_for_of_suspension_count(for_statement)
+            }
             Some(NodeData::SwitchStatement(_)) => self.es5_async_switch_suspension_count(statement),
             Some(NodeData::TryStatement(statement)) => {
                 self.es5_async_try_suspension_count(statement)
@@ -29933,6 +30370,20 @@ impl Printer<'_> {
                             .is_some(),
                     )
                 }) + self.es5_async_case_advance(statement.statement)
+                    + 3
+            }
+            Some(NodeData::ForInOrOfStatement(for_statement))
+                if self
+                    .arena
+                    .get(statement)
+                    .is_some_and(|node| node.kind == SyntaxKind::ForOfStatement)
+                    && self.es5_async_for_of_suspension_count(for_statement) != 0 =>
+            {
+                usize::from(
+                    self.es5_async_simple_await_in_expression(for_statement.expression)
+                        .is_some(),
+                ) + self.es5_async_for_of_binding_case_advance(for_statement.initializer)
+                    + self.es5_async_case_advance(for_statement.statement)
                     + 3
             }
             Some(NodeData::ForInOrOfStatement(for_statement))
@@ -30899,9 +31350,25 @@ impl Printer<'_> {
     fn prepare_es5_async_for_of_names(
         &mut self,
         body: NodeId,
-    ) -> HashMap<NodeId, (String, String, Option<String>)> {
+    ) -> HashMap<NodeId, Es5AsyncForOfPlan> {
         let mut loops = Vec::new();
         self.collect_es5_async_for_of_nodes(body, &mut loops);
+        let body_range = self.arena.get(body).map(|node| node.range);
+        let mut used = self
+            .arena
+            .iter()
+            .filter_map(|(_, node)| {
+                body_range
+                    .is_some_and(|range| {
+                        range.start <= node.range.start && node.range.end <= range.end
+                    })
+                    .then(|| match &node.data {
+                        NodeData::Identifier(identifier) => Some(identifier.text.clone()),
+                        _ => None,
+                    })
+                    .flatten()
+            })
+            .collect::<HashSet<_>>();
         let mut plans = HashMap::new();
         for statement in loops {
             let Some(NodeData::ForInOrOfStatement(data)) =
@@ -30910,16 +31377,58 @@ impl Printer<'_> {
                 continue;
             };
             let expression = data.expression;
-            let (counter, scoped_rhs, binding_temp) =
+            let (counter, scoped_rhs, _) =
                 self.scoped_downlevel_for_of_names(statement, expression);
             let identifier = match self.arena.get(expression).map(|node| &node.data) {
                 Some(NodeData::Identifier(identifier)) => Some(identifier.text.clone()),
                 _ => None,
             };
             let rhs = identifier.map_or(scoped_rhs, |name| self.generated_names.generate(&name));
-            plans.insert(statement, (counter, rhs, binding_temp));
+            used.insert(counter.clone());
+            used.insert(rhs.clone());
+            let default = self.es5_async_for_of_binding_default(data.initializer);
+            let value_temp = default
+                .is_some_and(|default| self.es5_async_simple_await_in_expression(default).is_some())
+                .then(|| Self::generate_scoped_temp(&mut used));
+            let pattern_temp = default.map(|_| Self::generate_scoped_temp(&mut used));
+            plans.insert(
+                statement,
+                Es5AsyncForOfPlan {
+                    counter,
+                    rhs,
+                    pattern_temp,
+                    value_temp,
+                },
+            );
         }
         plans
+    }
+
+    fn es5_async_for_of_binding_default(&self, initializer: NodeId) -> Option<NodeId> {
+        match self.arena.get(initializer).map(|node| &node.data) {
+            Some(NodeData::ArrayLiteralExpression(array)) => {
+                let element = *array.elements.nodes.first()?;
+                let NodeData::BinaryExpression(binary) = &self.arena.get(element)?.data else {
+                    return None;
+                };
+                self.arena
+                    .get(binary.operator_token)
+                    .is_some_and(|node| node.kind == SyntaxKind::EqualsToken)
+                    .then_some(binary.right)
+            }
+            Some(NodeData::ObjectLiteralExpression(object)) => object
+                .properties
+                .nodes
+                .first()
+                .and_then(|property| self.arena.get(*property))
+                .and_then(|property| match &property.data {
+                    NodeData::ShorthandPropertyAssignment(property) => {
+                        property.object_assignment_initializer
+                    }
+                    _ => None,
+                }),
+            _ => None,
+        }
     }
 
     fn collect_es5_async_for_of_nodes(&self, statement: NodeId, loops: &mut Vec<NodeId>) {
@@ -31014,14 +31523,10 @@ impl Printer<'_> {
                     .arena
                     .get(statement)
                     .is_some_and(|node| node.kind == SyntaxKind::ForOfStatement)
-                    && let Some((counter, rhs, binding_temp)) =
-                        self.es5_async_for_of_names.get(&statement)
+                    && let Some(plan) = self.es5_async_for_of_names.get(&statement)
                 {
-                    push_unique(names, counter);
-                    push_unique(names, rhs);
-                    if let Some(binding_temp) = binding_temp {
-                        push_unique(names, binding_temp);
-                    }
+                    push_unique(names, &plan.counter);
+                    push_unique(names, &plan.rhs);
                 }
                 if let Some(NodeData::VariableDeclarationList(list)) = self
                     .arena
@@ -31038,6 +31543,11 @@ impl Printer<'_> {
                             }
                         }
                     }
+                }
+                if let Some(plan) = self.es5_async_for_of_names.get(&statement)
+                    && let Some(value_temp) = &plan.value_temp
+                {
+                    push_unique(names, value_temp);
                 }
                 self.collect_es5_async_for_hoists(for_statement.statement, lists, names);
             }
