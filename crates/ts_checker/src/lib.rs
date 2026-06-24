@@ -4526,6 +4526,7 @@ impl<'a> Checker<'a> {
                 .active_declared_object_instantiations
                 .contains(&cache_key)
             || self.alias_stack.contains(&symbol)
+            || self.class_value_stack.contains(&symbol)
         {
             return Some(self.result.types.any());
         }
@@ -17558,6 +17559,38 @@ mod tests {
 
         assert!(
             result.types.len() < 100,
+            "type count: {}",
+            result.types.len()
+        );
+    }
+
+    #[test]
+    fn does_not_reinstantiate_a_class_for_each_recursive_generic_member() {
+        let parsed = parse_source_file(
+            r"
+                declare class Recursive<T> {
+                    value: T;
+                    static a<U>(value: U): Recursive<U>;
+                    static b<U>(value: U): Recursive<U>;
+                    static c<U>(value: U): Recursive<U>;
+                    static d<U>(value: U): Recursive<U>;
+                    static e<U>(value: U): Recursive<U>;
+                    static f<U>(value: U): Recursive<U>;
+                    static g<U>(value: U): Recursive<U>;
+                    static h<U>(value: U): Recursive<U>;
+                    static i<U>(value: U): Recursive<U>;
+                    static j<U>(value: U): Recursive<U>;
+                    static k<U>(value: U): Recursive<U>;
+                    static l<U>(value: U): Recursive<U>;
+                }
+            ",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+
+        assert!(
+            result.types.len() < 200,
             "type count: {}",
             result.types.len()
         );
