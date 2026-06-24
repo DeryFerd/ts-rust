@@ -268,6 +268,7 @@ pub fn emit_source_file_with_context(
         commonjs_destructuring_assignment_roots: HashSet::new(),
         commonjs_destructuring_assignment_temps: HashMap::new(),
         commonjs_destructuring_assignment_hoists: Vec::new(),
+        downlevel_nullish_temps: HashMap::new(),
         namespace_destructuring_temps: HashMap::new(),
         private_method_plans: HashMap::new(),
         active_private_method_plan: None,
@@ -17628,6 +17629,7 @@ struct Printer<'a> {
     commonjs_destructuring_assignment_roots: HashSet<NodeId>,
     commonjs_destructuring_assignment_temps: HashMap<NodeId, String>,
     commonjs_destructuring_assignment_hoists: Vec<String>,
+    downlevel_nullish_temps: HashMap<NodeId, String>,
     namespace_destructuring_temps: HashMap<NodeId, String>,
     private_method_plans: HashMap<NodeId, PrivateMethodPlan>,
     active_private_method_plan: Option<PrivateMethodPlan>,
@@ -22854,6 +22856,9 @@ impl Printer<'_> {
                 .insert(class_expression, temp.clone());
             temps.push(temp);
         }
+        if is_function_body {
+            self.prepare_downlevel_nullish_temps(block_id, &mut claimed, &mut temps);
+        }
         if !temps.is_empty() {
             self.writer.write("var ");
             self.writer.write(&temps.join(", "));
@@ -22944,6 +22949,7 @@ impl Printer<'_> {
                 field_temps.push(temp);
             }
         }
+        self.prepare_downlevel_nullish_temps(source_file, &mut claimed, &mut field_temps);
         if !field_temps.is_empty() {
             self.writer.write("var ");
             self.writer.write(&field_temps.join(", "));
@@ -23404,6 +23410,109 @@ impl Printer<'_> {
                 }
             }
             count += 1;
+        }
+    }
+
+    fn prepare_downlevel_nullish_temps(
+        &mut self,
+        container: NodeId,
+        claimed: &mut HashSet<String>,
+        temps: &mut Vec<String>,
+    ) {
+        if self.settings.target >= ScriptTarget::Es2020 {
+            return;
+        }
+        let mut expressions = self
+            .arena
+            .iter()
+            .filter_map(|(id, node)| {
+                let NodeData::BinaryExpression(binary) = &node.data else {
+                    return None;
+                };
+                if self
+                    .arena
+                    .get(binary.operator_token)
+                    .is_none_or(|operator| operator.kind != SyntaxKind::QuestionQuestionToken)
+                    || !self.downlevel_nullish_left_needs_temp(binary.left)
+                    || !self.node_belongs_to_temp_scope(id, container)
+                {
+                    return None;
+                }
+                Some((node.range.start.get(), id))
+            })
+            .collect::<Vec<_>>();
+        expressions.sort_by_key(|(start, _)| *start);
+        for (_, expression) in expressions {
+            if self.downlevel_nullish_temps.contains_key(&expression) {
+                continue;
+            }
+            let temp = self.generate_block_temp(container, claimed);
+            claimed.insert(temp.clone());
+            self.downlevel_nullish_temps
+                .insert(expression, temp.clone());
+            temps.push(temp);
+        }
+    }
+
+    fn node_belongs_to_temp_scope(&self, node: NodeId, container: NodeId) -> bool {
+        let mut current = node;
+        while let Some(parent) = self.arena.get(current).and_then(|node| node.parent) {
+            if parent == container {
+                return true;
+            }
+            if matches!(
+                self.arena.get(parent).map(|node| &node.data),
+                Some(
+                    NodeData::FunctionDeclaration(_)
+                        | NodeData::FunctionExpression(_)
+                        | NodeData::ArrowFunction(_)
+                        | NodeData::MethodDeclaration(_)
+                        | NodeData::ConstructorDeclaration(_)
+                        | NodeData::GetAccessorDeclaration(_)
+                        | NodeData::SetAccessorDeclaration(_)
+                )
+            ) {
+                return false;
+            }
+            current = parent;
+        }
+        false
+    }
+
+    fn downlevel_nullish_left_needs_temp(&self, expression: NodeId) -> bool {
+        match self.arena.get(expression).map(|node| &node.data) {
+            Some(
+                NodeData::Identifier(_)
+                | NodeData::NumericLiteral(_)
+                | NodeData::BigIntLiteral(_)
+                | NodeData::StringLiteral(_),
+            )
+            | None => false,
+            Some(NodeData::ParenthesizedExpression(expression)) => {
+                self.downlevel_nullish_left_needs_temp(expression.expression)
+            }
+            Some(NodeData::AsExpression(expression)) => {
+                self.downlevel_nullish_left_needs_temp(expression.expression)
+            }
+            Some(NodeData::SatisfiesExpression(expression)) => {
+                self.downlevel_nullish_left_needs_temp(expression.expression)
+            }
+            Some(NodeData::TypeAssertion(expression)) => {
+                self.downlevel_nullish_left_needs_temp(expression.expression)
+            }
+            Some(NodeData::NonNullExpression(expression)) => {
+                self.downlevel_nullish_left_needs_temp(expression.expression)
+            }
+            Some(_) => self.arena.get(expression).is_none_or(|node| {
+                !matches!(
+                    node.kind,
+                    SyntaxKind::ThisKeyword
+                        | SyntaxKind::SuperKeyword
+                        | SyntaxKind::NullKeyword
+                        | SyntaxKind::TrueKeyword
+                        | SyntaxKind::FalseKeyword
+                )
+            }),
         }
     }
 
@@ -24922,25 +25031,31 @@ impl Printer<'_> {
         };
         let trivia_start = arrow_offset + 2;
         let trivia = &prefix[trivia_start..];
-        let Some(comment_start) = trivia.find("//") else {
-            return;
-        };
-        let comment_end = trivia[comment_start..]
-            .find(['\n', '\r'])
-            .map_or(trivia.len(), |offset| comment_start + offset);
-        let absolute_comment_start = start + trivia_start + comment_start;
-        let absolute_comment_end = start + trivia_start + comment_end;
-        if !self
-            .emitted_source_comments
-            .insert((absolute_comment_start, absolute_comment_end))
-        {
-            return;
+        let mut cursor = 0;
+        let mut emitted_any = false;
+        while let Some(offset) = trivia[cursor..].find("//") {
+            let comment_start = cursor + offset;
+            let comment_end = trivia[comment_start..]
+                .find(['\n', '\r'])
+                .map_or(trivia.len(), |offset| comment_start + offset);
+            let absolute_comment_start = start + trivia_start + comment_start;
+            let absolute_comment_end = start + trivia_start + comment_end;
+            if self
+                .emitted_source_comments
+                .insert((absolute_comment_start, absolute_comment_end))
+            {
+                if !emitted_any && trivia[..comment_start].contains(['\n', '\r']) {
+                    self.writer.newline_preserving_trailing_spaces();
+                }
+                self.writer.write(&trivia[comment_start..comment_end]);
+                self.writer.newline_preserving_trailing_spaces();
+                emitted_any = true;
+            }
+            if comment_end == trivia.len() {
+                break;
+            }
+            cursor = comment_end + 1;
         }
-        if trivia[..comment_start].contains(['\n', '\r']) {
-            self.writer.newline_preserving_trailing_spaces();
-        }
-        self.writer.write(&trivia[comment_start..comment_end]);
-        self.writer.newline_preserving_trailing_spaces();
     }
 
     fn finish_spread_comment_trivia(&mut self, start: u32, end: u32) {
@@ -33146,6 +33261,30 @@ impl Printer<'_> {
             .contains(&expression)
         {
             return self.emit_commonjs_destructuring_assignment(expression, parent_precedence);
+        }
+        if let Some(temp) = self.downlevel_nullish_temps.get(&expression).cloned() {
+            let node = self.node(expression)?.clone();
+            let NodeData::BinaryExpression(binary) = &node.data else {
+                return Err(Self::unsupported(expression, node.kind));
+            };
+            let wrap = parent_precedence > 2;
+            if wrap {
+                self.writer.write("(");
+            }
+            self.writer.write("(");
+            self.writer.write(&temp);
+            self.writer.write(" = ");
+            self.emit_expression(binary.left, 1)?;
+            self.writer.write(") !== null && ");
+            self.writer.write(&temp);
+            self.writer.write(" !== void 0 ? ");
+            self.writer.write(&temp);
+            self.writer.write(" : ");
+            self.emit_expression(binary.right, 2)?;
+            if wrap {
+                self.writer.write(")");
+            }
+            return Ok(());
         }
         if self.settings.target < ScriptTarget::Es2018
             && let Some(NodeData::BinaryExpression(binary)) =

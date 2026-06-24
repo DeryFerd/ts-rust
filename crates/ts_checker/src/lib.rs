@@ -7590,11 +7590,41 @@ impl<'a> Checker<'a> {
             NodeData::TemplateExpression(_) | NodeData::TypeOfExpression(_) => {
                 self.result.types.string()
             }
+            NodeData::JsxElement(_)
+            | NodeData::JsxSelfClosingElement(_)
+            | NodeData::JsxFragment(_) => self.jsx_element_type(),
             NodeData::FunctionDeclaration(data) => self.function_type(data),
             _ => self.result.types.unknown(),
         };
         self.result.node_types.insert(node_id, result);
         result
+    }
+
+    fn jsx_element_type(&mut self) -> TypeId {
+        let Some(namespace) = self.external_names.get("JSX").cloned() else {
+            return self.result.types.any();
+        };
+        let namespace = self.import_type(&namespace);
+        let Some(element) = self.lookup_property_type(namespace, "Element") else {
+            return self.result.types.any();
+        };
+        let Some(kind) = self
+            .result
+            .types
+            .get(element)
+            .map(|type_| type_.kind.clone())
+        else {
+            return self.result.types.any();
+        };
+        let named = self.result.types.alloc(kind);
+        self.result.named_type_references.insert(
+            named,
+            NamedTypeReference {
+                name: "JSX.Element".into(),
+                type_arguments: Vec::new(),
+            },
+        );
+        named
     }
 
     fn has_deep_left_binary_chain(&self, mut node_id: NodeId) -> bool {
