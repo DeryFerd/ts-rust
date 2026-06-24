@@ -162,7 +162,7 @@ impl Default for CompilerOptions {
             emit_bom: false,
             emit_decorator_metadata: false,
             experimental_decorators: false,
-            es_module_interop: false,
+            es_module_interop: true,
             exact_optional_property_types: false,
             force_consistent_casing_in_file_names: false,
             isolated_modules: false,
@@ -715,7 +715,7 @@ impl PartialOptions {
         let module_resolution = self
             .module_resolution
             .unwrap_or_else(|| default_module_resolution(module));
-        let es_module_interop = self.es_module_interop.unwrap_or(false);
+        let es_module_interop = self.es_module_interop.unwrap_or(true);
         CompilerOptions {
             always_strict: self.always_strict.unwrap_or(true),
             allow_arbitrary_extensions: self.allow_arbitrary_extensions.unwrap_or(false),

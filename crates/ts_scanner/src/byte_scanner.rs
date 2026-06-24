@@ -74,6 +74,13 @@ impl<'a> ByteScanner<'a> {
         token
     }
 
+    pub fn rescan_less_than_token(&mut self) -> ByteToken<'a> {
+        let token = self.inner.rescan_less_than_token();
+        let token = self.map_token(token);
+        self.sync_diagnostics();
+        token
+    }
+
     pub fn rescan_slash_token(&mut self) -> ByteToken<'a> {
         let token = self.inner.rescan_slash_token();
         let token = self.map_token(token);

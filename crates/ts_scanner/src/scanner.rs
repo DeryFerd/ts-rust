@@ -421,6 +421,17 @@ impl<'a> Scanner<'a> {
         self.current_token()
     }
 
+    /// Splits a parser-contextual `<<` token so its first character can begin
+    /// type arguments and the second can begin a nested generic function type.
+    pub fn rescan_less_than_token(&mut self) -> Token<'a> {
+        if self.last_kind != SyntaxKind::LessThanLessThanToken {
+            return self.current_token();
+        }
+        self.byte_pos = self.last_start + 1;
+        self.last_kind = SyntaxKind::LessThanToken;
+        self.current_token()
+    }
+
     /// Reinterprets `/` or `/=` as a regular-expression literal.
     pub fn rescan_slash_token(&mut self) -> Token<'a> {
         if !matches!(

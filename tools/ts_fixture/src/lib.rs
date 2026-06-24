@@ -783,11 +783,19 @@ fn compile_case_variant(case: &Case, variant: &OptionVariant) -> std::io::Result
             roots.push(path);
         }
     }
+    let last_unit_uses_implicit_references = case.units.last().is_some_and(|unit| {
+        unit.source_text.as_scannable_str().contains("require(")
+            || unit
+                .source_text
+                .as_scannable_str()
+                .contains("reference path")
+    });
     if project_directory.is_none()
-        && case
+        && (case
             .directive_values("noImplicitReferences")
             .next()
             .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+            || last_unit_uses_implicit_references)
         && let Some(last_root) = roots.pop()
     {
         roots.clear();

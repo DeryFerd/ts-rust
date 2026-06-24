@@ -8976,6 +8976,36 @@ impl<'a> Checker<'a> {
         data: &ts_ast::FunctionExpressionData,
         contextual_type: Option<TypeId>,
     ) -> TypeId {
+        let mut generic_parameters = Vec::new();
+        self.type_parameter_scopes.push(HashMap::new());
+        if let Some(type_parameters) = &data.type_parameters {
+            for type_parameter in &type_parameters.nodes {
+                let Some(NodeData::TypeParameterDeclaration(parameter)) =
+                    self.arena.get(*type_parameter).map(|node| &node.data)
+                else {
+                    continue;
+                };
+                let Some(name) = self.property_name(parameter.name) else {
+                    continue;
+                };
+                let constraint = parameter
+                    .constraint
+                    .map(|constraint| self.type_from_type_node(constraint));
+                let type_id = self.result.types.alloc(TypeKind::TypeParameter {
+                    name: name.clone(),
+                    constraint,
+                });
+                if let Some(default_type) = parameter.default_type {
+                    let default_type = self.type_from_type_node(default_type);
+                    self.type_parameter_defaults.insert(type_id, default_type);
+                }
+                self.type_parameter_scopes
+                    .last_mut()
+                    .expect("function type-parameter scope exists")
+                    .insert(name.clone(), type_id);
+                generic_parameters.push((name, constraint));
+            }
+        }
         let contextual_signature =
             contextual_type.and_then(|type_id| self.contextual_function_signature(type_id));
         let jsdoc = self.jsdoc_signature_types(node_id);
@@ -9077,6 +9107,21 @@ impl<'a> Checker<'a> {
                         )
                     })),
         }));
+        if !generic_parameters.is_empty() {
+            let mut encoded = Vec::with_capacity(generic_parameters.len());
+            let mut constraints = Vec::with_capacity(generic_parameters.len());
+            for (name, constraint) in generic_parameters {
+                encoded.push(format!("{name}={}", u8::from(constraint.is_some())));
+                constraints.push(constraint.unwrap_or_else(|| self.result.types.any()));
+            }
+            self.result.named_type_references.insert(
+                function,
+                NamedTypeReference {
+                    name: format!("__generic_function:{}", encoded.join(",")),
+                    type_arguments: constraints,
+                },
+            );
+        }
         self.apply_javascript_signature_metadata(
             node_id,
             function,
@@ -9084,6 +9129,7 @@ impl<'a> Checker<'a> {
             data.type_,
             Some(data.body),
         );
+        self.type_parameter_scopes.pop();
         function
     }
 
@@ -12229,14 +12275,6 @@ impl<'a> Checker<'a> {
                     ) || symbol.is_some_and(|symbol_id| {
                         self.bindings.symbols.get(symbol_id).is_some_and(|symbol| {
                             symbol.flags.contains(ts_binder::SymbolFlags::TYPE_ALIAS)
-                        }) && self.bindings.exports.iter().any(|(_, exported)| {
-                            exported == symbol_id
-                                || self
-                                    .bindings
-                                    .symbols
-                                    .get(exported)
-                                    .and_then(|exported| exported.target)
-                                    == Some(symbol_id)
                         })
                     }))
                 {
@@ -15670,6 +15708,22 @@ fn exported_reference_names(source: &ProgramSource<'_>) -> BTreeSet<String> {
     names
 }
 
+fn declaration_reference_names(
+    source: &ProgramSource<'_>,
+    symbol_id: SymbolId,
+) -> BTreeSet<String> {
+    let mut names = exported_reference_names(source);
+    let mut current = Some(symbol_id);
+    while let Some(symbol_id) = current {
+        let Some(symbol) = source.bindings.symbols.get(symbol_id) else {
+            break;
+        };
+        names.extend(symbol.members.iter().map(|(name, _)| name.to_owned()));
+        current = symbol.parent;
+    }
+    names
+}
+
 fn describe_source_type(
     source: &ProgramSource<'_>,
     result: &CheckResult,
@@ -16809,7 +16863,7 @@ fn describe_declaration_symbol(
                 let mut checker = Checker::new(source.arena, source.bindings)
                     .with_options(source.checker_options);
                 checker.seed_symbol_types();
-                let mut exported_names = exported_reference_names(source);
+                let mut exported_names = declaration_reference_names(source, symbol_id);
                 let mut type_parameter_scope = HashMap::new();
                 let mut defaults = Vec::new();
                 if let Some(type_parameters) = &declaration.type_parameters {
@@ -16905,7 +16959,7 @@ fn describe_declaration_symbol(
                 let mut checker = Checker::new(source.arena, source.bindings)
                     .with_options(source.checker_options);
                 checker.seed_symbol_types();
-                let mut exported_names = exported_reference_names(source);
+                let mut exported_names = declaration_reference_names(source, symbol_id);
                 exported_names.extend(type_parameters.nodes.iter().filter_map(|parameter| {
                     let NodeData::TypeParameterDeclaration(parameter) =
                         &source.arena.get(*parameter)?.data
@@ -17085,7 +17139,7 @@ fn describe_declaration_symbol(
                 let mut checker = Checker::new(source.arena, source.bindings)
                     .with_options(source.checker_options);
                 checker.seed_symbol_types();
-                let exported_names = exported_reference_names(source);
+                let exported_names = declaration_reference_names(source, symbol_id);
                 if let Some(NodeData::TypeReferenceNode(reference)) =
                     source.arena.get(type_node).map(|node| &node.data)
                     && let Some(target) =
@@ -17134,7 +17188,7 @@ fn describe_declaration_symbol(
         &arguments,
     );
     let mut body = describe_source_type(source, &checker.result, object);
-    let mut exported_names = exported_reference_names(source);
+    let mut exported_names = declaration_reference_names(source, symbol_id);
     exported_names.extend(parameters.iter().cloned());
     if let TypeDescriptor::Object { properties, .. } = &mut body {
         for member in &class.members.nodes {

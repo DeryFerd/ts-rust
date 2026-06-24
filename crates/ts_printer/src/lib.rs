@@ -566,7 +566,8 @@ pub fn emit_source_file_with_context(
             helpers.insert("__classPrivateFieldIn");
             helpers.insert("__classPrivateFieldSet");
         }
-        if (matches!(
+        if printer.es_module_interop
+            && (matches!(
             settings.module,
             ModuleKind::CommonJs | ModuleKind::Amd | ModuleKind::Umd
         ) || (settings.module == ModuleKind::Preserve
@@ -585,8 +586,7 @@ pub fn emit_source_file_with_context(
         {
             helpers.insert("__importStar");
         }
-        if printer.es_module_interop
-            && (matches!(
+        if (matches!(
                 settings.module,
                 ModuleKind::CommonJs | ModuleKind::Amd | ModuleKind::Umd
             ) || (settings.module == ModuleKind::Preserve
@@ -7722,7 +7722,7 @@ impl DeclarationPrinter<'_> {
                     .filter(|arguments| !arguments.is_empty())
                 {
                     self.writer.write("<");
-                    self.emit_semantic_type_list(arguments, ", ")?;
+                    self.emit_semantic_type_argument_list(arguments)?;
                     self.writer.write(">");
                 }
             } else if let Some((local_class, argument)) = declaration
@@ -12984,6 +12984,13 @@ impl DeclarationPrinter<'_> {
     }
 
     fn semantic_type_precedence(&self, id: TypeId) -> SemanticTypePrecedence {
+        if self.named_type_references.is_some_and(|references| {
+            references
+                .get(&id)
+                .is_some_and(|reference| reference.name.starts_with("__generic_function:"))
+        }) {
+            return SemanticTypePrecedence::Function;
+        }
         if self
             .import_type_references
             .is_some_and(|references| references.contains_key(&id))
@@ -13044,7 +13051,7 @@ impl DeclarationPrinter<'_> {
                 self.writer.write(&local_name);
                 if !type_arguments.is_empty() {
                     self.writer.write("<");
-                    self.emit_semantic_type_list(&type_arguments, ", ")?;
+                    self.emit_semantic_type_argument_list(&type_arguments)?;
                     self.writer.write(">");
                 }
                 return Ok(());
@@ -13064,7 +13071,7 @@ impl DeclarationPrinter<'_> {
             }
             if !type_arguments.is_empty() {
                 self.writer.write("<");
-                self.emit_semantic_type_list(&type_arguments, ", ")?;
+                self.emit_semantic_type_argument_list(&type_arguments)?;
                 self.writer.write(">");
             }
             return Ok(());
@@ -13263,7 +13270,7 @@ impl DeclarationPrinter<'_> {
                 .contains(&format!("{} extends", reference.name));
             if !reference.type_arguments.is_empty() && !type_parameter_name {
                 self.writer.write("<");
-                self.emit_semantic_type_list(&reference.type_arguments, ", ")?;
+                self.emit_semantic_type_argument_list(&reference.type_arguments)?;
                 self.writer.write(">");
             }
             return Ok(());
@@ -13628,6 +13635,27 @@ impl DeclarationPrinter<'_> {
                 self.writer.write(separator);
             }
             self.emit_semantic_type(*type_id)?;
+        }
+        Ok(())
+    }
+
+    fn emit_semantic_type_argument_list(&mut self, types: &[TypeId]) -> Result<(), EmitError> {
+        for (index, type_id) in types.iter().enumerate() {
+            if index != 0 {
+                self.writer.write(", ");
+            }
+            let generic_function = self.named_type_references.is_some_and(|references| {
+                references
+                    .get(type_id)
+                    .is_some_and(|reference| reference.name.starts_with("__generic_function:"))
+            });
+            if generic_function {
+                self.writer.write("(");
+            }
+            self.emit_semantic_type(*type_id)?;
+            if generic_function {
+                self.writer.write(")");
+            }
         }
         Ok(())
     }
@@ -23187,8 +23215,13 @@ impl Printer<'_> {
             let alias_chain = self.identifier_text(import.name).is_ok_and(|name| {
                 self.import_name_has_runtime_alias_chain(name, &mut HashSet::new())
             });
+            let unresolved_local_target = self
+                .resolve_entity_symbol(import.module_reference, &mut HashSet::new())
+                .is_none()
+                && !self.entity_root_is_import_alias(import.module_reference);
             self.internal_import_equals_has_runtime_value(import)
-                && (!self.import_equals_is_namespace_member(import)
+                && ((!self.import_equals_is_namespace_member(import)
+                    && unresolved_local_target)
                     || exported
                     || used
                     || export_equals_target
@@ -23267,6 +23300,39 @@ impl Printer<'_> {
         import: &ts_ast::ImportEqualsDeclarationData,
     ) -> bool {
         self.internal_import_equals_has_runtime_value_with_visited(import, &mut HashSet::new())
+    }
+
+    fn entity_root_is_import_alias(&self, mut entity: NodeId) -> bool {
+        while let Some(NodeData::QualifiedName(qualified)) =
+            self.arena.get(entity).map(|node| &node.data)
+        {
+            entity = qualified.left;
+        }
+        let Some(name) = declaration_name_text(self.arena, entity) else {
+            return false;
+        };
+        let Some(symbol) = self
+            .bindings
+            .node_symbols
+            .get(&entity)
+            .copied()
+            .or_else(|| self.bindings.resolve_name_at(entity, name))
+        else {
+            return false;
+        };
+        self.bindings.symbols.get(symbol).is_some_and(|symbol| {
+            symbol.declarations.iter().any(|declaration| {
+                matches!(
+                    self.arena.get(*declaration).map(|node| &node.data),
+                    Some(
+                        NodeData::ImportEqualsDeclaration(_)
+                            | NodeData::ImportSpecifier(_)
+                            | NodeData::ImportClause(_)
+                            | NodeData::NamespaceImport(_)
+                    )
+                )
+            })
+        })
     }
 
     fn internal_import_equals_has_runtime_value_with_visited(
@@ -25188,13 +25254,15 @@ impl Printer<'_> {
                     "else",
                 )
                 .unwrap_or(then_statement.range.end.get());
-            self.emit_for_block_comment_gap(
+            self.emit_source_comments_between_with_ownership(
                 then_statement.range.end.get(),
                 else_start,
-                false,
-                false,
+                true,
+                true,
             );
-            self.writer.newline();
+            if !self.writer.line_start {
+                self.writer.newline();
+            }
             self.writer.write("else");
             self.emit_for_block_comment_gap(
                 else_start.saturating_add(4),

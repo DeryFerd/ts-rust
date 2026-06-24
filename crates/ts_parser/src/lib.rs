@@ -6901,7 +6901,7 @@ impl<'a> Parser<'a> {
                 &[type_name, right],
             );
         }
-        let type_arguments = self.parse_type_arguments();
+        let type_arguments = self.parse_type_arguments_of_type_reference();
         let end = type_arguments
             .as_ref()
             .map_or_else(|| self.node_end(type_name), |arguments| arguments.range.end);
@@ -7014,7 +7014,7 @@ impl<'a> Parser<'a> {
             return import_type;
         }
         let expr_name = self.parse_entity_name();
-        let type_arguments = self.parse_type_arguments();
+        let type_arguments = self.parse_type_arguments_of_type_reference();
         let end = type_arguments
             .as_ref()
             .map_or_else(|| self.node_end(expr_name), |arguments| arguments.range.end);
@@ -7042,7 +7042,7 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        let type_arguments = self.parse_type_arguments();
+        let type_arguments = self.parse_type_arguments_of_type_reference();
         let end = type_arguments.as_ref().map_or_else(
             || qualifier.map_or_else(|| self.node_end(argument), |node| self.node_end(node)),
             |arguments| arguments.range.end,
@@ -7438,6 +7438,20 @@ impl<'a> Parser<'a> {
             nodes: arguments,
             has_trailing_comma: false,
         })
+    }
+
+    fn parse_type_arguments_of_type_reference(&mut self) -> Option<NodeList> {
+        if self
+            .current
+            .flags
+            .contains(ScannerTokenFlags::PRECEDING_LINE_BREAK)
+        {
+            return None;
+        }
+        if self.current.kind == SyntaxKind::LessThanLessThanToken {
+            self.current = self.scanner.rescan_less_than_token();
+        }
+        self.parse_type_arguments()
     }
 
     fn parse_type_member_terminator(&mut self, fallback_end: TextPos) -> TextPos {
