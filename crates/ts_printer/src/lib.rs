@@ -780,22 +780,18 @@ pub fn emit_source_file_with_context(
             printer.emit_leading_pinned_source_comments(start);
         }
     }
-    if is_external_module
-        && (settings.module == ModuleKind::CommonJs
-            || settings.target < ScriptTarget::Es2015)
-    {
-        if settings.module == ModuleKind::CommonJs {
-            printer.prepare_commonjs_destructuring_assignment_temps();
-        }
+    let lowers_destructuring_assignments = settings.target < ScriptTarget::Es2015;
+    let transforms_commonjs_exports =
+        is_external_module && settings.module == ModuleKind::CommonJs;
+    if lowers_destructuring_assignments || transforms_commonjs_exports {
+        printer.prepare_commonjs_destructuring_assignment_temps();
         let mut temps = printer.commonjs_empty_binding_hoists.clone();
-        if settings.module == ModuleKind::CommonJs {
-            temps.extend(
-                printer
-                    .commonjs_destructuring_assignment_hoists
-                    .iter()
-                    .cloned(),
-            );
-        }
+        temps.extend(
+            printer
+                .commonjs_destructuring_assignment_hoists
+                .iter()
+                .cloned(),
+        );
         if !temps.is_empty() {
             printer.writer.write("var ");
             printer.writer.write(&temps.join(", "));
@@ -26612,7 +26608,8 @@ impl Printer<'_> {
                                 | SyntaxKind::ArrayLiteralExpression
                         )
                     )
-                    || !self.commonjs_destructuring_pattern_updates_export(binary.left)
+                    || (self.settings.target >= ScriptTarget::Es2015
+                        && !self.commonjs_destructuring_pattern_updates_export(binary.left))
                 {
                     return None;
                 }
@@ -44351,10 +44348,23 @@ impl Printer<'_> {
                     .parent
                     .and_then(|parent| self.arena.get(parent))
                     .is_some_and(|parent| identifier_is_declaration_name(id, parent));
-                let symbol = (!is_declaration_name
-                    && !self.class_expression_name_exclusions.contains(&id))
-                    .then(|| self.bindings.resolve_name_at(id, &data.text))
-                    .flatten();
+                let symbol = if is_declaration_name {
+                    (self.settings.target < ScriptTarget::Es2015)
+                        .then(|| self.bindings.node_symbols.get(&id).copied())
+                        .flatten()
+                        .filter(|symbol| {
+                            self.bindings.symbols.get(*symbol).is_some_and(|symbol| {
+                                symbol.flags.intersects(SymbolFlags::BLOCK_SCOPED_VARIABLE)
+                            }) && self
+                                .identifier_rewrites
+                                .get(symbol)
+                                .is_some_and(|rewrite| is_identifier_text(rewrite))
+                        })
+                } else if self.class_expression_name_exclusions.contains(&id) {
+                    None
+                } else {
+                    self.bindings.resolve_name_at(id, &data.text)
+                };
                 if let Some(rewrite) = symbol
                     .filter(|symbol| {
                         !self.identifier_is_qualified_enclosing_namespace_root(id, *symbol)
@@ -50317,6 +50327,40 @@ mod tests {
                 "}\n",
             )
         );
+    }
+
+    #[test]
+    fn renames_block_scoped_declarations_and_assignments_when_downleveling() {
+        let output = emit_with(
+            concat!(
+                "var x0, z;\n",
+                "if (true) {\n",
+                "    let x0;\n",
+                "    let z;\n",
+                "    ({ z } = { z: 0 });\n",
+                "}\n",
+            ),
+            ScriptTarget::Es5,
+            ModuleKind::EsNext,
+        )
+        .code;
+        assert!(output.contains("var x0_1;"), "{output}");
+        assert!(output.contains("var z_1;"), "{output}");
+        assert!(output.contains("(z_1 = { z: 0 }.z);"), "{output}");
+    }
+
+    #[test]
+    fn evaluates_downleveled_destructuring_assignment_sources_once() {
+        let output = emit_with(
+            "var a, b; ({ a, b } = getValue());",
+            ScriptTarget::Es5,
+            ModuleKind::EsNext,
+        )
+        .code;
+        assert_eq!(output.matches("getValue()").count(), 1, "{output}");
+        assert!(output.contains(".a"), "{output}");
+        assert!(output.contains(".b"), "{output}");
+        assert!(!output.contains("{ a, b } ="), "{output}");
     }
 
     #[test]
