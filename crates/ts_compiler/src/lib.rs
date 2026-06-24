@@ -3466,6 +3466,7 @@ fn config_diagnostic(diagnostic: &ConfigDiagnostic) -> ProgramDiagnostic {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::time::{Duration, Instant};
 
     use ts_options::{CompilerOptions, ModuleKind, ScriptTarget};
@@ -5277,6 +5278,118 @@ mod tests {
                 "declare module \"index\" {\n",
                 "    export * from \"nested/index\";\n",
                 "}\n",
+            )
+        );
+    }
+
+    #[test]
+    fn path_mapped_ambient_return_types_emit_as_import_types() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/repo/packages/a/index.d.ts",
+            concat!(
+                "declare module '@scope/a' {\n",
+                "    export type Result = { value: string };\n",
+                "    export function create(value: string): Result;\n",
+                "}\n",
+            ),
+        )
+        .unwrap();
+        fs.write_file(
+            "/repo/packages/b/src/index.ts",
+            concat!(
+                "import { create } from '@scope/a';\n",
+                "export function read(value: string) { return create(value); }\n",
+            ),
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/repo/packages/b",
+            &["src/index.ts".to_owned()],
+            CompilerOptions {
+                declaration: true,
+                emit_declaration_only: true,
+                base_url: Some("/repo/packages/b".into()),
+                paths: BTreeMap::from([("@scope/a".into(), vec!["../a".into()])]),
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        assert!(
+            program.diagnostics().is_empty(),
+            "{:?}",
+            program.diagnostics()
+        );
+        let emitted = program.emit();
+        let declaration = emitted
+            .files
+            .iter()
+            .find(|file| file.file_name.ends_with("index.d.ts"))
+            .unwrap();
+        assert_eq!(
+            declaration.text,
+            "export declare function read(value: string): import(\"@scope/a\").Result;\n"
+        );
+    }
+
+    #[test]
+    fn path_mapped_factory_default_export_preserves_imported_type() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/repo/packages/core/src/SvgIcon.d.ts",
+            concat!(
+                "export interface SomeInterface { myProp: string; }\n",
+                "declare const SvgIcon: SomeInterface;\n",
+                "export default SvgIcon;\n",
+            ),
+        )
+        .unwrap();
+        fs.write_file(
+            "/repo/packages/core/src/utils.d.ts",
+            concat!(
+                "import SvgIcon from './SvgIcon';\n",
+                "export function createSvgIcon(path: string, name: string): typeof SvgIcon;\n",
+            ),
+        )
+        .unwrap();
+        fs.write_file(
+            "/repo/packages/lab/src/index.ts",
+            concat!(
+                "import { createSvgIcon } from '@scope/core/utils';\n",
+                "export default createSvgIcon('Hello', 'ArrowLeft');\n",
+            ),
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/repo/packages/lab",
+            &["src/index.ts".to_owned()],
+            CompilerOptions {
+                declaration: true,
+                emit_declaration_only: true,
+                base_url: Some("/repo/packages".into()),
+                paths: BTreeMap::from([("@scope/core/*".into(), vec!["./core/src/*".into()])]),
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        assert!(
+            program.diagnostics().is_empty(),
+            "{:?}",
+            program.diagnostics()
+        );
+        let emitted = program.emit();
+        let declaration = emitted
+            .files
+            .iter()
+            .find(|file| file.file_name.ends_with("index.d.ts"))
+            .unwrap();
+        assert_eq!(
+            declaration.text,
+            concat!(
+                "declare const _default: import(\"@scope/core/SvgIcon\").SomeInterface;\n",
+                "export default _default;\n",
             )
         );
     }

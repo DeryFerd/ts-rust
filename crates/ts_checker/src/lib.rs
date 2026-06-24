@@ -863,7 +863,13 @@ impl<'a> ProgramChecker<'a> {
                 .and_then(|name| identifier_text(source.arena, name))
                 && let Some(descriptor) = target_exports.get("default")
             {
-                imported.insert(local.to_owned(), descriptor.clone());
+                let mut descriptor = descriptor.clone();
+                paint_exported_named_descriptor_imports(
+                    &mut descriptor,
+                    import_specifier,
+                    &target_exports,
+                );
+                imported.insert(local.to_owned(), descriptor);
                 imported_type_references.insert(
                     local.to_owned(),
                     ImportTypeReference {
@@ -892,7 +898,13 @@ impl<'a> ProgramChecker<'a> {
                         continue;
                     };
                     if let Some(descriptor) = target_exports.get(imported_name) {
-                        imported.insert(local_name.to_owned(), descriptor.clone());
+                        let mut descriptor = descriptor.clone();
+                        paint_exported_named_descriptor_imports(
+                            &mut descriptor,
+                            import_specifier,
+                            &target_exports,
+                        );
+                        imported.insert(local_name.to_owned(), descriptor);
                         imported_type_references.insert(
                             local_name.to_owned(),
                             ImportTypeReference {
@@ -1043,6 +1055,7 @@ impl<'a> ProgramChecker<'a> {
             }
         }
         for descriptor in exports.values_mut() {
+            resolve_imported_type_queries(descriptor, &imported);
             paint_imported_named_descriptor_references(descriptor, &imported_type_references);
         }
         exports
@@ -1856,6 +1869,7 @@ impl<'a> ProgramChecker<'a> {
         if let Some(descriptor) = exports.get(imported_name) {
             let mut descriptor = descriptor.clone();
             paint_exported_named_descriptor_imports(&mut descriptor, module_name, exports);
+            rebase_relative_import_references(&mut descriptor, module_name);
             symbols.insert(symbol, descriptor);
             import_references.insert(
                 symbol,
@@ -12945,6 +12959,155 @@ fn paint_imported_named_descriptor_references(
     }
 }
 
+fn resolve_imported_type_queries(
+    descriptor: &mut TypeDescriptor,
+    imports: &BTreeMap<String, TypeDescriptor>,
+) {
+    let replacement = match descriptor {
+        TypeDescriptor::Named { name, .. } => {
+            name.strip_prefix("__imported_type_query:")
+                .and_then(|name| {
+                    let mut parts = name.split('.');
+                    let mut resolved = imports.get(parts.next()?)?.clone();
+                    for property in parts {
+                        resolved = descriptor_property(&resolved, property)?;
+                    }
+                    Some(resolved)
+                })
+        }
+        _ => None,
+    };
+    if let Some(replacement) = replacement {
+        *descriptor = replacement;
+        resolve_imported_type_queries(descriptor, imports);
+        return;
+    }
+    visit_descriptor_children(descriptor, |child| {
+        resolve_imported_type_queries(child, imports);
+    });
+}
+
+fn rebase_relative_import_references(descriptor: &mut TypeDescriptor, imported_module: &str) {
+    if let TypeDescriptor::Import { reference, .. } = descriptor
+        && reference.module_specifier.starts_with('.')
+    {
+        reference.module_specifier =
+            rebase_module_specifier(imported_module, &reference.module_specifier);
+    }
+    visit_descriptor_children(descriptor, |child| {
+        rebase_relative_import_references(child, imported_module);
+    });
+}
+
+fn rebase_module_specifier(imported_module: &str, nested: &str) -> String {
+    let package_root_parts = if imported_module.starts_with('@') {
+        2
+    } else {
+        1
+    };
+    let module_parts = imported_module.split('/').count();
+    let directory = if !imported_module.starts_with('.') && module_parts <= package_root_parts {
+        imported_module
+    } else {
+        imported_module
+            .rsplit_once('/')
+            .map_or("", |(directory, _)| directory)
+    };
+    let combined = if directory.is_empty() {
+        nested.to_owned()
+    } else {
+        format!("{directory}/{nested}")
+    };
+    let explicitly_relative = combined.starts_with("./");
+    let mut parts = Vec::new();
+    for part in combined.split('/') {
+        match part {
+            "" | "." => {}
+            ".." if parts.last().is_some_and(|part| *part != "..") => {
+                parts.pop();
+            }
+            _ => parts.push(part),
+        }
+    }
+    let normalized = parts.join("/");
+    if explicitly_relative && !normalized.starts_with('.') {
+        format!("./{normalized}")
+    } else {
+        normalized
+    }
+}
+
+fn visit_descriptor_children(
+    descriptor: &mut TypeDescriptor,
+    mut visit: impl FnMut(&mut TypeDescriptor),
+) {
+    match descriptor {
+        TypeDescriptor::Named {
+            type_arguments,
+            target,
+            ..
+        } => {
+            for argument in type_arguments {
+                visit(argument);
+            }
+            visit(target);
+        }
+        TypeDescriptor::Import { target, .. } | TypeDescriptor::ConstEnum(target) => visit(target),
+        TypeDescriptor::Alias { body, .. } | TypeDescriptor::Array(body) => visit(body),
+        TypeDescriptor::Tuple(members)
+        | TypeDescriptor::ReadonlyTuple(members)
+        | TypeDescriptor::Union(members)
+        | TypeDescriptor::Intersection(members)
+        | TypeDescriptor::Overload(members) => {
+            for member in members {
+                visit(member);
+            }
+        }
+        TypeDescriptor::Object {
+            properties,
+            string_index_type,
+            number_index_type,
+            call_signatures,
+            construct_signatures,
+            ..
+        } => {
+            for property in properties.values_mut() {
+                visit(property);
+            }
+            if let Some(index) = string_index_type {
+                visit(index);
+            }
+            if let Some(index) = number_index_type {
+                visit(index);
+            }
+            for signature in call_signatures.iter_mut().chain(construct_signatures) {
+                visit(signature);
+            }
+        }
+        TypeDescriptor::Function {
+            parameters,
+            rest_parameter,
+            return_type,
+            ..
+        }
+        | TypeDescriptor::Constructor {
+            parameters,
+            rest_parameter,
+            return_type,
+            ..
+        } => {
+            for parameter in parameters {
+                visit(parameter);
+            }
+            if let Some(rest) = rest_parameter {
+                visit(rest);
+            }
+            visit(return_type);
+        }
+        _ => {}
+    }
+}
+
 fn describe_alias(
     source: &ProgramSource<'_>,
     alias: &ts_ast::TypeAliasDeclarationData,
@@ -13211,6 +13374,12 @@ fn describe_type_node_syntax(
             if exported_names.contains(root) {
                 TypeDescriptor::Named {
                     name: format!("typeof {name}"),
+                    type_arguments: Vec::new(),
+                    target: Box::new(resolved),
+                }
+            } else if imported_type_query_reference(source, Some(node)).is_some() {
+                TypeDescriptor::Named {
+                    name: format!("__imported_type_query:{name}"),
                     type_arguments: Vec::new(),
                     target: Box::new(resolved),
                 }
@@ -15090,7 +15259,7 @@ mod tests {
         Checker, CheckerOptions, EnumConstantValue, FunctionType, ImportTypeReference,
         NamedTypeReference, ObjectType, ProgramChecker, ProgramSource, TypeArena, TypeDescriptor,
         TypeKind, check_program, check_source_file, check_source_file_with_options,
-        describe_type_with_imports_bounded, identifier_text,
+        describe_type_with_imports_bounded, identifier_text, rebase_module_specifier,
     };
 
     struct Builder {
@@ -19002,6 +19171,78 @@ mod tests {
             properties["private"],
             TypeDescriptor::StringLiteral("private".into())
         );
+    }
+
+    #[test]
+    fn preserves_ambient_module_aliases_in_imported_call_returns() {
+        let dependency = parse_source_file(concat!(
+            "declare module '@scope/a' {\n",
+            "    export type Result = { value: string };\n",
+            "    export function create(value: string): Result;\n",
+            "}\n",
+        ));
+        let consumer = parse_source_file(concat!(
+            "import { create } from '@scope/a';\n",
+            "export function read(value: string) { return create(value); }\n",
+        ));
+        let dependency_bindings = bind_source_file(&dependency.arena, dependency.source_file);
+        let consumer_bindings = bind_source_file(&consumer.arena, consumer.source_file);
+        let no_modules = BTreeMap::new();
+        let consumer_modules = BTreeMap::from([("@scope/a".into(), 0)]);
+        let checked = check_program(&[
+            ProgramSource {
+                arena: &dependency.arena,
+                source_file: dependency.source_file,
+                bindings: &dependency_bindings,
+                resolved_modules: &no_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+            ProgramSource {
+                arena: &consumer.arena,
+                source_file: consumer.source_file,
+                bindings: &consumer_bindings,
+                resolved_modules: &consumer_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+        ]);
+        let read = consumer_bindings
+            .root_scope()
+            .unwrap()
+            .symbols
+            .get("read")
+            .unwrap();
+        let read_type = checked.files[1].type_of_symbol(read).unwrap();
+        let TypeKind::Function(read) = &checked.files[1].types.get(read_type).unwrap().kind else {
+            panic!("expected function type");
+        };
+        assert_eq!(
+            checked.files[1]
+                .import_type_references
+                .get(&read.return_type),
+            Some(&ImportTypeReference {
+                module_specifier: "@scope/a".into(),
+                qualifier: "Result".into(),
+                is_typeof: false,
+            })
+        );
+    }
+
+    #[test]
+    fn rebases_nested_relative_imports_through_package_specifiers() {
+        assert_eq!(
+            rebase_module_specifier("@scope/core/utils", "./SvgIcon"),
+            "@scope/core/SvgIcon"
+        );
+        assert_eq!(
+            rebase_module_specifier("@scope/core", "./SvgIcon"),
+            "@scope/core/SvgIcon"
+        );
+        assert_eq!(rebase_module_specifier("core", "./SvgIcon"), "core/SvgIcon");
+        assert_eq!(rebase_module_specifier("./utils", "./SvgIcon"), "./SvgIcon");
     }
 
     #[test]

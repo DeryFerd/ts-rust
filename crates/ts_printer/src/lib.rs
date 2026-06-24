@@ -3112,6 +3112,7 @@ impl DeclarationPrinter<'_> {
                     && !self.statement_is_inferred_class_property_dependency(id)
                     && !self.import_has_non_assertion_type_reference(data)
                     && !self.import_is_used_by_inferred_semantic_variable_type(id, data)
+                    && !self.import_is_used_by_inferred_return(id, data)
                 {
                     return Ok(());
                 }
@@ -4117,6 +4118,9 @@ impl DeclarationPrinter<'_> {
         else {
             return true;
         };
+        if self.import_is_used_by_inferred_return(import_id, import) {
+            return true;
+        }
         let mut names = clause
             .name
             .and_then(|name| declaration_name_text(self.arena, name))
@@ -4156,6 +4160,7 @@ impl DeclarationPrinter<'_> {
                                         if names.contains(identifier_data.text.as_str())
                                 ) && self.node_is_within(identifier, *statement)
                                     && !self.identifier_is_in_untyped_exported_variable(identifier)
+                                    && !self.identifier_is_in_unannotated_function_body(identifier)
                             })
                     })
                 })
@@ -4688,7 +4693,8 @@ impl DeclarationPrinter<'_> {
     }
 
     fn identifier_is_synthesized_export_initializer(&self, identifier: NodeId) -> bool {
-        self.identifier_is_in_untyped_exported_variable(identifier)
+        (self.identifier_is_in_untyped_exported_variable(identifier)
+            || self.identifier_is_in_unannotated_function_body(identifier))
             && !self.identifier_is_in_erased_type_context(identifier)
     }
 
@@ -4733,6 +4739,23 @@ impl DeclarationPrinter<'_> {
             };
             if node_is_erased_type_context(parent_node) {
                 return true;
+            }
+            if matches!(parent_node.data, NodeData::SourceFile(_)) {
+                return false;
+            }
+            current = parent;
+        }
+        false
+    }
+
+    fn identifier_is_in_unannotated_function_body(&self, identifier: NodeId) -> bool {
+        let mut current = identifier;
+        while let Some(parent) = self.arena.get(current).and_then(|node| node.parent) {
+            let Some(parent_node) = self.arena.get(parent) else {
+                return false;
+            };
+            if let NodeData::FunctionDeclaration(function) = &parent_node.data {
+                return function.type_.is_none() && function.body.is_some();
             }
             if matches!(parent_node.data, NodeData::SourceFile(_)) {
                 return false;
@@ -13708,6 +13731,9 @@ impl DeclarationPrinter<'_> {
         if self.inferred_semantic_variable_types_reference_name(name) {
             return true;
         }
+        if self.inferred_return_references_name(name) {
+            return true;
+        }
         self.declaration_reachability.is_none_or(|reachability| {
             reachability.values().any(|retained| {
                 retained.iter().any(|statement| {
@@ -13719,6 +13745,8 @@ impl DeclarationPrinter<'_> {
                                     if identifier_data.text == name
                             ) && self.node_is_within(identifier, *statement)
                                 && (!self.identifier_is_in_untyped_exported_variable(identifier)
+                                    || self.identifier_is_in_erased_type_context(identifier))
+                                && (!self.identifier_is_in_unannotated_function_body(identifier)
                                     || self.identifier_is_in_erased_type_context(identifier))
                         })
                 })
@@ -13769,6 +13797,42 @@ impl DeclarationPrinter<'_> {
                         )
                     })
             })
+        })
+    }
+
+    fn inferred_return_references_name(&self, name: &str) -> bool {
+        self.arena.iter().any(|(id, node)| {
+            if !matches!(
+                &node.data,
+                NodeData::Identifier(identifier) if identifier.text == name
+            ) {
+                return false;
+            }
+            let Some(parent) = node.parent else {
+                return false;
+            };
+            if matches!(
+                self.arena.get(parent).map(|node| &node.data),
+                Some(NodeData::ReturnStatement(return_)) if return_.expression == Some(id)
+            ) {
+                return true;
+            }
+            if !matches!(
+                self.arena.get(parent).map(|node| &node.data),
+                Some(NodeData::NewExpression(new_expression))
+                    if new_expression.expression == id
+            ) {
+                return false;
+            }
+            let mut current = parent;
+            while let Some(ancestor) = self.arena.get(current).and_then(|node| node.parent) {
+                match self.arena.get(ancestor).map(|node| &node.data) {
+                    Some(NodeData::ReturnStatement(_)) => return true,
+                    Some(NodeData::SourceFile(_)) => return false,
+                    _ => current = ancestor,
+                }
+            }
+            false
         })
     }
 
