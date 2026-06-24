@@ -2151,13 +2151,68 @@ impl<'a> ProgramChecker<'a> {
         source: &ProgramSource<'_>,
         statements: &[NodeId],
     ) -> BTreeMap<NodeId, bool> {
-        statements
-            .iter()
-            .filter_map(|statement| {
-                self.import_runtime_meaning(source, *statement)
-                    .map(|meaning| (*statement, meaning))
-            })
-            .collect()
+        let mut meanings = BTreeMap::new();
+        for statement in statements {
+            if let Some(meaning) = self.import_runtime_meaning(source, *statement) {
+                meanings.insert(*statement, meaning);
+            }
+            let Some(NodeData::ExportDeclaration(export)) =
+                source.arena.get(*statement).map(|node| &node.data)
+            else {
+                continue;
+            };
+            let Some(NodeData::NamedExports(exports)) = export
+                .export_clause
+                .and_then(|clause| source.arena.get(clause))
+                .map(|node| &node.data)
+            else {
+                continue;
+            };
+            for specifier in &exports.elements.nodes {
+                if let Some(meaning) =
+                    self.export_specifier_runtime_meaning(source, export, *specifier)
+                {
+                    meanings.insert(*specifier, meaning);
+                }
+            }
+        }
+        meanings
+    }
+
+    fn export_specifier_runtime_meaning(
+        &self,
+        source: &ProgramSource<'_>,
+        export: &ts_ast::ExportDeclarationData,
+        specifier: NodeId,
+    ) -> Option<bool> {
+        if export.is_type_only {
+            return Some(false);
+        }
+        let NodeData::ExportSpecifier(specifier) = &source.arena.get(specifier)?.data else {
+            return None;
+        };
+        if specifier.is_type_only {
+            return Some(false);
+        }
+        let module = string_literal_text(source.arena, export.module_specifier?)?;
+        let target = source.resolved_modules.get(module).copied()?;
+        let imported = specifier.property_name.unwrap_or(specifier.name);
+        let name = module_export_name_text(source.arena, imported)?;
+        let runtime = self.module_export_name_has_runtime_value(
+            target,
+            name,
+            &mut HashSet::new(),
+        );
+        if runtime {
+            return Some(true);
+        }
+        let exports = self.resolved_module_export_symbols(target, module);
+        if exports.contains_key("export=") && !exports.contains_key(name) {
+            return None;
+        }
+        (exports.contains_key(name)
+            || self.module_export_name_is_explicitly_type_only(target, name))
+        .then_some(false)
     }
 
     #[allow(clippy::too_many_arguments)]
