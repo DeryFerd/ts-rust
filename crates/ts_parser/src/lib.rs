@@ -2246,7 +2246,10 @@ impl<'a> Parser<'a> {
 
     fn is_index_signature(&mut self) -> bool {
         let checkpoint = self.scanner.mark();
-        let name = self.scanner.scan();
+        let mut name = self.scanner.scan();
+        while name.kind.is_modifier() {
+            name = self.scanner.scan();
+        }
         let colon = self.scanner.scan();
         self.scanner.rewind(checkpoint);
         (name.kind == SyntaxKind::Identifier || name.kind.is_keyword())
