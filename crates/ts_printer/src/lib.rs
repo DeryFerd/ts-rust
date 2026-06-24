@@ -21621,40 +21621,27 @@ impl Printer<'_> {
         parameters: &NodeList,
     ) -> Result<Vec<(NodeId, String)>, EmitError> {
         let mut bindings = Vec::new();
-        self.writer.write("(");
-        let emitted_parameters = parameters
-            .nodes
-            .iter()
-            .filter(|parameter_id| {
-                !matches!(
-                    self.arena.get(**parameter_id).map(|node| &node.data),
-                    Some(NodeData::ParameterDeclaration(parameter))
-                        if parameter.dot_dot_dot_token.is_some()
-                            || self.identifier_text(parameter.name).ok() == Some("this")
-                )
-            })
-            .copied()
-            .collect::<Vec<_>>();
-        for (index, parameter_id) in emitted_parameters.iter().enumerate() {
-            if index != 0 {
-                self.writer.write(", ");
-            }
+        let mut overrides = Vec::new();
+        for parameter_id in &parameters.nodes {
             let parameter_node = self.node(*parameter_id)?.clone();
             let NodeData::ParameterDeclaration(parameter) = &parameter_node.data else {
                 return Err(Self::unsupported(*parameter_id, parameter_node.kind));
             };
+            if parameter.dot_dot_dot_token.is_some()
+                || self.identifier_text(parameter.name).ok() == Some("this")
+            {
+                continue;
+            }
             if matches!(
                 self.arena.get(parameter.name).map(|node| &node.data),
                 Some(NodeData::BindingPattern(_))
             ) {
                 let temp = self.generated_names.generate_temp();
-                self.writer.write(&temp);
-                bindings.push((parameter.name, temp));
-            } else {
-                self.emit_expression(parameter.name, 0)?;
+                bindings.push((parameter.name, temp.clone()));
+                overrides.push((*parameter_id, parameter.name, temp));
             }
         }
-        self.writer.write(")");
+        self.emit_parameters_with_name_overrides(parameters, false, &overrides)?;
         Ok(bindings)
     }
 
@@ -32154,6 +32141,24 @@ mod tests {
             .code,
             "var b = function (_a) {\n    var _b = \"key\", renamed = _a[_b];\n    return renamed;\n};\n"
         );
+    }
+
+    #[test]
+    fn preserves_parameter_comments_when_downleveling_arrows() {
+        let output = emit_with(
+            concat!(
+                "const add = /** arrow */ (/** a */ a: number, /** b */ b: number) => a + b;\n",
+                "const value = { f: /** own */ (/** item */ item: string) => item };\n",
+            ),
+            ScriptTarget::Es5,
+            ModuleKind::EsNext,
+        )
+        .code;
+        assert!(
+            output.contains("function (/** a */ a, /** b */ b)"),
+            "{output}"
+        );
+        assert!(output.contains("function (/** item */ item)"), "{output}");
     }
 
     #[test]
