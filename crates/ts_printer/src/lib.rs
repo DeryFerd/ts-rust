@@ -82,6 +82,7 @@ pub struct EmitContext<'a> {
     pub preserve_dynamic_import: bool,
     pub isolated_modules: bool,
     pub strict_null_checks: bool,
+    pub force_use_strict: bool,
     pub jsx_factory: Option<&'a str>,
     pub downlevel_iteration: bool,
     /// Controls whether JSX-generated runtime imports make an otherwise-script file a module.
@@ -221,6 +222,7 @@ pub fn emit_source_file_with_settings_and_bindings(
             preserve_dynamic_import: false,
             isolated_modules: false,
             strict_null_checks: false,
+            force_use_strict: false,
             jsx_factory: None,
             downlevel_iteration: false,
             module_detection: ModuleDetectionKind::Auto,
@@ -477,11 +479,12 @@ pub fn emit_source_file_with_context(
         && !context.preserve_dynamic_import
         && source_has_dynamic_import(arena);
     if !has_use_strict
-        && !preserves_external_module_syntax
-        && (settings.always_strict
-            || (settings.module == ModuleKind::CommonJs && is_external_module)
-            || needs_async_generator_helper
-            || !printer.private_method_plans.is_empty())
+        && (context.force_use_strict
+            || (!preserves_external_module_syntax
+                && (settings.always_strict
+                    || (settings.module == ModuleKind::CommonJs && is_external_module)
+                    || needs_async_generator_helper
+                    || !printer.private_method_plans.is_empty())))
     {
         printer.writer.write("\"use strict\";");
         printer.writer.newline();
@@ -21093,7 +21096,7 @@ impl Printer<'_> {
                 return false;
             };
             match parent.data {
-                NodeData::ModuleBlock(_) => return true,
+                NodeData::Block(_) | NodeData::ModuleBlock(_) => return true,
                 NodeData::ModuleDeclaration(_) => declaration = Some(parent_id),
                 _ => return false,
             }
@@ -26291,7 +26294,17 @@ impl Printer<'_> {
                 self.writer.write(" = void 0");
             }
         }
-        if keyword != "const" {
+        let ends_with_missing_initializer = data
+            .declarations
+            .nodes
+            .last()
+            .and_then(|declaration| self.arena.get(*declaration))
+            .and_then(|node| match &node.data {
+                NodeData::VariableDeclaration(declaration) => declaration.initializer,
+                _ => None,
+            })
+            .is_some_and(|initializer| self.expression_emits_nothing(initializer));
+        if keyword != "const" && !ends_with_missing_initializer {
             self.writer.remove_trailing_spaces();
         }
         Ok(())
@@ -30773,7 +30786,7 @@ impl Printer<'_> {
                 if numeric_name {
                     self.writer.write(&member_name);
                 } else {
-                    write_quoted(&mut self.writer, &member_name);
+                    self.write_enum_member_quoted_name(member.name, &member_name);
                 }
                 self.writer.write("] = ");
                 if let Some(constant) = constant {
@@ -30790,7 +30803,7 @@ impl Printer<'_> {
                 if numeric_name {
                     self.writer.write(&member_name);
                 } else {
-                    write_quoted(&mut self.writer, &member_name);
+                    self.write_enum_member_quoted_name(member.name, &member_name);
                 }
                 self.writer.write("] = ");
                 if let Some(constant) = constant {
@@ -30817,7 +30830,7 @@ impl Printer<'_> {
                 if numeric_name {
                     self.writer.write(&member_name);
                 } else {
-                    write_quoted(&mut self.writer, &member_name);
+                    self.write_enum_member_quoted_name(member.name, &member_name);
                 }
             }
             self.writer.write(";");
@@ -33409,6 +33422,11 @@ impl Printer<'_> {
                         self.source_has_line_break_after_property_dot(data.expression, data.name);
                     let expression_end = self.node(data.expression)?.range.end.get();
                     let name_start = self.node(data.name)?.range.start.get();
+                    let name = self.node(data.name)?.clone();
+                    let missing_name = matches!(
+                        &name.data,
+                        NodeData::Identifier(identifier) if identifier.text.is_empty()
+                    );
                     if break_before_dot {
                         self.writer.indent += 1;
                         self.writer.newline();
@@ -33425,14 +33443,9 @@ impl Printer<'_> {
                         self.emit_block_comment_trivia(expression_end, name_start, false);
                     }
                     if break_after_dot {
-                        self.writer.indent += 1;
+                        self.writer.indent += usize::from(!missing_name);
                         self.writer.newline();
                     }
-                    let name = self.node(data.name)?.clone();
-                    let missing_name = matches!(
-                        &name.data,
-                        NodeData::Identifier(identifier) if identifier.text.is_empty()
-                    );
                     if missing_name
                         && let Some((start, trivia)) = usize::try_from(expression_end)
                             .ok()
@@ -33455,7 +33468,7 @@ impl Printer<'_> {
                         _ => self.emit_expression(data.name, 18)?,
                     }
                     if break_after_dot {
-                        self.writer.indent -= 1;
+                        self.writer.indent -= usize::from(!missing_name);
                     }
                 }
             }
@@ -34302,7 +34315,7 @@ impl Printer<'_> {
             }
             NodeData::FunctionExpression(data) => {
                 let previous_static_capture = self.class_static_this_capture.take();
-                let wrap = parent_precedence > 18;
+                let wrap = parent_precedence >= 18;
                 if wrap {
                     self.writer.write("(");
                 }
@@ -34554,10 +34567,24 @@ impl Printer<'_> {
         self.writer.write(", ");
         self.emit_jsx_attributes(attributes, false)?;
         if let Some(children) = children {
-            for child in semantic_jsx_children(self.arena, children) {
-                self.writer.write(", ");
+            let semantic_children = semantic_jsx_children(self.arena, children);
+            let multiline = semantic_children.len() > 1
+                && usize::try_from(children.range.start.get())
+                    .ok()
+                    .zip(usize::try_from(children.range.end.get()).ok())
+                    .and_then(|(start, end)| self.source_text.get(start..end))
+                    .is_some_and(|source| source.contains(['\n', '\r']));
+            self.writer.indent += usize::from(multiline);
+            for child in semantic_children {
+                self.writer.write(",");
+                if multiline {
+                    self.writer.newline();
+                } else {
+                    self.writer.write(" ");
+                }
                 self.emit_jsx_child(child, false)?;
             }
+            self.writer.indent -= usize::from(multiline);
         }
         self.writer.write(")");
         Ok(())
@@ -34921,7 +34948,9 @@ impl Printer<'_> {
         let node = self.node(id)?.clone();
         match &node.data {
             NodeData::JsxText(text) if preserve => self.writer.write(&text.text),
-            NodeData::JsxText(text) => write_quoted(&mut self.writer, &text.text),
+            NodeData::JsxText(text) => {
+                write_quoted(&mut self.writer, &normalize_jsx_text(&text.text));
+            }
             NodeData::JsxExpression(expression) if preserve => {
                 self.writer.write("{");
                 if let Some(expression) = expression.expression {
@@ -36549,17 +36578,27 @@ impl Printer<'_> {
 
     fn expression_statement_starts_with_erased_function(&self, expression: NodeId) -> bool {
         match self.arena.get(expression).map(|node| &node.data) {
+            Some(NodeData::FunctionExpression(_) | NodeData::ObjectLiteralExpression(_)) => true,
             Some(NodeData::CallExpression(data)) => {
-                self.expression_statement_starts_with_erased_function(data.expression)
+                self.arrow_expression_starts_with_object_literal(data.expression)
             }
             Some(NodeData::PropertyAccessExpression(data)) => {
-                self.expression_statement_starts_with_erased_function(data.expression)
+                self.arrow_expression_starts_with_object_literal(data.expression)
             }
             Some(NodeData::ElementAccessExpression(data)) => {
-                self.expression_statement_starts_with_erased_function(data.expression)
+                self.arrow_expression_starts_with_object_literal(data.expression)
             }
             Some(NodeData::NonNullExpression(data)) => {
                 self.expression_statement_starts_with_erased_function(data.expression)
+            }
+            Some(NodeData::AsExpression(data)) => {
+                self.asserted_expression_needs_statement_parentheses(data.expression)
+            }
+            Some(NodeData::SatisfiesExpression(data)) => {
+                self.asserted_expression_needs_statement_parentheses(data.expression)
+            }
+            Some(NodeData::TypeAssertion(data)) => {
+                self.asserted_expression_needs_statement_parentheses(data.expression)
             }
             Some(NodeData::ParenthesizedExpression(data)) => {
                 let asserted_expression =
@@ -36573,6 +36612,29 @@ impl Printer<'_> {
                         Some(NodeData::FunctionExpression(_))
                     )
                 })
+            }
+            _ => false,
+        }
+    }
+
+    fn asserted_expression_needs_statement_parentheses(&self, expression: NodeId) -> bool {
+        self.arrow_expression_starts_with_object_literal(expression)
+            || matches!(
+                self.arena.get(expression).map(|node| &node.data),
+                Some(NodeData::FunctionExpression(_))
+            )
+    }
+
+    fn expression_emits_nothing(&self, expression: NodeId) -> bool {
+        match self.arena.get(expression).map(|node| &node.data) {
+            Some(NodeData::Identifier(identifier)) => identifier.text.is_empty(),
+            Some(NodeData::AsExpression(data)) => self.expression_emits_nothing(data.expression),
+            Some(NodeData::SatisfiesExpression(data)) => {
+                self.expression_emits_nothing(data.expression)
+            }
+            Some(NodeData::TypeAssertion(data)) => self.expression_emits_nothing(data.expression),
+            Some(NodeData::NonNullExpression(data)) => {
+                self.expression_emits_nothing(data.expression)
             }
             _ => false,
         }
@@ -36608,6 +36670,9 @@ impl Printer<'_> {
                 self.arrow_expression_starts_with_object_literal(data.expression)
             }
             Some(NodeData::PropertyAccessExpression(data)) => {
+                self.arrow_expression_starts_with_object_literal(data.expression)
+            }
+            Some(NodeData::CallExpression(data)) => {
                 self.arrow_expression_starts_with_object_literal(data.expression)
             }
             Some(NodeData::ElementAccessExpression(data)) => {
@@ -36809,6 +36874,64 @@ impl Printer<'_> {
             NodeData::BigIntLiteral(data) => Ok((data.text.to_ascii_lowercase(), true)),
             NodeData::ComputedPropertyName(data) => self.enum_member_name_text(data.expression),
             _ => Err(Self::unsupported(id, node.kind)),
+        }
+    }
+
+    fn write_enum_member_quoted_name(&mut self, id: NodeId, text: &str) {
+        let literal = match self.arena.get(id).map(|node| &node.data) {
+            Some(NodeData::StringLiteral(_)) => Some(id),
+            Some(NodeData::ComputedPropertyName(data)) => {
+                self.enum_member_string_literal(data.expression)
+            }
+            _ => None,
+        };
+        let raw = literal.and_then(|literal| {
+            let node = self.arena.get(literal)?;
+            let start = usize::try_from(node.range.start.get()).ok()?;
+            let end = usize::try_from(node.range.end.get()).ok()?;
+            self.source_text.get(start..end).map(str::to_owned)
+        });
+        let Some(raw) = raw.filter(|raw| {
+            let bytes = raw.as_bytes();
+            bytes.len() >= 2
+                && matches!(bytes.first(), Some(b'\'' | b'"'))
+                && bytes.last() == bytes.first()
+        }) else {
+            write_quoted(&mut self.writer, text);
+            return;
+        };
+        if raw.starts_with('"') {
+            self.writer.write(&raw);
+            return;
+        }
+        self.writer.write("\"");
+        let mut characters = raw[1..raw.len() - 1].chars().peekable();
+        while let Some(character) = characters.next() {
+            if character == '\\' {
+                match characters.next() {
+                    Some('\'') => self.writer.write("'"),
+                    Some(escaped) => {
+                        self.writer.write("\\");
+                        self.writer.write(&escaped.to_string());
+                    }
+                    None => self.writer.write("\\"),
+                }
+            } else if character == '"' {
+                self.writer.write("\\\"");
+            } else {
+                self.writer.write(&character.to_string());
+            }
+        }
+        self.writer.write("\"");
+    }
+
+    fn enum_member_string_literal(&self, id: NodeId) -> Option<NodeId> {
+        match self.arena.get(id).map(|node| &node.data) {
+            Some(NodeData::StringLiteral(_)) => Some(id),
+            Some(NodeData::ComputedPropertyName(data)) => {
+                self.enum_member_string_literal(data.expression)
+            }
+            _ => None,
         }
     }
 
@@ -37947,6 +38070,7 @@ mod tests {
                 preserve_dynamic_import: false,
                 isolated_modules: false,
                 strict_null_checks: false,
+                force_use_strict: false,
                 jsx_factory: None,
                 downlevel_iteration: false,
                 module_detection: ModuleDetectionKind::Auto,
@@ -38074,6 +38198,7 @@ mod tests {
                 preserve_dynamic_import: false,
                 isolated_modules: false,
                 strict_null_checks: false,
+                force_use_strict: false,
                 jsx_factory: None,
                 downlevel_iteration: false,
                 module_detection: ModuleDetectionKind::Auto,
@@ -39799,6 +39924,7 @@ mod tests {
                 preserve_dynamic_import: false,
                 isolated_modules: false,
                 strict_null_checks: false,
+                force_use_strict: false,
                 jsx_factory: None,
                 downlevel_iteration: false,
                 module_detection: ModuleDetectionKind::Auto,
@@ -40323,6 +40449,7 @@ mod tests {
                     preserve_dynamic_import: false,
                     isolated_modules: false,
                     strict_null_checks: false,
+                    force_use_strict: false,
                     jsx_factory: None,
                     downlevel_iteration: false,
                     module_detection: ModuleDetectionKind::Auto,
@@ -42462,6 +42589,7 @@ class Board {
                 preserve_dynamic_import: false,
                 isolated_modules: false,
                 strict_null_checks: false,
+                force_use_strict: false,
                 jsx_factory: None,
                 downlevel_iteration: false,
                 module_detection: ModuleDetectionKind::Auto,

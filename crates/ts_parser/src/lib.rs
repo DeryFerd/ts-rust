@@ -4860,6 +4860,11 @@ impl<'a> Parser<'a> {
                 continue;
             }
             if self.current.kind != SyntaxKind::CommaToken {
+                if token_starts_argument_expression(self.current.kind) {
+                    self.error_current("Expected ','.");
+                    trailing = false;
+                    continue;
+                }
                 break;
             }
             self.bump();
@@ -6096,7 +6101,10 @@ impl<'a> Parser<'a> {
             .contains(ScannerTokenFlags::PRECEDING_LINE_BREAK)
             && matches!(
                 self.current.kind,
-                SyntaxKind::VarKeyword | SyntaxKind::LetKeyword | SyntaxKind::ConstKeyword
+                SyntaxKind::VarKeyword
+                    | SyntaxKind::LetKeyword
+                    | SyntaxKind::ConstKeyword
+                    | SyntaxKind::NamespaceKeyword
             )
         {
             let position = self.current.range.start;
@@ -7387,6 +7395,48 @@ fn is_prefix_operator(kind: SyntaxKind) -> bool {
             | SyntaxKind::PlusPlusToken
             | SyntaxKind::MinusMinusToken
     )
+}
+
+fn token_starts_argument_expression(kind: SyntaxKind) -> bool {
+    matches!(
+        kind,
+        SyntaxKind::Identifier
+            | SyntaxKind::PrivateIdentifier
+            | SyntaxKind::NumericLiteral
+            | SyntaxKind::BigIntLiteral
+            | SyntaxKind::StringLiteral
+            | SyntaxKind::ImportKeyword
+            | SyntaxKind::FunctionKeyword
+            | SyntaxKind::ClassKeyword
+            | SyntaxKind::AtToken
+            | SyntaxKind::NoSubstitutionTemplateLiteral
+            | SyntaxKind::NullKeyword
+            | SyntaxKind::TrueKeyword
+            | SyntaxKind::FalseKeyword
+            | SyntaxKind::UndefinedKeyword
+            | SyntaxKind::ThisKeyword
+            | SyntaxKind::SuperKeyword
+            | SyntaxKind::ImplementsKeyword
+            | SyntaxKind::InterfaceKeyword
+            | SyntaxKind::LetKeyword
+            | SyntaxKind::PackageKeyword
+            | SyntaxKind::StaticKeyword
+            | SyntaxKind::OpenParenToken
+            | SyntaxKind::OpenBracketToken
+            | SyntaxKind::OpenBraceToken
+            | SyntaxKind::TemplateHead
+            | SyntaxKind::LessThanToken
+            | SyntaxKind::SlashToken
+            | SyntaxKind::SlashEqualsToken
+            | SyntaxKind::AwaitKeyword
+            | SyntaxKind::YieldKeyword
+            | SyntaxKind::TypeOfKeyword
+            | SyntaxKind::VoidKeyword
+            | SyntaxKind::DeleteKeyword
+            | SyntaxKind::NewKeyword
+    ) || is_keyword_type(kind)
+        || is_contextual_keyword(kind)
+        || is_prefix_operator(kind)
 }
 
 fn is_keyword_type(kind: SyntaxKind) -> bool {

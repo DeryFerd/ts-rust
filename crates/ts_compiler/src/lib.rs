@@ -532,15 +532,23 @@ impl Program {
             let enum_access_values = enum_values_for_emit(&source_file.checking.enum_access_values);
             if settings.emit_javascript {
                 let mut source_settings = settings;
-                if source_file.file_name.to_ascii_lowercase().ends_with(".cts") {
-                    source_settings.module = ModuleKind::CommonJs;
-                } else if matches!(
-                    source_settings.module,
-                    ModuleKind::Node16
-                        | ModuleKind::Node18
-                        | ModuleKind::Node20
-                        | ModuleKind::NodeNext
-                ) {
+                let lower_file_name = source_file.file_name.to_ascii_lowercase();
+                let fixed_es_module = [".mts", ".mjs"]
+                    .iter()
+                    .any(|extension| lower_file_name.ends_with(extension));
+                let fixed_module_format = fixed_es_module
+                    || [".cts", ".cjs"]
+                        .iter()
+                        .any(|extension| lower_file_name.ends_with(extension));
+                if fixed_module_format
+                    || matches!(
+                        source_settings.module,
+                        ModuleKind::Node16
+                            | ModuleKind::Node18
+                            | ModuleKind::Node20
+                            | ModuleKind::NodeNext
+                    )
+                {
                     source_settings.module = source_file.implied_node_format;
                 }
                 let amd_dependencies = source_file
@@ -609,6 +617,7 @@ impl Program {
                     ),
                     isolated_modules: self.options.isolated_modules,
                     strict_null_checks: self.options.strict_null_checks,
+                    force_use_strict: fixed_es_module && settings.module == ModuleKind::CommonJs,
                     jsx_factory: self.options.jsx_factory.as_deref(),
                     downlevel_iteration: self.options.downlevel_iteration,
                     module_detection: self.options.module_detection,
@@ -884,6 +893,7 @@ impl Program {
                     ),
                     isolated_modules: self.options.isolated_modules,
                     strict_null_checks: self.options.strict_null_checks,
+                    force_use_strict: false,
                     jsx_factory: self.options.jsx_factory.as_deref(),
                     downlevel_iteration: self.options.downlevel_iteration,
                     module_detection: self.options.module_detection,
