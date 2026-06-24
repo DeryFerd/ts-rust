@@ -320,6 +320,7 @@ pub fn emit_source_file_with_context(
         es5_async_hoisted_variable_lists: HashSet::new(),
         es5_async_hoisted_function_declarations: HashSet::new(),
         es5_async_for_of_names: HashMap::new(),
+        es5_async_for_in_plans: HashMap::new(),
         async_loop_counter: 0,
         async_control_counter: 0,
         commonjs_empty_binding_temps: HashMap::new(),
@@ -17490,7 +17491,16 @@ struct Es5AsyncCapturePlan {
     try_catch_temps: HashMap<NodeId, String>,
     try_catch_hoists: Vec<String>,
     with_temps: HashMap<NodeId, String>,
+    for_in_plans: HashMap<NodeId, Es5AsyncForInPlan>,
     state_parameter: Option<String>,
+}
+
+#[derive(Clone)]
+struct Es5AsyncForInPlan {
+    object: String,
+    keys: String,
+    key: String,
+    index: String,
 }
 
 #[derive(Clone)]
@@ -18267,6 +18277,7 @@ struct Printer<'a> {
     es5_async_hoisted_variable_lists: HashSet<NodeId>,
     es5_async_hoisted_function_declarations: HashSet<NodeId>,
     es5_async_for_of_names: HashMap<NodeId, (String, String, Option<String>)>,
+    es5_async_for_in_plans: HashMap<NodeId, Es5AsyncForInPlan>,
     async_loop_counter: u32,
     async_control_counter: u32,
     commonjs_empty_binding_temps: HashMap<NodeId, Vec<String>>,
@@ -25289,6 +25300,179 @@ impl Printer<'_> {
     }
 
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn emit_es5_async_for_in_statement(
+        &mut self,
+        statement_id: NodeId,
+        statement: &ts_ast::ForInOrOfStatementData,
+        label: Option<NodeId>,
+        plan: &Es5AsyncForInPlan,
+        state: &str,
+        case: &mut usize,
+        is_last: bool,
+    ) -> Result<(), EmitError> {
+        let start_case = *case;
+        let expression_await = self.es5_async_simple_await_in_expression(statement.expression);
+        let initializer_await = self.es5_async_simple_await_in_expression(statement.initializer);
+        let head_case = start_case + usize::from(expression_await.is_some()) + 1;
+        let increment_case = head_case
+            + usize::from(initializer_await.is_some())
+            + self.es5_async_case_advance(statement.statement)
+            + 1;
+        let exit_case = increment_case + 1;
+
+        if let Some(await_id) = expression_await {
+            let NodeData::AwaitExpression(awaited) = &self.node(await_id)?.data else {
+                unreachable!("await expression identified above")
+            };
+            let awaited_expression = awaited.expression;
+            self.emit_es5_async_yield(awaited_expression, case, false)?;
+            let previous = self
+                .es5_async_expression_rewrites
+                .insert(await_id, format!("{state}.sent()"));
+            self.writer.write(&plan.object);
+            self.writer.write(" = ");
+            self.emit_expression(statement.expression, 1)?;
+            self.writer.write(";");
+            self.writer.newline();
+            self.restore_es5_async_expression_rewrite(await_id, previous);
+        } else {
+            if !self.writer.line_start {
+                self.writer.newline();
+            }
+            self.writer.write(&plan.object);
+            self.writer.write(" = ");
+            self.emit_expression(statement.expression, 1)?;
+            self.writer.write(";");
+            self.writer.newline();
+        }
+        self.writer.write(&plan.keys);
+        self.writer.write(" = [];");
+        self.writer.newline();
+        self.writer.write("for (");
+        self.writer.write(&plan.key);
+        self.writer.write(" in ");
+        self.writer.write(&plan.object);
+        self.writer.write(")");
+        self.writer.newline();
+        self.writer.indent += 1;
+        self.writer.write(&plan.keys);
+        self.writer.write(".push(");
+        self.writer.write(&plan.key);
+        self.writer.write(");");
+        self.writer.newline();
+        self.writer.indent -= 1;
+        self.writer.write(&plan.index);
+        self.writer.write(" = 0;");
+        self.writer.newline();
+        self.writer.write(state);
+        self.writer.write(".label = ");
+        self.writer.write(&head_case.to_string());
+        self.writer.write(";");
+        self.writer.newline();
+
+        self.emit_es5_async_case_label(head_case, false);
+        *case = head_case;
+        self.writer.write("if (!(");
+        self.writer.write(&plan.index);
+        self.writer.write(" < ");
+        self.writer.write(&plan.keys);
+        self.writer.write(".length)) return [3 /*break*/, ");
+        self.writer.write(&exit_case.to_string());
+        self.writer.write("];");
+        self.writer.newline();
+        self.writer.write(&plan.key);
+        self.writer.write(" = ");
+        self.writer.write(&plan.keys);
+        self.writer.write("[");
+        self.writer.write(&plan.index);
+        self.writer.write("];");
+        self.writer.newline();
+        self.writer.write("if (!(");
+        self.writer.write(&plan.key);
+        self.writer.write(" in ");
+        self.writer.write(&plan.object);
+        self.writer.write(")) return [3 /*break*/, ");
+        self.writer.write(&increment_case.to_string());
+        self.writer.write("];");
+        self.writer.newline();
+
+        if let Some(await_id) = initializer_await {
+            let NodeData::AwaitExpression(awaited) = &self.node(await_id)?.data else {
+                unreachable!("await expression identified above")
+            };
+            let awaited_expression = awaited.expression;
+            self.emit_es5_async_yield(awaited_expression, case, false)?;
+            let previous = self
+                .es5_async_expression_rewrites
+                .insert(await_id, format!("{state}.sent()"));
+            self.emit_es5_async_for_in_binding(statement.initializer, &plan.key)?;
+            self.restore_es5_async_expression_rewrite(await_id, previous);
+        } else {
+            self.emit_es5_async_for_in_binding(statement.initializer, &plan.key)?;
+        }
+
+        let mut nodes = vec![statement_id];
+        nodes.extend(label);
+        self.es5_async_control_targets.push(Es5AsyncControlTarget {
+            nodes,
+            break_case: exit_case,
+            continue_case: increment_case,
+        });
+        let body_result = self.emit_es5_async_branch(statement.statement, state, case);
+        self.es5_async_control_targets.pop();
+        body_result?;
+        if self.es5_async_statement_may_complete_normally(statement.statement) {
+            self.writer.write(state);
+            self.writer.write(".label = ");
+            self.writer.write(&increment_case.to_string());
+            self.writer.write(";");
+            self.writer.newline();
+        }
+
+        self.emit_es5_async_case_label(increment_case, false);
+        *case = increment_case;
+        self.writer.write(&plan.index);
+        self.writer.write("++;");
+        self.writer.newline();
+        self.writer.write("return [3 /*break*/, ");
+        self.writer.write(&head_case.to_string());
+        self.writer.write("];");
+        self.writer.newline();
+        self.emit_es5_async_case_label(exit_case, is_last);
+        if is_last {
+            self.writer.write(" ");
+        }
+        *case = exit_case;
+        Ok(())
+    }
+
+    fn emit_es5_async_for_in_binding(
+        &mut self,
+        initializer: NodeId,
+        key: &str,
+    ) -> Result<(), EmitError> {
+        let initializer_node = self.node(initializer)?.clone();
+        let target = if let NodeData::VariableDeclarationList(list) = &initializer_node.data {
+            let Some(declaration) = list.declarations.nodes.first() else {
+                return Ok(());
+            };
+            let declaration_node = self.node(*declaration)?.clone();
+            let NodeData::VariableDeclaration(declaration) = &declaration_node.data else {
+                return Err(Self::unsupported(*declaration, declaration_node.kind));
+            };
+            declaration.name
+        } else {
+            initializer
+        };
+        self.emit_expression(target, 1)?;
+        self.writer.write(" = ");
+        self.writer.write(key);
+        self.writer.write(";");
+        self.writer.newline();
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn emit_es5_async_function_body(
         &mut self,
         body: NodeId,
@@ -25318,6 +25502,7 @@ impl Printer<'_> {
         let previous_hoisted_function_declarations =
             std::mem::take(&mut self.es5_async_hoisted_function_declarations);
         let previous_for_of_names = std::mem::take(&mut self.es5_async_for_of_names);
+        let previous_for_in_plans = std::mem::take(&mut self.es5_async_for_in_plans);
         let mut hoisted_names = Vec::new();
         let mut hoisted_functions = Vec::new();
         if expression_body.is_none() {
@@ -25347,6 +25532,7 @@ impl Printer<'_> {
                 try_catch_temps: HashMap::new(),
                 try_catch_hoists: Vec::new(),
                 with_temps: HashMap::new(),
+                for_in_plans: HashMap::new(),
                 state_parameter: None,
             }
         };
@@ -25364,6 +25550,7 @@ impl Printer<'_> {
             try_catch_temps,
             try_catch_hoists,
             with_temps,
+            for_in_plans,
             state_parameter: planned_state_parameter,
         } = capture_plan;
         self.es5_async_await_captures = await_captures;
@@ -25376,6 +25563,7 @@ impl Printer<'_> {
         self.es5_async_switch_temps = switch_temps;
         self.es5_async_try_catch_temps = try_catch_temps;
         self.es5_async_with_temps = with_temps;
+        self.es5_async_for_in_plans = for_in_plans;
         let state_parameter = planned_state_parameter
             .as_deref()
             .unwrap_or(requested_state_parameter);
@@ -25434,16 +25622,19 @@ impl Printer<'_> {
             self.writer.write(";");
             self.writer.newline();
         }
-        if !planned_temps.is_empty() {
-            self.writer.write("var ");
-            self.writer.write(&planned_temps.join(", "));
-            self.writer.write(";");
-            self.writer.newline();
-        }
-        if expression_body.is_none() && (!hoisted_names.is_empty() || !try_catch_hoists.is_empty())
+        if !planned_temps.is_empty()
+            || (expression_body.is_none()
+                && (!hoisted_names.is_empty() || !try_catch_hoists.is_empty()))
         {
             self.writer.write("var ");
             let mut index = 0;
+            for name in &planned_temps {
+                if index != 0 {
+                    self.writer.write(", ");
+                }
+                self.writer.write(name);
+                index += 1;
+            }
             for name in &hoisted_names {
                 if index != 0 {
                     self.writer.write(", ");
@@ -25520,6 +25711,7 @@ impl Printer<'_> {
         self.es5_async_hoisted_variable_lists = previous_hoisted_variable_lists;
         self.es5_async_hoisted_function_declarations = previous_hoisted_function_declarations;
         self.es5_async_for_of_names = previous_for_of_names;
+        self.es5_async_for_in_plans = previous_for_in_plans;
         Ok(())
     }
 
@@ -25586,6 +25778,7 @@ impl Printer<'_> {
         let mut switch_nodes = Vec::new();
         let mut try_nodes = Vec::new();
         let mut with_nodes = Vec::new();
+        let mut for_in_nodes = Vec::new();
         if let Some(NodeData::Block(block)) = self.arena.get(body).map(|node| &node.data) {
             for statement in &block.statements.nodes {
                 self.collect_es5_async_await_captures(*statement, &mut await_captures);
@@ -25598,6 +25791,7 @@ impl Printer<'_> {
                 self.collect_es5_async_switch_plans(*statement, &mut switch_nodes);
                 self.collect_es5_async_try_plans(*statement, &mut try_nodes);
                 self.collect_es5_async_with_plans(*statement, &mut with_nodes);
+                self.collect_es5_async_for_in_plans(*statement, &mut for_in_nodes);
             }
         }
         let mut claimed = HashSet::new();
@@ -25729,6 +25923,34 @@ impl Printer<'_> {
             temps.push(temp.clone());
             with_temps.insert(statement, temp);
         }
+        let mut for_in_plans = HashMap::new();
+        for statement in for_in_nodes {
+            let object = self.generate_block_temp(body, &claimed);
+            claimed.insert(object.clone());
+            temps.push(object.clone());
+            let keys = self.generate_block_temp(body, &claimed);
+            claimed.insert(keys.clone());
+            temps.push(keys.clone());
+            let key = self.generate_block_temp(body, &claimed);
+            claimed.insert(key.clone());
+            temps.push(key.clone());
+            let index = if !claimed.contains("_i") && !self.es5_async_block_uses_name(body, "_i") {
+                "_i".to_owned()
+            } else {
+                self.generate_block_temp(body, &claimed)
+            };
+            claimed.insert(index.clone());
+            temps.push(index.clone());
+            for_in_plans.insert(
+                statement,
+                Es5AsyncForInPlan {
+                    object,
+                    keys,
+                    key,
+                    index,
+                },
+            );
+        }
         let state_parameter = (!temps.is_empty()).then(|| self.generate_block_temp(body, &claimed));
         Es5AsyncCapturePlan {
             temps,
@@ -25744,7 +25966,71 @@ impl Printer<'_> {
             try_catch_temps,
             try_catch_hoists,
             with_temps,
+            for_in_plans,
             state_parameter,
+        }
+    }
+
+    fn es5_async_block_uses_name(&self, block: NodeId, name: &str) -> bool {
+        let range = self.arena.get(block).map(|node| node.range);
+        self.arena.iter().any(|(_, node)| {
+            matches!(&node.data, NodeData::Identifier(identifier) if identifier.text == name)
+                && range.is_some_and(|range| {
+                    range.start <= node.range.start && node.range.end <= range.end
+                })
+        })
+    }
+
+    fn collect_es5_async_for_in_plans(&self, statement: NodeId, loops: &mut Vec<NodeId>) {
+        let Some(node) = self.arena.get(statement) else {
+            return;
+        };
+        match &node.data {
+            NodeData::Block(block) => {
+                for statement in &block.statements.nodes {
+                    self.collect_es5_async_for_in_plans(*statement, loops);
+                }
+            }
+            NodeData::ForInOrOfStatement(for_statement) => {
+                if node.kind == SyntaxKind::ForInStatement
+                    && self.es5_async_for_in_suspension_count(for_statement) != 0
+                {
+                    loops.push(statement);
+                }
+                self.collect_es5_async_for_in_plans(for_statement.statement, loops);
+            }
+            NodeData::IfStatement(statement) => {
+                self.collect_es5_async_for_in_plans(statement.then_statement, loops);
+                if let Some(statement) = statement.else_statement {
+                    self.collect_es5_async_for_in_plans(statement, loops);
+                }
+            }
+            NodeData::WhileStatement(statement) => {
+                self.collect_es5_async_for_in_plans(statement.statement, loops);
+            }
+            NodeData::DoStatement(statement) => {
+                self.collect_es5_async_for_in_plans(statement.statement, loops);
+            }
+            NodeData::ForStatement(statement) => {
+                self.collect_es5_async_for_in_plans(statement.statement, loops);
+            }
+            NodeData::LabeledStatement(statement) => {
+                self.collect_es5_async_for_in_plans(statement.statement, loops);
+            }
+            NodeData::WithStatement(statement) => {
+                self.collect_es5_async_for_in_plans(statement.statement, loops);
+            }
+            NodeData::SwitchStatement(statement) => self.collect_es5_async_switch_regions(
+                statement,
+                loops,
+                Self::collect_es5_async_for_in_plans,
+            ),
+            NodeData::TryStatement(statement) => self.collect_es5_async_try_regions(
+                statement,
+                loops,
+                Self::collect_es5_async_for_in_plans,
+            ),
+            _ => {}
         }
     }
 
@@ -26459,6 +26745,24 @@ impl Printer<'_> {
                     case,
                     is_last,
                 ),
+                NodeData::ForInOrOfStatement(for_statement)
+                    if labeled_node.kind == SyntaxKind::ForInStatement =>
+                {
+                    let plan = self
+                        .es5_async_for_in_plans
+                        .get(&labeled.statement)
+                        .cloned()
+                        .expect("suspending for-in plan");
+                    self.emit_es5_async_for_in_statement(
+                        labeled.statement,
+                        for_statement,
+                        Some(statement),
+                        &plan,
+                        state,
+                        case,
+                        is_last,
+                    )
+                }
                 _ => self.emit_es5_async_planned_statement(labeled.statement, state, case, is_last),
             };
         }
@@ -26493,6 +26797,25 @@ impl Printer<'_> {
                 statement,
                 for_statement,
                 None,
+                state,
+                case,
+                is_last,
+            );
+        }
+        if let NodeData::ForInOrOfStatement(for_statement) = &node.data
+            && node.kind == SyntaxKind::ForInStatement
+            && self.es5_async_for_in_suspension_count(for_statement) != 0
+        {
+            let plan = self
+                .es5_async_for_in_plans
+                .get(&statement)
+                .cloned()
+                .expect("suspending for-in plan");
+            return self.emit_es5_async_for_in_statement(
+                statement,
+                for_statement,
+                None,
+                &plan,
                 state,
                 case,
                 is_last,
@@ -29363,6 +29686,19 @@ impl Printer<'_> {
             + self.es5_async_simple_suspension_count(statement.statement)
     }
 
+    fn es5_async_for_in_suspension_count(
+        &self,
+        statement: &ts_ast::ForInOrOfStatementData,
+    ) -> usize {
+        usize::from(
+            self.es5_async_simple_await_in_expression(statement.expression)
+                .is_some(),
+        ) + usize::from(
+            self.es5_async_simple_await_in_expression(statement.initializer)
+                .is_some(),
+        ) + self.es5_async_simple_suspension_count(statement.statement)
+    }
+
     fn es5_async_statement_ends_in_transformed_with(&self, statement: NodeId) -> bool {
         match self.arena.get(statement).map(|node| &node.data) {
             Some(NodeData::Block(block)) => {
@@ -29486,6 +29822,14 @@ impl Printer<'_> {
                     )
                 }) + self.es5_async_simple_suspension_count(statement.statement)
             }
+            Some(NodeData::ForInOrOfStatement(for_statement))
+                if self
+                    .arena
+                    .get(statement)
+                    .is_some_and(|node| node.kind == SyntaxKind::ForInStatement) =>
+            {
+                self.es5_async_for_in_suspension_count(for_statement)
+            }
             Some(NodeData::SwitchStatement(_)) => self.es5_async_switch_suspension_count(statement),
             Some(NodeData::TryStatement(statement)) => {
                 self.es5_async_try_suspension_count(statement)
@@ -29589,6 +29933,22 @@ impl Printer<'_> {
                             .is_some(),
                     )
                 }) + self.es5_async_case_advance(statement.statement)
+                    + 3
+            }
+            Some(NodeData::ForInOrOfStatement(for_statement))
+                if self
+                    .arena
+                    .get(statement)
+                    .is_some_and(|node| node.kind == SyntaxKind::ForInStatement)
+                    && self.es5_async_for_in_suspension_count(for_statement) != 0 =>
+            {
+                usize::from(
+                    self.es5_async_simple_await_in_expression(for_statement.expression)
+                        .is_some(),
+                ) + usize::from(
+                    self.es5_async_simple_await_in_expression(for_statement.initializer)
+                        .is_some(),
+                ) + self.es5_async_case_advance(for_statement.statement)
                     + 3
             }
             Some(NodeData::SwitchStatement(_)) => self.es5_async_switch_case_advance(statement),
