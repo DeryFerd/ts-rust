@@ -5395,6 +5395,65 @@ mod tests {
     }
 
     #[test]
+    fn anonymous_mixin_heritage_preserves_constructor_object_shape() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/wrappers.ts",
+            concat!(
+                "export type Constructor<T = {}> = new (...args: any[]) => T;\n",
+                "export function Timestamped<TBase extends Constructor>(Base: TBase) {\n",
+                "    return class extends Base { timestamp: number = 1; };\n",
+                "}\n",
+            ),
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/index.ts",
+            concat!(
+                "import { Timestamped } from './wrappers';\n",
+                "export class User { name = ''; }\n",
+                "export class TimestampedUser extends Timestamped(User) {}\n",
+            ),
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["index.ts".to_owned()],
+            CompilerOptions {
+                declaration: true,
+                emit_declaration_only: true,
+                module: ModuleKind::CommonJs,
+                target: ScriptTarget::Es2015,
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        assert!(
+            program.diagnostics().is_empty(),
+            "{:?}",
+            program.diagnostics()
+        );
+        let emitted = program.emit();
+        let declaration = emitted
+            .files
+            .iter()
+            .find(|file| file.file_name == "/project/index.d.ts")
+            .unwrap();
+        assert!(
+            declaration.text.contains(concat!(
+                "declare const TimestampedUser_base: {\n",
+                "    new (...args: any[]): {\n",
+                "        timestamp: number;\n",
+                "    };\n",
+                "} & typeof User;",
+            )),
+            "{}",
+            declaration.text
+        );
+    }
+
+    #[test]
     fn bundled_export_only_imports_follow_the_export_alias() {
         assert_eq!(
             defer_export_only_bundle_imports(concat!(

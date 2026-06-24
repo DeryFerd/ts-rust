@@ -3245,6 +3245,18 @@ impl DeclarationPrinter<'_> {
                         )
                     {
                         self.emit_semantic_object_literal_type(&object, data.expression, true)?;
+                    } else if let Some(signature) = self
+                        .semantic_types
+                        .and_then(|types| types.get(type_id))
+                        .and_then(|type_| match &type_.kind {
+                            TypeKind::Constructor(signature) => Some(signature.clone()),
+                            TypeKind::Object(object) => {
+                                Self::compact_construct_signature(object).cloned()
+                            }
+                            _ => None,
+                        })
+                    {
+                        self.emit_semantic_constructor_type(&signature, None)?;
                     } else {
                         self.emit_semantic_type(type_id)?;
                     }
@@ -3955,7 +3967,15 @@ impl DeclarationPrinter<'_> {
             return self.emit_semantic_type(type_id);
         };
         match kind {
-            TypeKind::Constructor(signature) if argument.is_some() => {
+            TypeKind::Constructor(signature)
+                if argument.is_some()
+                    && matches!(
+                        self.semantic_types
+                            .and_then(|types| types.get(signature.return_type))
+                            .map(|type_| &type_.kind),
+                        Some(TypeKind::TypeParameter { .. })
+                    ) =>
+            {
                 self.writer.write("new (");
                 self.emit_semantic_parameters(&signature, None)?;
                 self.writer.write(") => ");
@@ -3968,23 +3988,11 @@ impl DeclarationPrinter<'_> {
                         .and_then(|types| types.get(signature.return_type))
                         .map(|type_| &type_.kind),
                     Some(TypeKind::Object(object))
-                        if object.properties.is_empty()
-                            && object.call_signatures.is_empty()
+                        if object.call_signatures.is_empty()
                             && object.construct_signatures.is_empty()
-                            && object.string_index_type.is_none()
-                            && object.number_index_type.is_none()
                 ) =>
             {
-                self.writer.write("{");
-                self.writer.newline();
-                self.writer.indent += 1;
-                self.writer.write("new (");
-                self.emit_semantic_parameters(&signature, None)?;
-                self.writer.write("): {};");
-                self.writer.newline();
-                self.writer.indent -= 1;
-                self.writer.write("}");
-                Ok(())
+                self.emit_semantic_constructor_type(&signature, None)
             }
             TypeKind::Intersection(members) => {
                 let mut members = members;
@@ -5051,10 +5059,9 @@ impl DeclarationPrinter<'_> {
             return Ok(());
         }
         if let Some(TypeKind::Intersection(mut members)) = kind.clone()
-            && function
+            && let Some(class) = function
                 .body
                 .and_then(|body| self.returned_class_expression(body))
-                .is_some()
         {
             members.sort_by_key(|member| {
                 matches!(
@@ -5064,7 +5071,36 @@ impl DeclarationPrinter<'_> {
                     Some(TypeKind::TypeParameter { .. })
                 )
             });
-            return self.emit_semantic_type_list(&members, " & ");
+            let parameter_names = self.class_expression_constructor_parameter_names(class);
+            for (index, member) in members.into_iter().enumerate() {
+                if index != 0 {
+                    self.writer.write(" & ");
+                }
+                match self
+                    .semantic_types
+                    .and_then(|types| types.get(member))
+                    .map(|type_| type_.kind.clone())
+                {
+                    Some(TypeKind::Constructor(signature)) => {
+                        self.emit_semantic_constructor_type(
+                            &signature,
+                            parameter_names.as_deref(),
+                        )?;
+                    }
+                    Some(TypeKind::Object(object))
+                        if Self::compact_construct_signature(&object).is_some() =>
+                    {
+                        let signature = Self::compact_construct_signature(&object)
+                            .expect("compact constructor checked above");
+                        self.emit_semantic_constructor_type(signature, parameter_names.as_deref())?;
+                    }
+                    _ => self.emit_semantic_type_with_precedence(
+                        member,
+                        SemanticTypePrecedence::Intersection,
+                    )?,
+                }
+            }
+            return Ok(());
         }
         if let Some(TypeKind::Object(object)) = kind.clone()
             && let Some(order) = self.function_object_rest_property_order(function)
@@ -36431,6 +36467,47 @@ class Board {
                 "    match(path: string): boolean;\n",
                 "    thing: number;\n",
                 "}) & typeof Unmixed;",
+            )),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn declaration_emit_uses_construct_signature_object_for_returned_class_intersections() {
+        let output = emit_declarations_with_semantics(concat!(
+            "export type Constructor<T = {}> = new (...args: any[]) => T;\n",
+            "export function Timestamped<TBase extends Constructor>(Base: TBase) {\n",
+            "    return class extends Base { timestamp: number = 1; };\n",
+            "}\n",
+        ));
+        assert!(
+            output.contains(concat!(
+                "export declare function Timestamped<TBase extends Constructor>(Base: TBase): {\n",
+                "    new (...args: any[]): {\n",
+                "        timestamp: number;\n",
+                "    };\n",
+                "} & TBase;",
+            )),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn declaration_emit_uses_construct_signature_object_for_default_class_factory_call() {
+        let output = emit_declarations_with_semantics(concat!(
+            "function wrapClass(param: any) {\n",
+            "    return class Wrapped { foo() { return param; } };\n",
+            "}\n",
+            "export default wrapClass(0);\n",
+        ));
+        assert!(
+            output.contains(concat!(
+                "declare const _default: {\n",
+                "    new (): {\n",
+                "        foo(): any;\n",
+                "    };\n",
+                "};\n",
+                "export default _default;",
             )),
             "{output}"
         );
