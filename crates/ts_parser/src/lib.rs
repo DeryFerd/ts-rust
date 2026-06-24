@@ -3466,8 +3466,7 @@ impl<'a> Parser<'a> {
         let mut entity = if matches!(
             self.current.kind,
             SyntaxKind::UndefinedKeyword | SyntaxKind::ThisKeyword
-        )
-            || is_contextual_keyword(self.current.kind)
+        ) || is_contextual_keyword(self.current.kind)
         {
             self.parse_identifier_name("Expected a module reference.")
         } else {

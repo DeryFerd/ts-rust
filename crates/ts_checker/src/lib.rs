@@ -690,16 +690,17 @@ impl<'a> ProgramChecker<'a> {
             let Some(target_source) = self.sources.get(target) else {
                 continue;
             };
-            let has_augmentation = target_source.arena.iter().any(|(_, node)| {
-                matches!(
-                    &node.data,
-                    NodeData::ModuleDeclaration(module)
-                        if matches!(
-                            target_source.arena.get(module.name).map(|node| &node.data),
-                            Some(NodeData::StringLiteral(_))
-                        )
-                )
-            });
+            let has_augmentation = is_external_module(target_source)
+                && target_source.arena.iter().any(|(_, node)| {
+                    matches!(
+                        &node.data,
+                        NodeData::ModuleDeclaration(module)
+                            if matches!(
+                                target_source.arena.get(module.name).map(|node| &node.data),
+                                Some(NodeData::StringLiteral(_))
+                            )
+                    )
+                });
             if has_augmentation {
                 result
                     .declaration_reachability
@@ -4515,7 +4516,7 @@ impl<'a> Checker<'a> {
         symbol: SymbolId,
         arguments: &[TypeId],
     ) -> Option<TypeId> {
-        const MAX_DECLARED_OBJECT_INSTANTIATION_DEPTH: usize = 64;
+        const MAX_DECLARED_OBJECT_INSTANTIATION_DEPTH: usize = 4;
 
         let cache_key = (symbol, arguments.to_vec());
         if let Some(type_id) = self.declared_object_instantiations.get(&cache_key) {
@@ -14846,7 +14847,12 @@ fn is_external_module(source: &ProgramSource<'_>) -> bool {
     file.statements.nodes.iter().any(|statement| {
         matches!(
             source.arena.get(*statement).map(|node| &node.data),
-            Some(NodeData::ImportDeclaration(_) | NodeData::ImportEqualsDeclaration(_))
+            Some(
+                NodeData::ImportDeclaration(_)
+                    | NodeData::ImportEqualsDeclaration(_)
+                    | NodeData::ExportDeclaration(_)
+                    | NodeData::ExportAssignment(_)
+            )
         )
     })
 }
@@ -15263,7 +15269,10 @@ fn computed_property_name_text(arena: &NodeArena, node: NodeId) -> Option<String
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        fmt::Write as _,
+    };
 
     use ts_ast::{
         ArrayLiteralExpressionData, BlockData, ElementAccessExpressionData,
@@ -17567,6 +17576,34 @@ mod tests {
 
         assert!(
             result.types.len() < 100,
+            "type count: {}",
+            result.types.len()
+        );
+    }
+
+    #[test]
+    fn bounds_complex_recursive_collection_instantiations() {
+        let mut source = String::new();
+        for level in 0..8 {
+            write!(source, "interface C{level}<T> {{").unwrap();
+            for branch in 0..5 {
+                write!(
+                    source,
+                    "m{branch}<U>(value: T, iter: this): C{}<[T, U]>;",
+                    (level + 1) % 8,
+                )
+                .unwrap();
+            }
+            source.push_str("}\n");
+        }
+        source.push_str("declare const value: C0<string>;");
+        let parsed = parse_source_file(&source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+
+        assert!(
+            result.types.len() < 200_000,
             "type count: {}",
             result.types.len()
         );
@@ -20361,6 +20398,58 @@ mod tests {
         }
         assert!(!retained.contains(&source.statements.nodes[4]));
         assert!(retained.contains(&source.statements.nodes[5]));
+    }
+
+    #[test]
+    fn distinguishes_ambient_module_definitions_from_module_augmentations() {
+        let ambient = parse_source_file("declare module 'bar' { export const y: number; }");
+        let augmentation =
+            parse_source_file("export {}; declare module 'pkg' { interface Added {} }");
+        let consumer = parse_source_file("import { y } from 'bar'; import 'pkg'; y;");
+        let ambient_bindings = bind_source_file(&ambient.arena, ambient.source_file);
+        let augmentation_bindings = bind_source_file(&augmentation.arena, augmentation.source_file);
+        let consumer_bindings = bind_source_file(&consumer.arena, consumer.source_file);
+        let no_modules = BTreeMap::new();
+        let consumer_modules = BTreeMap::from([("bar".into(), 0), ("pkg".into(), 1)]);
+        let checked = check_program(&[
+            ProgramSource {
+                arena: &ambient.arena,
+                source_file: ambient.source_file,
+                bindings: &ambient_bindings,
+                resolved_modules: &no_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+            ProgramSource {
+                arena: &augmentation.arena,
+                source_file: augmentation.source_file,
+                bindings: &augmentation_bindings,
+                resolved_modules: &no_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+            ProgramSource {
+                arena: &consumer.arena,
+                source_file: consumer.source_file,
+                bindings: &consumer_bindings,
+                resolved_modules: &consumer_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+        ]);
+        let NodeData::SourceFile(source) = &consumer.arena.get(consumer.source_file).unwrap().data
+        else {
+            panic!("expected source file");
+        };
+        let retained = checked.files[2]
+            .declarations_to_emit(consumer.source_file)
+            .unwrap();
+
+        assert!(!retained.contains(&source.statements.nodes[0]));
+        assert!(retained.contains(&source.statements.nodes[1]));
     }
 
     #[test]

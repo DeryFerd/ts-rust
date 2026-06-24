@@ -25059,10 +25059,7 @@ impl Printer<'_> {
             })
     }
 
-    fn erased_constructor_modifier_precedes_property_assignment(
-        &self,
-        statement: NodeId,
-    ) -> bool {
+    fn erased_constructor_modifier_precedes_property_assignment(&self, statement: NodeId) -> bool {
         if !self.is_recovered_constructor_property_assignment(statement) {
             return false;
         }
