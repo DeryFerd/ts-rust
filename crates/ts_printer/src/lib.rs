@@ -20791,6 +20791,11 @@ impl Printer<'_> {
     }
 
     fn statement_emits_runtime(&self, id: NodeId, node: &Node) -> bool {
+        if !self.namespace_containers.is_empty()
+            && self.namespace_erases_external_module_statement(node)
+        {
+            return false;
+        }
         if (declaration_has_modifier(self.arena, node, SyntaxKind::DeclareKeyword)
             && !matches!(node.data, NodeData::ImportEqualsDeclaration(_)))
             || (is_const_enum_declaration(self.arena, node)
@@ -20851,6 +20856,14 @@ impl Printer<'_> {
                 .map(|node| &node.data),
             Some(NodeData::ExternalModuleReference(_))
         )
+    }
+
+    fn namespace_erases_external_module_statement(&self, node: &Node) -> bool {
+        match &node.data {
+            NodeData::ImportDeclaration(_) | NodeData::ExportDeclaration(_) => true,
+            NodeData::ImportEqualsDeclaration(import) => self.is_external_import_equals(import),
+            _ => false,
+        }
     }
 
     fn import_equals_has_runtime_use(
@@ -21117,6 +21130,9 @@ impl Printer<'_> {
         let Some(node) = self.arena.get(statement) else {
             return false;
         };
+        if self.namespace_erases_external_module_statement(node) {
+            return false;
+        }
         match &node.data {
             NodeData::InterfaceDeclaration(_) | NodeData::TypeAliasDeclaration(_) => false,
             NodeData::ModuleDeclaration(module) => {
@@ -21431,6 +21447,11 @@ impl Printer<'_> {
     fn emit_statement(&mut self, id: NodeId) -> Result<(), EmitError> {
         let node = self.node(id)?.clone();
         if self.es5_async_hoisted_function_declarations.contains(&id) {
+            return Ok(());
+        }
+        if !self.namespace_containers.is_empty()
+            && self.namespace_erases_external_module_statement(&node)
+        {
             return Ok(());
         }
         if let NodeData::VariableStatement(statement) = &node.data
@@ -24997,21 +25018,7 @@ impl Printer<'_> {
         let mut case = 0;
         for statement in statements {
             if let Some(yielded) = self.direct_yield_expression(*statement).cloned() {
-                let expression = yielded.expression;
-                self.writer.write(if yielded.asterisk_token.is_some() {
-                    "return [5 /*yield**/, __values("
-                } else {
-                    "return [4 /*yield*/, "
-                });
-                if let Some(expression) = expression {
-                    self.emit_expression(expression, 0)?;
-                } else {
-                    self.writer.write("void 0");
-                }
-                if yielded.asterisk_token.is_some() {
-                    self.writer.write(")");
-                }
-                self.writer.write("];");
+                self.emit_es5_generator_yield_opcode(&yielded)?;
                 self.writer.newline();
                 self.writer.indent -= 1;
                 case += 1;
@@ -25043,6 +25050,29 @@ impl Printer<'_> {
         self.writer.indent -= 2;
         self.writer.write("}");
         self.writer.newline();
+        Ok(())
+    }
+
+    fn emit_es5_generator_yield_opcode(
+        &mut self,
+        yielded: &ts_ast::YieldExpressionData,
+    ) -> Result<(), EmitError> {
+        if yielded.asterisk_token.is_some() {
+            self.writer.write("return [5 /*yield**/, __values(");
+            if let Some(expression) = yielded.expression {
+                self.emit_expression(expression, 0)?;
+            } else {
+                self.writer.write("void 0");
+            }
+            self.writer.write(")];");
+        } else {
+            self.writer.write("return [4 /*yield*/");
+            if let Some(expression) = yielded.expression {
+                self.writer.write(", ");
+                self.emit_expression(expression, 0)?;
+            }
+            self.writer.write("];");
+        }
         Ok(())
     }
 
