@@ -306,6 +306,7 @@ pub fn emit_source_file_with_context(
         es5_async_await_captures: HashMap::new(),
         es5_async_conditional_temps: HashMap::new(),
         es5_async_array_temps: HashMap::new(),
+        es5_async_call_temps: HashMap::new(),
         es5_async_control_targets: Vec::new(),
         es5_async_hoisted_variable_lists: HashSet::new(),
         async_loop_counter: 0,
@@ -17469,6 +17470,7 @@ struct Es5AsyncCapturePlan {
     captures: HashMap<NodeId, Vec<(NodeId, String)>>,
     conditional_temps: HashMap<NodeId, String>,
     array_temps: HashMap<NodeId, Option<String>>,
+    call_temps: HashMap<NodeId, Vec<String>>,
     state_parameter: Option<String>,
 }
 
@@ -18220,6 +18222,7 @@ struct Printer<'a> {
     es5_async_await_captures: HashMap<NodeId, Vec<(NodeId, String)>>,
     es5_async_conditional_temps: HashMap<NodeId, String>,
     es5_async_array_temps: HashMap<NodeId, Option<String>>,
+    es5_async_call_temps: HashMap<NodeId, Vec<String>>,
     es5_async_control_targets: Vec<Es5AsyncControlTarget>,
     es5_async_hoisted_variable_lists: HashSet<NodeId>,
     async_loop_counter: u32,
@@ -25217,6 +25220,7 @@ impl Printer<'_> {
         let previous_await_captures = std::mem::take(&mut self.es5_async_await_captures);
         let previous_conditional_temps = std::mem::take(&mut self.es5_async_conditional_temps);
         let previous_array_temps = std::mem::take(&mut self.es5_async_array_temps);
+        let previous_call_temps = std::mem::take(&mut self.es5_async_call_temps);
         let previous_hoisted_variable_lists =
             std::mem::take(&mut self.es5_async_hoisted_variable_lists);
         let mut hoisted_for_names = Vec::new();
@@ -25233,6 +25237,7 @@ impl Printer<'_> {
                 captures: HashMap::new(),
                 conditional_temps: HashMap::new(),
                 array_temps: HashMap::new(),
+                call_temps: HashMap::new(),
                 state_parameter: None,
             }
         };
@@ -25241,11 +25246,13 @@ impl Printer<'_> {
             captures: await_captures,
             conditional_temps,
             array_temps,
+            call_temps,
             state_parameter: planned_state_parameter,
         } = capture_plan;
         self.es5_async_await_captures = await_captures;
         self.es5_async_conditional_temps = conditional_temps;
         self.es5_async_array_temps = array_temps;
+        self.es5_async_call_temps = call_temps;
         let state_parameter = planned_state_parameter
             .as_deref()
             .unwrap_or(requested_state_parameter);
@@ -25360,6 +25367,7 @@ impl Printer<'_> {
         self.es5_async_await_captures = previous_await_captures;
         self.es5_async_conditional_temps = previous_conditional_temps;
         self.es5_async_array_temps = previous_array_temps;
+        self.es5_async_call_temps = previous_call_temps;
         self.es5_async_hoisted_variable_lists = previous_hoisted_variable_lists;
         Ok(())
     }
@@ -25419,11 +25427,13 @@ impl Printer<'_> {
         let mut await_captures = Vec::new();
         let mut conditional_nodes = Vec::new();
         let mut array_nodes = Vec::new();
+        let mut call_nodes = Vec::new();
         if let Some(NodeData::Block(block)) = self.arena.get(body).map(|node| &node.data) {
             for statement in &block.statements.nodes {
                 self.collect_es5_async_await_captures(*statement, &mut await_captures);
                 self.collect_es5_async_conditional_temps(*statement, &mut conditional_nodes);
                 self.collect_es5_async_array_temps(*statement, &mut array_nodes);
+                self.collect_es5_async_call_temps(*statement, &mut call_nodes);
             }
         }
         let mut claimed = HashSet::new();
@@ -25457,13 +25467,62 @@ impl Printer<'_> {
             };
             array_temps.insert(array, temp);
         }
+        let mut call_temps = HashMap::new();
+        for call in call_nodes {
+            let mut planned = Vec::new();
+            for _ in 0..self.es5_async_call_temp_count(call) {
+                let temp = self.generate_block_temp(body, &claimed);
+                claimed.insert(temp.clone());
+                temps.push(temp.clone());
+                planned.push(temp);
+            }
+            call_temps.insert(call, planned);
+        }
         let state_parameter = (!temps.is_empty()).then(|| self.generate_block_temp(body, &claimed));
         Es5AsyncCapturePlan {
             temps,
             captures,
             conditional_temps,
             array_temps,
+            call_temps,
             state_parameter,
+        }
+    }
+
+    fn collect_es5_async_call_temps(&self, statement: NodeId, calls: &mut Vec<NodeId>) {
+        match self.arena.get(statement).map(|node| &node.data) {
+            Some(NodeData::Block(block)) => {
+                for statement in &block.statements.nodes {
+                    self.collect_es5_async_call_temps(*statement, calls);
+                }
+            }
+            Some(NodeData::IfStatement(statement)) => {
+                self.collect_es5_async_call_temps(statement.then_statement, calls);
+                if let Some(statement) = statement.else_statement {
+                    self.collect_es5_async_call_temps(statement, calls);
+                }
+            }
+            Some(NodeData::WhileStatement(statement)) => {
+                self.collect_es5_async_call_temps(statement.statement, calls);
+            }
+            Some(NodeData::DoStatement(statement)) => {
+                self.collect_es5_async_call_temps(statement.statement, calls);
+            }
+            Some(NodeData::ForStatement(statement)) => {
+                self.collect_es5_async_call_temps(statement.statement, calls);
+            }
+            Some(NodeData::LabeledStatement(statement)) => {
+                self.collect_es5_async_call_temps(statement.statement, calls);
+            }
+            Some(NodeData::ExpressionStatement(statement)) => {
+                if let Some(NodeData::CallExpression(call)) =
+                    self.arena.get(statement.expression).map(|node| &node.data)
+                    && self.es5_async_call_internal_await_count(call) != 0
+                {
+                    calls.push(statement.expression);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -25541,6 +25600,14 @@ impl Printer<'_> {
             for statement in &block.statements.nodes {
                 self.collect_es5_async_await_captures(*statement, captures);
             }
+            return;
+        }
+        if let Some(NodeData::ExpressionStatement(expression)) =
+            self.arena.get(statement).map(|node| &node.data)
+            && let Some(NodeData::CallExpression(call)) =
+                self.arena.get(expression.expression).map(|node| &node.data)
+            && self.es5_async_call_internal_await_count(call) != 0
+        {
             return;
         }
         let Some((await_id, _)) = self.es5_async_simple_statement_await(statement) else {
@@ -25720,6 +25787,14 @@ impl Printer<'_> {
             && self.es5_async_simple_suspension_count(statement) != 0
         {
             return self.emit_es5_async_if_statement(if_statement, state, case, is_last);
+        }
+        if let NodeData::ExpressionStatement(expression) = &node.data
+            && let Some(temps) = self
+                .es5_async_call_temps
+                .get(&expression.expression)
+                .cloned()
+        {
+            return self.emit_es5_async_call_statement(expression.expression, &temps, state, case);
         }
         if let Some((left, array)) = self.es5_async_array_assignment(statement)
             && let Some(temp) = self.es5_async_array_temps.get(&array).cloned()
@@ -26336,6 +26411,298 @@ impl Printer<'_> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
+    fn emit_es5_async_call_statement(
+        &mut self,
+        call_id: NodeId,
+        temps: &[String],
+        state: &str,
+        case: &mut usize,
+    ) -> Result<(), EmitError> {
+        let node = self.node(call_id)?.clone();
+        let NodeData::CallExpression(call) = &node.data else {
+            return Err(Self::unsupported(call_id, node.kind));
+        };
+        let awaited_arguments = call
+            .arguments
+            .nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, argument)| {
+                self.es5_async_simple_await_in_expression(*argument)
+                    .map(|await_id| (index, await_id))
+            })
+            .collect::<Vec<_>>();
+        if awaited_arguments.is_empty() {
+            return self.emit_es5_async_computed_call(call, temps, state, case);
+        }
+        if call.arguments.nodes.iter().any(|argument| {
+            matches!(
+                self.arena.get(*argument).map(|node| &node.data),
+                Some(NodeData::SpreadElement(_))
+            )
+        }) {
+            return self.emit_es5_async_spread_call(call, temps, state, case);
+        }
+        let (await_index, await_id) = awaited_arguments[0];
+        if !self.writer.line_start {
+            self.writer.newline();
+        }
+        let (function_temp, receiver_temp, next_temp) =
+            match self.arena.get(call.expression).map(|node| &node.data) {
+                Some(NodeData::PropertyAccessExpression(access)) => {
+                    self.writer.write(&temps[1]);
+                    self.writer.write(" = (");
+                    self.writer.write(&temps[0]);
+                    self.writer.write(" = ");
+                    self.emit_expression(access.expression, 1)?;
+                    self.writer.write(").");
+                    self.emit_expression(access.name, 0)?;
+                    self.writer.write(";");
+                    self.writer.newline();
+                    (&temps[1], Some(&temps[0]), 2)
+                }
+                Some(NodeData::ElementAccessExpression(access)) => {
+                    self.writer.write(&temps[1]);
+                    self.writer.write(" = (");
+                    self.writer.write(&temps[0]);
+                    self.writer.write(" = ");
+                    self.emit_expression(access.expression, 1)?;
+                    self.writer.write(")[");
+                    self.emit_expression(access.argument_expression, 0)?;
+                    self.writer.write("];");
+                    self.writer.newline();
+                    (&temps[1], Some(&temps[0]), 2)
+                }
+                _ => {
+                    self.writer.write(&temps[0]);
+                    self.writer.write(" = ");
+                    self.emit_expression(call.expression, 1)?;
+                    self.writer.write(";");
+                    self.writer.newline();
+                    (&temps[0], None, 1)
+                }
+            };
+        let prefix_temp = (await_index != 0).then(|| &temps[next_temp]);
+        if let Some(prefix_temp) = prefix_temp {
+            self.writer.write(prefix_temp);
+            self.writer.write(" = [");
+            for (index, argument) in call.arguments.nodes[..await_index].iter().enumerate() {
+                if index != 0 {
+                    self.writer.write(", ");
+                }
+                self.emit_expression(*argument, 0)?;
+            }
+            self.writer.write("];");
+            self.writer.newline();
+        }
+        let NodeData::AwaitExpression(awaited) = &self.node(await_id)?.data else {
+            unreachable!("await expression identified above")
+        };
+        let awaited_expression = awaited.expression;
+        self.emit_es5_async_yield(awaited_expression, case, false)?;
+        self.writer.write(function_temp);
+        self.writer.write(".apply(");
+        self.writer
+            .write(receiver_temp.map_or("void 0", String::as_str));
+        self.writer.write(", ");
+        if let Some(prefix_temp) = prefix_temp {
+            self.writer.write(prefix_temp);
+            self.writer.write(".concat(");
+        }
+        self.writer.write("[");
+        self.writer.write(state);
+        self.writer.write(".sent()");
+        for argument in &call.arguments.nodes[await_index + 1..] {
+            self.writer.write(", ");
+            self.emit_expression(*argument, 0)?;
+        }
+        self.writer.write("]");
+        if prefix_temp.is_some() {
+            self.writer.write(")");
+        }
+        self.writer.write(");");
+        self.writer.newline();
+        Ok(())
+    }
+
+    fn emit_es5_async_computed_call(
+        &mut self,
+        call: &ts_ast::CallExpressionData,
+        temps: &[String],
+        state: &str,
+        case: &mut usize,
+    ) -> Result<(), EmitError> {
+        let Some(NodeData::ElementAccessExpression(access)) =
+            self.arena.get(call.expression).map(|node| &node.data)
+        else {
+            return Err(Self::unsupported(
+                call.expression,
+                SyntaxKind::CallExpression,
+            ));
+        };
+        let Some(await_id) = self.es5_async_simple_await_in_expression(access.argument_expression)
+        else {
+            return Err(Self::unsupported(
+                call.expression,
+                SyntaxKind::CallExpression,
+            ));
+        };
+        let receiver = access.expression;
+        let arguments = call.arguments.nodes.clone();
+        let NodeData::AwaitExpression(awaited) = &self.node(await_id)?.data else {
+            unreachable!("await expression identified above")
+        };
+        let awaited_expression = awaited.expression;
+        if !self.writer.line_start {
+            self.writer.newline();
+        }
+        self.writer.write(&temps[0]);
+        self.writer.write(" = ");
+        self.emit_expression(receiver, 1)?;
+        self.writer.write(";");
+        self.writer.newline();
+        self.emit_es5_async_yield(awaited_expression, case, false)?;
+        self.writer.write(&temps[0]);
+        self.writer.write("[");
+        self.writer.write(state);
+        self.writer.write(".sent()](");
+        for (index, argument) in arguments.iter().enumerate() {
+            if index != 0 {
+                self.writer.write(", ");
+            }
+            self.emit_expression(*argument, 0)?;
+        }
+        self.writer.write(");");
+        self.writer.newline();
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn emit_es5_async_spread_call(
+        &mut self,
+        call: &ts_ast::CallExpressionData,
+        temps: &[String],
+        state: &str,
+        case: &mut usize,
+    ) -> Result<(), EmitError> {
+        let spread_index = call
+            .arguments
+            .nodes
+            .iter()
+            .position(|argument| {
+                matches!(
+                    self.arena.get(*argument).map(|node| &node.data),
+                    Some(NodeData::SpreadElement(_))
+                )
+            })
+            .expect("spread call identified above");
+        let (await_index, await_id) = call
+            .arguments
+            .nodes
+            .iter()
+            .enumerate()
+            .find_map(|(index, argument)| {
+                self.es5_async_simple_await_in_expression(*argument)
+                    .map(|await_id| (index, await_id))
+            })
+            .expect("awaited argument identified above");
+        let NodeData::AwaitExpression(awaited) = &self.node(await_id)?.data else {
+            unreachable!("await expression identified above")
+        };
+        let awaited_expression = awaited.expression;
+        if !self.writer.line_start {
+            self.writer.newline();
+        }
+        self.writer.write(&temps[1]);
+        self.writer.write(" = (");
+        self.writer.write(&temps[0]);
+        self.writer.write(" = ");
+        self.emit_expression(call.expression, 1)?;
+        self.writer.write(").apply;");
+        self.writer.newline();
+        self.writer.write(&temps[2]);
+        self.writer.write(" = [void 0];");
+        self.writer.newline();
+        if temps.len() == 4 {
+            self.writer.write(&temps[3]);
+            self.writer.write(" = ");
+            match (spread_index, await_index) {
+                (0, 0) => self.writer.write("[[]]"),
+                (0, _) => {
+                    let NodeData::SpreadElement(spread) =
+                        &self.node(call.arguments.nodes[spread_index])?.data
+                    else {
+                        unreachable!("spread index identified above")
+                    };
+                    let spread_expression = spread.expression;
+                    self.writer.write("[__spreadArray([], ");
+                    self.emit_expression(spread_expression, 0)?;
+                    self.writer.write(", false)]");
+                }
+                _ => {
+                    self.writer.write("[[");
+                    for (index, argument) in call.arguments.nodes[..spread_index].iter().enumerate()
+                    {
+                        if index != 0 {
+                            self.writer.write(", ");
+                        }
+                        self.emit_expression(*argument, 0)?;
+                    }
+                    self.writer.write("]]");
+                }
+            }
+            self.writer.write(";");
+            self.writer.newline();
+        }
+        self.emit_es5_async_yield(awaited_expression, case, false)?;
+        self.writer.write(&temps[1]);
+        self.writer.write(".apply(");
+        self.writer.write(&temps[0]);
+        self.writer.write(", ");
+        self.writer.write(&temps[2]);
+        self.writer.write(".concat([__spreadArray.apply(void 0, ");
+        match (spread_index, await_index) {
+            (0, 0) => {
+                self.writer.write("[__spreadArray.apply(void 0, ");
+                self.writer.write(&temps[3]);
+                self.writer.write(".concat([(");
+                self.writer.write(state);
+                self.writer.write(".sent()), false])), [");
+                self.emit_expression(call.arguments.nodes[1], 0)?;
+                self.writer.write("], false]");
+            }
+            (0, _) => {
+                self.writer.write(&temps[3]);
+                self.writer.write(".concat([[");
+                self.writer.write(state);
+                self.writer.write(".sent()], false])");
+            }
+            (_, 0) => {
+                self.writer.write("[[");
+                self.writer.write(state);
+                self.writer.write(".sent()], ");
+                let NodeData::SpreadElement(spread) =
+                    &self.node(call.arguments.nodes[spread_index])?.data
+                else {
+                    unreachable!("spread index identified above")
+                };
+                self.emit_expression(spread.expression, 0)?;
+                self.writer.write(", false]");
+            }
+            _ => {
+                self.writer.write(&temps[3]);
+                self.writer.write(".concat([(");
+                self.writer.write(state);
+                self.writer.write(".sent()), false])");
+            }
+        }
+        self.writer.write(")]))");
+        self.writer.write(";");
+        self.writer.newline();
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn emit_es5_async_spread_array_assignment(
         &mut self,
@@ -26577,7 +26944,12 @@ impl Printer<'_> {
                 usize::from(self.direct_await_binding(statement).is_some())
             }
             Some(NodeData::ExpressionStatement(expression)) => {
-                if let Some((_, array)) = self.es5_async_array_assignment(statement) {
+                if let Some(NodeData::CallExpression(call)) =
+                    self.arena.get(expression.expression).map(|node| &node.data)
+                    && self.es5_async_call_internal_await_count(call) != 0
+                {
+                    self.es5_async_call_internal_await_count(call)
+                } else if let Some((_, array)) = self.es5_async_array_assignment(statement) {
                     self.es5_async_array_awaits(array).len()
                 } else if let Some((_, conditional)) =
                     self.es5_async_conditional_assignment(statement)
@@ -26936,6 +27308,69 @@ impl Printer<'_> {
                             )
                         })
             })
+    }
+
+    fn es5_async_call_internal_await_count(&self, call: &ts_ast::CallExpressionData) -> usize {
+        let target_await = match self.arena.get(call.expression).map(|node| &node.data) {
+            Some(NodeData::ElementAccessExpression(access)) => usize::from(
+                self.es5_async_simple_await_in_expression(access.argument_expression)
+                    .is_some(),
+            ),
+            _ => 0,
+        };
+        target_await
+            + call
+                .arguments
+                .nodes
+                .iter()
+                .filter(|argument| {
+                    self.es5_async_simple_await_in_expression(**argument)
+                        .is_some()
+                })
+                .count()
+    }
+
+    fn es5_async_call_temp_count(&self, call: NodeId) -> usize {
+        let Some(NodeData::CallExpression(call)) = self.arena.get(call).map(|node| &node.data)
+        else {
+            return 0;
+        };
+        let awaited_arguments = call
+            .arguments
+            .nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, argument)| {
+                self.es5_async_simple_await_in_expression(*argument)
+                    .map(|_| index)
+            })
+            .collect::<Vec<_>>();
+        if awaited_arguments.is_empty() {
+            return 1;
+        }
+        if call.arguments.nodes.iter().any(|argument| {
+            matches!(
+                self.arena.get(*argument).map(|node| &node.data),
+                Some(NodeData::SpreadElement(_))
+            )
+        }) {
+            return if awaited_arguments[0] == 0
+                && !matches!(
+                    self.arena
+                        .get(call.arguments.nodes[0])
+                        .map(|node| &node.data),
+                    Some(NodeData::SpreadElement(_))
+                ) {
+                3
+            } else {
+                4
+            };
+        }
+        let target_temps = match self.arena.get(call.expression).map(|node| &node.data) {
+            Some(NodeData::PropertyAccessExpression(_) | NodeData::ElementAccessExpression(_)) => 2,
+            _ => 1,
+        };
+        target_temps + usize::from(awaited_arguments[0] != 0)
     }
 
     fn es5_async_simple_await_in_expression(&self, expression: NodeId) -> Option<NodeId> {
@@ -35259,6 +35694,15 @@ impl Printer<'_> {
                         &data.arguments,
                         parent_precedence,
                     )?;
+                } else if self.settings.target < ScriptTarget::Es2015
+                    && data.arguments.nodes.iter().any(|argument| {
+                        matches!(
+                            self.arena.get(*argument).map(|node| &node.data),
+                            Some(NodeData::SpreadElement(_))
+                        )
+                    })
+                {
+                    self.emit_downlevel_spread_call(data)?;
                 } else {
                     let unbound_receiver = self.commonjs_module_transform
                         && self.commonjs_call_requires_unbound_receiver(data.expression);
@@ -37721,6 +38165,91 @@ impl Printer<'_> {
             self.writer.write("]");
         }
         self.writer.write(")");
+        Ok(())
+    }
+
+    fn emit_downlevel_spread_call(
+        &mut self,
+        call: &ts_ast::CallExpressionData,
+    ) -> Result<(), EmitError> {
+        self.emit_expression(call.expression, 18)?;
+        self.writer.write(".apply(");
+        match self.arena.get(call.expression).map(|node| &node.data) {
+            Some(NodeData::PropertyAccessExpression(access)) => {
+                self.emit_expression(access.expression, 1)?;
+            }
+            Some(NodeData::ElementAccessExpression(access)) => {
+                self.emit_expression(access.expression, 1)?;
+            }
+            _ => self.writer.write("void 0"),
+        }
+        self.writer.write(", ");
+        self.emit_es5_spread_argument_array(&call.arguments.nodes, false)?;
+        self.writer.write(")");
+        Ok(())
+    }
+
+    fn emit_es5_spread_argument_array(
+        &mut self,
+        arguments: &[NodeId],
+        leading_void: bool,
+    ) -> Result<(), EmitError> {
+        let Some(spread_index) = arguments.iter().position(|argument| {
+            matches!(
+                self.arena.get(*argument).map(|node| &node.data),
+                Some(NodeData::SpreadElement(_))
+            )
+        }) else {
+            let mut ordinary = Vec::new();
+            if leading_void {
+                ordinary.push(None);
+            }
+            ordinary.extend(arguments.iter().copied().map(Some));
+            return self.emit_es5_spread_ordinary_array(&ordinary);
+        };
+        let suffix = &arguments[spread_index + 1..];
+        if !suffix.is_empty() {
+            self.writer.write("__spreadArray(");
+        }
+        self.writer.write("__spreadArray(");
+        let mut prefix = Vec::new();
+        if leading_void {
+            prefix.push(None);
+        }
+        prefix.extend(arguments[..spread_index].iter().copied().map(Some));
+        self.emit_es5_spread_ordinary_array(&prefix)?;
+        self.writer.write(", ");
+        let NodeData::SpreadElement(spread) = &self.node(arguments[spread_index])?.data else {
+            unreachable!("spread index identified above")
+        };
+        let spread_expression = spread.expression;
+        self.emit_expression(spread_expression, 1)?;
+        self.writer.write(", false)");
+        if !suffix.is_empty() {
+            self.writer.write(", ");
+            let suffix = suffix.iter().copied().map(Some).collect::<Vec<_>>();
+            self.emit_es5_spread_ordinary_array(&suffix)?;
+            self.writer.write(", false)");
+        }
+        Ok(())
+    }
+
+    fn emit_es5_spread_ordinary_array(
+        &mut self,
+        elements: &[Option<NodeId>],
+    ) -> Result<(), EmitError> {
+        self.writer.write("[");
+        for (index, element) in elements.iter().enumerate() {
+            if index != 0 {
+                self.writer.write(", ");
+            }
+            if let Some(element) = element {
+                self.emit_expression(*element, 0)?;
+            } else {
+                self.writer.write("void 0");
+            }
+        }
+        self.writer.write("]");
         Ok(())
     }
 
