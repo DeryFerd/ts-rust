@@ -20485,7 +20485,8 @@ impl Printer<'_> {
         if self.is_external_import_equals(import) {
             self.external_import_equals_has_runtime_use(declaration, import)
         } else {
-            self.internal_import_equals_has_runtime_value(import)
+            self.import_runtime_meanings.get(&declaration) == Some(&true)
+                || self.internal_import_equals_has_runtime_value(import)
         }
     }
 

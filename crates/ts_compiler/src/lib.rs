@@ -1,7 +1,7 @@
 //! Compiler Program and source-file graph foundations.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     path::Path,
 };
 
@@ -422,7 +422,7 @@ impl Program {
             &self.current_directory,
             self.case_sensitivity,
         );
-        for source_file in &self.source_files {
+        for (source_index, source_file) in self.source_files.iter().enumerate() {
             if source_file.is_default_library
                 || ts_path::is_declaration_file(&source_file.file_name)
                 || !self.source_should_emit(source_file)
@@ -469,6 +469,9 @@ impl Program {
                     source_file,
                     preserve_const_enums,
                     source_settings.module == ModuleKind::Amd,
+                    &later_top_level_script_variable_names(
+                        self.source_files.iter().skip(source_index + 1),
+                    ),
                 );
                 let emit_context = EmitContext {
                     bindings: &source_file.binding,
@@ -642,7 +645,7 @@ impl Program {
             let mut map_builder = settings.source_map.then(SourceMapBuilder::new);
             let mut map_sources = Vec::new();
             let mut amd_generated_name_offsets = BTreeMap::new();
-            for source in &sources {
+            for (source_index, source) in sources.iter().enumerate() {
                 let generated_line =
                     u32::try_from(code.bytes().filter(|byte| *byte == b'\n').count())
                         .unwrap_or(u32::MAX);
@@ -682,6 +685,9 @@ impl Program {
                     source,
                     preserve_const_enums,
                     settings.module == ModuleKind::Amd,
+                    &later_top_level_script_variable_names(
+                        sources.iter().skip(source_index + 1).copied(),
+                    ),
                 );
                 let emit_context = EmitContext {
                     bindings: &source.binding,
@@ -3264,15 +3270,22 @@ fn source_is_external_module(source: &SourceFile) -> bool {
         return false;
     };
     file.statements.nodes.iter().any(|statement| {
-        matches!(
-            source.parse.arena.get(*statement).map(|node| &node.data),
+        match source.parse.arena.get(*statement).map(|node| &node.data) {
             Some(
                 NodeData::ImportDeclaration(_)
-                    | NodeData::ImportEqualsDeclaration(_)
-                    | NodeData::ExportDeclaration(_)
-                    | NodeData::ExportAssignment(_)
-            )
-        )
+                | NodeData::ExportDeclaration(_)
+                | NodeData::ExportAssignment(_),
+            ) => true,
+            Some(NodeData::ImportEqualsDeclaration(import)) => matches!(
+                source
+                    .parse
+                    .arena
+                    .get(import.module_reference)
+                    .map(|node| &node.data),
+                Some(NodeData::ExternalModuleReference(_))
+            ),
+            _ => false,
+        }
     })
 }
 
@@ -3345,6 +3358,7 @@ fn import_runtime_meanings_for_emit(
     source: &SourceFile,
     preserve_const_enums: bool,
     amd: bool,
+    later_script_variable_names: &HashSet<String>,
 ) -> BTreeMap<NodeId, bool> {
     let mut meanings = source.checking.import_runtime_meanings.clone();
     let Some(NodeData::SourceFile(file)) = source
@@ -3367,6 +3381,22 @@ fn import_runtime_meanings_for_emit(
             continue;
         }
         if !amd {
+            if let Some(NodeData::ImportEqualsDeclaration(import)) =
+                source.parse.arena.get(*statement).map(|node| &node.data)
+                && !import.is_type_only
+                && !matches!(
+                    source
+                        .parse
+                        .arena
+                        .get(import.module_reference)
+                        .map(|node| &node.data),
+                    Some(NodeData::ExternalModuleReference(_))
+                )
+                && import_equals_name(source, import)
+                    .is_some_and(|name| later_script_variable_names.contains(name))
+            {
+                meanings.insert(*statement, true);
+            }
             continue;
         }
         let Some(NodeData::ImportEqualsDeclaration(import)) =
@@ -3395,6 +3425,57 @@ fn import_runtime_meanings_for_emit(
         meanings.insert(*statement, true);
     }
     meanings
+}
+
+fn later_top_level_script_variable_names<'a>(
+    sources: impl IntoIterator<Item = &'a SourceFile>,
+) -> HashSet<String> {
+    sources
+        .into_iter()
+        .filter(|source| {
+            !source.is_default_library
+                && !ts_path::is_declaration_file(&source.file_name)
+                && !source_is_external_module(source)
+        })
+        .flat_map(|source| {
+            let statements = match source
+                .parse
+                .arena
+                .get(source.parse.source_file)
+                .map(|node| &node.data)
+            {
+                Some(NodeData::SourceFile(file)) => file.statements.nodes.as_slice(),
+                _ => &[],
+            };
+            statements
+                .iter()
+                .filter_map(|statement| {
+                    let NodeData::VariableStatement(variable) =
+                        &source.parse.arena.get(*statement)?.data
+                    else {
+                        return None;
+                    };
+                    let NodeData::VariableDeclarationList(list) =
+                        &source.parse.arena.get(variable.declaration_list)?.data
+                    else {
+                        return None;
+                    };
+                    Some(list.declarations.nodes.iter().filter_map(|declaration| {
+                        let NodeData::VariableDeclaration(variable) =
+                            &source.parse.arena.get(*declaration)?.data
+                        else {
+                            return None;
+                        };
+                        match source.parse.arena.get(variable.name).map(|node| &node.data) {
+                            Some(NodeData::Identifier(identifier)) => Some(identifier.text.clone()),
+                            _ => None,
+                        }
+                    }))
+                })
+                .flatten()
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 fn append_bundle_declaration_module(
