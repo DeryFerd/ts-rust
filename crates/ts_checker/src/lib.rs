@@ -1170,8 +1170,10 @@ impl<'a> ProgramChecker<'a> {
                 if let Some(bindings) = clause.named_bindings {
                     match &source.arena.get(bindings)?.data {
                         NodeData::NamespaceImport(_) => {
-                            has_value |=
-                                self.module_has_runtime_export(target, &mut HashSet::new());
+                            has_value |= exports.values().any(|symbol| {
+                                self.symbol_has_runtime_value(target, *symbol, &mut HashSet::new())
+                            }) || self
+                                .module_has_runtime_export(target, &mut HashSet::new());
                         }
                         NodeData::NamedImports(imports) => {
                             has_value |= imports.elements.nodes.iter().any(|specifier| {
@@ -1187,7 +1189,12 @@ impl<'a> ProgramChecker<'a> {
                                 let Some(name) = identifier_text(source.arena, imported) else {
                                     return false;
                                 };
-                                self.module_export_name_has_runtime_value(
+                                self.module_export_has_runtime_value(
+                                    target,
+                                    &exports,
+                                    name,
+                                    &mut HashSet::new(),
+                                ) || self.module_export_name_has_runtime_value(
                                     target,
                                     name,
                                     &mut HashSet::new(),
@@ -19576,6 +19583,7 @@ mod tests {
                 import EqualsValue = require("./export-equals");
                 import Internal = require("internal");
                 import Direct = require("direct");
+                import * as DirectNamespace from "direct";
                 import Types = require("types");
             "#,
         );
@@ -19639,10 +19647,10 @@ mod tests {
             panic!("expected source file");
         };
         let meanings = &checked.files[2].import_runtime_meanings;
-        for statement in &source.statements.nodes[..4] {
+        for statement in &source.statements.nodes[..5] {
             assert_eq!(meanings.get(statement), Some(&true), "{statement:?}");
         }
-        assert_eq!(meanings.get(&source.statements.nodes[4]), Some(&false));
+        assert_eq!(meanings.get(&source.statements.nodes[5]), Some(&false));
     }
 
     #[test]
