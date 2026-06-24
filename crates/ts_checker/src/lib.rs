@@ -2723,13 +2723,112 @@ impl<'a> Checker<'a> {
         let mut saw_return = false;
         self.check_node(source_file, None, &mut saw_return);
         self.check_unused_symbols();
+        let inferred_type_names = self.exported_inferred_type_names();
         self.result.declaration_reachability = DeclarationReachability::analyze(
             self.arena,
             self.bindings,
             source_file,
             self.options.is_declaration_file,
+            &inferred_type_names,
         );
         self.result
+    }
+
+    fn exported_inferred_type_names(&self) -> BTreeSet<String> {
+        fn visit(
+            result: &CheckResult,
+            type_id: TypeId,
+            names: &mut BTreeSet<String>,
+            visited: &mut HashSet<TypeId>,
+        ) {
+            if !visited.insert(type_id) {
+                return;
+            }
+            if let Some(reference) = result.named_type_references.get(&type_id) {
+                if !result.import_type_references.contains_key(&type_id) {
+                    names.insert(reference.name.clone());
+                }
+                for argument in &reference.type_arguments {
+                    visit(result, *argument, names, visited);
+                }
+            }
+            let Some(kind) = result.types.get(type_id).map(|type_| &type_.kind) else {
+                return;
+            };
+            match kind {
+                TypeKind::TypeParameter {
+                    constraint: Some(constraint),
+                    ..
+                } => visit(result, *constraint, names, visited),
+                TypeKind::Array(element) => visit(result, *element, names, visited),
+                TypeKind::Tuple(elements)
+                | TypeKind::ReadonlyTuple(elements)
+                | TypeKind::Union(elements)
+                | TypeKind::Intersection(elements) => {
+                    for element in elements {
+                        visit(result, *element, names, visited);
+                    }
+                }
+                TypeKind::Object(object) => {
+                    for property in object.properties.values() {
+                        visit(result, *property, names, visited);
+                    }
+                    for index in [object.string_index_type, object.number_index_type]
+                        .into_iter()
+                        .flatten()
+                    {
+                        visit(result, index, names, visited);
+                    }
+                }
+                TypeKind::Function(signature) | TypeKind::Constructor(signature) => {
+                    for parameter in &signature.parameters {
+                        visit(result, *parameter, names, visited);
+                    }
+                    if let Some(rest) = signature.rest_parameter {
+                        visit(result, rest, names, visited);
+                    }
+                    visit(result, signature.return_type, names, visited);
+                }
+                TypeKind::Overload(signatures) => {
+                    for signature in signatures {
+                        for parameter in &signature.parameters {
+                            visit(result, *parameter, names, visited);
+                        }
+                        if let Some(rest) = signature.rest_parameter {
+                            visit(result, rest, names, visited);
+                        }
+                        visit(result, signature.return_type, names, visited);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut names = BTreeSet::new();
+        let mut visited = HashSet::new();
+        for (_, symbol) in self.bindings.exports.iter() {
+            let requires_inferred_reachability =
+                self.bindings.symbols.get(symbol).is_some_and(|symbol| {
+                    symbol.declarations.iter().any(|declaration| {
+                        matches!(
+                            self.arena.get(*declaration).map(|node| &node.data),
+                            Some(NodeData::VariableDeclaration(variable))
+                                if variable.type_.is_none()
+                        ) || matches!(
+                            self.arena.get(*declaration).map(|node| &node.data),
+                            Some(NodeData::FunctionDeclaration(function))
+                                if function.type_.is_none()
+                        )
+                    })
+                });
+            if !requires_inferred_reachability {
+                continue;
+            }
+            if let Some(type_id) = self.result.symbol_types.get(&symbol) {
+                visit(&self.result, *type_id, &mut names, &mut visited);
+            }
+        }
+        names
     }
 
     #[allow(clippy::too_many_lines)]
@@ -11286,20 +11385,48 @@ impl<'a> Checker<'a> {
                     self.infer_conditional_type(return_type, signature.return_type, inference)
                 })
             }
-            NodeData::TypeLiteralNode(data) => data.members.nodes.iter().all(|member| {
-                let Some(NodeData::PropertySignatureDeclaration(property)) =
-                    self.arena.get(*member).map(|node| &node.data)
-                else {
-                    return true;
-                };
-                let Some(name) = self.property_name(property.name) else {
-                    return false;
-                };
-                let Some(actual_property) = self.lookup_property_type(actual, &name) else {
-                    return false;
-                };
-                self.infer_conditional_type(property.type_, actual_property, inference)
-            }),
+            NodeData::TypeLiteralNode(data) => {
+                for member in &data.members.nodes {
+                    let (name_node, type_node, optional) =
+                        match self.arena.get(*member).map(|node| &node.data) {
+                            Some(NodeData::PropertySignatureDeclaration(property)) => (
+                                property.name,
+                                Some(property.type_),
+                                property.postfix_token.is_some_and(|token| {
+                                    self.arena.get(token).is_some_and(|token| {
+                                        token.kind == SyntaxKind::QuestionToken
+                                    })
+                                }),
+                            ),
+                            Some(NodeData::PropertyDeclaration(property)) => (
+                                property.name,
+                                property.type_,
+                                property.postfix_token.is_some_and(|token| {
+                                    self.arena.get(token).is_some_and(|token| {
+                                        token.kind == SyntaxKind::QuestionToken
+                                    })
+                                }),
+                            ),
+                            _ => continue,
+                        };
+                    let Some(type_node) = type_node else {
+                        continue;
+                    };
+                    let Some(name) = self.property_name(name_node) else {
+                        return false;
+                    };
+                    let Some(actual_property) = self.lookup_property_type(actual, &name) else {
+                        if optional {
+                            continue;
+                        }
+                        return false;
+                    };
+                    if !self.infer_conditional_type(type_node, actual_property, inference) {
+                        return false;
+                    }
+                }
+                true
+            }
             NodeData::UnionTypeNode(data) => data.types.nodes.iter().any(|candidate| {
                 let mut candidate_inference = inference.clone();
                 if self.infer_conditional_type(*candidate, actual, &mut candidate_inference) {
@@ -12196,7 +12323,7 @@ impl<'a> Checker<'a> {
         let substitutions = parameters
             .iter()
             .zip(arguments)
-            .map(|(name, argument)| (name.clone(), describe_type(&self.result.types, *argument)))
+            .map(|(name, argument)| (name.clone(), describe_checked_type(&self.result, *argument)))
             .collect::<BTreeMap<_, _>>();
         let instantiated = substitute_descriptor(body, &substitutions);
         self.import_type(&instantiated)
@@ -12859,6 +12986,7 @@ impl<'a> DeclarationReachability<'a> {
         bindings: &'a BindResult,
         source_file: NodeId,
         is_declaration_file: bool,
+        inferred_type_names: &BTreeSet<String>,
     ) -> BTreeMap<NodeId, BTreeSet<NodeId>> {
         let mut children = HashMap::<NodeId, Vec<NodeId>>::new();
         for (id, node) in arena.iter() {
@@ -12898,8 +13026,42 @@ impl<'a> DeclarationReachability<'a> {
             is_declaration_file,
         );
         analyzer.seed_roots();
+        for name in inferred_type_names {
+            analyzer.retain_name(name);
+        }
         analyzer.trace_dependencies();
         analyzer.retained
+    }
+
+    fn retain_name(&mut self, name: &str) {
+        let name = name.strip_prefix("typeof ").unwrap_or(name);
+        let root = name.split_once('.').map_or(name, |(root, _)| root);
+        let Some(symbol) = self
+            .bindings
+            .root_scope()
+            .and_then(|scope| scope.symbols.get(root))
+        else {
+            return;
+        };
+        let target = self
+            .bindings
+            .symbols
+            .get(symbol)
+            .and_then(|symbol| symbol.target)
+            .unwrap_or(symbol);
+        for candidate in [symbol, target] {
+            let declarations = self
+                .bindings
+                .symbols
+                .get(candidate)
+                .map(|symbol| symbol.declarations.clone())
+                .unwrap_or_default();
+            for declaration in declarations {
+                if let Some(statement) = self.declaration_statement(declaration) {
+                    self.retain(statement);
+                }
+            }
+        }
     }
 
     fn collect_scope(
@@ -14296,6 +14458,35 @@ fn describe_type_node_syntax(
             semantic_target,
             exported_names,
         ),
+        NodeData::ConditionalTypeNode(conditional) => {
+            if !matches!(semantic_target, TypeDescriptor::Unknown) {
+                return semantic_target;
+            }
+            let check = checker.type_from_type_node(conditional.check_type);
+            if checker.type_contains_type_parameter(check) {
+                return semantic_target;
+            }
+            let mut inference = HashMap::new();
+            let matched =
+                checker.infer_conditional_type(conditional.extends_type, check, &mut inference);
+            let selected = if matched {
+                conditional.true_type
+            } else {
+                conditional.false_type
+            };
+            checker.type_parameter_scopes.push(inference);
+            let selected_target = checker.type_from_type_node(selected);
+            let selected_target = describe_source_type(source, &checker.result, selected_target);
+            let described = describe_type_node_syntax(
+                source,
+                checker,
+                selected,
+                selected_target,
+                exported_names,
+            );
+            checker.type_parameter_scopes.pop();
+            described
+        }
         NodeData::TypeQueryNode(query) => {
             let Some(name) = checker.entity_name_text(query.expr_name) else {
                 return semantic_target;
@@ -14341,6 +14532,29 @@ fn describe_type_node_syntax(
             );
             if matches!(semantic_target, TypeDescriptor::TypeParameter(_)) {
                 return semantic_target;
+            }
+            if matches!(semantic_target, TypeDescriptor::Unknown)
+                && let Some(symbol) = checker.resolve_identifier(reference.type_name, &name)
+                && let Some(alias) = checker.bindings.symbols.get(symbol).and_then(|symbol| {
+                    symbol.declarations.iter().find_map(|declaration| {
+                        let NodeData::TypeAliasDeclaration(alias) =
+                            &source.arena.get(*declaration)?.data
+                        else {
+                            return None;
+                        };
+                        (alias.type_parameters.is_none()
+                            && matches!(
+                                source.arena.get(alias.type_).map(|node| &node.data),
+                                Some(NodeData::ConditionalTypeNode(_))
+                            ))
+                        .then_some(alias.as_ref())
+                    })
+                })
+            {
+                let TypeDescriptor::Alias { body, .. } = describe_alias(source, alias) else {
+                    unreachable!("describe_alias always returns an alias descriptor");
+                };
+                return *body;
             }
             let type_arguments = reference
                 .type_arguments
