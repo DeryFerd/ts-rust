@@ -500,6 +500,13 @@ impl Program {
                     inline_const_enums: !self.options.isolated_modules
                         && !self.options.verbatim_module_syntax,
                     emit_decorator_metadata: self.options.emit_decorator_metadata,
+                    preserve_dynamic_import: matches!(
+                        settings.module,
+                        ModuleKind::Node16
+                            | ModuleKind::Node18
+                            | ModuleKind::Node20
+                            | ModuleKind::NodeNext
+                    ),
                     strict_null_checks: self.options.strict_null_checks,
                     jsx_factory: self.options.jsx_factory.as_deref(),
                     downlevel_iteration: self.options.downlevel_iteration,
@@ -719,6 +726,13 @@ impl Program {
                     inline_const_enums: !self.options.isolated_modules
                         && !self.options.verbatim_module_syntax,
                     emit_decorator_metadata: self.options.emit_decorator_metadata,
+                    preserve_dynamic_import: matches!(
+                        settings.module,
+                        ModuleKind::Node16
+                            | ModuleKind::Node18
+                            | ModuleKind::Node20
+                            | ModuleKind::NodeNext
+                    ),
                     strict_null_checks: self.options.strict_null_checks,
                     jsx_factory: self.options.jsx_factory.as_deref(),
                     downlevel_iteration: self.options.downlevel_iteration,

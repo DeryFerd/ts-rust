@@ -7276,6 +7276,10 @@ impl<'a> Checker<'a> {
                 }
             }
             NodeData::PrefixUnaryExpression(data) => self.prefix_unary_type(data),
+            NodeData::AwaitExpression(data) => {
+                let expression = self.type_of_expression(data.expression);
+                self.awaited_type(expression)
+            }
             NodeData::VoidExpression(data) => {
                 self.type_of_expression(data.expression);
                 self.result.types.undefined()
@@ -7438,15 +7442,7 @@ impl<'a> Checker<'a> {
                         .and_then(|argument| string_literal_text(self.arena, *argument))
                     && let Some(descriptor) = self.external_names.get(specifier).cloned()
                 {
-                    let module_type = self.import_type(&descriptor);
-                    self.result.import_type_references.insert(
-                        module_type,
-                        ImportTypeReference {
-                            module_specifier: specifier.to_owned(),
-                            qualifier: String::new(),
-                            is_typeof: true,
-                        },
-                    );
+                    let module_type = self.dynamic_import_module_type(&descriptor, specifier);
                     if let Some(contextual_type) = contextual_type
                         && let Some(reference) = self
                             .result
@@ -7598,6 +7594,70 @@ impl<'a> Checker<'a> {
         };
         self.result.node_types.insert(node_id, result);
         result
+    }
+
+    fn awaited_type(&mut self, type_id: TypeId) -> TypeId {
+        if let Some(reference) = self.result.named_type_references.get(&type_id)
+            && reference.name == "Promise"
+            && let Some(awaited) = reference.type_arguments.first()
+        {
+            return *awaited;
+        }
+        let Some(TypeKind::Union(members)) = self
+            .result
+            .types
+            .get(type_id)
+            .map(|type_| type_.kind.clone())
+        else {
+            return type_id;
+        };
+        let awaited = members
+            .into_iter()
+            .map(|member| self.awaited_type(member))
+            .collect::<Vec<_>>();
+        self.result.types.union(awaited)
+    }
+
+    fn dynamic_import_module_type(
+        &mut self,
+        descriptor: &TypeDescriptor,
+        specifier: &str,
+    ) -> TypeId {
+        let imported = self.import_type(descriptor);
+        let Some(TypeKind::Object(mut object)) = self
+            .result
+            .types
+            .get(imported)
+            .map(|type_| type_.kind.clone())
+        else {
+            self.result.import_type_references.insert(
+                imported,
+                ImportTypeReference {
+                    module_specifier: specifier.to_owned(),
+                    qualifier: String::new(),
+                    is_typeof: true,
+                },
+            );
+            return imported;
+        };
+        for property in object.properties.values_mut() {
+            let kind = self
+                .result
+                .types
+                .get(*property)
+                .map_or(TypeKind::Unknown, |type_| type_.kind.clone());
+            let referenced = self.result.types.alloc(kind);
+            self.result.import_type_references.insert(
+                referenced,
+                ImportTypeReference {
+                    module_specifier: specifier.to_owned(),
+                    qualifier: String::new(),
+                    is_typeof: true,
+                },
+            );
+            *property = referenced;
+        }
+        self.result.types.alloc(TypeKind::Object(object))
     }
 
     fn jsx_element_type(&mut self) -> TypeId {
@@ -12992,6 +13052,7 @@ impl<'a> Checker<'a> {
                     .map(|(name, property)| {
                         let property = if readonly_properties.contains(&name)
                             || self.result.named_type_references.contains_key(&property)
+                            || self.result.import_type_references.contains_key(&property)
                         {
                             property
                         } else {
