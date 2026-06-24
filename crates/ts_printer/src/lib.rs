@@ -305,6 +305,7 @@ pub fn emit_source_file_with_context(
         es5_async_expression_rewrites: HashMap::new(),
         es5_async_await_captures: HashMap::new(),
         es5_async_conditional_temps: HashMap::new(),
+        es5_async_array_temps: HashMap::new(),
         es5_async_control_targets: Vec::new(),
         es5_async_hoisted_variable_lists: HashSet::new(),
         async_loop_counter: 0,
@@ -17467,7 +17468,13 @@ struct Es5AsyncCapturePlan {
     temps: Vec<String>,
     captures: HashMap<NodeId, Vec<(NodeId, String)>>,
     conditional_temps: HashMap<NodeId, String>,
+    array_temps: HashMap<NodeId, Option<String>>,
     state_parameter: Option<String>,
+}
+
+enum Es5AsyncArrayValue {
+    Node(NodeId),
+    Sent(bool),
 }
 
 struct Es5AsyncControlTarget {
@@ -18212,6 +18219,7 @@ struct Printer<'a> {
     es5_async_expression_rewrites: HashMap<NodeId, String>,
     es5_async_await_captures: HashMap<NodeId, Vec<(NodeId, String)>>,
     es5_async_conditional_temps: HashMap<NodeId, String>,
+    es5_async_array_temps: HashMap<NodeId, Option<String>>,
     es5_async_control_targets: Vec<Es5AsyncControlTarget>,
     es5_async_hoisted_variable_lists: HashSet<NodeId>,
     async_loop_counter: u32,
@@ -25208,6 +25216,7 @@ impl Printer<'_> {
     ) -> Result<(), EmitError> {
         let previous_await_captures = std::mem::take(&mut self.es5_async_await_captures);
         let previous_conditional_temps = std::mem::take(&mut self.es5_async_conditional_temps);
+        let previous_array_temps = std::mem::take(&mut self.es5_async_array_temps);
         let previous_hoisted_variable_lists =
             std::mem::take(&mut self.es5_async_hoisted_variable_lists);
         let mut hoisted_for_names = Vec::new();
@@ -25223,6 +25232,7 @@ impl Printer<'_> {
                 temps: Vec::new(),
                 captures: HashMap::new(),
                 conditional_temps: HashMap::new(),
+                array_temps: HashMap::new(),
                 state_parameter: None,
             }
         };
@@ -25230,10 +25240,12 @@ impl Printer<'_> {
             temps: planned_temps,
             captures: await_captures,
             conditional_temps,
+            array_temps,
             state_parameter: planned_state_parameter,
         } = capture_plan;
         self.es5_async_await_captures = await_captures;
         self.es5_async_conditional_temps = conditional_temps;
+        self.es5_async_array_temps = array_temps;
         let state_parameter = planned_state_parameter
             .as_deref()
             .unwrap_or(requested_state_parameter);
@@ -25347,6 +25359,7 @@ impl Printer<'_> {
         }
         self.es5_async_await_captures = previous_await_captures;
         self.es5_async_conditional_temps = previous_conditional_temps;
+        self.es5_async_array_temps = previous_array_temps;
         self.es5_async_hoisted_variable_lists = previous_hoisted_variable_lists;
         Ok(())
     }
@@ -25405,10 +25418,12 @@ impl Printer<'_> {
     fn es5_async_capture_plan(&self, body: NodeId) -> Es5AsyncCapturePlan {
         let mut await_captures = Vec::new();
         let mut conditional_nodes = Vec::new();
+        let mut array_nodes = Vec::new();
         if let Some(NodeData::Block(block)) = self.arena.get(body).map(|node| &node.data) {
             for statement in &block.statements.nodes {
                 self.collect_es5_async_await_captures(*statement, &mut await_captures);
                 self.collect_es5_async_conditional_temps(*statement, &mut conditional_nodes);
+                self.collect_es5_async_array_temps(*statement, &mut array_nodes);
             }
         }
         let mut claimed = HashSet::new();
@@ -25430,12 +25445,60 @@ impl Printer<'_> {
             temps.push(temp.clone());
             conditional_temps.insert(conditional, temp);
         }
+        let mut array_temps = HashMap::new();
+        for array in array_nodes {
+            let temp = if self.es5_async_array_needs_temp(array) {
+                let temp = self.generate_block_temp(body, &claimed);
+                claimed.insert(temp.clone());
+                temps.push(temp.clone());
+                Some(temp)
+            } else {
+                None
+            };
+            array_temps.insert(array, temp);
+        }
         let state_parameter = (!temps.is_empty()).then(|| self.generate_block_temp(body, &claimed));
         Es5AsyncCapturePlan {
             temps,
             captures,
             conditional_temps,
+            array_temps,
             state_parameter,
+        }
+    }
+
+    fn collect_es5_async_array_temps(&self, statement: NodeId, arrays: &mut Vec<NodeId>) {
+        match self.arena.get(statement).map(|node| &node.data) {
+            Some(NodeData::Block(block)) => {
+                for statement in &block.statements.nodes {
+                    self.collect_es5_async_array_temps(*statement, arrays);
+                }
+            }
+            Some(NodeData::IfStatement(statement)) => {
+                self.collect_es5_async_array_temps(statement.then_statement, arrays);
+                if let Some(statement) = statement.else_statement {
+                    self.collect_es5_async_array_temps(statement, arrays);
+                }
+            }
+            Some(NodeData::WhileStatement(statement)) => {
+                self.collect_es5_async_array_temps(statement.statement, arrays);
+            }
+            Some(NodeData::DoStatement(statement)) => {
+                self.collect_es5_async_array_temps(statement.statement, arrays);
+            }
+            Some(NodeData::ForStatement(statement)) => {
+                self.collect_es5_async_array_temps(statement.statement, arrays);
+            }
+            Some(NodeData::LabeledStatement(statement)) => {
+                self.collect_es5_async_array_temps(statement.statement, arrays);
+            }
+            _ => {
+                if let Some((_, array)) = self.es5_async_array_assignment(statement)
+                    && !self.es5_async_array_awaits(array).is_empty()
+                {
+                    arrays.push(array);
+                }
+            }
         }
     }
 
@@ -25657,6 +25720,11 @@ impl Printer<'_> {
             && self.es5_async_simple_suspension_count(statement) != 0
         {
             return self.emit_es5_async_if_statement(if_statement, state, case, is_last);
+        }
+        if let Some((left, array)) = self.es5_async_array_assignment(statement)
+            && let Some(temp) = self.es5_async_array_temps.get(&array).cloned()
+        {
+            return self.emit_es5_async_array_assignment(left, array, temp.as_deref(), state, case);
         }
         if let Some((left, conditional)) = self.es5_async_conditional_assignment(statement)
             && let Some(temp) = self.es5_async_conditional_temps.get(&conditional).cloned()
@@ -26190,6 +26258,221 @@ impl Printer<'_> {
         Ok(())
     }
 
+    fn emit_es5_async_array_assignment(
+        &mut self,
+        left: NodeId,
+        array: NodeId,
+        temp: Option<&str>,
+        state: &str,
+        case: &mut usize,
+    ) -> Result<(), EmitError> {
+        let node = self.node(array)?.clone();
+        let NodeData::ArrayLiteralExpression(array_data) = &node.data else {
+            return Err(Self::unsupported(array, node.kind));
+        };
+        let spread_index = array_data.elements.nodes.iter().position(|element| {
+            matches!(
+                self.arena.get(*element).map(|node| &node.data),
+                Some(NodeData::SpreadElement(_))
+            )
+        });
+        if let Some(spread_index) = spread_index {
+            return self.emit_es5_async_spread_array_assignment(
+                left,
+                array_data,
+                spread_index,
+                temp,
+                state,
+                case,
+            );
+        }
+
+        let mut values = Vec::new();
+        let mut temp_assigned = false;
+        for element in &array_data.elements.nodes {
+            if let Some(await_id) = self.es5_async_simple_await_in_expression(*element) {
+                if !values.is_empty()
+                    && let Some(temp) = temp
+                {
+                    if !self.writer.line_start {
+                        self.writer.newline();
+                    }
+                    self.writer.write(temp);
+                    self.writer.write(" = ");
+                    if temp_assigned {
+                        self.writer.write(temp);
+                        self.writer.write(".concat(");
+                    }
+                    self.emit_es5_async_array_values(&values, state)?;
+                    if temp_assigned {
+                        self.writer.write(")");
+                    }
+                    self.writer.write(";");
+                    self.writer.newline();
+                    temp_assigned = true;
+                    values.clear();
+                }
+                let NodeData::AwaitExpression(awaited) = &self.node(await_id)?.data else {
+                    unreachable!("await expression identified above")
+                };
+                self.emit_es5_async_yield(awaited.expression, case, false)?;
+                values.push(Es5AsyncArrayValue::Sent(false));
+            } else {
+                values.push(Es5AsyncArrayValue::Node(*element));
+            }
+        }
+        self.emit_expression(left, 1)?;
+        self.writer.write(" = ");
+        if temp_assigned {
+            self.writer.write(temp.expect("assigned array temp"));
+            self.writer.write(".concat(");
+        }
+        self.emit_es5_async_array_values(&values, state)?;
+        if temp_assigned {
+            self.writer.write(")");
+        }
+        self.writer.write(";");
+        self.writer.newline();
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_es5_async_spread_array_assignment(
+        &mut self,
+        left: NodeId,
+        array: &ts_ast::ArrayLiteralExpressionData,
+        spread_index: usize,
+        temp: Option<&str>,
+        state: &str,
+        case: &mut usize,
+    ) -> Result<(), EmitError> {
+        let array_awaits = self.es5_async_array_awaits_from_data(array);
+        let [(await_index, await_id)] = array_awaits.as_slice() else {
+            return Err(Self::unsupported(left, SyntaxKind::ArrayLiteralExpression));
+        };
+        let await_index = *await_index;
+        let await_id = *await_id;
+        let NodeData::AwaitExpression(awaited) = &self.node(await_id)?.data else {
+            unreachable!("await expression identified above")
+        };
+        let awaited_expression = awaited.expression;
+        if let Some(temp) = temp {
+            if !self.writer.line_start {
+                self.writer.newline();
+            }
+            self.writer.write(temp);
+            self.writer.write(" = ");
+            if spread_index == 0 && await_index == 0 {
+                self.writer.write("[[]]");
+            } else if spread_index == 0 {
+                self.writer.write("[__spreadArray([], ");
+                let NodeData::SpreadElement(spread) =
+                    &self.node(array.elements.nodes[spread_index])?.data
+                else {
+                    unreachable!("spread index identified above")
+                };
+                self.emit_expression(spread.expression, 0)?;
+                self.writer.write(", true)]");
+            } else {
+                self.writer.write("[[");
+                for (index, element) in array.elements.nodes[..spread_index].iter().enumerate() {
+                    if index != 0 {
+                        self.writer.write(", ");
+                    }
+                    self.emit_expression(*element, 0)?;
+                }
+                self.writer.write("]]");
+            }
+            self.writer.write(";");
+            self.writer.newline();
+        }
+        self.emit_es5_async_yield(awaited_expression, case, false)?;
+        self.emit_expression(left, 1)?;
+        self.writer.write(" = __spreadArray.apply(void 0, ");
+        match (spread_index, await_index) {
+            (0, 0) => {
+                self.writer.write("[__spreadArray.apply(void 0, ");
+                self.writer.write(temp.expect("spread await temp"));
+                self.writer.write(".concat([(");
+                self.writer.write(state);
+                self.writer.write(".sent()), true])), [");
+                self.emit_expression(array.elements.nodes[1], 0)?;
+                self.writer.write("], false]");
+            }
+            (0, _) => {
+                self.writer.write(temp.expect("spread prefix temp"));
+                self.writer.write(".concat([[");
+                self.writer.write(state);
+                self.writer.write(".sent()], false])");
+            }
+            (_, 0) => {
+                self.writer.write("[[");
+                self.writer.write(state);
+                self.writer.write(".sent()], ");
+                let NodeData::SpreadElement(spread) =
+                    &self.node(array.elements.nodes[spread_index])?.data
+                else {
+                    unreachable!("spread index identified above")
+                };
+                self.emit_expression(spread.expression, 0)?;
+                self.writer.write(", true]");
+            }
+            _ => {
+                self.writer.write(temp.expect("spread prefix temp"));
+                self.writer.write(".concat([(");
+                self.writer.write(state);
+                self.writer.write(".sent()), true])");
+            }
+        }
+        self.writer.write(");");
+        self.writer.newline();
+        Ok(())
+    }
+
+    fn es5_async_array_awaits_from_data(
+        &self,
+        array: &ts_ast::ArrayLiteralExpressionData,
+    ) -> Vec<(usize, NodeId)> {
+        array
+            .elements
+            .nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, element)| {
+                self.es5_async_simple_await_in_expression(*element)
+                    .map(|await_id| (index, await_id))
+            })
+            .collect()
+    }
+
+    fn emit_es5_async_array_values(
+        &mut self,
+        values: &[Es5AsyncArrayValue],
+        state: &str,
+    ) -> Result<(), EmitError> {
+        self.writer.write("[");
+        for (index, value) in values.iter().enumerate() {
+            if index != 0 {
+                self.writer.write(", ");
+            }
+            match value {
+                Es5AsyncArrayValue::Node(node) => self.emit_expression(*node, 0)?,
+                Es5AsyncArrayValue::Sent(parenthesized) => {
+                    if *parenthesized {
+                        self.writer.write("(");
+                    }
+                    self.writer.write(state);
+                    self.writer.write(".sent()");
+                    if *parenthesized {
+                        self.writer.write(")");
+                    }
+                }
+            }
+        }
+        self.writer.write("]");
+        Ok(())
+    }
+
     fn emit_es5_async_conditional_value(
         &mut self,
         expression: NodeId,
@@ -26294,7 +26577,10 @@ impl Printer<'_> {
                 usize::from(self.direct_await_binding(statement).is_some())
             }
             Some(NodeData::ExpressionStatement(expression)) => {
-                if let Some((_, conditional)) = self.es5_async_conditional_assignment(statement)
+                if let Some((_, array)) = self.es5_async_array_assignment(statement) {
+                    self.es5_async_array_awaits(array).len()
+                } else if let Some((_, conditional)) =
+                    self.es5_async_conditional_assignment(statement)
                     && let Some(NodeData::ConditionalExpression(conditional)) =
                         self.arena.get(conditional).map(|node| &node.data)
                 {
@@ -26579,6 +26865,79 @@ impl Printer<'_> {
         Some((binary.left, binary.right))
     }
 
+    fn es5_async_array_assignment(&self, statement: NodeId) -> Option<(NodeId, NodeId)> {
+        let NodeData::ExpressionStatement(statement) = &self.arena.get(statement)?.data else {
+            return None;
+        };
+        let NodeData::BinaryExpression(binary) = &self.arena.get(statement.expression)?.data else {
+            return None;
+        };
+        if self.arena.get(binary.operator_token)?.kind != SyntaxKind::EqualsToken
+            || !matches!(
+                self.arena.get(binary.right).map(|node| &node.data),
+                Some(NodeData::ArrayLiteralExpression(_))
+            )
+        {
+            return None;
+        }
+        Some((binary.left, binary.right))
+    }
+
+    fn es5_async_array_awaits(&self, array: NodeId) -> Vec<(usize, NodeId)> {
+        let Some(NodeData::ArrayLiteralExpression(array)) =
+            self.arena.get(array).map(|node| &node.data)
+        else {
+            return Vec::new();
+        };
+        array
+            .elements
+            .nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, element)| {
+                self.es5_async_simple_await_in_expression(*element)
+                    .map(|await_id| (index, await_id))
+            })
+            .collect()
+    }
+
+    fn es5_async_array_needs_temp(&self, array: NodeId) -> bool {
+        let awaits = self.es5_async_array_awaits(array);
+        awaits.len() > 1
+            || awaits.first().is_some_and(|(index, await_id)| {
+                *index != 0
+                    || self
+                        .arena
+                        .get(*await_id)
+                        .and_then(|await_node| await_node.parent)
+                        .is_some_and(|parent| {
+                            matches!(
+                                self.arena.get(parent).map(|node| &node.data),
+                                Some(NodeData::ParenthesizedExpression(_))
+                            ) && self
+                                .arena
+                                .get(parent)
+                                .and_then(|node| node.parent)
+                                .is_some_and(|parent| {
+                                    matches!(
+                                        self.arena.get(parent).map(|node| &node.data),
+                                        Some(NodeData::SpreadElement(_))
+                                    )
+                                })
+                        })
+                    || self
+                        .arena
+                        .get(*await_id)
+                        .and_then(|node| node.parent)
+                        .is_some_and(|parent| {
+                            matches!(
+                                self.arena.get(parent).map(|node| &node.data),
+                                Some(NodeData::SpreadElement(_))
+                            )
+                        })
+            })
+    }
+
     fn es5_async_simple_await_in_expression(&self, expression: NodeId) -> Option<NodeId> {
         match &self.arena.get(expression)?.data {
             NodeData::AwaitExpression(_) => Some(expression),
@@ -26598,6 +26957,15 @@ impl Printer<'_> {
                 self.es5_async_simple_await_in_expression(expression.expression)
             }
             NodeData::PropertyAccessExpression(expression) => {
+                self.es5_async_simple_await_in_expression(expression.expression)
+            }
+            NodeData::CallExpression(expression) => {
+                self.es5_async_simple_await_in_expression(expression.expression)
+            }
+            NodeData::NewExpression(expression) => {
+                self.es5_async_simple_await_in_expression(expression.expression)
+            }
+            NodeData::SpreadElement(expression) => {
                 self.es5_async_simple_await_in_expression(expression.expression)
             }
             NodeData::ElementAccessExpression(expression) => self
