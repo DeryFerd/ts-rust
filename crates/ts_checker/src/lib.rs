@@ -4960,7 +4960,7 @@ impl<'a> Checker<'a> {
             };
             match &node.data {
                 NodeData::PropertyAssignment(data) => {
-                    let Some(name) = self.property_name(data.name) else {
+                    let Some(name) = self.object_literal_property_name(data.name) else {
                         continue;
                     };
                     let contextual_name = contextual_object
@@ -6800,6 +6800,16 @@ impl<'a> Checker<'a> {
             }
             NodeData::ParenthesizedExpression(data) => {
                 self.type_of_expression_context(data.expression, contextual_type)
+            }
+            NodeData::ExpressionWithTypeArguments(data) => {
+                let callee = self.type_of_expression_context(data.expression, contextual_type);
+                data.type_arguments.as_ref().map_or(callee, |arguments| {
+                    self.instantiate_explicit_call_signature(
+                        data.expression,
+                        callee,
+                        &arguments.nodes,
+                    )
+                })
             }
             NodeData::AsExpression(data) => {
                 if self.type_node_is_const_reference(data.type_) {
@@ -10841,6 +10851,22 @@ impl<'a> Checker<'a> {
         let Some(node) = self.arena.get(pattern) else {
             return false;
         };
+        if let NodeData::TypeQueryNode(query) = &node.data
+            && let Some(symbol) = self.resolve_value_expression_symbol(query.expr_name)
+            && self.external_imports.contains_key(&symbol)
+            && self
+                .result
+                .symbol_types
+                .get(&symbol)
+                .and_then(|type_id| self.result.types.get(*type_id))
+                .is_some_and(|type_| matches!(type_.kind, TypeKind::Unknown))
+        {
+            return self
+                .result
+                .types
+                .get(actual)
+                .is_some_and(|type_| matches!(type_.kind, TypeKind::Unknown));
+        }
         match &node.data {
             NodeData::InferTypeNode(data) => {
                 let Some(NodeData::TypeParameterDeclaration(parameter)) =
@@ -12133,6 +12159,25 @@ impl<'a> Checker<'a> {
             NodeData::NoSubstitutionTemplateLiteral(data) => Some(data.text.clone()),
             NodeData::ComputedPropertyName(computed) => {
                 self.computed_property_name(computed.expression)
+            }
+            _ => None,
+        }
+    }
+
+    fn object_literal_property_name(&mut self, node: NodeId) -> Option<String> {
+        let Some(NodeData::ComputedPropertyName(computed)) =
+            self.arena.get(node).map(|node| &node.data)
+        else {
+            return self.property_name(node);
+        };
+        let expression = computed.expression;
+        if let Some(name) = self.computed_property_name(expression) {
+            return Some(name);
+        }
+        let type_id = self.type_of_expression(expression);
+        match self.result.types.get(type_id).map(|type_| &type_.kind) {
+            Some(TypeKind::StringLiteral(value) | TypeKind::NumberLiteral(value)) => {
+                Some(value.clone())
             }
             _ => None,
         }

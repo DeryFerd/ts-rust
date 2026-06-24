@@ -545,7 +545,9 @@ pub fn emit_source_file_with_context(
     {
         printer.emit_leading_source_comments(start);
     }
-    printer.prepare_source_class_expression_temps(source_file);
+    if !(settings.module == ModuleKind::CommonJs && is_external_module) {
+        printer.prepare_source_class_expression_temps(source_file);
+    }
     if (ScriptTarget::Es2015..ScriptTarget::Es2017).contains(&settings.target)
         && source_needs_async_static_field_class_temp(arena)
     {
@@ -569,6 +571,7 @@ pub fn emit_source_file_with_context(
         if !printer.commonjs_default_imports.is_empty() {
             printer.emit_import_default_helper();
         }
+        printer.prepare_source_class_expression_temps(source_file);
         if export_equals_expression.is_none() {
             printer
                 .writer
@@ -2142,6 +2145,32 @@ impl DeclarationPrinter<'_> {
         })
     }
 
+    fn statement_is_synthesized_export_type_dependency(&self, statement: NodeId) -> bool {
+        let Some(statement) = self.arena.get(statement) else {
+            return false;
+        };
+        let name = match &statement.data {
+            NodeData::TypeAliasDeclaration(alias) => declaration_name_text(self.arena, alias.name),
+            NodeData::InterfaceDeclaration(interface) => {
+                declaration_name_text(self.arena, interface.name)
+            }
+            _ => None,
+        };
+        let Some(name) = name else {
+            return false;
+        };
+        self.arena.iter().any(|(_, node)| {
+            let NodeData::ExportAssignment(export) = &node.data else {
+                return false;
+            };
+            !export.is_export_equals
+                && self
+                    .synthesized_expression_type(export.expression)
+                    .and_then(|type_id| self.named_type_references?.get(&type_id))
+                    .is_some_and(|reference| reference.name == name)
+        })
+    }
+
     fn import_is_local_export_dependency(&self, statement: NodeId) -> bool {
         let Some(NodeData::ImportDeclaration(import)) =
             self.arena.get(statement).map(|node| &node.data)
@@ -2673,6 +2702,7 @@ impl DeclarationPrinter<'_> {
             .and_then(|reachability| reachability.get(&scope))
             && !retained.contains(&id)
             && !self.statement_is_local_export_dependency(id)
+            && !self.statement_is_synthesized_export_type_dependency(id)
             && !self.import_is_local_export_dependency(id)
             && !self.statement_is_inferred_class_property_dependency(id)
             && !matches!(
@@ -9534,7 +9564,11 @@ impl DeclarationPrinter<'_> {
                     self.writer.write("readonly ");
                 }
                 self.emit_name(data.name)?;
-                if data.postfix_token.is_some() {
+                if data.postfix_token.is_some_and(|token| {
+                    self.arena
+                        .get(token)
+                        .is_some_and(|token| token.kind == SyntaxKind::QuestionToken)
+                }) {
                     self.writer.write("?");
                 }
                 if !self.member_has_modifier(data.modifiers.as_ref(), SyntaxKind::PrivateKeyword) {
@@ -21055,6 +21089,13 @@ impl Printer<'_> {
         }
         let mut claimed = HashSet::new();
         let mut temps = Vec::new();
+        if self.settings.target < ScriptTarget::Es2015 {
+            self.prepare_source_computed_object_literal_temps(
+                source_file,
+                &mut claimed,
+                &mut temps,
+            );
+        }
         let mut computed_class_fields = self
             .arena
             .iter()
@@ -21171,6 +21212,73 @@ impl Printer<'_> {
             self.computed_property_temps.insert(name, temp.clone());
             temps.push(temp);
         }
+    }
+
+    fn prepare_source_computed_object_literal_temps(
+        &mut self,
+        source_file: NodeId,
+        claimed: &mut HashSet<String>,
+        temps: &mut Vec<String>,
+    ) {
+        let mut objects = self
+            .arena
+            .iter()
+            .filter_map(|(id, node)| {
+                let NodeData::ObjectLiteralExpression(object) = &node.data else {
+                    return None;
+                };
+                if !self.class_expression_belongs_to_source_scope(id, source_file)
+                    || self.node_has_class_ancestor(id, source_file)
+                {
+                    return None;
+                }
+                object
+                    .properties
+                    .nodes
+                    .iter()
+                    .any(|property| {
+                        let Some(property) = self.arena.get(*property) else {
+                            return false;
+                        };
+                        let name = match &property.data {
+                            NodeData::PropertyAssignment(property) => property.name,
+                            NodeData::MethodDeclaration(method) => method.name,
+                            NodeData::GetAccessorDeclaration(accessor) => accessor.name,
+                            NodeData::SetAccessorDeclaration(accessor) => accessor.name,
+                            _ => return false,
+                        };
+                        matches!(
+                            self.arena.get(name).map(|name| &name.data),
+                            Some(NodeData::ComputedPropertyName(_))
+                        )
+                    })
+                    .then_some((node.range.start, id))
+            })
+            .collect::<Vec<_>>();
+        objects.sort_by_key(|(start, _)| *start);
+        for (_, object) in objects {
+            let temp = self.generate_block_temp(source_file, claimed);
+            claimed.insert(temp.clone());
+            self.computed_property_temps.insert(object, temp.clone());
+            temps.push(temp);
+        }
+    }
+
+    fn node_has_class_ancestor(&self, node: NodeId, boundary: NodeId) -> bool {
+        let mut current = node;
+        while let Some(parent) = self.arena.get(current).and_then(|node| node.parent) {
+            if parent == boundary {
+                return false;
+            }
+            if matches!(
+                self.arena.get(parent).map(|node| &node.data),
+                Some(NodeData::ClassDeclaration(_) | NodeData::ClassExpression(_))
+            ) {
+                return true;
+            }
+            current = parent;
+        }
+        false
     }
 
     fn class_expression_belongs_to_source_scope(
@@ -27937,6 +28045,9 @@ impl Printer<'_> {
             Some(NodeData::ParenthesizedExpression(expression)) => {
                 self.commonjs_export_initializer_can_be_direct(expression.expression)
             }
+            Some(NodeData::ExpressionWithTypeArguments(expression)) => {
+                self.commonjs_export_initializer_can_be_direct(expression.expression)
+            }
             _ => false,
         }
     }
@@ -28734,6 +28845,11 @@ impl Printer<'_> {
                 self.writer.write("[");
                 self.emit_expression(data.expression, 0)?;
                 self.writer.write("]");
+            }
+            NodeData::ExpressionWithTypeArguments(data) => {
+                self.writer.write("(");
+                self.emit_expression(data.expression, 0)?;
+                self.writer.write(")");
             }
             NodeData::ParenthesizedExpression(data) => {
                 let erases_to_inner_expression = matches!(
@@ -36747,6 +36863,17 @@ class Board {
     }
 
     #[test]
+    fn es5_commonjs_hoists_computed_object_literal_temps_after_helpers() {
+        let source = "import value from './dep'; export const result = { [value.name]: 1 };";
+        let output = emit_with(source, ScriptTarget::Es5, ModuleKind::CommonJs).code;
+        let helper = output.find("var __importDefault").unwrap();
+        let temp = output.find("var _a;").unwrap();
+        let module_marker = output.find("Object.defineProperty(exports").unwrap();
+        assert!(helper < temp && temp < module_marker, "{output}");
+        assert!(output.contains("exports.result = (_a = {},"), "{output}");
+    }
+
+    #[test]
     fn emits_multiple_commonjs_named_imports_through_one_collision_safe_temp() {
         let source = concat!(
             "import { first, second as alias } from './mod';\n",
@@ -38308,6 +38435,15 @@ class Board {
             output.contains("declare function make(): StringBox<number>;"),
             "{output}"
         );
+    }
+
+    #[test]
+    fn declaration_emit_distinguishes_definite_and_optional_properties() {
+        let output = emit_declarations_with_semantics(
+            "class Example { required!: string; optional?: string; }",
+        );
+        assert!(output.contains("required: string;"), "{output}");
+        assert!(output.contains("optional?: string;"), "{output}");
     }
 
     #[test]

@@ -4007,6 +4007,7 @@ impl<'a> Parser<'a> {
             | NodeData::StringLiteral(_)
             | NodeData::KeywordExpression(_)
             | NodeData::ParenthesizedExpression(_)
+            | NodeData::ExpressionWithTypeArguments(_)
             | NodeData::NonNullExpression(_) => true,
             NodeData::ArrayLiteralExpression(_) | NodeData::ObjectLiteralExpression(_) => {
                 operator == SyntaxKind::EqualsToken
@@ -4506,13 +4507,19 @@ impl<'a> Parser<'a> {
                     } else {
                         let start = self.node_start(expression);
                         let end = type_arguments.range.end;
+                        let mut children = vec![expression];
+                        children.extend(type_arguments.nodes.iter().copied());
                         expression = self.alloc_node(
-                            SyntaxKind::ParenthesizedExpression,
+                            SyntaxKind::ExpressionWithTypeArguments,
                             TextRange::new(start, end),
-                            NodeData::ParenthesizedExpression(Box::new(
-                                ParenthesizedExpressionData { expression },
+                            NodeData::ExpressionWithTypeArguments(Box::new(
+                                ExpressionWithTypeArgumentsData {
+                                    expression,
+                                    type_arguments: Some(type_arguments),
+                                    facts: 0,
+                                },
                             )),
-                            &[expression],
+                            &children,
                         );
                     }
                 }
@@ -4610,7 +4617,22 @@ impl<'a> Parser<'a> {
         }
         self.scanner.rewind(checkpoint);
         depth == 0
-            && (token.kind == SyntaxKind::OpenParenToken || token.kind.is_assignment_operator())
+            && (token.kind == SyntaxKind::OpenParenToken
+                || token.kind.is_assignment_operator()
+                || matches!(
+                    token.kind,
+                    SyntaxKind::SemicolonToken
+                        | SyntaxKind::EndOfFile
+                        | SyntaxKind::CommaToken
+                        | SyntaxKind::CloseParenToken
+                        | SyntaxKind::CloseBracketToken
+                        | SyntaxKind::DotToken
+                        | SyntaxKind::QuestionDotToken
+                        | SyntaxKind::OpenBracketToken
+                        | SyntaxKind::AsKeyword
+                        | SyntaxKind::SatisfiesKeyword
+                        | SyntaxKind::ExclamationToken
+                ))
     }
 
     fn parse_await_expression(&mut self) -> NodeId {
@@ -11213,7 +11235,7 @@ mod tests {
             };
             assert_eq!(
                 result.arena.get(assignment.left).unwrap().kind,
-                SyntaxKind::ParenthesizedExpression
+                SyntaxKind::ExpressionWithTypeArguments
             );
         }
 
