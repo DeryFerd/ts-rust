@@ -1033,6 +1033,21 @@ impl<'a> ProgramChecker<'a> {
                         Self::describe_symbol(source, result, symbol)
                     })
                 {
+                    let mut descriptor = descriptor;
+                    if !assignment.is_export_equals
+                        && let Some(local) = identifier_text(source.arena, assignment.expression)
+                        && let Some(imported_reference) = imported_type_references.get(local)
+                    {
+                        rewrite_matching_import_reference(
+                            &mut descriptor,
+                            imported_reference,
+                            &ImportTypeReference {
+                                module_specifier: specifier.to_owned(),
+                                qualifier: "default".into(),
+                                is_typeof: false,
+                            },
+                        );
+                    }
                     exports.insert(
                         if assignment.is_export_equals {
                             "export=".to_owned()
@@ -1994,6 +2009,32 @@ impl<'a> ProgramChecker<'a> {
                     .or_else(|| source.bindings.node_symbols.get(&namespace.name))
             {
                 let mut qualified_exports = module_exports;
+                for descriptor in qualified_exports.values_mut() {
+                    if let Some((source_path, target_path)) = rebase_paths
+                        && !specifier.starts_with('.')
+                        && target_path.contains("/node_modules/")
+                    {
+                        rebase_package_import_references(
+                            descriptor,
+                            specifier,
+                            source_path,
+                            target_path,
+                        );
+                    } else if let Some((source_path, target_path)) = rebase_paths
+                        && specifier.starts_with('.')
+                    {
+                        rebase_relative_import_references_between_files(
+                            descriptor,
+                            source_path,
+                            target_path,
+                        );
+                    } else {
+                        rebase_relative_import_references(descriptor, specifier);
+                    }
+                    if let Some((source_path, _)) = rebase_paths {
+                        rebase_absolute_import_references(descriptor, source_path);
+                    }
+                }
                 if let Some(local_name) = identifier_text(source.arena, namespace.name) {
                     let exported_names = qualified_exports.keys().cloned().collect::<BTreeSet<_>>();
                     for descriptor in qualified_exports.values_mut() {
@@ -13932,8 +13973,9 @@ fn paint_exported_named_descriptor_import(
             .map_or((false, name.as_str()), |name| (true, name));
         let exported_root = referenced_name
             .split_once('.')
-            .map_or(referenced_name, |(root, _)| root);
-        if !name.starts_with("__") && exports.contains_key(exported_root) {
+            .map_or(referenced_name, |(root, _)| root)
+            .to_owned();
+        if !name.starts_with("__") && exports.contains_key(&exported_root) {
             let qualifier = referenced_name.to_owned();
             let mut target = descriptor.clone();
             if let TypeDescriptor::Named {
@@ -13942,6 +13984,13 @@ fn paint_exported_named_descriptor_import(
                 ..
             } = &mut target
             {
+                if type_arguments.is_empty()
+                    && matches!(target.as_ref(), TypeDescriptor::Object { .. })
+                    && let Some(authoritative @ TypeDescriptor::Object { .. }) =
+                        exports.get(&exported_root)
+                {
+                    **target = authoritative.clone();
+                }
                 for argument in type_arguments {
                     paint_exported_named_descriptor_imports(argument, module_name, exports);
                 }
@@ -14122,6 +14171,40 @@ fn rebase_relative_import_references(descriptor: &mut TypeDescriptor, imported_m
     });
 }
 
+fn rewrite_matching_import_reference(
+    descriptor: &mut TypeDescriptor,
+    from: &ImportTypeReference,
+    to: &ImportTypeReference,
+) {
+    if let TypeDescriptor::Import { reference, .. } = descriptor
+        && reference == from
+    {
+        *reference = to.clone();
+    }
+    visit_descriptor_children(descriptor, |child| {
+        rewrite_matching_import_reference(child, from, to);
+    });
+}
+
+fn rebase_package_import_references(
+    descriptor: &mut TypeDescriptor,
+    imported_module: &str,
+    source_file: &str,
+    target_file: &str,
+) {
+    if let TypeDescriptor::Import { reference, .. } = descriptor
+        && reference.module_specifier.starts_with('.')
+    {
+        let public_entry =
+            public_module_specifier_for_target(imported_module, "", source_file, target_file);
+        reference.module_specifier =
+            rebase_module_specifier(&public_entry, &reference.module_specifier);
+    }
+    visit_descriptor_children(descriptor, |child| {
+        rebase_package_import_references(child, imported_module, source_file, target_file);
+    });
+}
+
 fn rebase_relative_import_references_between_files(
     descriptor: &mut TypeDescriptor,
     source_file: &str,
@@ -14281,7 +14364,11 @@ fn public_module_specifier_for_target(
     let marker = format!("/node_modules/{package_root}/");
     if let Some((_, relative)) = target_path.rsplit_once(&marker) {
         let relative = ts_path::remove_file_extension(relative);
-        let relative = relative.strip_suffix("/index").unwrap_or(relative);
+        let relative = if relative == "index" {
+            ""
+        } else {
+            relative.strip_suffix("/index").unwrap_or(relative)
+        };
         return if relative.is_empty() {
             package_root
         } else {
@@ -14629,16 +14716,20 @@ fn describe_type_node_syntax(
             exported_names,
         ),
         NodeData::ConditionalTypeNode(conditional) => {
-            if !matches!(semantic_target, TypeDescriptor::Unknown) {
+            let extends_unknown = source
+                .arena
+                .get(conditional.extends_type)
+                .is_some_and(|node| node.kind == SyntaxKind::UnknownKeyword);
+            if !extends_unknown && !matches!(semantic_target, TypeDescriptor::Unknown) {
                 return semantic_target;
             }
             let check = checker.type_from_type_node(conditional.check_type);
-            if checker.type_contains_type_parameter(check) {
+            if !extends_unknown && checker.type_contains_type_parameter(check) {
                 return semantic_target;
             }
             let mut inference = HashMap::new();
-            let matched =
-                checker.infer_conditional_type(conditional.extends_type, check, &mut inference);
+            let matched = extends_unknown
+                || checker.infer_conditional_type(conditional.extends_type, check, &mut inference);
             let selected = if matched {
                 conditional.true_type
             } else {
@@ -15397,6 +15488,52 @@ fn homomorphic_identity_alias_body(
     }
 }
 
+fn describe_interface_member_syntax(
+    source: &ProgramSource<'_>,
+    declarations: &[&ts_ast::Node],
+    mut descriptor: TypeDescriptor,
+) -> TypeDescriptor {
+    let TypeDescriptor::Object { properties, .. } = &mut descriptor else {
+        return descriptor;
+    };
+    let mut checker =
+        Checker::new(source.arena, source.bindings).with_options(source.checker_options);
+    checker.seed_symbol_types();
+    let exported_names = exported_reference_names(source);
+    for declaration in declarations {
+        let NodeData::InterfaceDeclaration(interface) = &declaration.data else {
+            continue;
+        };
+        for member in &interface.members.nodes {
+            let (name_node, return_node) = match source.arena.get(*member).map(|node| &node.data) {
+                Some(NodeData::MethodSignatureDeclaration(method)) => (method.name, method.type_),
+                Some(NodeData::MethodDeclaration(method)) if method.body.is_none() => {
+                    (method.name, method.type_)
+                }
+                _ => continue,
+            };
+            let Some(name) = checker.property_name(name_node) else {
+                continue;
+            };
+            let Some(TypeDescriptor::Function { return_type, .. }) = properties.get_mut(&name)
+            else {
+                continue;
+            };
+            let Some(return_node) = return_node else {
+                continue;
+            };
+            **return_type = describe_type_node_syntax(
+                source,
+                &mut checker,
+                return_node,
+                (**return_type).clone(),
+                &exported_names,
+            );
+        }
+    }
+    descriptor
+}
+
 #[allow(clippy::too_many_lines)]
 fn describe_declaration_symbol(
     source: &ProgramSource<'_>,
@@ -15613,6 +15750,23 @@ fn describe_declaration_symbol(
             if !source.checker_options.exact_optional_property_types {
                 add_implicit_undefined_to_optional_properties(&mut descriptor);
             }
+            descriptor = describe_interface_member_syntax(source, &declarations, descriptor);
+            if let Some(variable) = declarations.iter().find_map(|node| {
+                let NodeData::VariableDeclaration(variable) = &node.data else {
+                    return None;
+                };
+                Some(variable.as_ref())
+            }) && let Some(NodeData::TypeReferenceNode(reference)) = variable
+                .type_
+                .and_then(|annotation| source.arena.get(annotation))
+                .map(|node| &node.data)
+                && let Some(target) =
+                    ProgramChecker::resolve_entity_symbol(source, reference.type_name)
+                && target != symbol_id
+                && let Some(static_descriptor) = describe_declaration_symbol(source, None, target)
+            {
+                merge_global_descriptor(&mut descriptor, static_descriptor);
+            }
             return Some(descriptor);
         }
         let mut checker =
@@ -15662,7 +15816,11 @@ fn describe_declaration_symbol(
         {
             merge_global_descriptor(&mut descriptor, static_descriptor);
         }
-        return Some(descriptor);
+        return Some(describe_interface_member_syntax(
+            source,
+            &declarations,
+            descriptor,
+        ));
     }
     if let Some(variable) = declarations.iter().find_map(|node| {
         let NodeData::VariableDeclaration(variable) = &node.data else {
@@ -15696,6 +15854,16 @@ fn describe_declaration_symbol(
                     .with_options(source.checker_options);
                 checker.seed_symbol_types();
                 let exported_names = exported_reference_names(source);
+                if let Some(NodeData::TypeReferenceNode(reference)) =
+                    source.arena.get(type_node).map(|node| &node.data)
+                    && let Some(target) =
+                        ProgramChecker::resolve_entity_symbol(source, reference.type_name)
+                    && target != symbol_id
+                    && let Some(target_descriptor) =
+                        describe_declaration_symbol(source, Some(result), target)
+                {
+                    descriptor = target_descriptor;
+                }
                 descriptor = describe_type_node_syntax(
                     source,
                     &mut checker,
@@ -16781,8 +16949,8 @@ mod tests {
     use super::{
         Checker, CheckerOptions, EnumConstantValue, FunctionType, ImportTypeReference,
         NamedTypeReference, ObjectType, ProgramChecker, ProgramSource, TypeArena, TypeDescriptor,
-        TypeKind, check_program, check_source_file, check_source_file_with_options,
-        describe_type_with_imports_bounded, identifier_text,
+        TypeKind, check_program, check_program_with_paths, check_source_file,
+        check_source_file_with_options, describe_type_with_imports_bounded, identifier_text,
         paint_exported_named_descriptor_imports, rebase_module_specifier,
         rebase_module_specifier_between_files,
     };
@@ -21085,6 +21253,116 @@ mod tests {
                 .map(|argument| checked.files[2].types.display(*argument))
                 .collect::<Vec<_>>(),
             ["number", "string"],
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn preserves_indirect_default_export_alias_in_generic_method_returns() {
+        let constructor = parse_source_file(concat!(
+            "export interface Ctor { x: number; }\n",
+            "export type ExtendedCtor<T> = { x: number; ext: T };\n",
+            "export interface CtorConstructor {\n",
+            "  extends<T>(x: T): ExtendedCtor<T extends unknown ? Ctor : undefined>;\n",
+            "}\n",
+            "export const Ctor: CtorConstructor;\n",
+        ));
+        let entry = parse_source_file("import { Ctor } from './ctor';\nexport default Ctor;\n");
+        let consumer = parse_source_file(concat!(
+            "import * as ns from 'mod';\n",
+            "const Ctor = ns.default;\n",
+            "export const MyComp = Ctor.extends({ foo: 'bar' });\n",
+        ));
+        let constructor_bindings = bind_source_file(&constructor.arena, constructor.source_file);
+        assert!(
+            constructor_bindings.diagnostics.is_empty(),
+            "{:?}",
+            constructor_bindings.diagnostics
+        );
+        let entry_bindings = bind_source_file(&entry.arena, entry.source_file);
+        let consumer_bindings = bind_source_file(&consumer.arena, consumer.source_file);
+        let no_modules = BTreeMap::new();
+        let entry_modules = BTreeMap::from([("./ctor".into(), 0)]);
+        let consumer_modules = BTreeMap::from([("mod".into(), 1)]);
+        let sources = [
+            ProgramSource {
+                arena: &constructor.arena,
+                source_file: constructor.source_file,
+                bindings: &constructor_bindings,
+                resolved_modules: &no_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions {
+                    is_declaration_file: true,
+                    ..CheckerOptions::default()
+                },
+            },
+            ProgramSource {
+                arena: &entry.arena,
+                source_file: entry.source_file,
+                bindings: &entry_bindings,
+                resolved_modules: &entry_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions {
+                    is_declaration_file: true,
+                    ..CheckerOptions::default()
+                },
+            },
+            ProgramSource {
+                arena: &consumer.arena,
+                source_file: consumer.source_file,
+                bindings: &consumer_bindings,
+                resolved_modules: &consumer_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+        ];
+        let checked = check_program_with_paths(
+            &sources,
+            &[
+                "/case/node_modules/mod/ctor.d.ts".into(),
+                "/case/node_modules/mod/index.d.ts".into(),
+                "/case/index.ts".into(),
+            ],
+        );
+        assert!(
+            checked.files.iter().all(|file| file.diagnostics.is_empty()),
+            "{:?}",
+            checked
+                .files
+                .iter()
+                .flat_map(|file| &file.diagnostics)
+                .collect::<Vec<_>>()
+        );
+        let my_comp = consumer_bindings
+            .root_scope()
+            .unwrap()
+            .symbols
+            .get("MyComp")
+            .unwrap();
+        let type_id = checked.files[2].type_of_symbol(my_comp).unwrap();
+        assert_eq!(
+            checked.files[2].import_type_references.get(&type_id),
+            Some(&ImportTypeReference {
+                module_specifier: "mod/ctor".into(),
+                qualifier: "ExtendedCtor".into(),
+                is_typeof: false,
+            }),
+            "type: {}; named: {:?}; imports: {:?}",
+            checked.files[2].types.display(type_id),
+            checked.files[2].named_type_references.get(&type_id),
+            checked.files[2].import_type_references,
+        );
+        let argument = checked.files[2].named_type_references[&type_id].type_arguments[0];
+        assert_eq!(
+            checked.files[2].import_type_references.get(&argument),
+            Some(&ImportTypeReference {
+                module_specifier: "mod".into(),
+                qualifier: "default".into(),
+                is_typeof: false,
+            })
         );
     }
 

@@ -2795,6 +2795,12 @@ impl DeclarationPrinter<'_> {
         if self.module_file && self.statement_is_structurally_consumed_local_mixin(id) {
             return Ok(());
         }
+        if self.module_file
+            && (self.statement_is_portable_inferred_alias_dependency(id)
+                || self.import_is_only_used_by_portable_inferred_aliases(id))
+        {
+            return Ok(());
+        }
         if let Some(retained) = self
             .declaration_reachability
             .and_then(|reachability| reachability.get(&scope))
@@ -3640,6 +3646,135 @@ impl DeclarationPrinter<'_> {
                                 })
                         })
                     })
+            })
+    }
+
+    fn statement_is_portable_inferred_alias_dependency(&self, statement: NodeId) -> bool {
+        let Some(node) = self.arena.get(statement) else {
+            return false;
+        };
+        if declaration_has_modifier(self.arena, node, SyntaxKind::ExportKeyword) {
+            return false;
+        }
+        let Some(NodeData::VariableStatement(variable)) = Some(&node.data) else {
+            return false;
+        };
+        let Some(NodeData::VariableDeclarationList(list)) = self
+            .arena
+            .get(variable.declaration_list)
+            .map(|node| &node.data)
+        else {
+            return false;
+        };
+        let [declaration] = list.declarations.nodes.as_slice() else {
+            return false;
+        };
+        let Some(NodeData::VariableDeclaration(variable)) =
+            self.arena.get(*declaration).map(|node| &node.data)
+        else {
+            return false;
+        };
+        if variable.type_.is_some() || variable.initializer.is_none() {
+            return false;
+        }
+        let Some(name) = declaration_name_text(self.arena, variable.name) else {
+            return false;
+        };
+        let uses = self
+            .arena
+            .iter()
+            .filter_map(|(id, node)| {
+                matches!(&node.data, NodeData::Identifier(identifier) if identifier.text == name)
+                    .then_some(id)
+            })
+            .filter(|identifier| !self.node_is_within(*identifier, statement))
+            .collect::<Vec<_>>();
+        !uses.is_empty()
+            && uses.iter().all(|identifier| {
+                self.arena.iter().any(|(candidate, node)| {
+                    let NodeData::VariableStatement(exported) = &node.data else {
+                        return false;
+                    };
+                    if !declaration_has_modifier(self.arena, node, SyntaxKind::ExportKeyword) {
+                        return false;
+                    }
+                    let Some(NodeData::VariableDeclarationList(list)) = self
+                        .arena
+                        .get(exported.declaration_list)
+                        .map(|node| &node.data)
+                    else {
+                        return false;
+                    };
+                    list.declarations.nodes.iter().any(|declaration| {
+                        let Some(NodeData::VariableDeclaration(declaration_data)) =
+                            self.arena.get(*declaration).map(|node| &node.data)
+                        else {
+                            return false;
+                        };
+                        declaration_data.type_.is_none()
+                            && declaration_data.initializer.is_some_and(|initializer| {
+                                self.node_is_within(*identifier, initializer)
+                            })
+                            && self
+                                .node_types
+                                .and_then(|types| {
+                                    types
+                                        .get(declaration)
+                                        .or_else(|| types.get(&declaration_data.name))
+                                        .or_else(|| {
+                                            declaration_data
+                                                .initializer
+                                                .and_then(|initializer| types.get(&initializer))
+                                        })
+                                })
+                                .is_some_and(|type_id| {
+                                    self.import_type_references
+                                        .is_some_and(|references| references.contains_key(type_id))
+                                })
+                    }) && self.node_is_within(*identifier, candidate)
+                })
+            })
+    }
+
+    fn import_is_only_used_by_portable_inferred_aliases(&self, statement: NodeId) -> bool {
+        let Some(NodeData::ImportDeclaration(import)) =
+            self.arena.get(statement).map(|node| &node.data)
+        else {
+            return false;
+        };
+        let Some(NodeData::ImportClause(clause)) = import
+            .import_clause
+            .and_then(|clause| self.arena.get(clause))
+            .map(|node| &node.data)
+        else {
+            return false;
+        };
+        let Some(NodeData::NamespaceImport(namespace)) = clause
+            .named_bindings
+            .and_then(|bindings| self.arena.get(bindings))
+            .map(|node| &node.data)
+        else {
+            return false;
+        };
+        let Some(name) = declaration_name_text(self.arena, namespace.name) else {
+            return false;
+        };
+        let uses = self
+            .arena
+            .iter()
+            .filter_map(|(id, node)| {
+                matches!(&node.data, NodeData::Identifier(identifier) if identifier.text == name)
+                    .then_some(id)
+            })
+            .filter(|identifier| !self.node_is_within(*identifier, statement))
+            .collect::<Vec<_>>();
+        !uses.is_empty()
+            && uses.iter().all(|identifier| {
+                self.arena.iter().any(|(candidate, node)| {
+                    matches!(node.data, NodeData::VariableStatement(_))
+                        && self.node_is_within(*identifier, candidate)
+                        && self.statement_is_portable_inferred_alias_dependency(candidate)
+                })
             })
     }
 
