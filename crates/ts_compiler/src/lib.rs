@@ -3585,7 +3585,7 @@ fn module_specifiers(parse: &ParseResult) -> Vec<(String, TextRange, bool)> {
         .filter_map(|(_, node)| match &node.data {
             NodeData::ImportDeclaration(data) => {
                 string_literal(&parse.arena, data.module_specifier)
-                    .map(|(specifier, range)| (specifier, range, false))
+                    .map(|(specifier, range)| (specifier, range, true))
             }
             NodeData::ImportEqualsDeclaration(data) => parse
                 .arena
@@ -3600,14 +3600,14 @@ fn module_specifiers(parse: &ParseResult) -> Vec<(String, TextRange, bool)> {
             NodeData::ExportDeclaration(data) => data
                 .module_specifier
                 .and_then(|specifier| string_literal(&parse.arena, specifier))
-                .map(|(specifier, range)| (specifier, range, false)),
+                .map(|(specifier, range)| (specifier, range, true)),
             NodeData::ImportTypeNode(data) => {
                 let argument = match parse.arena.get(data.argument).map(|node| &node.data) {
                     Some(NodeData::LiteralTypeNode(literal)) => literal.literal,
                     _ => data.argument,
                 };
                 string_literal(&parse.arena, argument)
-                    .map(|(specifier, range)| (specifier, range, false))
+                    .map(|(specifier, range)| (specifier, range, true))
             }
             NodeData::CallExpression(data)
                 if matches!(
@@ -3619,7 +3619,7 @@ fn module_specifiers(parse: &ParseResult) -> Vec<(String, TextRange, bool)> {
                     .nodes
                     .first()
                     .and_then(|argument| string_literal(&parse.arena, *argument))
-                    .map(|(specifier, range)| (specifier, range, false))
+                    .map(|(specifier, range)| (specifier, range, true))
             }
             _ => None,
         })
@@ -4772,6 +4772,50 @@ mod tests {
                 .get(&("/project/main.ts".to_owned(), "M".to_owned()))
                 .map(String::as_str),
             Some("/project/ambient.ts")
+        );
+    }
+
+    #[test]
+    fn resolves_es_imports_against_top_level_ambient_modules() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/ambient.d.ts",
+            r#"declare module "url" { export class Url {} export function parse(): Url; }"#,
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/main.ts",
+            r#"import { parse } from "url"; export const thing = parse();"#,
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["main.ts".to_owned(), "ambient.d.ts".to_owned()],
+            CompilerOptions {
+                declaration: true,
+                emit_declaration_only: true,
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        assert!(
+            !program
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code == Some(2307)),
+            "{:?}",
+            program.diagnostics()
+        );
+        let declaration = program
+            .emit()
+            .files
+            .into_iter()
+            .find(|file| file.file_name == "/project/main.d.ts")
+            .unwrap();
+        assert_eq!(
+            declaration.text,
+            "export declare const thing: import(\"url\").Url;\n"
         );
     }
 

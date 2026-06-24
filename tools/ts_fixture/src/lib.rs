@@ -932,6 +932,7 @@ fn directive_json_value(name: &str, value: &str) -> ts_config::JsonValue {
 
 const SCALAR_OPTION_NAMES: &[&str] = &[
     "alwaysStrict",
+    "allowArbitraryExtensions",
     "allowJs",
     "allowSyntheticDefaultImports",
     "baseUrl",

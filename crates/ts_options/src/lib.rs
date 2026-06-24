@@ -82,6 +82,7 @@ pub enum ModuleDetectionKind {
 #[allow(clippy::struct_excessive_bools)]
 pub struct CompilerOptions {
     pub always_strict: bool,
+    pub allow_arbitrary_extensions: bool,
     pub allow_js: bool,
     pub allow_unreachable_code: Option<bool>,
     pub allow_synthetic_default_imports: bool,
@@ -143,6 +144,7 @@ impl Default for CompilerOptions {
     fn default() -> Self {
         Self {
             always_strict: true,
+            allow_arbitrary_extensions: false,
             allow_js: false,
             allow_unreachable_code: None,
             allow_synthetic_default_imports: false,
@@ -235,10 +237,14 @@ impl ParseOptionsResult {
 }
 
 impl CompilerOptions {
+    #[allow(clippy::too_many_lines)]
     pub fn apply_overrides(&mut self, overrides: &Self, names: &BTreeSet<String>) {
         for name in names {
             match name.as_str() {
                 "alwaysstrict" => self.always_strict = overrides.always_strict,
+                "allowarbitraryextensions" => {
+                    self.allow_arbitrary_extensions = overrides.allow_arbitrary_extensions;
+                }
                 "allowjs" => self.allow_js = overrides.allow_js,
                 "allowunreachablecode" => {
                     self.allow_unreachable_code = overrides.allow_unreachable_code;
@@ -349,6 +355,7 @@ impl CompilerOptions {
                 ModuleResolutionKind::NodeNext => ResolutionMode::NodeNext,
                 ModuleResolutionKind::Bundler => ResolutionMode::Bundler,
             },
+            allow_arbitrary_extensions: self.allow_arbitrary_extensions,
             allow_javascript: self.allow_js,
             resolve_json: self.resolve_json_module,
             prefer_types: true,
@@ -448,6 +455,9 @@ pub fn parse_compiler_options_map(options: &BTreeMap<String, JsonValue>) -> Pars
         match name.as_str() {
             "alwaysstrict" => {
                 parsed.always_strict = boolean(original_name, value, &mut diagnostics);
+            }
+            "allowarbitraryextensions" => {
+                parsed.allow_arbitrary_extensions = boolean(original_name, value, &mut diagnostics);
             }
             "allowjs" => parsed.allow_js = boolean(original_name, value, &mut diagnostics),
             "allowunreachablecode" => {
@@ -592,6 +602,7 @@ pub fn parse_compiler_options_map(options: &BTreeMap<String, JsonValue>) -> Pars
 #[derive(Default)]
 struct PartialOptions {
     always_strict: Option<bool>,
+    allow_arbitrary_extensions: Option<bool>,
     allow_js: Option<bool>,
     allow_unreachable_code: Option<bool>,
     allow_synthetic_default_imports: Option<bool>,
@@ -666,6 +677,7 @@ impl PartialOptions {
         let es_module_interop = self.es_module_interop.unwrap_or(false);
         CompilerOptions {
             always_strict: self.always_strict.unwrap_or(true),
+            allow_arbitrary_extensions: self.allow_arbitrary_extensions.unwrap_or(false),
             allow_js: self.allow_js.unwrap_or(check_js),
             allow_unreachable_code: self.allow_unreachable_code,
             allow_synthetic_default_imports: self.allow_synthetic_default_imports.unwrap_or(
@@ -1273,7 +1285,7 @@ mod tests {
     fn parses_project_config_and_converts_resolution_settings() {
         let config = parse_config_text(
             "/repo/tsconfig.json",
-            r#"{"compilerOptions":{"allowJs":true,"resolveJsonModule":true,"moduleResolution":"Bundler","baseUrl":".","paths":{"@app/*":["src/*"]},"rootDirs":["src","generated"],"typeRoots":["types","/shared/types"],"types":["node","jest"]}}"#,
+            r#"{"compilerOptions":{"allowArbitraryExtensions":true,"allowJs":true,"resolveJsonModule":true,"moduleResolution":"Bundler","baseUrl":".","paths":{"@app/*":["src/*"]},"rootDirs":["src","generated"],"typeRoots":["types","/shared/types"],"types":["node","jest"]}}"#,
         )
         .value
         .unwrap();
@@ -1282,6 +1294,7 @@ mod tests {
             result.options.module_resolution_options(),
             ResolutionOptions {
                 mode: ResolutionMode::Bundler,
+                allow_arbitrary_extensions: true,
                 allow_javascript: true,
                 resolve_json: true,
                 base_url: Some("/repo".into()),

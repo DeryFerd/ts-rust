@@ -21,8 +21,10 @@ pub enum ResolutionMode {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct ResolutionOptions {
     pub mode: ResolutionMode,
+    pub allow_arbitrary_extensions: bool,
     pub allow_javascript: bool,
     pub resolve_json: bool,
     pub prefer_types: bool,
@@ -37,6 +39,7 @@ impl Default for ResolutionOptions {
     fn default() -> Self {
         Self {
             mode: ResolutionMode::Node10,
+            allow_arbitrary_extensions: false,
             allow_javascript: true,
             resolve_json: false,
             prefer_types: true,
@@ -535,6 +538,15 @@ impl<F: FileSystem + ?Sized> ResolutionState<'_, '_, F> {
     fn file_candidates(&self, candidate: &str) -> Vec<String> {
         let normalized = normalize_path(candidate);
         let extension = source_extension(&normalized);
+        if extension.is_none()
+            && self.resolver.options.allow_arbitrary_extensions
+            && let Some(segment) = normalized.rsplit('/').next()
+            && let Some(dot) = segment.rfind('.')
+        {
+            let extension = &segment[dot..];
+            let stem = &normalized[..normalized.len() - extension.len()];
+            return vec![format!("{stem}.d{extension}.ts")];
+        }
         let stem = extension.map_or_else(
             || normalized.as_str(),
             |extension| &normalized[..normalized.len() - extension.len()],
@@ -551,6 +563,9 @@ impl<F: FileSystem + ?Sized> ResolutionState<'_, '_, F> {
                 }
             }
             Some(".json") if self.resolver.options.resolve_json => &[".d.json.ts", ".json"],
+            Some(extension) if self.resolver.options.allow_arbitrary_extensions => {
+                return vec![format!("{stem}.d{extension}.ts")];
+            }
             Some(_) => &[".d.ts"],
         };
         endings
@@ -1020,6 +1035,23 @@ mod tests {
                 .unwrap()
                 .extension,
             Some(FileExtension::Json)
+        );
+    }
+
+    #[test]
+    fn resolves_arbitrary_extensions_to_declaration_companions() {
+        let fs = fs(&[("/src/data.d.html.ts", "")]);
+        let options = ResolutionOptions {
+            allow_arbitrary_extensions: true,
+            ..ResolutionOptions::default()
+        };
+        assert_eq!(
+            Resolver::new(&fs, options)
+                .resolve("./data.html", "/src/main.ts")
+                .resolved
+                .unwrap()
+                .resolved_file_name,
+            "/src/data.d.html.ts"
         );
     }
 

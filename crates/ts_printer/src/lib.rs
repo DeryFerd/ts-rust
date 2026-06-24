@@ -1304,9 +1304,8 @@ fn commonjs_module_temp_base(arena: &NodeArena, module_specifier: NodeId) -> Str
         .rsplit('/')
         .find(|segment| !segment.is_empty())
         .unwrap_or("module");
-    let stem = segment.split('.').next().unwrap_or(segment);
     let mut base = String::new();
-    for (index, character) in stem.chars().enumerate() {
+    for (index, character) in segment.chars().enumerate() {
         if character == '_' || character == '$' || character.is_ascii_alphanumeric() {
             if index == 0 && character.is_ascii_digit() {
                 base.push('_');
@@ -5019,6 +5018,23 @@ impl DeclarationPrinter<'_> {
         {
             self.writer.write("typeof ");
             self.emit_name(type_query)?;
+            return Ok(());
+        }
+        if let Some(asserted_type) = function
+            .body
+            .and_then(|body| self.declaration_single_return_expression(body))
+            .and_then(|returned| self.asserted_initializer_type(returned))
+            .filter(|type_| {
+                !matches!(
+                    self.arena.get(*type_).map(|node| &node.data),
+                    Some(NodeData::TypeReferenceNode(reference))
+                        if reference.type_arguments.is_none()
+                            && declaration_name_text(self.arena, reference.type_name)
+                                == Some("const")
+                )
+            })
+        {
+            self.emit_type(asserted_type)?;
             return Ok(());
         }
         if let Some((nested_id, nested)) = function
@@ -36717,6 +36733,20 @@ class Board {
     }
 
     #[test]
+    fn commonjs_module_temp_preserves_dotted_specifier_segments() {
+        let source = "import { value } from './data.json'; export const result = value;";
+        let output = emit_with(source, ScriptTarget::Es2015, ModuleKind::CommonJs).code;
+        assert!(
+            output.contains("const data_json_1 = require(\"./data.json\");"),
+            "{output}"
+        );
+        assert!(
+            output.contains("exports.result = data_json_1.value;"),
+            "{output}"
+        );
+    }
+
+    #[test]
     fn emits_multiple_commonjs_named_imports_through_one_collision_safe_temp() {
         let source = concat!(
             "import { first, second as alias } from './mod';\n",
@@ -38265,6 +38295,17 @@ class Board {
         );
         assert!(
             output.contains("declare const print: (value: typeof action) => void;"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn declaration_emit_preserves_asserted_alias_function_returns() {
+        let output = emit_declarations_with_semantics(
+            "type Box<T, U> = { value: T; other: U }; type StringBox<T> = Box<string, T>; function make() { return {} as StringBox<number>; }",
+        );
+        assert!(
+            output.contains("declare function make(): StringBox<number>;"),
             "{output}"
         );
     }
