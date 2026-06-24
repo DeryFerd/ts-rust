@@ -2198,11 +2198,7 @@ impl<'a> ProgramChecker<'a> {
         let target = source.resolved_modules.get(module).copied()?;
         let imported = specifier.property_name.unwrap_or(specifier.name);
         let name = module_export_name_text(source.arena, imported)?;
-        let runtime = self.module_export_name_has_runtime_value(
-            target,
-            name,
-            &mut HashSet::new(),
-        );
+        let runtime = self.module_export_name_has_runtime_value(target, name, &mut HashSet::new());
         if runtime {
             return Some(true);
         }
@@ -8246,6 +8242,7 @@ impl<'a> Checker<'a> {
             if !self
                 .serialized_structural_external_symbols
                 .contains(&symbol)
+                && !self.type_has_intrinsic_spelling(type_id)
                 && !self.result.import_type_references.contains_key(&type_id)
                 && let Some(reference) = self.external_imports.get(&symbol).cloned()
             {
@@ -8296,6 +8293,30 @@ impl<'a> Checker<'a> {
         }
         self.error(node, 2304, [name.to_owned()]);
         self.result.types.any()
+    }
+
+    fn type_has_intrinsic_spelling(&self, type_id: TypeId) -> bool {
+        !self.result.named_type_references.contains_key(&type_id)
+            && !self.result.const_enum_types.contains(&type_id)
+            && matches!(
+                self.result.types.get(type_id).map(|type_| &type_.kind),
+                Some(
+                    TypeKind::Any
+                        | TypeKind::Unknown
+                        | TypeKind::Never
+                        | TypeKind::Void
+                        | TypeKind::Undefined
+                        | TypeKind::Null
+                        | TypeKind::Boolean
+                        | TypeKind::Number
+                        | TypeKind::String
+                        | TypeKind::BigInt
+                        | TypeKind::BooleanLiteral(_)
+                        | TypeKind::NumberLiteral(_)
+                        | TypeKind::StringLiteral(_)
+                        | TypeKind::BigIntLiteral(_)
+                )
+            )
     }
 
     fn readonly_assignment_name(&mut self, left: NodeId) -> Option<String> {
@@ -14074,10 +14095,20 @@ impl<'a> DeclarationReachability<'a> {
                 continue;
             }
             for statement in statements {
-                if self.node_has_modifier(statement, SyntaxKind::ExportKeyword)
+                let exported_declaration = self
+                    .arena
+                    .get(statement)
+                    .is_some_and(|node| !matches!(node.data, NodeData::ImportDeclaration(_)))
+                    && self.node_has_modifier(statement, SyntaxKind::ExportKeyword);
+                if exported_declaration
                     || matches!(
                         self.arena.get(statement).map(|node| &node.data),
                         Some(NodeData::ExportDeclaration(_) | NodeData::ExportAssignment(_))
+                    )
+                    || matches!(
+                        self.arena.get(statement).map(|node| &node.data),
+                        Some(NodeData::ImportDeclaration(import))
+                            if import.import_clause.is_none()
                     )
                     || matches!(
                         self.arena.get(statement).map(|node| &node.data),
@@ -14644,6 +14675,7 @@ impl<'a> DeclarationReachability<'a> {
             Some(NodeData::TypeAliasDeclaration(declaration)) => declaration.modifiers.as_ref(),
             Some(NodeData::EnumDeclaration(declaration)) => declaration.modifiers.as_ref(),
             Some(NodeData::ModuleDeclaration(declaration)) => declaration.modifiers.as_ref(),
+            Some(NodeData::ImportDeclaration(declaration)) => declaration.modifiers.as_ref(),
             Some(NodeData::ImportEqualsDeclaration(declaration)) => declaration.modifiers.as_ref(),
             _ => None,
         };
@@ -14691,86 +14723,41 @@ fn paint_exported_named_descriptor_imports(
     module_name: &str,
     exports: &BTreeMap<String, TypeDescriptor>,
 ) {
-    if paint_exported_named_descriptor_import(descriptor, module_name, exports) {
+    paint_exported_named_descriptor_imports_with_visited(
+        descriptor,
+        module_name,
+        exports,
+        &mut HashSet::new(),
+    );
+}
+
+fn paint_exported_named_descriptor_imports_with_visited(
+    descriptor: &mut TypeDescriptor,
+    module_name: &str,
+    exports: &BTreeMap<String, TypeDescriptor>,
+    visiting_names: &mut HashSet<String>,
+) {
+    if paint_exported_named_descriptor_import(descriptor, module_name, exports, visiting_names) {
         return;
     }
     if matches!(descriptor, TypeDescriptor::Alias { .. }) {
         return;
     }
-    match descriptor {
-        TypeDescriptor::Named {
-            name: _,
-            type_arguments,
-            target,
-        } => {
-            for argument in type_arguments {
-                paint_exported_named_descriptor_imports(argument, module_name, exports);
-            }
-            paint_exported_named_descriptor_imports(target, module_name, exports);
-        }
-        TypeDescriptor::Import { target, .. }
-        | TypeDescriptor::ConstEnum(target)
-        | TypeDescriptor::Array(target) => {
-            paint_exported_named_descriptor_imports(target, module_name, exports);
-        }
-        TypeDescriptor::Tuple(members)
-        | TypeDescriptor::ReadonlyTuple(members)
-        | TypeDescriptor::Union(members)
-        | TypeDescriptor::Intersection(members)
-        | TypeDescriptor::Overload(members) => {
-            for member in members {
-                paint_exported_named_descriptor_imports(member, module_name, exports);
-            }
-        }
-        TypeDescriptor::Object {
-            properties,
-            string_index_type,
-            number_index_type,
-            call_signatures,
-            construct_signatures,
-            ..
-        } => {
-            for property in properties.values_mut() {
-                paint_exported_named_descriptor_imports(property, module_name, exports);
-            }
-            if let Some(index) = string_index_type {
-                paint_exported_named_descriptor_imports(index, module_name, exports);
-            }
-            if let Some(index) = number_index_type {
-                paint_exported_named_descriptor_imports(index, module_name, exports);
-            }
-            for signature in call_signatures.iter_mut().chain(construct_signatures) {
-                paint_exported_named_descriptor_imports(signature, module_name, exports);
-            }
-        }
-        TypeDescriptor::Function {
-            parameters,
-            rest_parameter,
-            return_type,
-            ..
-        }
-        | TypeDescriptor::Constructor {
-            parameters,
-            rest_parameter,
-            return_type,
-            ..
-        } => {
-            for parameter in parameters {
-                paint_exported_named_descriptor_imports(parameter, module_name, exports);
-            }
-            if let Some(rest) = rest_parameter {
-                paint_exported_named_descriptor_imports(rest, module_name, exports);
-            }
-            paint_exported_named_descriptor_imports(return_type, module_name, exports);
-        }
-        _ => {}
-    }
+    visit_descriptor_children(descriptor, |child| {
+        paint_exported_named_descriptor_imports_with_visited(
+            child,
+            module_name,
+            exports,
+            visiting_names,
+        );
+    });
 }
 
 fn paint_exported_named_descriptor_import(
     descriptor: &mut TypeDescriptor,
     module_name: &str,
     exports: &BTreeMap<String, TypeDescriptor>,
+    visiting_names: &mut HashSet<String>,
 ) -> bool {
     if let TypeDescriptor::Import { reference, target } = descriptor {
         let exported_root = reference
@@ -14779,7 +14766,12 @@ fn paint_exported_named_descriptor_import(
             .map_or(reference.qualifier.as_str(), |(root, _)| root);
         if exports.contains_key(exported_root) {
             module_name.clone_into(&mut reference.module_specifier);
-            paint_exported_named_descriptor_imports(target, module_name, exports);
+            paint_exported_named_descriptor_imports_with_visited(
+                target,
+                module_name,
+                exports,
+                visiting_names,
+            );
             return true;
         }
     }
@@ -14806,6 +14798,8 @@ fn paint_exported_named_descriptor_import(
             });
         if !name.starts_with("__")
             && let Some(exported_root) = exported_root
+            && let visiting_name = referenced_name.to_owned()
+            && visiting_names.insert(visiting_name.clone())
         {
             let qualifier = referenced_name.strip_prefix(&referenced_root).map_or_else(
                 || exported_root.clone(),
@@ -14826,10 +14820,21 @@ fn paint_exported_named_descriptor_import(
                     **target = authoritative.clone();
                 }
                 for argument in type_arguments {
-                    paint_exported_named_descriptor_imports(argument, module_name, exports);
+                    paint_exported_named_descriptor_imports_with_visited(
+                        argument,
+                        module_name,
+                        exports,
+                        visiting_names,
+                    );
                 }
-                paint_exported_named_descriptor_imports(target, module_name, exports);
+                paint_exported_named_descriptor_imports_with_visited(
+                    target,
+                    module_name,
+                    exports,
+                    visiting_names,
+                );
             }
+            visiting_names.remove(&visiting_name);
             *descriptor = TypeDescriptor::Import {
                 reference: ImportTypeReference {
                     module_specifier: module_name.to_owned(),

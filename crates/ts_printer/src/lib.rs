@@ -12,6 +12,8 @@ use ts_checker::{
 use ts_options::{JsxEmit, ModuleDetectionKind, ModuleKind, PrinterSettings, ScriptTarget};
 use ts_sourcemap::{SourceMap, SourceMapBuilder};
 
+const NODE_FLAG_HAS_ERROR: u32 = 1 << 15;
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct EmitResult {
     pub code: String,
@@ -461,7 +463,14 @@ pub fn emit_source_file_with_context(
                 && printer.statement_emits_runtime(*statement, node)
         })
     });
-    let has_emitted_module_indicator = has_runtime_module_indicator || automatic_jsx.any();
+    let has_invalid_import_recovery = data.statements.nodes.iter().any(|statement| {
+        arena.get(*statement).is_some_and(|node| {
+            matches!(node.data, NodeData::NotEmittedStatement(_))
+                && node.flags.0 & NODE_FLAG_HAS_ERROR != 0
+        })
+    });
+    let has_emitted_module_indicator =
+        has_runtime_module_indicator || automatic_jsx.any() || has_invalid_import_recovery;
     if settings.module == ModuleKind::System && is_external_module {
         return printer.emit_system_source_file(data, context);
     }
@@ -497,10 +506,10 @@ pub fn emit_source_file_with_context(
             .is_some_and(|statement| export_declaration_is_empty(arena, statement))
     });
     let has_recovered_module_clause = data.statements.nodes.iter().any(|statement| {
-        matches!(
-            arena.get(*statement).map(|node| &node.data),
-            Some(NodeData::NotEmittedStatement(_))
-        )
+        arena.get(*statement).is_some_and(|node| {
+            matches!(node.data, NodeData::NotEmittedStatement(_))
+                && node.flags.0 & NODE_FLAG_HAS_ERROR == 0
+        })
     });
     let needs_async_generator_helper =
         settings.target < ScriptTarget::Es2018 && source_needs_async_generator_helper(arena);
@@ -509,6 +518,7 @@ pub fn emit_source_file_with_context(
         && source_has_dynamic_import(arena);
     if !has_use_strict
         && (context.force_use_strict
+            || has_invalid_import_recovery
             || (!preserves_external_module_syntax
                 && (settings.always_strict
                     || (settings.module == ModuleKind::CommonJs && is_external_module)
@@ -901,14 +911,12 @@ pub fn emit_source_file_with_context(
                     node.range.start.get(),
                 );
             }
-            if !erased_import {
-                printer.emit_source_comments_between_with_ownership(
-                    previous_end,
-                    node.range.start.get(),
-                    previous_emitted,
-                    current_owns_source_comments,
-                );
-            }
+            printer.emit_source_comments_between_with_ownership(
+                previous_end,
+                node.range.start.get(),
+                previous_emitted,
+                current_owns_source_comments,
+            );
             previous_emitted = current_owns_source_comments;
             previous_end = if erased_import {
                 let next_start = data
@@ -1768,7 +1776,12 @@ fn binding_has_runtime_identifier_use(
                 &node.data,
                 NodeData::Identifier(identifier) if identifier.text == name
             )
-            && identifier_is_runtime_use(arena, identifier, source_file)
+            && (identifier_is_runtime_use(arena, identifier, source_file)
+                || identifier_is_runtime_import_equals_reference(
+                    arena,
+                    identifier,
+                    runtime_identifier_uses,
+                ))
             && bindings.resolve_name_at(identifier, name) == Some(symbol)
     })
 }
@@ -1995,6 +2008,32 @@ fn identifier_is_runtime_use(arena: &NodeArena, id: NodeId, source_file: NodeId)
             return false;
         }
         child = parent_id;
+    }
+    false
+}
+
+fn identifier_is_runtime_import_equals_reference(
+    arena: &NodeArena,
+    id: NodeId,
+    runtime_identifier_uses: &HashSet<String>,
+) -> bool {
+    let mut current = id;
+    while let Some(parent_id) = arena.get(current).and_then(|node| node.parent) {
+        let Some(parent) = arena.get(parent_id) else {
+            return false;
+        };
+        if let NodeData::ImportEqualsDeclaration(import) = &parent.data {
+            return entity_root_identifier(arena, import.module_reference) == Some(id)
+                && declaration_name_text(arena, import.name)
+                    .is_some_and(|alias| runtime_identifier_uses.contains(alias));
+        }
+        if matches!(
+            parent.data,
+            NodeData::SourceFile(_) | NodeData::ImportDeclaration(_)
+        ) {
+            return false;
+        }
+        current = parent_id;
     }
     false
 }
@@ -3812,6 +3851,9 @@ impl DeclarationPrinter<'_> {
                     ) {
                         return Ok(());
                     }
+                    if exported {
+                        self.writer.write("export ");
+                    }
                     self.writer.write("import ");
                     match self.arena.get(data.module_specifier).map(|node| &node.data) {
                         Some(NodeData::StringLiteral(literal)) => {
@@ -3821,6 +3863,9 @@ impl DeclarationPrinter<'_> {
                     }
                     self.writer.write(";");
                 } else {
+                    if exported {
+                        self.writer.write("export ");
+                    }
                     self.emit_import(id, data)?;
                 }
             }
@@ -17599,6 +17644,7 @@ fn declaration_modifiers(node: &Node) -> Option<&ts_ast::ModifierList> {
         NodeData::TypeAliasDeclaration(data) => data.modifiers.as_ref(),
         NodeData::EnumDeclaration(data) => data.modifiers.as_ref(),
         NodeData::ModuleDeclaration(data) => data.modifiers.as_ref(),
+        NodeData::ImportDeclaration(data) => data.modifiers.as_ref(),
         NodeData::ImportEqualsDeclaration(data) => data.modifiers.as_ref(),
         NodeData::PropertyDeclaration(data) => data.modifiers.as_ref(),
         NodeData::MethodDeclaration(data) => data.modifiers.as_ref(),
@@ -17653,6 +17699,13 @@ fn declaration_name_text(arena: &NodeArena, id: NodeId) -> Option<&str> {
         }
         _ => None,
     }
+}
+
+fn node_is_missing_identifier(arena: &NodeArena, id: NodeId) -> bool {
+    arena.get(id).is_some_and(|node| {
+        matches!(&node.data, NodeData::Identifier(identifier) if identifier.text.is_empty())
+            && (node.range.is_empty() || node.flags.0 & NODE_FLAG_HAS_ERROR != 0)
+    })
 }
 
 fn keyword_type_text(kind: SyntaxKind) -> &'static str {
@@ -38216,6 +38269,10 @@ impl Printer<'_> {
         if self.commonjs_module_transform {
             return self.emit_commonjs_import(data);
         }
+        let recovered_module_specifier = !matches!(
+            self.arena.get(data.module_specifier).map(|node| &node.data),
+            Some(NodeData::StringLiteral(_))
+        );
         if let Some(clause) = data.import_clause {
             let clause_node = self.node(clause)?.clone();
             let NodeData::ImportClause(clause) = &clause_node.data else {
@@ -38223,10 +38280,10 @@ impl Printer<'_> {
             };
             let runtime_default = clause
                 .name
-                .filter(|name| self.import_binding_is_used(*name));
-            let runtime_bindings = clause
-                .named_bindings
-                .filter(|bindings| self.import_bindings_have_runtime_use(*bindings));
+                .filter(|name| recovered_module_specifier || self.import_binding_is_used(*name));
+            let runtime_bindings = clause.named_bindings.filter(|bindings| {
+                recovered_module_specifier || self.import_bindings_have_runtime_use(*bindings)
+            });
             if runtime_default.is_none() && runtime_bindings.is_none() {
                 return Ok(());
             }
@@ -38238,7 +38295,7 @@ impl Printer<'_> {
                 }
             }
             if let Some(bindings) = runtime_bindings {
-                self.emit_named_imports(bindings)?;
+                self.emit_named_imports(bindings, recovered_module_specifier)?;
             }
             self.writer.write(" from ");
         } else {
@@ -38524,7 +38581,7 @@ impl Printer<'_> {
         Ok(())
     }
 
-    fn emit_named_imports(&mut self, id: NodeId) -> Result<(), EmitError> {
+    fn emit_named_imports(&mut self, id: NodeId, retain_all: bool) -> Result<(), EmitError> {
         let node = self.node(id)?.clone();
         if let NodeData::NamespaceImport(data) = &node.data {
             self.writer.write("* as ");
@@ -38536,7 +38593,7 @@ impl Printer<'_> {
         self.writer.write("{ ");
         let mut emitted = false;
         for specifier in &data.elements.nodes {
-            if !self.import_specifier_has_runtime_use(*specifier) {
+            if !retain_all && !self.import_specifier_has_runtime_use(*specifier) {
                 continue;
             }
             if emitted {
@@ -38586,30 +38643,6 @@ impl Printer<'_> {
                     && self
                         .containing_import_declaration(specifier)
                         .is_some_and(|import| self.import_semantically_has_runtime_value(import)))
-                || (self.import_runtime_meanings.is_empty()
-                    && !self.import_name_has_reference_outside_import(name))
-        })
-    }
-
-    fn import_name_has_reference_outside_import(&self, name: &str) -> bool {
-        self.arena.iter().any(|(identifier, node)| {
-            if !matches!(
-                &node.data,
-                NodeData::Identifier(identifier) if identifier.text == name
-            ) {
-                return false;
-            }
-            let mut current = identifier;
-            while let Some(parent) = self.arena.get(current).and_then(|node| node.parent) {
-                if matches!(
-                    self.arena.get(parent).map(|node| &node.data),
-                    Some(NodeData::ImportDeclaration(_))
-                ) {
-                    return false;
-                }
-                current = parent;
-            }
-            true
         })
     }
 
@@ -39962,6 +39995,9 @@ impl Printer<'_> {
         declaration: NodeId,
         import: &ts_ast::ImportDeclarationData,
     ) -> bool {
+        if node_is_missing_identifier(self.arena, import.module_specifier) {
+            return false;
+        }
         if import.attributes.is_some() {
             return true;
         }
@@ -39972,6 +40008,25 @@ impl Printer<'_> {
         else {
             return true;
         };
+        let has_syntactic_binding = clause.name.is_some()
+            || match clause
+                .named_bindings
+                .and_then(|bindings| self.arena.get(bindings))
+                .map(|node| &node.data)
+            {
+                Some(NodeData::NamespaceImport(_)) => true,
+                Some(NodeData::NamedImports(imports)) => !imports.elements.nodes.is_empty(),
+                _ => false,
+            };
+        if !has_syntactic_binding {
+            return false;
+        }
+        if !matches!(
+            self.arena.get(import.module_specifier).map(|node| &node.data),
+            Some(NodeData::StringLiteral(_))
+        ) {
+            return true;
+        }
         if clause.phase_modifier == Some(SyntaxKind::TypeKeyword) {
             return false;
         }
@@ -40005,43 +40060,30 @@ impl Printer<'_> {
         if !has_runtime_value {
             return false;
         }
-        let mut saw_binding = false;
-        if let Some(name) = clause.name {
-            saw_binding = true;
-            if self.import_binding_is_used(name) {
-                return true;
-            }
+        if let Some(name) = clause.name
+            && self.import_binding_is_used(name)
+        {
+            return true;
         }
         let Some(bindings) = clause.named_bindings else {
-            return !saw_binding;
+            return false;
         };
         match self.arena.get(bindings).map(|node| &node.data) {
             Some(NodeData::NamespaceImport(namespace)) => {
-                saw_binding = true;
                 if self.import_binding_is_used(namespace.name) {
                     return true;
                 }
             }
             Some(NodeData::NamedImports(imports)) => {
                 for specifier in &imports.elements.nodes {
-                    let Some(NodeData::ImportSpecifier(specifier)) =
-                        self.arena.get(*specifier).map(|node| &node.data)
-                    else {
-                        continue;
-                    };
-                    saw_binding = true;
-                    if !specifier.is_type_only
-                        && self.identifier_text(specifier.name).is_ok_and(|name| {
-                            self.import_name_has_non_erased_runtime_reference(name)
-                        })
-                    {
+                    if self.import_specifier_has_runtime_use(*specifier) {
                         return true;
                     }
                 }
             }
             _ => return true,
         }
-        !saw_binding
+        false
     }
 
     fn source_needs_import_star_helper(&self, statements: &NodeList) -> bool {

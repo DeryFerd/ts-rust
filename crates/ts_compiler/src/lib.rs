@@ -4148,6 +4148,7 @@ fn declaration_modifiers(node: &ts_ast::Node) -> Option<&ts_ast::ModifierList> {
         NodeData::TypeAliasDeclaration(data) => data.modifiers.as_ref(),
         NodeData::EnumDeclaration(data) => data.modifiers.as_ref(),
         NodeData::ModuleDeclaration(data) => data.modifiers.as_ref(),
+        NodeData::ImportDeclaration(data) => data.modifiers.as_ref(),
         NodeData::ImportEqualsDeclaration(data) => data.modifiers.as_ref(),
         _ => None,
     }

@@ -1284,6 +1284,7 @@ impl<'a> Binder<'a> {
             Some(NodeData::InterfaceDeclaration(data)) => data.modifiers.as_ref(),
             Some(NodeData::TypeAliasDeclaration(data)) => data.modifiers.as_ref(),
             Some(NodeData::EnumDeclaration(data)) => data.modifiers.as_ref(),
+            Some(NodeData::ImportDeclaration(data)) => data.modifiers.as_ref(),
             Some(NodeData::ImportEqualsDeclaration(data)) => data.modifiers.as_ref(),
             Some(NodeData::ModuleDeclaration(data)) => data.modifiers.as_ref(),
             Some(NodeData::VariableStatement(data)) => data.modifiers.as_ref(),
