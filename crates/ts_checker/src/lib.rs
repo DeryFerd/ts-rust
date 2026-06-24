@@ -2761,8 +2761,20 @@ impl<'a> Checker<'a> {
         self.result.types.unknown()
     }
 
+    fn duplicate_type(&mut self, type_id: TypeId) -> TypeId {
+        let kind = self
+            .result
+            .types
+            .get(type_id)
+            .expect("source type exists")
+            .kind
+            .clone();
+        self.result.types.alloc(kind)
+    }
+
     fn enum_type(&mut self, data: &ts_ast::EnumDeclarationData) -> TypeId {
         let mut properties = BTreeMap::new();
+        let mut member_type_names = BTreeMap::new();
         let mut resolved_values = BTreeMap::<String, Value>::new();
         let member_names = data
             .members
@@ -2808,7 +2820,8 @@ impl<'a> Checker<'a> {
                 member_type
             } else if let Some(initializer) = initializer {
                 next_numeric_value = None;
-                self.type_of_expression(initializer)
+                let inferred = self.type_of_expression(initializer);
+                self.duplicate_type(inferred)
             } else if let Some(value) = next_numeric_value {
                 next_numeric_value = Some(value + 1.0);
                 let value = Value::Number(Number::new(value));
@@ -2822,6 +2835,9 @@ impl<'a> Checker<'a> {
             };
             if let Some(symbol) = self.bindings.node_symbols.get(member_id).copied() {
                 self.result.symbol_types.insert(symbol, member_type);
+            }
+            if identifier_text(self.arena, member.name).is_some() {
+                member_type_names.insert(member_type, format!("{enum_name}.{name}"));
             }
             properties.insert(name, member_type);
         }
@@ -2841,6 +2857,15 @@ impl<'a> Checker<'a> {
         }));
         for member_type in properties.values() {
             self.enum_member_owners.insert(*member_type, enum_type);
+        }
+        for (member_type, name) in member_type_names {
+            self.result.named_type_references.insert(
+                member_type,
+                NamedTypeReference {
+                    name,
+                    type_arguments: Vec::new(),
+                },
+            );
         }
         self.enum_types.insert(enum_type);
         if is_const {
@@ -6156,6 +6181,22 @@ impl<'a> Checker<'a> {
     }
 
     fn const_assertion_type(&mut self, expression: NodeId) -> TypeId {
+        let result = self.const_assertion_type_worker(expression);
+        let result = if let Some(owner) = self.enum_member_owners.get(&result).copied() {
+            let fresh = self.duplicate_type(result);
+            if let Some(reference) = self.result.named_type_references.get(&result).cloned() {
+                self.result.named_type_references.insert(fresh, reference);
+            }
+            self.enum_member_owners.insert(fresh, owner);
+            fresh
+        } else {
+            result
+        };
+        self.non_widening_types.insert(result);
+        result
+    }
+
+    fn const_assertion_type_worker(&mut self, expression: NodeId) -> TypeId {
         let Some(node) = self.arena.get(expression).cloned() else {
             return self.result.types.unknown();
         };
@@ -11569,6 +11610,9 @@ impl<'a> Checker<'a> {
         if self.non_widening_types.contains(&type_id) {
             return type_id;
         }
+        if let Some(owner) = self.enum_member_owners.get(&type_id) {
+            return *owner;
+        }
         let widened = match self
             .result
             .types
@@ -16114,6 +16158,65 @@ mod tests {
                 EnumConstantValue::Number(5.0),
                 EnumConstantValue::String("ok".into()),
             ]
+        );
+    }
+
+    #[test]
+    fn preserves_computed_enum_member_identity_and_widening() {
+        let parsed = parse_source_file(
+            r"
+                declare function computed(value: number): number;
+                enum E {
+                    A = computed(0),
+                    B = computed(1),
+                }
+                const preserved = E.B as const;
+                let widened = E.B;
+                let asserted = E.B as const;
+            ",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+
+        let enum_declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(id, node)| matches!(node.data, NodeData::EnumDeclaration(_)).then_some(id))
+            .unwrap();
+        let enum_symbol = bindings.node_symbols[&enum_declaration];
+        let enum_type = result.symbol_types[&enum_symbol];
+        let TypeKind::Object(enum_object) = &result.types.get(enum_type).unwrap().kind else {
+            panic!("enum value should have an object type");
+        };
+        let a = enum_object.properties["A"];
+        let b = enum_object.properties["B"];
+        assert_ne!(a, b);
+        assert_eq!(result.named_type_references[&a].name, "E.A");
+        assert_eq!(result.named_type_references[&b].name, "E.B");
+
+        let variable_type = |name: &str| {
+            parsed
+                .arena
+                .iter()
+                .find_map(|(id, node)| {
+                    let NodeData::VariableDeclaration(declaration) = &node.data else {
+                        return None;
+                    };
+                    (identifier_text(&parsed.arena, declaration.name) == Some(name))
+                        .then(|| result.node_types[&id])
+                })
+                .unwrap()
+        };
+        assert_eq!(
+            result.named_type_references[&variable_type("preserved")].name,
+            "E.B"
+        );
+        assert_eq!(variable_type("widened"), enum_type);
+        assert_eq!(
+            result.named_type_references[&variable_type("asserted")].name,
+            "E.B"
         );
     }
 

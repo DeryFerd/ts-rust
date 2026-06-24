@@ -25412,13 +25412,22 @@ impl Printer<'_> {
                     },
                     |next| next.range.start,
                 );
+            let comma = self
+                .source_text
+                .get(
+                    usize::try_from(node.range.end.get()).unwrap_or(usize::MAX)
+                        ..usize::try_from(comment_end.get()).unwrap_or(usize::MAX),
+                )
+                .and_then(trivia_comma_offset)
+                .and_then(|offset| u32::try_from(offset).ok())
+                .map(|offset| node.range.end.get().saturating_add(offset));
             self.emit_source_comments_between_with_ownership(
                 node.range.end.get(),
-                comment_end.get(),
+                comma.unwrap_or_else(|| comment_end.get()),
                 true,
                 false,
             );
-            previous_end = node.range.end.get();
+            previous_end = comma.map_or_else(|| node.range.end.get(), |_| comment_end.get());
         }
         self.writer.indent -= 1;
         self.writer.write("})(");
@@ -33286,6 +33295,25 @@ mod tests {
                 "    Foo[Foo[\"b\"] = 0] = \"b\"; // should work fine\n",
                 "})(Foo || (Foo = {}));\n",
             )
+        );
+    }
+
+    #[test]
+    fn drops_enum_comments_owned_by_erased_commas() {
+        let output = emit_with(
+            "enum Foo { a = (`value`) as string, // comma-owned\n b = `next`!, // also comma-owned\n c = 1 }",
+            ScriptTarget::EsNext,
+            ModuleKind::EsNext,
+        )
+        .code;
+        assert!(!output.contains("comma-owned"), "{output}");
+        assert!(
+            output.contains("Foo[Foo[\"a\"] = (`value`)] = \"a\";"),
+            "{output}"
+        );
+        assert!(
+            output.contains("Foo[Foo[\"b\"] = `next`] = \"b\";"),
+            "{output}"
         );
     }
 
