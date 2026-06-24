@@ -428,6 +428,9 @@ pub fn emit_source_file_with_context(
         && !settings.no_emit_helpers;
     if let Some(start) = first_statement_start {
         printer.emit_leading_detached_source_comments(start);
+        if settings.module == ModuleKind::CommonJs && is_external_module {
+            printer.emit_detached_reference_directives_between(0, start);
+        }
         if needs_extends_helper || (settings.module == ModuleKind::CommonJs && is_external_module) {
             let source_prologues = data
                 .statements
@@ -17455,6 +17458,7 @@ fn collect_namespace_alias_rewrites(
     container: &str,
     rewrites: &mut HashMap<ts_ast::SymbolId, String>,
 ) {
+    let module_declaration = arena.get(module.name).and_then(|name| name.parent);
     if let Some(module_symbol) = bindings
         .node_symbols
         .get(&module.name)
@@ -17469,7 +17473,6 @@ fn collect_namespace_alias_rewrites(
             | SymbolFlags::CONST_ENUM
             | SymbolFlags::VALUE_MODULE
             | SymbolFlags::NAMESPACE_MODULE;
-        let module_declaration = arena.get(module.name).and_then(|name| name.parent);
         for (name, member) in module_symbol.members.iter() {
             let Some(symbol) = bindings.symbols.get(member) else {
                 continue;
@@ -17489,7 +17492,10 @@ fn collect_namespace_alias_rewrites(
                     false
                 })
             });
-            if symbol.flags.intersects(always_rewritten_member_flags)
+            let has_local_variable_declaration =
+                namespace_has_non_exported_variable_name(arena, module, name);
+            if (!has_local_variable_declaration
+                && symbol.flags.intersects(always_rewritten_member_flags))
                 || (symbol.flags.intersects(reopened_member_flags) && !declared_here)
             {
                 rewrites.insert(member, format!("{container}.{name}"));
@@ -17534,7 +17540,9 @@ fn collect_namespace_alias_rewrites(
                     let Some(name) = declaration_name_text(arena, declaration.name) else {
                         continue;
                     };
-                    if let Some(symbol) = bindings.node_symbols.get(&declaration.name) {
+                    if let Some(symbol) = bindings.node_symbols.get(&declaration.name)
+                        && !namespace_has_non_exported_variable_name(arena, module, name)
+                    {
                         rewrites.insert(*symbol, format!("{container}.{name}"));
                     }
                 }
@@ -17542,6 +17550,34 @@ fn collect_namespace_alias_rewrites(
             _ => {}
         }
     }
+}
+
+fn namespace_has_non_exported_variable_name(
+    arena: &NodeArena,
+    module: &ts_ast::ModuleDeclarationData,
+    name: &str,
+) -> bool {
+    let Some(NodeData::ModuleBlock(block)) = module
+        .body
+        .and_then(|body| arena.get(body))
+        .map(|node| &node.data)
+    else {
+        return false;
+    };
+    block.statements.nodes.iter().any(|statement| {
+        let Some(node) = arena.get(*statement) else {
+            return false;
+        };
+        let NodeData::VariableStatement(variable) = &node.data else {
+            return false;
+        };
+        if declaration_has_modifier(arena, node, SyntaxKind::ExportKeyword) {
+            return false;
+        }
+        simple_variable_names(arena, variable.declaration_list)
+            .iter()
+            .any(|candidate| candidate == name)
+    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -18979,10 +19015,12 @@ impl Printer<'_> {
                     .position(|byte| *byte == b'\n' || *byte == b'\r')
                     .map_or(bytes.len(), |offset| index + offset);
                 let comment = &trivia[index..comment_end];
+                let comment_range = (start + index, start + comment_end);
                 if is_reference_directive(comment)
                     && (include_owned
                         || (include_compact_owned && comment.starts_with("///<reference"))
                         || contains_blank_line(&trivia[comment_end..]))
+                    && self.emitted_source_comments.insert(comment_range)
                 {
                     self.writer.write(comment);
                     self.writer.newline_preserving_trailing_spaces();
@@ -19017,7 +19055,10 @@ impl Printer<'_> {
                     .position(|byte| *byte == b'\n' || *byte == b'\r')
                     .map_or(bytes.len(), |offset| index + offset);
                 let comment = &trivia[index..comment_end];
-                if is_reference_directive(comment) {
+                let comment_range = (start + index, start + comment_end);
+                if is_reference_directive(comment)
+                    && self.emitted_source_comments.insert(comment_range)
+                {
                     self.writer.write(comment);
                     self.writer.newline_preserving_trailing_spaces();
                 }
@@ -19128,7 +19169,7 @@ impl Printer<'_> {
                     continue;
                 }
                 let comment_range = (start + index, start + comment_end);
-                let immediate_trailing = !trivia[..index].contains(['\n', '\r']);
+                let immediate_trailing = start != 0 && !trivia[..index].contains(['\n', '\r']);
                 if ((immediate_trailing && preserve_immediate_trailing)
                     || (!immediate_trailing && preserve_leading))
                     && self.emitted_source_comments.insert(comment_range)
@@ -19152,7 +19193,7 @@ impl Printer<'_> {
                     .position(|window| window == b"*/")
                     .map_or(bytes.len(), |offset| index + 2 + offset + 2);
                 let comment_range = (start + index, start + comment_end);
-                let immediate_trailing = !trivia[..index].contains(['\n', '\r']);
+                let immediate_trailing = start != 0 && !trivia[..index].contains(['\n', '\r']);
                 if ((immediate_trailing && preserve_immediate_trailing)
                     || (!immediate_trailing && preserve_leading))
                     && self.emitted_source_comments.insert(comment_range)
@@ -20919,7 +20960,15 @@ impl Printer<'_> {
                         .and_then(|name| declaration_name_text(self.arena, name))
                         .map(str::to_owned)
                 {
-                    self.writer.newline();
+                    self.emit_source_comments_between_with_ownership(
+                        node.range.end.get(),
+                        u32::try_from(self.source_text.len()).unwrap_or(u32::MAX),
+                        true,
+                        false,
+                    );
+                    if !self.writer.line_start {
+                        self.writer.newline();
+                    }
                     self.writer.write(&container);
                     self.writer.write(".");
                     self.writer.write(&name);
@@ -23843,9 +23892,55 @@ impl Printer<'_> {
             self.writer.remove_trailing_newline();
             self.writer.write(" }");
             Ok(())
+        } else if let Some(statements) = self.compact_function_body_statements(body)? {
+            self.writer.write("{ ");
+            for (index, statement) in statements.iter().enumerate() {
+                self.emit_statement(*statement)?;
+                self.writer.remove_trailing_newline();
+                if index + 1 != statements.len() {
+                    self.writer.write(" ");
+                }
+            }
+            self.writer.write(" }");
+            Ok(())
         } else {
             self.emit_block(body)
         }
+    }
+
+    fn compact_function_body_statements(
+        &self,
+        body: NodeId,
+    ) -> Result<Option<Vec<NodeId>>, EmitError> {
+        if self.source_text.is_empty() || self.node_source_is_multiline(body) {
+            return Ok(None);
+        }
+        let node = self.node(body)?;
+        let NodeData::Block(block) = &node.data else {
+            return Err(Self::unsupported(body, node.kind));
+        };
+        if block.statements.nodes.len() < 2
+            || self.source_range_contains_comment(
+                node.range.start.get().saturating_add(1),
+                node.range.end.get().saturating_sub(1),
+            )
+        {
+            return Ok(None);
+        }
+        for statement in &block.statements.nodes {
+            if !matches!(
+                self.node(*statement)?.data,
+                NodeData::ExpressionStatement(_)
+                    | NodeData::DebuggerStatement(_)
+                    | NodeData::ReturnStatement(_)
+                    | NodeData::ThrowStatement(_)
+                    | NodeData::EmptyStatement(_)
+            ) || self.statement_contains_class_expression(*statement)?
+            {
+                return Ok(None);
+            }
+        }
+        Ok(Some(block.statements.nodes.clone()))
     }
 
     fn body_has_downlevel_async_arrow(&self, body: NodeId) -> bool {
@@ -32158,6 +32253,11 @@ impl Printer<'_> {
                         .bindings
                         .root_scope()
                         .and_then(|scope| scope.symbols.get(name))
+                    && self
+                        .bindings
+                        .symbols
+                        .get(symbol)
+                        .is_some_and(|symbol| symbol.flags.intersects(SymbolFlags::VARIABLE))
                 {
                     self.identifier_rewrites
                         .insert(symbol, format!("exports.{exported}"));
