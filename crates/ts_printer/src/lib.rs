@@ -69,6 +69,7 @@ pub struct EmitContext<'a> {
     pub preemitted_shebang: bool,
     pub suppress_extends_helper: bool,
     pub preemitted_comment_end: Option<u32>,
+    pub preserve_top_of_file_reference_directive: bool,
     pub amd_dependencies: &'a [AmdDependency<'a>],
     pub amd_module_specifier_rewrites: &'a BTreeMap<String, String>,
     pub amd_generated_name_offsets: &'a BTreeMap<String, u32>,
@@ -207,6 +208,7 @@ pub fn emit_source_file_with_settings_and_bindings(
             preemitted_shebang: false,
             suppress_extends_helper: false,
             preemitted_comment_end: None,
+            preserve_top_of_file_reference_directive: false,
             amd_dependencies: &[],
             amd_module_specifier_rewrites: &BTreeMap::new(),
             amd_generated_name_offsets: &BTreeMap::new(),
@@ -322,6 +324,8 @@ pub fn emit_source_file_with_context(
         strict_null_checks: context.strict_null_checks,
         jsx_factory: context.jsx_factory.map(str::to_owned),
         downlevel_iteration: context.downlevel_iteration,
+        context_preserves_top_of_file_reference_directive: context
+            .preserve_top_of_file_reference_directive,
     };
     let node = printer.node(source_file)?.clone();
     let NodeData::SourceFile(data) = &node.data else {
@@ -13192,7 +13196,9 @@ impl DeclarationPrinter<'_> {
                 })
             {
                 emitted_names.insert(name.clone());
-                if !self.emit_computed_literal_property_name(name_node)? {
+                if method && name == "new" {
+                    write_quoted(&mut self.writer, "new");
+                } else if !self.emit_computed_literal_property_name(name_node)? {
                     if syntactic_name.is_some() {
                         self.emit_name(name_node)?;
                     } else {
@@ -13213,7 +13219,9 @@ impl DeclarationPrinter<'_> {
             if object.readonly_properties.contains(&name) {
                 self.writer.write("readonly ");
             }
-            if !self.emit_computed_literal_property_name(name_node)? {
+            if method && name == "new" {
+                write_quoted(&mut self.writer, "new");
+            } else if !self.emit_computed_literal_property_name(name_node)? {
                 if syntactic_name.is_some() {
                     self.emit_name(name_node)?;
                 } else {
@@ -18163,6 +18171,7 @@ struct Printer<'a> {
     strict_null_checks: bool,
     jsx_factory: Option<String>,
     downlevel_iteration: bool,
+    context_preserves_top_of_file_reference_directive: bool,
 }
 
 impl Printer<'_> {
@@ -19516,8 +19525,15 @@ impl Printer<'_> {
                     .map_or(bytes.len(), |offset| index + offset);
                 let comment = &trivia[index..comment_end];
                 let comment_range = (start + index, start + comment_end);
+                let top_of_file = self.settings.module == ModuleKind::None
+                    && self.context_preserves_top_of_file_reference_directive
+                    && self.source_text[..comment_range.0]
+                        .trim_start_matches('\u{feff}')
+                        .trim()
+                        .is_empty();
                 if is_reference_directive(comment)
                     && (include_owned
+                        || top_of_file
                         || (include_compact_owned && comment.starts_with("///<reference"))
                         || contains_blank_line(&trivia[comment_end..]))
                     && self.emitted_source_comments.insert(comment_range)
@@ -19680,7 +19696,7 @@ impl Printer<'_> {
                             self.writer.remove_trailing_spaces();
                             self.writer.write(" ");
                         }
-                    } else if !self.writer.line_start {
+                    } else if !self.writer.line_start && !self.writer.is_empty() {
                         self.writer.newline();
                     }
                     self.writer.write(&trivia[index..comment_end]);
@@ -19705,7 +19721,10 @@ impl Printer<'_> {
                         self.writer.remove_trailing_newline();
                         self.writer.remove_trailing_spaces();
                         self.writer.write(" ");
-                    } else if !continues_previous_block && !self.writer.line_start {
+                    } else if !continues_previous_block
+                        && !self.writer.line_start
+                        && !self.writer.is_empty()
+                    {
                         self.writer.newline();
                     }
                     let remainder = &trivia[comment_end..];
@@ -26194,6 +26213,8 @@ impl Printer<'_> {
             self.emit_block_comment_trivia(comment_start, name_start, true);
             self.emit_expression(declaration.name, 0)?;
             if let Some(initializer) = declaration.initializer {
+                self.emit_initializer_preceding_block_comments(declaration.name, initializer);
+                self.writer.remove_trailing_spaces();
                 self.writer.write(" = ");
                 self.emit_initializer_leading_block_comments(declaration.name, initializer);
                 let export_rewrite = commonjs_exported
@@ -26789,6 +26810,34 @@ impl Printer<'_> {
         } else {
             self.emit_block_comment_trivia(comment_start, end, true);
         }
+    }
+
+    fn emit_initializer_preceding_block_comments(&mut self, name: NodeId, initializer: NodeId) {
+        let Some(start) = self.arena.get(name).map(|node| node.range.end.get()) else {
+            return;
+        };
+        let Some(end) = self
+            .arena
+            .get(initializer)
+            .map(|node| node.range.start.get())
+        else {
+            return;
+        };
+        let Some(trivia) = usize::try_from(start)
+            .ok()
+            .zip(usize::try_from(end).ok())
+            .and_then(|(start, end)| self.source_text.get(start..end))
+        else {
+            return;
+        };
+        let Some(equals) = trivia.rfind('=') else {
+            return;
+        };
+        if trivia[..equals].starts_with("/*") && !self.writer.line_start {
+            self.writer.write(" ");
+        }
+        let equals = start.saturating_add(u32::try_from(equals).unwrap_or(u32::MAX));
+        self.emit_block_comment_trivia(start, equals, true);
     }
 
     fn binding_pattern_has_single_simple_leaf(&self, name: NodeId) -> bool {
@@ -33931,14 +33980,28 @@ impl Printer<'_> {
                             self.emit_expression(accessor.name, 0)?;
                             self.emit_parameters(&accessor.parameters)?;
                             self.writer.write(" ");
-                            self.emit_accessor_body(accessor.body)?;
+                            if self.settings.target < ScriptTarget::Es2015 {
+                                self.emit_downlevel_accessor_body(
+                                    &accessor.parameters,
+                                    accessor.body,
+                                )?;
+                            } else {
+                                self.emit_accessor_body(accessor.body)?;
+                            }
                         }
                         NodeData::SetAccessorDeclaration(accessor) => {
                             self.writer.write("set ");
                             self.emit_expression(accessor.name, 0)?;
                             self.emit_parameters(&accessor.parameters)?;
                             self.writer.write(" ");
-                            self.emit_accessor_body(accessor.body)?;
+                            if self.settings.target < ScriptTarget::Es2015 {
+                                self.emit_downlevel_accessor_body(
+                                    &accessor.parameters,
+                                    accessor.body,
+                                )?;
+                            } else {
+                                self.emit_accessor_body(accessor.body)?;
+                            }
                         }
                         _ => return Err(Self::unsupported(*property, node.kind)),
                     }
@@ -36212,6 +36275,29 @@ impl Printer<'_> {
             previous_end = self.node(*expression)?.range.end.get();
         }
         let list_end = list.range.end.get().saturating_sub(1);
+        if list.nodes.is_empty()
+            && (self.trivia_has_block_comment(previous_end, list_end)
+                || self.source_range_contains_line_comment(previous_end, list_end))
+        {
+            let starts_on_new_line = usize::try_from(previous_end)
+                .ok()
+                .zip(usize::try_from(list_end).ok())
+                .and_then(|(start, end)| self.source_text.get(start..end))
+                .and_then(|trivia| {
+                    [trivia.find("/*"), trivia.find("//")]
+                        .into_iter()
+                        .flatten()
+                        .min()
+                        .map(|comment| trivia[..comment].contains(['\n', '\r']))
+                })
+                .unwrap_or(false);
+            if !starts_on_new_line {
+                self.writer.write(" ");
+            }
+            self.emit_binary_comment_trivia(previous_end, list_end);
+            self.writer.remove_trailing_spaces();
+            return Ok(());
+        }
         if self.trivia_has_block_comment(previous_end, list_end) {
             self.emit_block_comment_trivia(previous_end, list_end, true);
         } else if self.source_range_contains_line_comment(previous_end, list_end) {
@@ -37761,6 +37847,7 @@ mod tests {
                 preemitted_shebang: false,
                 suppress_extends_helper: false,
                 preemitted_comment_end: None,
+                preserve_top_of_file_reference_directive: false,
                 amd_dependencies: &[],
                 amd_module_specifier_rewrites: &BTreeMap::new(),
                 amd_generated_name_offsets: &BTreeMap::new(),
@@ -37887,6 +37974,7 @@ mod tests {
                 preemitted_shebang: false,
                 suppress_extends_helper: false,
                 preemitted_comment_end: None,
+                preserve_top_of_file_reference_directive: false,
                 amd_dependencies: &dependencies,
                 amd_module_specifier_rewrites: &BTreeMap::new(),
                 amd_generated_name_offsets: &BTreeMap::new(),
@@ -39611,6 +39699,7 @@ mod tests {
                 preemitted_shebang: false,
                 suppress_extends_helper: false,
                 preemitted_comment_end: None,
+                preserve_top_of_file_reference_directive: false,
                 amd_dependencies: &[],
                 amd_module_specifier_rewrites: &BTreeMap::new(),
                 amd_generated_name_offsets: &BTreeMap::new(),
@@ -40134,6 +40223,7 @@ mod tests {
                     preemitted_shebang: false,
                     suppress_extends_helper: false,
                     preemitted_comment_end: None,
+                    preserve_top_of_file_reference_directive: false,
                     amd_dependencies: &[],
                     amd_module_specifier_rewrites: &BTreeMap::new(),
                     amd_generated_name_offsets: &BTreeMap::new(),
@@ -42272,6 +42362,7 @@ class Board {
                 preemitted_shebang: false,
                 suppress_extends_helper: false,
                 preemitted_comment_end: None,
+                preserve_top_of_file_reference_directive: false,
                 amd_dependencies: &[],
                 amd_module_specifier_rewrites: &BTreeMap::new(),
                 amd_generated_name_offsets: &BTreeMap::new(),

@@ -565,6 +565,22 @@ impl Program {
                         self.source_files.iter().skip(source_index + 1),
                     ),
                 );
+                let preserve_top_of_file_reference_directive =
+                    reference_directives(&source_file.source_text)
+                        .into_iter()
+                        .filter(|directive| matches!(directive.kind, ReferenceKind::Path))
+                        .any(|directive| {
+                            let referenced = resolve_path(
+                                &directory_path(&source_file.file_name),
+                                &[directive.value.as_str()],
+                            );
+                            let canonical = canonicalize(
+                                &referenced,
+                                &self.current_directory,
+                                self.case_sensitivity,
+                            );
+                            self.file_index.contains_key(&canonical)
+                        });
                 let emit_context = EmitContext {
                     bindings: &source_file.binding,
                     amd_module_name: source_file.parse.amd_module_name.as_deref(),
@@ -573,6 +589,7 @@ impl Program {
                     preemitted_shebang: false,
                     suppress_extends_helper: false,
                     preemitted_comment_end: None,
+                    preserve_top_of_file_reference_directive,
                     amd_dependencies: &amd_dependencies,
                     amd_module_specifier_rewrites: &BTreeMap::new(),
                     amd_generated_name_offsets: &BTreeMap::new(),
@@ -847,6 +864,7 @@ impl Program {
                     preemitted_shebang: source_shebang(source).is_some(),
                     suppress_extends_helper: bundle_needs_extends_helper,
                     preemitted_comment_end: detached_comment.as_ref().map(|(_, end)| *end),
+                    preserve_top_of_file_reference_directive: false,
                     amd_dependencies: &amd_dependencies,
                     amd_module_specifier_rewrites: &amd_module_specifier_rewrites,
                     amd_generated_name_offsets: &amd_generated_name_offsets,
