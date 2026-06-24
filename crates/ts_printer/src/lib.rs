@@ -1465,7 +1465,9 @@ fn export_declaration_is_empty(arena: &NodeArena, node: &Node) -> bool {
     )
 }
 
-fn runtime_identifier_uses(arena: &NodeArena, source_file: NodeId) -> HashSet<String> {
+/// Returns source identifiers that survive type erasure and are needed at runtime.
+#[must_use]
+pub fn runtime_identifier_uses(arena: &NodeArena, source_file: NodeId) -> HashSet<String> {
     let mut uses = arena
         .iter()
         .filter_map(|(id, node)| {
@@ -1530,6 +1532,12 @@ fn identifier_is_runtime_use(arena: &NodeArena, id: NodeId, source_file: NodeId)
         let Some(parent) = arena.get(parent_id) else {
             return false;
         };
+        if matches!(
+            &parent.data,
+            NodeData::PropertyAccessExpression(access) if access.name == child
+        ) {
+            return false;
+        }
         if matches!(
             &parent.data,
             NodeData::ComputedPropertyName(computed) if computed.expression == child

@@ -24,7 +24,7 @@ use ts_path::{
 };
 use ts_printer::{
     AmdDependency as PrinterAmdDependency, EmitConstantValue, EmitContext,
-    emit_declaration_file_with_semantics, emit_source_file_with_context,
+    emit_declaration_file_with_semantics, emit_source_file_with_context, runtime_identifier_uses,
 };
 use ts_sourcemap::{SourceMap, SourceMapBuilder};
 use ts_vfs::FileSystem;
@@ -2872,6 +2872,71 @@ fn source_is_external_module(source: &SourceFile) -> bool {
     })
 }
 
+fn import_binding_is_const_enum(source: &SourceFile, binding: NodeId) -> bool {
+    source
+        .binding
+        .node_symbols
+        .get(&binding)
+        .and_then(|symbol| source.checking.symbol_types.get(symbol))
+        .is_some_and(|type_id| source.checking.const_enum_types.contains(type_id))
+}
+
+fn import_declaration_binds_const_enum(
+    source: &SourceFile,
+    import: &ts_ast::ImportDeclarationData,
+) -> bool {
+    import
+        .import_clause
+        .and_then(|clause| source.parse.arena.get(clause))
+        .and_then(|node| match &node.data {
+            NodeData::ImportClause(clause) => Some(clause),
+            _ => None,
+        })
+        .is_some_and(|clause| {
+            clause
+                .name
+                .is_some_and(|name| import_binding_is_const_enum(source, name))
+                || clause.named_bindings.is_some_and(|bindings| {
+                    match source.parse.arena.get(bindings).map(|node| &node.data) {
+                        Some(NodeData::NamedImports(imports)) => {
+                            imports.elements.nodes.iter().any(|specifier| {
+                                matches!(
+                                    source.parse.arena.get(*specifier).map(|node| &node.data),
+                                    Some(NodeData::ImportSpecifier(specifier))
+                                        if import_binding_is_const_enum(source, specifier.name)
+                                )
+                            })
+                        }
+                        _ => false,
+                    }
+                })
+        })
+}
+
+fn import_equals_name<'a>(
+    source: &'a SourceFile,
+    import: &ts_ast::ImportEqualsDeclarationData,
+) -> Option<&'a str> {
+    match &source.parse.arena.get(import.name)?.data {
+        NodeData::Identifier(identifier) => Some(&identifier.text),
+        _ => None,
+    }
+}
+
+fn import_equals_has_inlined_const_enum_access(source: &SourceFile, import_name: &str) -> bool {
+    source.checking.enum_access_values.keys().any(|access| {
+        let mut current = *access;
+        loop {
+            match source.parse.arena.get(current).map(|node| &node.data) {
+                Some(NodeData::PropertyAccessExpression(access)) => current = access.expression,
+                Some(NodeData::ElementAccessExpression(access)) => current = access.expression,
+                Some(NodeData::Identifier(identifier)) => break identifier.text == import_name,
+                _ => break false,
+            }
+        }
+    })
+}
+
 fn import_runtime_meanings_for_emit(
     source: &SourceFile,
     preserve_const_enums: bool,
@@ -2886,46 +2951,16 @@ fn import_runtime_meanings_for_emit(
     else {
         return meanings;
     };
+    let runtime_identifier_uses =
+        amd.then(|| runtime_identifier_uses(&source.parse.arena, source.parse.source_file));
     for statement in &file.statements.nodes {
-        if preserve_const_enums
-            && let Some(NodeData::ImportDeclaration(import)) =
-                source.parse.arena.get(*statement).map(|node| &node.data)
+        if let Some(NodeData::ImportDeclaration(import)) =
+            source.parse.arena.get(*statement).map(|node| &node.data)
         {
-            let binding_is_const_enum = |binding: NodeId| {
-                source
-                    .binding
-                    .node_symbols
-                    .get(&binding)
-                    .and_then(|symbol| source.checking.symbol_types.get(symbol))
-                    .is_some_and(|type_id| source.checking.const_enum_types.contains(type_id))
-            };
-            let preserves_import = import
-                .import_clause
-                .and_then(|clause| source.parse.arena.get(clause))
-                .and_then(|node| match &node.data {
-                    NodeData::ImportClause(clause) => Some(clause),
-                    _ => None,
-                })
-                .is_some_and(|clause| {
-                    clause.name.is_some_and(binding_is_const_enum)
-                        || clause.named_bindings.is_some_and(|bindings| {
-                            match source.parse.arena.get(bindings).map(|node| &node.data) {
-                                Some(NodeData::NamedImports(imports)) => {
-                                    imports.elements.nodes.iter().any(|specifier| {
-                                        matches!(
-                                            source.parse.arena.get(*specifier).map(|node| &node.data),
-                                            Some(NodeData::ImportSpecifier(specifier))
-                                                if binding_is_const_enum(specifier.name)
-                                        )
-                                    })
-                                }
-                                _ => false,
-                            }
-                        })
-                });
-            if preserves_import {
+            if preserve_const_enums && import_declaration_binds_const_enum(source, import) {
                 meanings.insert(*statement, true);
             }
+            continue;
         }
         if !amd {
             continue;
@@ -2935,43 +2970,25 @@ fn import_runtime_meanings_for_emit(
         else {
             continue;
         };
-        if !import.is_type_only {
-            let import_name =
-                source
-                    .parse
-                    .arena
-                    .get(import.name)
-                    .and_then(|node| match &node.data {
-                        NodeData::Identifier(identifier) => Some(identifier.text.as_str()),
-                        _ => None,
-                    });
-            let has_inlined_const_enum_access = import_name.is_some_and(|import_name| {
-                source.checking.enum_access_values.keys().any(|access| {
-                    let mut current = *access;
-                    loop {
-                        match source.parse.arena.get(current).map(|node| &node.data) {
-                            Some(NodeData::PropertyAccessExpression(access)) => {
-                                current = access.expression;
-                            }
-                            Some(NodeData::ElementAccessExpression(access)) => {
-                                current = access.expression;
-                            }
-                            Some(NodeData::Identifier(identifier)) => {
-                                break identifier.text == import_name;
-                            }
-                            _ => break false,
-                        }
-                    }
-                })
-            });
-            if meanings.get(statement) == Some(&false) && has_inlined_const_enum_access {
-                continue;
-            }
-            // Import-equals runtime use is decided from its actual value references by
-            // the emitter. An ambient module has no implementation initializer, so
-            // symbol-shape classification alone must not erase a referenced require.
-            meanings.insert(*statement, true);
+        if import.is_type_only {
+            continue;
         }
+        let Some(import_name) = import_equals_name(source, import) else {
+            continue;
+        };
+        let runtime_uses = runtime_identifier_uses
+            .as_ref()
+            .expect("AMD uses were collected");
+        let has_runtime_use = runtime_uses.contains(import_name);
+        if meanings.get(statement) == Some(&false)
+            && (!has_runtime_use
+                || import_equals_has_inlined_const_enum_access(source, import_name))
+        {
+            continue;
+        }
+        // Ambient modules have no implementation initializer, so semantic shape alone cannot
+        // distinguish their runtime aliases. Preserve only aliases with binding-resolved uses.
+        meanings.insert(*statement, true);
     }
     meanings
 }
@@ -4524,6 +4541,49 @@ mod tests {
                 "});\n",
             )
         );
+    }
+
+    #[test]
+    fn amd_elides_import_equals_used_only_in_erased_generic_types() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/types.ts",
+            "interface Foo<T> { value: T; } export = Foo;",
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/main.ts",
+            "import Foo = require(\"./types\"); export let value: Foo<string>;",
+        )
+        .unwrap();
+
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["main.ts".to_owned(), "types.ts".to_owned()],
+            CompilerOptions {
+                module: ModuleKind::Amd,
+                target: ScriptTarget::Es2015,
+                declaration: true,
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        let emitted = program.emit();
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        let javascript = emitted
+            .files
+            .iter()
+            .find(|file| file.file_name == "/project/main.js")
+            .unwrap();
+        assert!(
+            javascript
+                .text
+                .starts_with("define([\"require\", \"exports\"], function (require, exports)"),
+            "{}",
+            javascript.text
+        );
+        assert!(!javascript.text.contains("./types"), "{}", javascript.text);
     }
 
     #[test]

@@ -4375,7 +4375,7 @@ impl<'a> Checker<'a> {
                 .unwrap_or_else(|| self.result.types.any());
             if self.is_question_token(data.question_token) {
                 optional_properties.insert(name.clone());
-                if self.options.strict_null_checks && !self.options.exact_optional_property_types {
+                if !self.options.exact_optional_property_types {
                     let undefined = self.result.types.undefined();
                     property_type = self.result.types.union([property_type, undefined]);
                 }
@@ -16559,6 +16559,32 @@ mod tests {
                 .collect::<Vec<_>>(),
             [2345, 2322]
         );
+    }
+
+    #[test]
+    fn optional_parameter_properties_include_undefined_without_strict_null_checks() {
+        let parsed = parse_source_file("class C { constructor(public value?: string) {} }");
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file_with_options(
+            &parsed.arena,
+            parsed.source_file,
+            &bindings,
+            CheckerOptions {
+                strict_null_checks: false,
+                ..CheckerOptions::default()
+            },
+        );
+        let class = bindings.root_scope().unwrap().symbols.get("C").unwrap();
+        let class_type = result.type_of_symbol(class).unwrap();
+        let TypeKind::Object(object) = &result.types.get(class_type).unwrap().kind else {
+            panic!("expected class instance type");
+        };
+        let value = object.properties["value"];
+        assert!(object.optional_properties.contains("value"));
+        assert!(matches!(
+            &result.types.get(value).unwrap().kind,
+            TypeKind::Union(members) if members.contains(&result.types.undefined())
+        ));
     }
 
     #[test]
