@@ -30204,7 +30204,14 @@ impl Printer<'_> {
         }
         let Some((await_id, awaited)) = self.es5_async_simple_statement_await(statement) else {
             if !self.writer.line_start {
-                self.writer.newline();
+                if matches!(
+                    node.data,
+                    NodeData::ReturnStatement(_) | NodeData::ThrowStatement(_)
+                ) {
+                    self.writer.write(" ");
+                } else {
+                    self.writer.newline();
+                }
             }
             self.emit_es5_async_non_suspending_statement(statement)?;
             return Ok(());
@@ -30827,19 +30834,25 @@ impl Printer<'_> {
         self.writer.write("];");
         self.writer.newline();
 
-        let else_inline = statement
-            .else_statement
-            .is_some_and(|statement| self.es5_async_branch_starts_with_suspension(statement));
+        let else_inline = statement.else_statement.is_some_and(|statement| {
+            self.es5_async_branch_starts_with_suspension(statement)
+                || !self.es5_async_statement_may_complete_normally(statement)
+        });
         self.emit_es5_async_case_label(else_case, else_inline);
         *case = else_case;
         if let Some(else_statement) = statement.else_statement {
             self.emit_es5_async_branch(else_statement, state, case)?;
         }
-        self.writer.write(state);
-        self.writer.write(".label = ");
-        self.writer.write(&end_case.to_string());
-        self.writer.write(";");
-        self.writer.newline();
+        if statement
+            .else_statement
+            .is_none_or(|statement| self.es5_async_statement_may_complete_normally(statement))
+        {
+            self.writer.write(state);
+            self.writer.write(".label = ");
+            self.writer.write(&end_case.to_string());
+            self.writer.write(";");
+            self.writer.newline();
+        }
         self.emit_es5_async_case_label(end_case, is_last);
         if is_last {
             self.writer.write(" ");
@@ -44325,7 +44338,7 @@ impl Printer<'_> {
             }
             NodeData::FunctionExpression(data) => {
                 let previous_static_capture = self.class_static_this_capture.take();
-                let wrap = parent_precedence >= 18;
+                let wrap = parent_precedence > 18;
                 if wrap {
                     self.writer.write("(");
                 }
