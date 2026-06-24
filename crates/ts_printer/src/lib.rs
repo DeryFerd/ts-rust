@@ -5674,7 +5674,8 @@ impl DeclarationPrinter<'_> {
                 let declaration_name = declaration_name_text(self.arena, declaration.name);
                 let const_asserted = declaration_name.is_some_and(|name| {
                     self.source_text.lines().any(|line| {
-                        line.contains("as const") && line.contains("const") && line.contains(name)
+                        let code = line.split_once("//").map_or(line, |(code, _)| code);
+                        code.contains("as const") && code.contains("const") && code.contains(name)
                     })
                 }) || declaration.initializer.is_some_and(|initializer| {
                     if self.expression_has_const_assertion_ancestor(initializer) {
@@ -5687,7 +5688,12 @@ impl DeclarationPrinter<'_> {
                     start
                         .and_then(|start| self.source_text.get(start..))
                         .and_then(|suffix| suffix.lines().next())
-                        .is_some_and(|suffix| suffix.contains("as const"))
+                        .is_some_and(|suffix| {
+                            suffix
+                                .split_once("//")
+                                .map_or(suffix, |(code, _)| code)
+                                .contains("as const")
+                        })
                 });
                 self.writer.write(if const_asserted { ": " } else { " = " });
                 let previous = self.canonical_literal_quotes;
@@ -25758,16 +25764,20 @@ impl Printer<'_> {
     }
 
     fn import_specifier_has_runtime_use(&self, specifier: NodeId) -> bool {
-        let Some(NodeData::ImportSpecifier(specifier)) =
+        let Some(NodeData::ImportSpecifier(data)) =
             self.arena.get(specifier).map(|node| &node.data)
         else {
             return true;
         };
-        if specifier.is_type_only {
+        if data.is_type_only {
             return false;
         }
-        self.identifier_text(specifier.name).is_ok_and(|name| {
+        self.identifier_text(data.name).is_ok_and(|name| {
             self.import_name_has_non_erased_runtime_reference(name)
+                || (import_name_is_reexported(self.arena, name)
+                    && self
+                        .containing_import_declaration(specifier)
+                        .is_some_and(|import| self.import_semantically_has_runtime_value(import)))
                 || (self.import_runtime_meanings.is_empty()
                     && !self.import_name_has_reference_outside_import(name))
         })
@@ -35725,6 +35735,19 @@ class Board {
     }
 
     #[test]
+    fn preserves_arbitrary_module_names_in_runtime_reexports() {
+        assert_eq!(
+            emit_with(
+                "import { \"0n\" as foo } from './foo'; export { foo as \"0n\" };",
+                ScriptTarget::EsNext,
+                ModuleKind::EsNext,
+            )
+            .code,
+            "import { \"0n\" as foo } from './foo';\nexport { foo as \"0n\" };\n"
+        );
+    }
+
+    #[test]
     fn emits_import_star_helpers_once_for_commonjs_namespace_imports() {
         let result = emit_with(
             "import * as first from 'first'; import * as second from 'second'; first.read(second);",
@@ -36299,6 +36322,13 @@ class Board {
             output.contains("export declare const number = 100;"),
             "{output}"
         );
+    }
+
+    #[test]
+    fn declaration_bigint_literal_ignores_const_assertion_words_in_comments() {
+        let output =
+            emit_declarations_with_semantics("const w = 12n; // should emit as const w = 12n\n");
+        assert_eq!(output, "declare const w = 12n;\n");
     }
 
     #[test]

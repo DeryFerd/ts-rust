@@ -891,7 +891,8 @@ impl<'a> ProgramChecker<'a> {
                         continue;
                     };
                     let imported_name = specifier.property_name.unwrap_or(specifier.name);
-                    let Some(imported_name) = identifier_text(source.arena, imported_name) else {
+                    let Some(imported_name) = module_export_name_text(source.arena, imported_name)
+                    else {
                         continue;
                     };
                     let Some(local_name) = identifier_text(source.arena, specifier.name) else {
@@ -1010,10 +1011,11 @@ impl<'a> ProgramChecker<'a> {
                         continue;
                     };
                     let local = specifier.property_name.unwrap_or(specifier.name);
-                    let Some(local) = identifier_text(source.arena, local) else {
+                    let Some(local) = module_export_name_text(source.arena, local) else {
                         continue;
                     };
-                    let Some(exported) = identifier_text(source.arena, specifier.name) else {
+                    let Some(exported) = module_export_name_text(source.arena, specifier.name)
+                    else {
                         continue;
                     };
                     if let Some(descriptor) = direct
@@ -1186,7 +1188,8 @@ impl<'a> ProgramChecker<'a> {
                                     return false;
                                 }
                                 let imported = import.property_name.unwrap_or(import.name);
-                                let Some(name) = identifier_text(source.arena, imported) else {
+                                let Some(name) = module_export_name_text(source.arena, imported)
+                                else {
                                     return false;
                                 };
                                 self.module_export_has_runtime_value(
@@ -1249,7 +1252,7 @@ impl<'a> ProgramChecker<'a> {
                         return false;
                     }
                     let imported = specifier.property_name.unwrap_or(specifier.name);
-                    let Some(name) = identifier_text(source.arena, imported) else {
+                    let Some(name) = module_export_name_text(source.arena, imported) else {
                         return false;
                     };
                     self.module_export_name_has_runtime_value(target, name, &mut HashSet::new())
@@ -1446,7 +1449,7 @@ impl<'a> ProgramChecker<'a> {
                 NodeData::ImportSpecifier(specifier) => {
                     let imported = specifier.property_name.unwrap_or(specifier.name);
                     (
-                        identifier_text(source.arena, imported).map(str::to_owned),
+                        module_export_name_text(source.arena, imported).map(str::to_owned),
                         false,
                         specifier.is_type_only,
                     )
@@ -1790,7 +1793,8 @@ impl<'a> ProgramChecker<'a> {
                     let imported_node = import_specifier
                         .property_name
                         .unwrap_or(import_specifier.name);
-                    let Some(imported_name) = identifier_text(source.arena, imported_node) else {
+                    let Some(imported_name) = module_export_name_text(source.arena, imported_node)
+                    else {
                         continue;
                     };
                     let Some(symbol) = source.bindings.node_symbols.get(&import_specifier.name)
@@ -15014,6 +15018,10 @@ fn identifier_text(arena: &NodeArena, node: NodeId) -> Option<&str> {
     }
 }
 
+fn module_export_name_text(arena: &NodeArena, node: NodeId) -> Option<&str> {
+    identifier_text(arena, node).or_else(|| string_literal_text(arena, node))
+}
+
 fn jsdoc_tag_type_and_remainder(tag: &str) -> Option<(&str, &str)> {
     let tag = tag.trim_start();
     if let Some(tag) = tag.strip_prefix('{') {
@@ -19493,6 +19501,51 @@ mod tests {
         for statement in &source.statements.nodes[4..] {
             assert_eq!(meanings.get(statement), Some(&false), "{statement:?}");
         }
+    }
+
+    #[test]
+    fn arbitrary_module_export_names_keep_runtime_imports() {
+        let dependency = parse_source_file("const foo = 0n; export { foo as \"0n\" };");
+        let consumer = parse_source_file("import { \"0n\" as foo } from './dep'; foo;");
+        let dependency_bindings = bind_source_file(&dependency.arena, dependency.source_file);
+        let consumer_bindings = bind_source_file(&consumer.arena, consumer.source_file);
+        let no_modules = BTreeMap::new();
+        let consumer_modules = BTreeMap::from([("./dep".into(), 0)]);
+        let checked = check_program(&[
+            ProgramSource {
+                arena: &dependency.arena,
+                source_file: dependency.source_file,
+                bindings: &dependency_bindings,
+                resolved_modules: &no_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+            ProgramSource {
+                arena: &consumer.arena,
+                source_file: consumer.source_file,
+                bindings: &consumer_bindings,
+                resolved_modules: &consumer_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+        ]);
+        assert!(
+            checked.files[1].diagnostics.is_empty(),
+            "{:?}",
+            checked.files[1].diagnostics
+        );
+        let NodeData::SourceFile(source) = &consumer.arena.get(consumer.source_file).unwrap().data
+        else {
+            panic!("expected source file");
+        };
+        assert_eq!(
+            checked.files[1]
+                .import_runtime_meanings
+                .get(&source.statements.nodes[0]),
+            Some(&true)
+        );
     }
 
     #[test]
