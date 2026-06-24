@@ -8072,6 +8072,110 @@ mod tests {
     }
 
     #[test]
+    fn declaration_emit_preserves_cross_file_import_type_wrapper() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/box.d.ts",
+            "export declare class Box<T> { value: T; }",
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/boxed.d.ts",
+            concat!(
+                "export declare const boxed: import(\"./box\").Box<{\n",
+                "    nested: import(\"./box\").Box<number>;\n",
+                "}>;",
+            ),
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/main.ts",
+            "import { boxed } from './boxed'; export const value = boxed;",
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["main.ts".to_owned()],
+            CompilerOptions {
+                declaration: true,
+                no_lib: true,
+                module: ModuleKind::CommonJs,
+                strict: true,
+                ..CompilerOptions::default()
+            },
+        );
+        let emitted = program.emit();
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        let declaration = emitted
+            .files
+            .iter()
+            .find(|file| file.file_name == "/project/main.d.ts")
+            .unwrap();
+        assert!(
+            declaration.text.contains(concat!(
+                "export declare const value: import(\"./box\").Box<{\n",
+                "    nested: import(\"./box\").Box<number>;\n",
+                "}>;",
+            )),
+            "{}",
+            declaration.text
+        );
+    }
+
+    #[test]
+    fn declaration_emit_preserves_nested_optional_alias_parameters_across_files() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/a.ts",
+            concat!(
+                "export type X = string; ",
+                "export const fn = { o: (a?: (X | undefined)[]) => {} };",
+            ),
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/b.ts",
+            "import { fn } from './a'; export const value = { fn };",
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["a.ts".to_owned(), "b.ts".to_owned()],
+            CompilerOptions {
+                declaration: true,
+                no_lib: true,
+                module: ModuleKind::CommonJs,
+                ..CompilerOptions::default()
+            },
+        );
+        let emitted = program.emit();
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        let a = emitted
+            .files
+            .iter()
+            .find(|file| file.file_name == "/project/a.d.ts")
+            .unwrap();
+        let b = emitted
+            .files
+            .iter()
+            .find(|file| file.file_name == "/project/b.d.ts")
+            .unwrap();
+        assert!(
+            a.text.contains("o: (a?: (X | undefined)[]) => void;"),
+            "{}",
+            a.text
+        );
+        assert!(
+            b.text
+                .contains("o: (a?: (import(\"./a\").X | undefined)[]) => void;"),
+            "{}",
+            b.text
+        );
+    }
+
+    #[test]
     fn resolves_non_relative_imports_from_base_url() {
         let fs = MemoryFileSystem::new(true);
         fs.write_file("/proj/defs/cc.ts", "export const enum CharCode { A, B }")

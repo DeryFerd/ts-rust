@@ -1954,8 +1954,7 @@ impl DeclarationPrinter<'_> {
                     .replace("\r\n", "\n")
                     .replace('\r', "\n"),
             );
-            self.writer.write(" ");
-            self.writer.newline_preserving_trailing_spaces();
+            self.writer.newline();
             cursor = comment_end;
         }
     }
@@ -11175,6 +11174,22 @@ impl DeclarationPrinter<'_> {
                     }
                     unique.push(member);
                 }
+                if unique.iter().any(|member| {
+                    self.named_type_references
+                        .is_some_and(|references| references.contains_key(member))
+                }) {
+                    unique.sort_by_key(|member| {
+                        match self
+                            .semantic_types
+                            .and_then(|types| types.get(*member))
+                            .map(|type_| &type_.kind)
+                        {
+                            Some(TypeKind::Null) => 1,
+                            Some(TypeKind::Undefined) => 2,
+                            _ => 0,
+                        }
+                    });
+                }
                 if unique.len() == 2
                     && matches!(
                         self.semantic_types
@@ -11585,19 +11600,21 @@ impl DeclarationPrinter<'_> {
             if index != 0 {
                 self.writer.write(", ");
             }
-            let rest = signature.parameters.len() == 1
+            let inferred_rest = signature.parameters.len() == 1
+                && (signature.parameter_names.is_empty()
+                    || signature.parameter_names.as_slice() == ["args"])
                 && matches!(
                     self.semantic_types
                         .and_then(|types| types.get(*parameter))
                         .map(|type_| &type_.kind),
                     Some(TypeKind::Array(_))
                 );
-            if rest {
+            if inferred_rest {
                 self.writer.write("...");
             }
             if let Some(name) = parameter_names.and_then(|names| names.get(index)) {
                 self.writer.write(name);
-            } else if rest {
+            } else if inferred_rest {
                 self.writer.write("args");
             } else {
                 self.writer.write("arg");
@@ -11609,6 +11626,13 @@ impl DeclarationPrinter<'_> {
             }
             self.writer.write(": ");
             self.emit_semantic_parameter_type(*parameter, optional)?;
+        }
+        if let Some(rest) = signature.rest_parameter {
+            if !signature.parameters.is_empty() {
+                self.writer.write(", ");
+            }
+            self.writer.write("...args: ");
+            self.emit_semantic_type(rest)?;
         }
         Ok(())
     }
@@ -39370,6 +39394,16 @@ class Board {
         )
         .code;
         assert_eq!(output, "var value = \n/// initializer docs\n1;\n");
+    }
+
+    #[test]
+    fn declaration_trailing_jsdoc_has_no_synthetic_space() {
+        let declarations =
+            emit_declarations_with_semantics("export let value = 1;\n/**\n * trailing\n */");
+        assert_eq!(
+            declarations,
+            "export declare let value: number;\n/**\n * trailing\n */\n"
+        );
     }
 
     #[test]

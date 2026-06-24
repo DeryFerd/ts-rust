@@ -7962,7 +7962,16 @@ impl<'a> Checker<'a> {
                 .collect(),
             rest_parameter: None,
             return_type,
-            parameters_optional: self.options.is_javascript_file,
+            parameters_optional: self.options.is_javascript_file
+                || (!data.parameters.nodes.is_empty()
+                    && data.parameters.nodes.iter().all(|parameter| {
+                        matches!(
+                            self.arena.get(*parameter).map(|node| &node.data),
+                            Some(NodeData::ParameterDeclaration(parameter))
+                                if parameter.question_token.is_some()
+                                    || parameter.initializer.is_some()
+                        )
+                    })),
         }));
         if !generic_parameters.is_empty() {
             let mut encoded = Vec::with_capacity(generic_parameters.len());
@@ -8087,7 +8096,16 @@ impl<'a> Checker<'a> {
                 .collect(),
             rest_parameter: None,
             return_type,
-            parameters_optional: self.options.is_javascript_file,
+            parameters_optional: self.options.is_javascript_file
+                || (!data.parameters.nodes.is_empty()
+                    && data.parameters.nodes.iter().all(|parameter| {
+                        matches!(
+                            self.arena.get(*parameter).map(|node| &node.data),
+                            Some(NodeData::ParameterDeclaration(parameter))
+                                if parameter.question_token.is_some()
+                                    || parameter.initializer.is_some()
+                        )
+                    })),
         }));
         self.apply_javascript_signature_metadata(
             node_id,
@@ -10894,15 +10912,27 @@ impl<'a> Checker<'a> {
                     && !indexed_mapped_alias
                     && !structurally_serialized_alias
                     && self.named_type_arguments_are_resolved_or_in_scope(&arguments)
-                    && let Some(
-                        kind @ (TypeKind::Object(_)
-                        | TypeKind::Union(_)
-                        | TypeKind::Intersection(_)),
-                    ) = self
+                    && let Some(kind) = self
                         .result
                         .types
                         .get(type_id)
                         .map(|type_| type_.kind.clone())
+                    && (matches!(
+                        kind,
+                        TypeKind::Object(_) | TypeKind::Union(_) | TypeKind::Intersection(_)
+                    ) || symbol.is_some_and(|symbol_id| {
+                        self.bindings.symbols.get(symbol_id).is_some_and(|symbol| {
+                            symbol.flags.contains(ts_binder::SymbolFlags::TYPE_ALIAS)
+                        }) && self.bindings.exports.iter().any(|(_, exported)| {
+                            exported == symbol_id
+                                || self
+                                    .bindings
+                                    .symbols
+                                    .get(exported)
+                                    .and_then(|exported| exported.target)
+                                    == Some(symbol_id)
+                        })
+                    }))
                 {
                     let referenced_type = self.result.types.alloc(kind);
                     if let Some(reference) =
@@ -14469,14 +14499,6 @@ fn describe_type_node_syntax(
                 })
                 .unwrap_or_default();
             let qualifier = qualifier.unwrap_or_default();
-            if let [(argument_target, argument @ TypeDescriptor::Object { properties, .. })] =
-                type_arguments.as_slice()
-                && !properties.is_empty()
-                && (semantic_target == *argument_target
-                    || matches!(semantic_target, TypeDescriptor::Unknown))
-            {
-                return argument.clone();
-            }
             let type_arguments = type_arguments
                 .into_iter()
                 .map(|(_, described)| described)
