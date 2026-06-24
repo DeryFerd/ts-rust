@@ -17,8 +17,8 @@ use ts_ast::{
     ImportAttributeData, ImportAttributesData, ImportClauseData, ImportDeclarationData,
     ImportEqualsDeclarationData, ImportSpecifierData, ImportTypeNodeData,
     IndexSignatureDeclarationData, IndexedAccessTypeNodeData, InferTypeNodeData,
-    InterfaceDeclarationData, IntersectionTypeNodeData, JsDocData, JsDocTextData,
-    JsDocUnknownTagData, JsxAttributeData, JsxAttributesData, JsxClosingElementData,
+    InterfaceDeclarationData, IntersectionTypeNodeData, JsDocData, JsDocNullableTypeData,
+    JsDocTextData, JsDocUnknownTagData, JsxAttributeData, JsxAttributesData, JsxClosingElementData,
     JsxClosingFragmentData, JsxElementData, JsxExpressionData, JsxFragmentData,
     JsxOpeningElementData, JsxOpeningFragmentData, JsxSelfClosingElementData,
     JsxSpreadAttributeData, JsxTextData, KeywordExpressionData, KeywordTypeNodeData,
@@ -545,7 +545,11 @@ impl<'a> Parser<'a> {
         let abstract_starts_expression = self.current.kind == SyntaxKind::AbstractKeyword
             && self.next_token_preceded_by_line_break();
         let declare_starts_expression = self.current.kind == SyntaxKind::DeclareKeyword
-            && self.next_token_kind() == SyntaxKind::InstanceOfKeyword;
+            && (self.next_token_kind() == SyntaxKind::InstanceOfKeyword
+                || self.next_tokens_are(
+                    SyntaxKind::ModuleKeyword,
+                    SyntaxKind::OpenBraceToken,
+                ));
         let async_starts_function = self.current.kind == SyntaxKind::AsyncKeyword
             && !self.next_token_preceded_by_line_break()
             && self.next_token_kind() == SyntaxKind::FunctionKeyword;
@@ -878,6 +882,13 @@ impl<'a> Parser<'a> {
         let kind = self.scanner.scan().kind;
         self.scanner.rewind(checkpoint);
         kind
+    }
+
+    fn next_tokens_are(&mut self, first: SyntaxKind, second: SyntaxKind) -> bool {
+        let checkpoint = self.scanner.mark();
+        let matches = self.scanner.scan().kind == first && self.scanner.scan().kind == second;
+        self.scanner.rewind(checkpoint);
+        matches
     }
 
     fn next_token_preceded_by_line_break(&mut self) -> bool {
@@ -6577,7 +6588,28 @@ impl<'a> Parser<'a> {
             );
         }
         let mut type_node = self.parse_primary_type();
-        while self.current.kind == SyntaxKind::OpenBracketToken {
+        loop {
+            if self.current.kind == SyntaxKind::QuestionToken
+                && !self
+                    .current
+                    .flags
+                    .contains(ScannerTokenFlags::PRECEDING_LINE_BREAK)
+                && !self.next_token_starts_type()
+            {
+                let end = self.consume().range.end;
+                type_node = self.alloc_node(
+                    SyntaxKind::JsDocNullableType,
+                    TextRange::new(self.node_start(type_node), end),
+                    NodeData::JsDocNullableType(Box::new(JsDocNullableTypeData {
+                        type_: type_node,
+                    })),
+                    &[type_node],
+                );
+                continue;
+            }
+            if self.current.kind != SyntaxKind::OpenBracketToken {
+                break;
+            }
             self.bump();
             if self.current.kind == SyntaxKind::CloseBracketToken {
                 let end = self.consume().range.end;
@@ -6589,26 +6621,46 @@ impl<'a> Parser<'a> {
                     })),
                     &[type_node],
                 );
-            } else {
-                let index_type = self.parse_type();
-                let end = if self.current.kind == SyntaxKind::CloseBracketToken {
-                    self.consume().range.end
-                } else {
-                    self.error_current("Expected ']'.");
-                    self.node_end(index_type)
-                };
-                type_node = self.alloc_node(
-                    SyntaxKind::IndexedAccessType,
-                    TextRange::new(self.node_start(type_node), end),
-                    NodeData::IndexedAccessTypeNode(Box::new(IndexedAccessTypeNodeData {
-                        index_type,
-                        object_type: type_node,
-                    })),
-                    &[type_node, index_type],
-                );
+                continue;
             }
+            let index_type = self.parse_type();
+            let end = if self.current.kind == SyntaxKind::CloseBracketToken {
+                self.consume().range.end
+            } else {
+                self.error_current("Expected ']'.");
+                self.node_end(index_type)
+            };
+            type_node = self.alloc_node(
+                SyntaxKind::IndexedAccessType,
+                TextRange::new(self.node_start(type_node), end),
+                NodeData::IndexedAccessTypeNode(Box::new(IndexedAccessTypeNodeData {
+                    index_type,
+                    object_type: type_node,
+                })),
+                &[type_node, index_type],
+            );
         }
         type_node
+    }
+
+    fn next_token_starts_type(&mut self) -> bool {
+        let checkpoint = self.scanner.mark();
+        let kind = self.scanner.scan().kind;
+        self.scanner.rewind(checkpoint);
+        is_type_start_kind(kind)
+    }
+
+    fn parse_jsdoc_nullable_type(&mut self) -> NodeId {
+        let start = self.consume().range.start;
+        let type_node = self.parse_type_operator_or_postfix();
+        self.alloc_node(
+            SyntaxKind::JsDocNullableType,
+            TextRange::new(start, self.node_end(type_node)),
+            NodeData::JsDocNullableType(Box::new(JsDocNullableTypeData {
+                type_: type_node,
+            })),
+            &[type_node],
+        )
     }
 
     #[allow(clippy::too_many_lines)]
@@ -6617,6 +6669,7 @@ impl<'a> Parser<'a> {
             && self.is_parenthesized_function_type();
         let mapped_type = self.current.kind == SyntaxKind::OpenBraceToken && self.is_mapped_type();
         match self.current.kind {
+            SyntaxKind::QuestionToken => self.parse_jsdoc_nullable_type(),
             SyntaxKind::OpenBraceToken if mapped_type => self.parse_mapped_type(),
             SyntaxKind::OpenBraceToken => {
                 let members = self.parse_class_members(true);
@@ -7578,6 +7631,37 @@ fn is_keyword_type(kind: SyntaxKind) -> bool {
             | SyntaxKind::UnknownKeyword
             | SyntaxKind::VoidKeyword
     )
+}
+
+fn is_type_start_kind(kind: SyntaxKind) -> bool {
+    kind == SyntaxKind::Identifier
+        || is_keyword_type(kind)
+        || matches!(
+            kind,
+            SyntaxKind::ThisKeyword
+                | SyntaxKind::TypeOfKeyword
+                | SyntaxKind::ImportKeyword
+                | SyntaxKind::NewKeyword
+                | SyntaxKind::AbstractKeyword
+                | SyntaxKind::InferKeyword
+                | SyntaxKind::KeyOfKeyword
+                | SyntaxKind::ReadonlyKeyword
+                | SyntaxKind::UniqueKeyword
+                | SyntaxKind::OpenBraceToken
+                | SyntaxKind::OpenBracketToken
+                | SyntaxKind::OpenParenToken
+                | SyntaxKind::LessThanToken
+                | SyntaxKind::TemplateHead
+                | SyntaxKind::StringLiteral
+                | SyntaxKind::NumericLiteral
+                | SyntaxKind::BigIntLiteral
+                | SyntaxKind::NoSubstitutionTemplateLiteral
+                | SyntaxKind::TrueKeyword
+                | SyntaxKind::FalseKeyword
+                | SyntaxKind::NullKeyword
+                | SyntaxKind::MinusToken
+                | SyntaxKind::QuestionToken
+        )
 }
 
 fn binary_precedence(kind: SyntaxKind) -> Option<(u8, bool)> {

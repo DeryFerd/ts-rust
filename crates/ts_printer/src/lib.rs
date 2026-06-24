@@ -725,7 +725,10 @@ pub fn emit_source_file_with_context(
     } else {
         Vec::new()
     };
-    if !printer.private_field_plans.is_empty() && !settings.no_emit_helpers {
+    if !printer.private_field_plans.is_empty()
+        && source_has_private_field_access(arena)
+        && !settings.no_emit_helpers
+    {
         printer.emit_private_field_helpers();
     }
     if !auto_accessor_storages.is_empty() {
@@ -1224,6 +1227,18 @@ fn source_has_dynamic_import(arena: &NodeArena) -> bool {
         matches!(
             arena.get(call.expression).map(|node| &node.data),
             Some(NodeData::Identifier(identifier)) if identifier.text == "import"
+        )
+    })
+}
+
+fn source_has_private_field_access(arena: &NodeArena) -> bool {
+    arena.iter().any(|(_, node)| {
+        let NodeData::PropertyAccessExpression(access) = &node.data else {
+            return false;
+        };
+        matches!(
+            arena.get(access.name).map(|node| &node.data),
+            Some(NodeData::PrivateIdentifier(_))
         )
     })
 }
@@ -16213,6 +16228,10 @@ impl DeclarationPrinter<'_> {
                 self.emit_type(data.type_)?;
                 self.writer.write("?");
             }
+            NodeData::JsDocNullableType(data) => {
+                self.writer.write("?");
+                self.emit_type(data.type_)?;
+            }
             NodeData::RestTypeNode(data) => {
                 self.writer.write("...");
                 self.emit_type(data.type_)?;
@@ -19388,6 +19407,13 @@ struct PrivateDestructuringRewrite {
     receiver_temp: String,
     value_temp: String,
     storage: String,
+}
+
+type ParameterNameOverride = (NodeId, NodeId, String);
+
+struct DownlevelAsyncParameterPlan {
+    outer_parameters: NodeList,
+    overrides: Vec<ParameterNameOverride>,
 }
 
 #[derive(Clone)]
@@ -23225,6 +23251,10 @@ impl Printer<'_> {
                 } else {
                     Vec::new()
                 };
+                let downlevel_async_parameters = (downlevel_async
+                    && self.settings.target >= ScriptTarget::Es2015)
+                    .then(|| self.downlevel_async_parameter_plan(&data.parameters, id))
+                    .flatten();
                 if !downlevel_async && !downlevel_async_generator && is_async {
                     self.writer.write("async ");
                 }
@@ -23258,7 +23288,13 @@ impl Printer<'_> {
                                 if parameter.initializer.is_some()
                         )
                     });
-                if !downlevel_binding_parameters.is_empty() {
+                if let Some(plan) = &downlevel_async_parameters {
+                    self.emit_parameters_with_name_overrides(
+                        &plan.outer_parameters,
+                        false,
+                        &plan.overrides,
+                    )?;
+                } else if !downlevel_binding_parameters.is_empty() {
                     self.emit_parameters_with_name_overrides(
                         &data.parameters,
                         false,
@@ -23273,9 +23309,12 @@ impl Printer<'_> {
                 }
                 self.writer.write(" ");
                 if downlevel_async {
-                    self.emit_downlevel_async_function_body(
+                    self.emit_downlevel_async_function_body_with_parameters(
                         data.body.expect("body checked above"),
                         "this",
+                        downlevel_async_parameters
+                            .as_ref()
+                            .map(|_| &data.parameters),
                     )?;
                 } else if downlevel_async_generator {
                     let inner_name = self
@@ -26323,7 +26362,7 @@ impl Printer<'_> {
         &self,
         parameters: &NodeList,
         function: NodeId,
-    ) -> Vec<(NodeId, NodeId, String)> {
+    ) -> Vec<ParameterNameOverride> {
         let mut claimed = HashSet::new();
         let mut result = Vec::new();
         for parameter_id in &parameters.nodes {
@@ -26352,6 +26391,53 @@ impl Printer<'_> {
             result.push((*parameter_id, parameter.name, temp));
         }
         result
+    }
+
+    fn downlevel_async_parameter_plan(
+        &self,
+        parameters: &NodeList,
+        function: NodeId,
+    ) -> Option<DownlevelAsyncParameterPlan> {
+        let non_simple = parameters.nodes.iter().any(|parameter| {
+            matches!(
+                self.arena.get(*parameter).map(|node| &node.data),
+                Some(NodeData::ParameterDeclaration(parameter))
+                    if parameter.initializer.is_some()
+                        || parameter.dot_dot_dot_token.is_some()
+                        || matches!(
+                            self.arena.get(parameter.name).map(|node| &node.data),
+                            Some(NodeData::BindingPattern(_))
+                        )
+            )
+        });
+        if !non_simple {
+            return None;
+        }
+        let mut outer = parameters.clone();
+        outer.nodes.clear();
+        let mut claimed = HashSet::new();
+        let mut overrides = Vec::new();
+        for parameter_id in &parameters.nodes {
+            let Some(NodeData::ParameterDeclaration(parameter)) =
+                self.arena.get(*parameter_id).map(|node| &node.data)
+            else {
+                continue;
+            };
+            if self.identifier_text(parameter.name).ok() == Some("this") {
+                continue;
+            }
+            if parameter.initializer.is_some() || parameter.dot_dot_dot_token.is_some() {
+                break;
+            }
+            let temp = self.generate_block_temp(function, &claimed);
+            claimed.insert(temp.clone());
+            outer.nodes.push(*parameter_id);
+            overrides.push((*parameter_id, parameter.name, temp));
+        }
+        Some(DownlevelAsyncParameterPlan {
+            outer_parameters: outer,
+            overrides,
+        })
     }
 
     fn emit_function_body_with_binding_parameters(
@@ -26751,6 +26837,15 @@ impl Printer<'_> {
         body: NodeId,
         this_argument: &str,
     ) -> Result<(), EmitError> {
+        self.emit_downlevel_async_function_body_with_parameters(body, this_argument, None)
+    }
+
+    fn emit_downlevel_async_function_body_with_parameters(
+        &mut self,
+        body: NodeId,
+        this_argument: &str,
+        parameters: Option<&NodeList>,
+    ) -> Result<(), EmitError> {
         if self.settings.target < ScriptTarget::Es2015 {
             return self.emit_es5_async_function_body(
                 body,
@@ -26766,7 +26861,7 @@ impl Printer<'_> {
         self.writer.newline();
         self.writer.indent += 1;
         self.writer.write("return ");
-        self.emit_awaiter_call(body, None, this_argument)?;
+        self.emit_awaiter_call_with_parameters(body, None, this_argument, parameters)?;
         self.writer.write(";");
         self.writer.newline();
         self.writer.indent -= 1;
@@ -34390,20 +34485,43 @@ impl Printer<'_> {
         expression_body: Option<NodeId>,
         this_argument: &str,
     ) -> Result<(), EmitError> {
+        self.emit_awaiter_call_with_parameters(body, expression_body, this_argument, None)
+    }
+
+    fn emit_awaiter_call_with_parameters(
+        &mut self,
+        body: NodeId,
+        expression_body: Option<NodeId>,
+        this_argument: &str,
+        parameters: Option<&NodeList>,
+    ) -> Result<(), EmitError> {
         self.emit_awaiter_reference();
         self.writer.write("(");
         self.writer.write(this_argument);
-        self.writer.write(", void 0, void 0, function* () ");
+        if parameters.is_some() {
+            self.writer.write(", arguments, void 0, function* ");
+        } else {
+            self.writer.write(", void 0, void 0, function* ");
+        }
         let previous = self.async_expression_transform;
         self.async_expression_transform = AsyncExpressionTransform::AwaitAsYield;
-        let result = if let Some(expression) = expression_body {
-            self.writer.write("{ return ");
-            self.emit_expression(expression, 0)?;
-            self.writer.write("; }");
+        let result = parameters.map_or(Ok(()), |parameters| {
+            self.emit_parameters(parameters)?;
+            self.writer.write(" ");
             Ok(())
-        } else {
-            self.emit_function_body(body)
-        };
+        }).and_then(|()| {
+            if parameters.is_none() {
+                self.writer.write("() ");
+            }
+            if let Some(expression) = expression_body {
+                self.writer.write("{ return ");
+                self.emit_expression(expression, 0)?;
+                self.writer.write("; }");
+                Ok(())
+            } else {
+                self.emit_function_body(body)
+            }
+        });
         self.async_expression_transform = previous;
         result?;
         self.writer.write(")");
@@ -35584,7 +35702,7 @@ impl Printer<'_> {
         &mut self,
         parameters: &NodeList,
         emit_initializers: bool,
-        overrides: &[(NodeId, NodeId, String)],
+        overrides: &[ParameterNameOverride],
     ) -> Result<(), EmitError> {
         self.writer.write("(");
         let emitted_parameters = parameters
@@ -42713,9 +42831,24 @@ impl Printer<'_> {
                 self.writer.write("]");
             }
             NodeData::ExpressionWithTypeArguments(data) => {
-                self.writer.write("(");
-                self.emit_expression(data.expression, 0)?;
-                self.writer.write(")");
+                self.emit_expression(data.expression, parent_precedence)?;
+                if let Some(arguments) = &data.type_arguments
+                    && arguments.nodes.iter().any(|argument| {
+                        matches!(
+                            self.arena.get(*argument).map(|node| &node.data),
+                            Some(NodeData::JsDocNullableType(_))
+                        )
+                    })
+                {
+                    self.writer.write("<");
+                    for (index, argument) in arguments.nodes.iter().enumerate() {
+                        if index != 0 {
+                            self.writer.write(", ");
+                        }
+                        self.emit_jsdoc_recovery_type(*argument)?;
+                    }
+                    self.writer.write(">");
+                }
             }
             NodeData::ParenthesizedExpression(data) => {
                 let erases_to_inner_expression = matches!(
@@ -43936,6 +44069,20 @@ impl Printer<'_> {
             NodeData::JsxSelfClosingElement(data) => self.emit_jsx_self_closing(data)?,
             NodeData::JsxFragment(data) => self.emit_jsx_fragment(data)?,
             _ => return Err(Self::unsupported(id, node.kind)),
+        }
+        Ok(())
+    }
+
+    fn emit_jsdoc_recovery_type(&mut self, id: NodeId) -> Result<(), EmitError> {
+        let node = self.node(id)?.clone();
+        match &node.data {
+            NodeData::JsDocNullableType(data) => {
+                self.writer.write("?");
+                self.emit_jsdoc_recovery_type(data.type_)?;
+            }
+            NodeData::KeywordTypeNode(_) => self.writer.write(keyword_type_text(node.kind)),
+            NodeData::TypeReferenceNode(data) => self.emit_expression(data.type_name, 0)?,
+            _ => self.emit_expression(id, 0)?,
         }
         Ok(())
     }
