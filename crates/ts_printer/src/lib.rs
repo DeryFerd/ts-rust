@@ -43358,8 +43358,19 @@ impl Printer<'_> {
                         NodeData::Identifier(identifier) if identifier.text.is_empty()
                     );
                     if break_before_dot {
+                        let dot = self
+                            .source_punctuation_between(expression_end, name_start, b'.')
+                            .unwrap_or(expression_end);
+                        self.emit_source_comments_between_with_ownership(
+                            expression_end,
+                            dot,
+                            true,
+                            false,
+                        );
                         self.writer.indent += 1;
-                        self.writer.newline();
+                        if !self.writer.line_start {
+                            self.writer.newline();
+                        }
                     }
                     self.writer.write(if data.question_dot_token.is_some() {
                         "?."
