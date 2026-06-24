@@ -17597,6 +17597,15 @@ struct Es5GeneratorForOf {
     yielded: NodeId,
 }
 
+#[derive(Clone)]
+struct Es5GeneratorObjectLiteral {
+    target: NodeId,
+    properties: Vec<NodeId>,
+    suspended_property: usize,
+    key_yield: Option<NodeId>,
+    value_yield: Option<NodeId>,
+}
+
 #[derive(Clone, Copy)]
 enum Es5AsyncLoopControl {
     None,
@@ -24951,9 +24960,92 @@ impl Printer<'_> {
         }))
     }
 
+    fn es5_generator_object_literal(&self, body: NodeId) -> Option<Es5GeneratorObjectLiteral> {
+        let NodeData::Block(block) = &self.arena.get(body)?.data else {
+            return None;
+        };
+        let [statement] = block.statements.nodes.as_slice() else {
+            return None;
+        };
+        let NodeData::VariableStatement(statement) = &self.arena.get(*statement)?.data else {
+            return None;
+        };
+        let NodeData::VariableDeclarationList(list) =
+            &self.arena.get(statement.declaration_list)?.data
+        else {
+            return None;
+        };
+        let [declaration] = list.declarations.nodes.as_slice() else {
+            return None;
+        };
+        let NodeData::VariableDeclaration(declaration) = &self.arena.get(*declaration)?.data else {
+            return None;
+        };
+        if !matches!(
+            self.arena.get(declaration.name).map(|node| &node.data),
+            Some(NodeData::Identifier(_))
+        ) {
+            return None;
+        }
+        let initializer = declaration.initializer?;
+        let NodeData::ObjectLiteralExpression(object) = &self.arena.get(initializer)?.data else {
+            return None;
+        };
+
+        let mut suspended = Vec::new();
+        let mut direct_yields = HashSet::new();
+        for (index, property) in object.properties.nodes.iter().enumerate() {
+            let NodeData::PropertyAssignment(property) = &self.arena.get(*property)?.data else {
+                return None;
+            };
+            let key_yield = match &self.arena.get(property.name)?.data {
+                NodeData::ComputedPropertyName(computed)
+                    if matches!(
+                        self.arena.get(computed.expression).map(|node| &node.data),
+                        Some(NodeData::YieldExpression(_))
+                    ) => Some(computed.expression),
+                _ => None,
+            };
+            let value_yield = matches!(
+                self.arena.get(property.initializer).map(|node| &node.data),
+                Some(NodeData::YieldExpression(_))
+            )
+            .then_some(property.initializer);
+            if let Some(yield_) = key_yield {
+                direct_yields.insert(yield_);
+            }
+            if let Some(yield_) = value_yield {
+                direct_yields.insert(yield_);
+            }
+            if key_yield.is_some() || value_yield.is_some() {
+                suspended.push((index, key_yield, value_yield));
+            }
+        }
+        let [(suspended_property, key_yield, value_yield)] = suspended.as_slice() else {
+            return None;
+        };
+        if self.arena.iter().any(|(id, node)| {
+            matches!(node.data, NodeData::YieldExpression(_))
+                && self.node_is_within(id, initializer)
+                && !direct_yields.contains(&id)
+        }) {
+            return None;
+        }
+        Some(Es5GeneratorObjectLiteral {
+            target: declaration.name,
+            properties: object.properties.nodes.clone(),
+            suspended_property: *suspended_property,
+            key_yield: *key_yield,
+            value_yield: *value_yield,
+        })
+    }
+
     fn emit_es5_generator_body(&mut self, body: NodeId) -> Result<(), EmitError> {
         if self.es5_generator_for_of(body)?.is_some() {
             return self.emit_es5_generator_for_of_body(body);
+        }
+        if let Some(plan) = self.es5_generator_object_literal(body) {
+            return self.emit_es5_generator_object_literal_body(body, &plan);
         }
         let node = self.node(body)?.clone();
         let NodeData::Block(block) = &node.data else {
@@ -24973,6 +25065,385 @@ impl Printer<'_> {
         self.writer.newline();
         self.writer.indent -= 1;
         self.writer.write("}");
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn emit_es5_generator_object_literal_body(
+        &mut self,
+        body: NodeId,
+        plan: &Es5GeneratorObjectLiteral,
+    ) -> Result<(), EmitError> {
+        let first_computed = plan
+            .properties
+            .iter()
+            .position(|property| self.es5_generator_object_property_is_computed(*property));
+        let computed_owns_prefix = first_computed
+            .is_some_and(|index| index <= plan.suspended_property);
+        let suspended_computed = self
+            .es5_generator_object_property_is_computed(plan.properties[plan.suspended_property]);
+
+        let mut claimed = HashSet::new();
+        let mut generator_hoists = Vec::new();
+        let generator_accumulator = if computed_owns_prefix {
+            None
+        } else {
+            let temp = self.generate_block_temp(body, &claimed);
+            claimed.insert(temp.clone());
+            generator_hoists.push(temp.clone());
+            Some(temp)
+        };
+        let key_temp = if suspended_computed && plan.value_yield.is_some() {
+            let temp = self.generate_block_temp(body, &claimed);
+            claimed.insert(temp.clone());
+            generator_hoists.push(temp.clone());
+            Some(temp)
+        } else {
+            None
+        };
+        let computed_accumulator = first_computed.map(|_| {
+            let temp = self.generate_block_temp(body, &claimed);
+            claimed.insert(temp.clone());
+            temp
+        });
+        let accumulator = if computed_owns_prefix {
+            computed_accumulator
+                .clone()
+                .expect("computed prefix requires an accumulator")
+        } else {
+            generator_accumulator
+                .clone()
+                .expect("suspended object requires an accumulator")
+        };
+        let state = self.generate_block_temp(body, &claimed);
+
+        self.writer.write("{");
+        self.writer.newline();
+        self.writer.indent += 1;
+        self.writer.write("var ");
+        self.emit_expression(plan.target, 0)?;
+        for temp in &generator_hoists {
+            self.writer.write(", ");
+            self.writer.write(temp);
+        }
+        self.writer.write(";");
+        self.writer.newline();
+        if let Some(computed) = &computed_accumulator {
+            self.writer.write("var ");
+            self.writer.write(computed);
+            self.writer.write(";");
+            self.writer.newline();
+        }
+        self.writer.write("return ");
+        self.emit_generator_reference();
+        self.writer.write("(this, function (");
+        self.writer.write(&state);
+        self.writer.write(") {");
+        self.writer.newline();
+        self.writer.indent += 1;
+        self.writer.write("switch (");
+        self.writer.write(&state);
+        self.writer.write(".label) {");
+        self.writer.newline();
+        self.writer.indent += 1;
+        self.writer.write("case 0:");
+        self.writer.newline();
+        self.writer.indent += 1;
+
+        self.emit_es5_generator_object_prefix(
+            plan,
+            &accumulator,
+            computed_owns_prefix,
+        )?;
+
+        let mut case = 0_usize;
+        if let Some(key_yield) = plan.key_yield {
+            let NodeData::YieldExpression(yielded) = self.node(key_yield)?.data.clone() else {
+                unreachable!("planned key yield must remain a yield expression");
+            };
+            self.emit_es5_generator_yield_opcode(&yielded)?;
+            self.emit_es5_generator_next_case(&mut case);
+            if let Some(value_yield) = plan.value_yield {
+                self.writer
+                    .write(key_temp.as_deref().expect("yielded key crossing yield needs temp"));
+                self.writer.write(" = ");
+                self.writer.write(&state);
+                self.writer.write(".sent();");
+                self.writer.newline();
+                let NodeData::YieldExpression(yielded) = self.node(value_yield)?.data.clone() else {
+                    unreachable!("planned value yield must remain a yield expression");
+                };
+                self.emit_es5_generator_yield_opcode(&yielded)?;
+                self.emit_es5_generator_next_case(&mut case);
+            }
+        } else if let Some(value_yield) = plan.value_yield {
+            if let Some(key_temp) = &key_temp {
+                let property = self.node(plan.properties[plan.suspended_property])?.clone();
+                let NodeData::PropertyAssignment(property) = &property.data else {
+                    unreachable!("planned object member must remain a property assignment");
+                };
+                let NodeData::ComputedPropertyName(computed) = self.node(property.name)?.data.clone()
+                else {
+                    unreachable!("planned computed key must remain computed");
+                };
+                self.writer.write(key_temp);
+                self.writer.write(" = ");
+                self.emit_expression(computed.expression, 1)?;
+                self.writer.write(";");
+                self.writer.newline();
+            }
+            let NodeData::YieldExpression(yielded) = self.node(value_yield)?.data.clone() else {
+                unreachable!("planned value yield must remain a yield expression");
+            };
+            self.emit_es5_generator_yield_opcode(&yielded)?;
+            self.emit_es5_generator_next_case(&mut case);
+        }
+
+        self.emit_es5_generator_object_finish(
+            plan,
+            &accumulator,
+            computed_accumulator.as_deref(),
+            key_temp.as_deref(),
+            &state,
+        )?;
+        self.writer.write("return [2 /*return*/];");
+        self.writer.newline();
+        self.writer.indent -= 2;
+        self.writer.write("}");
+        self.writer.newline();
+        self.writer.indent -= 1;
+        self.writer.write("});");
+        self.writer.newline();
+        self.writer.indent -= 1;
+        self.writer.write("}");
+        Ok(())
+    }
+
+    fn es5_generator_object_property_is_computed(&self, property: NodeId) -> bool {
+        let Some(NodeData::PropertyAssignment(property)) =
+            self.arena.get(property).map(|node| &node.data)
+        else {
+            return false;
+        };
+        matches!(
+            self.arena.get(property.name).map(|node| &node.data),
+            Some(NodeData::ComputedPropertyName(_))
+        )
+    }
+
+    fn emit_es5_generator_object_prefix(
+        &mut self,
+        plan: &Es5GeneratorObjectLiteral,
+        accumulator: &str,
+        computed_style: bool,
+    ) -> Result<(), EmitError> {
+        let prefix = &plan.properties[..plan.suspended_property];
+        let literal_end = prefix
+            .iter()
+            .position(|property| self.es5_generator_object_property_is_computed(*property))
+            .unwrap_or(prefix.len());
+
+        self.writer.write(accumulator);
+        self.writer.write(" = ");
+        if computed_style {
+            self.writer.indent += 1;
+        }
+        if literal_end == 0 {
+            self.writer.write("{}");
+        } else {
+            self.writer.write("{");
+            self.writer.indent += 1;
+            self.writer.newline();
+            for (index, property) in prefix[..literal_end].iter().enumerate() {
+                if index != 0 {
+                    self.writer.write(",");
+                    self.writer.newline();
+                }
+                let property = self.node(*property)?.clone();
+                let NodeData::PropertyAssignment(property) = &property.data else {
+                    unreachable!("planned object member must remain a property assignment");
+                };
+                self.emit_object_literal_property_name(property.name)?;
+                self.writer.write(": ");
+                self.emit_expression(property.initializer, 1)?;
+            }
+            self.writer.indent -= 1;
+            self.writer.newline();
+            self.writer.write("}");
+        }
+        for property in &prefix[literal_end..] {
+            self.writer.write(",");
+            self.writer.newline();
+            self.emit_es5_generator_object_property_assignment(
+                accumulator,
+                *property,
+                None,
+                false,
+                None,
+            )?;
+        }
+        self.writer.write(";");
+        if computed_style {
+            self.writer.indent -= 1;
+        }
+        self.writer.newline();
+        Ok(())
+    }
+
+    fn emit_es5_generator_next_case(&mut self, case: &mut usize) {
+        self.writer.newline();
+        self.writer.indent -= 1;
+        *case += 1;
+        self.writer.write("case ");
+        self.writer.write(&case.to_string());
+        self.writer.write(":");
+        self.writer.newline();
+        self.writer.indent += 1;
+    }
+
+    fn emit_es5_generator_object_finish(
+        &mut self,
+        plan: &Es5GeneratorObjectLiteral,
+        accumulator: &str,
+        computed_accumulator: Option<&str>,
+        key_temp: Option<&str>,
+        state: &str,
+    ) -> Result<(), EmitError> {
+        let suffix = &plan.properties[plan.suspended_property + 1..];
+        let rebase_at = computed_accumulator
+            .filter(|computed| *computed != accumulator)
+            .and_then(|_| {
+                suffix
+                    .iter()
+                    .position(|property| self.es5_generator_object_property_is_computed(*property))
+            });
+        let final_accumulator = if rebase_at.is_some() {
+            computed_accumulator.expect("rebase requires computed accumulator")
+        } else {
+            accumulator
+        };
+
+        self.emit_expression(plan.target, 1)?;
+        self.writer.write(" = (");
+        self.writer.indent += 1;
+        if let Some(rebase_at) = rebase_at {
+            let computed = computed_accumulator.expect("rebase requires computed accumulator");
+            self.writer.write(computed);
+            self.writer.write(" = (");
+            self.emit_es5_generator_suspended_property_assignment(
+                plan,
+                accumulator,
+                key_temp,
+                state,
+            )?;
+            for property in &suffix[..rebase_at] {
+                self.writer.write(",");
+                self.writer.newline();
+                self.emit_es5_generator_object_property_assignment(
+                    accumulator,
+                    *property,
+                    None,
+                    false,
+                    None,
+                )?;
+            }
+            self.writer.write(",");
+            self.writer.newline();
+            self.writer.write(accumulator);
+            self.writer.write(")");
+            for property in &suffix[rebase_at..] {
+                self.writer.write(",");
+                self.writer.newline();
+                self.emit_es5_generator_object_property_assignment(
+                    computed,
+                    *property,
+                    None,
+                    false,
+                    None,
+                )?;
+            }
+        } else {
+            self.emit_es5_generator_suspended_property_assignment(
+                plan,
+                accumulator,
+                key_temp,
+                state,
+            )?;
+            for property in suffix {
+                self.writer.write(",");
+                self.writer.newline();
+                self.emit_es5_generator_object_property_assignment(
+                    accumulator,
+                    *property,
+                    None,
+                    false,
+                    None,
+                )?;
+            }
+        }
+        self.writer.write(",");
+        self.writer.newline();
+        self.writer.write(final_accumulator);
+        self.writer.indent -= 1;
+        self.writer.write(");");
+        self.writer.newline();
+        Ok(())
+    }
+
+    fn emit_es5_generator_suspended_property_assignment(
+        &mut self,
+        plan: &Es5GeneratorObjectLiteral,
+        accumulator: &str,
+        key_temp: Option<&str>,
+        state: &str,
+    ) -> Result<(), EmitError> {
+        let property = plan.properties[plan.suspended_property];
+        let key = if let Some(key_temp) = key_temp {
+            Some(key_temp)
+        } else if plan.key_yield.is_some() {
+            Some(state)
+        } else {
+            None
+        };
+        self.emit_es5_generator_object_property_assignment(
+            accumulator,
+            property,
+            key,
+            plan.key_yield.is_some() && key_temp.is_none(),
+            plan.value_yield.map(|_| state),
+        )
+    }
+
+    fn emit_es5_generator_object_property_assignment(
+        &mut self,
+        accumulator: &str,
+        property: NodeId,
+        key_override: Option<&str>,
+        key_is_sent: bool,
+        value_state: Option<&str>,
+    ) -> Result<(), EmitError> {
+        let property = self.node(property)?.clone();
+        let NodeData::PropertyAssignment(property) = &property.data else {
+            unreachable!("planned object member must remain a property assignment");
+        };
+        self.writer.write(accumulator);
+        if let Some(key) = key_override {
+            self.writer.write("[");
+            self.writer.write(key);
+            if key_is_sent {
+                self.writer.write(".sent()");
+            }
+            self.writer.write("]");
+        } else {
+            self.emit_downlevel_member_access(property.name)?;
+        }
+        self.writer.write(" = ");
+        if let Some(state) = value_state {
+            self.writer.write(state);
+            self.writer.write(".sent()");
+        } else {
+            self.emit_expression(property.initializer, 1)?;
+        }
         Ok(())
     }
 

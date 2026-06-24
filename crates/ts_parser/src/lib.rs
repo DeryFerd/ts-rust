@@ -4729,9 +4729,7 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        let expression = if self.current.kind == SyntaxKind::SemicolonToken
-            || self.current.kind == SyntaxKind::CloseBraceToken
-            || self.current.kind == SyntaxKind::EndOfFile
+        let expression = if is_expression_terminator(self.current.kind)
             || self
                 .current
                 .flags
