@@ -318,6 +318,8 @@ pub fn emit_source_file_with_context(
         es5_async_inline_with_environment: false,
         es5_async_control_targets: Vec::new(),
         es5_async_hoisted_variable_lists: HashSet::new(),
+        es5_async_hoisted_function_declarations: HashSet::new(),
+        es5_async_for_of_names: HashMap::new(),
         async_loop_counter: 0,
         async_control_counter: 0,
         commonjs_empty_binding_temps: HashMap::new(),
@@ -18263,6 +18265,8 @@ struct Printer<'a> {
     es5_async_inline_with_environment: bool,
     es5_async_control_targets: Vec<Es5AsyncControlTarget>,
     es5_async_hoisted_variable_lists: HashSet<NodeId>,
+    es5_async_hoisted_function_declarations: HashSet<NodeId>,
+    es5_async_for_of_names: HashMap<NodeId, (String, String, Option<String>)>,
     async_loop_counter: u32,
     async_control_counter: u32,
     commonjs_empty_binding_temps: HashMap<NodeId, Vec<String>>,
@@ -21348,6 +21352,9 @@ impl Printer<'_> {
     #[allow(clippy::too_many_lines)]
     fn emit_statement(&mut self, id: NodeId) -> Result<(), EmitError> {
         let node = self.node(id)?.clone();
+        if self.es5_async_hoisted_function_declarations.contains(&id) {
+            return Ok(());
+        }
         if let NodeData::VariableStatement(statement) = &node.data
             && self
                 .es5_async_hoisted_variable_lists
@@ -21790,7 +21797,14 @@ impl Printer<'_> {
                     &self.node(data.initializer)?.data,
                     NodeData::VariableDeclarationList(_)
                 ) {
-                    self.emit_variable_list(data.initializer, false)?;
+                    if self
+                        .es5_async_hoisted_variable_lists
+                        .contains(&data.initializer)
+                    {
+                        self.emit_es5_async_hoisted_loop_binding(data.initializer)?;
+                    } else {
+                        self.emit_variable_list(data.initializer, false)?;
+                    }
                 } else {
                     self.emit_expression(data.initializer, 0)?;
                 }
@@ -22715,9 +22729,14 @@ impl Printer<'_> {
         statement: NodeId,
         data: &ts_ast::ForInOrOfStatementData,
     ) -> Result<(), EmitError> {
-        let (counter, rhs, binding_temp) =
-            self.scoped_downlevel_for_of_names(statement, data.expression);
-        self.writer.write("for (var ");
+        let planned = self.es5_async_for_of_names.get(&statement).cloned();
+        let (counter, rhs, binding_temp) = planned
+            .clone()
+            .unwrap_or_else(|| self.scoped_downlevel_for_of_names(statement, data.expression));
+        self.writer.write("for (");
+        if planned.is_none() {
+            self.writer.write("var ");
+        }
         self.writer.write(&counter);
         self.writer.write(" = 0, ");
         self.writer.write(&rhs);
@@ -22986,6 +23005,19 @@ impl Printer<'_> {
     ) -> Result<(), EmitError> {
         let initializer_node = self.node(initializer)?.clone();
         if let NodeData::VariableDeclarationList(list) = &initializer_node.data {
+            if self.es5_async_hoisted_variable_lists.contains(&initializer)
+                && let Some(declaration_id) = list.declarations.nodes.first()
+                && let NodeData::VariableDeclaration(declaration) =
+                    &self.node(*declaration_id)?.data
+                && matches!(self.node(declaration.name)?.data, NodeData::Identifier(_))
+            {
+                self.emit_expression(declaration.name, 1)?;
+                self.writer.write(" = ");
+                self.emit_downlevel_binding_value(value)?;
+                self.writer.write(";");
+                self.writer.newline();
+                return Ok(());
+            }
             self.writer.write("var ");
             let mut emitted = false;
             if let Some(declaration_id) = list.declarations.nodes.first() {
@@ -25283,11 +25315,19 @@ impl Printer<'_> {
             std::mem::take(&mut self.es5_async_inline_with_environment);
         let previous_hoisted_variable_lists =
             std::mem::take(&mut self.es5_async_hoisted_variable_lists);
+        let previous_hoisted_function_declarations =
+            std::mem::take(&mut self.es5_async_hoisted_function_declarations);
+        let previous_for_of_names = std::mem::take(&mut self.es5_async_for_of_names);
         let mut hoisted_names = Vec::new();
+        let mut hoisted_functions = Vec::new();
         if expression_body.is_none() {
+            self.es5_async_for_of_names = self.prepare_es5_async_for_of_names(body);
             let mut hoisted_lists = HashSet::new();
             self.collect_es5_async_variable_hoists(body, &mut hoisted_lists, &mut hoisted_names);
             self.collect_es5_async_for_hoists(body, &mut hoisted_lists, &mut hoisted_names);
+            self.collect_es5_async_function_hoists(body, &mut hoisted_functions);
+            self.es5_async_hoisted_function_declarations =
+                hoisted_functions.iter().copied().collect();
             self.es5_async_hoisted_variable_lists = hoisted_lists;
         }
         let capture_plan = if expression_body.is_none() {
@@ -25380,6 +25420,14 @@ impl Printer<'_> {
         {
             self.emit_es5_async_captured_loop_hoists(&loop_info)?;
         }
+        for function in &hoisted_functions {
+            self.es5_async_hoisted_function_declarations
+                .remove(function);
+            let result = self.emit_statement(*function);
+            self.es5_async_hoisted_function_declarations
+                .insert(*function);
+            result?;
+        }
         for temp in object_key_hoists {
             self.writer.write("var ");
             self.writer.write(&temp);
@@ -25470,6 +25518,8 @@ impl Printer<'_> {
         self.es5_async_open_with_depth = previous_open_with_depth;
         self.es5_async_inline_with_environment = previous_inline_with_environment;
         self.es5_async_hoisted_variable_lists = previous_hoisted_variable_lists;
+        self.es5_async_hoisted_function_declarations = previous_hoisted_function_declarations;
+        self.es5_async_for_of_names = previous_for_of_names;
         Ok(())
     }
 
@@ -30438,6 +30488,134 @@ impl Printer<'_> {
         }
     }
 
+    fn collect_es5_async_function_hoists(&self, statement: NodeId, functions: &mut Vec<NodeId>) {
+        match self.arena.get(statement).map(|node| &node.data) {
+            Some(NodeData::Block(block)) => {
+                for statement in &block.statements.nodes {
+                    self.collect_es5_async_function_hoists(*statement, functions);
+                }
+            }
+            Some(NodeData::FunctionDeclaration(function)) if function.body.is_some() => {
+                functions.push(statement);
+            }
+            Some(NodeData::IfStatement(statement)) => {
+                self.collect_es5_async_function_hoists(statement.then_statement, functions);
+                if let Some(statement) = statement.else_statement {
+                    self.collect_es5_async_function_hoists(statement, functions);
+                }
+            }
+            Some(NodeData::WhileStatement(statement)) => {
+                self.collect_es5_async_function_hoists(statement.statement, functions);
+            }
+            Some(NodeData::DoStatement(statement)) => {
+                self.collect_es5_async_function_hoists(statement.statement, functions);
+            }
+            Some(NodeData::ForStatement(statement)) => {
+                self.collect_es5_async_function_hoists(statement.statement, functions);
+            }
+            Some(NodeData::ForInOrOfStatement(statement)) => {
+                self.collect_es5_async_function_hoists(statement.statement, functions);
+            }
+            Some(NodeData::LabeledStatement(statement)) => {
+                self.collect_es5_async_function_hoists(statement.statement, functions);
+            }
+            Some(NodeData::WithStatement(statement)) => {
+                self.collect_es5_async_function_hoists(statement.statement, functions);
+            }
+            Some(NodeData::SwitchStatement(statement)) => self.collect_es5_async_switch_regions(
+                statement,
+                functions,
+                Self::collect_es5_async_function_hoists,
+            ),
+            Some(NodeData::TryStatement(statement)) => self.collect_es5_async_try_regions(
+                statement,
+                functions,
+                Self::collect_es5_async_function_hoists,
+            ),
+            _ => {}
+        }
+    }
+
+    fn prepare_es5_async_for_of_names(
+        &mut self,
+        body: NodeId,
+    ) -> HashMap<NodeId, (String, String, Option<String>)> {
+        let mut loops = Vec::new();
+        self.collect_es5_async_for_of_nodes(body, &mut loops);
+        let mut plans = HashMap::new();
+        for statement in loops {
+            let Some(NodeData::ForInOrOfStatement(data)) =
+                self.arena.get(statement).map(|node| &node.data)
+            else {
+                continue;
+            };
+            let expression = data.expression;
+            let (counter, scoped_rhs, binding_temp) =
+                self.scoped_downlevel_for_of_names(statement, expression);
+            let identifier = match self.arena.get(expression).map(|node| &node.data) {
+                Some(NodeData::Identifier(identifier)) => Some(identifier.text.clone()),
+                _ => None,
+            };
+            let rhs = identifier.map_or(scoped_rhs, |name| self.generated_names.generate(&name));
+            plans.insert(statement, (counter, rhs, binding_temp));
+        }
+        plans
+    }
+
+    fn collect_es5_async_for_of_nodes(&self, statement: NodeId, loops: &mut Vec<NodeId>) {
+        let Some(node) = self.arena.get(statement) else {
+            return;
+        };
+        match &node.data {
+            NodeData::Block(block) => {
+                for statement in &block.statements.nodes {
+                    self.collect_es5_async_for_of_nodes(*statement, loops);
+                }
+            }
+            NodeData::ForInOrOfStatement(for_statement) => {
+                if node.kind == SyntaxKind::ForOfStatement
+                    && for_statement.await_modifier.is_none()
+                    && !self.downlevel_iteration
+                {
+                    loops.push(statement);
+                }
+                self.collect_es5_async_for_of_nodes(for_statement.statement, loops);
+            }
+            NodeData::IfStatement(statement) => {
+                self.collect_es5_async_for_of_nodes(statement.then_statement, loops);
+                if let Some(statement) = statement.else_statement {
+                    self.collect_es5_async_for_of_nodes(statement, loops);
+                }
+            }
+            NodeData::WhileStatement(statement) => {
+                self.collect_es5_async_for_of_nodes(statement.statement, loops);
+            }
+            NodeData::DoStatement(statement) => {
+                self.collect_es5_async_for_of_nodes(statement.statement, loops);
+            }
+            NodeData::ForStatement(statement) => {
+                self.collect_es5_async_for_of_nodes(statement.statement, loops);
+            }
+            NodeData::LabeledStatement(statement) => {
+                self.collect_es5_async_for_of_nodes(statement.statement, loops);
+            }
+            NodeData::WithStatement(statement) => {
+                self.collect_es5_async_for_of_nodes(statement.statement, loops);
+            }
+            NodeData::SwitchStatement(statement) => self.collect_es5_async_switch_regions(
+                statement,
+                loops,
+                Self::collect_es5_async_for_of_nodes,
+            ),
+            NodeData::TryStatement(statement) => self.collect_es5_async_try_regions(
+                statement,
+                loops,
+                Self::collect_es5_async_for_of_nodes,
+            ),
+            _ => {}
+        }
+    }
+
     fn collect_es5_async_for_hoists(
         &self,
         statement: NodeId,
@@ -30470,6 +30648,38 @@ impl Printer<'_> {
                     }
                 }
                 self.collect_es5_async_for_hoists(statement.statement, lists, names);
+            }
+            Some(NodeData::ForInOrOfStatement(for_statement)) => {
+                if self
+                    .arena
+                    .get(statement)
+                    .is_some_and(|node| node.kind == SyntaxKind::ForOfStatement)
+                    && let Some((counter, rhs, binding_temp)) =
+                        self.es5_async_for_of_names.get(&statement)
+                {
+                    push_unique(names, counter);
+                    push_unique(names, rhs);
+                    if let Some(binding_temp) = binding_temp {
+                        push_unique(names, binding_temp);
+                    }
+                }
+                if let Some(NodeData::VariableDeclarationList(list)) = self
+                    .arena
+                    .get(for_statement.initializer)
+                    .map(|node| &node.data)
+                {
+                    lists.insert(for_statement.initializer);
+                    for declaration in &list.declarations.nodes {
+                        if let Some(NodeData::VariableDeclaration(declaration)) =
+                            self.arena.get(*declaration).map(|node| &node.data)
+                        {
+                            for name in self.declaration_names(&[declaration.name]) {
+                                push_unique(names, &name);
+                            }
+                        }
+                    }
+                }
+                self.collect_es5_async_for_hoists(for_statement.statement, lists, names);
             }
             Some(NodeData::WhileStatement(statement)) => {
                 self.collect_es5_async_for_hoists(statement.statement, lists, names);
@@ -30519,6 +30729,24 @@ impl Printer<'_> {
             emitted = true;
         }
         Ok(emitted)
+    }
+
+    fn emit_es5_async_hoisted_loop_binding(
+        &mut self,
+        initializer: NodeId,
+    ) -> Result<(), EmitError> {
+        let node = self.node(initializer)?.clone();
+        let NodeData::VariableDeclarationList(list) = &node.data else {
+            return Err(Self::unsupported(initializer, node.kind));
+        };
+        let Some(declaration) = list.declarations.nodes.first() else {
+            return Ok(());
+        };
+        let declaration_node = self.node(*declaration)?.clone();
+        let NodeData::VariableDeclaration(declaration) = &declaration_node.data else {
+            return Err(Self::unsupported(*declaration, declaration_node.kind));
+        };
+        self.emit_expression(declaration.name, 0)
     }
 
     fn direct_await_binding(&self, statement: NodeId) -> Option<(NodeId, NodeId)> {
