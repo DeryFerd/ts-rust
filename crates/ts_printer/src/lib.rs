@@ -7422,7 +7422,19 @@ impl DeclarationPrinter<'_> {
             {
                 self.writer.write(": ");
                 self.emit_name(class_name)?;
-                self.emit_type_arguments(type_arguments.as_ref())?;
+                if type_arguments.is_some() {
+                    self.emit_type_arguments(type_arguments.as_ref())?;
+                } else if let Some(arguments) = declaration
+                    .initializer
+                    .and_then(|initializer| self.node_types?.get(&initializer))
+                    .and_then(|type_id| self.named_type_references?.get(type_id))
+                    .map(|reference| &reference.type_arguments)
+                    .filter(|arguments| !arguments.is_empty())
+                {
+                    self.writer.write("<");
+                    self.emit_semantic_type_list(arguments, ", ")?;
+                    self.writer.write(">");
+                }
             } else if let Some((local_class, argument)) = declaration
                 .initializer
                 .and_then(|initializer| self.local_class_factory_call(initializer))

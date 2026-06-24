@@ -5102,7 +5102,7 @@ impl<'a> Checker<'a> {
         members: &[NodeId],
         arguments: &[TypeId],
     ) -> TypeId {
-        let mut scope = HashMap::new();
+        self.type_parameter_scopes.push(HashMap::new());
         if let Some(parameters) = type_parameters {
             for (index, parameter) in parameters.nodes.iter().enumerate() {
                 let Some(NodeData::TypeParameterDeclaration(parameter)) =
@@ -5114,15 +5114,24 @@ impl<'a> Checker<'a> {
                     continue;
                 };
                 let type_id = arguments.get(index).copied().unwrap_or_else(|| {
-                    self.result.types.alloc(TypeKind::TypeParameter {
-                        name: name.clone(),
-                        constraint: None,
-                    })
+                    if let Some(default) = parameter.default_type {
+                        self.type_from_type_node(default)
+                    } else {
+                        let constraint = parameter
+                            .constraint
+                            .map(|constraint| self.type_from_type_node(constraint));
+                        self.result.types.alloc(TypeKind::TypeParameter {
+                            name: name.clone(),
+                            constraint,
+                        })
+                    }
                 });
-                scope.insert(name, type_id);
+                self.type_parameter_scopes
+                    .last_mut()
+                    .expect("declared object type-parameter scope exists")
+                    .insert(name, type_id);
             }
         }
-        self.type_parameter_scopes.push(scope);
         let mut properties = BTreeMap::new();
         let mut property_order = Vec::new();
         let mut numeric_properties = BTreeSet::new();
@@ -5323,13 +5332,13 @@ impl<'a> Checker<'a> {
         {
             return Some(type_id);
         }
-        let declaration = self
+        let declarations = self
             .bindings
             .symbols
             .get(symbol)?
             .declarations
             .iter()
-            .find_map(|declaration| match &self.arena.get(*declaration)?.data {
+            .filter_map(|declaration| match &self.arena.get(*declaration)?.data {
                 NodeData::ClassDeclaration(data) => {
                     Some(DeclaredObject::Class(data.as_ref().clone()))
                 }
@@ -5337,12 +5346,16 @@ impl<'a> Checker<'a> {
                     Some(DeclaredObject::Interface(data.as_ref().clone()))
                 }
                 _ => None,
-            })?;
+            })
+            .collect::<Vec<_>>();
+        if declarations.is_empty() {
+            return None;
+        }
         self.active_declared_object_instantiations
             .insert(cache_key.clone());
         self.declared_object_instantiation_depth += 1;
         self.alias_stack.push(symbol);
-        let result = match declaration {
+        let mut instantiated = declarations.into_iter().map(|declaration| match declaration {
             DeclaredObject::Class(data) => self.declared_object_type(
                 data.type_parameters.as_ref(),
                 data.heritage_clauses.as_ref(),
@@ -5355,6 +5368,18 @@ impl<'a> Checker<'a> {
                 &data.members.nodes,
                 arguments,
             ),
+        });
+        let first = instantiated.next().expect("declarations checked non-empty");
+        let remaining = instantiated.collect::<Vec<_>>();
+        let result = if remaining.is_empty() {
+            first
+        } else {
+            let mut members = Vec::with_capacity(remaining.len() + 1);
+            members.push(first);
+            members.extend(remaining);
+            self.combine_contextual_objects(members, true).map_or(first, |object| {
+                self.result.types.alloc(TypeKind::Object(object))
+            })
         };
         self.alias_stack.pop();
         self.declared_object_instantiation_depth -= 1;
@@ -5382,21 +5407,86 @@ impl<'a> Checker<'a> {
                 };
                 Some(class.as_ref().clone())
             })?;
-        let instance = self.instantiate_declared_object(symbol, arguments)?;
         let mut scope = HashMap::new();
+        let mut effective_arguments = arguments.to_vec();
         if let Some(parameters) = &class.type_parameters {
-            for (parameter, argument) in parameters.nodes.iter().zip(arguments) {
+            for (index, parameter) in parameters.nodes.iter().enumerate() {
                 let NodeData::TypeParameterDeclaration(parameter) =
                     &self.arena.get(*parameter)?.data
                 else {
                     continue;
                 };
                 let name = self.property_name(parameter.name)?;
-                scope.insert(name, *argument);
+                if let Some(argument) = arguments.get(index).copied() {
+                    scope.insert(name, argument);
+                    continue;
+                }
+                self.type_parameter_scopes.push(scope.clone());
+                let constraint = parameter
+                    .constraint
+                    .map(|constraint| self.type_from_type_node(constraint));
+                self.type_parameter_scopes.pop();
+                let type_parameter = self.result.types.alloc(TypeKind::TypeParameter {
+                    name: name.clone(),
+                    constraint,
+                });
+                scope.insert(name, type_parameter);
+                self.type_parameter_scopes.push(scope.clone());
+                let default_type = match parameter.default_type {
+                    Some(default_type) => self.type_from_type_node(default_type),
+                    None => self.result.types.unknown(),
+                };
+                self.type_parameter_scopes.pop();
+                self.type_parameter_defaults
+                    .insert(type_parameter, default_type);
+                effective_arguments.push(type_parameter);
             }
         }
+        let instance = self.instantiate_declared_object(symbol, &effective_arguments)?;
+        let kind = self.result.types.get(instance)?.kind.clone();
+        let named_instance = self.result.types.alloc(kind);
+        let class_name = self.bindings.symbols.get(symbol)?.name.clone();
+        self.result.named_type_references.insert(
+            named_instance,
+            NamedTypeReference {
+                name: class_name.clone(),
+                type_arguments: effective_arguments.clone(),
+            },
+        );
         self.type_parameter_scopes.push(scope);
-        let signature = self.class_constructor_signature(&class.members.nodes, instance);
+        let mut signature = self.class_constructor_signature(&class.members.nodes, named_instance);
+        let has_constructor = class.members.nodes.iter().any(|member| {
+            matches!(
+                self.arena.get(*member).map(|node| &node.data),
+                Some(NodeData::ConstructorDeclaration(_))
+            ) || matches!(
+                self.arena.get(*member).map(|node| &node.data),
+                Some(NodeData::MethodDeclaration(method))
+                    if self.property_name(method.name).as_deref() == Some("constructor")
+            )
+        });
+        if !has_constructor
+            && let Some(base_signature) = self
+                .class_base_value_type(class.heritage_clauses.as_ref())
+                .and_then(|base| self.construct_signature(base))
+        {
+            signature.parameters = base_signature.parameters;
+            signature.parameter_names = base_signature.parameter_names;
+            signature.rest_parameter = base_signature.rest_parameter;
+            signature.parameters_optional = base_signature.parameters_optional;
+            let return_type = self
+                .result
+                .types
+                .intersection([named_instance, base_signature.return_type]);
+            self.result.named_type_references.insert(
+                return_type,
+                NamedTypeReference {
+                    name: class_name,
+                    type_arguments: effective_arguments,
+                },
+            );
+            signature.return_type = return_type;
+        }
         self.type_parameter_scopes.pop();
         Some(self.result.types.alloc(TypeKind::Constructor(signature)))
     }
@@ -6110,7 +6200,11 @@ impl<'a> Checker<'a> {
         &mut self,
         class: &ts_ast::ClassExpressionData,
     ) -> Option<TypeId> {
-        let clauses = class.heritage_clauses.as_ref()?;
+        self.class_base_value_type(class.heritage_clauses.as_ref())
+    }
+
+    fn class_base_value_type(&mut self, clauses: Option<&ts_ast::NodeList>) -> Option<TypeId> {
+        let clauses = clauses?;
         let clause = clauses.nodes.iter().find_map(|clause| {
             let NodeData::HeritageClause(clause) = &self.arena.get(*clause)?.data else {
                 return None;
@@ -6122,7 +6216,14 @@ impl<'a> Checker<'a> {
         else {
             return None;
         };
-        Some(self.type_of_expression(heritage.expression))
+        let base = self.type_of_expression(heritage.expression);
+        Some(heritage.type_arguments.as_ref().map_or(base, |arguments| {
+            self.instantiate_explicit_call_signature(
+                heritage.expression,
+                base,
+                &arguments.nodes,
+            )
+        }))
     }
 
     fn construct_signature(&self, type_id: TypeId) -> Option<FunctionType> {
@@ -8859,13 +8960,17 @@ impl<'a> Checker<'a> {
 
     fn property_access_type(&mut self, node: NodeId, receiver: TypeId, name: &str) -> TypeId {
         if let Some(property) = self.lookup_property_type(receiver, name) {
-            if name == "flat"
+            let property = if name == "flat"
                 && let Some(flat) = self.array_flat_property_type(receiver, property)
             {
                 flat
             } else {
                 property
+            };
+            if self.non_widening_types.contains(&receiver) {
+                self.non_widening_types.insert(property);
             }
+            property
         } else if self.options.is_javascript_file && self.is_assignment_left_hand_side(node) {
             let property = self.result.types.any();
             if let Some(Type {
@@ -13620,12 +13725,22 @@ impl<'a> Checker<'a> {
         {
             name = format!("globalThis.{name}");
         }
+        let inferred_arguments = self
+            .result
+            .named_type_references
+            .get(&type_id)
+            .filter(|reference| reference.name == name)
+            .map(|reference| reference.type_arguments.clone());
         let named = self.result.types.alloc(kind);
         self.result.named_type_references.insert(
             named,
             NamedTypeReference {
                 name,
-                type_arguments: type_arguments.to_vec(),
+                type_arguments: if type_arguments.is_empty() {
+                    inferred_arguments.unwrap_or_default()
+                } else {
+                    type_arguments.to_vec()
+                },
             },
         );
         named
