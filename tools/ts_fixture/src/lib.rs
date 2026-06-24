@@ -334,9 +334,7 @@ fn parse_baseline_section_list(baseline: &str) -> Vec<(String, String)> {
     let mut current_text = String::new();
     for line in normalized.split_inclusive('\n') {
         let marker = line.trim_end_matches(['\r', '\n']);
-        if marker.starts_with("!!!! File ")
-            && marker.contains("differs from original emit in noCheck emit")
-        {
+        if marker.starts_with("!!!! File ") && marker.contains("noCheck emit") {
             break;
         }
         if let Some(name) = marker
@@ -365,14 +363,18 @@ pub fn expand_option_matrix(case: &Case) -> Vec<OptionVariant> {
         let Some(value) = case.directive_values(name).next() else {
             continue;
         };
-        let values = if name == "module" && value.trim() == "*" {
-            [
-                "amd", "commonjs", "es2020", "es2022", "es6", "esnext", "node16", "node18",
-                "node20", "nodenext", "none", "preserve", "system", "umd",
-            ]
-            .into_iter()
-            .map(str::to_owned)
-            .collect::<Vec<_>>()
+        let values = if value.trim() == "*" {
+            if name == "module" {
+                [
+                    "amd", "commonjs", "es2020", "es2022", "es6", "esnext", "node16",
+                    "node18", "node20", "nodenext", "none", "preserve", "system", "umd",
+                ]
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+            } else {
+                vec!["false".to_owned(), "true".to_owned()]
+            }
         } else {
             value
                 .split(',')
@@ -1058,6 +1060,7 @@ const SCALAR_OPTION_NAMES: &[&str] = &[
     "sourceMap",
     "sourceRoot",
     "strict",
+    "strictBuiltinIteratorReturn",
     "strictNullChecks",
     "target",
     "tsBuildInfoFile",
@@ -1149,7 +1152,7 @@ fn matrix_axes(case: &Case) -> Vec<String> {
             case.directive_values(name)
                 .next()
                 .filter(|value| {
-                    (*name == "module" && value.trim() == "*")
+                    value.trim() == "*"
                         || value
                             .split(',')
                             .filter(|part| !part.trim().is_empty())
@@ -1499,7 +1502,8 @@ mod tests {
         Case, OptionVariant, OutputDifferenceKind, ParseError,
         compare_case_emitted_output_sections, compare_emitted_output_sections, compile_case,
         compile_case_matrix, expand_option_matrix, first_different_line, fixture_compiler_options,
-        parse_baseline_sections, run_case_against_baseline, select_variant_baselines,
+        matrix_axes, parse_baseline_sections, run_case_against_baseline,
+        select_variant_baselines,
     };
 
     #[test]
@@ -1949,6 +1953,24 @@ mod tests {
             &["jsx".to_owned(), "module".to_owned()],
         );
         assert_eq!(selected, vec![&paths[0]]);
+    }
+
+    #[test]
+    fn expands_boolean_wildcard_matrix_axes() {
+        let case = Case::parse(
+            "wildcards.ts",
+            "// @isolatedDeclarations: *\n// @strictBuiltinIteratorReturn: *\nconst x = 1;\n",
+        )
+        .unwrap();
+        let variants = expand_option_matrix(&case);
+        assert_eq!(variants.len(), 4);
+        assert_eq!(
+            matrix_axes(&case),
+            vec![
+                "isolatedDeclarations".to_owned(),
+                "strictBuiltinIteratorReturn".to_owned(),
+            ]
+        );
     }
 
     #[test]

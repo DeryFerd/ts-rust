@@ -1764,19 +1764,8 @@ impl<'a> ProgramChecker<'a> {
         let mut globals = BTreeMap::new();
         let mut declarations = BTreeMap::<String, (usize, ts_binder::SymbolFlags)>::new();
         let mut duplicates = Vec::new();
-        let referenced_names = self
-            .sources
-            .iter()
-            .filter(|source| !source.is_default_library)
-            .flat_map(|source| {
-                source.arena.iter().filter_map(|(_, node)| {
-                    let NodeData::Identifier(identifier) = &node.data else {
-                        return None;
-                    };
-                    Some(identifier.text.clone())
-                })
-            })
-            .collect::<BTreeSet<_>>();
+        let referenced_names = self.referenced_global_names();
+        let enum_member_name_counts = self.enum_member_name_counts(results);
         for (file_index, (source, result)) in self.sources.iter().zip(results).enumerate() {
             if is_external_module(source) {
                 continue;
@@ -1855,8 +1844,76 @@ impl<'a> ProgramChecker<'a> {
                     declarations.insert(name.to_owned(), (file_index, symbol.flags));
                 }
             }
+            Self::extend_unique_enum_member_globals(
+                source,
+                result,
+                &enum_member_name_counts,
+                &mut globals,
+            );
         }
         (globals, duplicates)
+    }
+
+    fn referenced_global_names(&self) -> BTreeSet<String> {
+        self.sources
+            .iter()
+            .filter(|source| !source.is_default_library)
+            .flat_map(|source| {
+                source.arena.iter().filter_map(|(_, node)| {
+                    let NodeData::Identifier(identifier) = &node.data else {
+                        return None;
+                    };
+                    Some(identifier.text.clone())
+                })
+            })
+            .collect()
+    }
+
+    fn enum_member_name_counts(&self, results: &[CheckResult]) -> BTreeMap<String, usize> {
+        self.sources
+            .iter()
+            .zip(results)
+            .filter(|(source, _)| !is_external_module(source))
+            .flat_map(|(source, result)| {
+                result.enum_member_values.keys().filter_map(|member| {
+                    let NodeData::EnumMember(member) = &source.arena.get(*member)?.data else {
+                        return None;
+                    };
+                    property_name_text(source.arena, member.name)
+                })
+            })
+            .fold(BTreeMap::new(), |mut counts, name| {
+                *counts.entry(name).or_default() += 1;
+                counts
+            })
+    }
+
+    fn extend_unique_enum_member_globals(
+        source: &ProgramSource<'_>,
+        result: &CheckResult,
+        name_counts: &BTreeMap<String, usize>,
+        globals: &mut BTreeMap<String, TypeDescriptor>,
+    ) {
+        for (member, value) in &result.enum_member_values {
+            let Some(NodeData::EnumMember(member)) =
+                source.arena.get(*member).map(|node| &node.data)
+            else {
+                continue;
+            };
+            let Some(name) = property_name_text(source.arena, member.name) else {
+                continue;
+            };
+            if name_counts.get(&name) != Some(&1) {
+                continue;
+            }
+            let descriptor = match value {
+                EnumConstantValue::Number(value) => {
+                    TypeDescriptor::NumberLiteral(value.to_string())
+                }
+                EnumConstantValue::String(value) => TypeDescriptor::StringLiteral(value.clone()),
+            };
+            globals.entry(name).or_insert(descriptor);
+        }
     }
 
     fn describe_global_symbol(
@@ -3807,6 +3864,16 @@ impl<'a> Checker<'a> {
         if let Some(local_constant) = self.enum_local_constant_variable(reference, name) {
             return Some(local_constant);
         }
+        if matches!(
+            self.arena.get(reference).map(|node| &node.data),
+            Some(NodeData::Identifier(_))
+        ) && let Some(value) = self
+            .external_names
+            .get(name)
+            .and_then(enum_constant_from_descriptor)
+        {
+            return Some(value);
+        }
         if let Some(value) = self.enum_access_receiver_constant(reference, name) {
             return Some(value);
         }
@@ -3924,12 +3991,20 @@ impl<'a> Checker<'a> {
             _ => return None,
         };
         let receiver_name = identifier_text(self.arena, receiver)?;
-        let receiver_symbol = self.resolve_identifier(receiver, receiver_name)?;
-        let receiver_type = self.result.symbol_types.get(&receiver_symbol)?;
-        let TypeKind::Object(object) = &self.result.types.get(*receiver_type)?.kind else {
-            return None;
-        };
-        enum_constant_from_type(&self.result.types, *object.properties.get(name)?)
+        let local = self
+            .resolve_identifier(receiver, receiver_name)
+            .and_then(|receiver_symbol| self.result.symbol_types.get(&receiver_symbol))
+            .and_then(|receiver_type| self.result.types.get(*receiver_type))
+            .and_then(|type_| match &type_.kind {
+                TypeKind::Object(object) => object.properties.get(name),
+                _ => None,
+            })
+            .and_then(|member| enum_constant_from_type(&self.result.types, *member));
+        local.or_else(|| {
+            self.external_names
+                .get(receiver_name)
+                .and_then(|descriptor| enum_property_constant_from_descriptor(descriptor, name))
+        })
     }
 
     fn enum_import_symbol(&self, name_node: NodeId, name: &str) -> Option<ts_ast::SymbolId> {
@@ -8116,6 +8191,25 @@ impl<'a> Checker<'a> {
                     let asserted = self.type_from_type_node(data.type_);
                     self.non_widening_types.insert(asserted);
                     asserted
+                }
+            }
+            NodeData::NonNullExpression(data) => {
+                let original = self.type_of_expression(data.expression);
+                match self.result.types.get(original).map(|type_| type_.kind.clone()) {
+                    Some(TypeKind::Null | TypeKind::Undefined) => self.result.types.never(),
+                    Some(TypeKind::Union(members)) => {
+                        let members = members
+                            .into_iter()
+                            .filter(|member| {
+                                !matches!(
+                                    self.result.types.get(*member).map(|type_| &type_.kind),
+                                    Some(TypeKind::Null | TypeKind::Undefined)
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        self.result.types.union(members)
+                    }
+                    _ => original,
                 }
             }
             NodeData::PrefixUnaryExpression(data) => self.prefix_unary_type(data),
@@ -19184,6 +19278,23 @@ fn enum_constant_from_descriptor(descriptor: &TypeDescriptor) -> Option<Value> {
         TypeDescriptor::Import { target, .. }
         | TypeDescriptor::Named { target, .. }
         | TypeDescriptor::ConstEnum(target) => enum_constant_from_descriptor(target),
+        _ => None,
+    }
+}
+
+fn enum_property_constant_from_descriptor(
+    descriptor: &TypeDescriptor,
+    name: &str,
+) -> Option<Value> {
+    match descriptor {
+        TypeDescriptor::Object { properties, .. } => properties
+            .get(name)
+            .and_then(enum_constant_from_descriptor),
+        TypeDescriptor::Import { target, .. }
+        | TypeDescriptor::Named { target, .. }
+        | TypeDescriptor::ConstEnum(target) => {
+            enum_property_constant_from_descriptor(target, name)
+        }
         _ => None,
     }
 }

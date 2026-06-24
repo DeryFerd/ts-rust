@@ -530,7 +530,11 @@ impl Program {
             );
             let enum_member_values = enum_values_for_emit(&source_file.checking.enum_member_values);
             let enum_access_values = enum_values_for_emit(&source_file.checking.enum_access_values);
-            if settings.emit_javascript {
+            let javascript_output_overwrites_input = paths
+                .javascript
+                .as_deref()
+                .is_some_and(|file_name| self.output_overwrites_input(file_name));
+            if settings.emit_javascript && !javascript_output_overwrites_input {
                 let mut source_settings = settings;
                 let lower_file_name = source_file.file_name.to_ascii_lowercase();
                 let fixed_es_module = [".mts", ".mjs"]
@@ -2315,6 +2319,10 @@ fn preserved_reference_value<'a>(directive: &'a str, attribute: &str) -> Option<
 }
 
 fn has_isolated_declaration_emit_error(source: &SourceFile) -> bool {
+    let javascript_source = matches!(
+        ts_path::script_kind_from_path(&source.file_name),
+        ts_path::ScriptKind::Js | ts_path::ScriptKind::Jsx
+    );
     source.parse.arena.iter().any(|(_, node)| {
         let NodeData::ComputedPropertyName(name) = &node.data else {
             return false;
@@ -2360,13 +2368,14 @@ fn has_isolated_declaration_emit_error(source: &SourceFile) -> bool {
                 source.parse.arena.get(*declaration).map(|node| &node.data),
                 Some(NodeData::VariableDeclaration(variable))
                     if variable.type_.is_none()
-                        && variable.initializer.is_some_and(|initializer| matches!(
-                            source.parse.arena.get(initializer).map(|node| &node.data),
-                            Some(NodeData::PropertyAccessExpression(_)
-                                | NodeData::ElementAccessExpression(_)
-                                | NodeData::CallExpression(_)
-                                | NodeData::NewExpression(_))
-                        ))
+                        && ((!javascript_source && variable.initializer.is_none())
+                            || variable.initializer.is_some_and(|initializer| matches!(
+                                source.parse.arena.get(initializer).map(|node| &node.data),
+                                Some(NodeData::PropertyAccessExpression(_)
+                                    | NodeData::ElementAccessExpression(_)
+                                    | NodeData::CallExpression(_)
+                                    | NodeData::NewExpression(_))
+                            )))
             )
         })
     }) || has_unsupported_isolated_declaration_shape(source)
@@ -2424,6 +2433,24 @@ fn has_unsupported_isolated_declaration_shape(source: &SourceFile) -> bool {
                         function_values.insert(name.to_owned());
                     }
                     if function.type_.is_none() {
+                        return true;
+                    }
+                    if function.parameters.nodes.iter().any(|parameter| {
+                        let Some(NodeData::ParameterDeclaration(parameter)) =
+                            arena.get(*parameter).map(|node| &node.data)
+                        else {
+                            return false;
+                        };
+                        parameter.initializer.is_some_and(|initializer| {
+                            arena.iter().any(|(candidate, candidate_node)| {
+                                matches!(
+                                    &candidate_node.data,
+                                    NodeData::ParameterDeclaration(nested)
+                                        if nested.initializer.is_some() && nested.type_.is_none()
+                                ) && syntax_node_is_within(arena, candidate, initializer)
+                            })
+                        })
+                    }) {
                         return true;
                     }
                 }
