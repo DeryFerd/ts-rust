@@ -3236,6 +3236,10 @@ impl DeclarationPrinter<'_> {
                     self.writer.write("export default ");
                     self.writer.write(&name);
                     self.writer.write(";");
+                } else if self.entity_is_local_enum(data.expression) {
+                    self.writer.write("export default ");
+                    self.emit_name(data.expression)?;
+                    self.writer.write(";");
                 } else if let Some(type_query) = self
                     .entity_value_type_query(data.expression)
                     .or_else(|| self.imported_namespace_entity_type_query(data.expression))
@@ -6375,6 +6379,25 @@ impl DeclarationPrinter<'_> {
                 },
             )
             .then_some(initializer)
+    }
+
+    fn entity_is_local_enum(&self, expression: NodeId) -> bool {
+        if !matches!(
+            self.arena.get(expression).map(|node| &node.data),
+            Some(NodeData::Identifier(_))
+        ) {
+            return false;
+        }
+        self.resolve_entity_expression_symbol(expression)
+            .and_then(|symbol| self.bindings.symbols.get(symbol))
+            .is_some_and(|symbol| {
+                symbol.declarations.iter().any(|declaration| {
+                    matches!(
+                        self.arena.get(*declaration).map(|node| &node.data),
+                        Some(NodeData::EnumDeclaration(_))
+                    )
+                })
+            })
     }
 
     fn imported_namespace_entity_type_query(&self, initializer: NodeId) -> Option<NodeId> {
@@ -31311,6 +31334,15 @@ mod tests {
             "{output}"
         );
         assert!(output.contains("param: things.Thing"), "{output}");
+    }
+
+    #[test]
+    fn declaration_emit_preserves_default_exported_enum_identifier() {
+        let output = emit_declarations_with_semantics(
+            "enum State { Ready = 'ready' } export default State;",
+        );
+        assert!(output.contains("export default State;"), "{output}");
+        assert!(!output.contains("_default"), "{output}");
     }
 
     #[test]

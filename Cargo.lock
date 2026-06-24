@@ -307,6 +307,7 @@ dependencies = [
  "ts_evaluator",
  "ts_jsnum",
  "ts_parser",
+ "ts_path",
 ]
 
 [[package]]

@@ -9,7 +9,7 @@ use ts_ast::{NodeData, NodeId};
 use ts_binder::{BindResult, bind_source_file};
 use ts_checker::{
     CheckDiagnostic, CheckResult, CheckerOptions, EnumConstantValue as CheckerConstantValue,
-    ProgramSource, TypeId, TypeKind, check_program, empty_check_result,
+    ProgramSource, TypeId, TypeKind, check_program_with_paths, empty_check_result,
 };
 use ts_config::{ConfigDiagnostic, resolve_config_file};
 use ts_core::{TextPos, TextRange};
@@ -1233,6 +1233,11 @@ impl Program {
             })
             .collect::<Vec<_>>();
         let checked = {
+            let source_paths = self
+                .source_files
+                .iter()
+                .map(|source_file| source_file.file_name.clone())
+                .collect::<Vec<_>>();
             let inputs = self
                 .source_files
                 .iter()
@@ -1264,7 +1269,7 @@ impl Program {
                     },
                 })
                 .collect::<Vec<_>>();
-            check_program(&inputs)
+            check_program_with_paths(&inputs, &source_paths)
         };
         let check_declaration_portability = self.options.declaration && !self.options.no_check;
         let portability_diagnostics = if check_declaration_portability {

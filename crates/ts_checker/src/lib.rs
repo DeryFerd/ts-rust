@@ -507,6 +507,15 @@ pub fn check_program(sources: &[ProgramSource<'_>]) -> ProgramCheckResult {
     ProgramChecker::new(sources).check()
 }
 
+/// Checks a program while retaining source paths for exact cross-file import-type rebasing.
+#[must_use]
+pub fn check_program_with_paths(
+    sources: &[ProgramSource<'_>],
+    source_paths: &[String],
+) -> ProgramCheckResult {
+    ProgramChecker::new_with_paths(sources, source_paths).check()
+}
+
 #[derive(Clone, Debug, PartialEq)]
 enum TypeDescriptor {
     Any,
@@ -573,6 +582,7 @@ enum TypeDescriptor {
 
 struct ProgramChecker<'a> {
     sources: &'a [ProgramSource<'a>],
+    source_paths: Option<&'a [String]>,
 }
 
 type DuplicateGlobal = (usize, NodeId, u32, String);
@@ -586,7 +596,17 @@ type ImportCollection = (
 
 impl<'a> ProgramChecker<'a> {
     const fn new(sources: &'a [ProgramSource<'a>]) -> Self {
-        Self { sources }
+        Self {
+            sources,
+            source_paths: None,
+        }
+    }
+
+    const fn new_with_paths(sources: &'a [ProgramSource<'a>], source_paths: &'a [String]) -> Self {
+        Self {
+            sources,
+            source_paths: Some(source_paths),
+        }
     }
 
     fn check(self) -> ProgramCheckResult {
@@ -614,7 +634,7 @@ impl<'a> ProgramChecker<'a> {
                 external_imports,
                 mut import_diagnostics,
                 import_runtime_meanings,
-            ) = self.imports(source, &preliminary, &files);
+            ) = self.imports(file_index, source, &preliminary, &files);
             let mut result =
                 if source.is_default_library {
                     preliminary[file_index].clone()
@@ -1689,6 +1709,7 @@ impl<'a> ProgramChecker<'a> {
     #[allow(clippy::too_many_lines)]
     fn imports(
         &self,
+        source_index: usize,
         source: &ProgramSource<'_>,
         preliminary: &[CheckResult],
         completed: &[CheckResult],
@@ -1775,6 +1796,18 @@ impl<'a> ProgramChecker<'a> {
                 if let Some(local_name) = identifier_text(source.arena, import.name) {
                     rewrite_named_descriptor_qualifier(&mut descriptor, local_name);
                 }
+                if specifier.starts_with('.')
+                    && let Some((source_path, target_path)) =
+                        self.import_rebase_paths(source_index, target)
+                {
+                    rebase_relative_import_references_between_files(
+                        &mut descriptor,
+                        source_path,
+                        target_path,
+                    );
+                } else {
+                    rebase_relative_import_references(&mut descriptor, specifier);
+                }
                 symbols.insert(symbol, descriptor);
                 continue;
             }
@@ -1800,6 +1833,7 @@ impl<'a> ProgramChecker<'a> {
                 preliminary,
                 completed,
             );
+            let rebase_paths = self.import_rebase_paths(source_index, target);
             let Some(clause) = import.import_clause else {
                 continue;
             };
@@ -1820,6 +1854,7 @@ impl<'a> ProgramChecker<'a> {
                     &mut symbols,
                     &mut import_references,
                     &mut diagnostics,
+                    rebase_paths,
                 );
             }
             if let Some(bindings) = clause_data.named_bindings
@@ -1852,6 +1887,7 @@ impl<'a> ProgramChecker<'a> {
                         &mut symbols,
                         &mut import_references,
                         &mut diagnostics,
+                        rebase_paths,
                     );
                 }
             } else if let Some(bindings) = clause_data.named_bindings
@@ -1894,6 +1930,11 @@ impl<'a> ProgramChecker<'a> {
         (symbols, import_references, diagnostics, runtime_meanings)
     }
 
+    fn import_rebase_paths(&self, source: usize, target: usize) -> Option<(&str, &str)> {
+        let paths = self.source_paths?;
+        Some((paths.get(source)?.as_str(), paths.get(target)?.as_str()))
+    }
+
     fn collect_import_runtime_meanings(
         &self,
         source: &ProgramSource<'_>,
@@ -1918,11 +1959,22 @@ impl<'a> ProgramChecker<'a> {
         symbols: &mut HashMap<SymbolId, TypeDescriptor>,
         import_references: &mut HashMap<SymbolId, ImportTypeReference>,
         diagnostics: &mut Vec<CheckDiagnostic>,
+        rebase_paths: Option<(&str, &str)>,
     ) {
         if let Some(descriptor) = exports.get(imported_name) {
             let mut descriptor = descriptor.clone();
             paint_exported_named_descriptor_imports(&mut descriptor, module_name, exports);
-            rebase_relative_import_references(&mut descriptor, module_name);
+            if module_name.starts_with('.')
+                && let Some((source_path, target_path)) = rebase_paths
+            {
+                rebase_relative_import_references_between_files(
+                    &mut descriptor,
+                    source_path,
+                    target_path,
+                );
+            } else {
+                rebase_relative_import_references(&mut descriptor, module_name);
+            }
             symbols.insert(symbol, descriptor);
             import_references.insert(
                 symbol,
@@ -13129,6 +13181,61 @@ fn rebase_relative_import_references(descriptor: &mut TypeDescriptor, imported_m
     });
 }
 
+fn rebase_relative_import_references_between_files(
+    descriptor: &mut TypeDescriptor,
+    source_file: &str,
+    imported_file: &str,
+) {
+    if let TypeDescriptor::Import { reference, .. } = descriptor
+        && reference.module_specifier.starts_with('.')
+    {
+        reference.module_specifier = rebase_module_specifier_between_files(
+            source_file,
+            imported_file,
+            &reference.module_specifier,
+        );
+    }
+    visit_descriptor_children(descriptor, |child| {
+        rebase_relative_import_references_between_files(child, source_file, imported_file);
+    });
+}
+
+fn rebase_module_specifier_between_files(
+    source_file: &str,
+    imported_file: &str,
+    nested: &str,
+) -> String {
+    let source_directory = ts_path::directory_path(source_file);
+    let imported_directory = ts_path::directory_path(imported_file);
+    let target = ts_path::resolve_path(&imported_directory, &[nested]);
+    let source_root_length = ts_path::root_length(&source_directory);
+    let target_root_length = ts_path::root_length(&target);
+    if source_directory[..source_root_length] != target[..target_root_length] {
+        return nested.to_owned();
+    }
+    let source_parts = source_directory[source_root_length..]
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    let target_parts = target[target_root_length..]
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    let common = source_parts
+        .iter()
+        .zip(&target_parts)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let mut parts = vec![".."; source_parts.len().saturating_sub(common)];
+    parts.extend(target_parts[common..].iter().copied());
+    let relative = parts.join("/");
+    if relative.starts_with('.') {
+        relative
+    } else {
+        format!("./{relative}")
+    }
+}
+
 fn rebase_module_specifier(imported_module: &str, nested: &str) -> String {
     let package_root_parts = if imported_module.starts_with('@') {
         2
@@ -15402,6 +15509,7 @@ mod tests {
         NamedTypeReference, ObjectType, ProgramChecker, ProgramSource, TypeArena, TypeDescriptor,
         TypeKind, check_program, check_source_file, check_source_file_with_options,
         describe_type_with_imports_bounded, identifier_text, rebase_module_specifier,
+        rebase_module_specifier_between_files,
     };
 
     struct Builder {
@@ -19567,6 +19675,14 @@ mod tests {
         );
         assert_eq!(rebase_module_specifier("core", "./SvgIcon"), "core/SvgIcon");
         assert_eq!(rebase_module_specifier("./utils", "./SvgIcon"), "./SvgIcon");
+        assert_eq!(
+            rebase_module_specifier_between_files(
+                "/project/projD/index.ts",
+                "/project/projC/index.d.ts",
+                "../projA",
+            ),
+            "../projA"
+        );
     }
 
     #[test]
