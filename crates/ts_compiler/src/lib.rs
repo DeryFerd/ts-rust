@@ -7892,6 +7892,80 @@ mod tests {
     }
 
     #[test]
+    fn nonportable_package_entry_alias_inference_suppresses_declaration_output() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/node_modules/some-dep/dist/inner.d.ts",
+            concat!(
+                "export type Other = { other: string };\n",
+                "export type SomeType = { arg: Other };",
+            ),
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/node_modules/some-dep/dist/index.d.ts",
+            concat!(
+                "export type OtherType = import('./inner').Other;\n",
+                "export type SomeType = import('./inner').SomeType;",
+            ),
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/node_modules/some-dep/package.json",
+            r#"{"name":"some-dep","types":"./dist/index.d.ts","exports":{".":"./dist/index.js"}}"#,
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/src/index.ts",
+            concat!(
+                "import { SomeType } from 'some-dep';\n",
+                "export const foo = (thing: SomeType) => thing;\n",
+                "export const bar = (thing: SomeType) => thing.arg;",
+            ),
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["src/index.ts".to_owned()],
+            CompilerOptions {
+                declaration: true,
+                no_lib: true,
+                module: ModuleKind::NodeNext,
+                target: ScriptTarget::Es2015,
+                strict: true,
+                ..CompilerOptions::default()
+            },
+        );
+        let entry = program
+            .source_files
+            .iter()
+            .find(|source| source.file_name == "/project/src/index.ts")
+            .unwrap();
+
+        assert_eq!(
+            program
+                .diagnostics()
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Some(2883))
+                .count(),
+            2,
+            "diagnostics={:?}, refs={:?}, named={:?}, types={:?}",
+            program.diagnostics(),
+            entry.checking.import_type_references,
+            entry.checking.named_type_references,
+            entry.checking.types,
+        );
+        assert!(
+            !program
+                .emit()
+                .files
+                .iter()
+                .any(|file| file.file_name == "/project/src/index.d.ts")
+        );
+    }
+
+    #[test]
     fn node_next_uses_the_nearest_package_type_for_javascript_emit() {
         for (package_json, common_js) in [
             ("{\"name\":\"pkg\"}", true),

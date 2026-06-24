@@ -2057,8 +2057,8 @@ impl<'a> ProgramChecker<'a> {
     ) {
         if let Some(descriptor) = exports.get(imported_name) {
             let mut descriptor = descriptor.clone();
-            if module_name.starts_with('.')
-                && let Some((source_path, target_path)) = rebase_paths
+            if let Some((source_path, target_path)) = rebase_paths
+                && (module_name.starts_with('.') || target_path.contains("/node_modules/"))
             {
                 rebase_relative_import_references_between_files(
                     &mut descriptor,
@@ -10900,7 +10900,8 @@ impl<'a> Checker<'a> {
                     if let Some(reference) = self.external_imports.get(&symbol).cloned() {
                         self.result
                             .import_type_references
-                            .insert(type_id, reference);
+                            .entry(type_id)
+                            .or_insert(reference);
                     }
                     type_id
                 } else if let Some(descriptor) = self.external_names.get(&name).cloned() {
@@ -11937,7 +11938,15 @@ impl<'a> Checker<'a> {
                 }
             }
             TypeDescriptor::Import { reference, target } => {
-                let type_id = self.import_type(target);
+                let target = self.import_type(target);
+                let kind = self.result.types.get(target).unwrap().kind.clone();
+                let type_id = self.result.types.alloc(kind);
+                if let Some(named) = self.result.named_type_references.get(&target).cloned() {
+                    self.result.named_type_references.insert(type_id, named);
+                }
+                if self.result.const_enum_types.contains(&target) {
+                    self.result.const_enum_types.insert(type_id);
+                }
                 self.result
                     .import_type_references
                     .insert(type_id, reference.clone());
@@ -13496,6 +13505,9 @@ fn paint_exported_named_descriptor_imports(
     if paint_exported_named_descriptor_import(descriptor, module_name, exports) {
         return;
     }
+    if matches!(descriptor, TypeDescriptor::Alias { .. }) {
+        return;
+    }
     match descriptor {
         TypeDescriptor::Named {
             name: _,
@@ -13509,7 +13521,6 @@ fn paint_exported_named_descriptor_imports(
         }
         TypeDescriptor::Import { target, .. }
         | TypeDescriptor::ConstEnum(target)
-        | TypeDescriptor::Alias { body: target, .. }
         | TypeDescriptor::Array(target) => {
             paint_exported_named_descriptor_imports(target, module_name, exports);
         }
@@ -14516,7 +14527,7 @@ fn describe_type_node_syntax(
                 reference: ImportTypeReference {
                     module_specifier: module.to_owned(),
                     qualifier,
-                    is_typeof: false,
+                    is_typeof: import.is_type_of,
                 },
                 target: Box::new(target),
             }
