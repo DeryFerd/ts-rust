@@ -32895,6 +32895,19 @@ mod tests {
     }
 
     #[test]
+    fn preserves_parenthesized_expressions_as_invalid_assignment_targets() {
+        assert_eq!(
+            emit_with(
+                "var x; (1, x) = 0;",
+                ScriptTarget::Es2015,
+                ModuleKind::EsNext,
+            )
+            .code,
+            "var x;\n(1, x) = 0;\n"
+        );
+    }
+
+    #[test]
     fn emits_native_and_downlevel_class_accessors() {
         let source =
             "class C { get X() { return 1; } set X(v = 0) { } static get Y() { return 2; } }";

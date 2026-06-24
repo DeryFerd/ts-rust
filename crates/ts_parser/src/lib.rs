@@ -3981,13 +3981,9 @@ impl<'a> Parser<'a> {
             | NodeData::NumericLiteral(_)
             | NodeData::BigIntLiteral(_)
             | NodeData::StringLiteral(_)
-            | NodeData::KeywordExpression(_) => true,
-            NodeData::ParenthesizedExpression(parenthesized) => {
-                self.expression_can_precede_assignment(parenthesized.expression, operator)
-            }
-            NodeData::NonNullExpression(non_null) => {
-                self.expression_can_precede_assignment(non_null.expression, operator)
-            }
+            | NodeData::KeywordExpression(_)
+            | NodeData::ParenthesizedExpression(_)
+            | NodeData::NonNullExpression(_) => true,
             NodeData::ArrayLiteralExpression(_) | NodeData::ObjectLiteralExpression(_) => {
                 operator == SyntaxKind::EqualsToken
             }
@@ -7472,6 +7468,25 @@ mod tests {
         assert_eq!(
             result.arena.get(assignment.operator_token).unwrap().kind,
             SyntaxKind::EqualsToken
+        );
+
+        let parenthesized = parse_source_file("(1, x) = 0;");
+        let NodeData::ExpressionStatement(statement) = &parenthesized
+            .arena
+            .get(source_statements(&parenthesized)[0])
+            .unwrap()
+            .data
+        else {
+            panic!("expected expression statement");
+        };
+        let NodeData::BinaryExpression(assignment) =
+            &parenthesized.arena.get(statement.expression).unwrap().data
+        else {
+            panic!("expected assignment expression");
+        };
+        assert_eq!(
+            parenthesized.arena.get(assignment.left).unwrap().kind,
+            SyntaxKind::ParenthesizedExpression
         );
     }
 
