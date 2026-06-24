@@ -4470,7 +4470,7 @@ impl DeclarationPrinter<'_> {
                 declaration_name_text(self.arena, specifier.name)
             }));
         }
-        self.arena.iter().any(|(id, node)| {
+        let syntactic_return = self.arena.iter().any(|(id, node)| {
             if self.node_is_within(id, import_id)
                 || !matches!(&node.data, NodeData::Identifier(identifier) if names.contains(identifier.text.as_str()))
             {
@@ -4506,6 +4506,74 @@ impl DeclarationPrinter<'_> {
                 }
             }
             false
+        });
+        syntactic_return
+            || names
+                .iter()
+                .any(|name| self.inferred_parameter_references_name(name))
+    }
+
+    fn inferred_parameter_references_name(&self, name: &str) -> bool {
+        let names = HashSet::from([name.to_owned()]);
+        self.arena.iter().any(|(id, node)| {
+            let parameters = match &node.data {
+                NodeData::FunctionDeclaration(function) if function.type_.is_none() => {
+                    &function.parameters
+                }
+                NodeData::MethodDeclaration(method) if method.type_.is_none() => &method.parameters,
+                _ => return false,
+            };
+            if self.declaration_reachability.is_some_and(|reachability| {
+                !reachability.values().any(|retained| retained.contains(&id))
+            }) {
+                return false;
+            }
+            let Some(signature) = self.semantic_function_signature(id) else {
+                return false;
+            };
+            parameters
+                .nodes
+                .iter()
+                .zip(&signature.parameters)
+                .any(|(parameter, type_id)| {
+                    let Some(NodeData::ParameterDeclaration(parameter)) =
+                        self.arena.get(*parameter).map(|node| &node.data)
+                    else {
+                        return false;
+                    };
+                    if parameter.type_.is_some() {
+                        return false;
+                    }
+                    let initializer_annotation_references_name = parameter
+                        .initializer
+                        .and_then(|initializer| self.resolve_entity_expression_symbol(initializer))
+                        .and_then(|symbol| self.bindings.symbols.get(symbol))
+                        .is_some_and(|symbol| {
+                            symbol.declarations.iter().any(|declaration| {
+                                let Some(NodeData::VariableDeclaration(variable)) =
+                                    self.arena.get(*declaration).map(|node| &node.data)
+                                else {
+                                    return false;
+                                };
+                                variable.type_.is_some_and(|type_node| {
+                                    self.arena.iter().any(|(id, node)| {
+                                        matches!(
+                                            &node.data,
+                                            NodeData::Identifier(identifier)
+                                                if identifier.text == name
+                                        ) && self.node_is_within(id, type_node)
+                                    })
+                                })
+                            })
+                        });
+                    initializer_annotation_references_name
+                        || self.semantic_type_references_names(
+                            *type_id,
+                            &names,
+                            &mut HashSet::new(),
+                            true,
+                        )
+                })
         })
     }
 
@@ -8749,6 +8817,11 @@ impl DeclarationPrinter<'_> {
                 result?;
             } else if let Some(hint) = self.jsdoc_parameter_type_hint(declaration, parameter.name) {
                 self.emit_jsdoc_type_hint(&hint);
+            } else if let Some(type_node) = parameter
+                .initializer
+                .and_then(|initializer| self.initializer_variable_type_annotation(initializer))
+            {
+                self.emit_type(type_node)?;
             } else if let Some(type_id) = type_id {
                 self.emit_semantic_parameter_type(type_id, optional)?;
             } else {
@@ -9317,6 +9390,11 @@ impl DeclarationPrinter<'_> {
                     parameter.initializer,
                     source_type,
                 )?;
+            } else if let Some(type_node) = parameter
+                .initializer
+                .and_then(|initializer| self.initializer_variable_type_annotation(initializer))
+            {
+                self.emit_type(type_node)?;
             } else if let Some(type_id) = parameter
                 .initializer
                 .and_then(|initializer| self.node_types?.get(&initializer).copied())
@@ -9330,6 +9408,47 @@ impl DeclarationPrinter<'_> {
         }
         self.writer.write(")");
         Ok(())
+    }
+
+    fn initializer_variable_type_annotation(&self, initializer: NodeId) -> Option<NodeId> {
+        let symbol = self.resolve_entity_expression_symbol(initializer)?;
+        let type_node = self
+            .bindings
+            .symbols
+            .get(symbol)?
+            .declarations
+            .iter()
+            .find_map(|declaration| {
+                let NodeData::VariableDeclaration(variable) = &self.arena.get(*declaration)?.data
+                else {
+                    return None;
+                };
+                variable.type_
+            })?;
+        self.arena
+            .iter()
+            .filter(|(id, _)| self.node_is_within(*id, type_node))
+            .filter_map(|(id, node)| {
+                let NodeData::Identifier(identifier) = &node.data else {
+                    return None;
+                };
+                self.bindings.resolve_name_at(id, &identifier.text)
+            })
+            .any(|symbol| {
+                self.bindings.symbols.get(symbol).is_some_and(|symbol| {
+                    symbol.declarations.iter().any(|declaration| {
+                        matches!(
+                            self.arena.get(*declaration).map(|node| &node.data),
+                            Some(
+                                NodeData::ImportSpecifier(_)
+                                    | NodeData::ImportClause(_)
+                                    | NodeData::NamespaceImport(_)
+                            )
+                        )
+                    })
+                })
+            })
+            .then_some(type_node)
     }
 
     fn emit_return_type(&mut self, type_: Option<NodeId>) -> Result<(), EmitError> {
@@ -14924,6 +15043,9 @@ impl DeclarationPrinter<'_> {
         if self.inferred_return_references_name(name) {
             return true;
         }
+        if self.inferred_parameter_references_name(name) {
+            return true;
+        }
         self.declaration_reachability.is_none_or(|reachability| {
             reachability.values().any(|retained| {
                 retained.iter().any(|statement| {
@@ -18485,9 +18607,25 @@ impl Printer<'_> {
         let Some(name) = declaration_name_text(self.arena, local) else {
             return false;
         };
-        let Some(symbol) = self.bindings.resolve_name_at(local, name) else {
+        let Some(mut symbol) = self.bindings.resolve_name_at(local, name) else {
             return false;
         };
+        if self.bindings.symbols.get(symbol).is_some_and(|symbol| {
+            symbol.target.is_none()
+                && !symbol.declarations.is_empty()
+                && symbol.declarations.iter().all(|declaration| {
+                    matches!(
+                        self.arena.get(*declaration).map(|node| &node.data),
+                        Some(NodeData::ExportSpecifier(_))
+                    )
+                })
+        }) && let Some(declaration_symbol) = self
+            .bindings
+            .root_scope()
+            .and_then(|scope| scope.symbols.get(name))
+        {
+            symbol = declaration_symbol;
+        }
         self.symbol_has_runtime_value(symbol, &mut HashSet::new())
     }
 
@@ -36956,6 +37094,17 @@ class Board {
             ModuleKind::CommonJs,
         );
         assert!(!type_only.code.contains("void 0;"), "{}", type_only.code);
+
+        let forward_type_only = emit_with(
+            "export { Shape, Alias }; interface Shape {} type Alias = Shape;",
+            ScriptTarget::Es2015,
+            ModuleKind::CommonJs,
+        );
+        assert!(
+            !forward_type_only.code.contains("void 0;"),
+            "{}",
+            forward_type_only.code
+        );
     }
 
     #[test]

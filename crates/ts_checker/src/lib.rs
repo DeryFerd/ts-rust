@@ -13272,7 +13272,7 @@ impl<'a> DeclarationReachability<'a> {
         let Some((identifier, name)) = self.leftmost_entity_name(entity) else {
             return;
         };
-        let Some(symbol) = self
+        let Some(mut symbol) = self
             .bindings
             .resolve_name_at(identifier, &name)
             .or_else(|| {
@@ -13283,6 +13283,22 @@ impl<'a> DeclarationReachability<'a> {
         else {
             return;
         };
+        if self.bindings.symbols.get(symbol).is_some_and(|symbol| {
+            symbol.target.is_none()
+                && !symbol.declarations.is_empty()
+                && symbol.declarations.iter().all(|declaration| {
+                    matches!(
+                        self.arena.get(*declaration).map(|node| &node.data),
+                        Some(NodeData::ExportSpecifier(_))
+                    )
+                })
+        }) && let Some(declaration_symbol) = self
+            .bindings
+            .root_scope()
+            .and_then(|scope| scope.symbols.get(&name))
+        {
+            symbol = declaration_symbol;
+        }
         let target = self
             .bindings
             .symbols
