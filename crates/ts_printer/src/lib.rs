@@ -273,6 +273,7 @@ pub fn emit_source_file_with_context(
         namespace_declarations: vec![HashSet::new()],
         generated_names: GeneratedNames::new(arena),
         runtime_identifier_uses: HashSet::new(),
+        synthetic_runtime_identifier_uses: HashSet::new(),
         commonjs_default_imports: HashMap::new(),
         commonjs_star_import_temps: HashMap::new(),
         commonjs_named_import_temps: HashMap::new(),
@@ -412,6 +413,9 @@ pub fn emit_source_file_with_context(
         printer
             .runtime_identifier_uses
             .insert(factory_root.to_owned());
+        printer
+            .synthetic_runtime_identifier_uses
+            .insert(factory_root.to_owned());
     }
     if settings.module == ModuleKind::CommonJs {
         let (star_temps, star_rewrites, star_text_rewrites) = commonjs_star_imports(
@@ -419,6 +423,7 @@ pub fn emit_source_file_with_context(
             &data.statements,
             context.bindings,
             &printer.runtime_identifier_uses,
+            &printer.synthetic_runtime_identifier_uses,
         );
         printer
             .generated_names
@@ -430,6 +435,7 @@ pub fn emit_source_file_with_context(
             &data.statements,
             context.bindings,
             &printer.runtime_identifier_uses,
+            &printer.synthetic_runtime_identifier_uses,
             &printer.commonjs_star_import_temps,
         );
         printer
@@ -441,6 +447,7 @@ pub fn emit_source_file_with_context(
             &data.statements,
             context.bindings,
             &printer.runtime_identifier_uses,
+            &printer.synthetic_runtime_identifier_uses,
             &printer.commonjs_default_imports,
             &printer.commonjs_star_import_temps,
         );
@@ -1628,6 +1635,7 @@ fn commonjs_star_imports(
     statements: &NodeList,
     bindings: &BindResult,
     runtime_identifier_uses: &HashSet<String>,
+    synthetic_runtime_identifier_uses: &HashSet<String>,
 ) -> (
     HashMap<NodeId, String>,
     HashMap<SymbolId, String>,
@@ -1656,7 +1664,13 @@ fn commonjs_star_imports(
         let mut defaults = Vec::new();
         let mut named = Vec::new();
         if let Some(name) = clause.name
-            && binding_has_runtime_identifier_use(arena, bindings, name, runtime_identifier_uses)
+            && binding_has_runtime_identifier_use(
+                arena,
+                bindings,
+                name,
+                runtime_identifier_uses,
+                synthetic_runtime_identifier_uses,
+            )
         {
             defaults.push(name);
         }
@@ -1680,6 +1694,7 @@ fn commonjs_star_imports(
                             bindings,
                             specifier.name,
                             runtime_identifier_uses,
+                            synthetic_runtime_identifier_uses,
                         ))
                 {
                     continue;
@@ -1750,6 +1765,7 @@ fn commonjs_default_imports(
     statements: &NodeList,
     bindings: &BindResult,
     runtime_identifier_uses: &HashSet<String>,
+    synthetic_runtime_identifier_uses: &HashSet<String>,
     star_imports: &HashMap<NodeId, String>,
 ) -> HashMap<String, String> {
     let mut imports = HashMap::new();
@@ -1777,6 +1793,7 @@ fn commonjs_default_imports(
                 bindings,
                 name,
                 runtime_identifier_uses,
+                synthetic_runtime_identifier_uses,
             )
             && let Some(name) = declaration_name_text(arena, name)
         {
@@ -1805,6 +1822,7 @@ fn commonjs_default_imports(
                     bindings,
                     specifier.name,
                     runtime_identifier_uses,
+                    synthetic_runtime_identifier_uses,
                 ) || declaration_name_text(arena, specifier.name)
                     .is_some_and(|name| import_name_is_reexported(arena, name)))
                     && let Some(name) = declaration_name_text(arena, specifier.name)
@@ -1884,6 +1902,7 @@ fn commonjs_named_imports(
     statements: &NodeList,
     bindings: &BindResult,
     runtime_identifier_uses: &HashSet<String>,
+    synthetic_runtime_identifier_uses: &HashSet<String>,
     default_imports: &HashMap<String, String>,
     star_imports: &HashMap<NodeId, String>,
 ) -> (
@@ -1953,6 +1972,7 @@ fn commonjs_named_imports(
                 bindings,
                 specifier.name,
                 runtime_identifier_uses,
+                synthetic_runtime_identifier_uses,
             ) {
                 continue;
             }
@@ -1985,12 +2005,16 @@ fn binding_has_runtime_identifier_use(
     bindings: &BindResult,
     binding: NodeId,
     runtime_identifier_uses: &HashSet<String>,
+    synthetic_runtime_identifier_uses: &HashSet<String>,
 ) -> bool {
     let Some(name) = declaration_name_text(arena, binding) else {
         return false;
     };
     if !runtime_identifier_uses.contains(name) {
         return false;
+    }
+    if synthetic_runtime_identifier_uses.contains(name) {
+        return true;
     }
     let symbol = bindings
         .node_symbols
@@ -19485,6 +19509,7 @@ struct Printer<'a> {
     namespace_declarations: Vec<HashSet<String>>,
     generated_names: GeneratedNames,
     runtime_identifier_uses: HashSet<String>,
+    synthetic_runtime_identifier_uses: HashSet<String>,
     commonjs_default_imports: HashMap<String, String>,
     commonjs_star_import_temps: HashMap<NodeId, String>,
     commonjs_named_import_temps: HashMap<NodeId, String>,
@@ -35512,11 +35537,29 @@ impl Printer<'_> {
         }
         self.emit_downlevel_declarator_start(emitted);
         self.writer.write("{ ");
+        let mut previous_end = pattern_node.range.start.get().saturating_add(1);
         for (index, element_id) in ordinary.iter().enumerate() {
             if index != 0 {
                 self.writer.write(", ");
             }
+            let element_node = self.node(*element_id)?.clone();
+            if index == 0
+                && !self.settings.remove_comments
+                && self.source_range_contains_comment(
+                    previous_end,
+                    element_node.range.start.get(),
+                )
+            {
+                self.writer.newline_preserving_trailing_spaces();
+            }
+            self.emit_source_comments_between_with_ownership(
+                previous_end,
+                element_node.range.start.get(),
+                true,
+                true,
+            );
             self.emit_expression(*element_id, 0)?;
+            previous_end = element_node.range.end.get();
         }
         self.writer.write(" } = ");
         if let Some(temp) = temp.as_deref() {
@@ -42383,6 +42426,7 @@ impl Printer<'_> {
             self.bindings,
             name,
             &self.runtime_identifier_uses,
+            &self.synthetic_runtime_identifier_uses,
         )
     }
 
@@ -44585,8 +44629,12 @@ impl Printer<'_> {
                 .jsx_factory
                 .clone()
                 .unwrap_or_else(|| "React.createElement".to_owned());
+            let factory = self.rewrite_synthetic_runtime_qualified_name(&factory);
+            let fragment = self.rewrite_synthetic_runtime_qualified_name("React.Fragment");
             self.writer.write(&factory);
-            self.writer.write("(React.Fragment, null");
+            self.writer.write("(");
+            self.writer.write(&fragment);
+            self.writer.write(", null");
             for child in semantic_jsx_children(self.arena, &data.children) {
                 self.writer.write(", ");
                 self.emit_jsx_child(child, false)?;
@@ -44610,6 +44658,7 @@ impl Printer<'_> {
             .jsx_factory
             .clone()
             .unwrap_or_else(|| "React.createElement".to_owned());
+        let factory = self.rewrite_synthetic_runtime_qualified_name(&factory);
         self.writer.write(&factory);
         self.writer.write("(");
         let tag = self.node(tag_name)?.clone();
@@ -44648,6 +44697,18 @@ impl Printer<'_> {
         }
         self.writer.write(")");
         Ok(())
+    }
+
+    fn rewrite_synthetic_runtime_qualified_name(&self, name: &str) -> String {
+        let root = name.split('.').next().unwrap_or(name);
+        let suffix = &name[root.len()..];
+        if let Some(temp) = self.commonjs_default_imports.get(root) {
+            return format!("{temp}.default{suffix}");
+        }
+        if let Some(rewrite) = self.commonjs_named_import_text_rewrites.get(root) {
+            return format!("{rewrite}{suffix}");
+        }
+        name.to_owned()
     }
 
     fn emit_automatic_jsx(
