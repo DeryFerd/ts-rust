@@ -318,10 +318,21 @@ pub fn parse_baseline_sections(baseline: &str) -> BTreeMap<String, String> {
 }
 
 fn parse_baseline_section_list(baseline: &str) -> Vec<(String, String)> {
+    let mut normalized = String::with_capacity(baseline.len());
+    let mut offset = 0;
+    for (index, _) in baseline.match_indices("//// [") {
+        normalized.push_str(&baseline[offset..index]);
+        if index > 0 && !matches!(baseline.as_bytes()[index - 1], b'\n' | b'\r') {
+            normalized.push('\n');
+        }
+        offset = index;
+    }
+    normalized.push_str(&baseline[offset..]);
+
     let mut sections = Vec::new();
     let mut current_name: Option<String> = None;
     let mut current_text = String::new();
-    for line in baseline.split_inclusive('\n') {
+    for line in normalized.split_inclusive('\n') {
         let marker = line.trim_end_matches(['\r', '\n']);
         if let Some(name) = marker
             .strip_prefix("//// [")
@@ -1747,6 +1758,22 @@ mod tests {
         assert_eq!(sections.len(), 2);
         assert_eq!(sections["input.ts"], "const value: number = 1;\n");
         assert_eq!(sections["input.js"], "const value = 1;\n");
+    }
+
+    #[test]
+    fn parses_section_marker_appended_to_source_map_url() {
+        let sections = parse_baseline_sections(concat!(
+            "//// [a.d.ts] ////\n",
+            "declare const a: number;\n",
+            "//# sourceMappingURL=a.d.ts.map",
+            "//// [b.d.ts] ////\n",
+            "declare const b: number;\n",
+        ));
+        assert_eq!(
+            sections["a.d.ts"],
+            "declare const a: number;\n//# sourceMappingURL=a.d.ts.map\n"
+        );
+        assert_eq!(sections["b.d.ts"], "declare const b: number;\n");
     }
 
     #[test]

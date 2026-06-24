@@ -12616,14 +12616,21 @@ impl<'a> Checker<'a> {
         if !is_class || self.result.import_type_references.contains_key(&type_id) {
             return type_id;
         }
-        let Some(kind @ (TypeKind::Object(_) | TypeKind::Union(_) | TypeKind::Intersection(_))) =
-            self.result
-                .types
-                .get(type_id)
-                .map(|type_| type_.kind.clone())
+        let Some(kind) = self
+            .result
+            .types
+            .get(type_id)
+            .map(|type_| type_.kind.clone())
         else {
             return type_id;
         };
+        if !(matches!(
+            &kind,
+            TypeKind::Object(_) | TypeKind::Union(_) | TypeKind::Intersection(_)
+        ) || matches!(&kind, TypeKind::Any) && self.class_value_stack.contains(&symbol))
+        {
+            return type_id;
+        }
         let Some(mut name) = self.value_expression_text(expression) else {
             return type_id;
         };

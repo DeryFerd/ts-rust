@@ -38964,6 +38964,7 @@ class Board {
         );
         assert!(output.contains("declare var instance: C;"), "{output}");
         assert!(output.contains("declare var color: Color;"), "{output}");
+        assert!(output.contains("static make(): C;"), "{output}");
     }
 
     #[test]
