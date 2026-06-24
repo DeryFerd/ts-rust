@@ -287,8 +287,13 @@ pub fn emit_source_file_with_context(
         printer.runtime_identifier_uses.insert("React".to_owned());
     }
     if settings.module == ModuleKind::CommonJs {
-        printer.commonjs_default_imports =
-            commonjs_default_imports(arena, &data.statements, &printer.runtime_identifier_uses);
+        printer.commonjs_default_imports = commonjs_default_imports(
+            arena,
+            &data.statements,
+            &printer.runtime_identifier_uses,
+            context.import_runtime_meanings,
+            context.preserve_const_enums,
+        );
         let (temps, rewrites, text_rewrites) = commonjs_named_imports(
             arena,
             &data.statements,
@@ -1221,10 +1226,15 @@ fn commonjs_default_imports(
     arena: &NodeArena,
     statements: &NodeList,
     runtime_identifier_uses: &HashSet<String>,
+    import_runtime_meanings: &BTreeMap<NodeId, bool>,
+    preserve_const_enums: bool,
 ) -> HashMap<String, String> {
     let mut imports = HashMap::new();
     let mut module_name_counts = HashMap::<String, usize>::new();
     for statement in &statements.nodes {
+        if import_runtime_meanings.get(statement) == Some(&false) && !preserve_const_enums {
+            continue;
+        }
         let Some(NodeData::ImportDeclaration(import)) =
             arena.get(*statement).map(|node| &node.data)
         else {
@@ -1343,6 +1353,9 @@ fn commonjs_named_imports(
         .used
         .extend(default_imports.values().cloned());
     for statement in &statements.nodes {
+        if import_runtime_meanings.get(statement) == Some(&false) && !preserve_const_enums {
+            continue;
+        }
         let Some(NodeData::ImportDeclaration(import)) =
             arena.get(*statement).map(|node| &node.data)
         else {
@@ -1354,7 +1367,6 @@ fn commonjs_named_imports(
         let Some(clause_id) = import.import_clause else {
             continue;
         };
-        let _ = (import_runtime_meanings, preserve_const_enums);
         let Some(NodeData::ImportClause(clause)) = arena.get(clause_id).map(|node| &node.data)
         else {
             continue;
@@ -14160,16 +14172,39 @@ fn const_enum_access_fallbacks(
         let Some(receiver_name) = enum_entity_path(arena, receiver) else {
             continue;
         };
+        let receiver_symbol = enum_entity_symbol(arena, bindings, receiver)
+            .and_then(|symbol| bindings.symbols.get(symbol));
         let root = receiver_name.split('.').next().unwrap_or(&receiver_name);
-        let resolved_name = bindings
+        let root_symbol = bindings
             .resolve_name_at(receiver, root)
             .and_then(|symbol| bindings.symbols.get(symbol));
-        let resolved_name = match resolved_name {
-            Some(symbol) if symbol.flags.contains(ts_binder::SymbolFlags::CONST_ENUM) => {
+        let resolved_name = match (receiver_symbol, root_symbol) {
+            (Some(symbol), _) if symbol.flags.contains(ts_binder::SymbolFlags::CONST_ENUM) => {
+                receiver_name.clone()
+            }
+            (_, Some(symbol)) if symbol.flags.contains(ts_binder::SymbolFlags::CONST_ENUM) => {
                 symbol.name.clone()
             }
-            Some(_) => continue,
-            None => aliases.get(root).map_or_else(
+            (_, Some(symbol))
+                if aliases.contains_key(root)
+                    && symbol.declarations.iter().any(|declaration| {
+                        matches!(
+                            arena.get(*declaration).map(|node| &node.data),
+                            Some(NodeData::ImportEqualsDeclaration(import))
+                                if !matches!(
+                                    arena.get(import.module_reference).map(|node| &node.data),
+                                    Some(NodeData::ExternalModuleReference(_))
+                                )
+                        )
+                    }) =>
+            {
+                receiver_name.strip_prefix(root).map_or_else(
+                    || aliases[root].clone(),
+                    |suffix| format!("{}{suffix}", aliases[root]),
+                )
+            }
+            (_, Some(_)) => continue,
+            (_, None) => aliases.get(root).map_or_else(
                 || receiver_name.clone(),
                 |target| {
                     receiver_name
@@ -14198,6 +14233,28 @@ fn enum_entity_path(arena: &NodeArena, entity: NodeId) -> Option<String> {
             enum_entity_path(arena, access.expression)?,
             declaration_name_text(arena, access.name)?
         )),
+        _ => None,
+    }
+}
+
+fn enum_entity_symbol(
+    arena: &NodeArena,
+    bindings: &BindResult,
+    entity: NodeId,
+) -> Option<SymbolId> {
+    if let Some(symbol) = bindings.node_symbols.get(&entity) {
+        return Some(*symbol);
+    }
+    match &arena.get(entity)?.data {
+        NodeData::Identifier(identifier) => bindings.resolve_name_at(entity, &identifier.text),
+        NodeData::PropertyAccessExpression(access) => {
+            if let Some(symbol) = bindings.node_symbols.get(&access.name) {
+                return Some(*symbol);
+            }
+            let receiver = enum_entity_symbol(arena, bindings, access.expression)?;
+            let name = declaration_name_text(arena, access.name)?;
+            bindings.symbols.get(receiver)?.members.get(name)
+        }
         _ => None,
     }
 }
@@ -27197,9 +27254,8 @@ impl Printer<'_> {
                     break;
                 }
                 if let NodeData::ExportAssignment(assignment) = &parent.data {
-                    return !assignment.is_export_equals
-                        || self
-                            .entity_has_runtime_value(assignment.expression, &mut HashSet::new());
+                    return self
+                        .entity_has_runtime_value(assignment.expression, &mut HashSet::new());
                 }
                 if matches!(parent.data, NodeData::ExportDeclaration(_))
                     && !self.const_enum_emit_mode.preserves_declarations()
@@ -27211,8 +27267,8 @@ impl Printer<'_> {
                     NodeData::PropertyAccessExpression(_) | NodeData::ElementAccessExpression(_)
                 ) && self.const_enum_emit_mode.inlines_accesses()
                     && (self.enum_access_values.contains_key(&parent_id)
-                        || self.enum_access_fallbacks.contains_key(&parent_id))
-                    && !self.import_name_semantically_has_runtime_value(name)
+                        || (self.enum_access_fallbacks.contains_key(&parent_id)
+                            && !self.import_name_semantically_has_runtime_value(name)))
                     && !identifier_is_within_computed_property_name(self.arena, id)
                 {
                     break;
@@ -27363,7 +27419,8 @@ impl Printer<'_> {
     fn emit_expression(&mut self, id: NodeId, parent_precedence: u8) -> Result<(), EmitError> {
         let node = self.node(id)?.clone();
         if self.const_enum_emit_mode.inlines_accesses()
-            && !self.expression_uses_semantic_runtime_import(id)
+            && (self.enum_access_values.contains_key(&id)
+                || !self.expression_uses_semantic_runtime_import(id))
             && let Some(value) = self
                 .enum_access_values
                 .get(&id)

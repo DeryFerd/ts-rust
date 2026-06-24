@@ -462,11 +462,14 @@ impl Program {
                         comment_end: dependency.range.end.get(),
                     })
                     .collect::<Vec<_>>();
-                let import_runtime_meanings = if source_settings.module == ModuleKind::Amd {
-                    import_runtime_meanings_for_emit(source_file)
-                } else {
-                    source_file.checking.import_runtime_meanings.clone()
-                };
+                let preserve_const_enums = self.options.preserve_const_enums
+                    || self.options.isolated_modules
+                    || self.options.verbatim_module_syntax;
+                let import_runtime_meanings = import_runtime_meanings_for_emit(
+                    source_file,
+                    preserve_const_enums,
+                    source_settings.module == ModuleKind::Amd,
+                );
                 let emit_context = EmitContext {
                     bindings: &source_file.binding,
                     amd_module_name: source_file.parse.amd_module_name.as_deref(),
@@ -477,9 +480,7 @@ impl Program {
                     enum_member_values: &enum_member_values,
                     enum_access_values: &enum_access_values,
                     import_runtime_meanings: &import_runtime_meanings,
-                    preserve_const_enums: self.options.preserve_const_enums
-                        || self.options.isolated_modules
-                        || self.options.verbatim_module_syntax,
+                    preserve_const_enums,
                     inline_const_enums: !self.options.isolated_modules
                         && !self.options.verbatim_module_syntax,
                     module_detection: self.options.module_detection,
@@ -663,11 +664,14 @@ impl Program {
                     });
                 let amd_module_specifier_rewrites =
                     self.amd_bundle_specifier_rewrites(source, &bundle_root);
-                let import_runtime_meanings = if settings.module == ModuleKind::Amd {
-                    import_runtime_meanings_for_emit(source)
-                } else {
-                    source.checking.import_runtime_meanings.clone()
-                };
+                let preserve_const_enums = self.options.preserve_const_enums
+                    || self.options.isolated_modules
+                    || self.options.verbatim_module_syntax;
+                let import_runtime_meanings = import_runtime_meanings_for_emit(
+                    source,
+                    preserve_const_enums,
+                    settings.module == ModuleKind::Amd,
+                );
                 let emit_context = EmitContext {
                     bindings: &source.binding,
                     amd_module_name: amd_module_name.as_deref(),
@@ -678,9 +682,7 @@ impl Program {
                     enum_member_values: &enum_member_values,
                     enum_access_values: &enum_access_values,
                     import_runtime_meanings: &import_runtime_meanings,
-                    preserve_const_enums: self.options.preserve_const_enums
-                        || self.options.isolated_modules
-                        || self.options.verbatim_module_syntax,
+                    preserve_const_enums,
                     inline_const_enums: !self.options.isolated_modules
                         && !self.options.verbatim_module_syntax,
                     module_detection: self.options.module_detection,
@@ -2870,7 +2872,11 @@ fn source_is_external_module(source: &SourceFile) -> bool {
     })
 }
 
-fn import_runtime_meanings_for_emit(source: &SourceFile) -> BTreeMap<NodeId, bool> {
+fn import_runtime_meanings_for_emit(
+    source: &SourceFile,
+    preserve_const_enums: bool,
+    amd: bool,
+) -> BTreeMap<NodeId, bool> {
     let mut meanings = source.checking.import_runtime_meanings.clone();
     let Some(NodeData::SourceFile(file)) = source
         .parse
@@ -2881,12 +2887,86 @@ fn import_runtime_meanings_for_emit(source: &SourceFile) -> BTreeMap<NodeId, boo
         return meanings;
     };
     for statement in &file.statements.nodes {
+        if preserve_const_enums
+            && let Some(NodeData::ImportDeclaration(import)) =
+                source.parse.arena.get(*statement).map(|node| &node.data)
+        {
+            let binding_is_const_enum = |binding: NodeId| {
+                source
+                    .binding
+                    .node_symbols
+                    .get(&binding)
+                    .and_then(|symbol| source.checking.symbol_types.get(symbol))
+                    .is_some_and(|type_id| source.checking.const_enum_types.contains(type_id))
+            };
+            let preserves_import = import
+                .import_clause
+                .and_then(|clause| source.parse.arena.get(clause))
+                .and_then(|node| match &node.data {
+                    NodeData::ImportClause(clause) => Some(clause),
+                    _ => None,
+                })
+                .is_some_and(|clause| {
+                    clause.name.is_some_and(binding_is_const_enum)
+                        || clause.named_bindings.is_some_and(|bindings| {
+                            match source.parse.arena.get(bindings).map(|node| &node.data) {
+                                Some(NodeData::NamedImports(imports)) => {
+                                    imports.elements.nodes.iter().any(|specifier| {
+                                        matches!(
+                                            source.parse.arena.get(*specifier).map(|node| &node.data),
+                                            Some(NodeData::ImportSpecifier(specifier))
+                                                if binding_is_const_enum(specifier.name)
+                                        )
+                                    })
+                                }
+                                _ => false,
+                            }
+                        })
+                });
+            if preserves_import {
+                meanings.insert(*statement, true);
+            }
+        }
+        if !amd {
+            continue;
+        }
         let Some(NodeData::ImportEqualsDeclaration(import)) =
             source.parse.arena.get(*statement).map(|node| &node.data)
         else {
             continue;
         };
         if !import.is_type_only {
+            let import_name =
+                source
+                    .parse
+                    .arena
+                    .get(import.name)
+                    .and_then(|node| match &node.data {
+                        NodeData::Identifier(identifier) => Some(identifier.text.as_str()),
+                        _ => None,
+                    });
+            let has_inlined_const_enum_access = import_name.is_some_and(|import_name| {
+                source.checking.enum_access_values.keys().any(|access| {
+                    let mut current = *access;
+                    loop {
+                        match source.parse.arena.get(current).map(|node| &node.data) {
+                            Some(NodeData::PropertyAccessExpression(access)) => {
+                                current = access.expression;
+                            }
+                            Some(NodeData::ElementAccessExpression(access)) => {
+                                current = access.expression;
+                            }
+                            Some(NodeData::Identifier(identifier)) => {
+                                break identifier.text == import_name;
+                            }
+                            _ => break false,
+                        }
+                    }
+                })
+            });
+            if meanings.get(statement) == Some(&false) && has_inlined_const_enum_access {
+                continue;
+            }
             // Import-equals runtime use is decided from its actual value references by
             // the emitter. An ambient module has no implementation initializer, so
             // symbol-shape classification alone must not erase a referenced require.

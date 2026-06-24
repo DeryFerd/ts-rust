@@ -388,6 +388,8 @@ pub struct CheckResult {
     pub named_type_references: BTreeMap<TypeId, NamedTypeReference>,
     pub enum_member_values: BTreeMap<NodeId, EnumConstantValue>,
     pub enum_access_values: BTreeMap<NodeId, EnumConstantValue>,
+    /// Enum value types erased from JavaScript unless const enums are preserved.
+    pub const_enum_types: BTreeSet<TypeId>,
     /// Resolved import declarations and whether their target has runtime value meaning.
     /// Missing entries are unresolved and should retain the emitter's syntactic fallback.
     pub import_runtime_meanings: BTreeMap<NodeId, bool>,
@@ -478,6 +480,7 @@ pub fn empty_check_result() -> CheckResult {
         named_type_references: BTreeMap::new(),
         enum_member_values: BTreeMap::new(),
         enum_access_values: BTreeMap::new(),
+        const_enum_types: BTreeSet::new(),
         import_runtime_meanings: BTreeMap::new(),
         declaration_reachability: BTreeMap::new(),
         diagnostics: Vec::new(),
@@ -1731,6 +1734,44 @@ impl<'a> ProgramChecker<'a> {
                         getter_properties: BTreeSet::new(),
                     }
                 });
+                let export_equals_is_const_enum = self
+                    .resolved_module_export_symbols(target, specifier)
+                    .get("export=")
+                    .and_then(|symbol| {
+                        let target_source = self.sources.get(target)?;
+                        let symbol = target_source.bindings.symbols.get(*symbol)?;
+                        let target_symbol = symbol
+                            .target
+                            .and_then(|target| target_source.bindings.symbols.get(target));
+                        let assignment_target =
+                            symbol.declarations.iter().find_map(|declaration| {
+                                let NodeData::ExportAssignment(assignment) =
+                                    &target_source.arena.get(*declaration)?.data
+                                else {
+                                    return None;
+                                };
+                                let target = Self::resolve_entity_symbol(
+                                    target_source,
+                                    assignment.expression,
+                                )?;
+                                target_source.bindings.symbols.get(target)
+                            });
+                        Some(
+                            symbol.flags.contains(ts_binder::SymbolFlags::CONST_ENUM)
+                                || target_symbol.is_some_and(|symbol| {
+                                    symbol.flags.contains(ts_binder::SymbolFlags::CONST_ENUM)
+                                })
+                                || assignment_target.is_some_and(|symbol| {
+                                    symbol.flags.contains(ts_binder::SymbolFlags::CONST_ENUM)
+                                }),
+                        )
+                    })
+                    .unwrap_or(false);
+                if export_equals_is_const_enum
+                    && !matches!(descriptor, TypeDescriptor::ConstEnum(_))
+                {
+                    descriptor = TypeDescriptor::ConstEnum(Box::new(descriptor));
+                }
                 if let Some(local_name) = identifier_text(source.arena, import.name) {
                     rewrite_named_descriptor_qualifier(&mut descriptor, local_name);
                 }
@@ -1979,8 +2020,14 @@ impl<'a> ProgramChecker<'a> {
                                 TypeDescriptor::Intersection(vec![declaration, namespace])
                             }));
                         }
-                        if namespace.is_some() {
-                            return namespace;
+                        if let Some(namespace) = namespace {
+                            return Some(
+                                if symbol.flags.contains(ts_binder::SymbolFlags::CONST_ENUM) {
+                                    TypeDescriptor::ConstEnum(Box::new(namespace))
+                                } else {
+                                    namespace
+                                },
+                            );
                         }
                         let target = symbol.target.unwrap_or(current);
                         let target_symbol = source.bindings.symbols.get(target)?;
@@ -1995,7 +2042,12 @@ impl<'a> ProgramChecker<'a> {
                                 source.arena.get(*declaration).map(|node| &node.data)
                                 && let Some(type_id) = result.type_of_node(assignment.expression)
                             {
-                                return Some(describe_type(&result.types, type_id));
+                                let descriptor = describe_type(&result.types, type_id);
+                                return Some(if result.const_enum_types.contains(&type_id) {
+                                    TypeDescriptor::ConstEnum(Box::new(descriptor))
+                                } else {
+                                    descriptor
+                                });
                             }
                         }
                         let descriptor = result
@@ -2409,7 +2461,6 @@ struct Checker<'a> {
     symbol_reads: HashMap<SymbolId, usize>,
     enum_member_owners: HashMap<TypeId, TypeId>,
     enum_types: BTreeSet<TypeId>,
-    const_enum_types: BTreeSet<TypeId>,
     checked_overload_symbols: HashSet<SymbolId>,
     reported_unresolved_type_names: HashSet<NodeId>,
     this_types: Vec<TypeId>,
@@ -2448,6 +2499,7 @@ impl<'a> Checker<'a> {
                 named_type_references: BTreeMap::new(),
                 enum_member_values: BTreeMap::new(),
                 enum_access_values: BTreeMap::new(),
+                const_enum_types: BTreeSet::new(),
                 import_runtime_meanings: BTreeMap::new(),
                 declaration_reachability: BTreeMap::new(),
                 diagnostics: Vec::new(),
@@ -2478,7 +2530,6 @@ impl<'a> Checker<'a> {
             symbol_reads: HashMap::new(),
             enum_member_owners: HashMap::new(),
             enum_types: BTreeSet::new(),
-            const_enum_types: BTreeSet::new(),
             checked_overload_symbols: HashSet::new(),
             reported_unresolved_type_names: HashSet::new(),
             this_types: Vec::new(),
@@ -2869,7 +2920,7 @@ impl<'a> Checker<'a> {
         }
         self.enum_types.insert(enum_type);
         if is_const {
-            self.const_enum_types.insert(enum_type);
+            self.result.const_enum_types.insert(enum_type);
         }
         enum_type
     }
@@ -2993,7 +3044,7 @@ impl<'a> Checker<'a> {
     }
 
     fn record_const_enum_access(&mut self, node: NodeId, receiver: TypeId, value: TypeId) {
-        if !self.const_enum_types.contains(&receiver) {
+        if !self.result.const_enum_types.contains(&receiver) {
             return;
         }
         let constant = match &self
@@ -6588,7 +6639,7 @@ impl<'a> Checker<'a> {
             },
             NodeData::Identifier(identifier) => {
                 let type_id = self.identifier_type(node_id, &identifier.text);
-                if self.const_enum_types.contains(&type_id)
+                if self.result.const_enum_types.contains(&type_id)
                     && !self.const_enum_value_usage_permitted(node_id)
                 {
                     self.error(node_id, 2475, std::iter::empty());
@@ -6759,7 +6810,7 @@ impl<'a> Checker<'a> {
             }
             NodeData::ElementAccessExpression(data) => {
                 let receiver = self.type_of_expression(data.expression);
-                if self.const_enum_types.contains(&receiver)
+                if self.result.const_enum_types.contains(&receiver)
                     && !matches!(
                         self.arena
                             .get(data.argument_expression)
@@ -11410,7 +11461,7 @@ impl<'a> Checker<'a> {
                 .alloc(TypeKind::BigIntLiteral(value.clone())),
             TypeDescriptor::ConstEnum(enum_type) => {
                 let type_id = self.import_type(enum_type);
-                self.const_enum_types.insert(type_id);
+                self.result.const_enum_types.insert(type_id);
                 type_id
             }
             TypeDescriptor::Alias { .. } => self.import_alias(descriptor, &[]),
@@ -16384,6 +16435,43 @@ mod tests {
                 EnumConstantValue::String("imported".into()),
                 EnumConstantValue::Number(7.0),
             ]
+        );
+    }
+
+    #[test]
+    fn publishes_const_enum_access_values_through_export_equals() {
+        let dependency = parse_source_file("const enum E { V = 100 } export = E;");
+        let consumer = parse_source_file("import A = require(\"m1\"); A.V;");
+        let dependency_bindings = bind_source_file(&dependency.arena, dependency.source_file);
+        let consumer_bindings = bind_source_file(&consumer.arena, consumer.source_file);
+        let checked = check_program(&[
+            ProgramSource {
+                arena: &dependency.arena,
+                source_file: dependency.source_file,
+                bindings: &dependency_bindings,
+                resolved_modules: &BTreeMap::new(),
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+            ProgramSource {
+                arena: &consumer.arena,
+                source_file: consumer.source_file,
+                bindings: &consumer_bindings,
+                resolved_modules: &BTreeMap::from([("m1".into(), 0)]),
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+        ]);
+
+        assert_eq!(
+            checked.files[1]
+                .enum_access_values
+                .values()
+                .cloned()
+                .collect::<Vec<_>>(),
+            [EnumConstantValue::Number(100.0)]
         );
     }
 
