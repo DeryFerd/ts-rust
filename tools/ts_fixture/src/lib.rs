@@ -953,6 +953,7 @@ const SCALAR_OPTION_NAMES: &[&str] = &[
     "declarationMap",
     "declarationDir",
     "emitDeclarationOnly",
+    "emitDecoratorMetadata",
     "esModuleInterop",
     "exactOptionalPropertyTypes",
     "forceConsistentCasingInFileNames",

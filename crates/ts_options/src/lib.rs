@@ -91,6 +91,7 @@ pub struct CompilerOptions {
     pub declaration: bool,
     pub declaration_map: bool,
     pub emit_declaration_only: bool,
+    pub emit_decorator_metadata: bool,
     pub es_module_interop: bool,
     pub exact_optional_property_types: bool,
     pub force_consistent_casing_in_file_names: bool,
@@ -153,6 +154,7 @@ impl Default for CompilerOptions {
             declaration: false,
             declaration_map: false,
             emit_declaration_only: false,
+            emit_decorator_metadata: false,
             es_module_interop: false,
             exact_optional_property_types: false,
             force_consistent_casing_in_file_names: false,
@@ -277,6 +279,9 @@ impl CompilerOptions {
                 "isolatedmodules" => self.isolated_modules = overrides.isolated_modules,
                 "isolateddeclarations" => {
                     self.isolated_declarations = overrides.isolated_declarations;
+                }
+                "emitdecoratormetadata" => {
+                    self.emit_decorator_metadata = overrides.emit_decorator_metadata;
                 }
                 "importhelpers" => self.import_helpers = overrides.import_helpers,
                 "jsx" => self.jsx = overrides.jsx,
@@ -478,6 +483,9 @@ pub fn parse_compiler_options_map(options: &BTreeMap<String, JsonValue>) -> Pars
             "emitdeclarationonly" => {
                 parsed.emit_declaration_only = boolean(original_name, value, &mut diagnostics);
             }
+            "emitdecoratormetadata" => {
+                parsed.emit_decorator_metadata = boolean(original_name, value, &mut diagnostics);
+            }
             "esmoduleinterop" => {
                 parsed.es_module_interop = boolean(original_name, value, &mut diagnostics);
             }
@@ -611,6 +619,7 @@ struct PartialOptions {
     declaration: Option<bool>,
     declaration_map: Option<bool>,
     emit_declaration_only: Option<bool>,
+    emit_decorator_metadata: Option<bool>,
     es_module_interop: Option<bool>,
     exact_optional_property_types: Option<bool>,
     force_consistent_casing_in_file_names: Option<bool>,
@@ -690,6 +699,7 @@ impl PartialOptions {
             declaration: self.declaration.unwrap_or(composite),
             declaration_map: self.declaration_map.unwrap_or(false),
             emit_declaration_only,
+            emit_decorator_metadata: self.emit_decorator_metadata.unwrap_or(false),
             es_module_interop,
             exact_optional_property_types: self.exact_optional_property_types.unwrap_or(false),
             force_consistent_casing_in_file_names: self
@@ -1107,6 +1117,14 @@ mod tests {
         assert!(result.is_ok(), "{:?}", result.diagnostics);
         assert!(result.options.no_emit_helpers);
         assert!(result.options.printer_settings().no_emit_helpers);
+    }
+
+    #[test]
+    fn parses_emit_decorator_metadata() {
+        let result =
+            parse_compiler_options(&object([("emitDecoratorMetadata", JsonValue::Bool(true))]));
+        assert!(result.is_ok(), "{:?}", result.diagnostics);
+        assert!(result.options.emit_decorator_metadata);
     }
 
     #[test]

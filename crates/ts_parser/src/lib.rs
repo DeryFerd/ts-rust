@@ -1094,6 +1094,9 @@ impl<'a> Parser<'a> {
     fn parse_parameter(&mut self) -> NodeId {
         let start = self.current.range.start;
         let mut modifier_nodes = Vec::new();
+        while self.current.kind == SyntaxKind::AtToken {
+            modifier_nodes.push(self.parse_decorator());
+        }
         while self.current_token_is_parameter_modifier() {
             modifier_nodes.push(self.consume_token_node());
         }
@@ -1167,6 +1170,20 @@ impl<'a> Parser<'a> {
                 | SyntaxKind::PublicKeyword
                 | SyntaxKind::ReadonlyKeyword
         ) || next.is_keyword()
+    }
+
+    fn parse_decorator(&mut self) -> NodeId {
+        let start = self.consume().range.start;
+        let expression = self.parse_postfix_expression();
+        self.alloc_node(
+            SyntaxKind::Decorator,
+            TextRange::new(start, self.node_end(expression)),
+            NodeData::Decorator(Box::new(DecoratorData {
+                expression,
+                facts: 0,
+            })),
+            &[expression],
+        )
     }
 
     fn parse_array_binding_pattern(&mut self) -> NodeId {
@@ -1814,6 +1831,9 @@ impl<'a> Parser<'a> {
             return self.parse_class_static_block(start);
         }
         let mut modifier_nodes = Vec::new();
+        while self.current.kind == SyntaxKind::AtToken {
+            modifier_nodes.push(self.parse_decorator());
+        }
         while self.current.kind.is_modifier() && !self.current_modifier_is_member_name() {
             modifier_nodes.push(self.consume_token_node());
         }
@@ -11452,6 +11472,61 @@ mod tests {
                 .iter()
                 .any(|(_, node)| matches!(node.data, NodeData::ArrowFunction(_)))
         );
+    }
+
+    #[test]
+    fn attaches_decorators_to_class_members_and_parameters() {
+        let result = parse_source_file(
+            "class C { @field value: string; @method run(@parameter input: number) {} }",
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+
+        let class = result
+            .arena
+            .iter()
+            .find_map(|(_, node)| {
+                let NodeData::ClassDeclaration(class) = &node.data else {
+                    return None;
+                };
+                Some(class)
+            })
+            .unwrap();
+        assert!(class.members.nodes.iter().all(|member| {
+            result
+                .arena
+                .get(*member)
+                .and_then(|member| match &member.data {
+                    NodeData::PropertyDeclaration(data) => data.modifiers.as_ref(),
+                    NodeData::MethodDeclaration(data) => data.modifiers.as_ref(),
+                    _ => None,
+                })
+                .is_some_and(|modifiers| {
+                    modifiers.list.nodes.iter().any(|modifier| {
+                        result
+                            .arena
+                            .get(*modifier)
+                            .is_some_and(|modifier| modifier.kind == SyntaxKind::Decorator)
+                    })
+                })
+        }));
+        let parameter = result
+            .arena
+            .iter()
+            .find_map(|(_, node)| {
+                let NodeData::ParameterDeclaration(parameter) = &node.data else {
+                    return None;
+                };
+                Some(parameter)
+            })
+            .unwrap();
+        assert!(parameter.modifiers.as_ref().is_some_and(|modifiers| {
+            modifiers.list.nodes.iter().any(|modifier| {
+                result
+                    .arena
+                    .get(*modifier)
+                    .is_some_and(|modifier| modifier.kind == SyntaxKind::Decorator)
+            })
+        }));
     }
 
     fn find_descendant_kind(

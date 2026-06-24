@@ -483,6 +483,7 @@ impl Program {
                     preserve_const_enums,
                     inline_const_enums: !self.options.isolated_modules
                         && !self.options.verbatim_module_syntax,
+                    emit_decorator_metadata: self.options.emit_decorator_metadata,
                     module_detection: self.options.module_detection,
                 };
                 match emit_source_file_with_context(
@@ -692,6 +693,7 @@ impl Program {
                     preserve_const_enums,
                     inline_const_enums: !self.options.isolated_modules
                         && !self.options.verbatim_module_syntax,
+                    emit_decorator_metadata: self.options.emit_decorator_metadata,
                     module_detection: self.options.module_detection,
                 };
                 match emit_source_file_with_context(

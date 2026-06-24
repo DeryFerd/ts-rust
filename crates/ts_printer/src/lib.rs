@@ -42,6 +42,7 @@ pub enum EmitConstantValue {
 
 /// Semantic and source-file metadata used while emitting one file.
 #[derive(Debug)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct EmitContext<'a> {
     pub bindings: &'a BindResult,
     pub amd_module_name: Option<&'a str>,
@@ -54,6 +55,7 @@ pub struct EmitContext<'a> {
     pub import_runtime_meanings: &'a BTreeMap<NodeId, bool>,
     pub preserve_const_enums: bool,
     pub inline_const_enums: bool,
+    pub emit_decorator_metadata: bool,
     /// Controls whether JSX-generated runtime imports make an otherwise-script file a module.
     pub module_detection: ModuleDetectionKind,
 }
@@ -182,6 +184,7 @@ pub fn emit_source_file_with_settings_and_bindings(
             import_runtime_meanings: &empty_import_meanings,
             preserve_const_enums: true,
             inline_const_enums: false,
+            emit_decorator_metadata: false,
             module_detection: ModuleDetectionKind::Auto,
         },
     )
@@ -270,6 +273,7 @@ pub fn emit_source_file_with_context(
         captured_loop_body: None,
         downlevel_super_context: None,
         is_external_module: false,
+        emit_decorator_metadata: context.emit_decorator_metadata,
     };
     let node = printer.node(source_file)?.clone();
     let NodeData::SourceFile(data) = &node.data else {
@@ -281,6 +285,11 @@ pub fn emit_source_file_with_context(
     }
     let source_end = node.range.end.get();
     printer.runtime_identifier_uses = runtime_identifier_uses(arena, source_file);
+    if context.emit_decorator_metadata {
+        printer
+            .runtime_identifier_uses
+            .extend(decorator_metadata_runtime_names(arena));
+    }
     // The classic JSX transform synthesizes `React.createElement` calls, so a default
     // `React` import is a runtime dependency even when every source-level reference is
     // confined to type positions.
@@ -476,6 +485,12 @@ pub fn emit_source_file_with_context(
     }
     if source_needs_legacy_decorate_helper(arena) && !settings.no_emit_helpers {
         printer.emit_decorate_helper();
+        if printer.emit_decorator_metadata {
+            printer.emit_metadata_helper();
+        }
+        if source_needs_legacy_param_helper(arena) {
+            printer.emit_param_helper();
+        }
     }
     if needs_extends_helper {
         printer.emit_extends_helper();
@@ -979,11 +994,33 @@ fn source_needs_legacy_decorate_helper(arena: &NodeArena) -> bool {
             return false;
         };
         !node_is_in_ambient_context(arena, id)
-            && declaration_has_modifier_in_list(
+            && (declaration_has_modifier_in_list(
                 arena,
                 class.modifiers.as_ref(),
                 SyntaxKind::Decorator,
-            )
+            ) || class.members.nodes.iter().any(|member| {
+                arena.get(*member).is_some_and(|member| {
+                    declaration_has_modifier(arena, member, SyntaxKind::Decorator)
+                }) || function_like_parameters(arena, *member).is_some_and(|parameters| {
+                    parameters.nodes.iter().any(|parameter| {
+                        arena.get(*parameter).is_some_and(|parameter| {
+                            declaration_has_modifier(arena, parameter, SyntaxKind::Decorator)
+                        })
+                    })
+                })
+            }))
+    })
+}
+
+fn source_needs_legacy_param_helper(arena: &NodeArena) -> bool {
+    arena.iter().any(|(_, node)| {
+        function_like_parameters_from_node(node).is_some_and(|parameters| {
+            parameters.nodes.iter().any(|parameter| {
+                arena.get(*parameter).is_some_and(|parameter| {
+                    declaration_has_modifier(arena, parameter, SyntaxKind::Decorator)
+                })
+            })
+        })
     })
 }
 
@@ -1507,6 +1544,54 @@ fn entity_root_identifier_text(arena: &NodeArena, entity: NodeId) -> Option<&str
         NodeData::QualifiedName(name) => entity_root_identifier_text(arena, name.left),
         _ => None,
     }
+}
+
+fn decorator_metadata_runtime_names(arena: &NodeArena) -> HashSet<String> {
+    let decorated_members = arena
+        .iter()
+        .filter_map(|(_, node)| {
+            let NodeData::ClassDeclaration(class) = &node.data else {
+                return None;
+            };
+            Some(class.members.nodes.iter().copied())
+        })
+        .flatten()
+        .filter(|member| class_member_has_legacy_decorators(arena, *member))
+        .collect::<HashSet<_>>();
+
+    arena
+        .iter()
+        .filter_map(|(type_reference, node)| {
+            let NodeData::TypeReferenceNode(reference) = &node.data else {
+                return None;
+            };
+            let mut current = type_reference;
+            let mut belongs_to_decorated_member = false;
+            while let Some(parent) = arena.get(current).and_then(|node| node.parent) {
+                if decorated_members.contains(&parent) {
+                    belongs_to_decorated_member = true;
+                    break;
+                }
+                current = parent;
+            }
+            belongs_to_decorated_member
+                .then(|| entity_root_identifier_text(arena, reference.type_name).map(str::to_owned))
+                .flatten()
+        })
+        .collect()
+}
+
+fn class_member_has_legacy_decorators(arena: &NodeArena, member: NodeId) -> bool {
+    arena
+        .get(member)
+        .is_some_and(|node| declaration_has_modifier(arena, node, SyntaxKind::Decorator))
+        || function_like_parameters(arena, member).is_some_and(|parameters| {
+            parameters.nodes.iter().any(|parameter| {
+                arena.get(*parameter).is_some_and(|parameter| {
+                    declaration_has_modifier(arena, parameter, SyntaxKind::Decorator)
+                })
+            })
+        })
 }
 
 fn source_has_jsx(arena: &NodeArena) -> bool {
@@ -15848,6 +15933,26 @@ fn declaration_modifiers(node: &Node) -> Option<&ts_ast::ModifierList> {
         NodeData::EnumDeclaration(data) => data.modifiers.as_ref(),
         NodeData::ModuleDeclaration(data) => data.modifiers.as_ref(),
         NodeData::ImportEqualsDeclaration(data) => data.modifiers.as_ref(),
+        NodeData::PropertyDeclaration(data) => data.modifiers.as_ref(),
+        NodeData::MethodDeclaration(data) => data.modifiers.as_ref(),
+        NodeData::ConstructorDeclaration(data) => data.modifiers.as_ref(),
+        NodeData::GetAccessorDeclaration(data) => data.modifiers.as_ref(),
+        NodeData::SetAccessorDeclaration(data) => data.modifiers.as_ref(),
+        NodeData::ParameterDeclaration(data) => data.modifiers.as_ref(),
+        _ => None,
+    }
+}
+
+fn function_like_parameters(arena: &NodeArena, node: NodeId) -> Option<&NodeList> {
+    function_like_parameters_from_node(arena.get(node)?)
+}
+
+fn function_like_parameters_from_node(node: &Node) -> Option<&NodeList> {
+    match &node.data {
+        NodeData::MethodDeclaration(data) => Some(&data.parameters),
+        NodeData::ConstructorDeclaration(data) => Some(&data.parameters),
+        NodeData::GetAccessorDeclaration(data) => Some(&data.parameters),
+        NodeData::SetAccessorDeclaration(data) => Some(&data.parameters),
         _ => None,
     }
 }
@@ -16784,6 +16889,7 @@ enum SemanticTypePrecedence {
     Primary,
 }
 
+#[allow(clippy::struct_excessive_bools)]
 struct Printer<'a> {
     arena: &'a NodeArena,
     writer: Writer,
@@ -16840,6 +16946,7 @@ struct Printer<'a> {
     captured_loop_body: Option<NodeId>,
     downlevel_super_context: Option<(String, bool)>,
     is_external_module: bool,
+    emit_decorator_metadata: bool,
 }
 
 impl Printer<'_> {
@@ -18644,6 +18751,28 @@ impl Printer<'_> {
         }
     }
 
+    fn emit_metadata_helper(&mut self) {
+        for line in [
+            "var __metadata = (this && this.__metadata) || function (k, v) {",
+            "    if (typeof Reflect === \"object\" && typeof Reflect.metadata === \"function\") return Reflect.metadata(k, v);",
+            "};",
+        ] {
+            self.writer.write(line);
+            self.writer.newline();
+        }
+    }
+
+    fn emit_param_helper(&mut self) {
+        for line in [
+            "var __param = (this && this.__param) || function (paramIndex, decorator) {",
+            "    return function (target, key) { decorator(target, key, paramIndex); }",
+            "};",
+        ] {
+            self.writer.write(line);
+            self.writer.newline();
+        }
+    }
+
     fn emit_extends_helper(&mut self) {
         self.writer
             .write("var __extends = (this && this.__extends) || (function () {");
@@ -19927,6 +20056,9 @@ impl Printer<'_> {
                     } else if !self.commonjs_class_export_precedes_static_initializers(data) {
                         self.emit_commonjs_declaration_exports(data.modifiers.as_ref(), &names);
                     }
+                }
+                if self.settings.target >= ScriptTarget::Es2015 {
+                    self.emit_class_member_decorators(data)?;
                 }
             }
             NodeData::EnumDeclaration(data) => {
@@ -24106,6 +24238,237 @@ impl Printer<'_> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
+    fn emit_class_member_decorators(
+        &mut self,
+        class: &ts_ast::ClassDeclarationData,
+    ) -> Result<(), EmitError> {
+        let Some(class_name) = class.name else {
+            return Ok(());
+        };
+        for member_id in &class.members.nodes {
+            if !class_member_has_legacy_decorators(self.arena, *member_id) {
+                continue;
+            }
+            let member = self.node(*member_id)?.clone();
+            let (name, modifiers, parameters, return_type, property_type, descriptor) =
+                match &member.data {
+                    NodeData::PropertyDeclaration(data) => (
+                        data.name,
+                        data.modifiers.as_ref(),
+                        None,
+                        None,
+                        data.type_,
+                        "void 0",
+                    ),
+                    NodeData::MethodDeclaration(data) => (
+                        data.name,
+                        data.modifiers.as_ref(),
+                        Some(&data.parameters),
+                        data.type_,
+                        None,
+                        "null",
+                    ),
+                    NodeData::GetAccessorDeclaration(data) => (
+                        data.name,
+                        data.modifiers.as_ref(),
+                        Some(&data.parameters),
+                        data.type_,
+                        None,
+                        "null",
+                    ),
+                    NodeData::SetAccessorDeclaration(data) => (
+                        data.name,
+                        data.modifiers.as_ref(),
+                        Some(&data.parameters),
+                        None,
+                        None,
+                        "null",
+                    ),
+                    _ => continue,
+                };
+            let decorators = self.class_decorator_expressions(modifiers);
+            let parameter_decorators = parameters
+                .into_iter()
+                .flat_map(|parameters| parameters.nodes.iter().enumerate())
+                .flat_map(|(index, parameter)| {
+                    let modifiers = self.arena.get(*parameter).and_then(declaration_modifiers);
+                    self.class_decorator_expressions(modifiers)
+                        .into_iter()
+                        .map(move |decorator| (index, decorator))
+                })
+                .collect::<Vec<_>>();
+
+            if !self.writer.line_start {
+                self.writer.newline();
+            }
+            self.writer.write("__decorate([");
+            self.writer.newline();
+            self.writer.indent += 1;
+            let mut entries = Vec::new();
+            entries.extend(decorators.into_iter().map(|decorator| (None, decorator)));
+            entries.extend(
+                parameter_decorators
+                    .into_iter()
+                    .map(|(index, decorator)| (Some(index), decorator)),
+            );
+            for (index, (parameter_index, decorator)) in entries.iter().enumerate() {
+                if let Some(parameter_index) = parameter_index {
+                    self.writer.write("__param(");
+                    self.writer.write(&parameter_index.to_string());
+                    self.writer.write(", ");
+                    self.emit_expression(*decorator, 1)?;
+                    self.writer.write(")");
+                } else {
+                    self.emit_expression(*decorator, 1)?;
+                }
+                if self.emit_decorator_metadata || index + 1 != entries.len() {
+                    self.writer.write(",");
+                }
+                self.writer.newline();
+            }
+            if self.emit_decorator_metadata {
+                if property_type.is_some() {
+                    self.writer.write("__metadata(\"design:type\", ");
+                    self.emit_runtime_metadata_type(property_type, "Object")?;
+                    self.writer.write(")");
+                    self.writer.newline();
+                } else {
+                    self.writer.write("__metadata(\"design:type\", Function),");
+                    self.writer.newline();
+                    self.writer.write("__metadata(\"design:paramtypes\", [");
+                    if let Some(parameters) = parameters {
+                        for (index, parameter) in parameters.nodes.iter().enumerate() {
+                            if index != 0 {
+                                self.writer.write(", ");
+                            }
+                            let type_node = self.arena.get(*parameter).and_then(|parameter| {
+                                let NodeData::ParameterDeclaration(parameter) = &parameter.data
+                                else {
+                                    return None;
+                                };
+                                parameter.type_
+                            });
+                            self.emit_runtime_metadata_type(type_node, "Object")?;
+                        }
+                    }
+                    self.writer.write("]),");
+                    self.writer.newline();
+                    self.writer.write("__metadata(\"design:returntype\", ");
+                    self.emit_runtime_metadata_type(return_type, "void 0")?;
+                    self.writer.write(")");
+                    self.writer.newline();
+                }
+            }
+            self.writer.indent -= 1;
+            self.writer.write("], ");
+            if let Some(class_name) = declaration_name_text(self.arena, class_name) {
+                self.writer.write(class_name);
+            } else {
+                self.emit_expression(class_name, 0)?;
+            }
+            if !self.has_modifier(modifiers, SyntaxKind::StaticKeyword) {
+                self.writer.write(".prototype");
+            }
+            self.writer.write(", ");
+            if let Some(name) = declaration_name_text(self.arena, name) {
+                write_quoted(&mut self.writer, name);
+            } else {
+                self.emit_expression(name, 0)?;
+            }
+            self.writer.write(", ");
+            self.writer.write(descriptor);
+            self.writer.write(");");
+        }
+        Ok(())
+    }
+
+    fn emit_runtime_metadata_type(
+        &mut self,
+        type_node: Option<NodeId>,
+        fallback: &'static str,
+    ) -> Result<(), EmitError> {
+        let Some(type_node) = type_node else {
+            self.writer.write(fallback);
+            return Ok(());
+        };
+        let node = self.node(type_node)?.clone();
+        let primitive = match node.kind {
+            SyntaxKind::StringKeyword => Some("String"),
+            SyntaxKind::NumberKeyword => Some("Number"),
+            SyntaxKind::BooleanKeyword => Some("Boolean"),
+            SyntaxKind::BigIntKeyword => Some("BigInt"),
+            SyntaxKind::SymbolKeyword => Some("Symbol"),
+            SyntaxKind::VoidKeyword
+            | SyntaxKind::UndefinedKeyword
+            | SyntaxKind::NeverKeyword
+            | SyntaxKind::NullKeyword => Some("void 0"),
+            SyntaxKind::AnyKeyword | SyntaxKind::UnknownKeyword | SyntaxKind::ObjectKeyword => {
+                Some("Object")
+            }
+            _ => None,
+        };
+        if let Some(primitive) = primitive {
+            self.writer.write(primitive);
+            return Ok(());
+        }
+        match &node.data {
+            NodeData::ArrayTypeNode(_) | NodeData::TupleTypeNode(_) => self.writer.write("Array"),
+            NodeData::FunctionTypeNode(_) | NodeData::ConstructorTypeNode(_) => {
+                self.writer.write("Function");
+            }
+            NodeData::LiteralTypeNode(literal) => {
+                let kind = self.arena.get(literal.literal).map(|literal| literal.kind);
+                self.writer.write(match kind {
+                    Some(SyntaxKind::TrueKeyword | SyntaxKind::FalseKeyword) => "Boolean",
+                    Some(SyntaxKind::StringLiteral) => "String",
+                    Some(SyntaxKind::NumericLiteral) => "Number",
+                    Some(SyntaxKind::BigIntLiteral) => "BigInt",
+                    _ => "Object",
+                });
+            }
+            NodeData::ConditionalTypeNode(conditional)
+                if self.metadata_type_is_boolean(conditional.true_type)
+                    && self.metadata_type_is_boolean(conditional.false_type) =>
+            {
+                self.writer.write("Boolean");
+            }
+            NodeData::ParenthesizedTypeNode(parenthesized) => {
+                self.emit_runtime_metadata_type(Some(parenthesized.type_), fallback)?;
+            }
+            NodeData::TypeReferenceNode(reference) => {
+                let is_type_parameter = declaration_name_text(self.arena, reference.type_name)
+                    .and_then(|name| self.bindings.resolve_name_at(reference.type_name, name))
+                    .and_then(|symbol| self.bindings.symbols.get(symbol))
+                    .is_some_and(|symbol| {
+                        symbol
+                            .flags
+                            .contains(ts_binder::SymbolFlags::TYPE_PARAMETER)
+                    });
+                if is_type_parameter {
+                    self.writer.write("Object");
+                } else {
+                    self.emit_expression(reference.type_name, 0)?;
+                }
+            }
+            _ => self.writer.write("Object"),
+        }
+        Ok(())
+    }
+
+    fn metadata_type_is_boolean(&self, type_node: NodeId) -> bool {
+        self.arena.get(type_node).is_some_and(|node| {
+            node.kind == SyntaxKind::BooleanKeyword
+                || matches!(
+                    &node.data,
+                    NodeData::LiteralTypeNode(literal)
+                        if self.arena.get(literal.literal).is_some_and(|literal| {
+                            matches!(literal.kind, SyntaxKind::TrueKeyword | SyntaxKind::FalseKeyword)
+                        })
+                )
+        })
+    }
+
     fn function_like_body_parameters(&self, body: NodeId) -> Option<&NodeList> {
         let parent = self.arena.get(body)?.parent?;
         match &self.arena.get(parent)?.data {
@@ -25865,6 +26228,10 @@ impl Printer<'_> {
         }
         self.emit_static_fields(data, name)?;
         self.this_alias = previous_this_alias;
+        self.emit_class_member_decorators(data)?;
+        if !self.writer.line_start {
+            self.writer.newline();
+        }
         self.writer.write("return ");
         self.writer.write(name);
         self.writer.write(";");
@@ -28913,6 +29280,9 @@ impl Printer<'_> {
 
     fn import_name_has_non_erased_runtime_reference(&self, name: &str) -> bool {
         if name == "React" && self.settings.jsx == JsxEmit::React && source_has_jsx(self.arena) {
+            return true;
+        }
+        if self.runtime_identifier_uses.contains(name) {
             return true;
         }
         self.import_name_has_non_erased_runtime_reference_with_visited(name, &mut HashSet::new())
@@ -33547,6 +33917,7 @@ mod tests {
                 import_runtime_meanings: &import_meanings,
                 preserve_const_enums: true,
                 inline_const_enums: false,
+                emit_decorator_metadata: false,
                 module_detection: ModuleDetectionKind::Auto,
             },
         )
@@ -33663,6 +34034,7 @@ mod tests {
                 import_runtime_meanings: &import_meanings,
                 preserve_const_enums: true,
                 inline_const_enums: false,
+                emit_decorator_metadata: false,
                 module_detection: ModuleDetectionKind::Auto,
             },
         )
@@ -35377,6 +35749,7 @@ mod tests {
                 import_runtime_meanings: &import_meanings,
                 preserve_const_enums: false,
                 inline_const_enums: true,
+                emit_decorator_metadata: false,
                 module_detection: ModuleDetectionKind::Auto,
             },
         )
@@ -35890,6 +36263,7 @@ mod tests {
                     import_runtime_meanings: &import_meanings,
                     preserve_const_enums: false,
                     inline_const_enums: false,
+                    emit_decorator_metadata: false,
                     module_detection: ModuleDetectionKind::Auto,
                 },
             )
@@ -38018,6 +38392,7 @@ class Board {
                 import_runtime_meanings: &import_meanings,
                 preserve_const_enums: true,
                 inline_const_enums: false,
+                emit_decorator_metadata: false,
                 module_detection: ModuleDetectionKind::Auto,
             },
         )
@@ -39434,6 +39809,29 @@ class Board {
         );
         assert!(
             output.ends_with("};\nOther = __decorate([\n    decorator(\"hi\")\n], Other);\n"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn lowers_legacy_member_and_parameter_decorators() {
+        let output = emit_with(
+            "class C { @field value: string; @method run(@parameter input: number) {} }",
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+
+        assert!(output.starts_with("var __decorate = "), "{output}");
+        assert!(output.contains("var __param = "), "{output}");
+        assert!(
+            output.contains("__decorate([\n    field\n], C.prototype, \"value\", void 0);"),
+            "{output}"
+        );
+        assert!(
+            output.contains(
+                "__decorate([\n    method,\n    __param(0, parameter)\n], C.prototype, \"run\", null);"
+            ),
             "{output}"
         );
     }
