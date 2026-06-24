@@ -6000,13 +6000,19 @@ impl DeclarationPrinter<'_> {
             .nodes
             .iter()
             .copied()
-            .filter(|declaration| {
+            .filter(|declaration_id| {
                 let Some(NodeData::VariableDeclaration(declaration)) =
-                    self.arena.get(*declaration).map(|node| &node.data)
+                    self.arena.get(*declaration_id).map(|node| &node.data)
                 else {
                     return true;
                 };
                 self.binding_name_has_identifier(declaration.name)
+                    && self.variable_declarator_is_reachable(
+                        *declaration_id,
+                        declaration.name,
+                        node.parent,
+                        data.declarations.nodes.len(),
+                    )
             })
             .collect::<Vec<_>>();
         let mut emitted_declaration = false;
@@ -6386,6 +6392,55 @@ impl DeclarationPrinter<'_> {
             previous_end = declaration_node.range.end.get();
         }
         Ok(())
+    }
+
+    fn variable_declarator_is_reachable(
+        &self,
+        declaration: NodeId,
+        name: NodeId,
+        statement: Option<NodeId>,
+        declaration_count: usize,
+    ) -> bool {
+        if declaration_count < 2 || !self.module_file || self.declaration_reachability.is_none() {
+            return true;
+        }
+        let Some(statement) = statement else {
+            return true;
+        };
+        if self.arena.get(statement).is_some_and(|statement| {
+            declaration_has_modifier(self.arena, statement, SyntaxKind::ExportKeyword)
+        }) || matches!(
+            self.arena.get(name).map(|node| &node.data),
+            Some(NodeData::BindingPattern(_))
+        ) {
+            return true;
+        }
+        let Some(name) = declaration_name_text(self.arena, name) else {
+            return true;
+        };
+        let declaration_symbol = self
+            .bindings
+            .node_symbols
+            .get(&declaration)
+            .copied()
+            .or_else(|| self.bindings.resolve_name_at(declaration, name));
+        self.declaration_reachability.is_some_and(|reachability| {
+            reachability.values().any(|retained| {
+                retained.iter().any(|retained_statement| {
+                    *retained_statement != statement
+                        && self.arena.iter().any(|(identifier, node)| {
+                            matches!(
+                                &node.data,
+                                NodeData::Identifier(identifier_data)
+                                    if identifier_data.text == name
+                            ) && self.node_is_within(identifier, *retained_statement)
+                                && declaration_symbol.is_none_or(|symbol| {
+                                    self.bindings.resolve_name_at(identifier, name) == Some(symbol)
+                                })
+                        })
+                })
+            })
+        })
     }
 
     fn variable_static_assignments(&self, variable_name: &str) -> Vec<(NodeId, NodeId)> {
@@ -14727,7 +14782,36 @@ impl DeclarationPrinter<'_> {
         if !has_private || public.is_empty() {
             return false;
         }
-        true
+        let sole_annotated_namespace_variable = matches!(
+            self.arena.get(scope).map(|node| &node.data),
+            Some(NodeData::ModuleBlock(_))
+        ) && match public.as_slice() {
+            [(_, node)] => match &node.data {
+                NodeData::VariableStatement(statement) => self
+                    .arena
+                    .get(statement.declaration_list)
+                    .and_then(|node| match &node.data {
+                        NodeData::VariableDeclarationList(list) => Some(list),
+                        _ => None,
+                    })
+                    .is_some_and(|list| {
+                        list.declarations.nodes.iter().all(|declaration| {
+                            matches!(
+                                self.arena.get(*declaration).map(|node| &node.data),
+                                Some(NodeData::VariableDeclaration(declaration))
+                                    if declaration.type_.is_some()
+                                        && matches!(
+                                            self.arena.get(declaration.name).map(|node| &node.data),
+                                            Some(NodeData::Identifier(_))
+                                        )
+                            )
+                        })
+                    }),
+                _ => false,
+            },
+            _ => false,
+        };
+        !sole_annotated_namespace_variable
     }
 
     fn namespace_scope_requires_explicit_exports(&self, scope: NodeId) -> bool {
