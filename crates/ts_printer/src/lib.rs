@@ -24,6 +24,24 @@ pub struct EmitError {
     pub kind: SyntaxKind,
 }
 
+pub const BUNDLE_EXTENDS_HELPER: &str = concat!(
+    "var __extends = (this && this.__extends) || (function () {\n",
+    "    var extendStatics = function (d, b) {\n",
+    "        extendStatics = Object.setPrototypeOf ||\n",
+    "            ({ __proto__: [] } instanceof Array && function (d, b) { d.__proto__ = b; }) ||\n",
+    "            function (d, b) { for (var p in b) if (Object.prototype.hasOwnProperty.call(b, p)) d[p] = b[p]; };\n",
+    "        return extendStatics(d, b);\n",
+    "    };\n",
+    "    return function (d, b) {\n",
+    "        if (typeof b !== \"function\" && b !== null)\n",
+    "            throw new TypeError(\"Class extends value \" + String(b) + \" is not a constructor or null\");\n",
+    "        extendStatics(d, b);\n",
+    "        function __() { this.constructor = d; }\n",
+    "        d.prototype = b === null ? Object.create(b) : (__.prototype = b.prototype, new __());\n",
+    "    };\n",
+    "})();\n",
+);
+
 /// One parsed AMD dependency pragma supplied by the compiler.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AmdDependency<'a> {
@@ -47,6 +65,10 @@ pub struct EmitContext<'a> {
     pub bindings: &'a BindResult,
     pub amd_module_name: Option<&'a str>,
     pub amd_bundle: bool,
+    pub preemitted_source_prologues: bool,
+    pub preemitted_shebang: bool,
+    pub suppress_extends_helper: bool,
+    pub preemitted_comment_end: Option<u32>,
     pub amd_dependencies: &'a [AmdDependency<'a>],
     pub amd_module_specifier_rewrites: &'a BTreeMap<String, String>,
     pub amd_generated_name_offsets: &'a BTreeMap<String, u32>,
@@ -181,6 +203,10 @@ pub fn emit_source_file_with_settings_and_bindings(
             bindings,
             amd_module_name: None,
             amd_bundle: false,
+            preemitted_source_prologues: false,
+            preemitted_shebang: false,
+            suppress_extends_helper: false,
+            preemitted_comment_end: None,
             amd_dependencies: &[],
             amd_module_specifier_rewrites: &BTreeMap::new(),
             amd_generated_name_offsets: &BTreeMap::new(),
@@ -301,6 +327,32 @@ pub fn emit_source_file_with_context(
     let NodeData::SourceFile(data) = &node.data else {
         return Err(Printer::unsupported(source_file, node.kind));
     };
+    if context.preemitted_source_prologues {
+        let prologues = data
+            .statements
+            .nodes
+            .iter()
+            .take_while(|statement| printer.statement_is_string_prologue(**statement))
+            .copied()
+            .collect::<Vec<_>>();
+        printer.preemitted_source_prologues.extend(prologues);
+    }
+    if context.preemitted_shebang {
+        printer
+            .preemitted_source_prologues
+            .extend(data.statements.nodes.iter().copied().filter(|statement| {
+                let Some(node) = arena.get(*statement) else {
+                    return false;
+                };
+                let Ok(start) = usize::try_from(node.range.start.get()) else {
+                    return false;
+                };
+                let line_start = source_text[..start]
+                    .rfind(['\n', '\r'])
+                    .map_or(0, |line_break| line_break + 1);
+                source_text[line_start..].starts_with("#!")
+            }));
+    }
     if settings.target < ScriptTarget::Es2022 {
         printer.prepare_private_method_lowerings();
         printer.prepare_private_field_lowerings();
@@ -437,7 +489,8 @@ pub fn emit_source_file_with_context(
         .map(|node| node.range.start.get());
     let needs_extends_helper = settings.target < ScriptTarget::Es2015
         && source_needs_extends_helper(arena)
-        && !settings.no_emit_helpers;
+        && !settings.no_emit_helpers
+        && !context.suppress_extends_helper;
     if let Some(start) = first_statement_start {
         printer.emit_leading_detached_source_comments(start);
         if settings.module == ModuleKind::CommonJs && is_external_module {
@@ -1182,7 +1235,8 @@ fn class_has_async_static_field(arena: &NodeArena, class: &ts_ast::ClassDeclarat
     })
 }
 
-fn source_needs_extends_helper(arena: &NodeArena) -> bool {
+#[must_use]
+pub fn source_needs_extends_helper(arena: &NodeArena) -> bool {
     arena.iter().any(|(_, node)| {
         let heritage_clauses = match &node.data {
             NodeData::ClassDeclaration(class) => class.heritage_clauses.as_ref(),
@@ -18905,7 +18959,11 @@ impl Printer<'_> {
             );
             self.writer.newline();
         }
-        if self.settings.target < ScriptTarget::Es2015 && source_needs_extends_helper(self.arena) {
+        if self.settings.target < ScriptTarget::Es2015
+            && source_needs_extends_helper(self.arena)
+            && !context.suppress_extends_helper
+            && !self.settings.no_emit_helpers
+        {
             self.emit_extends_helper();
         }
         let export_equals_expression = self.runtime_export_equals_expression(&data.statements);
@@ -19035,6 +19093,7 @@ impl Printer<'_> {
                 .amd_dependencies
                 .iter()
                 .map(|dependency| (dependency.comment_start, dependency.comment_end))
+                .chain(context.preemitted_comment_end.map(|end| (0, end)))
                 .collect::<Vec<_>>();
             self.emit_leading_source_comments_excluding(node.range.start.get(), &excluded);
         }
@@ -19780,8 +19839,8 @@ impl Printer<'_> {
                 if (!pinned_only || pinned)
                     && !is_reference_directive(comment)
                     && !excluded.iter().any(|(start, end)| {
-                        usize::try_from(*start) == Ok(index)
-                            && usize::try_from(*end) == Ok(comment_end)
+                        usize::try_from(*start).is_ok_and(|start| start <= index)
+                            && usize::try_from(*end).is_ok_and(|end| comment_end <= end)
                     })
                     && self.emitted_source_comments.insert(comment_range)
                 {
@@ -19797,7 +19856,13 @@ impl Printer<'_> {
                 let comment = &prefix[index..comment_end];
                 let comment_range = (index, comment_end);
                 let pinned = comment.starts_with("/*!") || comment.contains("@license");
-                if (!pinned_only || pinned) && self.emitted_source_comments.insert(comment_range) {
+                if (!pinned_only || pinned)
+                    && !excluded.iter().any(|(start, end)| {
+                        usize::try_from(*start).is_ok_and(|start| start <= index)
+                            && usize::try_from(*end).is_ok_and(|end| comment_end <= end)
+                    })
+                    && self.emitted_source_comments.insert(comment_range)
+                {
                     let remainder = &prefix[comment_end..];
                     let next_comment = [remainder.find("/*"), remainder.find("//")]
                         .into_iter()
@@ -20185,57 +20250,10 @@ impl Printer<'_> {
     }
 
     fn emit_extends_helper(&mut self) {
-        self.writer
-            .write("var __extends = (this && this.__extends) || (function () {");
-        self.writer.newline();
-        self.writer.indent += 1;
-        self.writer.write("var extendStatics = function (d, b) {");
-        self.writer.newline();
-        self.writer.indent += 1;
-        self.writer
-            .write("extendStatics = Object.setPrototypeOf ||");
-        self.writer.newline();
-        self.writer.indent += 1;
-        self.writer.write(
-            "({ __proto__: [] } instanceof Array && function (d, b) { d.__proto__ = b; }) ||",
-        );
-        self.writer.newline();
-        self.writer.write(
-            "function (d, b) { for (var p in b) if (Object.prototype.hasOwnProperty.call(b, p)) d[p] = b[p]; };",
-        );
-        self.writer.indent -= 1;
-        self.writer.newline();
-        self.writer.write("return extendStatics(d, b);");
-        self.writer.newline();
-        self.writer.indent -= 1;
-        self.writer.write("};");
-        self.writer.newline();
-        self.writer.write("return function (d, b) {");
-        self.writer.newline();
-        self.writer.indent += 1;
-        self.writer
-            .write("if (typeof b !== \"function\" && b !== null)");
-        self.writer.newline();
-        self.writer.indent += 1;
-        self.writer.write(
-            "throw new TypeError(\"Class extends value \" + String(b) + \" is not a constructor or null\");",
-        );
-        self.writer.newline();
-        self.writer.indent -= 1;
-        self.writer.write("extendStatics(d, b);");
-        self.writer.newline();
-        self.writer.write("function __() { this.constructor = d; }");
-        self.writer.newline();
-        self.writer.write(
-            "d.prototype = b === null ? Object.create(b) : (__.prototype = b.prototype, new __());",
-        );
-        self.writer.newline();
-        self.writer.indent -= 1;
-        self.writer.write("};");
-        self.writer.newline();
-        self.writer.indent -= 1;
-        self.writer.write("})();");
-        self.writer.newline();
+        for line in BUNDLE_EXTENDS_HELPER.lines() {
+            self.writer.write(line);
+            self.writer.newline();
+        }
     }
 
     fn emit_auto_accessor_helpers(&mut self) {
@@ -37739,6 +37757,10 @@ mod tests {
                 bindings: &bindings,
                 amd_module_name: None,
                 amd_bundle: false,
+                preemitted_source_prologues: false,
+                preemitted_shebang: false,
+                suppress_extends_helper: false,
+                preemitted_comment_end: None,
                 amd_dependencies: &[],
                 amd_module_specifier_rewrites: &BTreeMap::new(),
                 amd_generated_name_offsets: &BTreeMap::new(),
@@ -37861,6 +37883,10 @@ mod tests {
                 bindings: &bindings,
                 amd_module_name: parsed.amd_module_name.as_deref(),
                 amd_bundle: false,
+                preemitted_source_prologues: false,
+                preemitted_shebang: false,
+                suppress_extends_helper: false,
+                preemitted_comment_end: None,
                 amd_dependencies: &dependencies,
                 amd_module_specifier_rewrites: &BTreeMap::new(),
                 amd_generated_name_offsets: &BTreeMap::new(),
@@ -39581,6 +39607,10 @@ mod tests {
                 bindings: &bindings,
                 amd_module_name: None,
                 amd_bundle: false,
+                preemitted_source_prologues: false,
+                preemitted_shebang: false,
+                suppress_extends_helper: false,
+                preemitted_comment_end: None,
                 amd_dependencies: &[],
                 amd_module_specifier_rewrites: &BTreeMap::new(),
                 amd_generated_name_offsets: &BTreeMap::new(),
@@ -40100,6 +40130,10 @@ mod tests {
                     bindings: &bindings,
                     amd_module_name: None,
                     amd_bundle: false,
+                    preemitted_source_prologues: false,
+                    preemitted_shebang: false,
+                    suppress_extends_helper: false,
+                    preemitted_comment_end: None,
                     amd_dependencies: &[],
                     amd_module_specifier_rewrites: &BTreeMap::new(),
                     amd_generated_name_offsets: &BTreeMap::new(),
@@ -42234,6 +42268,10 @@ class Board {
                 bindings: &bindings,
                 amd_module_name: None,
                 amd_bundle: false,
+                preemitted_source_prologues: false,
+                preemitted_shebang: false,
+                suppress_extends_helper: false,
+                preemitted_comment_end: None,
                 amd_dependencies: &[],
                 amd_module_specifier_rewrites: &BTreeMap::new(),
                 amd_generated_name_offsets: &BTreeMap::new(),

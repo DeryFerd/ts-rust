@@ -23,8 +23,9 @@ use ts_path::{
     is_absolute, resolve_path,
 };
 use ts_printer::{
-    AmdDependency as PrinterAmdDependency, EmitConstantValue, EmitContext,
+    AmdDependency as PrinterAmdDependency, BUNDLE_EXTENDS_HELPER, EmitConstantValue, EmitContext,
     emit_declaration_file_with_semantics, emit_source_file_with_context, runtime_identifier_uses,
+    source_needs_extends_helper,
 };
 use ts_sourcemap::{SourceMap, SourceMapBuilder};
 use ts_vfs::FileSystem;
@@ -81,6 +82,84 @@ fn prepend_emit_bom(files: &mut [OutputFile]) {
             file.text.insert(0, '\u{feff}');
         }
     }
+}
+
+fn source_shebang(source: &SourceFile) -> Option<&str> {
+    let text = source
+        .source_text
+        .strip_prefix('\u{feff}')
+        .unwrap_or(&source.source_text);
+    text.lines()
+        .find(|line| line.starts_with("#!"))
+        .map(|line| line.trim_end_matches('\r'))
+}
+
+fn source_prologue_directives(source: &SourceFile) -> Vec<&str> {
+    let Some(NodeData::SourceFile(file)) = source
+        .parse
+        .arena
+        .get(source.parse.source_file)
+        .map(|node| &node.data)
+    else {
+        return Vec::new();
+    };
+    file.statements
+        .nodes
+        .iter()
+        .map_while(|statement| {
+            let NodeData::ExpressionStatement(statement) =
+                &source.parse.arena.get(*statement)?.data
+            else {
+                return None;
+            };
+            let NodeData::StringLiteral(literal) =
+                &source.parse.arena.get(statement.expression)?.data
+            else {
+                return None;
+            };
+            Some(literal.text.as_str())
+        })
+        .collect()
+}
+
+fn push_bundle_prologue(code: &mut String, directive: &str) {
+    code.push('"');
+    for character in directive.chars() {
+        match character {
+            '"' => code.push_str("\\\""),
+            '\\' => code.push_str("\\\\"),
+            '\n' => code.push_str("\\n"),
+            '\r' => code.push_str("\\r"),
+            '\t' => code.push_str("\\t"),
+            character => code.push(character),
+        }
+    }
+    code.push_str("\";\n");
+}
+
+fn bundle_detached_comment(source: &SourceFile) -> Option<(String, u32)> {
+    let Some(NodeData::SourceFile(file)) = source
+        .parse
+        .arena
+        .get(source.parse.source_file)
+        .map(|node| &node.data)
+    else {
+        return None;
+    };
+    let first_statement = file.statements.nodes.first()?;
+    let end = usize::try_from(source.parse.arena.get(*first_statement)?.range.start.get()).ok()?;
+    let prefix = source.source_text.get(..end)?;
+    let separators = ["\r\n\r\n", "\n\n", "\r\r"];
+    let (separator_start, separator_len) = separators
+        .iter()
+        .filter_map(|separator| prefix.find(separator).map(|start| (start, separator.len())))
+        .min_by_key(|(start, _)| *start)?;
+    let comment = prefix[..separator_start].trim();
+    if !comment.starts_with("//") && !comment.starts_with("/*") {
+        return None;
+    }
+    let excluded_end = u32::try_from(separator_start + separator_len).ok()?;
+    Some((format!("{comment}\n"), excluded_end))
 }
 
 /// A compilation's parsed source-file graph.
@@ -490,6 +569,10 @@ impl Program {
                     bindings: &source_file.binding,
                     amd_module_name: source_file.parse.amd_module_name.as_deref(),
                     amd_bundle: false,
+                    preemitted_source_prologues: false,
+                    preemitted_shebang: false,
+                    suppress_extends_helper: false,
+                    preemitted_comment_end: None,
                     amd_dependencies: &amd_dependencies,
                     amd_module_specifier_rewrites: &BTreeMap::new(),
                     amd_generated_name_offsets: &BTreeMap::new(),
@@ -669,14 +752,57 @@ impl Program {
             let mut map_builder = settings.source_map.then(SourceMapBuilder::new);
             let mut map_sources = Vec::new();
             let mut amd_generated_name_offsets = BTreeMap::new();
+            if let Some(shebang) = sources.iter().find_map(|source| source_shebang(source)) {
+                code.push_str(shebang);
+                code.push('\n');
+            }
+            let mut prologues = Vec::new();
+            let mut seen_prologues = HashSet::new();
+            let has_script_sources = sources
+                .iter()
+                .any(|source| !source_is_external_module(source));
+            for source in sources
+                .iter()
+                .filter(|source| !source_is_external_module(source))
+            {
+                for directive in source_prologue_directives(source) {
+                    if seen_prologues.insert(directive.to_owned()) {
+                        prologues.push(directive.to_owned());
+                    }
+                }
+            }
+            if has_script_sources
+                && settings.always_strict
+                && seen_prologues.insert("use strict".to_owned())
+            {
+                prologues.insert(0, "use strict".to_owned());
+            }
+            for directive in &prologues {
+                push_bundle_prologue(&mut code, directive);
+            }
+            let bundle_needs_extends_helper = settings.target < ts_options::ScriptTarget::Es2015
+                && !settings.no_emit_helpers
+                && sources
+                    .iter()
+                    .any(|source| source_needs_extends_helper(&source.parse.arena));
+            if bundle_needs_extends_helper {
+                code.push_str(BUNDLE_EXTENDS_HELPER);
+            }
             for (source_index, source) in sources.iter().enumerate() {
+                let detached_comment = (settings.module == ModuleKind::Amd
+                    && source_is_external_module(source))
+                .then(|| bundle_detached_comment(source))
+                .flatten();
+                if let Some((comment, _)) = &detached_comment {
+                    code.push_str(comment);
+                }
                 let generated_line =
                     u32::try_from(code.bytes().filter(|byte| *byte == b'\n').count())
                         .unwrap_or(u32::MAX);
                 let mut source_settings = settings;
                 source_settings.source_map = false;
                 source_settings.inline_source_map = false;
-                source_settings.always_strict = settings.always_strict && code.is_empty();
+                source_settings.always_strict = false;
                 let enum_member_values = enum_values_for_emit(&source.checking.enum_member_values);
                 let enum_access_values = enum_values_for_emit(&source.checking.enum_access_values);
                 let amd_dependencies = source
@@ -717,6 +843,10 @@ impl Program {
                     bindings: &source.binding,
                     amd_module_name: amd_module_name.as_deref(),
                     amd_bundle: true,
+                    preemitted_source_prologues: !source_is_external_module(source),
+                    preemitted_shebang: source_shebang(source).is_some(),
+                    suppress_extends_helper: bundle_needs_extends_helper,
+                    preemitted_comment_end: detached_comment.as_ref().map(|(_, end)| *end),
                     amd_dependencies: &amd_dependencies,
                     amd_module_specifier_rewrites: &amd_module_specifier_rewrites,
                     amd_generated_name_offsets: &amd_generated_name_offsets,
