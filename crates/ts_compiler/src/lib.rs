@@ -536,6 +536,15 @@ impl Program {
                 }
             }
             if settings.emit_declarations {
+                let Some(declaration_file_name) = paths.declaration.as_deref() else {
+                    continue;
+                };
+                if self.output_overwrites_input(declaration_file_name) {
+                    output
+                        .diagnostics
+                        .push(output_overwrites_input_diagnostic(declaration_file_name));
+                    continue;
+                }
                 if (self.options.isolated_declarations
                     && has_unserializable_isolated_declaration_name(source_file))
                     || has_private_export_type_query(source_file)
@@ -568,9 +577,7 @@ impl Program {
                     self.options.rewrite_relative_import_extensions,
                 ) {
                     Ok(mut emitted) => {
-                        let Some(file_name) = paths.declaration.clone() else {
-                            continue;
-                        };
+                        let file_name = declaration_file_name.to_owned();
                         let reference_directives =
                             preserved_reference_directives(source_file, &file_name);
                         if !reference_directives.is_empty() {
@@ -741,6 +748,17 @@ impl Program {
         }
 
         if settings.emit_declarations {
+            if let Some(declaration_file_name) = paths.declaration.as_deref()
+                && self.output_overwrites_input(declaration_file_name)
+            {
+                output
+                    .diagnostics
+                    .push(output_overwrites_input_diagnostic(declaration_file_name));
+                if self.options.no_emit_on_error {
+                    output.files.clear();
+                }
+                return output;
+            }
             let mut code = String::new();
             let mut preserved_references = BTreeSet::new();
             if let Some(declaration_file) = paths.declaration.as_deref() {
@@ -938,6 +956,11 @@ impl Program {
             || !canonical
                 .split('/')
                 .any(|component| component.eq_ignore_ascii_case("node_modules"))
+    }
+
+    fn output_overwrites_input(&self, file_name: &str) -> bool {
+        let canonical = canonicalize(file_name, &self.current_directory, self.case_sensitivity);
+        self.file_index.contains_key(&canonical)
     }
 
     fn amd_bundle_specifier_rewrites(
@@ -3578,6 +3601,14 @@ fn module_specifiers(parse: &ParseResult) -> Vec<(String, TextRange, bool)> {
                 .module_specifier
                 .and_then(|specifier| string_literal(&parse.arena, specifier))
                 .map(|(specifier, range)| (specifier, range, false)),
+            NodeData::ImportTypeNode(data) => {
+                let argument = match parse.arena.get(data.argument).map(|node| &node.data) {
+                    Some(NodeData::LiteralTypeNode(literal)) => literal.literal,
+                    _ => data.argument,
+                };
+                string_literal(&parse.arena, argument)
+                    .map(|(specifier, range)| (specifier, range, false))
+            }
             NodeData::CallExpression(data)
                 if matches!(
                     parse.arena.get(data.expression).map(|node| &node.data),
@@ -3818,6 +3849,18 @@ fn missing_file_diagnostic(file_name: &str) -> ProgramDiagnostic {
         message: message
             .format(&[file_name.to_owned()])
             .expect("TS6053 has one formatting argument"),
+    }
+}
+
+fn output_overwrites_input_diagnostic(file_name: &str) -> ProgramDiagnostic {
+    let message = message_by_code(5055).expect("TS5055 must be in the generated catalog");
+    ProgramDiagnostic {
+        file_name: None,
+        range: None,
+        code: Some(message.code()),
+        message: message
+            .format(&[file_name.to_owned()])
+            .expect("TS5055 has one formatting argument"),
     }
 }
 
@@ -5490,6 +5533,68 @@ mod tests {
         assert!(
             javascript.contains("exports.value = 1 /* E.A */;"),
             "{javascript}"
+        );
+    }
+
+    #[test]
+    fn type_only_import_expression_does_not_emit_commonjs_helpers() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/p1/index.ts",
+            concat!(
+                "export interface Ref<T> { current: T; }\n",
+                "export function useRef<T>(current: T): Ref<T> { return { current }; }\n",
+                "export const useParser = () => useRef<typeof import(\"csv-parse\")>(null);\n",
+            ),
+        )
+        .unwrap();
+        fs.write_file(
+            "/p1/node_modules/csv-parse/lib/index.d.ts",
+            "export function bar(): number;",
+        )
+        .unwrap();
+        fs.write_file(
+            "/p1/node_modules/csv-parse/package.json",
+            r#"{"main":"./lib","types":["./lib/index.d.ts"]}"#,
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/p1",
+            &["index.ts".to_owned()],
+            CompilerOptions {
+                declaration: true,
+                module: ModuleKind::CommonJs,
+                target: ScriptTarget::Es2015,
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        assert!(
+            program
+                .source_file("/p1/node_modules/csv-parse/lib/index.d.ts")
+                .is_some(),
+            "{:?}",
+            program.diagnostics()
+        );
+        let emitted = program.emit();
+        let javascript = emitted
+            .files
+            .iter()
+            .find(|file| file.file_name == "/p1/index.js")
+            .unwrap();
+        assert!(
+            !javascript.text.contains("__createBinding"),
+            "{javascript:?}"
+        );
+        let declaration = emitted
+            .files
+            .iter()
+            .find(|file| file.file_name == "/p1/index.d.ts")
+            .unwrap();
+        assert!(
+            declaration.text.contains("typeof import(\"csv-parse\")"),
+            "{declaration:?}"
         );
     }
 

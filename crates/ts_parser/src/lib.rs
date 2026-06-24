@@ -3285,7 +3285,10 @@ impl<'a> Parser<'a> {
                 None
             };
             if let Some(name) = name
-                && self.current.kind == SyntaxKind::EqualsToken
+                && matches!(
+                    self.current.kind,
+                    SyntaxKind::EqualsToken | SyntaxKind::Identifier
+                )
             {
                 return self.parse_import_equals_declaration(start, name);
             }
@@ -3437,7 +3440,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_import_equals_declaration(&mut self, start: TextPos, name: NodeId) -> NodeId {
-        self.bump();
+        self.expect_and_bump(SyntaxKind::EqualsToken, "Expected '='.");
         let module_reference = if self.current.kind == SyntaxKind::RequireKeyword {
             let reference_start = self.consume().range.start;
             self.expect_and_bump(SyntaxKind::OpenParenToken, "Expected '('.");
@@ -6564,6 +6567,16 @@ impl<'a> Parser<'a> {
 
     fn parse_type_query(&mut self) -> NodeId {
         let start = self.consume().range.start;
+        if self.current.kind == SyntaxKind::ImportKeyword {
+            let import_type = self.parse_import_type();
+            let node = self.arena.get_mut(import_type).unwrap();
+            node.range.start = start;
+            let NodeData::ImportTypeNode(import) = &mut node.data else {
+                unreachable!("parse_import_type must return an import type node");
+            };
+            import.is_type_of = true;
+            return import_type;
+        }
         let expr_name = self.parse_entity_name();
         let type_arguments = self.parse_type_arguments();
         let end = type_arguments
@@ -9892,6 +9905,35 @@ mod tests {
     }
 
     #[test]
+    fn recovers_import_equals_when_equals_token_is_missing() {
+        let result = parse_source_file("import Foo From './Foo';");
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message == "'=' expected."),
+            "{:?}",
+            result.diagnostics
+        );
+        let statements = source_statements(&result);
+        let NodeData::ImportEqualsDeclaration(import) =
+            &result.arena.get(statements[0]).unwrap().data
+        else {
+            panic!("expected import-equals declaration");
+        };
+        let NodeData::Identifier(reference) =
+            &result.arena.get(import.module_reference).unwrap().data
+        else {
+            panic!("expected identifier module reference");
+        };
+        assert_eq!(reference.text, "From");
+        assert_eq!(
+            result.arena.get(statements[1]).unwrap().kind,
+            SyntaxKind::ExpressionStatement
+        );
+    }
+
+    #[test]
     fn rescans_regular_expression_literals_in_expression_contexts() {
         let result = parse_source_file("const first = /a[b\\/]c+/giu; const second = /=foo/;");
         assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
@@ -11108,6 +11150,29 @@ mod tests {
             assert_eq!(diagnostic.message, message);
             assert_eq!(diagnostic.category, DiagnosticCategory::Error);
         }
+    }
+
+    #[test]
+    fn parses_typeof_import_as_a_type_argument() {
+        let result = parse_source_file("useRef<typeof import(\"pkg\")>(null);");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let statements = source_statements(&result);
+        assert_eq!(statements.len(), 1);
+        let NodeData::ExpressionStatement(statement) =
+            &result.arena.get(statements[0]).unwrap().data
+        else {
+            panic!("expected expression statement");
+        };
+        let NodeData::CallExpression(call) = &result.arena.get(statement.expression).unwrap().data
+        else {
+            panic!("expected call expression");
+        };
+        let type_argument = call.type_arguments.as_ref().unwrap().nodes[0];
+        let NodeData::ImportTypeNode(import) = &result.arena.get(type_argument).unwrap().data
+        else {
+            panic!("expected import type");
+        };
+        assert!(import.is_type_of);
     }
 
     #[test]
