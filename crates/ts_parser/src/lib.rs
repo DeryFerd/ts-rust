@@ -440,6 +440,16 @@ impl<'a> Parser<'a> {
                 break;
             }
             if self.current.kind == SyntaxKind::Unknown
+                && self.current.text == "\\"
+                && self.next_token_kind() == SyntaxKind::Identifier
+            {
+                // Keep the identifier after an incomplete unicode escape available for
+                // ordinary statement recovery (`a\\u` becomes `a; u;`). The scanner has
+                // already reported the invalid character for the backslash.
+                self.bump();
+                continue;
+            }
+            if self.current.kind == SyntaxKind::Unknown
                 || (self.current.kind == SyntaxKind::AtToken
                     && self.next_token_kind() == SyntaxKind::Unknown)
             {
@@ -907,6 +917,14 @@ impl<'a> Parser<'a> {
         let declaration_start = self.current.range.start;
         let mut declarations = Vec::new();
         loop {
+            if declarations.is_empty()
+                && self.current.kind == SyntaxKind::Unknown
+                && self.current.text == "\\"
+                && self.next_token_kind() == SyntaxKind::Identifier
+            {
+                self.bump();
+                continue;
+            }
             declarations.push(self.parse_variable_declaration());
             if self.current.kind != SyntaxKind::CommaToken {
                 if self.current.kind == SyntaxKind::ColonToken {
@@ -1260,6 +1278,21 @@ impl<'a> Parser<'a> {
                 self.bump();
                 has_trailing_comma = self.current.kind == SyntaxKind::CloseBracketToken;
                 continue;
+            }
+            if !matches!(
+                self.current.kind,
+                SyntaxKind::DotDotDotToken
+                    | SyntaxKind::Identifier
+                    | SyntaxKind::OpenBracketToken
+                    | SyntaxKind::OpenBraceToken
+            ) && !self.current.kind.is_keyword()
+            {
+                self.error_code_at(
+                    self.current.range,
+                    1181,
+                    std::iter::empty::<String>(),
+                );
+                break;
             }
             let before = (self.current.kind, self.current.range);
             let element_start = self.current.range.start;
@@ -1918,6 +1951,13 @@ impl<'a> Parser<'a> {
     }
 
     fn current_token_can_start_type_member(&mut self) -> bool {
+        if matches!(
+            self.current.kind,
+            SyntaxKind::GetKeyword | SyntaxKind::SetKeyword
+        ) && self.is_accessor_signature()
+        {
+            return true;
+        }
         if matches!(
             self.current.kind,
             SyntaxKind::OpenParenToken
@@ -2801,12 +2841,32 @@ impl<'a> Parser<'a> {
             self.disallow_in = true;
             let declaration_start = self.current.range.start;
             let mut declarations = Vec::new();
-            loop {
-                declarations.push(self.parse_variable_declaration());
-                if self.current.kind != SyntaxKind::CommaToken {
+            let permits_empty_list = self.current.kind == SyntaxKind::InKeyword
+                || (self.current.kind == SyntaxKind::OfKeyword
+                    && matches!(self.next_token_kind(), SyntaxKind::Identifier));
+            if !permits_empty_list {
+                loop {
+                    declarations.push(self.parse_variable_declaration());
+                    if self.current.kind == SyntaxKind::CommaToken {
+                        self.bump();
+                        continue;
+                    }
+                    if matches!(
+                        self.current.kind,
+                        SyntaxKind::Identifier
+                            | SyntaxKind::OpenBracketToken
+                            | SyntaxKind::OpenBraceToken
+                    ) || (self.current.kind.is_keyword()
+                        && !matches!(
+                            self.current.kind,
+                            SyntaxKind::InKeyword | SyntaxKind::OfKeyword
+                        ))
+                    {
+                        self.error_current("Expected ','.");
+                        continue;
+                    }
                     break;
                 }
-                self.bump();
             }
             self.disallow_in = previous_disallow_in;
             let declarations_end = declarations
@@ -2876,7 +2936,10 @@ impl<'a> Parser<'a> {
             Some(self.parse_binary_expression(0))
         };
         self.expect_and_bump(SyntaxKind::SemicolonToken, "Expected ';'.");
-        let incrementor = if self.current.kind == SyntaxKind::CloseParenToken {
+        let incrementor = if matches!(
+            self.current.kind,
+            SyntaxKind::CloseParenToken | SyntaxKind::CloseBracketToken
+        ) {
             None
         } else {
             Some(self.parse_binary_expression(0))
@@ -4112,6 +4175,10 @@ impl<'a> Parser<'a> {
             self.error_current("Expected ';'.");
             self.bump();
             expression_end
+        } else if self.current.kind == SyntaxKind::Unknown {
+            // Match parseErrorForMissingSemicolonAfter: a scanner error at the next
+            // token is sufficient and should not also produce a missing-semicolon error.
+            expression_end
         } else {
             self.parse_semicolon(expression_end)
         };
@@ -5104,6 +5171,21 @@ impl<'a> Parser<'a> {
         } else {
             self.parse_type_arguments()
         };
+        if self.current.kind == SyntaxKind::QuestionDotToken {
+            let expression_range = self.arena.get(expression).unwrap().range;
+            let expression_text = self
+                .arena
+                .source_text()
+                .and_then(|source| {
+                    source.get(
+                        expression_range.start.get() as usize
+                            ..expression_range.end.get() as usize,
+                    )
+                })
+                .unwrap_or_default()
+                .to_owned();
+            self.error_code_at(self.current.range, 1209, [expression_text]);
+        }
         let arguments = if self.current.kind == SyntaxKind::OpenParenToken {
             Some(self.parse_argument_list())
         } else {
@@ -5733,6 +5815,7 @@ impl<'a> Parser<'a> {
                 ));
                 if self.current.kind == SyntaxKind::CommaToken {
                     self.bump();
+                    trailing = self.current.kind == SyntaxKind::CloseBraceToken;
                 }
                 continue;
             }
@@ -6505,12 +6588,17 @@ impl<'a> Parser<'a> {
 
     fn parse_numeric_literal(&mut self) -> NodeId {
         let token = self.consume();
+        let token_flags = TokenFlags(if token.flags.contains(ScannerTokenFlags::OCTAL) {
+            1 << 5
+        } else {
+            0
+        });
         self.alloc_node(
             SyntaxKind::NumericLiteral,
             token.range,
             NodeData::NumericLiteral(Box::new(NumericLiteralData {
                 text: token.text.to_owned(),
-                token_flags: TokenFlags::default(),
+                token_flags,
             })),
             &[],
         )
@@ -8696,6 +8784,46 @@ mod tests {
     }
 
     #[test]
+    fn reports_optional_chain_from_bare_new_and_preserves_chain_shape() {
+        let result = parse_source_file("new A?.b(); new A()?.b();");
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .filter_map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [1209]
+        );
+        let statements = source_statements(&result);
+        assert_eq!(statements.len(), 2);
+        for (index, statement) in statements.iter().enumerate() {
+            let NodeData::ExpressionStatement(statement) =
+                &result.arena.get(*statement).unwrap().data
+            else {
+                panic!("expected expression statement");
+            };
+            let NodeData::CallExpression(call) =
+                &result.arena.get(statement.expression).unwrap().data
+            else {
+                panic!("expected outer call");
+            };
+            assert!(call.question_dot_token.is_none());
+            let NodeData::PropertyAccessExpression(access) =
+                &result.arena.get(call.expression).unwrap().data
+            else {
+                panic!("expected optional property access");
+            };
+            assert!(access.question_dot_token.is_some());
+            let NodeData::NewExpression(new_expression) =
+                &result.arena.get(access.expression).unwrap().data
+            else {
+                panic!("expected new-expression receiver");
+            };
+            assert_eq!(new_expression.arguments.is_some(), index == 1);
+        }
+    }
+
+    #[test]
     fn type_argument_lookahead_stops_at_top_level_semicolon() {
         let result = parse_source_file("for (; i < len; i++) {} for (; j >= 0; j--) {}");
         assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
@@ -9102,6 +9230,38 @@ mod tests {
                 .map(|statement| result.arena.get(*statement).unwrap().kind)
                 .collect::<Vec<_>>(),
             [SyntaxKind::ExpressionStatement, SyntaxKind::EmptyStatement]
+        );
+    }
+
+    #[test]
+    fn incomplete_unicode_escape_preserves_following_identifier_statement() {
+        let result = parse_source_file(r"a\u");
+        let statements = source_statements(&result);
+        assert_eq!(statements.len(), 2, "{:?}", result.diagnostics);
+        let names = statements
+            .iter()
+            .map(|statement| {
+                let NodeData::ExpressionStatement(statement) =
+                    &result.arena.get(*statement).unwrap().data
+                else {
+                    panic!("expected expression statement");
+                };
+                let NodeData::Identifier(identifier) =
+                    &result.arena.get(statement.expression).unwrap().data
+                else {
+                    panic!("expected identifier");
+                };
+                identifier.text.as_str()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["a", "u"]);
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .filter_map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [1127]
         );
     }
 

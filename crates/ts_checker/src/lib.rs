@@ -3804,19 +3804,10 @@ impl<'a> Checker<'a> {
             ),
             _ => return None,
         };
-        if let NodeData::PropertyAccessExpression(access) = &self.arena.get(reference)?.data
-            && let Some(receiver_name) = identifier_text(self.arena, access.expression)
-            && let Some(receiver_symbol) =
-                self.enum_import_symbol(access.expression, receiver_name)
-            && let Some(receiver_type) = self.result.symbol_types.get(&receiver_symbol)
-            && let Some(TypeKind::Object(object)) = self
-                .result
-                .types
-                .get(*receiver_type)
-                .map(|type_| &type_.kind)
-            && let Some(member_type) = object.properties.get(name)
-            && let Some(value) = enum_constant_from_type(&self.result.types, *member_type)
-        {
+        if let Some(local_constant) = self.enum_local_constant_variable(reference, name) {
+            return Some(local_constant);
+        }
+        if let Some(value) = self.enum_access_receiver_constant(reference, name) {
             return Some(value);
         }
         let entity_symbol = matches!(
@@ -3890,6 +3881,55 @@ impl<'a> Checker<'a> {
                 };
                 enum_constant_literal(self.arena, variable.initializer?)
             })
+    }
+
+    fn enum_local_constant_variable(&self, reference: NodeId, name: &str) -> Option<Value> {
+        if !matches!(
+            self.arena.get(reference).map(|node| &node.data),
+            Some(NodeData::Identifier(_))
+        ) {
+            return None;
+        }
+        let reference_start = self.arena.get(reference)?.range.start;
+        let declaration = self
+            .bindings
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.name == name)
+            .flat_map(|symbol| symbol.declarations.iter().copied())
+            .filter(|declaration| {
+                let Some(node) = self.arena.get(*declaration) else {
+                    return false;
+                };
+                node.range.start < reference_start
+                    && node
+                        .parent
+                        .and_then(|parent| self.arena.get(parent))
+                        .is_some_and(|parent| {
+                            matches!(parent.data, NodeData::VariableDeclarationList(_))
+                                && parent.flags.0 & (1 << 1) != 0
+                        })
+            })
+            .max_by_key(|declaration| self.arena.get(*declaration).unwrap().range.start)?;
+        let NodeData::VariableDeclaration(variable) = &self.arena.get(declaration)?.data else {
+            return None;
+        };
+        enum_constant_literal(self.arena, variable.initializer?)
+    }
+
+    fn enum_access_receiver_constant(&self, reference: NodeId, name: &str) -> Option<Value> {
+        let receiver = match &self.arena.get(reference)?.data {
+            NodeData::PropertyAccessExpression(access) => access.expression,
+            NodeData::ElementAccessExpression(access) => access.expression,
+            _ => return None,
+        };
+        let receiver_name = identifier_text(self.arena, receiver)?;
+        let receiver_symbol = self.resolve_identifier(receiver, receiver_name)?;
+        let receiver_type = self.result.symbol_types.get(&receiver_symbol)?;
+        let TypeKind::Object(object) = &self.result.types.get(*receiver_type)?.kind else {
+            return None;
+        };
+        enum_constant_from_type(&self.result.types, *object.properties.get(name)?)
     }
 
     fn enum_import_symbol(&self, name_node: NodeId, name: &str) -> Option<ts_ast::SymbolId> {
@@ -20108,6 +20148,22 @@ mod tests {
                 EnumConstantValue::Number(5.0),
                 EnumConstantValue::String("ok".into()),
             ]
+        );
+    }
+
+    #[test]
+    fn evaluates_const_variable_enum_initializers() {
+        let parsed = parse_source_file("const value = 1; enum E { A = value }");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        assert_eq!(
+            result
+                .enum_member_values
+                .values()
+                .cloned()
+                .collect::<Vec<_>>(),
+            [EnumConstantValue::Number(1.0)]
         );
     }
 

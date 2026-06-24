@@ -696,7 +696,8 @@ impl Program {
                     continue;
                 }
                 if (self.options.isolated_declarations
-                    && has_unserializable_isolated_declaration_name(source_file))
+                    && (has_isolated_declaration_emit_error(source_file)
+                        || self.source_imports_isolated_declaration_augmentation(source_file)))
                     || has_private_export_type_query(source_file)
                     || has_unserializable_exported_anonymous_class(source_file)
                     || has_unserializable_exported_class_property_type(source_file)
@@ -1078,7 +1079,8 @@ impl Program {
                     continue;
                 }
                 if (self.options.isolated_declarations
-                    && has_unserializable_isolated_declaration_name(source))
+                    && (has_isolated_declaration_emit_error(source)
+                        || self.source_imports_isolated_declaration_augmentation(source)))
                     || has_private_export_type_query(source)
                     || has_unserializable_exported_anonymous_class(source)
                     || has_unserializable_exported_class_property_type(source)
@@ -1255,6 +1257,20 @@ impl Program {
             || !canonical
                 .split('/')
                 .any(|component| component.eq_ignore_ascii_case("node_modules"))
+    }
+
+    fn source_imports_isolated_declaration_augmentation(&self, source: &SourceFile) -> bool {
+        let containing = canonicalize(
+            &source.file_name,
+            &self.current_directory,
+            self.case_sensitivity,
+        );
+        self.resolved_modules
+            .iter()
+            .filter(|((source, _), _)| source == &containing)
+            .filter_map(|(_, target)| self.file_index.get(target))
+            .filter_map(|index| self.source_files.get(*index))
+            .any(source_has_external_module_augmentation)
     }
 
     fn output_overwrites_input(&self, file_name: &str) -> bool {
@@ -2298,7 +2314,7 @@ fn preserved_reference_value<'a>(directive: &'a str, attribute: &str) -> Option<
     Some(&directive[value_start..value_end])
 }
 
-fn has_unserializable_isolated_declaration_name(source: &SourceFile) -> bool {
+fn has_isolated_declaration_emit_error(source: &SourceFile) -> bool {
     source.parse.arena.iter().any(|(_, node)| {
         let NodeData::ComputedPropertyName(name) = &node.data else {
             return false;
@@ -2353,6 +2369,196 @@ fn has_unserializable_isolated_declaration_name(source: &SourceFile) -> bool {
                         ))
             )
         })
+    }) || has_unsupported_isolated_declaration_shape(source)
+}
+
+#[allow(clippy::too_many_lines)]
+fn has_unsupported_isolated_declaration_shape(source: &SourceFile) -> bool {
+    let arena = &source.parse.arena;
+    let Some(NodeData::SourceFile(file)) = arena
+        .get(source.parse.source_file)
+        .map(|node| &node.data)
+    else {
+        return false;
+    };
+    let module_file = file.statements.nodes.iter().any(|statement| {
+        let Some(node) = arena.get(*statement) else {
+            return false;
+        };
+        matches!(
+            node.data,
+            NodeData::ImportDeclaration(_)
+                | NodeData::ImportEqualsDeclaration(_)
+                | NodeData::ExportDeclaration(_)
+                | NodeData::ExportAssignment(_)
+        ) || declaration_modifiers(node).is_some_and(|modifiers| {
+            node_has_modifier(arena, Some(modifiers), ts_ast::SyntaxKind::ExportKeyword)
+        })
+    });
+    let is_public_statement = |node: &ts_ast::Node| {
+        !module_file
+            || declaration_modifiers(node).is_some_and(|modifiers| {
+                node_has_modifier(arena, Some(modifiers), ts_ast::SyntaxKind::ExportKeyword)
+            })
+    };
+
+    let mut function_values = BTreeSet::new();
+    for statement in &file.statements.nodes {
+        let Some(node) = arena.get(*statement) else {
+            continue;
+        };
+        match &node.data {
+            NodeData::ExportAssignment(assignment)
+                if !assignment.is_export_equals
+                    && !matches!(
+                        arena.get(assignment.expression).map(|node| &node.data),
+                        Some(NodeData::Identifier(_))
+                    ) =>
+            {
+                return true;
+            }
+            NodeData::FunctionDeclaration(function) => {
+                if is_public_statement(node) {
+                    if let Some(name) = function.name.and_then(|name| identifier_text(arena, name))
+                    {
+                        function_values.insert(name.to_owned());
+                    }
+                    if function.type_.is_none() {
+                        return true;
+                    }
+                }
+            }
+            NodeData::VariableStatement(variable) if is_public_statement(node) => {
+                let Some(NodeData::VariableDeclarationList(list)) = arena
+                    .get(variable.declaration_list)
+                    .map(|node| &node.data)
+                else {
+                    continue;
+                };
+                for declaration in &list.declarations.nodes {
+                    let Some(NodeData::VariableDeclaration(declaration)) =
+                        arena.get(*declaration).map(|node| &node.data)
+                    else {
+                        continue;
+                    };
+                    let Some(initializer) = declaration.initializer else {
+                        continue;
+                    };
+                    if matches!(
+                        arena.get(initializer).map(|node| &node.data),
+                        Some(NodeData::ArrowFunction(_) | NodeData::FunctionExpression(_))
+                    ) && let Some(name) = identifier_text(arena, declaration.name)
+                    {
+                        function_values.insert(name.to_owned());
+                    }
+                    match arena.get(initializer).map(|node| &node.data) {
+                        Some(NodeData::ArrowFunction(function)) if function.type_.is_none() => {
+                            return true;
+                        }
+                        Some(NodeData::FunctionExpression(function)) if function.type_.is_none() => {
+                            return true;
+                        }
+                        _ => {}
+                    }
+                    if arena.iter().any(|(candidate, candidate_node)| {
+                        matches!(candidate_node.data, NodeData::ClassExpression(_))
+                            && syntax_node_is_within(arena, candidate, initializer)
+                    }) {
+                        return true;
+                    }
+                }
+            }
+            NodeData::ClassDeclaration(class) if is_public_statement(node) => {
+                for member in &class.members.nodes {
+                    let Some(NodeData::PropertyDeclaration(property)) =
+                        arena.get(*member).map(|node| &node.data)
+                    else {
+                        continue;
+                    };
+                    if property.type_.is_none()
+                        && property.initializer.is_some_and(|initializer| {
+                            matches!(
+                                arena.get(initializer).map(|node| &node.data),
+                                Some(
+                                    NodeData::ArrowFunction(_)
+                                        | NodeData::FunctionExpression(_)
+                                )
+                            )
+                        })
+                    {
+                        return true;
+                    }
+                }
+            }
+            NodeData::ModuleDeclaration(module)
+                if matches!(
+                    arena.get(module.name).map(|node| &node.data),
+                    Some(NodeData::StringLiteral(_))
+                ) =>
+            {
+                return true;
+            }
+            NodeData::EnumDeclaration(enumeration) => {
+                if enumeration.members.nodes.iter().any(|member| {
+                    let Some(NodeData::EnumMember(member)) =
+                        arena.get(*member).map(|node| &node.data)
+                    else {
+                        return false;
+                    };
+                    member.initializer.is_some_and(|initializer| {
+                        arena.iter().any(|(candidate, candidate_node)| {
+                            matches!(candidate_node.data, NodeData::CallExpression(_))
+                                && syntax_node_is_within(arena, candidate, initializer)
+                        })
+                    })
+                }) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    file.statements.nodes.iter().any(|statement| {
+        let Some(NodeData::ExpressionStatement(statement)) =
+            arena.get(*statement).map(|node| &node.data)
+        else {
+            return false;
+        };
+        let Some(NodeData::BinaryExpression(assignment)) =
+            arena.get(statement.expression).map(|node| &node.data)
+        else {
+            return false;
+        };
+        if arena
+            .get(assignment.operator_token)
+            .is_none_or(|operator| operator.kind != ts_ast::SyntaxKind::EqualsToken)
+        {
+            return false;
+        }
+        let Some(NodeData::PropertyAccessExpression(access)) =
+            arena.get(assignment.left).map(|node| &node.data)
+        else {
+            return false;
+        };
+        identifier_text(arena, access.expression)
+            .is_some_and(|name| function_values.contains(name))
+    })
+}
+
+fn source_has_external_module_augmentation(source: &SourceFile) -> bool {
+    source.parse.arena.iter().any(|(_, node)| {
+        let NodeData::ModuleDeclaration(module) = &node.data else {
+            return false;
+        };
+        matches!(
+            source
+                .parse
+                .arena
+                .get(module.name)
+                .map(|node| &node.data),
+            Some(NodeData::StringLiteral(_))
+        )
     })
 }
 

@@ -344,6 +344,7 @@ pub fn emit_source_file_with_context(
         commonjs_destructuring_assignment_temps: HashMap::new(),
         commonjs_destructuring_assignment_hoists: Vec::new(),
         downlevel_nullish_temps: HashMap::new(),
+        downlevel_optional_temps: HashMap::new(),
         namespace_destructuring_temps: HashMap::new(),
         private_method_plans: HashMap::new(),
         active_private_method_plan: None,
@@ -3903,6 +3904,7 @@ impl DeclarationPrinter<'_> {
             && !matches!(&node.data, NodeData::ImportDeclaration(import) if self.import_is_used_by_inferred_semantic_variable_type(id, import))
             && !matches!(&node.data, NodeData::ImportDeclaration(import) if self.import_is_used_by_retained_binding_pattern(id, import))
             && !matches!(&node.data, NodeData::ImportDeclaration(import) if self.import_is_used_by_synthetic_class_base(id, import))
+            && !matches!(&node.data, NodeData::ImportDeclaration(import) if self.import_has_retained_declaration_binding_use(id, import))
             && !matches!(&node.data, NodeData::ImportEqualsDeclaration(import) if self.import_equals_is_used_by_inferred_variable_type(id, import))
         {
             return Ok(());
@@ -17021,7 +17023,17 @@ impl DeclarationPrinter<'_> {
                 };
                 write_quoted_with(&mut self.writer, &data.text, quote);
             }
-            NodeData::NumericLiteral(data) => self.writer.write(&data.text),
+            NodeData::NumericLiteral(data) => {
+                if data.token_flags.0 & (1 << 5) != 0 {
+                    let digits = data.text.trim_start_matches('0');
+                    let digits = if digits.is_empty() { "0" } else { digits };
+                    self.writer.write(
+                        &ts_jsnum::Number::from_string(&format!("0o{digits}")).to_string(),
+                    );
+                } else {
+                    self.writer.write(&data.text);
+                }
+            }
             NodeData::BigIntLiteral(data) => self.writer.write(&data.text.to_ascii_lowercase()),
             NodeData::ComputedPropertyName(data) => {
                 self.writer.write("[");
@@ -18412,6 +18424,12 @@ impl DeclarationPrinter<'_> {
                     self.arena.iter().any(|(identifier, node)| {
                         matches!(&node.data, NodeData::Identifier(data) if data.text == name)
                             && self.node_is_within(identifier, type_node)
+                    })
+                }) || declaration.initializer.is_some_and(|initializer| {
+                    self.arena.iter().any(|(identifier, node)| {
+                        matches!(&node.data, NodeData::Identifier(data) if data.text == name)
+                            && self.node_is_within(identifier, initializer)
+                            && self.identifier_is_in_erased_type_context(identifier)
                     })
                 })
             })
@@ -20349,6 +20367,7 @@ struct Printer<'a> {
     commonjs_destructuring_assignment_temps: HashMap<NodeId, String>,
     commonjs_destructuring_assignment_hoists: Vec<String>,
     downlevel_nullish_temps: HashMap<NodeId, String>,
+    downlevel_optional_temps: HashMap<NodeId, String>,
     namespace_destructuring_temps: HashMap<NodeId, String>,
     private_method_plans: HashMap<NodeId, PrivateMethodPlan>,
     active_private_method_plan: Option<PrivateMethodPlan>,
@@ -25129,7 +25148,11 @@ impl Printer<'_> {
             incrementor_start,
             true,
             data.incrementor
-                .is_some_and(|incrementor| !self.expression_emits_nothing(incrementor)),
+                .is_some_and(|incrementor| !self.expression_emits_nothing(incrementor))
+                || (data.incrementor.is_none()
+                    && data.condition.is_some()
+                    && second_semicolon == second_semicolon_start
+                ),
         );
         if let Some(incrementor) = data.incrementor {
             self.emit_expression(incrementor, 0)?;
@@ -25211,13 +25234,28 @@ impl Printer<'_> {
             false,
             false,
         );
-        self.emit_variable_or_expression_loop_initializer(data.initializer)?;
-        self.emit_for_block_comment_gap(
-            initializer.range.end.get(),
-            operator_start,
-            true,
-            true,
+        let empty_variable_initializer = matches!(
+            &initializer.data,
+            NodeData::VariableDeclarationList(list) if list.declarations.nodes.is_empty()
         );
+        self.emit_variable_or_expression_loop_initializer(data.initializer)?;
+        if empty_variable_initializer {
+            self.emit_for_block_comment_gap(
+                initializer.range.end.get(),
+                operator_start,
+                true,
+                false,
+            );
+            self.writer.remove_trailing_spaces();
+            self.writer.write("  ");
+        } else {
+            self.emit_for_block_comment_gap(
+                initializer.range.end.get(),
+                operator_start,
+                true,
+                true,
+            );
+        }
         self.writer.write(operator);
         self.emit_for_block_comment_gap(
             operator_end,
@@ -28187,30 +28225,50 @@ impl Printer<'_> {
             .arena
             .iter()
             .filter_map(|(id, node)| {
-                let NodeData::BinaryExpression(binary) = &node.data else {
-                    return None;
+                let (receiver, optional) = match &node.data {
+                    NodeData::BinaryExpression(binary)
+                        if self
+                            .arena
+                            .get(binary.operator_token)
+                            .is_some_and(|operator| {
+                                operator.kind == SyntaxKind::QuestionQuestionToken
+                            }) => (binary.left, false),
+                    NodeData::PropertyAccessExpression(access)
+                        if access.question_dot_token.is_some() => (access.expression, true),
+                    NodeData::ElementAccessExpression(access)
+                        if access.question_dot_token.is_some() => (access.expression, true),
+                    NodeData::CallExpression(call) if call.question_dot_token.is_some() => {
+                        (call.expression, true)
+                    }
+                    _ => return None,
                 };
-                if self
-                    .arena
-                    .get(binary.operator_token)
-                    .is_none_or(|operator| operator.kind != SyntaxKind::QuestionQuestionToken)
-                    || !self.downlevel_nullish_left_needs_temp(binary.left)
+                if !self.downlevel_nullish_left_needs_temp(receiver)
                     || !self.node_belongs_to_temp_scope(id, container)
                 {
                     return None;
                 }
-                Some((node.range.start.get(), id))
+                Some((node.range.start.get(), id, optional))
             })
             .collect::<Vec<_>>();
-        expressions.sort_by_key(|(start, _)| *start);
-        for (_, expression) in expressions {
-            if self.downlevel_nullish_temps.contains_key(&expression) {
+        expressions.sort_by_key(|(start, _, _)| *start);
+        for (_, expression, optional) in expressions {
+            let already_allocated = if optional {
+                self.downlevel_optional_temps.contains_key(&expression)
+            } else {
+                self.downlevel_nullish_temps.contains_key(&expression)
+            };
+            if already_allocated {
                 continue;
             }
             let temp = self.generate_block_temp(container, claimed);
             claimed.insert(temp.clone());
-            self.downlevel_nullish_temps
-                .insert(expression, temp.clone());
+            if optional {
+                self.downlevel_optional_temps
+                    .insert(expression, temp.clone());
+            } else {
+                self.downlevel_nullish_temps
+                    .insert(expression, temp.clone());
+            }
             temps.push(temp);
         }
     }
@@ -38479,7 +38537,7 @@ impl Printer<'_> {
                     if method.asterisk_token.is_some() {
                         self.writer.write("*");
                     }
-                    self.emit_class_member_name(data, member_index, method.name)?;
+                    self.emit_class_member_name(data, member_index, method.name, lower_fields)?;
                     self.emit_parameters(&method.parameters)?;
                     self.writer.write(" ");
                     if downlevel_async {
@@ -38543,7 +38601,7 @@ impl Printer<'_> {
                         self.writer.write("static ");
                     }
                     self.writer.write("get ");
-                    self.emit_class_member_name(data, member_index, accessor.name)?;
+                    self.emit_class_member_name(data, member_index, accessor.name, lower_fields)?;
                     self.emit_parameters(&accessor.parameters)?;
                     self.writer.write(" ");
                     self.emit_accessor_body(accessor.body)?;
@@ -38554,7 +38612,7 @@ impl Printer<'_> {
                         self.writer.write("static ");
                     }
                     self.writer.write("set ");
-                    self.emit_class_member_name(data, member_index, accessor.name)?;
+                    self.emit_class_member_name(data, member_index, accessor.name, lower_fields)?;
                     self.emit_parameters(&accessor.parameters)?;
                     self.emit_set_accessor_return_type(accessor.type_)?;
                     self.writer.write(" ");
@@ -38674,6 +38732,7 @@ impl Printer<'_> {
         class: &ts_ast::ClassDeclarationData,
         member_index: usize,
         name: NodeId,
+        lower_fields: bool,
     ) -> Result<(), EmitError> {
         let Some(NodeData::ComputedPropertyName(computed)) =
             self.arena.get(name).map(|node| &node.data)
@@ -38681,6 +38740,7 @@ impl Printer<'_> {
             return self.emit_expression(name, 0);
         };
         let pending = (0..member_index)
+            .filter(|_| lower_fields)
             .filter_map(|field_index| {
                 let NodeData::PropertyDeclaration(field) =
                     &self.arena.get(class.members.nodes[field_index])?.data
@@ -44659,7 +44719,17 @@ impl Printer<'_> {
             }
             NodeData::QualifiedName(data) => self.emit_qualified_name(data)?,
             NodeData::PrivateIdentifier(data) => self.writer.write(&data.text),
-            NodeData::NumericLiteral(data) => self.writer.write(&data.text),
+            NodeData::NumericLiteral(data) => {
+                if data.token_flags.0 & (1 << 5) != 0 {
+                    let digits = data.text.trim_start_matches('0');
+                    let digits = if digits.is_empty() { "0" } else { digits };
+                    self.writer.write(
+                        &ts_jsnum::Number::from_string(&format!("0o{digits}")).to_string(),
+                    );
+                } else {
+                    self.writer.write(&data.text);
+                }
+            }
             NodeData::BigIntLiteral(data) => self.writer.write(&data.text.to_ascii_lowercase()),
             NodeData::StringLiteral(data) => {
                 if data.token_flags.0 & (1 << 2) != 0 {
@@ -44914,6 +44984,7 @@ impl Printer<'_> {
                     && self.settings.target < ScriptTarget::Es2020
                 {
                     self.emit_downlevel_optional_property(
+                        id,
                         data.expression,
                         data.name,
                         parent_precedence,
@@ -45000,6 +45071,7 @@ impl Printer<'_> {
                 if data.question_dot_token.is_some() && self.settings.target < ScriptTarget::Es2020
                 {
                     self.emit_downlevel_optional_element(
+                        id,
                         data.expression,
                         data.argument_expression,
                         parent_precedence,
@@ -45100,10 +45172,20 @@ impl Printer<'_> {
                     && self.is_dynamic_import_call(data)
                 {
                     self.emit_commonjs_dynamic_import(data)?;
+                } else if data.question_dot_token.is_none()
+                    && self.settings.target < ScriptTarget::Es2020
+                    && self.is_optional_access_expression(data.expression)
+                {
+                    self.emit_downlevel_optional_access_call(
+                        data.expression,
+                        &data.arguments,
+                        parent_precedence,
+                    )?;
                 } else if data.question_dot_token.is_some()
                     && self.settings.target < ScriptTarget::Es2020
                 {
                     self.emit_downlevel_optional_call(
+                        id,
                         data.expression,
                         &data.arguments,
                         parent_precedence,
@@ -47555,16 +47637,8 @@ impl Printer<'_> {
     }
 
     fn emit_access_comment_gap(&mut self, start: u32, end: u32) {
-        let multiline = usize::try_from(start)
-            .ok()
-            .zip(usize::try_from(end).ok())
-            .and_then(|(start, end)| self.source_text.get(start..end))
-            .is_some_and(|text| text.contains(['\n', '\r']));
         self.emit_binary_comment_trivia(start, end);
         self.writer.remove_trailing_spaces();
-        if multiline && !self.writer.line_start {
-            self.writer.write(" ");
-        }
     }
 
     fn emit_binary_comment_trivia(&mut self, start: u32, end: u32) {
@@ -47644,8 +47718,78 @@ impl Printer<'_> {
         }
     }
 
+    fn is_optional_access_expression(&self, expression: NodeId) -> bool {
+        matches!(
+            self.arena.get(expression).map(|node| &node.data),
+            Some(NodeData::PropertyAccessExpression(access))
+                if access.question_dot_token.is_some()
+        ) || matches!(
+            self.arena.get(expression).map(|node| &node.data),
+            Some(NodeData::ElementAccessExpression(access))
+                if access.question_dot_token.is_some()
+        )
+    }
+
+    fn emit_downlevel_optional_access_call(
+        &mut self,
+        optional_access: NodeId,
+        arguments: &NodeList,
+        parent_precedence: u8,
+    ) -> Result<(), EmitError> {
+        let access_node = self.node(optional_access)?.clone();
+        let receiver = match &access_node.data {
+            NodeData::PropertyAccessExpression(access) => access.expression,
+            NodeData::ElementAccessExpression(access) => access.expression,
+            _ => return Err(Self::unsupported(optional_access, access_node.kind)),
+        };
+        let wrap = parent_precedence > 2;
+        if wrap {
+            self.writer.write("(");
+        }
+        if let Some(temp) = self
+            .downlevel_optional_temps
+            .get(&optional_access)
+            .cloned()
+        {
+            self.writer.write("(");
+            self.writer.write(&temp);
+            self.writer.write(" = ");
+            self.emit_expression(receiver, 1)?;
+            self.writer.write(") === null || ");
+            self.writer.write(&temp);
+            self.writer.write(" === void 0 ? void 0 : ");
+            self.writer.write(&temp);
+        } else {
+            self.emit_expression(receiver, 10)?;
+            self.writer.write(" === null || ");
+            self.emit_expression(receiver, 10)?;
+            self.writer.write(" === void 0 ? void 0 : ");
+            self.emit_expression(receiver, 18)?;
+        }
+        match &access_node.data {
+            NodeData::PropertyAccessExpression(access) => {
+                self.writer.write(".");
+                self.emit_expression(access.name, 18)?;
+            }
+            NodeData::ElementAccessExpression(access) => {
+                self.writer.write("[");
+                self.emit_expression(access.argument_expression, 0)?;
+                self.writer.write("]");
+            }
+            _ => unreachable!("optional access checked above"),
+        }
+        self.writer.write("(");
+        self.emit_expression_list(arguments)?;
+        self.writer.write(")");
+        if wrap {
+            self.writer.write(")");
+        }
+        Ok(())
+    }
+
     fn emit_downlevel_optional_property(
         &mut self,
+        optional: NodeId,
         expression: NodeId,
         name: NodeId,
         parent_precedence: u8,
@@ -47654,11 +47798,23 @@ impl Printer<'_> {
         if wrap {
             self.writer.write("(");
         }
-        self.emit_expression(expression, 10)?;
-        self.writer.write(" === null || ");
-        self.emit_expression(expression, 10)?;
-        self.writer.write(" === void 0 ? void 0 : ");
-        self.emit_expression(expression, 18)?;
+        if let Some(temp) = self.downlevel_optional_temps.get(&optional).cloned() {
+            self.writer.write("(");
+            self.writer.write(&temp);
+            self.writer.write(" = ");
+            self.emit_expression(expression, 1)?;
+            self.writer.write(")");
+            self.writer.write(" === null || ");
+            self.writer.write(&temp);
+            self.writer.write(" === void 0 ? void 0 : ");
+            self.writer.write(&temp);
+        } else {
+            self.emit_expression(expression, 10)?;
+            self.writer.write(" === null || ");
+            self.emit_expression(expression, 10)?;
+            self.writer.write(" === void 0 ? void 0 : ");
+            self.emit_expression(expression, 18)?;
+        }
         self.writer.write(".");
         self.emit_expression(name, 18)?;
         if wrap {
@@ -47669,6 +47825,7 @@ impl Printer<'_> {
 
     fn emit_downlevel_optional_call(
         &mut self,
+        optional: NodeId,
         expression: NodeId,
         arguments: &NodeList,
         parent_precedence: u8,
@@ -47677,11 +47834,23 @@ impl Printer<'_> {
         if wrap {
             self.writer.write("(");
         }
-        self.emit_expression(expression, 10)?;
-        self.writer.write(" === null || ");
-        self.emit_expression(expression, 10)?;
-        self.writer.write(" === void 0 ? void 0 : ");
-        self.emit_expression(expression, 18)?;
+        if let Some(temp) = self.downlevel_optional_temps.get(&optional).cloned() {
+            self.writer.write("(");
+            self.writer.write(&temp);
+            self.writer.write(" = ");
+            self.emit_expression(expression, 1)?;
+            self.writer.write(")");
+            self.writer.write(" === null || ");
+            self.writer.write(&temp);
+            self.writer.write(" === void 0 ? void 0 : ");
+            self.writer.write(&temp);
+        } else {
+            self.emit_expression(expression, 10)?;
+            self.writer.write(" === null || ");
+            self.emit_expression(expression, 10)?;
+            self.writer.write(" === void 0 ? void 0 : ");
+            self.emit_expression(expression, 18)?;
+        }
         self.writer.write("(");
         self.emit_expression_list(arguments)?;
         self.writer.write(")");
@@ -47693,6 +47862,7 @@ impl Printer<'_> {
 
     fn emit_downlevel_optional_element(
         &mut self,
+        optional: NodeId,
         expression: NodeId,
         argument: NodeId,
         parent_precedence: u8,
@@ -47701,11 +47871,23 @@ impl Printer<'_> {
         if wrap {
             self.writer.write("(");
         }
-        self.emit_expression(expression, 10)?;
-        self.writer.write(" === null || ");
-        self.emit_expression(expression, 10)?;
-        self.writer.write(" === void 0 ? void 0 : ");
-        self.emit_expression(expression, 18)?;
+        if let Some(temp) = self.downlevel_optional_temps.get(&optional).cloned() {
+            self.writer.write("(");
+            self.writer.write(&temp);
+            self.writer.write(" = ");
+            self.emit_expression(expression, 1)?;
+            self.writer.write(")");
+            self.writer.write(" === null || ");
+            self.writer.write(&temp);
+            self.writer.write(" === void 0 ? void 0 : ");
+            self.writer.write(&temp);
+        } else {
+            self.emit_expression(expression, 10)?;
+            self.writer.write(" === null || ");
+            self.emit_expression(expression, 10)?;
+            self.writer.write(" === void 0 ? void 0 : ");
+            self.emit_expression(expression, 18)?;
+        }
         self.writer.write("[");
         self.emit_expression(argument, 0)?;
         self.writer.write("]");
@@ -48309,7 +48491,14 @@ impl Printer<'_> {
             } else if index != 0 {
                 self.writer.write(" ");
             }
+            let nested_class = matches!(node.data, NodeData::ClassExpression(_));
+            if nested_class {
+                self.writer.indent += 1;
+            }
             self.emit_expression(*element, 1)?;
+            if nested_class {
+                self.writer.indent -= 1;
+            }
             previous_end = node.range.end.get();
             let needs_comma =
                 index + 1 < data.elements.nodes.len() || data.elements.has_trailing_comma;
@@ -52936,6 +53125,50 @@ mod tests {
         assert_eq!(
             result.code,
             "var value = source === null || source === void 0 ? void 0 : source[key];\nvar merged = Object.assign({ a: 1 }, extra, { b: 2 });\nvar list = [].concat([], [0], items, [3]);\n"
+        );
+    }
+
+    #[test]
+    fn downlevels_new_optional_access_calls_with_single_evaluation() {
+        let source = "new A?.b(); new A()?.b();";
+        let parsed = parse_source_file(source);
+        assert_eq!(
+            parsed
+                .diagnostics
+                .iter()
+                .filter_map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [1209]
+        );
+        let result = emit_source_file_with_settings(
+            &parsed.arena,
+            parsed.source_file,
+            "input.ts",
+            source,
+            PrinterSettings {
+                always_strict: false,
+                target: ScriptTarget::Es2015,
+                module: ModuleKind::EsNext,
+                jsx: JsxEmit::Preserve,
+                emit_javascript: true,
+                emit_declarations: false,
+                source_map: true,
+                inline_source_map: false,
+                import_helpers: false,
+                no_emit_helpers: false,
+                experimental_decorators: false,
+                remove_comments: false,
+                use_define_for_class_fields: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            result.code,
+            concat!(
+                "var _a, _b;\n",
+                "(_a = new A) === null || _a === void 0 ? void 0 : _a.b();\n",
+                "(_b = new A()) === null || _b === void 0 ? void 0 : _b.b();\n",
+            )
         );
     }
 
