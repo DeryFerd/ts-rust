@@ -302,6 +302,7 @@ pub fn emit_source_file_with_context(
         class_expression_computed_properties: HashSet::new(),
         consumed_class_expression_computed_properties: HashSet::new(),
         async_expression_transform: AsyncExpressionTransform::None,
+        es5_async_expression_rewrites: HashMap::new(),
         async_loop_counter: 0,
         async_control_counter: 0,
         commonjs_empty_binding_temps: HashMap::new(),
@@ -18191,6 +18192,7 @@ struct Printer<'a> {
     class_expression_computed_properties: HashSet<NodeId>,
     consumed_class_expression_computed_properties: HashSet<NodeId>,
     async_expression_transform: AsyncExpressionTransform,
+    es5_async_expression_rewrites: HashMap<NodeId, String>,
     async_loop_counter: u32,
     async_control_counter: u32,
     commonjs_empty_binding_temps: HashMap<NodeId, Vec<String>>,
@@ -25331,33 +25333,22 @@ impl Printer<'_> {
             self.writer.newline();
             return Ok(());
         }
-        // The general sequential form covers ordinary statements and direct awaits.
-        let await_index = block.statements.nodes.iter().position(|statement| {
-            self.direct_await_expression(*statement).is_some()
-                || self.direct_await_binding(*statement).is_some()
-        });
-        let Some(await_index) = await_index else {
+        let suspension_count = block
+            .statements
+            .nodes
+            .iter()
+            .map(|statement| self.es5_async_simple_suspension_count(*statement))
+            .sum::<usize>();
+        if suspension_count == 0 {
             for statement in &block.statements.nodes {
-                if let Some(NodeData::ReturnStatement(return_statement)) =
-                    self.arena.get(*statement).map(|node| &node.data)
-                {
-                    self.writer.write("return [2 /*return*/");
-                    if let Some(expression) = return_statement.expression {
-                        self.writer.write(", ");
-                        self.emit_expression(expression, 0)?;
-                    }
-                    self.writer.write("];");
-                    self.writer.newline();
-                } else {
-                    self.emit_statement(*statement)?;
-                }
+                self.emit_es5_async_non_suspending_statement(*statement)?;
             }
             if !self.statements_end_in_return(&block.statements.nodes) {
                 self.writer.write("return [2 /*return*/];");
                 self.writer.newline();
             }
             return Ok(());
-        };
+        }
         self.writer.write("switch (");
         self.writer.write(state);
         self.writer.write(".label) {");
@@ -25365,47 +25356,14 @@ impl Printer<'_> {
         self.writer.indent += 1;
         self.writer.write("case 0:");
         self.writer.indent += 1;
-        let prefix = &block.statements.nodes[..await_index];
-        if prefix.is_empty() {
-            self.writer.write(" ");
-        } else {
-            self.writer.newline();
+        let mut case = 0;
+        for statement in &block.statements.nodes {
+            self.emit_es5_async_planned_statement(*statement, state, &mut case)?;
         }
-        for statement in prefix {
-            self.emit_statement(*statement)?;
-        }
-        let await_statement = block.statements.nodes[await_index];
-        let direct_binding = self.direct_await_binding(await_statement);
-        let awaited = direct_binding
-            .map(|(_, awaited)| awaited)
-            .or_else(|| self.direct_await_expression(await_statement))
-            .expect("await statement was identified above");
-        self.writer.write("return [4 /*yield*/, ");
-        self.emit_expression(awaited, 0)?;
-        self.writer.write("];");
-        self.writer.newline();
-        self.writer.indent -= 1;
-        self.writer.write("case 1:");
-        self.writer.newline();
-        self.writer.indent += 1;
-        if let Some((name, _)) = direct_binding {
-            self.emit_expression(name, 0)?;
-            self.writer.write(" = ");
-        }
-        self.writer.write(state);
-        self.writer.write(".sent();");
-        self.writer.newline();
-        let suffix = &block.statements.nodes[await_index + 1..];
-        for statement in suffix {
-            if let Some(NodeData::ReturnStatement(return_statement)) =
-                self.arena.get(*statement).map(|node| &node.data)
-            {
-                self.emit_es5_generator_return(return_statement.expression)?;
-            } else {
-                self.emit_statement(*statement)?;
+        if !self.es5_async_statements_end_in_suspending_return(&block.statements.nodes) {
+            if !self.writer.line_start {
+                self.writer.newline();
             }
-        }
-        if !self.statements_end_in_return(suffix) {
             self.writer.write("return [2 /*return*/];");
             self.writer.newline();
         }
@@ -25413,6 +25371,210 @@ impl Printer<'_> {
         self.writer.write("}");
         self.writer.newline();
         Ok(())
+    }
+
+    fn emit_es5_async_planned_statement(
+        &mut self,
+        statement: NodeId,
+        state: &str,
+        case: &mut usize,
+    ) -> Result<(), EmitError> {
+        let node = self.node(statement)?.clone();
+        if let NodeData::Block(block) = &node.data {
+            if self.es5_async_simple_suspension_count(statement) != 0 {
+                for statement in &block.statements.nodes {
+                    self.emit_es5_async_planned_statement(*statement, state, case)?;
+                }
+            } else {
+                if !self.writer.line_start {
+                    self.writer.newline();
+                }
+                self.emit_es5_async_non_suspending_statement(statement)?;
+            }
+            return Ok(());
+        }
+        if let Some((name, awaited)) = self.direct_await_binding(statement) {
+            self.emit_es5_async_yield(awaited, case, false)?;
+            self.emit_expression(name, 0)?;
+            self.writer.write(" = ");
+            self.writer.write(state);
+            self.writer.write(".sent();");
+            self.writer.newline();
+            return Ok(());
+        }
+        let Some((await_id, awaited)) = self.es5_async_simple_statement_await(statement) else {
+            if !self.writer.line_start {
+                self.writer.newline();
+            }
+            self.emit_es5_async_non_suspending_statement(statement)?;
+            return Ok(());
+        };
+        self.emit_es5_async_yield(
+            awaited,
+            case,
+            matches!(&node.data, NodeData::ReturnStatement(_)),
+        )?;
+        let previous = self
+            .es5_async_expression_rewrites
+            .insert(await_id, format!("{state}.sent()"));
+        match &node.data {
+            NodeData::ReturnStatement(statement) => {
+                self.emit_es5_generator_return(statement.expression)?;
+            }
+            _ => self.emit_statement(statement)?,
+        }
+        if let Some(previous) = previous {
+            self.es5_async_expression_rewrites
+                .insert(await_id, previous);
+        } else {
+            self.es5_async_expression_rewrites.remove(&await_id);
+        }
+        Ok(())
+    }
+
+    fn emit_es5_async_yield(
+        &mut self,
+        awaited: NodeId,
+        case: &mut usize,
+        inline_resume: bool,
+    ) -> Result<(), EmitError> {
+        if !self.writer.line_start {
+            self.writer.write(" ");
+        }
+        self.writer.write("return [4 /*yield*/, ");
+        self.emit_expression(awaited, 0)?;
+        self.writer.write("];");
+        self.writer.newline();
+        self.writer.indent -= 1;
+        *case += 1;
+        self.writer.write("case ");
+        self.writer.write(&case.to_string());
+        self.writer.write(":");
+        if inline_resume {
+            self.writer.write(" ");
+        } else {
+            self.writer.newline();
+        }
+        self.writer.indent += 1;
+        Ok(())
+    }
+
+    fn emit_es5_async_non_suspending_statement(
+        &mut self,
+        statement: NodeId,
+    ) -> Result<(), EmitError> {
+        let node = self.node(statement)?.clone();
+        match &node.data {
+            NodeData::ReturnStatement(statement) => {
+                self.emit_es5_generator_return(statement.expression)
+            }
+            NodeData::Block(block) => {
+                self.writer.write("{");
+                self.writer.newline();
+                self.writer.indent += 1;
+                for statement in &block.statements.nodes {
+                    self.emit_es5_async_non_suspending_statement(*statement)?;
+                }
+                self.writer.indent -= 1;
+                self.writer.write("}");
+                self.writer.newline();
+                Ok(())
+            }
+            _ => self.emit_statement(statement),
+        }
+    }
+
+    fn es5_async_simple_suspension_count(&self, statement: NodeId) -> usize {
+        match self.arena.get(statement).map(|node| &node.data) {
+            Some(NodeData::Block(block)) => block
+                .statements
+                .nodes
+                .iter()
+                .map(|statement| self.es5_async_simple_suspension_count(*statement))
+                .sum(),
+            Some(NodeData::VariableStatement(_)) => {
+                usize::from(self.direct_await_binding(statement).is_some())
+            }
+            Some(NodeData::ExpressionStatement(expression)) => usize::from(
+                self.es5_async_simple_await_in_expression(expression.expression)
+                    .is_some(),
+            ),
+            Some(NodeData::ReturnStatement(statement)) => {
+                usize::from(statement.expression.is_some_and(|expression| {
+                    self.es5_async_simple_await_in_expression(expression)
+                        .is_some()
+                }))
+            }
+            _ => 0,
+        }
+    }
+
+    fn es5_async_simple_statement_await(&self, statement: NodeId) -> Option<(NodeId, NodeId)> {
+        let expression = match &self.arena.get(statement)?.data {
+            NodeData::ExpressionStatement(statement) => statement.expression,
+            NodeData::ReturnStatement(statement) => statement.expression?,
+            _ => return None,
+        };
+        let await_id = self.es5_async_simple_await_in_expression(expression)?;
+        let NodeData::AwaitExpression(awaited) = &self.arena.get(await_id)?.data else {
+            return None;
+        };
+        Some((await_id, awaited.expression))
+    }
+
+    fn es5_async_simple_await_in_expression(&self, expression: NodeId) -> Option<NodeId> {
+        match &self.arena.get(expression)?.data {
+            NodeData::AwaitExpression(_) => Some(expression),
+            NodeData::ParenthesizedExpression(expression) => {
+                self.es5_async_simple_await_in_expression(expression.expression)
+            }
+            NodeData::AsExpression(expression) => {
+                self.es5_async_simple_await_in_expression(expression.expression)
+            }
+            NodeData::SatisfiesExpression(expression) => {
+                self.es5_async_simple_await_in_expression(expression.expression)
+            }
+            NodeData::TypeAssertion(expression) => {
+                self.es5_async_simple_await_in_expression(expression.expression)
+            }
+            NodeData::NonNullExpression(expression) => {
+                self.es5_async_simple_await_in_expression(expression.expression)
+            }
+            NodeData::PropertyAccessExpression(expression) => {
+                self.es5_async_simple_await_in_expression(expression.expression)
+            }
+            NodeData::ElementAccessExpression(expression) => {
+                self.es5_async_simple_await_in_expression(expression.expression)
+            }
+            NodeData::BinaryExpression(expression) => {
+                let operator = self.arena.get(expression.operator_token)?.kind;
+                if operator.is_assignment_operator()
+                    && matches!(
+                        self.arena.get(expression.left).map(|node| &node.data),
+                        Some(NodeData::Identifier(_))
+                    )
+                {
+                    self.es5_async_simple_await_in_expression(expression.right)
+                } else {
+                    self.es5_async_simple_await_in_expression(expression.left)
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn es5_async_statements_end_in_suspending_return(&self, statements: &[NodeId]) -> bool {
+        statements.last().is_some_and(|statement| {
+            match self.arena.get(*statement).map(|node| &node.data) {
+                Some(NodeData::ReturnStatement(_)) => true,
+                Some(NodeData::Block(block))
+                    if self.es5_async_simple_suspension_count(*statement) != 0 =>
+                {
+                    self.es5_async_statements_end_in_suspending_return(&block.statements.nodes)
+                }
+                _ => false,
+            }
+        })
     }
 
     fn es5_async_await_binding_names(&self, body: NodeId) -> Vec<NodeId> {
@@ -33118,6 +33280,10 @@ impl Printer<'_> {
 
     #[allow(clippy::too_many_lines)]
     fn emit_expression(&mut self, id: NodeId, parent_precedence: u8) -> Result<(), EmitError> {
+        if let Some(rewrite) = self.es5_async_expression_rewrites.get(&id).cloned() {
+            self.writer.write(&rewrite);
+            return Ok(());
+        }
         let node = self.node(id)?.clone();
         if self.const_enum_emit_mode.inlines_accesses()
             && (self.enum_access_values.contains_key(&id)
@@ -34152,6 +34318,9 @@ impl Printer<'_> {
                     }
                     self.writer.write("}");
                 } else {
+                    if data.properties.has_trailing_comma {
+                        self.writer.write(",");
+                    }
                     self.writer.write(" }");
                 }
             }
