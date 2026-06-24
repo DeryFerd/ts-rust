@@ -1741,7 +1741,7 @@ impl<'a> ProgramChecker<'a> {
                                 referenced_names.contains(name),
                             )
                         } else {
-                            Self::describe_symbol(source, result, symbol_id)
+                            Self::describe_global_symbol(source, result, symbol_id)
                         }
                         && let Some(existing) = globals.get_mut(name)
                     {
@@ -1756,7 +1756,7 @@ impl<'a> ProgramChecker<'a> {
                         referenced_names.contains(name),
                     )
                 } else {
-                    Self::describe_symbol(source, result, symbol_id)
+                    Self::describe_global_symbol(source, result, symbol_id)
                 };
                 if let Some(descriptor) = descriptor {
                     globals.insert(name.to_owned(), descriptor);
@@ -1765,6 +1765,19 @@ impl<'a> ProgramChecker<'a> {
             }
         }
         (globals, duplicates)
+    }
+
+    fn describe_global_symbol(
+        source: &ProgramSource<'_>,
+        result: &CheckResult,
+        symbol_id: SymbolId,
+    ) -> Option<TypeDescriptor> {
+        let symbol = source.bindings.symbols.get(symbol_id)?;
+        if symbol.flags.contains(ts_binder::SymbolFlags::CLASS) {
+            Self::describe_namespace_member_value(source, symbol_id)
+        } else {
+            Self::describe_symbol(source, result, symbol_id)
+        }
     }
 
     fn describe_default_library_symbol(
@@ -11192,7 +11205,8 @@ impl<'a> Checker<'a> {
                     }
                     type_id
                 } else if let Some(descriptor) = self.external_names.get(&name).cloned() {
-                    self.import_alias(&descriptor, &arguments)
+                    let imported = self.import_alias(&descriptor, &arguments);
+                    self.constructor_instance_type(imported).unwrap_or(imported)
                 } else {
                     self.unresolved_type_name(data.type_name, name.clone())
                 };
@@ -20274,6 +20288,60 @@ mod tests {
             .expect("new M.C() should retain its cross-file class name");
         assert_eq!(reference.name, "M.C");
         assert!(reference.type_arguments.is_empty());
+    }
+
+    #[test]
+    fn resolves_global_class_values_and_types_across_files() {
+        let declarations =
+            parse_source_file("class Foo { doThing(x: { a: number }) { return { b: x.a }; } }");
+        let client = parse_source_file(
+            "const c = new Foo(); const typed: Foo = c; const result = c.doThing({ a: 1 });",
+        );
+        let declaration_bindings = bind_source_file(&declarations.arena, declarations.source_file);
+        let client_bindings = bind_source_file(&client.arena, client.source_file);
+        let no_modules = BTreeMap::new();
+        let checked = check_program(&[
+            ProgramSource {
+                arena: &declarations.arena,
+                source_file: declarations.source_file,
+                bindings: &declaration_bindings,
+                resolved_modules: &no_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+            ProgramSource {
+                arena: &client.arena,
+                source_file: client.source_file,
+                bindings: &client_bindings,
+                resolved_modules: &no_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+        ]);
+
+        assert!(
+            checked.files[1].diagnostics.is_empty(),
+            "{:?}",
+            checked.files[1].diagnostics
+        );
+        let root = client_bindings.root_scope().unwrap();
+        let c_type = checked.files[1]
+            .type_of_symbol(root.symbols.get("c").unwrap())
+            .unwrap();
+        assert!(
+            checked.files[1]
+                .named_type_references
+                .get(&c_type)
+                .is_some_and(|reference| reference.name == "Foo"),
+            "{}",
+            checked.files[1].types.display(c_type)
+        );
+        let result_type = checked.files[1]
+            .type_of_symbol(root.symbols.get("result").unwrap())
+            .unwrap();
+        assert_eq!(checked.files[1].types.display(result_type), "{ b: number }");
     }
 
     #[test]

@@ -17286,8 +17286,14 @@ impl Printer<'_> {
                                     } else if let Some(symbol) =
                                         self.bindings.node_symbols.get(&specifier.name)
                                     {
-                                        self.identifier_rewrites
-                                            .insert(*symbol, format!("{parameter}.{imported}"));
+                                        let rewrite = format!("{parameter}.{imported}");
+                                        self.identifier_rewrites.insert(*symbol, rewrite.clone());
+                                        if let Some(local) =
+                                            declaration_name_text(self.arena, specifier.name)
+                                        {
+                                            self.commonjs_named_import_text_rewrites
+                                                .insert(local.to_owned(), rewrite);
+                                        }
                                     }
                                 }
                             }
@@ -17556,6 +17562,14 @@ impl Printer<'_> {
             write_quoted(&mut self.writer, alias);
             self.writer.write(");");
             self.writer.newline();
+        }
+        for statement in &data.statements.nodes {
+            if matches!(
+                self.arena.get(*statement).map(|node| &node.data),
+                Some(NodeData::ImportDeclaration(_))
+            ) {
+                self.emit_commonjs_import_binding_exports(*statement, &data.statements)?;
+            }
         }
         if let Some(first_statement) = data.statements.nodes.first()
             && let Some(node) = self.arena.get(*first_statement)
@@ -27902,6 +27916,9 @@ impl Printer<'_> {
                         .commonjs_export_function_declaration(*specifier)
                         .is_some()
                     || self.commonjs_export_class_declaration(*specifier).is_some()
+                    || self
+                        .commonjs_export_variable_declaration(*specifier)
+                        .is_some()
             })
     }
 
@@ -35726,6 +35743,19 @@ mod tests {
         );
         assert!(
             output.ends_with("    exports.value = 1;\n});\n"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn emits_amd_live_binding_for_reexported_named_import() {
+        let output =
+            emit_amd("import { Foo } from './a'; const c = new Foo(); export { c, Foo };").code;
+
+        assert!(
+            output.contains(
+                "Object.defineProperty(exports, \"Foo\", { enumerable: true, get: function () { return a_1.Foo; } });\n    const c = new a_1.Foo();"
+            ),
             "{output}"
         );
     }
