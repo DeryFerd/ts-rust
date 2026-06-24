@@ -610,6 +610,25 @@ impl<'a> ProgramChecker<'a> {
     }
 
     fn check(self) -> ProgramCheckResult {
+        fn visit_dependencies(
+            index: usize,
+            sources: &[ProgramSource<'_>],
+            states: &mut [u8],
+            order: &mut Vec<usize>,
+        ) {
+            if states.get(index).copied().unwrap_or(2) != 0 {
+                return;
+            }
+            states[index] = 1;
+            for target in sources[index].resolved_modules.values().copied() {
+                if states.get(target).copied() == Some(0) {
+                    visit_dependencies(target, sources, states, order);
+                }
+            }
+            states[index] = 2;
+            order.push(index);
+        }
+
         let preliminary = self
             .sources
             .iter()
@@ -627,8 +646,14 @@ impl<'a> ProgramChecker<'a> {
             })
             .collect::<Vec<_>>();
         let (globals, duplicate_globals) = self.globals(&preliminary);
-        let mut files = Vec::with_capacity(self.sources.len());
-        for (file_index, source) in self.sources.iter().enumerate() {
+        let mut states = vec![0_u8; self.sources.len()];
+        let mut order = Vec::with_capacity(self.sources.len());
+        for index in 0..self.sources.len() {
+            visit_dependencies(index, self.sources, &mut states, &mut order);
+        }
+        let mut files = preliminary.clone();
+        for file_index in order {
+            let source = &self.sources[file_index];
             let (
                 external_symbols,
                 external_imports,
@@ -676,7 +701,7 @@ impl<'a> ProgramChecker<'a> {
             self.retain_module_augmentation_imports(source, &mut result);
             result.import_runtime_meanings = import_runtime_meanings;
             result.diagnostics.append(&mut import_diagnostics);
-            files.push(result);
+            files[file_index] = result;
         }
         for (file_index, node, code, name) in duplicate_globals {
             let message = message_by_code(code).expect("checker diagnostic is in catalog");
@@ -5599,7 +5624,9 @@ impl<'a> Checker<'a> {
                 effective_arguments.push(type_parameter);
             }
         }
-        let instance = self.instantiate_declared_object(symbol, &effective_arguments)?;
+        let instance = self
+            .active_class_instance_type(symbol)
+            .or_else(|| self.instantiate_declared_object(symbol, &effective_arguments))?;
         let kind = self.result.types.get(instance)?.kind.clone();
         let named_instance = self.result.types.alloc(kind);
         let class_name = self.bindings.symbols.get(symbol)?.name.clone();
@@ -5646,6 +5673,23 @@ impl<'a> Checker<'a> {
         }
         self.type_parameter_scopes.pop();
         Some(self.result.types.alloc(TypeKind::Constructor(signature)))
+    }
+
+    fn active_class_instance_type(&mut self, symbol: SymbolId) -> Option<TypeId> {
+        if self.class_value_stack.last() != Some(&symbol) {
+            return None;
+        }
+        match (
+            self.this_types.last().copied(),
+            self.super_types.last().copied(),
+        ) {
+            (Some(this_type), Some(super_type)) => {
+                Some(self.result.types.intersection([this_type, super_type]))
+            }
+            (Some(this_type), None) => Some(this_type),
+            (None, Some(super_type)) => Some(super_type),
+            (None, None) => None,
+        }
     }
 
     fn getter_property_type(&mut self, annotation: Option<NodeId>, body: Option<NodeId>) -> TypeId {
@@ -12591,7 +12635,13 @@ impl<'a> Checker<'a> {
         };
         let mut parameter_types = Vec::with_capacity(parameters.len());
         let mut parameter_names = Vec::with_capacity(parameters.len());
+        let mut rest_parameter = None;
         for (parameter_index, parameter) in parameters.iter().enumerate() {
+            let is_rest = matches!(
+                self.arena.get(*parameter).map(|node| &node.data),
+                Some(NodeData::ParameterDeclaration(parameter))
+                    if parameter.dot_dot_dot_token.is_some()
+            );
             let parameter_type = if let Some(NodeData::ParameterDeclaration(data)) =
                 self.arena.get(*parameter).map(|node| &node.data)
             {
@@ -12656,7 +12706,12 @@ impl<'a> Checker<'a> {
                 parameter_names.push(format!("arg{}", parameter_names.len()));
                 self.result.types.any()
             };
-            parameter_types.push(parameter_type);
+            if is_rest {
+                parameter_names.pop();
+                rest_parameter = Some(parameter_type);
+            } else {
+                parameter_types.push(parameter_type);
+            }
         }
         let mut return_type = match return_annotation {
             Some(node) => self.type_from_type_node(node),
@@ -12677,7 +12732,7 @@ impl<'a> Checker<'a> {
         self.result.types.alloc(TypeKind::Function(FunctionType {
             parameters: parameter_types,
             parameter_names,
-            rest_parameter: None,
+            rest_parameter,
             return_type,
             parameters_optional: self.options.is_javascript_file
                 || (!parameters.is_empty()

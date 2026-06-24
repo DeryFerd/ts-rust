@@ -1862,6 +1862,10 @@ impl<'a> Parser<'a> {
                 self.bump();
                 continue;
             }
+            if signature_only && !self.current_token_can_start_type_member() {
+                recovered_at_statement = true;
+                break;
+            }
             if !signature_only && !self.current_token_can_start_class_member() {
                 self.error_current("Declaration expected.");
                 recovered_at_statement = true;
@@ -1911,6 +1915,51 @@ impl<'a> Parser<'a> {
                     | SyntaxKind::AsteriskToken
                     | SyntaxKind::AtToken
             )
+    }
+
+    fn current_token_can_start_type_member(&mut self) -> bool {
+        if matches!(
+            self.current.kind,
+            SyntaxKind::OpenParenToken
+                | SyntaxKind::LessThanToken
+                | SyntaxKind::OpenBracketToken
+                | SyntaxKind::NewKeyword
+        ) {
+            return true;
+        }
+
+        let checkpoint = self.scanner.mark();
+        let mut name = self.current.kind;
+        if name == SyntaxKind::ReadonlyKeyword && !self.current_modifier_is_member_name() {
+            name = self.scanner.scan().kind;
+        }
+        if !(name == SyntaxKind::Identifier
+            || name.is_keyword()
+            || matches!(
+                name,
+                SyntaxKind::StringLiteral
+                    | SyntaxKind::NumericLiteral
+                    | SyntaxKind::BigIntLiteral
+            ))
+        {
+            self.scanner.rewind(checkpoint);
+            return false;
+        }
+        let next = self.scanner.scan();
+        self.scanner.rewind(checkpoint);
+        matches!(
+            next.kind,
+            SyntaxKind::OpenParenToken
+                | SyntaxKind::LessThanToken
+                | SyntaxKind::QuestionToken
+                | SyntaxKind::ColonToken
+                | SyntaxKind::CommaToken
+                | SyntaxKind::SemicolonToken
+                | SyntaxKind::CloseBraceToken
+                | SyntaxKind::EndOfFile
+        ) || next
+            .flags
+            .contains(ScannerTokenFlags::PRECEDING_LINE_BREAK)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -4910,6 +4959,14 @@ impl<'a> Parser<'a> {
                     SyntaxKind::NoSubstitutionTemplateLiteral | SyntaxKind::TemplateHead
                 )
                 || token.kind.is_assignment_operator()
+                || (token.kind.is_binary_operator()
+                    && !matches!(
+                        token.kind,
+                        SyntaxKind::LessThanToken
+                            | SyntaxKind::GreaterThanToken
+                            | SyntaxKind::PlusToken
+                            | SyntaxKind::MinusToken
+                    ))
                 || matches!(
                     token.kind,
                     SyntaxKind::SemicolonToken

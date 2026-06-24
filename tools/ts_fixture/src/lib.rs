@@ -929,7 +929,10 @@ fn fixture_compiler_options(case: &Case, variant: &OptionVariant) -> ts_options:
     {
         options.target = ts_options::ScriptTarget::Es2025;
     }
-    if !has_explicit_module && options.target < ts_options::ScriptTarget::Es2015 {
+    if !has_explicit_module
+        && options.out_file.is_none()
+        && options.target < ts_options::ScriptTarget::Es2015
+    {
         options.module = ts_options::ModuleKind::CommonJs;
     }
     if case

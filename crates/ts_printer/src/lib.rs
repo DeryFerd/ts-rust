@@ -11740,6 +11740,32 @@ impl DeclarationPrinter<'_> {
                             data.modifiers.as_ref(),
                             SyntaxKind::ReadonlyKeyword,
                         )
+                        && let Some(type_id) = self
+                            .node_types
+                            .and_then(|types| types.get(&id).copied())
+                        && matches!(
+                            self.semantic_types
+                                .and_then(|types| types.get(type_id))
+                                .map(|type_| &type_.kind),
+                            Some(
+                                TypeKind::BooleanLiteral(_)
+                                    | TypeKind::NumberLiteral(_)
+                                    | TypeKind::StringLiteral(_)
+                                    | TypeKind::BigIntLiteral(_)
+                            )
+                        )
+                    {
+                        self.writer.write(" = ");
+                        self.emit_semantic_type(type_id)?;
+                        self.writer.write(";");
+                        self.writer.newline();
+                        return Ok(());
+                    }
+                    if data.type_.is_none()
+                        && self.member_has_modifier(
+                            data.modifiers.as_ref(),
+                            SyntaxKind::ReadonlyKeyword,
+                        )
                         && data.initializer.is_some_and(|initializer| {
                             self.enum_member_type_expression(initializer).is_some()
                         })
@@ -19900,8 +19926,8 @@ fn collect_namespace_alias_rewrites(
                         let Some(node) = arena.get(current_id) else {
                             break;
                         };
-                        if matches!(node.data, NodeData::ModuleDeclaration(_)) {
-                            return current_id == module_declaration;
+                        if current_id == module_declaration {
+                            return true;
                         }
                         current = node.parent;
                     }
@@ -23886,29 +23912,24 @@ impl Printer<'_> {
                     sibling_path.pop();
                     sibling_path.push(text.to_owned());
                     let sibling = self.arena.iter().find_map(|(candidate_id, candidate)| {
-                        let NodeData::ModuleDeclaration(candidate) = &candidate.data else {
-                            return None;
-                        };
                         if self.namespace_declaration_path(candidate_id).as_ref()
                             != Some(&sibling_path)
-                            || !self
-                                .namespace_has_runtime_contents(candidate, &mut HashSet::new())
                         {
                             return None;
                         }
-                        let candidate_symbol = self.bindings.node_symbols.get(&candidate.name)?;
+                        let candidate_symbol = self.runtime_namespace_symbol(candidate_id, candidate)?;
                         let same_symbol = reference_symbol.is_none_or(|reference| {
-                            reference == *candidate_symbol
+                            reference == candidate_symbol
                                 || self
                                     .bindings
                                     .symbols
                                     .get(reference)
                                     .and_then(|symbol| symbol.target)
-                                    == Some(*candidate_symbol)
+                                    == Some(candidate_symbol)
                                 || self
                                     .bindings
                                     .symbols
-                                    .get(*candidate_symbol)
+                                    .get(candidate_symbol)
                                     .and_then(|symbol| symbol.target)
                                     == Some(reference)
                         });
@@ -23953,6 +23974,19 @@ impl Printer<'_> {
             ancestor = node.parent;
         }
         None
+    }
+
+    fn runtime_namespace_symbol(&self, id: NodeId, node: &Node) -> Option<SymbolId> {
+        if declaration_has_modifier(self.arena, node, SyntaxKind::DeclareKeyword) {
+            return None;
+        }
+        let NodeData::ModuleDeclaration(module) = &node.data else {
+            return None;
+        };
+        self.namespace_has_runtime_contents(module, &mut HashSet::new())
+            .then(|| self.bindings.node_symbols.get(&module.name).copied())
+            .flatten()
+            .or_else(|| self.bindings.node_symbols.get(&id).copied())
     }
 
     fn identifier_has_local_namespace_value_declaration(
@@ -24119,7 +24153,8 @@ impl Printer<'_> {
             }
             _ => {}
         }
-        if let Some(container) = self.namespace_containers.last().cloned()
+        if self.node_is_direct_namespace_member(id)
+            && let Some(container) = self.namespace_containers.last().cloned()
             && let NodeData::ImportEqualsDeclaration(import) = &node.data
             && !self.is_external_import_equals(import)
             && self.has_modifier(import.modifiers.as_ref(), SyntaxKind::ExportKeyword)
@@ -24134,7 +24169,7 @@ impl Printer<'_> {
             self.writer.newline();
             return Ok(());
         }
-        if (self.commonjs_module_transform || !self.namespace_containers.is_empty())
+        if (self.commonjs_module_transform || self.node_is_direct_namespace_member(id))
             && declaration_has_modifier(self.arena, &node, SyntaxKind::ExportKeyword)
             && let NodeData::VariableStatement(statement) = &node.data
             && self.variable_list_is_uninitialized(statement.declaration_list)
@@ -24170,7 +24205,7 @@ impl Printer<'_> {
                 } else if !self.emit_namespace_export_variable_initializers(data)?
                     && !self.emit_commonjs_export_variable_initializer(data)?
                 {
-                    self.emit_runtime_declaration_modifiers(data.modifiers.as_ref());
+                    self.emit_runtime_declaration_modifiers(id, data.modifiers.as_ref());
                     self.emit_variable_list(
                         data.declaration_list,
                         self.commonjs_module_transform
@@ -24186,13 +24221,13 @@ impl Printer<'_> {
             }
             NodeData::FunctionDeclaration(data) => {
                 let commonjs_default_name = self.commonjs_anonymous_default_names.get(&id).cloned();
-                let namespace_default_name = (!self.namespace_containers.is_empty()
+                let namespace_default_name = (self.node_is_direct_namespace_member(id)
                     && data.name.is_none()
                     && self.has_modifier(data.modifiers.as_ref(), SyntaxKind::ExportKeyword)
                     && self.has_modifier(data.modifiers.as_ref(), SyntaxKind::DefaultKeyword))
                 .then(|| self.generated_names.generate("default"));
-                self.emit_runtime_declaration_modifiers(data.modifiers.as_ref());
-                if !self.namespace_containers.is_empty()
+                self.emit_runtime_declaration_modifiers(id, data.modifiers.as_ref());
+                if self.node_is_direct_namespace_member(id)
                     && self.has_modifier(data.modifiers.as_ref(), SyntaxKind::DefaultKeyword)
                 {
                     self.writer.write("default ");
@@ -24320,7 +24355,8 @@ impl Printer<'_> {
                 } else {
                     self.emit_function_body(data.body.expect("body checked above"))?;
                 }
-                if let Some(container) = self.namespace_containers.last().cloned()
+                if self.node_is_direct_namespace_member(id)
+                    && let Some(container) = self.namespace_containers.last().cloned()
                     && self.has_modifier(data.modifiers.as_ref(), SyntaxKind::ExportKeyword)
                     && let Some(name) = data.name.and_then(|name| {
                         declaration_name_text(self.arena, name).map(str::to_owned)
@@ -24350,7 +24386,7 @@ impl Printer<'_> {
                     && self.has_modifier(data.modifiers.as_ref(), SyntaxKind::DefaultKeyword))
                 .then(|| self.generated_names.generate("default"));
                 let commonjs_default_name = ((self.commonjs_module_transform
-                    || !self.namespace_containers.is_empty())
+                    || self.node_is_direct_namespace_member(id))
                     && data.name.is_none()
                     && self.has_modifier(data.modifiers.as_ref(), SyntaxKind::ExportKeyword)
                     )
@@ -24363,7 +24399,7 @@ impl Printer<'_> {
                     && self.has_modifier(data.modifiers.as_ref(), SyntaxKind::DefaultKeyword);
                 if decorators.is_empty() {
                     if !lower_preserved_default {
-                        self.emit_runtime_declaration_modifiers(data.modifiers.as_ref());
+                        self.emit_runtime_declaration_modifiers(id, data.modifiers.as_ref());
                     }
                     self.emit_class_with_name(data, commonjs_default_name.as_deref())?;
                 } else if let Some(name) = recovered_default_name.as_deref() {
@@ -24387,7 +24423,9 @@ impl Printer<'_> {
                         || vec![commonjs_default_name.clone().expect("name checked above")],
                         |name| self.declaration_names(&[name]),
                     );
-                    if let Some(container) = self.namespace_containers.last().cloned() {
+                    if self.node_is_direct_namespace_member(id)
+                        && let Some(container) = self.namespace_containers.last().cloned()
+                    {
                         if self.has_modifier(data.modifiers.as_ref(), SyntaxKind::ExportKeyword)
                             && let Some(name) = names.first()
                         {
@@ -24424,7 +24462,7 @@ impl Printer<'_> {
                 }
             }
             NodeData::EnumDeclaration(data) => {
-                self.emit_runtime_declaration_modifiers(data.modifiers.as_ref());
+                self.emit_runtime_declaration_modifiers(id, data.modifiers.as_ref());
                 self.emit_enum(data)?;
             }
             NodeData::ModuleDeclaration(data) => self.emit_namespace(data)?,
@@ -24593,7 +24631,7 @@ impl Printer<'_> {
                 if !self.import_equals_has_runtime_use(id, data) {
                     return Ok(());
                 }
-                self.emit_import_equals(data)?;
+                self.emit_import_equals(id, data)?;
             }
             NodeData::ExportAssignment(data) => {
                 if data.is_export_equals {
@@ -38173,6 +38211,17 @@ impl Printer<'_> {
         let mut previous_emitted = false;
         for (member_index, member) in data.members.nodes.iter().enumerate() {
             let node = self.node(*member)?.clone();
+            let current_is_lowered_field = lower_fields
+                && matches!(
+                    &node.data,
+                    NodeData::PropertyDeclaration(property)
+                        if !self.has_modifier(
+                            property.modifiers.as_ref(),
+                            SyntaxKind::DeclareKeyword,
+                        ) && !self.property_is_native_private_field(property)
+                            && (property.initializer.is_some()
+                                || self.settings.use_define_for_class_fields == Some(true))
+                );
             let current_emitted = !self.class_member_is_abstract(&node)
                 && match &node.data {
                     NodeData::MethodDeclaration(method) => {
@@ -38205,7 +38254,7 @@ impl Printer<'_> {
                     previous_emitted,
                     current_emitted,
                 );
-            } else {
+            } else if !current_is_lowered_field {
                 self.discard_source_comments_between(previous_end, node.range.start.get());
             }
             if previous_emitted {
@@ -41825,6 +41874,7 @@ impl Printer<'_> {
 
     fn emit_import_equals(
         &mut self,
+        declaration: NodeId,
         data: &ts_ast::ImportEqualsDeclarationData,
     ) -> Result<(), EmitError> {
         if data.is_type_only {
@@ -41848,7 +41898,7 @@ impl Printer<'_> {
             self.writer.write(&name);
         } else {
             if !self.is_external_import_equals(data) {
-                self.emit_runtime_declaration_modifiers(data.modifiers.as_ref());
+                self.emit_runtime_declaration_modifiers(declaration, data.modifiers.as_ref());
             }
             self.writer.write(if self.is_external_import_equals(data) {
                 self.variable_keyword()
@@ -42923,10 +42973,22 @@ impl Printer<'_> {
         }
     }
 
-    fn emit_runtime_declaration_modifiers(&mut self, modifiers: Option<&ts_ast::ModifierList>) {
+    fn node_is_direct_namespace_member(&self, declaration: NodeId) -> bool {
+        self.arena
+            .get(declaration)
+            .and_then(|node| node.parent)
+            .and_then(|parent| self.arena.get(parent))
+            .is_some_and(|parent| matches!(parent.data, NodeData::ModuleBlock(_)))
+    }
+
+    fn emit_runtime_declaration_modifiers(
+        &mut self,
+        declaration: NodeId,
+        modifiers: Option<&ts_ast::ModifierList>,
+    ) {
         if self.commonjs_module_transform
             || self.system_export_function.is_some()
-            || !self.namespace_containers.is_empty()
+            || self.node_is_direct_namespace_member(declaration)
         {
             return;
         }
@@ -43198,6 +43260,12 @@ impl Printer<'_> {
         let NodeData::VariableDeclarationList(list) = &list_node.data else {
             return Ok(false);
         };
+        let Some(statement_id) = list_node.parent else {
+            return Ok(false);
+        };
+        if !self.node_is_direct_namespace_member(statement_id) {
+            return Ok(false);
+        }
         let namespace_destructuring = (|| {
             let [declaration_id] = list.declarations.nodes.as_slice() else {
                 return None;
@@ -44497,6 +44565,21 @@ impl Printer<'_> {
                 self.writer.write("]");
             }
             NodeData::ExpressionWithTypeArguments(data) => {
+                let preserve_binary_grouping = data.type_arguments.is_some()
+                    && node
+                        .parent
+                        .and_then(|parent| self.arena.get(parent))
+                        .is_some_and(|parent| {
+                            let NodeData::BinaryExpression(binary) = &parent.data else {
+                                return false;
+                            };
+                            self.arena
+                                .get(binary.operator_token)
+                                .is_some_and(|operator| operator.kind == SyntaxKind::InstanceOfKeyword)
+                        });
+                if preserve_binary_grouping {
+                    self.writer.write("(");
+                }
                 self.emit_expression(data.expression, parent_precedence)?;
                 if let Some(arguments) = &data.type_arguments
                     && arguments.nodes.iter().any(|argument| {
@@ -44514,6 +44597,9 @@ impl Printer<'_> {
                         self.emit_jsdoc_recovery_type(*argument)?;
                     }
                     self.writer.write(">");
+                }
+                if preserve_binary_grouping {
+                    self.writer.write(")");
                 }
             }
             NodeData::ParenthesizedExpression(data) => {
