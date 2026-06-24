@@ -4578,6 +4578,11 @@ impl<'a> Parser<'a> {
 
     #[allow(clippy::too_many_lines)]
     fn parse_postfix_expression_worker(&mut self, in_decorator_context: bool) -> NodeId {
+        if self.current.kind == SyntaxKind::LessThanToken
+            && self.language_variant != LanguageVariant::Jsx
+        {
+            return self.parse_type_assertion();
+        }
         let async_function = self.current.kind == SyntaxKind::AsyncKeyword
             && !self.next_token_preceded_by_line_break()
             && self.next_token_kind() == SyntaxKind::FunctionKeyword;
@@ -4936,9 +4941,22 @@ impl<'a> Parser<'a> {
     fn is_type_argument_expression_suffix(&mut self) -> bool {
         let checkpoint = self.scanner.mark();
         let mut depth = 1_u32;
+        let mut delimiter_depth = 0_u32;
         let mut token = self.scanner.scan();
         while token.kind != SyntaxKind::EndOfFile {
             match token.kind {
+                SyntaxKind::OpenParenToken
+                | SyntaxKind::OpenBracketToken
+                | SyntaxKind::OpenBraceToken => delimiter_depth += 1,
+                SyntaxKind::CloseParenToken
+                | SyntaxKind::CloseBracketToken
+                | SyntaxKind::CloseBraceToken => {
+                    if delimiter_depth == 0 {
+                        break;
+                    }
+                    delimiter_depth -= 1;
+                }
+                SyntaxKind::SemicolonToken if delimiter_depth == 0 => break,
                 SyntaxKind::LessThanToken => depth += 1,
                 SyntaxKind::GreaterThanToken => {
                     depth -= 1;
@@ -5077,7 +5095,15 @@ impl<'a> Parser<'a> {
                 _ => break,
             }
         }
-        let type_arguments = self.parse_type_arguments();
+        let missing_expression = matches!(
+            self.arena.get(expression).map(|node| &node.data),
+            Some(NodeData::Identifier(identifier)) if identifier.text.is_empty()
+        );
+        let type_arguments = if missing_expression {
+            None
+        } else {
+            self.parse_type_arguments()
+        };
         let arguments = if self.current.kind == SyntaxKind::OpenParenToken {
             Some(self.parse_argument_list())
         } else {
@@ -5573,7 +5599,6 @@ impl<'a> Parser<'a> {
             SyntaxKind::LessThanToken if self.language_variant == LanguageVariant::Jsx => {
                 self.parse_jsx_element(false)
             }
-            SyntaxKind::LessThanToken => self.parse_type_assertion(),
             _ => {
                 let position = self.current.range.start;
                 self.error_current("Expected an expression.");
@@ -8612,6 +8637,89 @@ mod tests {
             result.arena.get(assertion.expression).unwrap().kind,
             SyntaxKind::Identifier
         );
+    }
+
+    #[test]
+    fn recovers_type_assertion_after_new_as_relational_expression() {
+        let result = parse_source_file(
+            "const assertion = <T>value; const valid = new Value<T>(); const malformed = new <T> value;",
+        );
+        let statements = source_statements(&result);
+
+        let initializer = |statement| {
+            let (list, _) = variable_list(&result, statement);
+            let declaration = declaration_nodes(&result, list)[0];
+            let NodeData::VariableDeclaration(declaration) =
+                &result.arena.get(declaration).unwrap().data
+            else {
+                panic!("expected variable declaration");
+            };
+            declaration.initializer.unwrap()
+        };
+
+        assert!(matches!(
+            &result.arena.get(initializer(statements[0])).unwrap().data,
+            NodeData::TypeAssertion(_)
+        ));
+
+        let NodeData::NewExpression(valid) =
+            &result.arena.get(initializer(statements[1])).unwrap().data
+        else {
+            panic!("expected generic new expression");
+        };
+        assert_eq!(valid.type_arguments.as_ref().unwrap().nodes.len(), 1);
+
+        let NodeData::BinaryExpression(greater) =
+            &result.arena.get(initializer(statements[2])).unwrap().data
+        else {
+            panic!("expected outer relational expression");
+        };
+        assert_eq!(
+            result.arena.get(greater.operator_token).unwrap().kind,
+            SyntaxKind::GreaterThanToken
+        );
+        let NodeData::BinaryExpression(less) = &result.arena.get(greater.left).unwrap().data else {
+            panic!("expected inner relational expression");
+        };
+        assert_eq!(
+            result.arena.get(less.operator_token).unwrap().kind,
+            SyntaxKind::LessThanToken
+        );
+        let NodeData::NewExpression(malformed) = &result.arena.get(less.left).unwrap().data else {
+            panic!("expected recovered new expression");
+        };
+        assert!(malformed.type_arguments.is_none());
+        assert!(matches!(
+            &result.arena.get(malformed.expression).unwrap().data,
+            NodeData::Identifier(identifier) if identifier.text.is_empty()
+        ));
+    }
+
+    #[test]
+    fn type_argument_lookahead_stops_at_top_level_semicolon() {
+        let result = parse_source_file("for (; i < len; i++) {} for (; j >= 0; j--) {}");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let statements = source_statements(&result);
+        let expected = [SyntaxKind::LessThanToken, SyntaxKind::GreaterThanEqualsToken];
+        for (statement, expected) in statements.iter().zip(expected) {
+            let NodeData::ForStatement(for_statement) =
+                &result.arena.get(*statement).unwrap().data
+            else {
+                panic!("expected for statement");
+            };
+            let NodeData::BinaryExpression(condition) = &result
+                .arena
+                .get(for_statement.condition.unwrap())
+                .unwrap()
+                .data
+            else {
+                panic!("expected binary condition");
+            };
+            assert_eq!(
+                result.arena.get(condition.operator_token).unwrap().kind,
+                expected
+            );
+        }
     }
 
     #[test]
