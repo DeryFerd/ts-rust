@@ -23524,33 +23524,7 @@ impl Printer<'_> {
                     self.writer.newline();
                     return Ok(());
                 }
-                self.writer.write("for (");
-                if let Some(initializer) = data.initializer {
-                    if matches!(
-                        &self.node(initializer)?.data,
-                        NodeData::VariableDeclarationList(_)
-                    ) {
-                        if self.es5_async_hoisted_variable_lists.contains(&initializer) {
-                            self.emit_es5_async_for_initializer_assignments(initializer)?;
-                        } else {
-                            self.emit_variable_list(initializer, false)?;
-                        }
-                    } else {
-                        self.emit_expression(initializer, 0)?;
-                    }
-                }
-                self.writer.write(";");
-                if let Some(condition) = data.condition {
-                    self.writer.write(" ");
-                    self.emit_expression(condition, 0)?;
-                }
-                self.writer.write(";");
-                if let Some(incrementor) = data.incrementor {
-                    self.writer.write(" ");
-                    self.emit_expression(incrementor, 0)?;
-                }
-                self.writer.write(") ");
-                self.emit_embedded(data.statement)?;
+                self.emit_for_statement(id, data)?;
             }
             NodeData::ForInOrOfStatement(data) => {
                 if node.kind == SyntaxKind::ForOfStatement
@@ -23571,35 +23545,13 @@ impl Printer<'_> {
                     self.writer.newline();
                     return Ok(());
                 }
-                self.writer.write("for");
-                if data.await_modifier.is_some() {
-                    self.writer.write(" await");
+                if node.kind == SyntaxKind::ForOfStatement
+                    && self.emit_es2015_object_rest_for_of(data)?
+                {
+                    self.writer.newline();
+                    return Ok(());
                 }
-                self.writer.write(" (");
-                if matches!(
-                    &self.node(data.initializer)?.data,
-                    NodeData::VariableDeclarationList(_)
-                ) {
-                    if self
-                        .es5_async_hoisted_variable_lists
-                        .contains(&data.initializer)
-                    {
-                        self.emit_es5_async_hoisted_loop_binding(data.initializer)?;
-                    } else {
-                        self.emit_variable_list(data.initializer, false)?;
-                    }
-                } else {
-                    self.emit_expression(data.initializer, 0)?;
-                }
-                self.writer
-                    .write(if node.kind == SyntaxKind::ForInStatement {
-                        " in "
-                    } else {
-                        " of "
-                    });
-                self.emit_expression(data.expression, 0)?;
-                self.writer.write(") ");
-                self.emit_embedded(data.statement)?;
+                self.emit_for_in_or_of_statement(id, node.kind, data)?;
             }
             NodeData::SwitchStatement(data) => self.emit_switch(data)?,
             NodeData::TryStatement(data) => self.emit_try(data)?,
@@ -23765,6 +23717,315 @@ impl Printer<'_> {
         }
         self.writer.newline();
         Ok(())
+    }
+
+    fn emit_for_block_comment_gap(
+        &mut self,
+        start: u32,
+        end: u32,
+        terminal_space: bool,
+        default_space: bool,
+    ) {
+        if !self.settings.remove_comments && self.trivia_has_block_comment(start, end) {
+            self.emit_block_comment_trivia(start, end, terminal_space);
+        } else if default_space {
+            self.writer.write(" ");
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn emit_for_statement(
+        &mut self,
+        id: NodeId,
+        data: &ts_ast::ForStatementData,
+    ) -> Result<(), EmitError> {
+        let node = self.node(id)?.clone();
+        let statement_start = self.node(data.statement)?.range.start.get();
+        let keyword_end = node.range.start.get().saturating_add(3);
+        let first_start = data
+            .initializer
+            .or(data.condition)
+            .or(data.incrementor)
+            .and_then(|part| self.arena.get(part))
+            .map_or(statement_start, |part| part.range.start.get());
+        let open = self
+            .source_punctuation_between(keyword_end, first_start, b'(')
+            .unwrap_or(keyword_end);
+        let last_end = data
+            .incrementor
+            .or(data.condition)
+            .or(data.initializer)
+            .and_then(|part| self.arena.get(part))
+            .map_or(open.saturating_add(1), |part| part.range.end.get());
+        let close = self
+            .source_punctuation_between(last_end, statement_start, b')')
+            .unwrap_or(statement_start);
+        let first_semicolon_start = data
+            .initializer
+            .and_then(|part| self.arena.get(part))
+            .map_or(open.saturating_add(1), |part| part.range.end.get());
+        let first_semicolon_end = data
+            .condition
+            .or(data.incrementor)
+            .and_then(|part| self.arena.get(part))
+            .map_or(close, |part| part.range.start.get());
+        let first_semicolon = self
+            .source_punctuation_between(first_semicolon_start, first_semicolon_end, b';')
+            .unwrap_or(first_semicolon_start);
+        let second_semicolon_start = data
+            .condition
+            .and_then(|part| self.arena.get(part))
+            .map_or(first_semicolon.saturating_add(1), |part| part.range.end.get());
+        let second_semicolon_end = data
+            .incrementor
+            .and_then(|part| self.arena.get(part))
+            .map_or(close, |part| part.range.start.get());
+        let second_semicolon = self
+            .source_punctuation_between(second_semicolon_start, second_semicolon_end, b';')
+            .unwrap_or(second_semicolon_start);
+        let recovery_comment = self
+            .source_punctuation_between(open.saturating_add(1), close, b';')
+            .is_none()
+            .then(|| self.for_recovery_body_line_comment(data.statement))
+            .flatten();
+
+        self.writer.write("for");
+        self.emit_for_block_comment_gap(keyword_end, open, true, true);
+        self.writer.write("(");
+        let initializer_start = data
+            .initializer
+            .and_then(|initializer| self.arena.get(initializer))
+            .map_or(first_semicolon, |initializer| initializer.range.start.get());
+        self.emit_for_block_comment_gap(
+            open.saturating_add(1),
+            initializer_start,
+            false,
+            false,
+        );
+        if let Some(initializer) = data.initializer {
+            if matches!(
+                &self.node(initializer)?.data,
+                NodeData::VariableDeclarationList(_)
+            ) {
+                if self.es5_async_hoisted_variable_lists.contains(&initializer) {
+                    self.emit_es5_async_for_initializer_assignments(initializer)?;
+                } else {
+                    self.emit_variable_list(initializer, false)?;
+                }
+            } else {
+                self.emit_expression(initializer, 0)?;
+            }
+        }
+        self.emit_for_block_comment_gap(first_semicolon_start, first_semicolon, false, false);
+        self.writer.write(";");
+        let condition_start = data
+            .condition
+            .and_then(|condition| self.arena.get(condition))
+            .map_or(second_semicolon, |condition| condition.range.start.get());
+        self.emit_for_block_comment_gap(
+            first_semicolon.saturating_add(1),
+            condition_start,
+            true,
+            data.condition
+                .is_some_and(|condition| !self.expression_emits_nothing(condition)),
+        );
+        if let Some(condition) = data.condition {
+            self.emit_expression(condition, 0)?;
+        }
+        self.emit_for_block_comment_gap(second_semicolon_start, second_semicolon, false, false);
+        self.writer.write(";");
+        let incrementor_start = data
+            .incrementor
+            .and_then(|incrementor| self.arena.get(incrementor))
+            .map_or(close, |incrementor| incrementor.range.start.get());
+        self.emit_for_block_comment_gap(
+            second_semicolon.saturating_add(1),
+            incrementor_start,
+            true,
+            data.incrementor
+                .is_some_and(|incrementor| !self.expression_emits_nothing(incrementor)),
+        );
+        if let Some(incrementor) = data.incrementor {
+            self.emit_expression(incrementor, 0)?;
+        }
+        self.emit_for_block_comment_gap(last_end, close, false, false);
+        if let Some(comment) = recovery_comment {
+            self.writer.write(" ");
+            self.writer.write(&comment);
+            self.writer.newline();
+        }
+        self.writer.write(")");
+        self.emit_for_block_comment_gap(
+            close.saturating_add(1),
+            statement_start,
+            true,
+            true,
+        );
+        self.emit_embedded(data.statement)
+    }
+
+    fn for_recovery_body_line_comment(&self, statement: NodeId) -> Option<String> {
+        let statement = self.arena.get(statement)?;
+        let NodeData::Block(_) = &statement.data else {
+            return None;
+        };
+        let start = usize::try_from(statement.range.start.get().saturating_add(1)).ok()?;
+        let end = usize::try_from(statement.range.end.get().saturating_sub(1)).ok()?;
+        let trivia = self.source_text.get(start..end)?;
+        let comment = trivia.trim_start_matches([' ', '\t']);
+        let comment = comment.strip_prefix("//")?;
+        let comment = comment
+            .split_once(['\n', '\r'])
+            .map_or(comment, |(comment, _)| comment);
+        Some(format!("//{comment}"))
+    }
+
+    fn emit_for_in_or_of_statement(
+        &mut self,
+        id: NodeId,
+        kind: SyntaxKind,
+        data: &ts_ast::ForInOrOfStatementData,
+    ) -> Result<(), EmitError> {
+        if data.await_modifier.is_some() {
+            self.writer.write("for await (");
+            self.emit_variable_or_expression_loop_initializer(data.initializer)?;
+            self.writer.write(" of ");
+            self.emit_expression(data.expression, 0)?;
+            self.writer.write(") ");
+            return self.emit_embedded(data.statement);
+        }
+
+        let node = self.node(id)?.clone();
+        let initializer = self.node(data.initializer)?.clone();
+        let expression = self.node(data.expression)?.clone();
+        let statement_start = self.node(data.statement)?.range.start.get();
+        let keyword_end = node.range.start.get().saturating_add(3);
+        let open = self
+            .source_punctuation_between(keyword_end, initializer.range.start.get(), b'(')
+            .unwrap_or(keyword_end);
+        let operator = if kind == SyntaxKind::ForInStatement {
+            "in"
+        } else {
+            "of"
+        };
+        let operator_start = self
+            .source_keyword_between(initializer.range.end.get(), expression.range.start.get(), operator)
+            .unwrap_or(initializer.range.end.get());
+        let operator_end = operator_start.saturating_add(u32::try_from(operator.len()).unwrap_or(0));
+        let close = self
+            .source_punctuation_between(expression.range.end.get(), statement_start, b')')
+            .unwrap_or(statement_start);
+
+        self.writer.write("for");
+        self.emit_for_block_comment_gap(keyword_end, open, true, true);
+        self.writer.write("(");
+        self.emit_for_block_comment_gap(
+            open.saturating_add(1),
+            initializer.range.start.get(),
+            false,
+            false,
+        );
+        self.emit_variable_or_expression_loop_initializer(data.initializer)?;
+        self.emit_for_block_comment_gap(
+            initializer.range.end.get(),
+            operator_start,
+            true,
+            true,
+        );
+        self.writer.write(operator);
+        self.emit_for_block_comment_gap(
+            operator_end,
+            expression.range.start.get(),
+            true,
+            true,
+        );
+        self.emit_expression(data.expression, 0)?;
+        self.emit_for_block_comment_gap(expression.range.end.get(), close, false, false);
+        self.writer.write(")");
+        self.emit_for_block_comment_gap(
+            close.saturating_add(1),
+            statement_start,
+            true,
+            true,
+        );
+        self.emit_embedded(data.statement)
+    }
+
+    fn emit_variable_or_expression_loop_initializer(
+        &mut self,
+        initializer: NodeId,
+    ) -> Result<(), EmitError> {
+        if matches!(
+            &self.node(initializer)?.data,
+            NodeData::VariableDeclarationList(_)
+        ) {
+            if self
+                .es5_async_hoisted_variable_lists
+                .contains(&initializer)
+            {
+                self.emit_es5_async_hoisted_loop_binding(initializer)
+            } else {
+                self.emit_variable_list(initializer, false)
+            }
+        } else {
+            self.emit_expression(initializer, 0)
+        }
+    }
+
+    fn emit_es2015_object_rest_for_of(
+        &mut self,
+        data: &ts_ast::ForInOrOfStatementData,
+    ) -> Result<bool, EmitError> {
+        if self.settings.target < ScriptTarget::Es2015
+            || self.settings.target >= ScriptTarget::Es2018
+            || data.await_modifier.is_some()
+        {
+            return Ok(false);
+        }
+        let initializer_node = self.node(data.initializer)?.clone();
+        let NodeData::VariableDeclarationList(list) = &initializer_node.data else {
+            return Ok(false);
+        };
+        let [declaration_id] = list.declarations.nodes.as_slice() else {
+            return Ok(false);
+        };
+        let declaration_node = self.node(*declaration_id)?.clone();
+        let NodeData::VariableDeclaration(declaration) = &declaration_node.data else {
+            return Ok(false);
+        };
+        if !self.object_binding_pattern_has_rest(declaration.name) {
+            return Ok(false);
+        }
+        let keyword = if initializer_node.flags.0 & (1 << 1) != 0 {
+            "const"
+        } else if initializer_node.flags.0 & 1 != 0 {
+            "let"
+        } else {
+            "var"
+        };
+        let temp = self.generated_names.generate_temp();
+        self.writer.write("for (");
+        self.writer.write(keyword);
+        self.writer.write(" ");
+        self.writer.write(&temp);
+        self.writer.write(" of ");
+        self.emit_expression(data.expression, 0)?;
+        self.writer.write(") {");
+        self.writer.newline();
+        self.writer.indent += 1;
+        self.emit_object_rest_parameter_prologue(declaration.name, &temp, keyword)?;
+        if matches!(self.node(data.statement)?.data, NodeData::Block(_)) {
+            self.emit_block_statements(data.statement)?;
+        } else if self
+            .arena
+            .get(data.statement)
+            .is_some_and(|statement| self.statement_emits_runtime(data.statement, statement))
+        {
+            self.emit_statement(data.statement)?;
+        }
+        self.writer.indent -= 1;
+        self.writer.write("}");
+        Ok(true)
     }
 
     fn continue_targets_captured_loop(&self, statement: NodeId) -> bool {
@@ -25790,7 +26051,7 @@ impl Printer<'_> {
         self.emit_source_comments_between_with_trailing(
             previous_end,
             node.range.end.get().saturating_sub(1),
-            previous_emitted,
+            previous_emitted || previous_end == node.range.start.get().saturating_add(1),
         );
         self.namespace_declarations.pop();
         self.writer.indent -= 1;
@@ -26478,7 +26739,7 @@ impl Printer<'_> {
             if self.node(*pattern)?.kind == SyntaxKind::ObjectBindingPattern
                 && self.object_binding_pattern_has_rest(*pattern)
             {
-                self.emit_object_rest_parameter_prologue(*pattern, temp)?;
+                self.emit_object_rest_parameter_prologue(*pattern, temp, "var")?;
             } else {
                 self.writer.write("var ");
                 let mut emitted = false;
@@ -28462,7 +28723,7 @@ impl Printer<'_> {
                 self.writer.write(";");
                 self.writer.newline();
             }
-            self.emit_object_rest_parameter_prologue(pattern, parameter)?;
+            self.emit_object_rest_parameter_prologue(pattern, parameter, "var")?;
         } else if expression_body.is_none()
             && let Some(loop_info) = self.es5_async_captured_for_loop(body)?
         {
@@ -34643,7 +34904,7 @@ impl Printer<'_> {
         self.writer.write(", void 0, void 0, function* () {");
         self.writer.newline();
         self.writer.indent += 1;
-        self.emit_object_rest_parameter_prologue(pattern, parameter_temp)?;
+        self.emit_object_rest_parameter_prologue(pattern, parameter_temp, "var")?;
         if matches!(&self.node(body)?.data, NodeData::Block(_)) {
             let previous = self.async_expression_transform;
             self.async_expression_transform = AsyncExpressionTransform::AwaitAsYield;
@@ -34669,6 +34930,7 @@ impl Printer<'_> {
         &mut self,
         pattern: NodeId,
         parameter_temp: &str,
+        keyword: &str,
     ) -> Result<(), EmitError> {
         let pattern_node = self.node(pattern)?.clone();
         let NodeData::BindingPattern(pattern) = &pattern_node.data else {
@@ -34687,7 +34949,8 @@ impl Printer<'_> {
                 ordinary.push(*element_id);
             }
         }
-        self.writer.write("var ");
+        self.writer.write(keyword);
+        self.writer.write(" ");
         if self.settings.target < ScriptTarget::Es2015 {
             for (index, element_id) in ordinary.iter().enumerate() {
                 if index != 0 {
@@ -34756,7 +35019,7 @@ impl Printer<'_> {
         self.writer.write("{");
         self.writer.newline();
         self.writer.indent += 1;
-        self.emit_object_rest_parameter_prologue(pattern, parameter_temp)?;
+        self.emit_object_rest_parameter_prologue(pattern, parameter_temp, "var")?;
         if matches!(
             self.arena.get(body).map(|node| &node.data),
             Some(NodeData::Block(_))
@@ -40098,7 +40361,10 @@ impl Printer<'_> {
                 true,
                 false,
             );
-            previous_end = comma.map_or_else(|| node.range.end.get(), |_| comment_end.get());
+            previous_end = comma.map_or_else(
+                || node.range.end.get(),
+                |comma| comma.saturating_add(1),
+            );
         }
         self.writer.indent -= 1;
         self.writer.write("})(");
@@ -45333,6 +45599,42 @@ impl Printer<'_> {
                 }
                 index = (index + 2).min(bytes.len());
             } else if bytes[index] == token {
+                return u32::try_from(start_index + index).ok();
+            } else {
+                index += 1;
+            }
+        }
+        None
+    }
+
+    fn source_keyword_between(&self, start: u32, end: u32, keyword: &str) -> Option<u32> {
+        let start_index = usize::try_from(start).ok()?;
+        let end_index = usize::try_from(end).ok()?;
+        let text = self.source_text.get(start_index..end_index)?;
+        let bytes = text.as_bytes();
+        let keyword = keyword.as_bytes();
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index..].starts_with(b"//") {
+                index += 2;
+                while index < bytes.len() && !matches!(bytes[index], b'\n' | b'\r') {
+                    index += 1;
+                }
+            } else if bytes[index..].starts_with(b"/*") {
+                index += 2;
+                while index + 1 < bytes.len() && !bytes[index..].starts_with(b"*/") {
+                    index += 1;
+                }
+                index = (index + 2).min(bytes.len());
+            } else if bytes[index..].starts_with(keyword)
+                && index
+                    .checked_sub(1)
+                    .and_then(|previous| bytes.get(previous))
+                    .is_none_or(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_')
+                && bytes
+                    .get(index + keyword.len())
+                    .is_none_or(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_')
+            {
                 return u32::try_from(start_index + index).ok();
             } else {
                 index += 1;

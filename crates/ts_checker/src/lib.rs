@@ -3348,26 +3348,49 @@ impl<'a> Checker<'a> {
         let mut properties = BTreeMap::new();
         let mut member_type_names = BTreeMap::new();
         let mut resolved_values = BTreeMap::<String, Value>::new();
-        let member_names = data
-            .members
-            .nodes
+        let enum_name = self.property_name(data.name).unwrap_or_default();
+        let declarations = self
+            .bindings
+            .node_symbols
+            .get(&data.name)
+            .copied()
+            .or_else(|| self.bindings.resolve_name_at(data.name, &enum_name))
+            .and_then(|symbol| self.bindings.symbols.get(symbol))
+            .map(|symbol| symbol.declarations.clone())
+            .unwrap_or_default();
+        let member_positions = declarations
             .iter()
-            .filter_map(|member_id| {
-                let NodeData::EnumMember(member) = &self.arena.get(*member_id)?.data else {
+            .filter_map(|declaration| {
+                let NodeData::EnumDeclaration(enumeration) = &self.arena.get(*declaration)?.data
+                else {
                     return None;
                 };
-                self.property_name(member.name)
+                Some(&enumeration.members.nodes)
             })
-            .collect::<BTreeSet<_>>();
-        let enum_name = self.property_name(data.name).unwrap_or_default();
+            .flatten()
+            .filter_map(|member_id| {
+                let node = self.arena.get(*member_id)?;
+                let NodeData::EnumMember(member) = &node.data else {
+                    return None;
+                };
+                Some((self.property_name(member.name)?, node.range.start.get()))
+            })
+            .collect::<Vec<_>>();
         let is_const = self.has_ast_modifier(data.modifiers.as_ref(), SyntaxKind::ConstKeyword);
         let mut next_numeric_value = Some(0.0_f64);
         for member_id in &data.members.nodes {
-            let Some(NodeData::EnumMember(member)) =
-                self.arena.get(*member_id).map(|node| &node.data)
-            else {
+            let Some(member_node) = self.arena.get(*member_id) else {
                 continue;
             };
+            let NodeData::EnumMember(member) = &member_node.data else {
+                continue;
+            };
+            let following_member_names = member_positions
+                .iter()
+                .filter_map(|(name, position)| {
+                    (*position > member_node.range.start.get()).then_some(name.clone())
+                })
+                .collect::<BTreeSet<_>>();
             let Some(name) = self.property_name(member.name) else {
                 continue;
             };
@@ -3377,7 +3400,7 @@ impl<'a> Checker<'a> {
                     initializer,
                     is_const,
                     &enum_name,
-                    &member_names,
+                    &following_member_names,
                     &resolved_values,
                 )
             });
@@ -3465,14 +3488,7 @@ impl<'a> Checker<'a> {
             self.error(initializer, 2474, std::iter::empty());
             return None;
         }
-        if !is_const
-            && self.enum_initializer_requires_runtime(
-                initializer,
-                enum_name,
-                member_names,
-                resolved_values,
-            )
-        {
+        if !is_const && self.enum_initializer_requires_runtime(initializer) {
             return None;
         }
         let mut forward_reference = false;
@@ -3510,6 +3526,10 @@ impl<'a> Checker<'a> {
                 self.error(initializer, 2651, std::iter::empty());
                 None
             }
+            _ if forward_reference => {
+                self.error(initializer, 2651, std::iter::empty());
+                Some(Value::Number(Number::new(0.0)))
+            }
             _ if is_const => {
                 self.error(initializer, 2474, std::iter::empty());
                 None
@@ -3518,21 +3538,10 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn enum_initializer_requires_runtime(
-        &self,
-        initializer: NodeId,
-        enum_name: &str,
-        member_names: &BTreeSet<String>,
-        resolved_values: &BTreeMap<String, Value>,
-    ) -> bool {
+    fn enum_initializer_requires_runtime(&self, initializer: NodeId) -> bool {
         match self.arena.get(initializer).map(|node| &node.data) {
             Some(NodeData::ParenthesizedExpression(parenthesized)) => self
-                .enum_initializer_requires_runtime(
-                    parenthesized.expression,
-                    enum_name,
-                    member_names,
-                    resolved_values,
-                ),
+                .enum_initializer_requires_runtime(parenthesized.expression),
             Some(
                 NodeData::AsExpression(_)
                 | NodeData::TypeAssertion(_)
@@ -3543,39 +3552,14 @@ impl<'a> Checker<'a> {
                 matches!(
                     self.arena.get(access.expression).map(|node| &node.data),
                     Some(NodeData::StringLiteral(_) | NodeData::NoSubstitutionTemplateLiteral(_))
-                ) || enum_member_reference_name(self.arena, initializer, enum_name).is_some_and(
-                    |name| member_names.contains(&name) && !resolved_values.contains_key(&name),
                 )
-            }
-            Some(NodeData::ElementAccessExpression(_)) => {
-                enum_member_reference_name(self.arena, initializer, enum_name).is_some_and(|name| {
-                    member_names.contains(&name) && !resolved_values.contains_key(&name)
-                })
-            }
-            Some(NodeData::Identifier(identifier)) => {
-                member_names.contains(&identifier.text)
-                    && !resolved_values.contains_key(&identifier.text)
             }
             Some(NodeData::BinaryExpression(binary)) => {
-                self.enum_initializer_requires_runtime(
-                    binary.left,
-                    enum_name,
-                    member_names,
-                    resolved_values,
-                ) || self.enum_initializer_requires_runtime(
-                    binary.right,
-                    enum_name,
-                    member_names,
-                    resolved_values,
-                )
+                self.enum_initializer_requires_runtime(binary.left)
+                    || self.enum_initializer_requires_runtime(binary.right)
             }
             Some(NodeData::PrefixUnaryExpression(prefix)) => self
-                .enum_initializer_requires_runtime(
-                    prefix.operand,
-                    enum_name,
-                    member_names,
-                    resolved_values,
-                ),
+                .enum_initializer_requires_runtime(prefix.operand),
             _ => false,
         }
     }
@@ -5176,6 +5160,18 @@ impl<'a> Checker<'a> {
                                 .collect::<Vec<_>>()
                         })
                         .unwrap_or_default();
+                    let array_element = if matches!(
+                        self.property_name(heritage.expression).as_deref(),
+                        Some("Array" | "ReadonlyArray")
+                    ) {
+                        arguments.first().copied()
+                    } else {
+                        None
+                    };
+                    if let Some(element) = array_element {
+                        has_base = true;
+                        number_index_type = Some(element);
+                    }
                     let base = self
                         .property_name(heritage.expression)
                         .and_then(|name| self.resolve_identifier(heritage.expression, &name))
@@ -5193,6 +5189,10 @@ impl<'a> Checker<'a> {
                         Some(TypeKind::Any)
                     ) {
                         string_index_type = Some(self.result.types.any());
+                    } else if let TypeKind::Array(element) =
+                        &self.result.types.get(base).unwrap().kind
+                    {
+                        number_index_type = Some(*element);
                     } else if let TypeKind::Object(base) =
                         self.result.types.get(base).unwrap().kind.clone()
                     {
@@ -5212,6 +5212,7 @@ impl<'a> Checker<'a> {
                         getter_properties.extend(base.getter_properties);
                         setter_properties.extend(base.setter_properties);
                     }
+                    number_index_type = array_element.or(number_index_type);
                 }
             }
         }
@@ -8652,12 +8653,8 @@ impl<'a> Checker<'a> {
                 self.result.types.void()
             }
         } else {
-            let return_context = expected_return.filter(|expected| {
-                !matches!(
-                    self.result.types.get(*expected).map(|type_| &type_.kind),
-                    Some(TypeKind::TypeParameter { .. })
-                )
-            });
+            let return_context = expected_return
+                .filter(|expected| !self.type_contains_type_parameter(*expected));
             let actual = self.type_of_expression_context(data.body, return_context);
             if let Some(expected) = expected_return
                 && !self.is_assignable(actual, expected)
@@ -8665,12 +8662,8 @@ impl<'a> Checker<'a> {
                 self.assignability_error(data.body, actual, expected);
             }
             if data.type_.is_none()
-                && expected_return.is_some_and(|expected| {
-                    matches!(
-                        self.result.types.get(expected).map(|type_| &type_.kind),
-                        Some(TypeKind::TypeParameter { .. })
-                    )
-                })
+                && expected_return
+                    .is_some_and(|expected| self.type_contains_type_parameter(expected))
             {
                 self.widen_literal(actual)
             } else {
@@ -10027,9 +10020,7 @@ impl<'a> Checker<'a> {
                     .or_insert(actual);
             }
             TypeKind::Array(parameter_element) => {
-                if let TypeKind::Array(actual_element) =
-                    self.result.types.get(actual).unwrap().kind.clone()
-                {
+                if let Some(actual_element) = self.array_like_element_type(actual) {
                     self.infer_type_parameters(parameter_element, actual_element, inference);
                 }
             }
@@ -10237,6 +10228,7 @@ impl<'a> Checker<'a> {
     }
 
     fn inference_shape_score(&self, parameter: TypeId, actual: TypeId) -> u8 {
+        let actual_id = actual;
         if let (Some(parameter), Some(actual)) = (
             self.result.named_type_references.get(&parameter),
             self.result.named_type_references.get(&actual),
@@ -10248,6 +10240,11 @@ impl<'a> Checker<'a> {
         let actual = self.result.types.get(actual).map(|type_| &type_.kind);
         if matches!(parameter, Some(TypeKind::TypeParameter { .. })) {
             return 1;
+        }
+        if matches!(parameter, Some(TypeKind::Array(_)))
+            && self.array_like_element_type(actual_id).is_some()
+        {
+            return 2;
         }
         match (parameter, actual) {
             (Some(TypeKind::Array(_)), Some(TypeKind::Array(_)))
@@ -11151,6 +11148,18 @@ impl<'a> Checker<'a> {
 
     fn type_contains_type_parameter(&self, type_id: TypeId) -> bool {
         self.type_contains_type_parameter_inner(type_id, &mut HashSet::new())
+    }
+
+    fn array_like_element_type(&self, type_id: TypeId) -> Option<TypeId> {
+        match &self.result.types.get(type_id)?.kind {
+            TypeKind::Array(element) => Some(*element),
+            TypeKind::Object(object) => object.number_index_type,
+            TypeKind::Tuple(elements) | TypeKind::ReadonlyTuple(elements) => {
+                let first = *elements.first()?;
+                elements.iter().all(|element| *element == first).then_some(first)
+            }
+            _ => None,
+        }
     }
 
     fn type_contains_type_parameter_inner(
@@ -12813,6 +12822,11 @@ impl<'a> Checker<'a> {
             || matches!(target_kind, TypeKind::Any | TypeKind::Unknown)
         {
             return true;
+        }
+        if let TypeKind::Array(target_element) = target_kind
+            && let Some(source_element) = self.array_like_element_type(source)
+        {
+            return self.is_assignable(source_element, *target_element);
         }
         if let TypeKind::Object(target_object) = target_kind {
             let properties_assignable =
