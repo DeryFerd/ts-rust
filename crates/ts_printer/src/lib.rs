@@ -4073,7 +4073,19 @@ impl DeclarationPrinter<'_> {
                     && let Some(signature) = semantic_signature
                 {
                     self.writer.write(": ");
-                    self.emit_function_semantic_return_type(data, signature.return_type)?;
+                    if self.javascript_source
+                        && data.name.is_some_and(|name| {
+                            declaration_name_text(self.arena, name).is_some_and(|name| {
+                                data.body.is_some_and(|body| {
+                                    self.javascript_body_returns_new_name(body, name)
+                                })
+                            })
+                        })
+                    {
+                        self.emit_name(data.name.expect("function name checked"))?;
+                    } else {
+                        self.emit_function_semantic_return_type(data, signature.return_type)?;
+                    }
                 } else {
                     self.emit_return_type(data.type_)?;
                 }
@@ -4160,10 +4172,18 @@ impl DeclarationPrinter<'_> {
                 if self.javascript_source
                     && let Some(name) = data.name
                 {
-                    self.emit_javascript_prototype_overload_class(
-                        name,
-                        exported && !synthesized_default_namespace,
-                    )?;
+                    let emitted_constructor_class = self
+                        .emit_javascript_function_constructor_class(
+                            id,
+                            data,
+                            exported && !synthesized_default_namespace,
+                        )?;
+                    if !emitted_constructor_class {
+                        self.emit_javascript_prototype_overload_class(
+                            name,
+                            exported && !synthesized_default_namespace,
+                        )?;
+                    }
                 }
             }
             NodeData::ClassDeclaration(data) => {
@@ -12314,6 +12334,102 @@ impl DeclarationPrinter<'_> {
             self.writer.newline();
         }
         Ok(true)
+    }
+
+    fn emit_javascript_function_constructor_class(
+        &mut self,
+        function_id: NodeId,
+        function: &ts_ast::FunctionDeclarationData,
+        exported: bool,
+    ) -> Result<bool, EmitError> {
+        let (Some(name), Some(body)) = (function.name, function.body) else {
+            return Ok(false);
+        };
+        let properties = self.javascript_function_instance_properties(body);
+        if properties.is_empty() {
+            return Ok(false);
+        }
+        self.writer.newline();
+        self.writer.write(if exported { "export class " } else { "declare class " });
+        self.emit_name(name)?;
+        self.writer.write(" {");
+        self.writer.newline();
+        self.writer.indent += 1;
+        self.emit_leading_jsdoc(function_id);
+        self.writer.write("constructor");
+        if let Some(signature) = self.semantic_function_signature(function_id) {
+            self.emit_declaration_parameters(&function.parameters, &signature, function_id)?;
+        } else {
+            self.emit_inferred_declaration_parameters(&function.parameters)?;
+        }
+        self.writer.write(";");
+        self.writer.newline();
+        for (property, type_id, optional) in properties {
+            self.emit_semantic_property_name(&property);
+            self.writer.write(": ");
+            if let Some(hint) =
+                self.javascript_function_instance_property_hint(body, &property, function_id)
+            {
+                self.emit_jsdoc_type_hint(&hint);
+                if optional && !hint.contains("undefined") {
+                    self.writer.write(" | undefined");
+                }
+            } else if let Some(type_id) = type_id {
+                self.emit_semantic_type(type_id)?;
+                if optional && !self.semantic_type_includes_undefined(type_id) {
+                    self.writer.write(" | undefined");
+                }
+            } else {
+                self.writer.write("any");
+                if optional {
+                    self.writer.write(" | undefined");
+                }
+            }
+            self.writer.write(";");
+            self.writer.newline();
+        }
+        self.writer.indent -= 1;
+        self.writer.write("}");
+        Ok(true)
+    }
+
+    fn javascript_function_instance_property_hint(
+        &self,
+        body: NodeId,
+        property: &str,
+        function: NodeId,
+    ) -> Option<String> {
+        self.arena.iter().find_map(|(node_id, node)| {
+            if !self.node_is_within(node_id, body) {
+                return None;
+            }
+            let NodeData::BinaryExpression(assignment) = &node.data else {
+                return None;
+            };
+            if self.javascript_this_property_name(assignment.left).as_deref() != Some(property) {
+                return None;
+            }
+            self.jsdoc_parameter_type_hint(function, assignment.right)
+        })
+    }
+
+    fn javascript_body_returns_new_name(&self, body: NodeId, name: &str) -> bool {
+        self.arena.iter().any(|(node_id, node)| {
+            if !self.node_is_within(node_id, body) {
+                return false;
+            }
+            let NodeData::ReturnStatement(return_) = &node.data else {
+                return false;
+            };
+            let Some(NodeData::NewExpression(new_)) = return_
+                .expression
+                .and_then(|expression| self.arena.get(expression))
+                .map(|node| &node.data)
+            else {
+                return false;
+            };
+            declaration_name_text(self.arena, new_.expression) == Some(name)
+        })
     }
 
     fn emit_javascript_prototype_overload_class(
@@ -26691,7 +26807,17 @@ impl Printer<'_> {
                     }
                     self.writer.write(")");
                 } else if let Some(expression) = data.expression {
-                    self.writer.write(" ");
+                    let keyword_end = node.range.start.get().saturating_add(6);
+                    let expression_start = self.node(expression)?.range.start.get();
+                    if self.trivia_has_block_comment(keyword_end, expression_start) {
+                        self.emit_inline_block_comments_between(
+                            keyword_end,
+                            expression_start,
+                            true,
+                        );
+                    } else {
+                        self.writer.write(" ");
+                    }
                     self.emit_expression(expression, 0)?;
                 }
                 self.writer.write(";");
@@ -48683,7 +48809,18 @@ impl Printer<'_> {
         self.emit_jsx_attributes(attributes, false)?;
         if let Some(children) = children {
             let semantic_children = semantic_jsx_children(self.arena, children);
-            let multiline = semantic_children.len() > 1
+            let multiline_child = semantic_children.len() == 1
+                && matches!(
+                    self.arena
+                        .get(semantic_children[0])
+                        .map(|node| &node.data),
+                    Some(
+                        NodeData::JsxElement(_)
+                            | NodeData::JsxSelfClosingElement(_)
+                            | NodeData::JsxFragment(_)
+                    )
+                );
+            let multiline = (semantic_children.len() > 1 || multiline_child)
                 && usize::try_from(children.range.start.get())
                     .ok()
                     .zip(usize::try_from(children.range.end.get()).ok())
@@ -48909,7 +49046,10 @@ impl Printer<'_> {
         match &node.data {
             NodeData::StringLiteral(value) => write_quoted(&mut self.writer, &value.text),
             NodeData::JsxExpression(value) => {
-                if let Some(expression) = value.expression {
+                if let Some(expression) = value
+                    .expression
+                    .filter(|expression| !self.expression_emits_nothing(*expression))
+                {
                     self.emit_expression(expression, 0)?;
                 } else {
                     self.writer.write("true");
@@ -49101,10 +49241,13 @@ impl Printer<'_> {
                 match &initializer_node.data {
                     NodeData::StringLiteral(value) => write_quoted(&mut self.writer, &value.text),
                     NodeData::JsxExpression(value) => {
-                        if let Some(expression) = value.expression {
+                        if let Some(expression) = value
+                            .expression
+                            .filter(|expression| !self.expression_emits_nothing(*expression))
+                        {
                             self.emit_expression(expression, 0)?;
                         } else {
-                            self.writer.write("undefined");
+                            self.writer.write("true");
                         }
                     }
                     _ => return Err(Self::unsupported(initializer, initializer_node.kind)),
