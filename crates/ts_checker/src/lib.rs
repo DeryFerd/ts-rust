@@ -5094,6 +5094,13 @@ impl<'a> Checker<'a> {
             signature.parameters_optional = base_signature.parameters_optional;
         }
         let constructor_type = self.result.types.alloc(TypeKind::Constructor(signature));
+        self.result.named_type_references.insert(
+            constructor_type,
+            NamedTypeReference {
+                name: "__class_expression_constructor".into(),
+                type_arguments: Vec::new(),
+            },
+        );
         if let Some(symbol) = class.symbol.or(class.local_symbol) {
             self.result.symbol_types.insert(symbol, constructor_type);
         }
@@ -12596,6 +12603,7 @@ impl<'a> DeclarationReachability<'a> {
     }
 
     fn retain_heritage_factory_returns(&mut self, expression: NodeId) {
+        self.retain_expression_root(expression);
         let Some((identifier, name)) = self.leftmost_entity_name(expression) else {
             return;
         };
@@ -20321,6 +20329,38 @@ mod tests {
         assert!(retained.contains(&source.statements.nodes[0]));
         assert!(!retained.contains(&source.statements.nodes[1]));
         assert!(retained.contains(&source.statements.nodes[2]));
+    }
+
+    #[test]
+    fn retains_contextual_types_from_nested_heritage_factory_calls() {
+        let parsed = parse_source_file(
+            r#"
+                interface Pretty<T> { (value: T): string; }
+                interface Schema<T> { pretty?: Pretty<T>; }
+                interface Class<T> { new (): T; }
+                declare const Class: <Self>(name: string) => <Fields>(
+                    fields: Fields, schema?: Schema<Self>
+                ) => Class<Fields>;
+                interface Unused { hidden: string; }
+                export class A extends Class<A>("A")(
+                    { value: 1 }, { pretty: value => String(value) }
+                ) {}
+            "#,
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        let NodeData::SourceFile(source) = &parsed.arena.get(parsed.source_file).unwrap().data
+        else {
+            panic!("expected source file");
+        };
+        let retained = result.declarations_to_emit(parsed.source_file).unwrap();
+
+        for statement in &source.statements.nodes[..4] {
+            assert!(retained.contains(statement), "retained: {retained:?}");
+        }
+        assert!(!retained.contains(&source.statements.nodes[4]));
+        assert!(retained.contains(&source.statements.nodes[5]));
     }
 
     #[test]

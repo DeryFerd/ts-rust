@@ -10226,6 +10226,28 @@ impl DeclarationPrinter<'_> {
         if let Some(reference) = self
             .named_type_references
             .and_then(|references| references.get(&id))
+            && reference.name == "__class_expression_constructor"
+            && let Some(TypeKind::Constructor(signature)) = self
+                .semantic_types
+                .and_then(|types| types.get(id))
+                .map(|type_| &type_.kind)
+        {
+            self.writer.write("{");
+            self.writer.newline();
+            self.writer.indent += 1;
+            self.writer.write("new (");
+            self.emit_semantic_parameters(signature, None)?;
+            self.writer.write("): ");
+            self.emit_semantic_type(signature.return_type)?;
+            self.writer.write(";");
+            self.writer.newline();
+            self.writer.indent -= 1;
+            self.writer.write("}");
+            return Ok(());
+        }
+        if let Some(reference) = self
+            .named_type_references
+            .and_then(|references| references.get(&id))
             && reference.name == "__keyof"
             && let [operand] = reference.type_arguments.as_slice()
         {
@@ -23315,6 +23337,9 @@ impl Printer<'_> {
         if !self.has_instance_field_initializers(data)
             && !self.has_parameter_properties(&method.parameters)
             && self.active_private_method_plan.is_none()
+            && !body.statements.nodes.iter().any(|statement| {
+                self.erased_constructor_modifier_precedes_property_assignment(*statement)
+            })
             && self.single_line_body_statement(body_id)?.is_some()
         {
             self.writer.write(" ");
@@ -23373,7 +23398,9 @@ impl Printer<'_> {
                 previous_emitted = false;
                 continue;
             }
-            if !recover_property_assignment
+            let inline_recovered_property =
+                self.erased_constructor_modifier_precedes_property_assignment(*statement);
+            if (!recover_property_assignment && !inline_recovered_property)
                 || !self.emit_recovered_constructor_property_assignment(*statement)?
             {
                 self.emit_statement(*statement)?;
@@ -23849,7 +23876,9 @@ impl Printer<'_> {
                         previous_emitted = false;
                         continue;
                     }
-                    if recover_property_assignment {
+                    if recover_property_assignment
+                        || self.erased_constructor_modifier_precedes_property_assignment(*statement)
+                    {
                         self.emit_recovered_constructor_property_assignment(*statement)?;
                         recover_property_assignment = false;
                     } else if base.is_some()
@@ -25029,6 +25058,32 @@ impl Printer<'_> {
                     NodeData::Identifier(_) | NodeData::PropertyAccessExpression(_)
                 )
             })
+    }
+
+    fn erased_constructor_modifier_precedes_property_assignment(
+        &self,
+        statement: NodeId,
+    ) -> bool {
+        if !self.is_recovered_constructor_property_assignment(statement) {
+            return false;
+        }
+        let Some(start) = self
+            .arena
+            .get(statement)
+            .and_then(|node| usize::try_from(node.range.start.get()).ok())
+        else {
+            return false;
+        };
+        let Some(prefix) = self.source_text.get(..start) else {
+            return false;
+        };
+        let line_start = prefix
+            .rfind(['\n', '\r', ';', '{'])
+            .map_or(0, |position| position + 1);
+        matches!(
+            prefix[line_start..].trim(),
+            "public" | "private" | "protected"
+        )
     }
 
     fn emit_recovered_constructor_property_assignment(
@@ -33081,6 +33136,42 @@ mod tests {
     }
 
     #[test]
+    fn recovers_invalid_constructor_property_modifiers_as_this_assignments() {
+        let source = concat!(
+            "class O { constructor() { public p1 = 0; } }\n",
+            "class P { constructor() { private p1 = 0; } }\n",
+            "class Q { constructor() { public this.p1 = 0; } }\n",
+            "class R { constructor() { protected this.p1 = 0; } }\n",
+        );
+        let parsed = parse_source_file(source);
+        assert_eq!(parsed.diagnostics.len(), 4, "{:?}", parsed.diagnostics);
+        let output = emit_source_file_with_settings(
+            &parsed.arena,
+            parsed.source_file,
+            "input.ts",
+            source,
+            PrinterSettings {
+                always_strict: false,
+                target: ScriptTarget::Es2015,
+                module: ModuleKind::None,
+                jsx: JsxEmit::Preserve,
+                emit_javascript: true,
+                emit_declarations: false,
+                source_map: false,
+                inline_source_map: false,
+                import_helpers: false,
+                no_emit_helpers: false,
+                remove_comments: false,
+                use_define_for_class_fields: None,
+            },
+        )
+        .unwrap()
+        .code;
+        assert_eq!(output.matches("this.p1 = 0;").count(), 4, "{output}");
+        assert!(!output.contains("\n        p1 = 0;"), "{output}");
+    }
+
+    #[test]
     fn downlevels_rest_setter_parameters_into_the_accessor_body() {
         let source = "class C { set X(...v) { } static set X(...v2) { } }";
         assert_eq!(
@@ -36598,6 +36689,29 @@ class Board {
                 "        timestamp: number;\n",
                 "    };\n",
                 "} & TBase;",
+            )),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn declaration_emit_preserves_anonymous_class_constructor_in_generic_intersection() {
+        let output = emit_declarations_with_semantics(concat!(
+            "declare const key: symbol;\n",
+            "type Constructor = new (...args: any[]) => {};\n",
+            "declare function mix<T extends Constructor>(value: T): ",
+            "T & (new (...args: any[]) => { mixed: true });\n",
+            "export const Mixed = mix(class { [key]() { return 1; } });\n",
+        ));
+        assert!(
+            output.contains(concat!(
+                "export declare const Mixed: {\n",
+                "    new (): {\n",
+                "        [key]: () => number;\n",
+                "    };\n",
+                "} & (new (...args: any[]) => {\n",
+                "    mixed: true;\n",
+                "});",
             )),
             "{output}"
         );
