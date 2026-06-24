@@ -17773,6 +17773,18 @@ impl Printer<'_> {
                         symbol.flags.intersects(collision_flags)
                             || (scope.id == module_scope
                                 && symbol.flags.intersects(namespace_flags))
+                            || (scope.id != module_scope
+                                && symbol.flags.intersects(namespace_flags)
+                                && symbol.declarations.iter().any(|declaration| {
+                                    matches!(
+                                        self.arena.get(*declaration).map(|node| &node.data),
+                                        Some(NodeData::ModuleDeclaration(module))
+                                            if self.namespace_has_runtime_contents(
+                                                module,
+                                                &mut HashSet::new(),
+                                            )
+                                    )
+                                }))
                     })
         })
     }
@@ -33465,6 +33477,33 @@ mod tests {
             ModuleKind::EsNext,
         );
         assert!(reopened.code.contains("var value = new M.C();"));
+    }
+
+    #[test]
+    fn detects_runtime_namespace_collisions_in_descendant_scopes() {
+        let runtime = emit_with(
+            concat!(
+                "namespace M { export var x = 1; namespace child { ",
+                "namespace M { var value = x; } } }",
+            ),
+            ScriptTarget::Es2015,
+            ModuleKind::EsNext,
+        )
+        .code;
+        assert!(runtime.contains("(function (M_1) {"), "{runtime}");
+        assert!(runtime.contains("var value = M_1.x;"), "{runtime}");
+
+        let type_only = emit_with(
+            concat!(
+                "namespace M { export var x = 1; namespace child { ",
+                "interface M {} var value = x; } }",
+            ),
+            ScriptTarget::Es2015,
+            ModuleKind::EsNext,
+        )
+        .code;
+        assert!(type_only.contains("(function (M) {"), "{type_only}");
+        assert!(!type_only.contains("(function (M_1) {"), "{type_only}");
     }
 
     #[test]
