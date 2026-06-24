@@ -7759,6 +7759,7 @@ impl<'a> Checker<'a> {
         data: &ts_ast::ArrowFunctionData,
         contextual_type: Option<TypeId>,
     ) -> TypeId {
+        let mut generic_parameters = Vec::new();
         self.type_parameter_scopes.push(HashMap::new());
         if let Some(type_parameters) = &data.type_parameters {
             for type_parameter in &type_parameters.nodes {
@@ -7770,11 +7771,35 @@ impl<'a> Checker<'a> {
                 let Some(name) = self.property_name(parameter.name) else {
                     continue;
                 };
+                let display_name = if self.type_parameter_scopes
+                    [..self.type_parameter_scopes.len().saturating_sub(1)]
+                    .iter()
+                    .any(|scope| scope.contains_key(&name))
+                {
+                    let source_names = self
+                        .arena
+                        .iter()
+                        .filter_map(|(_, node)| match &node.data {
+                            NodeData::Identifier(identifier) => Some(identifier.text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<HashSet<_>>();
+                    let mut index = 1_u32;
+                    loop {
+                        let candidate = format!("{name}_{index}");
+                        if !source_names.contains(candidate.as_str()) {
+                            break candidate;
+                        }
+                        index = index.saturating_add(1);
+                    }
+                } else {
+                    name.clone()
+                };
                 let constraint = parameter
                     .constraint
                     .map(|constraint| self.type_from_type_node(constraint));
                 let type_id = self.result.types.alloc(TypeKind::TypeParameter {
-                    name: name.clone(),
+                    name: display_name.clone(),
                     constraint,
                 });
                 if let Some(default_type) = parameter.default_type {
@@ -7785,6 +7810,7 @@ impl<'a> Checker<'a> {
                     .last_mut()
                     .expect("arrow type-parameter scope exists")
                     .insert(name, type_id);
+                generic_parameters.push((display_name, constraint));
             }
         }
         let contextual_signature =
@@ -7938,6 +7964,21 @@ impl<'a> Checker<'a> {
             return_type,
             parameters_optional: self.options.is_javascript_file,
         }));
+        if !generic_parameters.is_empty() {
+            let mut encoded = Vec::with_capacity(generic_parameters.len());
+            let mut constraints = Vec::with_capacity(generic_parameters.len());
+            for (name, constraint) in generic_parameters {
+                encoded.push(format!("{name}={}", u8::from(constraint.is_some())));
+                constraints.push(constraint.unwrap_or_else(|| self.result.types.any()));
+            }
+            self.result.named_type_references.insert(
+                function,
+                NamedTypeReference {
+                    name: format!("__generic_function:{}", encoded.join(",")),
+                    type_arguments: constraints,
+                },
+            );
+        }
         self.apply_javascript_signature_metadata(
             node_id,
             function,
@@ -18835,6 +18876,36 @@ mod tests {
         };
 
         assert_eq!(inner.return_type, outer.parameters[0]);
+    }
+
+    #[test]
+    fn preserves_shadowed_nested_arrow_type_parameters() {
+        let parsed = parse_source_file(
+            "const foo = <T>(x: T) => { const inner = <T>(y: T) => [x, y] as const; return inner; };",
+        );
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        let foo = bindings.root_scope().unwrap().symbols.get("foo").unwrap();
+        let outer_type = result.type_of_symbol(foo).unwrap();
+        let TypeKind::Function(outer) = &result.types.get(outer_type).unwrap().kind else {
+            panic!("expected outer function");
+        };
+        let TypeKind::Function(inner) = &result.types.get(outer.return_type).unwrap().kind else {
+            panic!("expected inner function");
+        };
+        let TypeKind::ReadonlyTuple(elements) = &result.types.get(inner.return_type).unwrap().kind
+        else {
+            panic!("expected readonly tuple");
+        };
+
+        assert_eq!(result.types.display(elements[0]), "T");
+        assert_eq!(result.types.display(elements[1]), "T_1");
+        assert!(
+            result
+                .named_type_references
+                .get(&outer.return_type)
+                .is_some_and(|reference| reference.name == "__generic_function:T_1=0")
+        );
     }
 
     #[test]
