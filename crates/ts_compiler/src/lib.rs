@@ -484,6 +484,7 @@ impl Program {
                     inline_const_enums: !self.options.isolated_modules
                         && !self.options.verbatim_module_syntax,
                     emit_decorator_metadata: self.options.emit_decorator_metadata,
+                    strict_null_checks: self.options.strict_null_checks,
                     module_detection: self.options.module_detection,
                 };
                 match emit_source_file_with_context(
@@ -694,6 +695,7 @@ impl Program {
                     inline_const_enums: !self.options.isolated_modules
                         && !self.options.verbatim_module_syntax,
                     emit_decorator_metadata: self.options.emit_decorator_metadata,
+                    strict_null_checks: self.options.strict_null_checks,
                     module_detection: self.options.module_detection,
                 };
                 match emit_source_file_with_context(

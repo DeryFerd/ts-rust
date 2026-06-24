@@ -1174,7 +1174,7 @@ impl<'a> Parser<'a> {
 
     fn parse_decorator(&mut self) -> NodeId {
         let start = self.consume().range.start;
-        let expression = self.parse_postfix_expression();
+        let expression = self.parse_postfix_expression_in_decorator();
         self.alloc_node(
             SyntaxKind::Decorator,
             TextRange::new(start, self.node_end(expression)),
@@ -4316,8 +4316,16 @@ impl<'a> Parser<'a> {
         )
     }
 
-    #[allow(clippy::too_many_lines)]
     fn parse_postfix_expression(&mut self) -> NodeId {
+        self.parse_postfix_expression_worker(false)
+    }
+
+    fn parse_postfix_expression_in_decorator(&mut self) -> NodeId {
+        self.parse_postfix_expression_worker(true)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn parse_postfix_expression_worker(&mut self, in_decorator_context: bool) -> NodeId {
         let async_function = self.current.kind == SyntaxKind::AsyncKeyword
             && !self.next_token_preceded_by_line_break()
             && self.next_token_kind() == SyntaxKind::FunctionKeyword;
@@ -4565,6 +4573,13 @@ impl<'a> Parser<'a> {
                     }
                 }
                 SyntaxKind::OpenBracketToken => {
+                    // An ordinary element access is not consumed at the outer level of a
+                    // decorator expression because it may instead begin the decorated
+                    // class member's computed property name. Nested expressions (such as
+                    // `@dec(value[key])`) are parsed through the context-free wrapper.
+                    if in_decorator_context {
+                        break;
+                    }
                     self.bump();
                     let argument_expression = self.parse_binary_expression(0);
                     let end = if self.current.kind == SyntaxKind::CloseBracketToken {
@@ -11527,6 +11542,72 @@ mod tests {
                     .is_some_and(|modifier| modifier.kind == SyntaxKind::Decorator)
             })
         }));
+    }
+
+    #[test]
+    fn stops_decorator_expression_before_computed_class_member_name() {
+        let result =
+            parse_source_file("class C { @dec [key]: any; @dec(value[key]) [other]: any; }");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+
+        let class = result
+            .arena
+            .iter()
+            .find_map(|(_, node)| {
+                let NodeData::ClassDeclaration(class) = &node.data else {
+                    return None;
+                };
+                Some(class)
+            })
+            .unwrap();
+        assert_eq!(class.members.nodes.len(), 2);
+
+        for member in &class.members.nodes {
+            let NodeData::PropertyDeclaration(property) = &result.arena.get(*member).unwrap().data
+            else {
+                panic!("expected property declaration");
+            };
+            assert_eq!(
+                result.arena.get(property.name).unwrap().kind,
+                SyntaxKind::ComputedPropertyName
+            );
+        }
+
+        let NodeData::PropertyDeclaration(first_property) =
+            &result.arena.get(class.members.nodes[0]).unwrap().data
+        else {
+            unreachable!();
+        };
+        let first_decorator = first_property.modifiers.as_ref().unwrap().list.nodes[0];
+        let NodeData::Decorator(first_decorator) = &result.arena.get(first_decorator).unwrap().data
+        else {
+            panic!("expected decorator");
+        };
+        assert_eq!(
+            result.arena.get(first_decorator.expression).unwrap().kind,
+            SyntaxKind::Identifier
+        );
+
+        let NodeData::PropertyDeclaration(second_property) =
+            &result.arena.get(class.members.nodes[1]).unwrap().data
+        else {
+            unreachable!();
+        };
+        let second_decorator = second_property.modifiers.as_ref().unwrap().list.nodes[0];
+        let NodeData::Decorator(second_decorator) =
+            &result.arena.get(second_decorator).unwrap().data
+        else {
+            panic!("expected decorator");
+        };
+        let NodeData::CallExpression(call) =
+            &result.arena.get(second_decorator.expression).unwrap().data
+        else {
+            panic!("expected decorator call");
+        };
+        assert_eq!(
+            result.arena.get(call.arguments.nodes[0]).unwrap().kind,
+            SyntaxKind::ElementAccessExpression
+        );
     }
 
     fn find_descendant_kind(
