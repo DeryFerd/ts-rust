@@ -2174,6 +2174,11 @@ fn has_unserializable_exported_anonymous_class(source: &SourceFile) -> bool {
                     class.modifiers.as_ref(),
                     ts_ast::SyntaxKind::ExportKeyword,
                 ),
+                NodeData::VariableStatement(variable) => node_has_modifier(
+                    &source.parse.arena,
+                    variable.modifiers.as_ref(),
+                    ts_ast::SyntaxKind::ExportKeyword,
+                ),
                 _ => false,
             };
         exported

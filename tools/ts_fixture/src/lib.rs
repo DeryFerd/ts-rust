@@ -360,12 +360,22 @@ pub fn expand_option_matrix(case: &Case) -> Vec<OptionVariant> {
         let Some(value) = case.directive_values(name).next() else {
             continue;
         };
-        let values = value
-            .split(',')
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
+        let values = if name == "module" && value.trim() == "*" {
+            [
+                "amd", "commonjs", "es2020", "es2022", "es6", "esnext", "node16", "node18",
+                "node20", "nodenext", "none", "preserve", "system", "umd",
+            ]
+            .into_iter()
             .map(str::to_owned)
-            .collect::<Vec<_>>();
+            .collect::<Vec<_>>()
+        } else {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
         option_values.insert(
             name.to_owned(),
             if values.is_empty() {
@@ -887,6 +897,16 @@ fn fixture_compiler_options(case: &Case, variant: &OptionVariant) -> ts_options:
     if !has_explicit_module && options.target < ts_options::ScriptTarget::Es2015 {
         options.module = ts_options::ModuleKind::CommonJs;
     }
+    if case
+        .directive_values("module")
+        .any(|module| module.trim() == "*")
+        && variant
+            .values
+            .get("module")
+            .is_some_and(|module| module.eq_ignore_ascii_case("none"))
+    {
+        options.module = ts_options::ModuleKind::CommonJs;
+    }
     options
 }
 
@@ -1088,11 +1108,12 @@ fn matrix_axes(case: &Case) -> Vec<String> {
             case.directive_values(name)
                 .next()
                 .filter(|value| {
-                    value
-                        .split(',')
-                        .filter(|part| !part.trim().is_empty())
-                        .count()
-                        > 1
+                    (*name == "module" && value.trim() == "*")
+                        || value
+                            .split(',')
+                            .filter(|part| !part.trim().is_empty())
+                            .count()
+                            > 1
                 })
                 .map(|_| (*name).to_owned())
         })
