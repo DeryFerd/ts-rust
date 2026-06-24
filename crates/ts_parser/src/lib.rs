@@ -7237,18 +7237,27 @@ impl<'a> Parser<'a> {
     fn parse_infer_type(&mut self) -> NodeId {
         let start = self.consume().range.start;
         let name = self.parse_identifier("Expected a type parameter name.");
+        let constraint = if self.current.kind == SyntaxKind::ExtendsKeyword {
+            self.bump();
+            Some(self.parse_union_type())
+        } else {
+            None
+        };
+        let end = constraint.map_or_else(|| self.node_end(name), |node| self.node_end(node));
+        let mut children = vec![name];
+        children.extend(constraint);
         let type_parameter = self.alloc_node(
             SyntaxKind::TypeParameter,
-            self.arena.get(name).unwrap().range,
+            TextRange::new(self.node_start(name), end),
             NodeData::TypeParameterDeclaration(Box::new(TypeParameterDeclarationData {
-                constraint: None,
+                constraint,
                 default_type: None,
                 expression: None,
                 symbol: None,
                 modifiers: None,
                 name,
             })),
-            &[name],
+            &children,
         );
         self.alloc_node(
             SyntaxKind::InferType,

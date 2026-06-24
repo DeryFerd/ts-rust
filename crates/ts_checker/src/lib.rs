@@ -1861,7 +1861,9 @@ impl<'a> ProgramChecker<'a> {
                     core_name || value_is_referenced
                 }
                 Some(NodeData::FunctionDeclaration(_)) => {
-                    core_name && symbol.declarations.len() > 1
+                    (value_is_referenced
+                        && matches!(symbol.name.as_str(), "parseInt" | "parseFloat"))
+                        || (core_name && symbol.declarations.len() > 1)
                 }
                 Some(NodeData::VariableDeclaration(variable)) => {
                     value_is_referenced
@@ -8924,6 +8926,10 @@ impl<'a> Checker<'a> {
             TypeKind::Union(members) | TypeKind::Intersection(members) => members
                 .iter()
                 .find_map(|member| self.contextual_function_signature(*member)),
+            TypeKind::TypeParameter {
+                constraint: Some(constraint),
+                ..
+            } => self.contextual_function_signature(*constraint),
             _ => None,
         }
     }
@@ -9058,13 +9064,22 @@ impl<'a> Checker<'a> {
                     .as_ref()
                     .map(|signature| signature.return_type)
             });
+        let contextual_return_is_unknown = data.type_.is_none()
+            && expected_return.is_some_and(|expected| {
+                matches!(
+                    self.result.types.get(expected).map(|type_| &type_.kind),
+                    Some(TypeKind::Unknown)
+                )
+            });
         let mut return_type = if matches!(
             self.arena.get(data.body).map(|node| node.kind),
             Some(SyntaxKind::Block)
         ) {
             let mut saw_return = false;
             self.check_node(data.body, expected_return, &mut saw_return);
-            if let Some(expected_return) = expected_return {
+            if let Some(expected_return) = expected_return
+                && !contextual_return_is_unknown
+            {
                 expected_return
             } else if saw_return {
                 let return_types = self
@@ -9093,8 +9108,9 @@ impl<'a> Checker<'a> {
                 self.assignability_error(data.body, actual, expected);
             }
             if data.type_.is_none()
-                && expected_return
+                && (expected_return
                     .is_some_and(|expected| self.type_contains_type_parameter(expected))
+                    || contextual_return_is_unknown)
             {
                 self.widen_literal(actual)
             } else {
@@ -9794,8 +9810,22 @@ impl<'a> Checker<'a> {
                     .get(member)
                     .and_then(|type_| self.callable_signatures(type_.kind.clone()))
             }),
+            TypeKind::TypeParameter {
+                constraint: Some(constraint),
+                ..
+            } => self
+                .result
+                .types
+                .get(constraint)
+                .and_then(|type_| self.callable_signatures(type_.kind.clone())),
             _ => None,
         }
+    }
+
+    fn callable_return_type(&self, type_id: TypeId) -> Option<TypeId> {
+        let kind = self.result.types.get(type_id)?.kind.clone();
+        self.callable_signatures(kind)
+            .and_then(|signatures| signatures.last().map(|signature| signature.return_type))
     }
 
     fn construct_signatures(&self, kind: TypeKind) -> Option<Vec<FunctionType>> {
@@ -12547,11 +12577,18 @@ impl<'a> Checker<'a> {
                     .insert(name, semantic_type);
             }
         }
-        let return_type_parameters = self
+        let current_type_parameters = self
             .type_parameter_scopes
             .last()
-            .expect("signature type-parameter scope exists")
-            .clone();
+            .expect("signature type-parameter scope exists");
+        let return_type_parameters = if current_type_parameters.is_empty() {
+            current_type_parameters.clone()
+        } else {
+            self.type_parameter_scopes
+                .iter()
+                .flat_map(|scope| scope.iter().map(|(name, type_id)| (name.clone(), *type_id)))
+                .collect::<HashMap<_, _>>()
+        };
         let mut parameter_types = Vec::with_capacity(parameters.len());
         let mut parameter_names = Vec::with_capacity(parameters.len());
         for (parameter_index, parameter) in parameters.iter().enumerate() {
@@ -12853,6 +12890,12 @@ impl<'a> Checker<'a> {
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default();
+                if name == "ReturnType"
+                    && let [argument] = arguments.as_slice()
+                    && let Some(return_type) = self.callable_return_type(*argument)
+                {
+                    return return_type;
+                }
                 let symbol = self.resolve_identifier(data.type_name, &name);
                 let conditional_alias = symbol.is_some_and(|symbol| {
                     self.bindings.symbols.get(symbol).is_some_and(|symbol| {
@@ -13213,6 +13256,14 @@ impl<'a> Checker<'a> {
                 let Some(name) = self.property_name(parameter.name) else {
                     return false;
                 };
+                if let Some(constraint) = parameter.constraint {
+                    self.type_parameter_scopes.push(inference.clone());
+                    let constraint = self.type_from_type_node(constraint);
+                    self.type_parameter_scopes.pop();
+                    if !self.is_assignable(actual, constraint) {
+                        return false;
+                    }
+                }
                 inference
                     .entry(name)
                     .and_modify(|current| *current = self.result.types.union([*current, actual]))
