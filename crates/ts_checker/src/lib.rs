@@ -12345,13 +12345,12 @@ impl<'a> Checker<'a> {
     }
 
     fn resolve_value_expression_symbol(&self, expression: NodeId) -> Option<SymbolId> {
-        if let Some(symbol) = self.bindings.node_symbols.get(&expression) {
-            return Some(*symbol);
-        }
         match &self.arena.get(expression)?.data {
-            NodeData::Identifier(identifier) => {
-                self.resolve_identifier(expression, &identifier.text)
-            }
+            NodeData::Identifier(identifier) => self.resolve_value_identifier(
+                expression,
+                &identifier.text,
+                self.bindings.node_symbols.get(&expression).copied(),
+            ),
             NodeData::PropertyAccessExpression(access) => {
                 if let Some(symbol) = self.bindings.node_symbols.get(&access.name) {
                     return Some(*symbol);
@@ -12365,6 +12364,55 @@ impl<'a> Checker<'a> {
             }
             _ => None,
         }
+    }
+
+    fn resolve_value_identifier(
+        &self,
+        node: NodeId,
+        name: &str,
+        bound: Option<SymbolId>,
+    ) -> Option<SymbolId> {
+        let has_value_meaning = |symbol: SymbolId| {
+            self.bindings.symbols.get(symbol).is_some_and(|symbol| {
+                symbol.value_declaration.is_some()
+                    || symbol.flags.contains(ts_binder::SymbolFlags::ALIAS)
+            })
+        };
+        if bound.is_some_and(&has_value_meaning) {
+            return bound;
+        }
+        if let Some(container) = self.bindings.containers.get(&node)
+            && let Some(mut scope) =
+                self.bindings
+                    .node_scopes
+                    .get(container)
+                    .copied()
+                    .or_else(|| {
+                        self.bindings
+                            .scopes
+                            .iter()
+                            .find(|scope| scope.owner == *container)
+                            .map(|scope| scope.id)
+                    })
+        {
+            loop {
+                let current = self.bindings.scope(scope)?;
+                if let Some(symbol) = current.symbols.get(name)
+                    && has_value_meaning(symbol)
+                {
+                    return Some(symbol);
+                }
+                let Some(parent) = current.parent else {
+                    break;
+                };
+                scope = parent;
+            }
+        }
+        self.bindings
+            .scopes
+            .iter()
+            .filter_map(|scope| scope.symbols.get(name))
+            .find(|symbol| has_value_meaning(*symbol))
     }
 
     fn value_expression_text(&self, expression: NodeId) -> Option<String> {
@@ -12410,9 +12458,17 @@ impl<'a> Checker<'a> {
         else {
             return type_id;
         };
-        let Some(name) = self.value_expression_text(expression) else {
+        let Some(mut name) = self.value_expression_text(expression) else {
             return type_id;
         };
+        if !name.contains('.')
+            && self
+                .type_parameter_scopes
+                .iter()
+                .any(|scope| scope.contains_key(&name))
+        {
+            name = format!("globalThis.{name}");
+        }
         let named = self.result.types.alloc(kind);
         self.result.named_type_references.insert(
             named,
@@ -18905,6 +18961,32 @@ mod tests {
                 .named_type_references
                 .get(&outer.return_type)
                 .is_some_and(|reference| reference.name == "__generic_function:T_1=0")
+        );
+    }
+
+    #[test]
+    fn resolves_shadowed_class_names_in_arrow_value_expressions() {
+        let parsed = parse_source_file("class A {} const value = <A>(x: A) => new A();");
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        let value = bindings.root_scope().unwrap().symbols.get("value").unwrap();
+        let value_type = result.type_of_symbol(value).unwrap();
+        let TypeKind::Function(signature) = &result.types.get(value_type).unwrap().kind else {
+            panic!("expected function");
+        };
+
+        assert!(matches!(
+            result
+                .types
+                .get(signature.return_type)
+                .map(|type_| &type_.kind),
+            Some(TypeKind::Object(_))
+        ));
+        assert!(
+            result
+                .named_type_references
+                .get(&signature.return_type)
+                .is_some_and(|reference| reference.name == "globalThis.A")
         );
     }
 
