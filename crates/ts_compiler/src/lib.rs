@@ -690,7 +690,17 @@ impl Program {
                     || source_file.checking.diagnostics.iter().any(|diagnostic| {
                         matches!(
                             diagnostic.diagnostic.code(),
-                            2527 | 2883 | 4023 | 4025 | 4032 | 4081 | 4094 | 4118 | 5088 | 9010
+                            2527
+                                | 2883
+                                | 4023
+                                | 4025
+                                | 4032
+                                | 4081
+                                | 4094
+                                | 4118
+                                | 5088
+                                | 7056
+                                | 9010
                         )
                     })
                 {
@@ -1007,7 +1017,16 @@ impl Program {
                     || source.checking.diagnostics.iter().any(|diagnostic| {
                         matches!(
                             diagnostic.diagnostic.code(),
-                            2527 | 2883 | 4023 | 4025 | 4032 | 4081 | 4094 | 5088 | 9010
+                            2527
+                                | 2883
+                                | 4023
+                                | 4025
+                                | 4032
+                                | 4081
+                                | 4094
+                                | 5088
+                                | 7056
+                                | 9010
                         )
                     })
                 {
@@ -2588,6 +2607,16 @@ fn add_nonportable_inferred_type_diagnostics(source: &SourceFile, checking: &mut
             if declaration.type_.is_some() {
                 continue;
             }
+            if declaration.initializer.is_some_and(|initializer| {
+                inferred_type_syntax_exceeds_serialization_limit(source, initializer)
+            }) {
+                let message = message_by_code(7056).expect("TS7056 must be in the diagnostic catalog");
+                checking.diagnostics.push(CheckDiagnostic {
+                    node: declaration.name,
+                    diagnostic: Diagnostic::new(message),
+                });
+                continue;
+            }
             let Some(type_id) = checking.type_of_node(*declaration_id).or_else(|| {
                 declaration
                     .initializer
@@ -2895,6 +2924,146 @@ fn inaccessible_imported_unique_symbol(checking: &CheckResult, type_id: TypeId) 
     }
 
     visit(checking, type_id, false, &mut BTreeSet::new())
+}
+
+const MAX_INFERRED_TYPE_SYNTAX_COMPLEXITY: usize = 1_000_000;
+
+fn inferred_type_syntax_exceeds_serialization_limit(
+    source: &SourceFile,
+    initializer: NodeId,
+) -> bool {
+    let Some(NodeData::SourceFile(file)) = source
+        .parse
+        .arena
+        .get(source.parse.source_file)
+        .map(|node| &node.data)
+    else {
+        return false;
+    };
+    let aliases = file
+        .statements
+        .nodes
+        .iter()
+        .filter_map(|statement| {
+            let NodeData::TypeAliasDeclaration(alias) =
+                &source.parse.arena.get(*statement)?.data
+            else {
+                return None;
+            };
+            Some((
+                identifier_text(&source.parse.arena, alias.name)?.to_owned(),
+                alias.type_,
+            ))
+        })
+        .collect::<BTreeMap<_, _>>();
+    source.parse.arena.iter().any(|(candidate, node)| {
+        if !syntax_node_is_within(&source.parse.arena, candidate, initializer) {
+            return false;
+        }
+        let asserted_type = match &node.data {
+            NodeData::AsExpression(assertion) => Some(assertion.type_),
+            NodeData::TypeAssertion(assertion) => Some(assertion.type_),
+            _ => None,
+        };
+        asserted_type.is_some_and(|type_node| {
+            estimated_type_syntax_complexity(
+                &source.parse.arena,
+                type_node,
+                &aliases,
+                &mut HashSet::new(),
+            ) > MAX_INFERRED_TYPE_SYNTAX_COMPLEXITY
+        })
+    })
+}
+
+fn syntax_node_is_within(arena: &ts_ast::NodeArena, node: NodeId, ancestor: NodeId) -> bool {
+    let mut current = Some(node);
+    while let Some(id) = current {
+        if id == ancestor {
+            return true;
+        }
+        current = arena.get(id).and_then(|node| node.parent);
+    }
+    false
+}
+
+fn estimated_type_syntax_complexity(
+    arena: &ts_ast::NodeArena,
+    type_node: NodeId,
+    aliases: &BTreeMap<String, NodeId>,
+    visiting: &mut HashSet<NodeId>,
+) -> usize {
+    if !visiting.insert(type_node) {
+        return 1;
+    }
+    let cap = MAX_INFERRED_TYPE_SYNTAX_COMPLEXITY.saturating_add(1);
+    let add = |left: usize, right: usize| left.saturating_add(right).min(cap);
+    let multiply = |left: usize, right: usize| left.saturating_mul(right).min(cap);
+    let complexity = match arena.get(type_node).map(|node| &node.data) {
+        Some(NodeData::UnionTypeNode(union)) => union.types.nodes.iter().fold(0, |total, member| {
+            add(
+                total,
+                estimated_type_syntax_complexity(arena, *member, aliases, visiting),
+            )
+        }),
+        Some(NodeData::IntersectionTypeNode(intersection)) => {
+            intersection.types.nodes.iter().fold(0, |total, member| {
+                add(
+                    total,
+                    estimated_type_syntax_complexity(arena, *member, aliases, visiting),
+                )
+            })
+        }
+        Some(NodeData::TemplateLiteralTypeNode(template)) => template
+            .template_spans
+            .nodes
+            .iter()
+            .filter_map(|span| match &arena.get(*span)?.data {
+                NodeData::TemplateLiteralTypeSpan(span) => Some(span.type_),
+                _ => None,
+            })
+            .fold(1, |total, span| {
+                multiply(
+                    total,
+                    estimated_type_syntax_complexity(arena, span, aliases, visiting),
+                )
+            }),
+        Some(NodeData::MappedTypeNode(mapped)) => {
+            let keys = arena
+                .get(mapped.type_parameter)
+                .and_then(|parameter| match &parameter.data {
+                    NodeData::TypeParameterDeclaration(parameter) => parameter.constraint,
+                    _ => None,
+                })
+                .map_or(1, |constraint| {
+                    estimated_type_syntax_complexity(arena, constraint, aliases, visiting)
+                });
+            let value = mapped.type_.map_or(1, |value| {
+                estimated_type_syntax_complexity(arena, value, aliases, visiting)
+            });
+            multiply(multiply(keys, value), 8)
+        }
+        Some(NodeData::TypeReferenceNode(reference)) => {
+            let alias = identifier_text(arena, reference.type_name)
+                .and_then(|name| aliases.get(name))
+                .copied();
+            alias.map_or(1, |alias| {
+                estimated_type_syntax_complexity(arena, alias, aliases, visiting)
+            })
+        }
+        Some(NodeData::ParenthesizedTypeNode(parenthesized)) => {
+            estimated_type_syntax_complexity(arena, parenthesized.type_, aliases, visiting)
+        }
+        Some(NodeData::ArrayTypeNode(array)) => {
+            estimated_type_syntax_complexity(arena, array.element_type, aliases, visiting)
+        }
+        Some(NodeData::TypeOperatorNode(operator)) => {
+            estimated_type_syntax_complexity(arena, operator.type_, aliases, visiting)
+        }
+        _ => 1,
+    };
+    visiting.remove(&type_node);
+    complexity
 }
 
 fn source_import_bindings(source: &SourceFile) -> Vec<(String, String, String)> {

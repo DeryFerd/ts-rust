@@ -793,6 +793,7 @@ pub fn emit_source_file_with_context(
         })
         && let Some(start) = first_statement_start
     {
+        printer.emit_reference_directives_between(0, start);
         printer.emit_leading_source_comments(start);
     }
     if !(settings.module == ModuleKind::CommonJs && is_external_module) {
@@ -939,12 +940,7 @@ pub fn emit_source_file_with_context(
         printer.writer.newline();
     }
     printer.emit_automatic_jsx_prelude();
-    let mut previous_end = data
-        .statements
-        .nodes
-        .first()
-        .and_then(|statement| arena.get(*statement))
-        .map_or(0, |node| node.range.start.get());
+    let mut previous_end = 0;
     let mut reference_owner_start = 0;
     let mut previous_emitted = false;
     let mut emitted_runtime_statement = false;
@@ -16315,6 +16311,16 @@ impl DeclarationPrinter<'_> {
                     self.emit_type_arguments(data.type_arguments.as_ref())?;
                 }
             }
+            NodeData::TypePredicateNode(data) => {
+                if data.asserts_modifier.is_some() {
+                    self.writer.write("asserts ");
+                }
+                self.emit_name(data.parameter_name)?;
+                if let Some(type_) = data.type_ {
+                    self.writer.write(" is ");
+                    self.emit_type(type_)?;
+                }
+            }
             NodeData::ThisTypeNode(_) => self.writer.write("this"),
             _ => self.emit_source_slice(&node),
         }
@@ -23625,7 +23631,7 @@ impl Printer<'_> {
                 self.writer.write(";");
             }
             NodeData::IfStatement(data) => {
-                self.emit_if_statement(data)?;
+                self.emit_if_statement(id, data)?;
             }
             NodeData::WhileStatement(data) => {
                 self.writer.write("while (");
@@ -24322,17 +24328,69 @@ impl Printer<'_> {
             .is_some_and(|text| !text.contains(['\n', '\r']))
     }
 
-    fn emit_if_statement(&mut self, data: &ts_ast::IfStatementData) -> Result<(), EmitError> {
-        self.writer.write("if (");
+    fn emit_if_statement(
+        &mut self,
+        id: NodeId,
+        data: &ts_ast::IfStatementData,
+    ) -> Result<(), EmitError> {
+        let node = self.node(id)?.clone();
+        let expression = self.node(data.expression)?.clone();
+        let then_statement = self.node(data.then_statement)?.clone();
+        let keyword_end = node.range.start.get().saturating_add(2);
+        let open = self
+            .source_punctuation_between(keyword_end, expression.range.start.get(), b'(')
+            .unwrap_or(keyword_end);
+        let close = self
+            .source_punctuation_between(
+                expression.range.end.get(),
+                then_statement.range.start.get(),
+                b')',
+            )
+            .unwrap_or(then_statement.range.start.get());
+        self.writer.write("if");
+        self.emit_for_block_comment_gap(keyword_end, open, true, true);
+        self.writer.write("(");
+        self.emit_for_block_comment_gap(
+            open.saturating_add(1),
+            expression.range.start.get(),
+            false,
+            false,
+        );
         self.emit_expression(data.expression, 0)?;
-        self.writer.write(") ");
+        self.emit_for_block_comment_gap(expression.range.end.get(), close, false, false);
+        self.writer.write(")");
+        self.emit_for_block_comment_gap(
+            close.saturating_add(1),
+            then_statement.range.start.get(),
+            true,
+            true,
+        );
         self.emit_embedded(data.then_statement)?;
         if let Some(otherwise) = data.else_statement {
-            self.writer.newline();
-            self.writer.write("else ");
             let otherwise_node = self.node(otherwise)?.clone();
-            if let NodeData::IfStatement(otherwise) = &otherwise_node.data {
-                self.emit_if_statement(otherwise)?;
+            let else_start = self
+                .source_keyword_between(
+                    then_statement.range.end.get(),
+                    otherwise_node.range.start.get(),
+                    "else",
+                )
+                .unwrap_or(then_statement.range.end.get());
+            self.emit_for_block_comment_gap(
+                then_statement.range.end.get(),
+                else_start,
+                false,
+                false,
+            );
+            self.writer.newline();
+            self.writer.write("else");
+            self.emit_for_block_comment_gap(
+                else_start.saturating_add(4),
+                otherwise_node.range.start.get(),
+                true,
+                true,
+            );
+            if let NodeData::IfStatement(otherwise_data) = &otherwise_node.data {
+                self.emit_if_statement(otherwise, otherwise_data)?;
             } else {
                 self.emit_embedded(otherwise)?;
             }
@@ -30189,7 +30247,13 @@ impl Printer<'_> {
         if let NodeData::IfStatement(if_statement) = &node.data
             && self.es5_async_simple_suspension_count(statement) != 0
         {
-            return self.emit_es5_async_if_statement(if_statement, state, case, is_last);
+            return self.emit_es5_async_if_statement(
+                statement,
+                if_statement,
+                state,
+                case,
+                is_last,
+            );
         }
         if let NodeData::ReturnStatement(return_statement) = &node.data
             && let Some(object) = return_statement.expression
@@ -30869,6 +30933,7 @@ impl Printer<'_> {
 
     fn emit_es5_async_if_statement(
         &mut self,
+        statement_id: NodeId,
         statement: &ts_ast::IfStatementData,
         state: &str,
         case: &mut usize,
@@ -30891,7 +30956,7 @@ impl Printer<'_> {
             let previous = self
                 .es5_async_expression_rewrites
                 .insert(await_id, format!("{state}.sent()"));
-            self.emit_if_statement(statement)?;
+            self.emit_if_statement(statement_id, statement)?;
             self.writer.newline();
             if let Some(previous) = previous {
                 self.es5_async_expression_rewrites
@@ -30902,7 +30967,7 @@ impl Printer<'_> {
             return Ok(());
         }
         if condition_await.is_some() {
-            return self.emit_if_statement(statement);
+            return self.emit_if_statement(statement_id, statement);
         }
 
         let start_case = *case;
@@ -38563,6 +38628,9 @@ impl Printer<'_> {
                     if self
                         .has_modifier(property.modifiers.as_ref(), SyntaxKind::StaticKeyword) =>
                 {
+                    if self.has_modifier(property.modifiers.as_ref(), SyntaxKind::DeclareKeyword) {
+                        continue;
+                    }
                     let initializer = property.initializer;
                     if initializer.is_none()
                         && self.settings.use_define_for_class_fields != Some(true)
@@ -38671,6 +38739,9 @@ impl Printer<'_> {
             let NodeData::PropertyDeclaration(property) = &node.data else {
                 continue;
             };
+            if self.has_modifier(property.modifiers.as_ref(), SyntaxKind::DeclareKeyword) {
+                continue;
+            }
             if !self.has_modifier(property.modifiers.as_ref(), SyntaxKind::StaticKeyword) {
                 continue;
             }
@@ -39736,6 +39807,9 @@ impl Printer<'_> {
             let NodeData::PropertyDeclaration(property) = &node.data else {
                 continue;
             };
+            if self.has_modifier(property.modifiers.as_ref(), SyntaxKind::DeclareKeyword) {
+                continue;
+            }
             if self.has_modifier(property.modifiers.as_ref(), SyntaxKind::StaticKeyword) {
                 continue;
             }
@@ -39942,6 +40016,9 @@ impl Printer<'_> {
             let NodeData::PropertyDeclaration(property) = &node.data else {
                 continue;
             };
+            if self.has_modifier(property.modifiers.as_ref(), SyntaxKind::DeclareKeyword) {
+                continue;
+            }
             if !self.has_modifier(property.modifiers.as_ref(), SyntaxKind::StaticKeyword) {
                 continue;
             }
@@ -42687,7 +42764,7 @@ impl Printer<'_> {
         };
         match self.arena.get(bindings).map(|node| &node.data) {
             Some(NodeData::NamespaceImport(namespace)) => {
-                if self.import_binding_has_emitted_runtime_use(namespace.name) {
+                if self.import_binding_is_used(namespace.name) {
                     return true;
                 }
             }
@@ -44937,7 +45014,7 @@ impl Printer<'_> {
                         self.writer.write(", ");
                     }
                     wrote = true;
-                    self.emit_expression(attribute.name, 0)?;
+                    self.emit_jsx_attribute_property_name(attribute.name)?;
                     self.writer.write(": ");
                     self.emit_jsx_attribute_initializer(attribute.initializer)?;
                 }
@@ -45109,7 +45186,7 @@ impl Printer<'_> {
             let NodeData::JsxAttribute(attribute) = &node.data else {
                 return Err(Self::unsupported(*attribute, node.kind));
             };
-            self.emit_expression(attribute.name, 0)?;
+            self.emit_jsx_attribute_property_name(attribute.name)?;
             self.writer.write(": ");
             if let Some(initializer) = attribute.initializer {
                 let initializer_node = self.node(initializer)?.clone();
@@ -45130,6 +45207,16 @@ impl Printer<'_> {
         }
         self.writer.write(" }");
         Ok(())
+    }
+
+    fn emit_jsx_attribute_property_name(&mut self, name: NodeId) -> Result<(), EmitError> {
+        if let Some(text) = declaration_name_text(self.arena, name)
+            && !is_identifier_text(text)
+        {
+            write_quoted(&mut self.writer, text);
+            return Ok(());
+        }
+        self.emit_expression(name, 0)
     }
 
     fn emit_jsx_child(&mut self, id: NodeId, preserve: bool) -> Result<(), EmitError> {
