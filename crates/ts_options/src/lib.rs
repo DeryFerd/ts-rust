@@ -94,6 +94,7 @@ pub struct CompilerOptions {
     pub emit_declaration_only: bool,
     pub emit_bom: bool,
     pub emit_decorator_metadata: bool,
+    pub experimental_decorators: bool,
     pub es_module_interop: bool,
     pub exact_optional_property_types: bool,
     pub force_consistent_casing_in_file_names: bool,
@@ -160,6 +161,7 @@ impl Default for CompilerOptions {
             emit_declaration_only: false,
             emit_bom: false,
             emit_decorator_metadata: false,
+            experimental_decorators: false,
             es_module_interop: false,
             exact_optional_property_types: false,
             force_consistent_casing_in_file_names: false,
@@ -226,6 +228,7 @@ pub struct PrinterSettings {
     pub inline_source_map: bool,
     pub import_helpers: bool,
     pub no_emit_helpers: bool,
+    pub experimental_decorators: bool,
     pub remove_comments: bool,
     pub use_define_for_class_fields: Option<bool>,
 }
@@ -291,6 +294,9 @@ impl CompilerOptions {
                 }
                 "emitdecoratormetadata" => {
                     self.emit_decorator_metadata = overrides.emit_decorator_metadata;
+                }
+                "experimentaldecorators" => {
+                    self.experimental_decorators = overrides.experimental_decorators;
                 }
                 "emitbom" => self.emit_bom = overrides.emit_bom,
                 "importhelpers" => self.import_helpers = overrides.import_helpers,
@@ -399,6 +405,7 @@ impl CompilerOptions {
             inline_source_map: self.inline_source_map,
             import_helpers: self.import_helpers,
             no_emit_helpers: self.no_emit_helpers,
+            experimental_decorators: self.experimental_decorators,
             remove_comments: self.remove_comments,
             use_define_for_class_fields: self.use_define_for_class_fields,
         }
@@ -502,6 +509,9 @@ pub fn parse_compiler_options_map(options: &BTreeMap<String, JsonValue>) -> Pars
             }
             "emitdecoratormetadata" => {
                 parsed.emit_decorator_metadata = boolean(original_name, value, &mut diagnostics);
+            }
+            "experimentaldecorators" => {
+                parsed.experimental_decorators = boolean(original_name, value, &mut diagnostics);
             }
             "esmoduleinterop" => {
                 parsed.es_module_interop = boolean(original_name, value, &mut diagnostics);
@@ -640,6 +650,7 @@ struct PartialOptions {
     emit_declaration_only: Option<bool>,
     emit_bom: Option<bool>,
     emit_decorator_metadata: Option<bool>,
+    experimental_decorators: Option<bool>,
     es_module_interop: Option<bool>,
     exact_optional_property_types: Option<bool>,
     force_consistent_casing_in_file_names: Option<bool>,
@@ -723,6 +734,7 @@ impl PartialOptions {
             emit_declaration_only,
             emit_bom: self.emit_bom.unwrap_or(false),
             emit_decorator_metadata: self.emit_decorator_metadata.unwrap_or(false),
+            experimental_decorators: self.experimental_decorators.unwrap_or(false),
             es_module_interop,
             exact_optional_property_types: self.exact_optional_property_types.unwrap_or(false),
             force_consistent_casing_in_file_names: self
@@ -1149,6 +1161,15 @@ mod tests {
             parse_compiler_options(&object([("emitDecoratorMetadata", JsonValue::Bool(true))]));
         assert!(result.is_ok(), "{:?}", result.diagnostics);
         assert!(result.options.emit_decorator_metadata);
+    }
+
+    #[test]
+    fn threads_experimental_decorators_to_the_printer() {
+        let result =
+            parse_compiler_options(&object([("experimentalDecorators", JsonValue::Bool(true))]));
+        assert!(result.is_ok(), "{:?}", result.diagnostics);
+        assert!(result.options.experimental_decorators);
+        assert!(result.options.printer_settings().experimental_decorators);
     }
 
     #[test]

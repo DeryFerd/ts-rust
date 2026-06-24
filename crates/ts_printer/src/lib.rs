@@ -151,6 +151,7 @@ pub fn emit_source_file(arena: &NodeArena, source_file: NodeId) -> Result<EmitRe
             inline_source_map: false,
             import_helpers: false,
             no_emit_helpers: false,
+            experimental_decorators: false,
             remove_comments: false,
             use_define_for_class_fields: None,
         },
@@ -623,7 +624,10 @@ pub fn emit_source_file_with_context(
         printer.emit_create_binding_helper();
         printer.emit_import_star_helper();
     }
-    if source_needs_legacy_decorate_helper(arena) && !settings.no_emit_helpers {
+    if settings.experimental_decorators
+        && source_needs_legacy_decorate_helper(arena)
+        && !settings.no_emit_helpers
+    {
         printer.emit_decorate_helper();
         if printer.emit_decorator_metadata && !preemit_isolated_metadata_import_star {
             printer.emit_metadata_helper();
@@ -631,6 +635,12 @@ pub fn emit_source_file_with_context(
         if source_needs_legacy_param_helper(arena) {
             printer.emit_param_helper();
         }
+    }
+    let needs_standard_decorator_helpers = !settings.experimental_decorators
+        && source_needs_standard_decorator_helpers(arena);
+    if needs_standard_decorator_helpers && !settings.no_emit_helpers {
+        printer.emit_es_decorate_helper();
+        printer.emit_run_initializers_helper();
     }
     if settings.target < ScriptTarget::Es2017
         && source_needs_awaiter_helper(arena)
@@ -648,11 +658,12 @@ pub fn emit_source_file_with_context(
     {
         printer.emit_generator_helper();
     }
-    if settings.target < ScriptTarget::Es2022
-        && source_needs_set_function_name_helper(
-            arena,
-            settings.use_define_for_class_fields == Some(true),
-        )
+    if (needs_standard_decorator_helpers
+        || (settings.target < ScriptTarget::Es2022
+            && source_needs_set_function_name_helper(
+                arena,
+                settings.use_define_for_class_fields == Some(true),
+            )))
         && !settings.no_emit_helpers
     {
         printer.emit_set_function_name_helper();
@@ -1279,6 +1290,39 @@ fn source_needs_legacy_decorate_helper(arena: &NodeArena) -> bool {
                     })
                 })
             }))
+    })
+}
+
+fn source_needs_standard_decorator_helpers(arena: &NodeArena) -> bool {
+    arena.iter().any(|(id, node)| {
+        if node_is_in_ambient_context(arena, id) {
+            return false;
+        }
+        match &node.data {
+            NodeData::ClassDeclaration(class) => {
+                declaration_has_modifier_in_list(
+                    arena,
+                    class.modifiers.as_ref(),
+                    SyntaxKind::Decorator,
+                ) || class.members.nodes.iter().any(|member| {
+                    arena.get(*member).is_some_and(|member| {
+                        declaration_has_modifier(arena, member, SyntaxKind::Decorator)
+                    })
+                })
+            }
+            NodeData::ClassExpression(class) => {
+                declaration_has_modifier_in_list(
+                    arena,
+                    class.modifiers.as_ref(),
+                    SyntaxKind::Decorator,
+                ) || class.members.nodes.iter().any(|member| {
+                    arena.get(*member).is_some_and(|member| {
+                        declaration_has_modifier(arena, member, SyntaxKind::Decorator)
+                    })
+                })
+            }
+            _ => false,
+        }
     })
 }
 
@@ -18278,6 +18322,24 @@ struct GeneratedNames {
     used: HashSet<String>,
 }
 
+#[derive(Clone)]
+struct Stage3DecoratedMemberPlan {
+    member: NodeId,
+    name: String,
+    is_static: bool,
+    is_accessor: bool,
+    decorators: Vec<NodeId>,
+    decorators_name: String,
+    initializers_name: String,
+    extra_initializers_name: String,
+    backing_name: Option<String>,
+}
+
+struct Stage3DecoratedClassPlan {
+    inferred_name: Option<String>,
+    members: Vec<Stage3DecoratedMemberPlan>,
+}
+
 impl GeneratedNames {
     fn new(arena: &NodeArena) -> Self {
         Self {
@@ -21052,6 +21114,56 @@ impl Printer<'_> {
             "        } catch (e) { op = [6, e]; y = 0; } finally { f = t = 0; }",
             "        if (op[0] & 5) throw op[1]; return { value: op[0] ? op[1] : void 0, done: true };",
             "    }",
+            "};",
+        ] {
+            self.writer.write(line);
+            self.writer.newline();
+        }
+    }
+
+    fn emit_es_decorate_helper(&mut self) {
+        for line in [
+            "var __esDecorate = (this && this.__esDecorate) || function (ctor, descriptorIn, decorators, contextIn, initializers, extraInitializers) {",
+            "    function accept(f) { if (f !== void 0 && typeof f !== \"function\") throw new TypeError(\"Function expected\"); return f; }",
+            "    var kind = contextIn.kind, key = kind === \"getter\" ? \"get\" : kind === \"setter\" ? \"set\" : \"value\";",
+            "    var target = !descriptorIn && ctor ? contextIn[\"static\"] ? ctor : ctor.prototype : null;",
+            "    var descriptor = descriptorIn || (target ? Object.getOwnPropertyDescriptor(target, contextIn.name) : {});",
+            "    var _, done = false;",
+            "    for (var i = decorators.length - 1; i >= 0; i--) {",
+            "        var context = {};",
+            "        for (var p in contextIn) context[p] = p === \"access\" ? {} : contextIn[p];",
+            "        for (var p in contextIn.access) context.access[p] = contextIn.access[p];",
+            "        context.addInitializer = function (f) { if (done) throw new TypeError(\"Cannot add initializers after decoration has completed\"); extraInitializers.push(accept(f || null)); };",
+            "        var result = (0, decorators[i])(kind === \"accessor\" ? { get: descriptor.get, set: descriptor.set } : descriptor[key], context);",
+            "        if (kind === \"accessor\") {",
+            "            if (result === void 0) continue;",
+            "            if (result === null || typeof result !== \"object\") throw new TypeError(\"Object expected\");",
+            "            if (_ = accept(result.get)) descriptor.get = _;",
+            "            if (_ = accept(result.set)) descriptor.set = _;",
+            "            if (_ = accept(result.init)) initializers.unshift(_);",
+            "        }",
+            "        else if (_ = accept(result)) {",
+            "            if (kind === \"field\") initializers.unshift(_);",
+            "            else descriptor[key] = _;",
+            "        }",
+            "    }",
+            "    if (target) Object.defineProperty(target, contextIn.name, descriptor);",
+            "    done = true;",
+            "};",
+        ] {
+            self.writer.write(line);
+            self.writer.newline();
+        }
+    }
+
+    fn emit_run_initializers_helper(&mut self) {
+        for line in [
+            "var __runInitializers = (this && this.__runInitializers) || function (thisArg, initializers, value) {",
+            "    var useValue = arguments.length > 2;",
+            "    for (var i = 0; i < initializers.length; i++) {",
+            "        value = useValue ? initializers[i].call(thisArg, value) : initializers[i].call(thisArg);",
+            "    }",
+            "    return useValue ? value : void 0;",
             "};",
         ] {
             self.writer.write(line);
@@ -35777,6 +35889,11 @@ impl Printer<'_> {
         data: &ts_ast::ClassExpressionData,
         parent_precedence: u8,
     ) -> Result<(), EmitError> {
+        if !self.settings.experimental_decorators
+            && let Some(plan) = self.stage3_decorated_class_plan(id, data)
+        {
+            return self.emit_stage3_decorated_class_expression(data, &plan);
+        }
         let declaration = Self::class_expression_as_declaration(data);
         let needs_post_class_lowering = self.settings.target < ScriptTarget::Es2022
             && self.class_expression_requires_post_class_lowering(&declaration);
@@ -35799,6 +35916,373 @@ impl Printer<'_> {
             return self.emit_downlevel_class_value(&declaration, &name);
         }
         self.emit_class(&declaration)
+    }
+
+    fn unique_stage3_name(&mut self, preferred: &str) -> String {
+        self.generated_names
+            .claim(preferred)
+            .unwrap_or_else(|| self.generated_names.generate(preferred))
+    }
+
+    fn stage3_decorated_class_plan(
+        &mut self,
+        id: NodeId,
+        data: &ts_ast::ClassExpressionData,
+    ) -> Option<Stage3DecoratedClassPlan> {
+        if !self.class_decorator_expressions(data.modifiers.as_ref()).is_empty() {
+            return None;
+        }
+        let mut backing_names = HashSet::new();
+        for member in &data.members.nodes {
+            if let Some(NodeData::PropertyDeclaration(property)) =
+                self.arena.get(*member).map(|node| &node.data)
+                && let Some(NodeData::PrivateIdentifier(name)) =
+                    self.arena.get(property.name).map(|node| &node.data)
+            {
+                backing_names.insert(name.text.clone());
+            }
+        }
+        let mut members = Vec::new();
+        for member in &data.members.nodes {
+            let node = self.arena.get(*member)?;
+            let decorators = if let NodeData::PropertyDeclaration(property) = &node.data {
+                self.class_decorator_expressions(property.modifiers.as_ref())
+            } else {
+                if declaration_has_modifier(self.arena, node, SyntaxKind::Decorator) {
+                    return None;
+                }
+                continue;
+            };
+            if decorators.is_empty() {
+                continue;
+            }
+            let NodeData::PropertyDeclaration(property) = &node.data else {
+                unreachable!();
+            };
+            let name = declaration_name_text(self.arena, property.name)?.to_owned();
+            let is_static = self.has_modifier(
+                property.modifiers.as_ref(),
+                SyntaxKind::StaticKeyword,
+            );
+            let is_accessor = self.property_is_auto_accessor(property);
+            let prefix = if is_static { "_static_" } else { "_" };
+            let base = format!("{prefix}{name}");
+            let backing_name = is_accessor.then(|| {
+                let base = format!("{name}_accessor_storage");
+                if backing_names.insert(base.clone()) {
+                    return base;
+                }
+                let mut index = 1;
+                loop {
+                    let candidate = format!("{name}_{index}_accessor_storage");
+                    if backing_names.insert(candidate.clone()) {
+                        return candidate;
+                    }
+                    index += 1;
+                }
+            });
+            members.push(Stage3DecoratedMemberPlan {
+                member: *member,
+                name,
+                is_static,
+                is_accessor,
+                decorators,
+                decorators_name: self.unique_stage3_name(&format!("{base}_decorators")),
+                initializers_name: self.unique_stage3_name(&format!("{base}_initializers")),
+                extra_initializers_name: self
+                    .unique_stage3_name(&format!("{base}_extraInitializers")),
+                backing_name,
+            });
+        }
+        (!members.is_empty()).then(|| Stage3DecoratedClassPlan {
+            inferred_name: self.class_expression_inferred_name(id),
+            members,
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn emit_stage3_decorated_class_expression(
+        &mut self,
+        data: &ts_ast::ClassExpressionData,
+        plan: &Stage3DecoratedClassPlan,
+    ) -> Result<(), EmitError> {
+        self.writer.write("(() => {");
+        self.writer.newline();
+        self.writer.indent += 1;
+        for is_static in [true, false] {
+            for member in plan.members.iter().filter(|member| member.is_static == is_static) {
+                self.writer.write("let ");
+                self.writer.write(&member.decorators_name);
+                self.writer.write(";");
+                self.writer.newline();
+                for name in [&member.initializers_name, &member.extra_initializers_name] {
+                    self.writer.write("let ");
+                    self.writer.write(name);
+                    self.writer.write(" = [];");
+                    self.writer.newline();
+                }
+            }
+        }
+        self.writer.write("return class {");
+        self.writer.newline();
+        self.writer.indent += 1;
+        if let Some(name) = &plan.inferred_name {
+            self.writer.write("static { __setFunctionName(this, ");
+            write_quoted(&mut self.writer, name);
+            self.writer.write("); }");
+            self.writer.newline();
+        }
+        self.emit_stage3_decoration_block(plan)?;
+        let mut pending_static_extra: Option<&str> = None;
+        for member in &plan.members {
+            if !member.is_static && !member.is_accessor {
+                continue;
+            }
+            let node = self.node(member.member)?.clone();
+            let NodeData::PropertyDeclaration(property) = &node.data else {
+                unreachable!();
+            };
+            if member.is_accessor {
+                self.emit_stage3_auto_accessor(
+                    member,
+                    property,
+                    if member.is_static {
+                        pending_static_extra
+                    } else {
+                        None
+                    },
+                )?;
+            } else {
+                self.writer.write("static { this.");
+                self.writer.write(&member.name);
+                self.writer.write(" = __runInitializers(this, ");
+                self.writer.write(&member.initializers_name);
+                self.writer.write(", ");
+                self.emit_stage3_initializer(property.initializer)?;
+                self.writer.write("); }");
+                self.writer.newline();
+            }
+            if member.is_static {
+                pending_static_extra = Some(&member.extra_initializers_name);
+            }
+        }
+        if plan.members.iter().any(|member| !member.is_static) {
+            self.emit_stage3_constructor(plan)?;
+        }
+        if let Some(extra) = pending_static_extra {
+            self.writer.write("static {");
+            self.writer.newline();
+            self.writer.indent += 1;
+            self.writer.write("__runInitializers(this, ");
+            self.writer.write(extra);
+            self.writer.write(");");
+            self.writer.newline();
+            self.writer.indent -= 1;
+            self.writer.write("}");
+            self.writer.newline();
+        }
+        self.writer.indent -= 1;
+        self.writer.write("};");
+        self.writer.newline();
+        self.writer.indent -= 1;
+        self.writer.write("})()");
+        let _ = data;
+        Ok(())
+    }
+
+    fn emit_stage3_decoration_block(
+        &mut self,
+        plan: &Stage3DecoratedClassPlan,
+    ) -> Result<(), EmitError> {
+        self.writer.write("static {");
+        self.writer.newline();
+        self.writer.indent += 1;
+        self.writer.write("const _metadata = typeof Symbol === \"function\" && Symbol.metadata ? Object.create(null) : void 0;");
+        self.writer.newline();
+        for member in &plan.members {
+            self.writer.write(&member.decorators_name);
+            self.writer.write(" = [");
+            for (index, decorator) in member.decorators.iter().enumerate() {
+                if index != 0 {
+                    self.writer.write(", ");
+                }
+                self.emit_expression(*decorator, 1)?;
+            }
+            self.writer.write("];");
+            self.writer.newline();
+        }
+        for (is_accessor, is_static) in [(true, true), (true, false), (false, true), (false, false)] {
+            for member in plan.members.iter().filter(|member| {
+                member.is_accessor == is_accessor && member.is_static == is_static
+            }) {
+                self.writer.write("__esDecorate(");
+                self.writer.write(if member.is_accessor { "this" } else { "null" });
+                self.writer.write(", null, ");
+                self.writer.write(&member.decorators_name);
+                self.writer.write(", ");
+                self.emit_stage3_context(member);
+                self.writer.write(", ");
+                self.writer.write(&member.initializers_name);
+                self.writer.write(", ");
+                self.writer.write(&member.extra_initializers_name);
+                self.writer.write(");");
+                self.writer.newline();
+            }
+        }
+        self.writer.write("if (_metadata) Object.defineProperty(this, Symbol.metadata, { enumerable: true, configurable: true, writable: true, value: _metadata });");
+        self.writer.newline();
+        self.writer.indent -= 1;
+        self.writer.write("}");
+        self.writer.newline();
+        Ok(())
+    }
+
+    fn emit_stage3_context(&mut self, member: &Stage3DecoratedMemberPlan) {
+        self.writer.write("{ kind: ");
+        write_quoted(
+            &mut self.writer,
+            if member.is_accessor { "accessor" } else { "field" },
+        );
+        self.writer.write(", name: ");
+        write_quoted(&mut self.writer, &member.name);
+        self.writer.write(", static: ");
+        self.writer
+            .write(if member.is_static { "true" } else { "false" });
+        self.writer.write(", private: false, access: { has: obj => ");
+        write_quoted(&mut self.writer, &member.name);
+        self.writer.write(" in obj, get: obj => obj.");
+        self.writer.write(&member.name);
+        self.writer.write(", set: (obj, value) => { obj.");
+        self.writer.write(&member.name);
+        self.writer.write(" = value; } }, metadata: _metadata }");
+    }
+
+    fn emit_stage3_initializer(&mut self, initializer: Option<NodeId>) -> Result<(), EmitError> {
+        if let Some(initializer) = initializer {
+            self.emit_expression(initializer, 1)
+        } else {
+            self.writer.write("void 0");
+            Ok(())
+        }
+    }
+
+    fn emit_stage3_auto_accessor(
+        &mut self,
+        member: &Stage3DecoratedMemberPlan,
+        property: &ts_ast::PropertyDeclarationData,
+        preceding_extra: Option<&str>,
+    ) -> Result<(), EmitError> {
+        let backing = member.backing_name.as_deref().expect("accessor backing name");
+        if member.is_static {
+            self.writer.write("static #");
+            self.writer.write(backing);
+            self.writer.write(" = ");
+            if let Some(extra) = preceding_extra {
+                self.writer.write("(__runInitializers(this, ");
+                self.writer.write(extra);
+                self.writer.write("), __runInitializers(this, ");
+                self.writer.write(&member.initializers_name);
+                self.writer.write(", ");
+                self.emit_stage3_initializer(property.initializer)?;
+                self.writer.write("))");
+            } else {
+                self.writer.write("__runInitializers(this, ");
+                self.writer.write(&member.initializers_name);
+                self.writer.write(", ");
+                self.emit_stage3_initializer(property.initializer)?;
+                self.writer.write(")");
+            }
+            self.writer.write(";");
+            self.writer.newline();
+        } else {
+            self.writer.write("#");
+            self.writer.write(backing);
+            self.writer.write(";");
+            self.writer.newline();
+        }
+        if member.is_static {
+            self.writer.write("static ");
+        }
+        self.writer.write("get ");
+        self.writer.write(&member.name);
+        self.writer.write("() { return this.#");
+        self.writer.write(backing);
+        self.writer.write("; }");
+        self.writer.newline();
+        if member.is_static {
+            self.writer.write("static ");
+        }
+        self.writer.write("set ");
+        self.writer.write(&member.name);
+        self.writer.write("(value) { this.#");
+        self.writer.write(backing);
+        self.writer.write(" = value; }");
+        self.writer.newline();
+        Ok(())
+    }
+
+    fn emit_stage3_constructor(
+        &mut self,
+        plan: &Stage3DecoratedClassPlan,
+    ) -> Result<(), EmitError> {
+        self.writer.write("constructor() {");
+        self.writer.newline();
+        self.writer.indent += 1;
+        let mut preceding_extra: Option<&str> = None;
+        for member in plan.members.iter().filter(|member| !member.is_static) {
+            let node = self.node(member.member)?.clone();
+            let NodeData::PropertyDeclaration(property) = &node.data else {
+                unreachable!();
+            };
+            if member.is_accessor {
+                self.writer.write("this.#");
+                self.writer
+                    .write(member.backing_name.as_deref().expect("accessor backing name"));
+                self.writer.write(" = ");
+                if let Some(extra) = preceding_extra {
+                    self.writer.write("(__runInitializers(this, ");
+                    self.writer.write(extra);
+                    self.writer.write("), __runInitializers(this, ");
+                    self.writer.write(&member.initializers_name);
+                    self.writer.write(", ");
+                    self.emit_stage3_initializer(property.initializer)?;
+                    self.writer.write("))");
+                } else {
+                    self.writer.write("__runInitializers(this, ");
+                    self.writer.write(&member.initializers_name);
+                    self.writer.write(", ");
+                    self.emit_stage3_initializer(property.initializer)?;
+                    self.writer.write(")");
+                }
+            } else {
+                if let Some(extra) = preceding_extra {
+                    self.writer.write("__runInitializers(this, ");
+                    self.writer.write(extra);
+                    self.writer.write(");");
+                    self.writer.newline();
+                }
+                self.writer.write("this.");
+                self.writer.write(&member.name);
+                self.writer.write(" = __runInitializers(this, ");
+                self.writer.write(&member.initializers_name);
+                self.writer.write(", ");
+                self.emit_stage3_initializer(property.initializer)?;
+                self.writer.write(")");
+            }
+            self.writer.write(";");
+            self.writer.newline();
+            preceding_extra = Some(&member.extra_initializers_name);
+        }
+        if let Some(extra) = preceding_extra {
+            self.writer.write("__runInitializers(this, ");
+            self.writer.write(extra);
+            self.writer.write(");");
+            self.writer.newline();
+        }
+        self.writer.indent -= 1;
+        self.writer.write("}");
+        self.writer.newline();
+        Ok(())
     }
 
     fn class_expression_downlevel_name(
@@ -45872,6 +46356,7 @@ mod tests {
                 inline_source_map: false,
                 import_helpers: false,
                 no_emit_helpers: false,
+                experimental_decorators: false,
                 remove_comments: false,
                 use_define_for_class_fields: None,
             },
@@ -45908,6 +46393,7 @@ mod tests {
                 inline_source_map: false,
                 import_helpers: false,
                 no_emit_helpers: false,
+                experimental_decorators: false,
                 remove_comments: false,
                 use_define_for_class_fields: None,
             },
@@ -45960,6 +46446,7 @@ mod tests {
                 inline_source_map: false,
                 import_helpers: false,
                 no_emit_helpers: false,
+                experimental_decorators: false,
                 remove_comments: false,
                 use_define_for_class_fields: Some(true),
             },
@@ -45990,6 +46477,7 @@ mod tests {
                 inline_source_map: false,
                 import_helpers: false,
                 no_emit_helpers: false,
+                experimental_decorators: false,
                 remove_comments: false,
                 use_define_for_class_fields: None,
             },
@@ -46036,6 +46524,7 @@ mod tests {
                 inline_source_map: false,
                 import_helpers: false,
                 no_emit_helpers: false,
+                experimental_decorators: false,
                 remove_comments: false,
                 use_define_for_class_fields: None,
             },
@@ -46088,6 +46577,7 @@ mod tests {
                 inline_source_map: false,
                 import_helpers: false,
                 no_emit_helpers: false,
+                experimental_decorators: false,
                 remove_comments: false,
                 use_define_for_class_fields: None,
             },
@@ -46165,6 +46655,7 @@ mod tests {
                 inline_source_map: false,
                 import_helpers: false,
                 no_emit_helpers: false,
+                experimental_decorators: false,
                 remove_comments: false,
                 use_define_for_class_fields: None,
             },
@@ -46650,6 +47141,7 @@ mod tests {
                 inline_source_map: false,
                 import_helpers: false,
                 no_emit_helpers: false,
+                experimental_decorators: false,
                 remove_comments: false,
                 use_define_for_class_fields: None,
             },
@@ -46794,6 +47286,7 @@ mod tests {
                 inline_source_map: false,
                 import_helpers: true,
                 no_emit_helpers: false,
+                experimental_decorators: false,
                 remove_comments: false,
                 use_define_for_class_fields: None,
             },
@@ -47160,6 +47653,7 @@ mod tests {
                 inline_source_map: false,
                 import_helpers: false,
                 no_emit_helpers: false,
+                experimental_decorators: false,
                 remove_comments: false,
                 use_define_for_class_fields: None,
             },
@@ -47550,6 +48044,7 @@ mod tests {
                 inline_source_map: false,
                 import_helpers: false,
                 no_emit_helpers: false,
+                experimental_decorators: false,
                 remove_comments: false,
                 use_define_for_class_fields: None,
             },
@@ -47762,6 +48257,7 @@ mod tests {
                 inline_source_map: false,
                 import_helpers: false,
                 no_emit_helpers: false,
+                experimental_decorators: false,
                 remove_comments: false,
                 use_define_for_class_fields: None,
             },
@@ -48287,6 +48783,7 @@ mod tests {
                     inline_source_map: false,
                     import_helpers: false,
                     no_emit_helpers: false,
+                    experimental_decorators: false,
                     remove_comments: false,
                     use_define_for_class_fields: None,
                 },
@@ -48444,8 +48941,9 @@ mod tests {
                     source_map: false,
                     inline_source_map: false,
                     import_helpers: false,
-                    no_emit_helpers: false,
-                    remove_comments: false,
+                no_emit_helpers: false,
+                experimental_decorators: false,
+                remove_comments: false,
                     use_define_for_class_fields: None,
                 },
             )
@@ -49060,6 +49558,7 @@ mod tests {
                 inline_source_map: false,
                 import_helpers: false,
                 no_emit_helpers: false,
+                experimental_decorators: false,
                 remove_comments: false,
                 use_define_for_class_fields: None,
             },
@@ -49255,6 +49754,7 @@ class Board {
                 inline_source_map: false,
                 import_helpers: false,
                 no_emit_helpers: false,
+                experimental_decorators: false,
                 remove_comments: false,
                 use_define_for_class_fields: None,
             },
@@ -49286,6 +49786,7 @@ class Board {
                 inline_source_map: false,
                 import_helpers: false,
                 no_emit_helpers: false,
+                experimental_decorators: false,
                 remove_comments: false,
                 use_define_for_class_fields: None,
             },
@@ -49652,6 +50153,7 @@ class Board {
                 inline_source_map: false,
                 import_helpers: false,
                 no_emit_helpers: false,
+                experimental_decorators: false,
                 remove_comments: false,
                 use_define_for_class_fields: None,
             },
@@ -49687,8 +50189,9 @@ class Board {
                     source_map: false,
                     inline_source_map: false,
                     import_helpers: false,
-                    no_emit_helpers: false,
-                    remove_comments: false,
+                no_emit_helpers: false,
+                experimental_decorators: false,
+                remove_comments: false,
                     use_define_for_class_fields: None,
                 },
             )
@@ -49714,6 +50217,7 @@ class Board {
                 inline_source_map: false,
                 import_helpers: false,
                 no_emit_helpers: false,
+                experimental_decorators: false,
                 remove_comments: false,
                 use_define_for_class_fields: None,
             },
@@ -50427,6 +50931,7 @@ class Board {
                 inline_source_map: false,
                 import_helpers: false,
                 no_emit_helpers: false,
+                experimental_decorators: false,
                 remove_comments: false,
                 use_define_for_class_fields: None,
             },

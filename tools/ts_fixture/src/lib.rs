@@ -1007,6 +1007,7 @@ const SCALAR_OPTION_NAMES: &[&str] = &[
     "emitBOM",
     "emitDeclarationOnly",
     "emitDecoratorMetadata",
+    "experimentalDecorators",
     "esModuleInterop",
     "exactOptionalPropertyTypes",
     "forceConsistentCasingInFileNames",
