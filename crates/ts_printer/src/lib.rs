@@ -6015,20 +6015,7 @@ impl DeclarationPrinter<'_> {
         }
         if let Some(annotation) = function
             .body
-            .and_then(|body| self.declaration_single_return_expression(body))
-            .and_then(|returned| {
-                let name = declaration_name_text(self.arena, returned)?;
-                let symbol = self.resolve_lexical_name_at(returned, name)?;
-                self.bindings
-                    .symbols
-                    .get(symbol)?
-                    .declarations
-                    .iter()
-                    .find_map(|declaration| match &self.arena.get(*declaration)?.data {
-                        NodeData::VariableDeclaration(variable) => variable.type_,
-                        _ => None,
-                    })
-            })
+            .and_then(|body| self.returned_local_variable_type_annotation(body))
         {
             self.emit_type(annotation)?;
             return Ok(());
@@ -11171,6 +11158,12 @@ impl DeclarationPrinter<'_> {
                     {
                         self.writer.write("any");
                     } else if data.type_.is_none()
+                        && let Some(annotation) = data
+                            .body
+                            .and_then(|body| self.returned_local_variable_type_annotation(body))
+                    {
+                        self.emit_type(annotation)?;
+                    } else if data.type_.is_none()
                         && let Some((expression, type_id)) = data
                             .body
                             .and_then(|body| self.declaration_single_return_expression(body))
@@ -11210,6 +11203,11 @@ impl DeclarationPrinter<'_> {
                         })
                     {
                         self.emit_initializer_function_type(expression)?;
+                    } else if let Some(annotation) = data
+                        .body
+                        .and_then(|body| self.returned_local_variable_type_annotation(body))
+                    {
+                        self.emit_type(annotation)?;
                     } else if let Some(type_id) = data
                         .body
                         .and_then(|body| self.declaration_single_return_expression(body))
@@ -14887,6 +14885,31 @@ impl DeclarationPrinter<'_> {
             return None;
         };
         return_.expression
+    }
+
+    fn returned_local_variable_type_annotation(&self, body: NodeId) -> Option<NodeId> {
+        let returns = self.function_return_expressions_in_body(body);
+        let [returned] = returns.as_slice() else {
+            return None;
+        };
+        let name = declaration_name_text(self.arena, *returned)?;
+        let symbol = self.resolve_lexical_name_at(*returned, name)?;
+        self.bindings
+            .symbols
+            .get(symbol)?
+            .declarations
+            .iter()
+            .find_map(|declaration| {
+                if !self.node_is_within(*declaration, body) {
+                    return None;
+                }
+                let NodeData::VariableDeclaration(variable) =
+                    &self.arena.get(*declaration)?.data
+                else {
+                    return None;
+                };
+                variable.type_
+            })
     }
 
     fn expression_is_nullish(&self, expression: NodeId) -> bool {
