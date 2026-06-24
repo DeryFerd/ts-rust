@@ -9973,23 +9973,13 @@ impl DeclarationPrinter<'_> {
         ) {
             return Ok(false);
         }
+        let Some(initializer) = initializer
+            .filter(|initializer| self.is_enum_member_initializer(*initializer))
+        else {
+            return Ok(false);
+        };
         self.writer.write(" = ");
-        if let Some(initializer) = initializer
-            && self.is_enum_member_initializer(initializer)
-        {
-            self.emit_enum_member_initializer(initializer)?;
-        } else {
-            match kind {
-                TypeKind::BooleanLiteral(value) => {
-                    self.writer.write(if value { "true" } else { "false" });
-                }
-                TypeKind::NumberLiteral(value) | TypeKind::BigIntLiteral(value) => {
-                    self.writer.write(&value);
-                }
-                TypeKind::StringLiteral(value) => write_quoted(&mut self.writer, &value),
-                _ => unreachable!("literal kind checked above"),
-            }
-        }
+        self.emit_enum_member_initializer(initializer)?;
         Ok(true)
     }
 
@@ -12978,9 +12968,8 @@ impl DeclarationPrinter<'_> {
             TypeKind::BooleanLiteral(value) => {
                 self.writer.write(if value { "true" } else { "false" });
             }
-            TypeKind::NumberLiteral(value) | TypeKind::BigIntLiteral(value) => {
-                self.writer.write(&value);
-            }
+            TypeKind::NumberLiteral(value) => self.write_semantic_number_literal(&value),
+            TypeKind::BigIntLiteral(value) => self.writer.write(&value),
             TypeKind::StringLiteral(value) => write_quoted(&mut self.writer, &value),
             TypeKind::Object(object) => {
                 if let Some(signature) = Self::compact_construct_signature(&object) {
@@ -13104,6 +13093,12 @@ impl DeclarationPrinter<'_> {
             }
         }
         Ok(())
+    }
+
+    fn write_semantic_number_literal(&mut self, value: &str) {
+        self.writer.write(
+            &ts_jsnum::Number::from_string(&value.replace('_', "")).to_string(),
+        );
     }
 
     fn dynamic_import_object_specifier(&self, type_id: TypeId) -> Option<&str> {
@@ -16787,7 +16782,14 @@ impl DeclarationPrinter<'_> {
     fn emit_literal_expression(&mut self, id: NodeId) -> Result<(), EmitError> {
         let node = self.node(id)?.clone();
         match &node.data {
-            NodeData::NumericLiteral(data) => self.writer.write(&data.text),
+            NodeData::NumericLiteral(data) => {
+                if self.canonical_literal_quotes {
+                    self.writer
+                        .write(&ts_jsnum::Number::from_string(&data.text).to_string());
+                } else {
+                    self.writer.write(&data.text);
+                }
+            }
             NodeData::BigIntLiteral(data) => self.writer.write(&data.text.to_ascii_lowercase()),
             NodeData::StringLiteral(data) => {
                 let quote = if self.canonical_literal_quotes {
@@ -16819,6 +16821,16 @@ impl DeclarationPrinter<'_> {
                 _ => "undefined",
             }),
             NodeData::Identifier(_) | NodeData::QualifiedName(_) => self.emit_name(id)?,
+            NodeData::PrefixUnaryExpression(prefix)
+                if matches!(prefix.operator, SyntaxKind::PlusToken | SyntaxKind::MinusToken) =>
+            {
+                self.writer.write(if prefix.operator == SyntaxKind::MinusToken {
+                    "-"
+                } else {
+                    "+"
+                });
+                self.emit_literal_expression(prefix.operand)?;
+            }
             _ => return Err(Self::unsupported(id, node.kind)),
         }
         Ok(())
@@ -17948,7 +17960,9 @@ fn is_const_enum_declaration(arena: &NodeArena, node: &Node) -> bool {
 
 fn write_enum_constant(writer: &mut Writer, value: &EmitConstantValue) {
     match value {
-        EmitConstantValue::Number(value) => writer.write(&value.to_string()),
+        EmitConstantValue::Number(value) => {
+            writer.write(&ts_jsnum::Number::new(*value).to_string());
+        }
         EmitConstantValue::String(value) => write_quoted(writer, value),
     }
 }

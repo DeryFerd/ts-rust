@@ -912,6 +912,11 @@ impl<'a> Parser<'a> {
         loop {
             declarations.push(self.parse_variable_declaration());
             if self.current.kind != SyntaxKind::CommaToken {
+                if self.current.kind == SyntaxKind::ColonToken {
+                    self.error_current("Expected ','.");
+                    self.bump();
+                    continue;
+                }
                 if self.current.kind == SyntaxKind::Unknown
                     && self.current.text == "\\"
                     && self.next_token_kind() == SyntaxKind::Identifier
@@ -4086,7 +4091,18 @@ impl<'a> Parser<'a> {
                 &[left, operator_node, right],
             );
         }
-        if minimum_precedence <= 2 && self.current.kind == SyntaxKind::QuestionToken {
+        let block_bodied_arrow = matches!(
+            self.arena.get(left).map(|node| &node.data),
+            Some(NodeData::ArrowFunction(arrow))
+                if matches!(
+                    self.arena.get(arrow.body).map(|node| &node.data),
+                    Some(NodeData::Block(_))
+                )
+        );
+        if minimum_precedence <= 2
+            && self.current.kind == SyntaxKind::QuestionToken
+            && !block_bodied_arrow
+        {
             let question_token = self.consume_token_node();
             let before_else = self.current.kind == SyntaxKind::ElseKeyword;
             let when_true = if before_else {
@@ -4944,7 +4960,23 @@ impl<'a> Parser<'a> {
                 self.error_current("Expected ')'.");
                 break;
             }
-            arguments.push(self.parse_spread_element_or_expression());
+            let argument = self.parse_spread_element_or_expression();
+            arguments.push(argument);
+            if self.current.kind == SyntaxKind::CloseBraceToken
+                && self.next_token_kind() == SyntaxKind::CloseParenToken
+                && matches!(
+                    self.arena.get(argument).map(|node| &node.data),
+                    Some(NodeData::ObjectLiteralExpression(_))
+                )
+            {
+                self.bump();
+            }
+            if self.current.kind == SyntaxKind::EqualsGreaterThanToken {
+                self.error_current("Expected ','.");
+                self.bump();
+                trailing = false;
+                continue;
+            }
             if self.current.kind == SyntaxKind::ColonToken {
                 self.error_current("Expected ','.");
                 self.bump();
@@ -4996,16 +5028,32 @@ impl<'a> Parser<'a> {
         let mut bracket_depth = 0_u32;
         let mut typed_parameter = false;
         let mut top_level_question = false;
+        let mut at_parameter_start = true;
+        let mut invalid_parameter_start = false;
         let mut previous_kind = SyntaxKind::OpenParenToken;
         let mut token = self.scanner.scan();
         while token.kind != SyntaxKind::EndOfFile {
+            if at_parameter_start
+                && parenthesis_depth == 1
+                && brace_depth == 0
+                && bracket_depth == 0
+                && !matches!(
+                    token.kind,
+                    SyntaxKind::CommaToken | SyntaxKind::CloseParenToken
+                )
+            {
+                invalid_parameter_start |= invalid_arrow_parameter_start(token.kind);
+                at_parameter_start = false;
+            }
             match token.kind {
                 SyntaxKind::OpenParenToken => parenthesis_depth += 1,
                 SyntaxKind::CloseParenToken => {
                     parenthesis_depth -= 1;
                     if parenthesis_depth == 0 {
                         token = self.scanner.scan();
-                        let result = if token.kind == SyntaxKind::ColonToken {
+                        let result = if invalid_parameter_start {
+                            false
+                        } else if token.kind == SyntaxKind::ColonToken {
                             if previous_kind == SyntaxKind::OpenParenToken || typed_parameter {
                                 self.scanner.rewind(checkpoint);
                                 return true;
@@ -5059,6 +5107,11 @@ impl<'a> Parser<'a> {
                         typed_parameter = true;
                     }
                     top_level_question = false;
+                }
+                SyntaxKind::CommaToken
+                    if parenthesis_depth == 1 && brace_depth == 0 && bracket_depth == 0 =>
+                {
+                    at_parameter_start = true;
                 }
                 _ => {}
             }
@@ -7662,6 +7715,20 @@ fn is_type_start_kind(kind: SyntaxKind) -> bool {
                 | SyntaxKind::MinusToken
                 | SyntaxKind::QuestionToken
         )
+}
+
+fn invalid_arrow_parameter_start(kind: SyntaxKind) -> bool {
+    matches!(
+        kind,
+        SyntaxKind::OpenParenToken
+            | SyntaxKind::NumericLiteral
+            | SyntaxKind::BigIntLiteral
+            | SyntaxKind::StringLiteral
+            | SyntaxKind::NoSubstitutionTemplateLiteral
+            | SyntaxKind::TrueKeyword
+            | SyntaxKind::FalseKeyword
+            | SyntaxKind::NullKeyword
+    )
 }
 
 fn binary_precedence(kind: SyntaxKind) -> Option<(u8, bool)> {

@@ -748,6 +748,11 @@ impl Program {
                 }
             }
         }
+        suppress_output_path_collisions(
+            &mut output,
+            &self.current_directory,
+            self.case_sensitivity,
+        );
         if self.options.emit_bom {
             prepend_emit_bom(&mut output.files);
         }
@@ -4205,6 +4210,49 @@ fn output_overwrites_input_diagnostic(file_name: &str) -> ProgramDiagnostic {
             .format(&[file_name.to_owned()])
             .expect("TS5055 has one formatting argument"),
     }
+}
+
+fn output_collision_diagnostic(file_name: &str) -> ProgramDiagnostic {
+    let message = message_by_code(5056).expect("TS5056 must be in the generated catalog");
+    ProgramDiagnostic {
+        file_name: None,
+        range: None,
+        code: Some(message.code()),
+        message: message
+            .format(&[file_name.to_owned()])
+            .expect("TS5056 has one formatting argument"),
+    }
+}
+
+fn suppress_output_path_collisions(
+    output: &mut EmitOutput,
+    current_directory: &str,
+    case_sensitivity: CaseSensitivity,
+) {
+    let mut paths = BTreeMap::<String, (String, usize)>::new();
+    for file in &output.files {
+        let canonical = canonicalize(&file.file_name, current_directory, case_sensitivity);
+        let entry = paths
+            .entry(canonical)
+            .or_insert_with(|| (file.file_name.clone(), 0));
+        entry.1 += 1;
+    }
+    let collisions = paths
+        .into_iter()
+        .filter_map(|(canonical, (file_name, count))| (count > 1).then_some((canonical, file_name)))
+        .collect::<BTreeMap<_, _>>();
+    if collisions.is_empty() {
+        return;
+    }
+    output.files.retain(|file| {
+        let canonical = canonicalize(&file.file_name, current_directory, case_sensitivity);
+        !collisions.contains_key(&canonical)
+    });
+    output.diagnostics.extend(
+        collisions
+            .into_values()
+            .map(|file_name| output_collision_diagnostic(&file_name)),
+    );
 }
 
 fn emit_declaration_only_diagnostic() -> ProgramDiagnostic {

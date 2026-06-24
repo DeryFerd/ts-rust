@@ -3500,8 +3500,10 @@ impl<'a> Checker<'a> {
             EvaluationOutcome::Value(Value::Number(value)) if value.is_infinite() => {
                 if is_const {
                     self.error(initializer, 2477, std::iter::empty());
+                    None
+                } else {
+                    Some(Value::Number(value))
                 }
-                None
             }
             EvaluationOutcome::Value(value @ (Value::Number(_) | Value::String(_))) => Some(value),
             _ if is_const && forward_reference => {
@@ -14277,6 +14279,11 @@ impl<'a> DeclarationReachability<'a> {
                         if property.type_.is_none() && property.initializer.is_some() =>
                     {
                         self.retain_entity(property.initializer.unwrap());
+                    }
+                    NodeData::VariableDeclaration(variable) => {
+                        stack.push(variable.name);
+                        stack.extend(variable.type_);
+                        continue;
                     }
                     NodeData::ShorthandPropertyAssignment(property) => {
                         self.retain_entity(property.name);
