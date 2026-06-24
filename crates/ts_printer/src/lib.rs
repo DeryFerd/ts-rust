@@ -7647,6 +7647,12 @@ impl DeclarationPrinter<'_> {
             {
                 self.writer.write(": ");
                 self.emit_name(member)?;
+            } else if let Some(type_name) = declaration
+                .initializer
+                .and_then(|initializer| self.import_equals_primitive_target_name(initializer))
+            {
+                self.writer.write(": ");
+                self.writer.write(type_name);
             } else if let Some(type_query) =
                 self.variable_entity_value_type_query_name(declaration_id, declaration)
             {
@@ -11673,6 +11679,80 @@ impl DeclarationPrinter<'_> {
                     .flatten()
             })
         })
+    }
+
+    fn import_equals_primitive_target_name(&self, identifier: NodeId) -> Option<&'static str> {
+        let name = declaration_name_text(self.arena, identifier)?;
+        let import = self
+            .bindings
+            .resolve_name_at(identifier, name)
+            .and_then(|symbol| self.bindings.symbols.get(symbol))
+            .and_then(|symbol| {
+                symbol.declarations.iter().find_map(|declaration| {
+                    let NodeData::ImportEqualsDeclaration(import) =
+                        &self.arena.get(*declaration)?.data
+                    else {
+                        return None;
+                    };
+                    Some(import.as_ref())
+                })
+            })
+            .or_else(|| {
+                self.arena.iter().find_map(|(_, node)| {
+                    let NodeData::ImportEqualsDeclaration(import) = &node.data else {
+                        return None;
+                    };
+                    (declaration_name_text(self.arena, import.name) == Some(name))
+                        .then_some(import.as_ref())
+                })
+            })?;
+        let target = self.resolve_entity_expression_symbol(import.module_reference)?;
+        let variable = self
+            .bindings
+            .symbols
+            .get(target)?
+            .declarations
+            .iter()
+            .find_map(|declaration| {
+                let NodeData::VariableDeclaration(variable) =
+                    &self.arena.get(*declaration)?.data
+                else {
+                    return None;
+                };
+                Some(variable.as_ref())
+            })?;
+        if let Some(type_node) = variable.type_ {
+            return match self.arena.get(type_node)?.kind {
+                SyntaxKind::BooleanKeyword => Some("boolean"),
+                SyntaxKind::NumberKeyword => Some("number"),
+                SyntaxKind::StringKeyword => Some("string"),
+                SyntaxKind::BigIntKeyword => Some("bigint"),
+                _ => None,
+            };
+        }
+        let initializer = self.arena.get(variable.initializer?)?;
+        match &initializer.data {
+            NodeData::NumericLiteral(_) => Some("number"),
+            NodeData::BigIntLiteral(_) => Some("bigint"),
+            NodeData::StringLiteral(_) | NodeData::NoSubstitutionTemplateLiteral(_) => {
+                Some("string")
+            }
+            NodeData::KeywordExpression(_)
+                if matches!(initializer.kind, SyntaxKind::TrueKeyword | SyntaxKind::FalseKeyword) =>
+            {
+                Some("boolean")
+            }
+            NodeData::PrefixUnaryExpression(prefix)
+                if matches!(prefix.operator, SyntaxKind::PlusToken | SyntaxKind::MinusToken)
+                    && matches!(
+                        self.arena.get(prefix.operand).map(|node| &node.data),
+                        Some(NodeData::NumericLiteral(_))
+                    ) =>
+            {
+                Some("number")
+            }
+            _ => None,
+        }
     }
 
     fn import_equals_value_type(&self, type_id: TypeId) -> TypeId {
@@ -23048,7 +23128,8 @@ impl Printer<'_> {
                 }
                 NodeData::ImportEqualsDeclaration(import)
                     if exported
-                        && !self.is_external_import_equals(import) =>
+                        && !self.is_external_import_equals(import)
+                        && self.import_equals_has_runtime_use(*statement, import) =>
                 {
                     if let Some(name) = declaration_name_text(self.arena, import.name)
                         && seen.insert(name.to_owned())
@@ -54318,6 +54399,18 @@ class Board {
     }
 
     #[test]
+    fn exported_type_only_import_equals_has_no_runtime_export_slot() {
+        let output = emit_amd(concat!(
+            "export namespace a { export namespace b { export interface I {} } }\n",
+            "export import b = a.b; export var x: b.I;\n",
+        ))
+        .code;
+        assert!(output.contains("exports.x = void 0;"), "{output}");
+        assert!(!output.contains("exports.b"), "{output}");
+        assert!(!output.contains("= a.b"), "{output}");
+    }
+
+    #[test]
     fn retains_amd_import_equals_dependencies_for_exports() {
         assert_eq!(
             emit_amd("export import a = require(\"dep\");").code,
@@ -55064,6 +55157,31 @@ class Board {
         );
         assert!(nested_alias.contains("import local = x.c;"), "{nested_alias}");
         assert!(!nested_alias.contains("export import local"), "{nested_alias}");
+
+        let primitive_alias = emit_declarations_with_semantics(concat!(
+            "namespace a { export var x = 10; }\n",
+            "namespace c { import b = a.x; export var bVal = b; }\n",
+        ));
+        assert!(primitive_alias.contains("var bVal: number;"), "{primitive_alias}");
+        assert!(!primitive_alias.contains("typeof b"), "{primitive_alias}");
+        assert!(!primitive_alias.contains("import b ="), "{primitive_alias}");
+
+        let exported_primitive_alias = emit_declarations_with_semantics(concat!(
+            "export namespace a { export var x = 10; }\n",
+            "export namespace c { export import b = a.x; export var bVal = b; }\n",
+        ));
+        assert!(
+            exported_primitive_alias.contains("export import b = a.x;"),
+            "{exported_primitive_alias}"
+        );
+        assert!(
+            exported_primitive_alias.contains("var bVal: number;"),
+            "{exported_primitive_alias}"
+        );
+        assert!(
+            !exported_primitive_alias.contains("typeof b"),
+            "{exported_primitive_alias}"
+        );
 
         let class_visibility = emit_declarations_with_semantics(concat!(
             "namespace M {\n",
