@@ -3273,7 +3273,10 @@ impl DeclarationPrinter<'_> {
                     self.writer.write("declare ");
                 } else if !in_namespace {
                     self.emit_declaration_prefix(&node, !(self.javascript_source && exported));
-                } else if namespace_export {
+                } else if namespace_export
+                    || (exported
+                        && declaration_has_modifier(self.arena, &node, SyntaxKind::DefaultKeyword))
+                {
                     self.writer.write("export ");
                     if declaration_has_modifier(self.arena, &node, SyntaxKind::DefaultKeyword) {
                         self.writer.write("default ");
@@ -3426,8 +3429,14 @@ impl DeclarationPrinter<'_> {
                 }
                 if !in_namespace {
                     self.emit_declaration_prefix(&node, !(self.javascript_source && exported));
-                } else if namespace_export {
+                } else if namespace_export
+                    || (exported
+                        && declaration_has_modifier(self.arena, &node, SyntaxKind::DefaultKeyword))
+                {
                     self.writer.write("export ");
+                    if declaration_has_modifier(self.arena, &node, SyntaxKind::DefaultKeyword) {
+                        self.writer.write("default ");
+                    }
                 }
                 if declaration_has_modifier(self.arena, &node, SyntaxKind::AbstractKeyword) {
                     self.writer.write("abstract ");
@@ -3804,7 +3813,11 @@ impl DeclarationPrinter<'_> {
                     self.writer.write("export default ");
                     self.writer.write(&name);
                     self.writer.write(";");
-                } else if self.entity_is_local_enum(data.expression) {
+                } else if matches!(
+                    self.arena.get(data.expression).map(|node| &node.data),
+                    Some(NodeData::Identifier(_))
+                ) || self.entity_is_local_enum(data.expression)
+                {
                     self.writer.write("export default ");
                     self.emit_name(data.expression)?;
                     self.writer.write(";");
@@ -33992,7 +34005,7 @@ impl Printer<'_> {
         emitted_name: Option<&str>,
     ) -> Result<(), EmitError> {
         if self.settings.target < ScriptTarget::Es2015 {
-            return self.emit_downlevel_class(data);
+            return self.emit_downlevel_class(data, emitted_name);
         }
         let private_plan = self.private_method_plan(data);
         let previous_private_plan = self.active_private_method_plan.clone();
@@ -35302,10 +35315,12 @@ impl Printer<'_> {
     fn emit_downlevel_class(
         &mut self,
         data: &ts_ast::ClassDeclarationData,
+        emitted_name: Option<&str>,
     ) -> Result<(), EmitError> {
         let name = data
             .name
             .and_then(|name| self.identifier_text(name).ok())
+            .or(emitted_name)
             .unwrap_or("_class")
             .to_owned();
         self.writer.write("var ");
