@@ -28864,6 +28864,15 @@ impl Printer<'_> {
                 self.writer.write(" = ");
                 self.writer.write(name);
                 self.writer.write(";");
+                if self.has_modifier(modifiers, SyntaxKind::ExportKeyword)
+                    && let Some(symbol) = self
+                        .bindings
+                        .root_scope()
+                        .and_then(|scope| scope.symbols.get(name))
+                {
+                    self.identifier_rewrites
+                        .insert(symbol, format!("exports.{exported}"));
+                }
             }
         }
     }
@@ -31259,6 +31268,30 @@ impl Printer<'_> {
         &mut self,
         data: &ts_ast::ObjectLiteralExpressionData,
     ) -> Result<(), EmitError> {
+        if data.properties.nodes.len() > 1
+            && data.properties.nodes.iter().all(|property| {
+                matches!(
+                    self.arena.get(*property).map(|node| &node.data),
+                    Some(NodeData::SpreadAssignment(_))
+                )
+            })
+        {
+            for _ in 0..data.properties.nodes.len() {
+                self.writer.write("Object.assign(");
+            }
+            self.writer.write("{}");
+            for property in &data.properties.nodes {
+                let Some(NodeData::SpreadAssignment(spread)) =
+                    self.arena.get(*property).map(|node| &node.data)
+                else {
+                    unreachable!("all properties were checked as spreads");
+                };
+                self.writer.write(", ");
+                self.emit_expression(spread.expression, 1)?;
+                self.writer.write(")");
+            }
+            return Ok(());
+        }
         if let [first, remaining @ ..] = data.properties.nodes.as_slice()
             && let Some(NodeData::SpreadAssignment(spread)) =
                 self.arena.get(*first).map(|node| &node.data)
@@ -35951,6 +35984,7 @@ mod tests {
         let source = concat!(
             "const leading = { before: one(), [computed()]: two(), ...spread(), after: three() };",
             "const spreadFirst = { ...first, [key()]: value(), plain: after(), ...second(), tail: end() };",
+            "const consecutive = { ...first, ...second() };",
         );
         let output = emit_with(source, ScriptTarget::Es2015, ModuleKind::EsNext).code;
         assert_eq!(
@@ -35958,6 +35992,7 @@ mod tests {
             concat!(
                 "const leading = Object.assign({ before: one(), [computed()]: two() }, spread(), { after: three() });\n",
                 "const spreadFirst = Object.assign({}, first, { [key()]: value(), plain: after() }, second(), { tail: end() });\n",
+                "const consecutive = Object.assign(Object.assign({}, first), second());\n",
             )
         );
         for call in [
@@ -35969,11 +36004,11 @@ mod tests {
             "key()",
             "value()",
             "after()",
-            "second()",
             "end()",
         ] {
             assert_eq!(output.matches(call).count(), 1, "{call}: {output}");
         }
+        assert_eq!(output.matches("second()").count(), 2, "{output}");
     }
 
     #[test]
