@@ -2363,6 +2363,9 @@ impl DeclarationPrinter<'_> {
             NodeData::TypeAliasDeclaration(alias) => {
                 self.local_mixin_support_type_is_structurally_consumed(statement, alias.name)
             }
+            NodeData::ClassDeclaration(class) => {
+                self.local_class_is_synthetic_heritage_argument(statement, class)
+            }
             _ => false,
         }
     }
@@ -2398,17 +2401,26 @@ impl DeclarationPrinter<'_> {
                     .and_then(|name| declaration_name_text(self.arena, name))
             })
             .collect::<HashSet<_>>();
-        if local_classes.is_empty()
-            || !body.statements.nodes.iter().any(|statement| {
-                matches!(
-                    self.arena.get(*statement).map(|node| &node.data),
-                    Some(NodeData::ReturnStatement(return_))
-                        if return_.expression
-                            .and_then(|expression| declaration_name_text(self.arena, expression))
-                            .is_some_and(|name| local_classes.contains(name))
-                )
-            })
-        {
+        let returns_local_class = body.statements.nodes.iter().any(|statement| {
+            matches!(
+                self.arena.get(*statement).map(|node| &node.data),
+                Some(NodeData::ReturnStatement(return_))
+                    if return_.expression
+                        .and_then(|expression| declaration_name_text(self.arena, expression))
+                        .is_some_and(|name| local_classes.contains(name))
+            )
+        });
+        let returns_class_expression = body.statements.nodes.iter().any(|statement| {
+            matches!(
+                self.arena.get(*statement).map(|node| &node.data),
+                Some(NodeData::ReturnStatement(return_))
+                    if return_.expression.is_some_and(|expression| matches!(
+                        self.arena.get(expression).map(|node| &node.data),
+                        Some(NodeData::ClassExpression(_))
+                    ))
+            )
+        });
+        if !returns_local_class && !returns_class_expression {
             return false;
         }
         let uses = self
@@ -2451,6 +2463,93 @@ impl DeclarationPrinter<'_> {
                 }
                 false
             })
+    }
+
+    fn local_class_is_synthetic_heritage_argument(
+        &self,
+        declaration: NodeId,
+        class: &ts_ast::ClassDeclarationData,
+    ) -> bool {
+        let Some(name) = class
+            .name
+            .and_then(|name| declaration_name_text(self.arena, name))
+        else {
+            return false;
+        };
+        let uses = self
+            .arena
+            .iter()
+            .filter_map(|(id, node)| {
+                matches!(&node.data, NodeData::Identifier(identifier) if identifier.text == name)
+                    .then_some(id)
+            })
+            .filter(|identifier| !self.node_is_within(*identifier, declaration))
+            .collect::<Vec<_>>();
+        !uses.is_empty()
+            && uses.iter().all(|identifier| {
+                let Some(access) = self.arena.get(*identifier).and_then(|node| node.parent) else {
+                    return false;
+                };
+                if !matches!(
+                    self.arena.get(access).map(|node| &node.data),
+                    Some(NodeData::PropertyAccessExpression(property))
+                        if property.expression == *identifier
+                ) {
+                    return false;
+                }
+                let Some(call) = self.arena.get(access).and_then(|node| node.parent) else {
+                    return false;
+                };
+                let Some(NodeData::CallExpression(call_expression)) =
+                    self.arena.get(call).map(|node| &node.data)
+                else {
+                    return false;
+                };
+                if !call_expression.arguments.nodes.contains(&access) {
+                    return false;
+                }
+                let Some(factory_name) =
+                    declaration_name_text(self.arena, call_expression.expression)
+                else {
+                    return false;
+                };
+                let factory_consumed = self.arena.iter().any(|(id, node)| {
+                    matches!(
+                        &node.data,
+                        NodeData::FunctionDeclaration(function)
+                            if function
+                                .name
+                                .and_then(|name| declaration_name_text(self.arena, name))
+                                == Some(factory_name)
+                                && self.local_mixin_function_is_structurally_consumed(id, function)
+                    )
+                });
+                factory_consumed && self.node_has_exported_class_heritage_ancestor(call)
+            })
+    }
+
+    fn node_has_exported_class_heritage_ancestor(&self, mut node: NodeId) -> bool {
+        let mut saw_heritage = false;
+        while let Some(parent) = self.arena.get(node).and_then(|node| node.parent) {
+            let Some(parent_node) = self.arena.get(parent) else {
+                return false;
+            };
+            match &parent_node.data {
+                NodeData::HeritageClause(_) => saw_heritage = true,
+                NodeData::ClassDeclaration(_) => {
+                    return saw_heritage
+                        && declaration_has_modifier(
+                            self.arena,
+                            parent_node,
+                            SyntaxKind::ExportKeyword,
+                        );
+                }
+                NodeData::SourceFile(_) => return false,
+                _ => {}
+            }
+            node = parent;
+        }
+        false
     }
 
     fn local_mixin_support_type_is_structurally_consumed(
@@ -3698,7 +3797,7 @@ impl DeclarationPrinter<'_> {
             })?;
         let (type_id, argument) = match self.arena.get(expression).map(|node| &node.data) {
             Some(NodeData::CallExpression(call)) => self
-                .parsed_heritage_call(call)
+                .parsed_heritage_call(expression, call)
                 .map(|(type_id, argument)| (Some(type_id), argument))
                 .or_else(|| {
                     self.node_types
@@ -3744,6 +3843,7 @@ impl DeclarationPrinter<'_> {
 
     fn parsed_heritage_call(
         &self,
+        expression: NodeId,
         call: &ts_ast::CallExpressionData,
     ) -> Option<(TypeId, Option<String>)> {
         let function_type = self.node_types?.get(&call.expression).copied()?;
@@ -3760,7 +3860,44 @@ impl DeclarationPrinter<'_> {
             };
             declaration_name_text(self.arena, *argument).map(str::to_owned)
         });
-        Some((signature.return_type, argument))
+        let instantiated = self
+            .node_types
+            .and_then(|types| types.get(&expression).copied())
+            .filter(|type_id| {
+                !matches!(
+                    self.semantic_types
+                        .and_then(|types| types.get(*type_id))
+                        .map(|type_| &type_.kind),
+                    Some(TypeKind::Any)
+                )
+            });
+        let source_argument_substitutes_top_level_parameter = argument.is_some()
+            && matches!(
+                self.semantic_types
+                    .and_then(|types| types.get(signature.return_type))
+                    .map(|type_| &type_.kind),
+                Some(TypeKind::TypeParameter { .. })
+            )
+            || argument.is_some()
+                && matches!(
+                    self.semantic_types
+                        .and_then(|types| types.get(signature.return_type))
+                        .map(|type_| &type_.kind),
+                    Some(TypeKind::Intersection(members))
+                        if members.iter().any(|member| matches!(
+                            self.semantic_types
+                                .and_then(|types| types.get(*member))
+                                .map(|type_| &type_.kind),
+                            Some(TypeKind::TypeParameter { .. })
+                        ))
+                );
+        if source_argument_substitutes_top_level_parameter {
+            Some((signature.return_type, argument))
+        } else {
+            instantiated
+                .map(|return_type| (return_type, None))
+                .or(Some((signature.return_type, argument)))
+        }
     }
 
     fn recovered_heritage_call(&self, expression: NodeId) -> Option<(TypeId, Option<String>)> {
@@ -38497,6 +38634,33 @@ class Board {
             )),
             "{output}"
         );
+    }
+
+    #[test]
+    fn declaration_emit_instantiates_generic_class_factory_heritage() {
+        let output = emit_declarations_with_semantics(concat!(
+            "function ClassFactory<TKind extends string>(kind: TKind) {\n",
+            "    return class {\n",
+            "        static readonly THE_KIND: TKind = kind;\n",
+            "        readonly kind: TKind = kind;\n",
+            "    };\n",
+            "}\n",
+            "class Kinds { static readonly A = 'A'; }\n",
+            "export class AKind extends ClassFactory(Kinds.A) {}\n",
+        ));
+        assert!(
+            output.starts_with(concat!(
+                "declare const AKind_base: {\n",
+                "    new (): {\n",
+                "        readonly kind: \"A\";\n",
+                "    };\n",
+                "    readonly THE_KIND: \"A\";\n",
+                "};\n",
+            )),
+            "{output}"
+        );
+        assert!(!output.contains("function ClassFactory"), "{output}");
+        assert!(!output.contains("class Kinds"), "{output}");
     }
 
     #[test]

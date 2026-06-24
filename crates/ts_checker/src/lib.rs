@@ -4755,9 +4755,6 @@ impl<'a> Checker<'a> {
                     else {
                         continue;
                     };
-                    let Some(name) = self.property_name(heritage.expression) else {
-                        continue;
-                    };
                     let arguments = heritage
                         .type_arguments
                         .as_ref()
@@ -4770,7 +4767,8 @@ impl<'a> Checker<'a> {
                         })
                         .unwrap_or_default();
                     let base = self
-                        .resolve_identifier(heritage.expression, &name)
+                        .property_name(heritage.expression)
+                        .and_then(|name| self.resolve_identifier(heritage.expression, &name))
                         .and_then(|symbol| self.instantiate_declared_object(symbol, &arguments))
                         .or_else(|| {
                             let value = self.type_of_expression(heritage.expression);
@@ -4867,6 +4865,10 @@ impl<'a> Checker<'a> {
     fn constructor_instance_type(&self, type_id: TypeId) -> Option<TypeId> {
         match &self.result.types.get(type_id)?.kind {
             TypeKind::Constructor(signature) => Some(signature.return_type),
+            TypeKind::Object(object) => object
+                .construct_signatures
+                .first()
+                .map(|signature| signature.return_type),
             TypeKind::TypeParameter {
                 constraint: Some(constraint),
                 ..
@@ -5514,10 +5516,30 @@ impl<'a> Checker<'a> {
     }
 
     fn class_expression_type(&mut self, class: &ts_ast::ClassExpressionData) -> TypeId {
+        let instance_members = class
+            .members
+            .nodes
+            .iter()
+            .filter(|member| {
+                self.member_modifier(**member, SyntaxKind::StaticKeyword)
+                    .is_none()
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        let static_members = class
+            .members
+            .nodes
+            .iter()
+            .filter(|member| {
+                self.member_modifier(**member, SyntaxKind::StaticKeyword)
+                    .is_some()
+            })
+            .copied()
+            .collect::<Vec<_>>();
         let instance_type = self.declared_object_type(
             class.type_parameters.as_ref(),
             class.heritage_clauses.as_ref(),
-            &class.members.nodes,
+            &instance_members,
             &[],
         );
         self.this_types.push(instance_type);
@@ -5541,7 +5563,10 @@ impl<'a> Checker<'a> {
             signature.parameters = base_signature.parameters;
             signature.parameters_optional = base_signature.parameters_optional;
         }
-        let constructor_type = self.result.types.alloc(TypeKind::Constructor(signature));
+        let constructor_type = self
+            .result
+            .types
+            .alloc(TypeKind::Constructor(signature.clone()));
         self.result.named_type_references.insert(
             constructor_type,
             NamedTypeReference {
@@ -5552,6 +5577,18 @@ impl<'a> Checker<'a> {
         if let Some(symbol) = class.symbol.or(class.local_symbol) {
             self.result.symbol_types.insert(symbol, constructor_type);
         }
+        let static_type =
+            (!static_members.is_empty()).then(|| self.object_type_from_members(&static_members));
+        let class_value = static_type
+            .and_then(|static_type| {
+                let TypeKind::Object(mut object) = self.result.types.get(static_type)?.kind.clone()
+                else {
+                    return None;
+                };
+                object.construct_signatures.push(signature);
+                Some(self.result.types.alloc(TypeKind::Object(object)))
+            })
+            .unwrap_or(constructor_type);
         let suppress_covered_base = class.members.nodes.iter().any(|member| {
             matches!(
                 self.arena.get(*member).map(|node| &node.data),
@@ -5564,18 +5601,20 @@ impl<'a> Checker<'a> {
         }) && base_type.is_some_and(|base| {
             self.constructor_instance_properties_are_covered(base, instance_type)
         });
-        if base_type.is_some_and(|base| {
+        let inherited_value = base_type.filter(|base| {
             matches!(
-                self.result.types.get(base).map(|type_| &type_.kind),
+                self.result.types.get(*base).map(|type_| &type_.kind),
                 Some(TypeKind::TypeParameter { .. } | TypeKind::Intersection(_))
             )
-        }) && !suppress_covered_base
-        {
-            self.result
-                .types
-                .intersection([constructor_type, base_type.unwrap()])
+        });
+        let mut value_members = vec![class_value];
+        if !suppress_covered_base && let Some(base_type) = inherited_value {
+            value_members.push(base_type);
+        }
+        if value_members.len() > 1 {
+            self.result.types.intersection(value_members)
         } else {
-            constructor_type
+            class_value
         }
     }
 
@@ -5636,6 +5675,7 @@ impl<'a> Checker<'a> {
     fn construct_signature(&self, type_id: TypeId) -> Option<FunctionType> {
         match &self.result.types.get(type_id)?.kind {
             TypeKind::Constructor(signature) => Some(signature.clone()),
+            TypeKind::Object(object) => object.construct_signatures.first().cloned(),
             TypeKind::TypeParameter {
                 constraint: Some(constraint),
                 ..
@@ -9079,6 +9119,7 @@ impl<'a> Checker<'a> {
         parameter: TypeId,
     ) -> bool {
         signature.return_type == parameter
+            || self.type_contains_id(signature.return_type, parameter, &mut HashSet::new())
             || self
                 .mapped_return_templates
                 .get(&signature.return_type)
@@ -9181,13 +9222,20 @@ impl<'a> Checker<'a> {
             ) => elements
                 .iter()
                 .any(|element| self.type_contains_id(*element, wanted, visited)),
-            Some(TypeKind::Object(object)) => object
-                .properties
-                .values()
-                .copied()
-                .chain(object.string_index_type)
-                .chain(object.number_index_type)
-                .any(|part| self.type_contains_id(part, wanted, visited)),
+            Some(TypeKind::Object(object)) => {
+                object
+                    .properties
+                    .values()
+                    .copied()
+                    .chain(object.string_index_type)
+                    .chain(object.number_index_type)
+                    .any(|part| self.type_contains_id(part, wanted, visited))
+                    || object
+                        .call_signatures
+                        .iter()
+                        .chain(&object.construct_signatures)
+                        .any(|signature| self.signature_contains_type(signature, wanted))
+            }
             Some(TypeKind::Function(signature) | TypeKind::Constructor(signature)) => {
                 self.signature_contains_type(signature, wanted)
             }
@@ -9873,14 +9921,24 @@ impl<'a> Checker<'a> {
                     .into_iter()
                     .map(|(name, property)| (name, self.substitute_type(property, inference)))
                     .collect();
+                let call_signatures = object
+                    .call_signatures
+                    .into_iter()
+                    .map(|signature| self.substitute_signature(signature, inference))
+                    .collect();
+                let construct_signatures = object
+                    .construct_signatures
+                    .into_iter()
+                    .map(|signature| self.substitute_signature(signature, inference))
+                    .collect();
                 self.result.types.alloc(TypeKind::Object(ObjectType {
                     properties,
                     property_order: object.property_order,
                     numeric_properties: object.numeric_properties,
                     string_index_type,
                     number_index_type,
-                    call_signatures: object.call_signatures,
-                    construct_signatures: object.construct_signatures,
+                    call_signatures,
+                    construct_signatures,
                     optional_properties: object.optional_properties,
                     readonly_properties: object.readonly_properties,
                     getter_properties: object.getter_properties,
@@ -9941,6 +9999,26 @@ impl<'a> Checker<'a> {
                 .insert(substituted, reference);
         }
         substituted
+    }
+
+    fn substitute_signature(
+        &mut self,
+        signature: FunctionType,
+        inference: &HashMap<TypeId, TypeId>,
+    ) -> FunctionType {
+        FunctionType {
+            parameters: signature
+                .parameters
+                .into_iter()
+                .map(|parameter| self.substitute_type(parameter, inference))
+                .collect(),
+            parameter_names: signature.parameter_names,
+            rest_parameter: signature
+                .rest_parameter
+                .map(|parameter| self.substitute_type(parameter, inference)),
+            return_type: self.substitute_type(signature.return_type, inference),
+            parameters_optional: signature.parameters_optional,
+        }
     }
 
     fn instantiate_synthetic_named_type(
@@ -10170,30 +10248,8 @@ impl<'a> Checker<'a> {
         if data.type_.is_none()
             && let Some(body) = data.body
         {
-            self.type_parameter_scopes.push(HashMap::new());
-            if let Some(type_parameters) = &data.type_parameters {
-                for type_parameter in &type_parameters.nodes {
-                    let Some(NodeData::TypeParameterDeclaration(parameter)) =
-                        self.arena.get(*type_parameter).map(|node| &node.data)
-                    else {
-                        continue;
-                    };
-                    let Some(name) = self.property_name(parameter.name) else {
-                        continue;
-                    };
-                    let constraint = parameter
-                        .constraint
-                        .map(|constraint| self.type_from_type_node(constraint));
-                    let type_id = self.result.types.alloc(TypeKind::TypeParameter {
-                        name: name.clone(),
-                        constraint,
-                    });
-                    self.type_parameter_scopes
-                        .last_mut()
-                        .expect("function inference type-parameter scope exists")
-                        .insert(name, type_id);
-                }
-            }
+            let scope = self.inferred_function_type_parameter_scope(data, function);
+            self.type_parameter_scopes.push(scope);
             let inferred = self
                 .infer_function_return_type(data, function, body)
                 .or_else(|| {
@@ -10234,6 +10290,74 @@ impl<'a> Checker<'a> {
             );
         }
         function
+    }
+
+    fn inferred_function_type_parameter_scope(
+        &mut self,
+        data: &ts_ast::FunctionDeclarationData,
+        function: TypeId,
+    ) -> HashMap<String, TypeId> {
+        let wanted = data
+            .type_parameters
+            .iter()
+            .flat_map(|parameters| &parameters.nodes)
+            .filter_map(|parameter| {
+                let NodeData::TypeParameterDeclaration(parameter) =
+                    &self.arena.get(*parameter)?.data
+                else {
+                    return None;
+                };
+                self.property_name(parameter.name)
+            })
+            .collect::<HashSet<_>>();
+        let mut signature_parameters = HashMap::new();
+        if let TypeKind::Function(signature) = &self
+            .result
+            .types
+            .get(function)
+            .expect("function type exists")
+            .kind
+        {
+            self.collect_signature_type_parameters(
+                signature,
+                &wanted,
+                &mut signature_parameters,
+                &mut HashSet::new(),
+            );
+        }
+        self.type_parameter_scopes.push(HashMap::new());
+        if let Some(type_parameters) = &data.type_parameters {
+            for type_parameter in &type_parameters.nodes {
+                let Some(NodeData::TypeParameterDeclaration(parameter)) =
+                    self.arena.get(*type_parameter).map(|node| &node.data)
+                else {
+                    continue;
+                };
+                let Some(name) = self.property_name(parameter.name) else {
+                    continue;
+                };
+                let type_id = signature_parameters
+                    .get(&name)
+                    .and_then(|parameters| parameters.first())
+                    .copied()
+                    .unwrap_or_else(|| {
+                        let constraint = parameter
+                            .constraint
+                            .map(|constraint| self.type_from_type_node(constraint));
+                        self.result.types.alloc(TypeKind::TypeParameter {
+                            name: name.clone(),
+                            constraint,
+                        })
+                    });
+                self.type_parameter_scopes
+                    .last_mut()
+                    .expect("function inference type-parameter scope exists")
+                    .insert(name, type_id);
+            }
+        }
+        self.type_parameter_scopes
+            .pop()
+            .expect("function inference type-parameter scope exists")
     }
 
     fn type_contains_cyclic_alias(&self, type_id: TypeId) -> bool {
