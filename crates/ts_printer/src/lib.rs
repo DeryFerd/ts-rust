@@ -18630,7 +18630,8 @@ impl Printer<'_> {
     }
 
     fn statement_emits_runtime(&self, id: NodeId, node: &Node) -> bool {
-        if declaration_has_modifier(self.arena, node, SyntaxKind::DeclareKeyword)
+        if (declaration_has_modifier(self.arena, node, SyntaxKind::DeclareKeyword)
+            && !matches!(node.data, NodeData::ImportEqualsDeclaration(_)))
             || (is_const_enum_declaration(self.arena, node)
                 && !self.const_enum_emit_mode.preserves_declarations())
         {
@@ -19252,7 +19253,9 @@ impl Printer<'_> {
     #[allow(clippy::too_many_lines)]
     fn emit_statement(&mut self, id: NodeId) -> Result<(), EmitError> {
         let node = self.node(id)?.clone();
-        if declaration_has_modifier(self.arena, &node, SyntaxKind::DeclareKeyword) {
+        if declaration_has_modifier(self.arena, &node, SyntaxKind::DeclareKeyword)
+            && !matches!(node.data, NodeData::ImportEqualsDeclaration(_))
+        {
             return Ok(());
         }
         if is_const_enum_declaration(self.arena, &node)

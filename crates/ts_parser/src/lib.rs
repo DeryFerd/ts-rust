@@ -540,6 +540,8 @@ impl<'a> Parser<'a> {
         };
         let abstract_starts_expression = self.current.kind == SyntaxKind::AbstractKeyword
             && self.next_token_preceded_by_line_break();
+        let declare_starts_expression = self.current.kind == SyntaxKind::DeclareKeyword
+            && self.next_token_kind() == SyntaxKind::InstanceOfKeyword;
         let async_starts_function = self.current.kind == SyntaxKind::AsyncKeyword
             && !self.next_token_preceded_by_line_break()
             && self.next_token_kind() == SyntaxKind::FunctionKeyword;
@@ -587,6 +589,9 @@ impl<'a> Parser<'a> {
             }
             SyntaxKind::AtToken => self.parse_decorated_statement(),
             SyntaxKind::AbstractKeyword if abstract_starts_expression => {
+                self.parse_expression_statement()
+            }
+            SyntaxKind::DeclareKeyword if declare_starts_expression => {
                 self.parse_expression_statement()
             }
             SyntaxKind::AsyncKeyword if !async_starts_function => self.parse_expression_statement(),
