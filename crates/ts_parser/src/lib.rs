@@ -20,7 +20,7 @@ use ts_ast::{
     InterfaceDeclarationData, IntersectionTypeNodeData, JsDocData, JsDocNullableTypeData,
     JsDocTextData, JsDocUnknownTagData, JsxAttributeData, JsxAttributesData, JsxClosingElementData,
     JsxClosingFragmentData, JsxElementData, JsxExpressionData, JsxFragmentData,
-    JsxOpeningElementData, JsxOpeningFragmentData, JsxSelfClosingElementData,
+    JsxNamespacedNameData, JsxOpeningElementData, JsxOpeningFragmentData, JsxSelfClosingElementData,
     JsxSpreadAttributeData, JsxTextData, KeywordExpressionData, KeywordTypeNodeData,
     LabeledStatementData, LiteralTypeNodeData, MappedTypeNodeData, MethodDeclarationData,
     MethodSignatureDeclarationData, ModifierList, ModuleBlockData, ModuleDeclarationData,
@@ -6115,8 +6115,34 @@ impl<'a> Parser<'a> {
             return self.parse_jsx_fragment(start, resume_jsx);
         }
         let tag_name = self.parse_jsx_tag_name("Expected a JSX tag name.");
+        if self.current.kind == SyntaxKind::ColonToken {
+            self.bump();
+        }
         let type_arguments = self.parse_type_arguments();
-        let attributes = self.parse_jsx_attributes();
+        let recovered_attribute = if self.current.kind == SyntaxKind::EqualsToken {
+            let attribute_start = self.current.range.start;
+            self.current = self.scanner.scan_jsx_attribute_value();
+            if self.current.kind == SyntaxKind::OpenBraceToken {
+                self.bump();
+                let expression = self.parse_binary_expression(0);
+                let end = if self.current.kind == SyntaxKind::CloseBraceToken {
+                    self.consume().range.end
+                } else {
+                    self.node_end(expression)
+                };
+                Some(self.alloc_node(
+                    SyntaxKind::JsxSpreadAttribute,
+                    TextRange::new(attribute_start, end),
+                    NodeData::JsxSpreadAttribute(Box::new(JsxSpreadAttributeData { expression })),
+                    &[expression],
+                ))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let attributes = self.parse_jsx_attributes(recovered_attribute);
         let mut element_children = vec![tag_name];
         extend_list_children(&mut element_children, type_arguments.as_ref());
         element_children.push(attributes);
@@ -6309,9 +6335,9 @@ impl<'a> Parser<'a> {
         )
     }
 
-    fn parse_jsx_attributes(&mut self) -> NodeId {
+    fn parse_jsx_attributes(&mut self, recovered_attribute: Option<NodeId>) -> NodeId {
         let start = self.current.full_start;
-        let mut attributes = Vec::new();
+        let mut attributes = recovered_attribute.into_iter().collect::<Vec<_>>();
         while matches!(
             self.current.kind,
             SyntaxKind::Identifier | SyntaxKind::OpenBraceToken
@@ -6336,10 +6362,9 @@ impl<'a> Parser<'a> {
                 ));
                 continue;
             }
-            self.current = self.scanner.scan_jsx_identifier();
-            let name = self.parse_identifier_name("Expected a JSX attribute name.");
+            let name = self.parse_jsx_name("Expected a JSX attribute name.");
             let initializer = if self.current.kind == SyntaxKind::EqualsToken {
-                self.bump();
+                self.current = self.scanner.scan_jsx_attribute_value();
                 if self.current.kind == SyntaxKind::StringLiteral {
                     Some(self.parse_string_literal())
                 } else if self.current.kind == SyntaxKind::OpenBraceToken {
@@ -6415,8 +6440,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_jsx_tag_name(&mut self, message: &str) -> NodeId {
-        self.current = self.scanner.scan_jsx_identifier();
-        let mut expression = self.parse_identifier(message);
+        let mut expression = self.parse_jsx_name(message);
         while self.current.kind == SyntaxKind::DotToken {
             self.bump();
             self.current = self.scanner.scan_jsx_identifier();
@@ -6435,6 +6459,27 @@ impl<'a> Parser<'a> {
             );
         }
         expression
+    }
+
+    fn parse_jsx_name(&mut self, message: &str) -> NodeId {
+        self.current = self.scanner.scan_jsx_identifier();
+        let namespace = self.parse_identifier_name(message);
+        if self.current.kind != SyntaxKind::ColonToken {
+            return namespace;
+        }
+        self.bump();
+        self.current = self.scanner.scan_jsx_identifier();
+        let name = self.parse_identifier_name(message);
+        self.alloc_node(
+            SyntaxKind::JsxNamespacedName,
+            TextRange::new(self.node_start(namespace), self.node_end(name)),
+            NodeData::JsxNamespacedName(Box::new(JsxNamespacedNameData {
+                namespace,
+                facts: 0,
+                name,
+            })),
+            &[namespace, name],
+        )
     }
 
     fn parse_identifier(&mut self, message: &str) -> NodeId {

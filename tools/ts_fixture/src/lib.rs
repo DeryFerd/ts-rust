@@ -1038,6 +1038,7 @@ const SCALAR_OPTION_NAMES: &[&str] = &[
     "jsx",
     "jsxFactory",
     "jsxFragmentFactory",
+    "jsxImportSource",
     "module",
     "moduleDetection",
     "moduleResolution",

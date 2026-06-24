@@ -88,6 +88,7 @@ pub struct EmitContext<'a> {
     pub force_use_strict: bool,
     pub jsx_factory: Option<&'a str>,
     pub jsx_fragment_factory: Option<&'a str>,
+    pub jsx_import_source: Option<&'a str>,
     pub downlevel_iteration: bool,
     /// Controls whether JSX-generated runtime imports make an otherwise-script file a module.
     pub module_detection: ModuleDetectionKind,
@@ -231,6 +232,7 @@ pub fn emit_source_file_with_settings_and_bindings(
             force_use_strict: false,
             jsx_factory: None,
             jsx_fragment_factory: None,
+            jsx_import_source: None,
             downlevel_iteration: false,
             module_detection: ModuleDetectionKind::Auto,
         },
@@ -366,6 +368,7 @@ pub fn emit_source_file_with_context(
         strict_null_checks: context.strict_null_checks,
         jsx_factory: context.jsx_factory.map(str::to_owned),
         jsx_fragment_factory: context.jsx_fragment_factory.map(str::to_owned),
+        jsx_import_source: context.jsx_import_source.map(str::to_owned),
         downlevel_iteration: context.downlevel_iteration,
         context_preserves_top_of_file_reference_directive: context
             .preserve_top_of_file_reference_directive,
@@ -418,7 +421,8 @@ pub fn emit_source_file_with_context(
     }
     // The classic JSX transform synthesizes factory calls, so the configured factory root is a
     // runtime dependency even when every source-level reference is confined to type positions.
-    if settings.jsx == JsxEmit::React && source_has_jsx(arena) {
+    let preserves_classic_jsx = settings.jsx == JsxEmit::Preserve;
+    if (settings.jsx == JsxEmit::React || preserves_classic_jsx) && source_has_jsx(arena) {
         let factory_root = context
             .jsx_factory
             .unwrap_or("React.createElement")
@@ -756,7 +760,7 @@ pub fn emit_source_file_with_context(
         && !settings.no_emit_helpers;
     if let Some(start) = first_statement_start {
         let defer_commonjs_leading_comments = settings.module == ModuleKind::CommonJs
-            && printer.import_helpers_namespace.is_some();
+            && (printer.import_helpers_namespace.is_some() || printer.automatic_jsx.any());
         if !defer_commonjs_leading_comments {
             printer.emit_leading_detached_source_comments(start);
         }
@@ -1136,16 +1140,6 @@ pub fn emit_source_file_with_context(
             }
             printer.emit_commonjs_hoisted_function_exports(&data.statements)?;
         }
-        if printer.import_helpers_namespace.is_none()
-            && let Some(start) = first_statement_start
-            && data.statements.nodes.first().is_some_and(|statement| {
-                arena
-                    .get(*statement)
-                    .is_some_and(|node| printer.statement_emits_in_place(*statement, node))
-            })
-        {
-            printer.emit_leading_source_comments(start);
-        }
     }
     if let Some(namespace) = printer.import_helpers_namespace.clone() {
         printer
@@ -1160,6 +1154,18 @@ pub fn emit_source_file_with_context(
         printer.writer.newline();
     }
     printer.emit_automatic_jsx_prelude();
+    if settings.module == ModuleKind::CommonJs
+        && is_external_module
+        && let Some(start) = first_statement_start
+        && data.statements.nodes.first().is_some_and(|statement| {
+            arena
+                .get(*statement)
+                .is_some_and(|node| printer.statement_emits_in_place(*statement, node))
+        })
+    {
+        printer.emit_reference_directives_between(0, start);
+        printer.emit_leading_source_comments(start);
+    }
     let mut previous_end = 0;
     let mut reference_owner_start = 0;
     let mut previous_emitted = false;
@@ -19307,6 +19313,11 @@ impl DeclarationPrinter<'_> {
                     self.write_source_identifier(id, &data.text);
                 }
             }
+            NodeData::JsxNamespacedName(data) => {
+                self.emit_name(data.namespace)?;
+                self.writer.write(":");
+                self.emit_name(data.name)?;
+            }
             NodeData::PrivateIdentifier(data) => self.writer.write(&data.text),
             NodeData::StringLiteral(data) => {
                 let quote = if self.canonical_literal_quotes {
@@ -22692,6 +22703,7 @@ struct Printer<'a> {
     strict_null_checks: bool,
     jsx_factory: Option<String>,
     jsx_fragment_factory: Option<String>,
+    jsx_import_source: Option<String>,
     downlevel_iteration: bool,
     context_preserves_top_of_file_reference_directive: bool,
     pending_statement_line_comments: Vec<((usize, usize), String)>,
@@ -23766,6 +23778,7 @@ impl Printer<'_> {
                 self.emit_commonjs_import_binding_exports(*statement, &data.statements)?;
             }
         }
+        self.emit_automatic_jsx_prelude();
         if let Some(first_statement) = data.statements.nodes.first()
             && let Some(node) = self.arena.get(*first_statement)
             && ((self.statement_emits_in_place(*first_statement, node)
@@ -23787,7 +23800,6 @@ impl Printer<'_> {
                 .collect::<Vec<_>>();
             self.emit_leading_source_comments_excluding(node.range.start.get(), &excluded);
         }
-        self.emit_automatic_jsx_prelude();
         let mut previous_end = data
             .statements
             .nodes
@@ -25344,17 +25356,18 @@ impl Printer<'_> {
             return;
         }
         let development = self.settings.jsx == JsxEmit::ReactJsxDev;
+        let source = self.jsx_import_source.as_deref().unwrap_or("react");
         let runtime = if development {
-            "react/jsx-dev-runtime"
+            format!("{source}/jsx-dev-runtime")
         } else {
-            "react/jsx-runtime"
+            format!("{source}/jsx-runtime")
         };
         if self.is_external_module {
             if self.commonjs_module_transform {
                 self.writer.write("const ");
                 self.writer.write(self.automatic_jsx_runtime_binding());
                 self.writer.write(" = require(");
-                write_quoted(&mut self.writer, runtime);
+                write_quoted(&mut self.writer, &runtime);
                 self.writer.write(");");
                 self.writer.newline();
             } else {
@@ -25378,7 +25391,7 @@ impl Printer<'_> {
                     self.writer.write(local);
                 }
                 self.writer.write(" } from ");
-                write_quoted(&mut self.writer, runtime);
+            write_quoted(&mut self.writer, &runtime);
                 self.writer.write(";");
                 self.writer.newline();
             }
@@ -26673,7 +26686,18 @@ impl Printer<'_> {
         {
             return Ok(());
         }
-        if matches!(node.data, NodeData::ExpressionStatement(_))
+        if matches!(
+            &node.data,
+            NodeData::ExpressionStatement(statement)
+                if !matches!(
+                    self.arena.get(statement.expression).map(|node| &node.data),
+                    Some(
+                        NodeData::JsxElement(_)
+                            | NodeData::JsxSelfClosingElement(_)
+                            | NodeData::JsxFragment(_)
+                    )
+                )
+        )
             && self.emit_recovered_namespaced_jsx_statements(id)?
         {
             return Ok(());
@@ -27365,6 +27389,20 @@ impl Printer<'_> {
                         semicolon,
                     );
                     self.writer.remove_trailing_spaces();
+                }
+                let recovered_jsx_trailing_greater = matches!(
+                    self.settings.jsx,
+                    JsxEmit::React | JsxEmit::Preserve
+                ) && usize::try_from(node.range.start.get())
+                    .ok()
+                    .zip(usize::try_from(node.range.end.get()).ok())
+                    .and_then(|(start, end)| self.source_text.get(start..end))
+                    .is_some_and(|source| {
+                        let source = source.trim_start();
+                        source.starts_with('>') || source.starts_with("<:")
+                    });
+                if recovered_jsx_trailing_greater {
+                    self.writer.write(" ");
                 }
                 self.writer.write(";");
             }
@@ -39331,7 +39369,27 @@ impl Printer<'_> {
                 _ => None,
             })
             .is_some_and(|initializer| self.expression_emits_nothing(initializer));
-        if keyword != "const" && !ends_with_missing_initializer {
+        let preserves_recovered_jsx_space = data
+            .declarations
+            .nodes
+            .last()
+            .and_then(|declaration| self.arena.get(*declaration))
+            .and_then(|node| match &node.data {
+                NodeData::VariableDeclaration(declaration) => declaration.initializer,
+                _ => None,
+            })
+            .and_then(|initializer| self.arena.get(initializer))
+            .and_then(|initializer| {
+                usize::try_from(initializer.range.start.get())
+                    .ok()
+                    .zip(usize::try_from(initializer.range.end.get()).ok())
+            })
+            .and_then(|(start, end)| self.source_text.get(start..end))
+            .is_some_and(|source| source.trim_start().starts_with("<:"));
+        if keyword != "const"
+            && !ends_with_missing_initializer
+            && !preserves_recovered_jsx_space
+        {
             self.writer.remove_trailing_spaces();
         }
         Ok(())
@@ -46753,7 +46811,10 @@ impl Printer<'_> {
         if !self.import_semantically_has_runtime_value(declaration) {
             if clause
                 .name
-                .is_some_and(|name| self.import_binding_has_emitted_runtime_use(name))
+                .is_some_and(|name| {
+                    self.import_binding_has_emitted_runtime_use(name)
+                        || self.import_binding_is_used(name)
+                })
             {
                 return true;
             }
@@ -46769,7 +46830,8 @@ impl Printer<'_> {
             return false;
         }
         if let Some(name) = clause.name
-            && self.import_binding_has_emitted_runtime_use(name)
+            && (self.import_binding_has_emitted_runtime_use(name)
+                || self.import_binding_is_used(name))
         {
             return true;
         }
@@ -47352,6 +47414,11 @@ impl Printer<'_> {
                     self.write_source_identifier(id, &data.text);
                 }
             }
+            NodeData::JsxNamespacedName(data) => {
+                self.emit_expression(data.namespace, 0)?;
+                self.writer.write(":");
+                self.emit_expression(data.name, 0)?;
+            }
             NodeData::QualifiedName(data) => self.emit_qualified_name(data)?,
             NodeData::PrivateIdentifier(data) => self.writer.write(&data.text),
             NodeData::NumericLiteral(data) => {
@@ -47579,16 +47646,34 @@ impl Printer<'_> {
                     self.writer.write("(");
                     let comment_start = node.range.start.get().saturating_add(1);
                     let expression_start = self.node(data.expression)?.range.start.get();
-                    if self.trivia_has_block_comment(comment_start, expression_start) {
+                    let has_leading_line_comment = usize::try_from(comment_start)
+                        .ok()
+                        .zip(usize::try_from(expression_start).ok())
+                        .and_then(|(start, end)| self.source_text.get(start..end))
+                        .is_some_and(|trivia| trivia.contains("//"));
+                    if has_leading_line_comment {
+                        self.writer.indent += 1;
+                        self.emit_source_comments_between_with_trailing(
+                            comment_start,
+                            expression_start,
+                            false,
+                        );
+                    } else if self.trivia_has_block_comment(comment_start, expression_start) {
                         self.emit_block_comment_trivia(comment_start, expression_start, false);
                     }
                     self.emit_expression(data.expression, 0)?;
+                    if has_leading_line_comment {
+                        self.writer.indent -= 1;
+                    }
                     self.emit_binary_comment_trivia(
                         self.node(data.expression)?.range.end.get(),
                         node.range.end.get().saturating_sub(1),
                     );
                     self.writer.remove_trailing_spaces();
+                    let indent_closing = !has_leading_line_comment && self.writer.line_start;
+                    self.writer.indent += usize::from(indent_closing);
                     self.writer.write(")");
+                    self.writer.indent -= usize::from(indent_closing);
                 }
             }
             NodeData::BinaryExpression(_) => {
@@ -48807,7 +48892,15 @@ impl Printer<'_> {
                 if self.settings.target < ScriptTarget::Es2015 {
                     self.emit_downlevel_tagged_template(id, data)?;
                 } else {
+                    let unbound_receiver = self.commonjs_module_transform
+                        && self.commonjs_call_requires_unbound_receiver(data.tag);
+                    if unbound_receiver {
+                        self.writer.write("(0, ");
+                    }
                     self.emit_expression(data.tag, 18)?;
+                    if unbound_receiver {
+                        self.writer.write(")");
+                    }
                     if self.source_is_javascript_input()
                         && let Some(type_arguments) = &data.type_arguments
                     {
@@ -49064,6 +49157,9 @@ impl Printer<'_> {
         &mut self,
         data: &ts_ast::JsxSelfClosingElementData,
     ) -> Result<(), EmitError> {
+        if self.jsx_self_closing_starts_with_colon(data) {
+            return self.emit_leading_colon_jsx_recovery(data);
+        }
         if matches!(
             self.settings.jsx,
             JsxEmit::None | JsxEmit::Preserve | JsxEmit::ReactNative
@@ -49102,20 +49198,7 @@ impl Printer<'_> {
                 && self
                     .arena
                     .get(data.attributes)
-                    .is_some_and(|node| matches!(&node.data, NodeData::JsxAttributes(attributes) if attributes.properties.nodes.is_empty()))
-                && self
-                    .arena
-                    .get(data.tag_name)
-                    .and_then(|node| node.parent)
-                    .and_then(|node| self.arena.get(node))
-                    .and_then(|node| {
-                        usize::try_from(node.range.start.get())
-                            .ok()
-                            .zip(usize::try_from(node.range.end.get()).ok())
-                    })
-                    .and_then(|(start, end)| self.source_text.get(start..end))
-                    .and_then(|source| source.strip_suffix("/>"))
-                    .is_some_and(|source| source.ends_with(char::is_whitespace));
+                    .is_some_and(|node| matches!(&node.data, NodeData::JsxAttributes(attributes) if attributes.properties.nodes.is_empty()));
             if preserve_empty_attribute_space {
                 self.writer.write(" ");
             }
@@ -49149,6 +49232,61 @@ impl Printer<'_> {
         }
     }
 
+    fn jsx_self_closing_starts_with_colon(
+        &self,
+        data: &ts_ast::JsxSelfClosingElementData,
+    ) -> bool {
+        self.arena
+            .get(data.tag_name)
+            .and_then(|node| node.parent)
+            .and_then(|element| self.arena.get(element))
+            .and_then(|element| {
+                usize::try_from(element.range.start.get())
+                    .ok()
+                    .zip(usize::try_from(element.range.end.get()).ok())
+            })
+            .and_then(|(start, end)| self.source_text.get(start..end))
+            .is_some_and(|source| source.starts_with("<:"))
+    }
+
+    fn emit_leading_colon_jsx_recovery(
+        &mut self,
+        data: &ts_ast::JsxSelfClosingElementData,
+    ) -> Result<(), EmitError> {
+        self.writer.write(" < , ");
+        if let Some(NodeData::JsxNamespacedName(name)) =
+            self.arena.get(data.tag_name).map(|node| &node.data)
+        {
+            self.emit_expression(name.name, 0)?;
+        }
+        let Some(NodeData::JsxAttributes(attributes)) =
+            self.arena.get(data.attributes).map(|node| &node.data)
+        else {
+            return Err(Self::unsupported(data.attributes, SyntaxKind::JsxAttributes));
+        };
+        for attribute in &attributes.properties.nodes {
+            let Some(NodeData::JsxAttribute(attribute)) =
+                self.arena.get(*attribute).map(|node| &node.data)
+            else {
+                continue;
+            };
+            self.writer.write(", ");
+            self.emit_preserved_jsx_name_source(attribute.name)?;
+            self.writer.write(" = { ");
+            if let Some(NodeData::JsxExpression(expression)) = attribute
+                .initializer
+                .and_then(|initializer| self.arena.get(initializer))
+                .map(|node| &node.data)
+                && let Some(expression) = expression.expression
+            {
+                self.emit_expression(expression, 0)?;
+            }
+            self.writer.write(":  }");
+        }
+        self.writer.write(" /  > ");
+        Ok(())
+    }
+
     fn emit_jsx_fragment(&mut self, data: &ts_ast::JsxFragmentData) -> Result<(), EmitError> {
         if matches!(
             self.settings.jsx,
@@ -49176,7 +49314,16 @@ impl Printer<'_> {
             self.writer.write(&fragment);
             self.writer.write(", null");
             let children = semantic_jsx_children(self.arena, &data.children);
-            let multiline = children.len() > 1;
+            let multiline_child = children.len() == 1
+                && matches!(
+                    self.arena.get(children[0]).map(|node| &node.data),
+                    Some(
+                        NodeData::JsxElement(_)
+                            | NodeData::JsxSelfClosingElement(_)
+                            | NodeData::JsxFragment(_)
+                    )
+                );
+            let multiline = children.len() > 1 || multiline_child;
             self.writer.indent += usize::from(multiline);
             for child in children {
                 self.writer.write(",");
@@ -49213,6 +49360,8 @@ impl Printer<'_> {
         let tag = self.node(tag_name)?.clone();
         if let Some((name, _)) = &recovered_tag {
             write_quoted(&mut self.writer, name);
+        } else if let Some(name) = self.jsx_namespaced_name_text(tag_name) {
+            write_quoted(&mut self.writer, &name);
         } else if let NodeData::Identifier(identifier) = &tag.data
             && identifier
                 .text
@@ -49266,6 +49415,18 @@ impl Printer<'_> {
 
     fn emit_preserved_jsx_tag_name(&mut self, tag_name: NodeId) -> Result<(), EmitError> {
         let node = self.node(tag_name)?;
+        if let Some(name) = self.jsx_namespaced_name_text(tag_name) {
+            self.writer.write(&name);
+            return Ok(());
+        }
+        if matches!(node.data, NodeData::Identifier(_) | NodeData::PropertyAccessExpression(_)) {
+            return self.emit_expression(tag_name, 0);
+        }
+        self.emit_preserved_jsx_name_source(tag_name)
+    }
+
+    fn emit_preserved_jsx_name_source(&mut self, name: NodeId) -> Result<(), EmitError> {
+        let node = self.node(name)?;
         let start = usize::try_from(node.range.start.get()).unwrap_or(usize::MAX);
         let end = usize::try_from(node.range.end.get()).unwrap_or(usize::MAX);
         let source = self.source_text.get(start..end).unwrap_or_default().trim();
@@ -49525,7 +49686,9 @@ impl Printer<'_> {
 
     fn emit_jsx_tag(&mut self, tag_name: NodeId) -> Result<(), EmitError> {
         let tag = self.node(tag_name)?.clone();
-        if let NodeData::Identifier(identifier) = &tag.data
+        if let Some(name) = self.jsx_namespaced_name_text(tag_name) {
+            write_quoted(&mut self.writer, &name);
+        } else if let NodeData::Identifier(identifier) = &tag.data
             && identifier
                 .text
                 .chars()
@@ -49624,7 +49787,9 @@ impl Printer<'_> {
         };
         let node = self.node(initializer)?.clone();
         match &node.data {
-            NodeData::StringLiteral(value) => write_quoted(&mut self.writer, &value.text),
+            NodeData::StringLiteral(value) => {
+                self.write_jsx_attribute_string(initializer, &value.text, false);
+            }
             NodeData::JsxExpression(value) => {
                 if let Some(expression) = value
                     .expression
@@ -49736,13 +49901,17 @@ impl Printer<'_> {
                 match &node.data {
                     NodeData::JsxAttribute(attribute) => {
                         self.writer.write(" ");
-                        self.emit_expression(attribute.name, 0)?;
+                        self.emit_preserved_jsx_name_source(attribute.name)?;
                         if let Some(initializer) = attribute.initializer {
                             self.writer.write("=");
                             let initializer_node = self.node(initializer)?.clone();
                             match &initializer_node.data {
                                 NodeData::StringLiteral(value) => {
-                                    write_quoted(&mut self.writer, &value.text);
+                                    self.write_jsx_attribute_string(
+                                        initializer,
+                                        &value.text,
+                                        true,
+                                    );
                                 }
                                 NodeData::JsxExpression(value) => {
                                     self.writer.write("{");
@@ -49772,6 +49941,26 @@ impl Printer<'_> {
         }
         if properties.is_empty() {
             self.writer.write("null");
+            return Ok(());
+        }
+        let has_spread = properties.iter().any(|attribute| {
+            matches!(
+                self.arena.get(*attribute).map(|node| &node.data),
+                Some(NodeData::JsxSpreadAttribute(_))
+            )
+        });
+        let spreads_are_object_literals = properties.iter().all(|attribute| {
+            match self.arena.get(*attribute).map(|node| &node.data) {
+                Some(NodeData::JsxSpreadAttribute(spread)) => matches!(
+                    self.arena.get(spread.expression).map(|node| &node.data),
+                    Some(NodeData::ObjectLiteralExpression(_))
+                ),
+                Some(NodeData::JsxAttribute(_)) => true,
+                _ => false,
+            }
+        });
+        if has_spread && spreads_are_object_literals {
+            self.emit_flattened_jsx_attribute_object(&properties)?;
             return Ok(());
         }
         if self.settings.target < ScriptTarget::Es2018
@@ -49838,7 +50027,9 @@ impl Printer<'_> {
             if let Some(initializer) = attribute.initializer {
                 let initializer_node = self.node(initializer)?.clone();
                 match &initializer_node.data {
-                    NodeData::StringLiteral(value) => write_quoted(&mut self.writer, &value.text),
+                    NodeData::StringLiteral(value) => {
+                        self.write_jsx_attribute_string(initializer, &value.text, false);
+                    }
                     NodeData::JsxExpression(value) => {
                         if let Some(expression) = value
                             .expression
@@ -49853,6 +50044,90 @@ impl Printer<'_> {
                 }
             } else {
                 self.writer.write("true");
+            }
+        }
+        self.writer.write(" }");
+        Ok(())
+    }
+
+    fn emit_flattened_jsx_attribute_object(
+        &mut self,
+        attributes: &[NodeId],
+    ) -> Result<(), EmitError> {
+        self.writer.write("{ ");
+        let mut wrote = false;
+        for attribute in attributes {
+            let node = self.node(*attribute)?.clone();
+            match &node.data {
+                NodeData::JsxAttribute(attribute) => {
+                    if wrote {
+                        self.writer.write(", ");
+                    }
+                    self.emit_jsx_attribute_property_name(attribute.name)?;
+                    self.writer.write(": ");
+                    self.emit_jsx_attribute_initializer(attribute.initializer)?;
+                    wrote = true;
+                }
+                NodeData::JsxSpreadAttribute(spread) => {
+                    let Some(NodeData::ObjectLiteralExpression(object)) = self
+                        .arena
+                        .get(spread.expression)
+                        .map(|node| &node.data)
+                    else {
+                        return Err(Self::unsupported(spread.expression, SyntaxKind::Unknown));
+                    };
+                    for property in &object.properties.nodes {
+                        if wrote {
+                            self.writer.write(", ");
+                        }
+                        wrote = true;
+                        let property_node = self.node(*property)?.clone();
+                        match &property_node.data {
+                            NodeData::PropertyAssignment(property) => {
+                                self.emit_object_literal_property_name(property.name)?;
+                                self.writer.write(": ");
+                                self.emit_expression(property.initializer, 1)?;
+                            }
+                            NodeData::MethodDeclaration(method) if method.body.is_some() => {
+                                self.emit_expression(method.name, 0)?;
+                                self.emit_parameters(&method.parameters)?;
+                                self.writer.write(" ");
+                                self.emit_function_body(method.body.expect("body checked above"))?;
+                            }
+                            NodeData::GetAccessorDeclaration(accessor) => {
+                                self.writer.write("get ");
+                                self.emit_expression(accessor.name, 0)?;
+                                self.emit_parameters(&accessor.parameters)?;
+                                self.writer.write(" ");
+                                self.emit_accessor_body(accessor.body)?;
+                            }
+                            NodeData::SetAccessorDeclaration(accessor) => {
+                                self.writer.write("set ");
+                                self.emit_expression(accessor.name, 0)?;
+                                self.emit_parameters(&accessor.parameters)?;
+                                self.writer.write(" ");
+                                if let Some(body) = accessor.body {
+                                    if let Some(NodeData::Block(block)) =
+                                        self.arena.get(body).map(|node| &node.data)
+                                        && block.statements.nodes.len() == 1
+                                    {
+                                        let statement = block.statements.nodes[0];
+                                        self.writer.write("{ ");
+                                        self.emit_statement(statement)?;
+                                        self.writer.remove_trailing_newline();
+                                        self.writer.write(" }");
+                                    } else {
+                                        self.emit_function_body(body)?;
+                                    }
+                                } else {
+                                    self.writer.write("{ }");
+                                }
+                            }
+                            _ => return Err(Self::unsupported(*property, property_node.kind)),
+                        }
+                    }
+                }
+                _ => return Err(Self::unsupported(*attribute, node.kind)),
             }
         }
         self.writer.write(" }");
@@ -49878,6 +50153,10 @@ impl Printer<'_> {
     }
 
     fn emit_jsx_attribute_property_name(&mut self, name: NodeId) -> Result<(), EmitError> {
+        if let Some(name) = self.jsx_namespaced_name_text(name) {
+            write_quoted(&mut self.writer, &name);
+            return Ok(());
+        }
         if let Some(text) = declaration_name_text(self.arena, name)
             && !is_identifier_text(text)
         {
@@ -49885,6 +50164,37 @@ impl Printer<'_> {
             return Ok(());
         }
         self.emit_expression(name, 0)
+    }
+
+    fn write_jsx_attribute_string(&mut self, id: NodeId, text: &str, preserve: bool) {
+        let raw = self.arena.get(id).and_then(|node| {
+            usize::try_from(node.range.start.get())
+                .ok()
+                .zip(usize::try_from(node.range.end.get()).ok())
+                .and_then(|(start, end)| self.source_text.get(start..end))
+        });
+        if preserve
+            && let Some(raw) = raw
+        {
+            self.writer.write(raw);
+            return;
+        }
+        let quote = raw
+            .and_then(|raw| raw.chars().next())
+            .filter(|quote| matches!(quote, '\'' | '"'))
+            .unwrap_or('"');
+        write_quoted_with(&mut self.writer, text, quote);
+    }
+
+    fn jsx_namespaced_name_text(&self, name: NodeId) -> Option<String> {
+        let NodeData::JsxNamespacedName(name) = &self.arena.get(name)?.data else {
+            return None;
+        };
+        Some(format!(
+            "{}:{}",
+            declaration_name_text(self.arena, name.namespace)?,
+            declaration_name_text(self.arena, name.name)?,
+        ))
     }
 
     fn emit_jsx_child(&mut self, id: NodeId, preserve: bool) -> Result<(), EmitError> {
@@ -52197,6 +52507,9 @@ fn semantic_jsx_children(arena: &NodeArena, children: &NodeList) -> Vec<NodeId> 
 }
 
 fn source_basename(path: &str) -> &str {
+    if path.starts_with('/') && !path.starts_with("/case/") {
+        return path;
+    }
     path.rsplit(['/', '\\']).next().unwrap_or(path)
 }
 
@@ -53316,6 +53629,7 @@ mod tests {
                 force_use_strict: false,
                 jsx_factory: None,
                 jsx_fragment_factory: None,
+                jsx_import_source: None,
                 downlevel_iteration: false,
                 module_detection: ModuleDetectionKind::Auto,
             },
@@ -53449,6 +53763,7 @@ mod tests {
                 force_use_strict: false,
                 jsx_factory: None,
                 jsx_fragment_factory: None,
+                jsx_import_source: None,
                 downlevel_iteration: false,
                 module_detection: ModuleDetectionKind::Auto,
             },
@@ -55218,6 +55533,7 @@ mod tests {
                 force_use_strict: false,
                 jsx_factory: None,
                 jsx_fragment_factory: None,
+                jsx_import_source: None,
                 downlevel_iteration: false,
                 module_detection: ModuleDetectionKind::Auto,
             },
@@ -55746,6 +56062,7 @@ mod tests {
                     force_use_strict: false,
                     jsx_factory: None,
                     jsx_fragment_factory: None,
+                    jsx_import_source: None,
                     downlevel_iteration: false,
                     module_detection: ModuleDetectionKind::Auto,
                 },
@@ -57952,6 +58269,7 @@ class Board {
                 force_use_strict: false,
                 jsx_factory: None,
                 jsx_fragment_factory: None,
+                jsx_import_source: None,
                 downlevel_iteration: false,
                 module_detection: ModuleDetectionKind::Auto,
             },

@@ -128,6 +128,7 @@ pub struct CompilerOptions {
     pub jsx: JsxEmit,
     pub jsx_factory: Option<String>,
     pub jsx_fragment_factory: Option<String>,
+    pub jsx_import_source: Option<String>,
     pub react_namespace: Option<String>,
     pub resolve_json_module: bool,
     pub source_map: bool,
@@ -198,6 +199,7 @@ impl Default for CompilerOptions {
             jsx: JsxEmit::None,
             jsx_factory: None,
             jsx_fragment_factory: None,
+            jsx_import_source: None,
             react_namespace: None,
             resolve_json_module: false,
             source_map: false,
@@ -311,6 +313,9 @@ impl CompilerOptions {
                 "jsxfragmentfactory" => self
                     .jsx_fragment_factory
                     .clone_from(&overrides.jsx_fragment_factory),
+                "jsximportsource" => self
+                    .jsx_import_source
+                    .clone_from(&overrides.jsx_import_source),
                 "reactnamespace" => self.react_namespace.clone_from(&overrides.react_namespace),
                 "module" => {
                     self.module = overrides.module;
@@ -643,6 +648,9 @@ pub fn parse_compiler_options_map(options: &BTreeMap<String, JsonValue>) -> Pars
             "jsxfragmentfactory" => {
                 parsed.jsx_fragment_factory = string(original_name, value, &mut diagnostics);
             }
+            "jsximportsource" => {
+                parsed.jsx_import_source = string(original_name, value, &mut diagnostics);
+            }
             "reactnamespace" => {
                 parsed.react_namespace = string(original_name, value, &mut diagnostics);
             }
@@ -705,6 +713,7 @@ struct PartialOptions {
     jsx: Option<JsxEmit>,
     jsx_factory: Option<String>,
     jsx_fragment_factory: Option<String>,
+    jsx_import_source: Option<String>,
     react_namespace: Option<String>,
     resolve_json_module: Option<bool>,
     source_map: Option<bool>,
@@ -796,6 +805,7 @@ impl PartialOptions {
             jsx: self.jsx.unwrap_or_default(),
             jsx_factory: self.jsx_factory,
             jsx_fragment_factory: self.jsx_fragment_factory,
+            jsx_import_source: self.jsx_import_source,
             react_namespace: self.react_namespace,
             resolve_json_module: self.resolve_json_module.unwrap_or(false),
             source_map: self.source_map.unwrap_or(false),

@@ -99,6 +99,50 @@ fn is_valid_jsx_factory_expression(value: &str, allow_null: bool) -> bool {
         })
 }
 
+fn source_jsx_pragma_value<'a>(source: &'a str, pragma: &str) -> Option<&'a str> {
+    source
+        .match_indices(pragma)
+        .filter_map(|(start, _)| {
+            source[start + pragma.len()..]
+                .trim_start_matches([' ', '\t', ':'])
+                .split(|character: char| character.is_whitespace() || character == '*')
+                .next()
+                .filter(|value| !value.is_empty())
+        })
+        .last()
+}
+
+fn source_printer_settings(mut settings: PrinterSettings, source: &str) -> PrinterSettings {
+    if settings.jsx == ts_options::JsxEmit::React
+        && source_jsx_pragma_value(source, "@jsxImportSource").is_some()
+    {
+        settings.jsx = ts_options::JsxEmit::ReactJsx;
+    }
+    match source_jsx_pragma_value(source, "@jsxRuntime") {
+        Some("classic")
+            if matches!(
+                settings.jsx,
+                ts_options::JsxEmit::ReactJsx | ts_options::JsxEmit::ReactJsxDev
+            ) =>
+        {
+            settings.jsx = ts_options::JsxEmit::React;
+        }
+        Some("automatic") => {
+            if !matches!(
+                settings.jsx,
+                ts_options::JsxEmit::Preserve
+                    | ts_options::JsxEmit::ReactNative
+                    | ts_options::JsxEmit::None
+                    | ts_options::JsxEmit::ReactJsxDev
+            ) {
+                settings.jsx = ts_options::JsxEmit::ReactJsx;
+            }
+        }
+        _ => {}
+    }
+    settings
+}
+
 fn source_shebang(source: &SourceFile) -> Option<&str> {
     let text = source
         .source_text
@@ -208,6 +252,20 @@ impl Program {
         current_directory: &str,
         root_names: &[String],
     ) -> Self {
+        Self::new_unchecked_with_options(
+            file_system,
+            current_directory,
+            root_names,
+            CompilerOptions::default(),
+        )
+    }
+
+    fn new_unchecked_with_options(
+        file_system: &dyn FileSystem,
+        current_directory: &str,
+        root_names: &[String],
+        options: CompilerOptions,
+    ) -> Self {
         let case_sensitivity = if file_system.use_case_sensitive_file_names() {
             CaseSensitivity::Sensitive
         } else {
@@ -217,6 +275,7 @@ impl Program {
         let mut program = Self {
             current_directory: current_directory.clone(),
             case_sensitivity,
+            options,
             ..Self::default()
         };
         for root_name in root_names {
@@ -327,8 +386,12 @@ impl Program {
         root_names: &[String],
         options: CompilerOptions,
     ) -> Self {
-        let mut program = Self::new_unchecked(file_system, current_directory, root_names);
-        program.options = options;
+        let mut program = Self::new_unchecked_with_options(
+            file_system,
+            current_directory,
+            root_names,
+            options,
+        );
         if program.options.emit_declaration_only
             && !program.options.declaration
             && !program.options.composite
@@ -567,7 +630,8 @@ impl Program {
                 .as_deref()
                 .is_some_and(|file_name| self.output_overwrites_input(file_name));
             if settings.emit_javascript && !javascript_output_overwrites_input {
-                let mut source_settings = settings;
+                let mut source_settings =
+                    source_printer_settings(settings, &source_file.source_text);
                 let lower_file_name = source_file.file_name.to_ascii_lowercase();
                 let fixed_es_module = [".mts", ".mjs"]
                     .iter()
@@ -609,7 +673,12 @@ impl Program {
                 let preserve_const_enums = self.options.preserve_const_enums
                     || self.options.isolated_modules
                     || self.options.verbatim_module_syntax;
-                let import_runtime_meanings = import_runtime_meanings_for_emit(
+                let jsx_import_source = source_jsx_pragma_value(
+                    &source_file.source_text,
+                    "@jsxImportSource",
+                )
+                .or(self.options.jsx_import_source.as_deref());
+                let mut import_runtime_meanings = import_runtime_meanings_for_emit(
                     source_file,
                     preserve_const_enums,
                     source_settings.module == ModuleKind::Amd,
@@ -617,6 +686,24 @@ impl Program {
                         self.source_files.iter().skip(source_index + 1),
                     ),
                 );
+                if matches!(
+                    source_settings.jsx,
+                    ts_options::JsxEmit::React | ts_options::JsxEmit::Preserve
+                ) && source_file.parse.arena.iter().any(|(_, node)| {
+                    matches!(
+                        node.data,
+                        NodeData::JsxElement(_)
+                            | NodeData::JsxSelfClosingElement(_)
+                            | NodeData::JsxFragment(_)
+                    )
+                })
+                {
+                    preserve_classic_jsx_factory_import(
+                        source_file,
+                        &mut import_runtime_meanings,
+                        jsx_factory.as_deref().unwrap_or("React.createElement"),
+                    );
+                }
                 let preserve_top_of_file_reference_directive =
                     self.source_has_resolved_path_reference(source_file);
                 let emit_context = EmitContext {
@@ -651,6 +738,7 @@ impl Program {
                     force_use_strict: fixed_es_module && settings.module == ModuleKind::CommonJs,
                     jsx_factory: jsx_factory.as_deref(),
                     jsx_fragment_factory,
+                    jsx_import_source,
                     downlevel_iteration: self.options.downlevel_iteration,
                     module_detection: self.options.module_detection,
                 };
@@ -937,7 +1025,7 @@ impl Program {
                 let generated_line =
                     u32::try_from(code.bytes().filter(|byte| *byte == b'\n').count())
                         .unwrap_or(u32::MAX);
-                let mut source_settings = settings;
+                let mut source_settings = source_printer_settings(settings, &source.source_text);
                 source_settings.source_map = settings.source_map;
                 source_settings.inline_source_map = false;
                 source_settings.always_strict = false;
@@ -969,7 +1057,12 @@ impl Program {
                 let preserve_const_enums = self.options.preserve_const_enums
                     || self.options.isolated_modules
                     || self.options.verbatim_module_syntax;
-                let import_runtime_meanings = import_runtime_meanings_for_emit(
+                let jsx_import_source = source_jsx_pragma_value(
+                    &source.source_text,
+                    "@jsxImportSource",
+                )
+                .or(self.options.jsx_import_source.as_deref());
+                let mut import_runtime_meanings = import_runtime_meanings_for_emit(
                     source,
                     preserve_const_enums,
                     settings.module == ModuleKind::Amd,
@@ -977,6 +1070,24 @@ impl Program {
                         sources.iter().skip(source_index + 1).copied(),
                     ),
                 );
+                if matches!(
+                    source_settings.jsx,
+                    ts_options::JsxEmit::React | ts_options::JsxEmit::Preserve
+                ) && source.parse.arena.iter().any(|(_, node)| {
+                    matches!(
+                        node.data,
+                        NodeData::JsxElement(_)
+                            | NodeData::JsxSelfClosingElement(_)
+                            | NodeData::JsxFragment(_)
+                    )
+                })
+                {
+                    preserve_classic_jsx_factory_import(
+                        source,
+                        &mut import_runtime_meanings,
+                        jsx_factory.as_deref().unwrap_or("React.createElement"),
+                    );
+                }
                 let emit_context = EmitContext {
                     bindings: &source.binding,
                     amd_module_name: amd_module_name.as_deref(),
@@ -1010,6 +1121,7 @@ impl Program {
                     force_use_strict: false,
                     jsx_factory: jsx_factory.as_deref(),
                     jsx_fragment_factory,
+                    jsx_import_source,
                     downlevel_iteration: self.options.downlevel_iteration,
                     module_detection: self.options.module_detection,
                 };
@@ -1999,7 +2111,12 @@ impl Program {
             return;
         };
         let is_jsx = Path::new(file_name).extension().is_some_and(|extension| {
-            extension.eq_ignore_ascii_case("tsx") || extension.eq_ignore_ascii_case("jsx")
+            extension.eq_ignore_ascii_case("tsx")
+                || extension.eq_ignore_ascii_case("jsx")
+                || (self.options.jsx != ts_options::JsxEmit::None
+                    && ["js", "mjs", "cjs"]
+                        .iter()
+                        .any(|candidate| extension.eq_ignore_ascii_case(candidate)))
         });
         let parse = if is_jsx {
             parse_jsx_source_file(&source_text)
@@ -4102,6 +4219,63 @@ fn import_declaration_binds_const_enum(
                     }
                 })
         })
+}
+
+fn preserve_classic_jsx_factory_import(
+    source: &SourceFile,
+    meanings: &mut BTreeMap<NodeId, bool>,
+    factory: &str,
+) {
+    let Some(factory_root) = factory.split('.').next() else {
+        return;
+    };
+    let Some(NodeData::SourceFile(file)) = source
+        .parse
+        .arena
+        .get(source.parse.source_file)
+        .map(|node| &node.data)
+    else {
+        return;
+    };
+    for statement in &file.statements.nodes {
+        let Some(NodeData::ImportDeclaration(import)) =
+            source.parse.arena.get(*statement).map(|node| &node.data)
+        else {
+            continue;
+        };
+        let Some(NodeData::ImportClause(clause)) = import
+            .import_clause
+            .and_then(|clause| source.parse.arena.get(clause))
+            .map(|node| &node.data)
+        else {
+            continue;
+        };
+        let binds_factory = clause
+            .name
+            .and_then(|name| identifier_text(&source.parse.arena, name))
+            == Some(factory_root)
+            || clause.named_bindings.is_some_and(|bindings| {
+                match source.parse.arena.get(bindings).map(|node| &node.data) {
+                    Some(NodeData::NamespaceImport(namespace)) => {
+                        identifier_text(&source.parse.arena, namespace.name) == Some(factory_root)
+                    }
+                    Some(NodeData::NamedImports(imports)) => imports.elements.nodes.iter().any(
+                        |specifier| {
+                            matches!(
+                                source.parse.arena.get(*specifier).map(|node| &node.data),
+                                Some(NodeData::ImportSpecifier(specifier))
+                                    if identifier_text(&source.parse.arena, specifier.name)
+                                        == Some(factory_root)
+                            )
+                        },
+                    ),
+                    _ => false,
+                }
+            });
+        if binds_factory {
+            meanings.insert(*statement, true);
+        }
+    }
 }
 
 fn import_equals_name<'a>(
