@@ -191,7 +191,7 @@ fn reports_compilation_diagnostic_for_missing_emitted_section() {
 }
 
 #[test]
-fn prioritizes_emit_diagnostic_for_unsupported_output() {
+fn reports_output_mismatch_after_delete_expression_support() {
     let repository = TestRepository::new();
     repository.write_case(
         "unsupported",
@@ -206,9 +206,9 @@ fn prioritizes_emit_diagnostic_for_unsupported_output() {
     let output = run(&repository.0, &[]);
     assert_eq!(output.status.code(), Some(1));
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("diagnostic no code /case/unsupported.ts"));
-    assert!(stdout.contains("unsupported DeleteExpression node"));
-    assert!(stdout.contains("diagnostics=1"));
+    assert!(stdout.contains("MISMATCH tests/cases/compiler/unsupported.ts"));
+    assert!(stdout.contains("section unsupported.js differs at line 1"));
+    assert!(stdout.contains("diagnostics=0"));
 }
 
 #[test]

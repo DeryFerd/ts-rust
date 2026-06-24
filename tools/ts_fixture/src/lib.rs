@@ -875,6 +875,15 @@ fn fixture_compiler_options(case: &Case, variant: &OptionVariant) -> ts_options:
     if !has_explicit_target {
         options.target = ts_options::ScriptTarget::Es2025;
     }
+    if options.target == ts_options::ScriptTarget::Es3
+        && case
+            .directive_values("typeScriptVersion")
+            .filter_map(|version| version.split('.').next())
+            .filter_map(|major| major.parse::<u32>().ok())
+            .any(|major| major >= 5)
+    {
+        options.target = ts_options::ScriptTarget::Es2025;
+    }
     if !has_explicit_module && options.target < ts_options::ScriptTarget::Es2015 {
         options.module = ts_options::ModuleKind::CommonJs;
     }

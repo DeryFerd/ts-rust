@@ -588,6 +588,7 @@ impl<'a> Parser<'a> {
                 self.parse_module_declaration()
             }
             SyntaxKind::AtToken => self.parse_decorated_statement(),
+            SyntaxKind::DefaultKeyword => self.parse_modified_statement(),
             SyntaxKind::AbstractKeyword if abstract_starts_expression => {
                 self.parse_expression_statement()
             }
@@ -3220,7 +3221,10 @@ impl<'a> Parser<'a> {
         let mut modifiers = Vec::new();
         while matches!(
             self.current.kind,
-            SyntaxKind::DeclareKeyword | SyntaxKind::AbstractKeyword | SyntaxKind::AsyncKeyword
+            SyntaxKind::DeclareKeyword
+                | SyntaxKind::AbstractKeyword
+                | SyntaxKind::AsyncKeyword
+                | SyntaxKind::DefaultKeyword
         ) {
             modifiers.push(self.consume_token_node());
         }
@@ -3513,7 +3517,7 @@ impl<'a> Parser<'a> {
     fn parse_entity_name(&mut self) -> NodeId {
         let mut entity = if matches!(
             self.current.kind,
-            SyntaxKind::UndefinedKeyword | SyntaxKind::ThisKeyword
+            SyntaxKind::DefaultKeyword | SyntaxKind::UndefinedKeyword | SyntaxKind::ThisKeyword
         ) || is_contextual_keyword(self.current.kind)
         {
             self.parse_identifier_name("Expected a module reference.")

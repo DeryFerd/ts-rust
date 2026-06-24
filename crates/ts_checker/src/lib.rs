@@ -809,6 +809,17 @@ impl<'a> ProgramChecker<'a> {
                 let descriptor = (name == "export=")
                     .then(|| Self::describe_value_symbol(source, symbol))
                     .flatten()
+                    .or_else(|| {
+                        source
+                            .bindings
+                            .symbols
+                            .get(symbol)
+                            .is_some_and(|symbol| {
+                                symbol.flags.contains(ts_binder::SymbolFlags::CLASS)
+                            })
+                            .then(|| Self::describe_namespace_member_value(source, symbol))
+                            .flatten()
+                    })
                     .or_else(|| Self::describe_symbol(source, result, symbol));
                 descriptor.map(|descriptor| (name, descriptor))
             })
@@ -816,8 +827,11 @@ impl<'a> ProgramChecker<'a> {
         let local_export_renames = export_symbols
             .iter()
             .filter_map(|(exported, symbol)| {
-                let target = source.bindings.symbols.get(*symbol)?.target?;
-                let local = &source.bindings.symbols.get(target)?.name;
+                let symbol = source.bindings.symbols.get(*symbol)?;
+                let local = symbol
+                    .target
+                    .and_then(|target| source.bindings.symbols.get(target))
+                    .map_or(&symbol.name, |target| &target.name);
                 (local != exported).then(|| (local.clone(), exported.clone()))
             })
             .collect::<BTreeMap<_, _>>();
@@ -1251,7 +1265,7 @@ impl<'a> ProgramChecker<'a> {
                 .types
                 .intersection([constructor, static_type])
         };
-        Some(describe_type(&checker.result.types, value_type))
+        Some(describe_checked_type(&checker.result, value_type))
     }
 
     fn describe_namespace_member_value(
@@ -2069,7 +2083,9 @@ impl<'a> ProgramChecker<'a> {
                     .or_else(|| source.bindings.node_symbols.get(&namespace.name))
             {
                 let mut qualified_exports = module_exports;
+                let export_context = qualified_exports.clone();
                 for descriptor in qualified_exports.values_mut() {
+                    paint_exported_named_descriptor_imports(descriptor, specifier, &export_context);
                     if let Some((source_path, target_path)) = rebase_paths
                         && !specifier.starts_with('.')
                         && target_path.contains("/node_modules/")
@@ -2993,14 +3009,78 @@ impl<'a> Checker<'a> {
                             .symbol_types
                             .insert(symbol.id, self.result.types.any());
                         self.class_value_stack.push(symbol.id);
+                        let instance_members = data
+                            .members
+                            .nodes
+                            .iter()
+                            .filter(|member| {
+                                self.member_modifier(**member, SyntaxKind::StaticKeyword)
+                                    .is_none()
+                            })
+                            .copied()
+                            .collect::<Vec<_>>();
                         let instance_type = self.declared_object_type(
                             data.type_parameters.as_ref(),
                             data.heritage_clauses.as_ref(),
-                            &data.members.nodes,
+                            &instance_members,
                             &[],
                         );
-                        symbol_type = Some(instance_type);
                         self.class_value_stack.pop();
+                        self.result.symbol_types.insert(symbol.id, instance_type);
+                        let static_members = data
+                            .members
+                            .nodes
+                            .iter()
+                            .filter(|member| {
+                                self.member_modifier(**member, SyntaxKind::StaticKeyword)
+                                    .is_some()
+                                    && !matches!(
+                                        self.arena.get(**member).map(|node| &node.data),
+                                        Some(
+                                            NodeData::MethodDeclaration(_)
+                                                | NodeData::MethodSignatureDeclaration(_)
+                                        )
+                                    )
+                            })
+                            .copied()
+                            .collect::<Vec<_>>();
+                        if !static_members.is_empty() {
+                            let static_type = self.object_type_from_members(&static_members);
+                            if let Some(TypeKind::Object(static_object)) = self
+                                .result
+                                .types
+                                .get(static_type)
+                                .map(|type_| type_.kind.clone())
+                                && let Some(TypeKind::Object(instance)) = self
+                                    .result
+                                    .types
+                                    .types
+                                    .get_mut(instance_type.index())
+                                    .map(|type_| &mut type_.kind)
+                            {
+                                instance.properties.extend(static_object.properties);
+                                instance.property_order.extend(static_object.property_order);
+                                instance
+                                    .numeric_properties
+                                    .extend(static_object.numeric_properties);
+                                instance
+                                    .optional_properties
+                                    .extend(static_object.optional_properties);
+                                instance
+                                    .readonly_properties
+                                    .extend(static_object.readonly_properties);
+                                instance
+                                    .getter_properties
+                                    .extend(static_object.getter_properties);
+                                instance
+                                    .setter_properties
+                                    .extend(static_object.setter_properties);
+                                instance
+                                    .setter_property_types
+                                    .extend(static_object.setter_property_types);
+                            }
+                        }
+                        symbol_type = Some(instance_type);
                         break;
                     }
                     NodeData::InterfaceDeclaration(data) => {
@@ -7856,7 +7936,9 @@ impl<'a> Checker<'a> {
                     return type_id;
                 }
                 self.class_value_stack.push(symbol);
-                let signature = self.class_constructor_signature(&class.members.nodes, type_id);
+                let instance_type = self.preserve_constructed_type_name(type_id, node, &[]);
+                let signature =
+                    self.class_constructor_signature(&class.members.nodes, instance_type);
                 let constructor = self.result.types.alloc(TypeKind::Constructor(signature));
                 let static_members = class
                     .members
@@ -9184,16 +9266,29 @@ impl<'a> Checker<'a> {
                 self.type_of_expression_context(*argument, Some(contextual_parameter))
             };
             let preserve_literal_inference = self.preserve_literal_inference;
-            self.preserve_literal_inference &=
-                self.signature_return_depends_on_parameter(signature, parameter);
+            self.preserve_literal_inference = (self.preserve_literal_inference
+                || self
+                    .mapped_return_templates
+                    .contains_key(&signature.return_type))
+                && self.signature_return_depends_on_parameter(signature, parameter);
+            let checked_actual = actual;
+            let inference_actual = if self
+                .mapped_return_templates
+                .contains_key(&signature.return_type)
+                && self.preserve_literal_inference
+            {
+                self.literal_inference_type(*argument).unwrap_or(actual)
+            } else {
+                actual
+            };
             if !inferred_object_properties {
-                self.infer_type_parameters(parameter, actual, &mut inference);
+                self.infer_type_parameters(parameter, inference_actual, &mut inference);
             }
             self.preserve_literal_inference = preserve_literal_inference;
             self.infer_named_type_parameters_from_argument(parameter, *argument, &mut inference);
             let expected = self.substitute_type(parameter, &inference);
-            if !self.is_assignable(actual, expected) {
-                let code = if self.exact_optional_property_mismatch(actual, expected) {
+            if !self.is_assignable(checked_actual, expected) {
+                let code = if self.exact_optional_property_mismatch(checked_actual, expected) {
                     2379
                 } else {
                     2345
@@ -9202,7 +9297,7 @@ impl<'a> Checker<'a> {
                     *argument,
                     code,
                     [
-                        self.result.types.display(actual),
+                        self.result.types.display(checked_actual),
                         self.result.types.display(expected),
                     ],
                 );
@@ -9212,6 +9307,36 @@ impl<'a> Checker<'a> {
         let result = self.substitute_type(signature.return_type, &inference);
         self.active_defaulted_type_parameters.clear();
         result
+    }
+
+    fn literal_inference_type(&mut self, expression: NodeId) -> Option<TypeId> {
+        match &self.arena.get(expression)?.data {
+            NodeData::StringLiteral(literal) => Some(
+                self.result
+                    .types
+                    .alloc(TypeKind::StringLiteral(literal.text.clone())),
+            ),
+            NodeData::NumericLiteral(literal) => Some(
+                self.result
+                    .types
+                    .alloc(TypeKind::NumberLiteral(literal.text.clone())),
+            ),
+            NodeData::BigIntLiteral(literal) => Some(
+                self.result
+                    .types
+                    .alloc(TypeKind::BigIntLiteral(literal.text.clone())),
+            ),
+            NodeData::KeywordExpression(_) => match self.arena.get(expression)?.kind {
+                SyntaxKind::TrueKeyword => {
+                    Some(self.result.types.alloc(TypeKind::BooleanLiteral(true)))
+                }
+                SyntaxKind::FalseKeyword => {
+                    Some(self.result.types.alloc(TypeKind::BooleanLiteral(false)))
+                }
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     fn signature_return_depends_on_parameter(
@@ -9480,15 +9605,8 @@ impl<'a> Checker<'a> {
             TypeKind::TypeParameter { .. } => {
                 let actual = if self.type_contains_named_reference(actual, &mut HashSet::new())
                     || (self.preserve_literal_inference
-                        && matches!(
-                            self.result.types.get(actual).map(|type_| &type_.kind),
-                            Some(
-                                TypeKind::BooleanLiteral(_)
-                                    | TypeKind::NumberLiteral(_)
-                                    | TypeKind::StringLiteral(_)
-                                    | TypeKind::BigIntLiteral(_)
-                            )
-                        )) {
+                        && self.type_is_literal_or_literal_union(actual))
+                {
                     actual
                 } else {
                     self.widen_literal(actual)
@@ -9557,30 +9675,53 @@ impl<'a> Checker<'a> {
                 }
             }
             TypeKind::Object(parameter_object) => {
-                if let TypeKind::Object(actual_object) =
-                    self.result.types.get(actual).unwrap().kind.clone()
-                {
-                    for (name, parameter) in parameter_object.properties {
-                        if let Some(actual) = actual_object.properties.get(&name) {
-                            self.infer_type_parameters(parameter, *actual, inference);
+                match self.result.types.get(actual).unwrap().kind.clone() {
+                    TypeKind::Object(actual_object) => {
+                        for (name, parameter) in parameter_object.properties {
+                            if let Some(actual) = actual_object.properties.get(&name) {
+                                self.infer_type_parameters(parameter, *actual, inference);
+                            }
+                        }
+                        for (parameter, actual) in parameter_object
+                            .call_signatures
+                            .iter()
+                            .zip(&actual_object.call_signatures)
+                        {
+                            self.infer_signature_type_parameters(parameter, actual, inference);
+                        }
+                        for (parameter, actual) in parameter_object
+                            .construct_signatures
+                            .iter()
+                            .zip(&actual_object.construct_signatures)
+                        {
+                            self.infer_signature_type_parameters(parameter, actual, inference);
                         }
                     }
+                    TypeKind::Function(actual) => {
+                        if let Some(parameter) = parameter_object.call_signatures.first() {
+                            self.infer_signature_type_parameters(parameter, &actual, inference);
+                        }
+                    }
+                    TypeKind::Constructor(actual) => {
+                        if let Some(parameter) = parameter_object.construct_signatures.first() {
+                            self.infer_signature_type_parameters(parameter, &actual, inference);
+                        }
+                    }
+                    TypeKind::Intersection(actual_members) => {
+                        for actual in actual_members {
+                            self.infer_type_parameters(parameter, actual, inference);
+                        }
+                    }
+                    _ => {}
                 }
             }
             TypeKind::Function(parameter_signature) => {
                 if let TypeKind::Function(actual_signature) =
                     self.result.types.get(actual).unwrap().kind.clone()
                 {
-                    for (parameter, actual) in parameter_signature
-                        .parameters
-                        .iter()
-                        .zip(&actual_signature.parameters)
-                    {
-                        self.infer_type_parameters(*parameter, *actual, inference);
-                    }
-                    self.infer_type_parameters(
-                        parameter_signature.return_type,
-                        actual_signature.return_type,
+                    self.infer_signature_type_parameters(
+                        &parameter_signature,
+                        &actual_signature,
                         inference,
                     );
                 }
@@ -9589,22 +9730,45 @@ impl<'a> Checker<'a> {
                 if let TypeKind::Constructor(actual_signature) =
                     self.result.types.get(actual).unwrap().kind.clone()
                 {
-                    for (parameter, actual) in parameter_signature
-                        .parameters
-                        .iter()
-                        .zip(&actual_signature.parameters)
-                    {
-                        self.infer_type_parameters(*parameter, *actual, inference);
-                    }
-                    self.infer_type_parameters(
-                        parameter_signature.return_type,
-                        actual_signature.return_type,
+                    self.infer_signature_type_parameters(
+                        &parameter_signature,
+                        &actual_signature,
                         inference,
                     );
                 }
             }
             _ => {}
         }
+    }
+
+    fn type_is_literal_or_literal_union(&self, type_id: TypeId) -> bool {
+        match self.result.types.get(type_id).map(|type_| &type_.kind) {
+            Some(
+                TypeKind::BooleanLiteral(_)
+                | TypeKind::NumberLiteral(_)
+                | TypeKind::StringLiteral(_)
+                | TypeKind::BigIntLiteral(_),
+            ) => true,
+            Some(TypeKind::Union(members)) => members
+                .iter()
+                .all(|member| self.type_is_literal_or_literal_union(*member)),
+            _ => false,
+        }
+    }
+
+    fn infer_signature_type_parameters(
+        &mut self,
+        parameter: &FunctionType,
+        actual: &FunctionType,
+        inference: &mut HashMap<TypeId, TypeId>,
+    ) {
+        for (parameter, actual) in parameter.parameters.iter().zip(&actual.parameters) {
+            self.infer_type_parameters(*parameter, *actual, inference);
+        }
+        if let (Some(parameter), Some(actual)) = (parameter.rest_parameter, actual.rest_parameter) {
+            self.infer_type_parameters(parameter, actual, inference);
+        }
+        self.infer_type_parameters(parameter.return_type, actual.return_type, inference);
     }
 
     fn inference_type_is_uninformative(&self, type_id: TypeId) -> bool {
@@ -9916,8 +10080,82 @@ impl<'a> Checker<'a> {
                 .collect();
             self.type_parameter_scopes.push(scope);
             let substituted = self.type_from_type_node(type_node);
+            if let Some(NodeData::MappedTypeNode(mapped)) =
+                self.arena.get(type_node).map(|node| &node.data)
+                && let Some(NodeData::TypeParameterDeclaration(parameter)) =
+                    self.arena.get(mapped.type_parameter).map(|node| &node.data)
+                && let Some(parameter_name) = self.property_name(parameter.name)
+                && let Some(constraint_node) = parameter.constraint
+            {
+                let mut constraint = self.type_from_type_node(constraint_node);
+                if self.type_contains_type_parameter(constraint) {
+                    if let Some(TypeKind::Union(members)) = self
+                        .result
+                        .types
+                        .get(constraint)
+                        .map(|type_| type_.kind.clone())
+                        && members.iter().any(|member| {
+                            matches!(
+                                self.result.types.get(*member).map(|type_| &type_.kind),
+                                Some(TypeKind::String)
+                            )
+                        })
+                        && let Some(TypeKind::Object(object)) = self
+                            .result
+                            .types
+                            .get(substituted)
+                            .map(|type_| type_.kind.clone())
+                        && !object.property_order.is_empty()
+                    {
+                        let mut refined = Vec::new();
+                        for member in members {
+                            if matches!(
+                                self.result.types.get(member).map(|type_| &type_.kind),
+                                Some(TypeKind::String)
+                            ) {
+                                refined.extend(object.property_order.iter().map(|name| {
+                                    self.result
+                                        .types
+                                        .alloc(TypeKind::StringLiteral(name.clone()))
+                                }));
+                            } else {
+                                refined.push(member);
+                            }
+                        }
+                        constraint = self.result.types.union(refined);
+                    }
+                    let mapped_parameter = self.result.types.alloc(TypeKind::TypeParameter {
+                        name: parameter_name.clone(),
+                        constraint: None,
+                    });
+                    self.type_parameter_scopes
+                        .push(HashMap::from([(parameter_name.clone(), mapped_parameter)]));
+                    let value = match mapped.type_ {
+                        Some(value) => self.type_from_type_node(value),
+                        None => self.result.types.any(),
+                    };
+                    self.type_parameter_scopes.pop();
+                    self.result.named_type_references.insert(
+                        substituted,
+                        NamedTypeReference {
+                            name: format!(
+                                "__mapped:{parameter_name}:{}:{}",
+                                u8::from(mapped.question_token.is_some()),
+                                u8::from(mapped.readonly_token.is_some())
+                            ),
+                            type_arguments: vec![constraint, value],
+                        },
+                    );
+                }
+            }
             self.type_parameter_scopes.pop();
-            if self.deferred_return_preserves_literals(type_node) {
+            if self.deferred_return_preserves_literals(type_node)
+                || self
+                    .result
+                    .named_type_references
+                    .get(&substituted)
+                    .is_some_and(|reference| reference.name.starts_with("__mapped:"))
+            {
                 self.non_widening_types.insert(substituted);
             }
             return substituted;
@@ -10191,10 +10429,11 @@ impl<'a> Checker<'a> {
         let constraint = *arguments.first()?;
         let value = *arguments.get(1)?;
         let name_type = arguments.get(2).copied();
-        let keys = self.literal_keys(constraint);
+        let mut keys = self.literal_keys(constraint);
         if keys.is_empty() {
             return None;
         }
+        keys.sort_by(|(left, _), (right, _)| left.cmp(right));
         let wanted = HashSet::from([(*parameter_name).to_owned()]);
         let mut parameters = HashMap::<String, Vec<TypeId>>::new();
         self.collect_named_type_parameters(value, &wanted, &mut parameters, &mut HashSet::new());
@@ -10737,9 +10976,12 @@ impl<'a> Checker<'a> {
             else {
                 continue;
             };
-            let Some(type_id) = signature.parameters.get(index).copied() else {
+            let Some(mut type_id) = signature.parameters.get(index).copied() else {
                 continue;
             };
+            if parameter.initializer.is_some() {
+                type_id = self.without_undefined(type_id);
+            }
             self.extend_binding_scope(parameter.name, type_id, &mut local_scope);
         }
         self.local_scopes.push(local_scope);
@@ -10786,15 +11028,79 @@ impl<'a> Checker<'a> {
             }
         }
         let returns = self.function_return_expressions(body);
-        let return_types = returns
+        let mut return_types = returns
             .into_iter()
             .map(|expression| {
-                let type_id = self.type_of_expression(expression);
+                let type_id = self.inferred_function_return_expression_type(expression, body);
                 self.widen_literal(type_id)
             })
             .collect::<Vec<_>>();
+        if self.options.strict_null_checks
+            && !return_types.is_empty()
+            && !self.statement_definitely_terminates(body)
+        {
+            return_types.push(self.result.types.undefined());
+        }
         self.local_scopes.pop();
         (!return_types.is_empty()).then(|| self.result.types.union(return_types))
+    }
+
+    fn inferred_function_return_expression_type(
+        &mut self,
+        expression: NodeId,
+        body: NodeId,
+    ) -> TypeId {
+        let mut type_id = self.type_of_expression(expression);
+        let Some(returned_name) = identifier_text(self.arena, expression) else {
+            return type_id;
+        };
+        let mut child = expression;
+        while let Some(parent) = self.arena.get(child).and_then(|node| node.parent) {
+            if parent == body {
+                break;
+            }
+            if let Some(NodeData::IfStatement(if_statement)) =
+                self.arena.get(parent).map(|node| &node.data)
+                && child == if_statement.then_statement
+                && let Some(NodeData::BinaryExpression(binary)) = self
+                    .arena
+                    .get(if_statement.expression)
+                    .map(|node| &node.data)
+                && matches!(
+                    self.arena.get(binary.operator_token).map(|node| node.kind),
+                    Some(SyntaxKind::EqualsEqualsToken | SyntaxKind::EqualsEqualsEqualsToken)
+                )
+            {
+                let comparison = if identifier_text(self.arena, binary.left) == Some(returned_name)
+                {
+                    Some(binary.right)
+                } else if identifier_text(self.arena, binary.right) == Some(returned_name) {
+                    Some(binary.left)
+                } else {
+                    None
+                };
+                if let Some(comparison) = comparison {
+                    let comparison_type = self.type_of_expression(comparison);
+                    if matches!(
+                        self.result
+                            .types
+                            .get(comparison_type)
+                            .map(|type_| &type_.kind),
+                        Some(
+                            TypeKind::BooleanLiteral(_)
+                                | TypeKind::NumberLiteral(_)
+                                | TypeKind::StringLiteral(_)
+                                | TypeKind::BigIntLiteral(_)
+                        )
+                    ) {
+                        type_id = comparison_type;
+                        self.non_widening_types.insert(type_id);
+                    }
+                }
+            }
+            child = parent;
+        }
+        type_id
     }
 
     fn function_return_expressions(&self, body: NodeId) -> Vec<NodeId> {
@@ -13139,11 +13445,27 @@ impl<'a> Checker<'a> {
         } else {
             2322
         };
+        let call_result = matches!(
+            self.arena.get(node).map(|node| &node.data),
+            Some(NodeData::CallExpression(_))
+        ) || matches!(
+            self.arena.get(node).map(|node| &node.data),
+            Some(NodeData::VariableDeclaration(variable))
+                if variable.initializer.is_some_and(|initializer| matches!(
+                    self.arena.get(initializer).map(|node| &node.data),
+                    Some(NodeData::CallExpression(_))
+                ))
+        );
+        let displayed_actual = if call_result {
+            self.widen_literal(actual)
+        } else {
+            actual
+        };
         self.error(
             node,
             code,
             [
-                self.result.types.display(actual),
+                self.result.types.display(displayed_actual),
                 self.result.types.display(expected),
             ],
         );
@@ -14032,12 +14354,30 @@ fn paint_exported_named_descriptor_import(
         let (is_typeof, referenced_name) = name
             .strip_prefix("typeof ")
             .map_or((false, name.as_str()), |name| (true, name));
-        let exported_root = referenced_name
+        let referenced_root = referenced_name
             .split_once('.')
             .map_or(referenced_name, |(root, _)| root)
             .to_owned();
-        if !name.starts_with("__") && exports.contains_key(&exported_root) {
-            let qualifier = referenced_name.to_owned();
+        let exported_root = exports
+            .contains_key(&referenced_root)
+            .then(|| referenced_root.clone())
+            .or_else(|| {
+                exports.iter().find_map(|(exported, descriptor)| {
+                    let TypeDescriptor::Named { name, .. } = descriptor else {
+                        return None;
+                    };
+                    let name = name.strip_prefix("typeof ").unwrap_or(name);
+                    let root = name.split_once('.').map_or(name, |(root, _)| root);
+                    (root == referenced_root).then(|| exported.clone())
+                })
+            });
+        if !name.starts_with("__")
+            && let Some(exported_root) = exported_root
+        {
+            let qualifier = referenced_name.strip_prefix(&referenced_root).map_or_else(
+                || exported_root.clone(),
+                |suffix| format!("{exported_root}{suffix}"),
+            );
             let mut target = descriptor.clone();
             if let TypeDescriptor::Named {
                 type_arguments,
@@ -21904,6 +22244,47 @@ mod tests {
                 is_typeof: false,
             })
         );
+    }
+
+    #[test]
+    fn infers_type_parameters_through_object_construct_signatures() {
+        let parsed = parse_source_file(
+            r"
+                interface Things<P, T> { p: P; t: T; }
+                declare function make<P, CTor>(
+                    x: { new (): CTor & { props: P } }
+                ): Things<P, CTor>;
+                interface Props {}
+                class Component { props: Props; static create = make(Component); }
+            ",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let call = parsed
+            .arena
+            .iter()
+            .find_map(|(id, node)| matches!(node.data, NodeData::CallExpression(_)).then_some(id))
+            .expect("make call");
+        let type_id = result.type_of_node(call).expect("call type");
+        let reference = result
+            .named_type_references
+            .get(&type_id)
+            .expect("named Things result");
+        assert_eq!(reference.name, "Things");
+        assert_eq!(reference.type_arguments.len(), 2);
+        let arguments = reference
+            .type_arguments
+            .iter()
+            .map(|argument| {
+                result
+                    .named_type_references
+                    .get(argument)
+                    .map(|reference| reference.name.as_str())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(arguments, [Some("Props"), Some("Component")]);
     }
 
     #[test]

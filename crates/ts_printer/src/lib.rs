@@ -1424,7 +1424,11 @@ fn commonjs_named_imports(
         else {
             continue;
         };
-        if clause.name.is_some() || clause.phase_modifier == Some(SyntaxKind::TypeKeyword) {
+        let has_runtime_default = clause
+            .name
+            .and_then(|name| declaration_name_text(arena, name))
+            .is_some_and(|name| default_imports.contains_key(name));
+        if has_runtime_default || clause.phase_modifier == Some(SyntaxKind::TypeKeyword) {
             continue;
         }
         let Some(NodeData::NamedImports(imports)) = clause
@@ -5098,6 +5102,7 @@ impl DeclarationPrinter<'_> {
                     return false;
                 };
                 self.semantic_type_references_names(type_id, &names, &mut HashSet::new(), false)
+                    || self.semantic_type_references_import(type_id, import, &mut HashSet::new())
             })
         })
     }
@@ -5181,6 +5186,111 @@ impl DeclarationPrinter<'_> {
         children
             .into_iter()
             .any(|child| self.semantic_type_references_names(child, names, visiting, true))
+    }
+
+    fn semantic_type_references_import(
+        &self,
+        type_id: TypeId,
+        import: &ts_ast::ImportDeclarationData,
+        visiting: &mut HashSet<TypeId>,
+    ) -> bool {
+        if !visiting.insert(type_id) {
+            return false;
+        }
+        let module = string_literal_text(self.arena, import.module_specifier);
+        if self
+            .import_type_references
+            .and_then(|references| references.get(&type_id))
+            .is_some_and(|reference| {
+                module == Some(reference.module_specifier.as_str())
+                    && self.import_binds_qualifier(import, &reference.qualifier)
+            })
+        {
+            return true;
+        }
+        let mut children = self
+            .named_type_references
+            .and_then(|references| references.get(&type_id))
+            .map_or_else(Vec::new, |reference| reference.type_arguments.clone());
+        match self
+            .semantic_types
+            .and_then(|types| types.get(type_id))
+            .map(|type_| &type_.kind)
+        {
+            Some(TypeKind::Array(element)) => children.push(*element),
+            Some(
+                TypeKind::Tuple(elements)
+                | TypeKind::ReadonlyTuple(elements)
+                | TypeKind::Union(elements)
+                | TypeKind::Intersection(elements),
+            ) => children.extend(elements),
+            Some(TypeKind::Object(object)) => {
+                children.extend(object.properties.values().copied());
+                children.extend(object.string_index_type);
+                children.extend(object.number_index_type);
+            }
+            Some(TypeKind::Function(signature) | TypeKind::Constructor(signature)) => {
+                children.extend(&signature.parameters);
+                children.extend(signature.rest_parameter);
+                children.push(signature.return_type);
+            }
+            Some(TypeKind::Overload(signatures)) => {
+                for signature in signatures {
+                    children.extend(&signature.parameters);
+                    children.extend(signature.rest_parameter);
+                    children.push(signature.return_type);
+                }
+            }
+            Some(TypeKind::TypeParameter {
+                constraint: Some(constraint),
+                ..
+            }) => children.push(*constraint),
+            _ => {}
+        }
+        children
+            .into_iter()
+            .any(|child| self.semantic_type_references_import(child, import, visiting))
+    }
+
+    fn import_binds_qualifier(
+        &self,
+        import: &ts_ast::ImportDeclarationData,
+        qualifier: &str,
+    ) -> bool {
+        let Some(NodeData::ImportClause(clause)) = import
+            .import_clause
+            .and_then(|clause| self.arena.get(clause))
+            .map(|node| &node.data)
+        else {
+            return false;
+        };
+        let root = qualifier
+            .split_once('.')
+            .map_or(qualifier, |(root, _)| root);
+        if root == "default" && clause.name.is_some() {
+            return true;
+        }
+        match clause
+            .named_bindings
+            .and_then(|bindings| self.arena.get(bindings))
+            .map(|node| &node.data)
+        {
+            Some(NodeData::NamespaceImport(_)) => true,
+            Some(NodeData::NamedImports(imports)) => {
+                imports.elements.nodes.iter().any(|specifier| {
+                    let Some(NodeData::ImportSpecifier(specifier)) =
+                        self.arena.get(*specifier).map(|node| &node.data)
+                    else {
+                        return false;
+                    };
+                    declaration_name_text(
+                        self.arena,
+                        specifier.property_name.unwrap_or(specifier.name),
+                    ) == Some(root)
+                })
+            }
+            _ => false,
+        }
     }
 
     fn namespace_import_name(&self, expression: NodeId) -> Option<&str> {
@@ -5840,7 +5950,7 @@ impl DeclarationPrinter<'_> {
             );
         }
         let Some(TypeKind::Constructor(signature)) = kind else {
-            return self.emit_semantic_type(return_type);
+            return self.emit_semantic_type_with_nullish_last(return_type);
         };
         let parameter_names = function
             .body
@@ -9526,8 +9636,6 @@ impl DeclarationPrinter<'_> {
                     self.emit_semantic_type_with_nullish_last(type_id)?;
                 }
             } else if let Some(type_) = parameter.type_ {
-                let previous = self.canonical_literal_quotes;
-                self.canonical_literal_quotes = true;
                 let local_body = self
                     .arena
                     .get(declaration)
@@ -9543,7 +9651,6 @@ impl DeclarationPrinter<'_> {
                 } else {
                     self.emit_type(type_)
                 };
-                self.canonical_literal_quotes = previous;
                 result?;
             } else if let Some(hint) = self.jsdoc_parameter_type_hint(declaration, parameter.name) {
                 self.emit_jsdoc_type_hint(&hint);
@@ -9553,7 +9660,14 @@ impl DeclarationPrinter<'_> {
             {
                 self.emit_type(type_node)?;
             } else if let Some(type_id) = type_id {
-                self.emit_semantic_parameter_type(type_id, optional)?;
+                let initializer_includes_undefined = parameter
+                    .initializer
+                    .is_some_and(|initializer| self.expression_contains_undefined(initializer));
+                if initializer_includes_undefined {
+                    self.emit_semantic_type_with_nullish_last(type_id)?;
+                } else {
+                    self.emit_semantic_parameter_type(type_id, optional)?;
+                }
             } else {
                 self.writer.write("any");
             }
@@ -9726,6 +9840,17 @@ impl DeclarationPrinter<'_> {
         } else {
             self.emit_semantic_type_list(&members, " | ")
         }
+    }
+
+    fn expression_contains_undefined(&self, expression: NodeId) -> bool {
+        self.arena.iter().any(|(node_id, node)| {
+            self.node_range_contains(expression, node_id)
+                && (node.kind == SyntaxKind::UndefinedKeyword
+                    || matches!(
+                        &node.data,
+                        NodeData::Identifier(identifier) if identifier.text == "undefined"
+                    ))
+        })
     }
 
     fn semantic_type_includes_undefined(&self, type_id: TypeId) -> bool {
@@ -11897,7 +12022,7 @@ impl DeclarationPrinter<'_> {
             self.writer.write("[");
             self.writer.write(name);
             self.writer.write(" in ");
-            self.emit_semantic_type(constraint)?;
+            self.emit_mapped_constraint(constraint)?;
             self.writer.write("]");
             if *question == "1" {
                 self.writer.write("?");
@@ -11930,7 +12055,14 @@ impl DeclarationPrinter<'_> {
                 Some(TypeKind::TypeParameter { .. })
             )
         {
-            self.writer.write(&reference.name);
+            let display_name = self
+                .self_import_namespace_for_type_arguments(&reference.type_arguments)
+                .filter(|_| !reference.name.contains('.'))
+                .map_or_else(
+                    || reference.name.clone(),
+                    |namespace| format!("{namespace}.{}", reference.name),
+                );
+            self.writer.write(&display_name);
             let type_parameter_name = self.arena.iter().any(|(_, node)| {
                 matches!(
                     &node.data,
@@ -12089,6 +12221,67 @@ impl DeclarationPrinter<'_> {
         Ok(())
     }
 
+    fn self_import_namespace_for_type_arguments(&self, arguments: &[TypeId]) -> Option<String> {
+        arguments.iter().find_map(|argument| {
+            let reference = self.import_type_references?.get(argument)?;
+            if !self.module_specifier_targets_current_source(&reference.module_specifier) {
+                return None;
+            }
+            let local = self.local_named_import_for(reference)?;
+            local
+                .split_once('.')
+                .map(|(namespace, _)| namespace.to_owned())
+        })
+    }
+
+    fn module_specifier_targets_current_source(&self, specifier: &str) -> bool {
+        let source = self
+            .source_name
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(self.source_name);
+        let source = source
+            .strip_suffix(".d.ts")
+            .or_else(|| source.strip_suffix(".ts"))
+            .or_else(|| source.strip_suffix(".tsx"))
+            .or_else(|| source.strip_suffix(".mts"))
+            .or_else(|| source.strip_suffix(".cts"))
+            .unwrap_or(source);
+        let target = specifier
+            .rsplit('/')
+            .next()
+            .unwrap_or(specifier)
+            .strip_suffix(".js")
+            .or_else(|| {
+                specifier
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(specifier)
+                    .strip_suffix(".ts")
+            })
+            .unwrap_or_else(|| specifier.rsplit('/').next().unwrap_or(specifier));
+        source == target
+    }
+
+    fn emit_mapped_constraint(&mut self, type_id: TypeId) -> Result<(), EmitError> {
+        let Some(TypeKind::Union(mut members)) = self
+            .semantic_types
+            .and_then(|types| types.get(type_id))
+            .map(|type_| type_.kind.clone())
+        else {
+            return self.emit_semantic_type(type_id);
+        };
+        members.sort_by_key(|member| {
+            u8::from(matches!(
+                self.semantic_types
+                    .and_then(|types| types.get(*member))
+                    .map(|type_| &type_.kind),
+                Some(TypeKind::TypeParameter { .. })
+            ))
+        });
+        self.emit_semantic_type_list(&members, " | ")
+    }
+
     fn compact_construct_signature(object: &ObjectType) -> Option<&FunctionType> {
         if object.properties.is_empty()
             && object.call_signatures.is_empty()
@@ -12158,22 +12351,49 @@ impl DeclarationPrinter<'_> {
             else {
                 return None;
             };
-            let NodeData::NamedImports(bindings) = &self.arena.get(clause.named_bindings?)?.data
-            else {
-                return None;
-            };
-            bindings.elements.nodes.iter().find_map(|specifier| {
-                let NodeData::ImportSpecifier(specifier) = &self.arena.get(*specifier)?.data else {
-                    return None;
-                };
-                let imported = declaration_name_text(
-                    self.arena,
-                    specifier.property_name.unwrap_or(specifier.name),
-                )?;
-                (imported == reference.qualifier)
-                    .then(|| declaration_name_text(self.arena, specifier.name).map(str::to_owned))
-                    .flatten()
-            })
+            let (root, suffix) = reference
+                .qualifier
+                .split_once('.')
+                .map_or((reference.qualifier.as_str(), ""), |(root, _)| {
+                    (root, &reference.qualifier[root.len()..])
+                });
+            if root == "default"
+                && let Some(local) = clause
+                    .name
+                    .and_then(|name| declaration_name_text(self.arena, name))
+            {
+                return Some(format!("{local}{suffix}"));
+            }
+            match self
+                .arena
+                .get(clause.named_bindings?)
+                .map(|node| &node.data)
+            {
+                Some(NodeData::NamespaceImport(namespace)) => {
+                    let local = declaration_name_text(self.arena, namespace.name)?;
+                    Some(format!("{local}.{}", reference.qualifier))
+                }
+                Some(NodeData::NamedImports(bindings)) => {
+                    bindings.elements.nodes.iter().find_map(|specifier| {
+                        let NodeData::ImportSpecifier(specifier) =
+                            &self.arena.get(*specifier)?.data
+                        else {
+                            return None;
+                        };
+                        let imported = declaration_name_text(
+                            self.arena,
+                            specifier.property_name.unwrap_or(specifier.name),
+                        )?;
+                        (imported == root)
+                            .then(|| {
+                                declaration_name_text(self.arena, specifier.name)
+                                    .map(|local| format!("{local}{suffix}"))
+                            })
+                            .flatten()
+                    })
+                }
+                _ => None,
+            }
         })
     }
 
@@ -15708,13 +15928,16 @@ impl DeclarationPrinter<'_> {
             if clause.phase_modifier == Some(SyntaxKind::TypeKeyword) {
                 self.writer.write("type ");
             }
+            let retained_bindings = clause.named_bindings.filter(|bindings| {
+                self.import_bindings_have_retained_declaration_binding(import_id, *bindings)
+            });
             if let Some(name) = clause.name {
                 self.emit_name(name)?;
-                if clause.named_bindings.is_some() {
+                if retained_bindings.is_some() {
                     self.writer.write(", ");
                 }
             }
-            if let Some(bindings) = clause.named_bindings {
+            if let Some(bindings) = retained_bindings {
                 self.emit_import_bindings(import_id, bindings)?;
             }
             self.writer.write(" from ");
@@ -15801,6 +16024,33 @@ impl DeclarationPrinter<'_> {
             _ => return Err(Self::unsupported(id, node.kind)),
         }
         Ok(())
+    }
+
+    fn import_bindings_have_retained_declaration_binding(
+        &self,
+        import_id: NodeId,
+        bindings: NodeId,
+    ) -> bool {
+        match self.arena.get(bindings).map(|node| &node.data) {
+            Some(NodeData::NamedImports(imports)) => {
+                imports.elements.nodes.iter().any(|specifier| {
+                    let Some(NodeData::ImportSpecifier(specifier)) =
+                        self.arena.get(*specifier).map(|node| &node.data)
+                    else {
+                        return false;
+                    };
+                    declaration_name_text(self.arena, specifier.name).is_some_and(|name| {
+                        self.import_binding_is_used_in_retained_declaration(import_id, name)
+                    })
+                })
+            }
+            Some(NodeData::NamespaceImport(namespace)) => {
+                declaration_name_text(self.arena, namespace.name).is_some_and(|name| {
+                    self.import_binding_is_used_in_retained_declaration(import_id, name)
+                })
+            }
+            _ => false,
+        }
     }
 
     fn import_binding_is_used_in_retained_declaration(
@@ -20354,6 +20604,17 @@ impl Printer<'_> {
                 }
             }
             NodeData::FunctionDeclaration(data) => {
+                let commonjs_default_name = (self.commonjs_module_transform
+                    && data.name.is_none()
+                    && self.has_modifier(data.modifiers.as_ref(), SyntaxKind::ExportKeyword)
+                    && self.has_modifier(data.modifiers.as_ref(), SyntaxKind::DefaultKeyword))
+                .then(|| self.generated_names.generate("default"));
+                if let Some(name) = commonjs_default_name.as_deref() {
+                    self.writer.write("exports.default = ");
+                    self.writer.write(name);
+                    self.writer.write(";");
+                    self.writer.newline();
+                }
                 self.emit_runtime_declaration_modifiers(data.modifiers.as_ref());
                 let is_async = self.has_modifier(data.modifiers.as_ref(), SyntaxKind::AsyncKeyword);
                 let downlevel_async_generator = self.settings.target < ScriptTarget::Es2018
@@ -20387,9 +20648,12 @@ impl Printer<'_> {
                 let function_name = data
                     .name
                     .and_then(|name| declaration_name_text(self.arena, name))
-                    .map(str::to_owned);
+                    .map(str::to_owned)
+                    .or_else(|| commonjs_default_name.clone());
                 if let Some(name) = data.name {
                     self.emit_expression(name, 0)?;
+                } else if let Some(name) = commonjs_default_name.as_deref() {
+                    self.writer.write(name);
                 }
                 let parameter_class_temps = data.body.map_or_else(Vec::new, |body| {
                     self.prepare_parameter_class_expression_temps(&data.parameters, body)
@@ -20479,6 +20743,10 @@ impl Printer<'_> {
             }
             NodeData::ClassDeclaration(data) => {
                 let decorators = self.class_decorator_expressions(data.modifiers.as_ref());
+                let recovered_default_name = (!decorators.is_empty()
+                    && data.name.is_none()
+                    && self.has_modifier(data.modifiers.as_ref(), SyntaxKind::DefaultKeyword))
+                .then(|| self.generated_names.generate("default"));
                 let commonjs_default_name = (self.commonjs_module_transform
                     && data.name.is_none()
                     && self.has_modifier(data.modifiers.as_ref(), SyntaxKind::ExportKeyword)
@@ -20495,6 +20763,12 @@ impl Printer<'_> {
                         self.emit_runtime_declaration_modifiers(data.modifiers.as_ref());
                     }
                     self.emit_class_with_name(data, commonjs_default_name.as_deref())?;
+                } else if let Some(name) = recovered_default_name.as_deref() {
+                    self.writer.write("let ");
+                    self.writer.write(name);
+                    self.writer.write(" = ");
+                    self.emit_class(data)?;
+                    self.writer.write(";");
                 } else {
                     self.emit_decorated_class_binding(data)?;
                 }
@@ -20538,7 +20812,12 @@ impl Printer<'_> {
                     self.emit_class_member_decorators(data)?;
                 }
                 if !decorators.is_empty() && self.settings.target >= ScriptTarget::Es2015 {
-                    self.emit_class_decorator_assignment(data, &decorators, true)?;
+                    self.emit_class_decorator_assignment(
+                        data,
+                        &decorators,
+                        true,
+                        recovered_default_name.as_deref(),
+                    )?;
                 }
             }
             NodeData::EnumDeclaration(data) => {
@@ -24735,14 +25014,18 @@ impl Printer<'_> {
         data: &ts_ast::ClassDeclarationData,
         decorators: &[NodeId],
         prefix_commonjs_export: bool,
+        name_override: Option<&str>,
     ) -> Result<(), EmitError> {
-        let Some(name) = data.name else {
+        let local_name = name_override.or_else(|| {
+            data.name
+                .and_then(|name| declaration_name_text(self.arena, name))
+        });
+        let Some(local_name) = local_name else {
             return Ok(());
         };
         if !self.writer.line_start {
             self.writer.newline();
         }
-        let local_name = declaration_name_text(self.arena, name).unwrap_or("default");
         if prefix_commonjs_export && self.commonjs_module_transform {
             let exported = if self.has_modifier(data.modifiers.as_ref(), SyntaxKind::ExportKeyword)
             {
@@ -24806,7 +25089,11 @@ impl Printer<'_> {
         {
             self.writer.newline();
             self.writer.write("export default ");
-            self.emit_expression(name, 0)?;
+            if let Some(name) = data.name {
+                self.emit_expression(name, 0)?;
+            } else {
+                self.writer.write(local_name);
+            }
             self.writer.write(";");
         }
         Ok(())
@@ -25602,6 +25889,7 @@ impl Printer<'_> {
             && self.namespace_containers.is_empty()
             && data.name.is_some()
             && self.has_modifier(data.modifiers.as_ref(), SyntaxKind::ExportKeyword)
+            && !self.has_modifier(data.modifiers.as_ref(), SyntaxKind::DefaultKeyword)
             && self
                 .class_decorator_expressions(data.modifiers.as_ref())
                 .is_empty()
@@ -27016,7 +27304,7 @@ impl Printer<'_> {
         self.emit_class_member_decorators(data)?;
         let decorators = self.class_decorator_expressions(data.modifiers.as_ref());
         if !decorators.is_empty() {
-            self.emit_class_decorator_assignment(data, &decorators, false)?;
+            self.emit_class_decorator_assignment(data, &decorators, false, None)?;
         }
         if !self.writer.line_start {
             self.writer.newline();
@@ -29337,10 +29625,11 @@ impl Printer<'_> {
         {
             return;
         }
-        if self.has_modifier(modifiers, SyntaxKind::ExportKeyword) {
+        let exported = self.has_modifier(modifiers, SyntaxKind::ExportKeyword);
+        if exported {
             self.writer.write("export ");
         }
-        if self.has_modifier(modifiers, SyntaxKind::DefaultKeyword) {
+        if exported && self.has_modifier(modifiers, SyntaxKind::DefaultKeyword) {
             self.writer.write("default ");
         }
     }
@@ -30956,6 +31245,17 @@ impl Printer<'_> {
                     self.writer.write("(");
                 }
                 self.writer.write("void ");
+                self.emit_expression(data.expression, 16)?;
+                if wrap {
+                    self.writer.write(")");
+                }
+            }
+            NodeData::DeleteExpression(data) => {
+                let wrap = parent_precedence > 16;
+                if wrap {
+                    self.writer.write("(");
+                }
+                self.writer.write("delete ");
                 self.emit_expression(data.expression, 16)?;
                 if wrap {
                     self.writer.write(")");
@@ -33420,6 +33720,9 @@ impl Printer<'_> {
                     || self.expression_contains_class_expression(data.right)
             }
             Some(NodeData::TypeOfExpression(data)) => {
+                self.expression_contains_class_expression(data.expression)
+            }
+            Some(NodeData::DeleteExpression(data)) => {
                 self.expression_contains_class_expression(data.expression)
             }
             _ => false,
