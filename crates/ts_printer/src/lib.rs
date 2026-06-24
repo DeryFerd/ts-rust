@@ -304,6 +304,7 @@ pub fn emit_source_file_with_context(
         async_expression_transform: AsyncExpressionTransform::None,
         es5_async_expression_rewrites: HashMap::new(),
         es5_async_await_captures: HashMap::new(),
+        es5_async_conditional_temps: HashMap::new(),
         async_loop_counter: 0,
         async_control_counter: 0,
         commonjs_empty_binding_temps: HashMap::new(),
@@ -17463,6 +17464,7 @@ struct Es5AsyncCapturedLoop {
 struct Es5AsyncCapturePlan {
     temps: Vec<String>,
     captures: HashMap<NodeId, Vec<(NodeId, String)>>,
+    conditional_temps: HashMap<NodeId, String>,
     state_parameter: Option<String>,
 }
 
@@ -18201,6 +18203,7 @@ struct Printer<'a> {
     async_expression_transform: AsyncExpressionTransform,
     es5_async_expression_rewrites: HashMap<NodeId, String>,
     es5_async_await_captures: HashMap<NodeId, Vec<(NodeId, String)>>,
+    es5_async_conditional_temps: HashMap<NodeId, String>,
     async_loop_counter: u32,
     async_control_counter: u32,
     commonjs_empty_binding_temps: HashMap<NodeId, Vec<String>>,
@@ -25176,21 +25179,25 @@ impl Printer<'_> {
         compact_outer: bool,
     ) -> Result<(), EmitError> {
         let previous_await_captures = std::mem::take(&mut self.es5_async_await_captures);
+        let previous_conditional_temps = std::mem::take(&mut self.es5_async_conditional_temps);
         let capture_plan = if expression_body.is_none() {
             self.es5_async_capture_plan(body)
         } else {
             Es5AsyncCapturePlan {
                 temps: Vec::new(),
                 captures: HashMap::new(),
+                conditional_temps: HashMap::new(),
                 state_parameter: None,
             }
         };
         let Es5AsyncCapturePlan {
             temps: planned_temps,
             captures: await_captures,
+            conditional_temps,
             state_parameter: planned_state_parameter,
         } = capture_plan;
         self.es5_async_await_captures = await_captures;
+        self.es5_async_conditional_temps = conditional_temps;
         let state_parameter = planned_state_parameter
             .as_deref()
             .unwrap_or(requested_state_parameter);
@@ -25299,6 +25306,7 @@ impl Printer<'_> {
             self.writer.write(" }");
         }
         self.es5_async_await_captures = previous_await_captures;
+        self.es5_async_conditional_temps = previous_conditional_temps;
         Ok(())
     }
 
@@ -25355,9 +25363,11 @@ impl Printer<'_> {
 
     fn es5_async_capture_plan(&self, body: NodeId) -> Es5AsyncCapturePlan {
         let mut await_captures = Vec::new();
+        let mut conditional_nodes = Vec::new();
         if let Some(NodeData::Block(block)) = self.arena.get(body).map(|node| &node.data) {
             for statement in &block.statements.nodes {
                 self.collect_es5_async_await_captures(*statement, &mut await_captures);
+                self.collect_es5_async_conditional_temps(*statement, &mut conditional_nodes);
             }
         }
         let mut claimed = HashSet::new();
@@ -25372,11 +25382,49 @@ impl Printer<'_> {
                 entries.push((capture, temp));
             }
         }
+        let mut conditional_temps = HashMap::new();
+        for conditional in conditional_nodes {
+            let temp = self.generate_block_temp(body, &claimed);
+            claimed.insert(temp.clone());
+            temps.push(temp.clone());
+            conditional_temps.insert(conditional, temp);
+        }
         let state_parameter = (!temps.is_empty()).then(|| self.generate_block_temp(body, &claimed));
         Es5AsyncCapturePlan {
             temps,
             captures,
+            conditional_temps,
             state_parameter,
+        }
+    }
+
+    fn collect_es5_async_conditional_temps(
+        &self,
+        statement: NodeId,
+        conditionals: &mut Vec<NodeId>,
+    ) {
+        if let Some(NodeData::Block(block)) = self.arena.get(statement).map(|node| &node.data) {
+            for statement in &block.statements.nodes {
+                self.collect_es5_async_conditional_temps(*statement, conditionals);
+            }
+            return;
+        }
+        let Some((_, conditional)) = self.es5_async_conditional_assignment(statement) else {
+            return;
+        };
+        let Some(NodeData::ConditionalExpression(conditional_data)) =
+            self.arena.get(conditional).map(|node| &node.data)
+        else {
+            return;
+        };
+        if self
+            .es5_async_simple_await_in_expression(conditional_data.when_true)
+            .is_some()
+            || self
+                .es5_async_simple_await_in_expression(conditional_data.when_false)
+                .is_some()
+        {
+            conditionals.push(conditional);
         }
     }
 
@@ -25500,6 +25548,17 @@ impl Printer<'_> {
         {
             return self.emit_es5_async_if_statement(if_statement, state, case, is_last);
         }
+        if let Some((left, conditional)) = self.es5_async_conditional_assignment(statement)
+            && let Some(temp) = self.es5_async_conditional_temps.get(&conditional).cloned()
+        {
+            return self.emit_es5_async_conditional_assignment(
+                left,
+                conditional,
+                &temp,
+                state,
+                case,
+            );
+        }
         if let Some((name, awaited)) = self.direct_await_binding(statement) {
             self.emit_es5_async_yield(awaited, case, false)?;
             self.emit_expression(name, 0)?;
@@ -25553,20 +25612,24 @@ impl Printer<'_> {
             }
             _ => self.emit_statement(statement)?,
         }
-        if let Some(previous) = previous {
-            self.es5_async_expression_rewrites
-                .insert(await_id, previous);
-        } else {
-            self.es5_async_expression_rewrites.remove(&await_id);
-        }
+        self.restore_es5_async_expression_rewrite(await_id, previous);
         for (capture, previous) in previous_captures {
-            if let Some(previous) = previous {
-                self.es5_async_expression_rewrites.insert(capture, previous);
-            } else {
-                self.es5_async_expression_rewrites.remove(&capture);
-            }
+            self.restore_es5_async_expression_rewrite(capture, previous);
         }
         Ok(())
+    }
+
+    fn restore_es5_async_expression_rewrite(
+        &mut self,
+        expression: NodeId,
+        previous: Option<String>,
+    ) {
+        if let Some(previous) = previous {
+            self.es5_async_expression_rewrites
+                .insert(expression, previous);
+        } else {
+            self.es5_async_expression_rewrites.remove(&expression);
+        }
     }
 
     fn emit_es5_async_yield(
@@ -25673,6 +25736,93 @@ impl Printer<'_> {
         Ok(())
     }
 
+    fn emit_es5_async_conditional_assignment(
+        &mut self,
+        left: NodeId,
+        conditional: NodeId,
+        temp: &str,
+        state: &str,
+        case: &mut usize,
+    ) -> Result<(), EmitError> {
+        let node = self.node(conditional)?.clone();
+        let NodeData::ConditionalExpression(conditional) = &node.data else {
+            return Err(Self::unsupported(conditional, node.kind));
+        };
+        let true_suspensions = usize::from(
+            self.es5_async_simple_await_in_expression(conditional.when_true)
+                .is_some(),
+        );
+        let false_suspensions = usize::from(
+            self.es5_async_simple_await_in_expression(conditional.when_false)
+                .is_some(),
+        );
+        let start_case = *case;
+        let false_case = start_case + true_suspensions + 1;
+        let end_case = false_case + false_suspensions + 1;
+        if !self.writer.line_start {
+            self.writer.newline();
+        }
+        self.writer.write("if (!");
+        self.emit_expression(conditional.condition, 16)?;
+        self.writer.write(") return [3 /*break*/, ");
+        self.writer.write(&false_case.to_string());
+        self.writer.write("];");
+        self.writer.newline();
+        self.emit_es5_async_conditional_value(conditional.when_true, temp, state, case)?;
+        self.writer.write("return [3 /*break*/, ");
+        self.writer.write(&end_case.to_string());
+        self.writer.write("];");
+        self.writer.newline();
+
+        let false_inline = self
+            .es5_async_simple_await_in_expression(conditional.when_false)
+            .is_some();
+        self.emit_es5_async_case_label(false_case, false_inline);
+        *case = false_case;
+        self.emit_es5_async_conditional_value(conditional.when_false, temp, state, case)?;
+        self.writer.write(state);
+        self.writer.write(".label = ");
+        self.writer.write(&end_case.to_string());
+        self.writer.write(";");
+        self.writer.newline();
+        self.emit_es5_async_case_label(end_case, false);
+        *case = end_case;
+        self.emit_expression(left, 1)?;
+        self.writer.write(" = ");
+        self.writer.write(temp);
+        self.writer.write(";");
+        self.writer.newline();
+        Ok(())
+    }
+
+    fn emit_es5_async_conditional_value(
+        &mut self,
+        expression: NodeId,
+        temp: &str,
+        state: &str,
+        case: &mut usize,
+    ) -> Result<(), EmitError> {
+        if let Some(await_id) = self.es5_async_simple_await_in_expression(expression) {
+            let NodeData::AwaitExpression(awaited) = &self.node(await_id)?.data else {
+                unreachable!("await expression identified above")
+            };
+            let awaited_expression = awaited.expression;
+            self.emit_es5_async_yield(awaited_expression, case, false)?;
+            self.writer.write(temp);
+            self.writer.write(" = ");
+            self.writer.write(state);
+            self.writer.write(".sent();");
+            self.writer.newline();
+        } else {
+            self.writer.write(temp);
+            self.writer.write(" = ");
+            self.emit_expression(expression, 1)?;
+            self.writer.write(";");
+            self.writer.newline();
+        }
+        Ok(())
+    }
+
     fn emit_es5_async_branch(
         &mut self,
         statement: NodeId,
@@ -25748,10 +25898,28 @@ impl Printer<'_> {
             Some(NodeData::VariableStatement(_)) => {
                 usize::from(self.direct_await_binding(statement).is_some())
             }
-            Some(NodeData::ExpressionStatement(expression)) => usize::from(
-                self.es5_async_simple_await_in_expression(expression.expression)
-                    .is_some(),
-            ),
+            Some(NodeData::ExpressionStatement(expression)) => {
+                if let Some((_, conditional)) = self.es5_async_conditional_assignment(statement)
+                    && let Some(NodeData::ConditionalExpression(conditional)) =
+                        self.arena.get(conditional).map(|node| &node.data)
+                {
+                    usize::from(
+                        self.es5_async_simple_await_in_expression(conditional.condition)
+                            .is_some(),
+                    ) + usize::from(
+                        self.es5_async_simple_await_in_expression(conditional.when_true)
+                            .is_some(),
+                    ) + usize::from(
+                        self.es5_async_simple_await_in_expression(conditional.when_false)
+                            .is_some(),
+                    )
+                } else {
+                    usize::from(
+                        self.es5_async_simple_await_in_expression(expression.expression)
+                            .is_some(),
+                    )
+                }
+            }
             Some(NodeData::ReturnStatement(statement)) => {
                 usize::from(statement.expression.is_some_and(|expression| {
                     self.es5_async_simple_await_in_expression(expression)
@@ -25784,6 +25952,24 @@ impl Printer<'_> {
         Some((await_id, awaited.expression))
     }
 
+    fn es5_async_conditional_assignment(&self, statement: NodeId) -> Option<(NodeId, NodeId)> {
+        let NodeData::ExpressionStatement(statement) = &self.arena.get(statement)?.data else {
+            return None;
+        };
+        let NodeData::BinaryExpression(binary) = &self.arena.get(statement.expression)?.data else {
+            return None;
+        };
+        if self.arena.get(binary.operator_token)?.kind != SyntaxKind::EqualsToken
+            || !matches!(
+                self.arena.get(binary.right).map(|node| &node.data),
+                Some(NodeData::ConditionalExpression(_))
+            )
+        {
+            return None;
+        }
+        Some((binary.left, binary.right))
+    }
+
     fn es5_async_simple_await_in_expression(&self, expression: NodeId) -> Option<NodeId> {
         match &self.arena.get(expression)?.data {
             NodeData::AwaitExpression(_) => Some(expression),
@@ -25810,6 +25996,9 @@ impl Printer<'_> {
                 .or_else(|| {
                     self.es5_async_simple_await_in_expression(expression.argument_expression)
                 }),
+            NodeData::ConditionalExpression(expression) => {
+                self.es5_async_simple_await_in_expression(expression.condition)
+            }
             NodeData::BinaryExpression(expression) => {
                 let operator = self.arena.get(expression.operator_token)?.kind;
                 if operator.is_assignment_operator()
