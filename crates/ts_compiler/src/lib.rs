@@ -553,7 +553,7 @@ impl Program {
                     || source_file.checking.diagnostics.iter().any(|diagnostic| {
                         matches!(
                             diagnostic.diagnostic.code(),
-                            2527 | 2883 | 4023 | 4032 | 4081 | 4094 | 4118 | 5088 | 9010
+                            2527 | 2883 | 4023 | 4025 | 4032 | 4081 | 4094 | 4118 | 5088 | 9010
                         )
                     })
                 {
@@ -798,7 +798,7 @@ impl Program {
                     || source.checking.diagnostics.iter().any(|diagnostic| {
                         matches!(
                             diagnostic.diagnostic.code(),
-                            2527 | 2883 | 4023 | 4032 | 4081 | 4094 | 5088 | 9010
+                            2527 | 2883 | 4023 | 4025 | 4032 | 4081 | 4094 | 5088 | 9010
                         )
                     })
                 {
@@ -1952,23 +1952,28 @@ fn preserved_reference_directives(source: &SourceFile, declaration_file: &str) -
         {
             continue;
         }
-        let Some(path_start) = trimmed.find("path=").map(|index| index + "path=".len()) else {
-            continue;
-        };
-        let Some(quote) = trimmed.as_bytes().get(path_start).copied().map(char::from) else {
-            continue;
-        };
-        if !matches!(quote, '\'' | '"') {
+        if let Some(reference) = preserved_reference_value(trimmed, "types") {
+            output.push_str("/// <reference types=\"");
+            output.push_str(reference);
+            output.push('"');
+            if let Some(mode) = preserved_reference_value(trimmed, "resolution-mode") {
+                output.push_str(" resolution-mode=\"");
+                output.push_str(mode);
+                output.push('"');
+            }
+            output.push_str(" preserve=\"true\" />\n");
             continue;
         }
-        let value_start = path_start + 1;
-        let Some(value_end) = trimmed[value_start..]
-            .find(quote)
-            .map(|end| value_start + end)
-        else {
+        if let Some(reference) = preserved_reference_value(trimmed, "lib") {
+            output.push_str("/// <reference lib=\"");
+            output.push_str(reference);
+            output.push_str("\" preserve=\"true\" />\n");
+            continue;
+        }
+        let Some(reference) = preserved_reference_value(trimmed, "path") else {
             continue;
         };
-        let target = resolve_path(&source_directory, &[&trimmed[value_start..value_end]]);
+        let target = resolve_path(&source_directory, &[reference]);
         let target = change_extension(&target, declaration_emit_extension(&target));
         let rewritten = relative_path(&declaration_directory, &target);
         output.push_str("/// <reference path=\"");
@@ -1976,6 +1981,17 @@ fn preserved_reference_directives(source: &SourceFile, declaration_file: &str) -
         output.push_str("\" preserve=\"true\" />\n");
     }
     output
+}
+
+fn preserved_reference_value<'a>(directive: &'a str, attribute: &str) -> Option<&'a str> {
+    let start = directive.find(&format!("{attribute}="))? + attribute.len() + 1;
+    let quote = directive.as_bytes().get(start).copied().map(char::from)?;
+    if !matches!(quote, '\'' | '"') {
+        return None;
+    }
+    let value_start = start + 1;
+    let value_end = directive[value_start..].find(quote)? + value_start;
+    Some(&directive[value_start..value_end])
 }
 
 fn has_unserializable_isolated_declaration_name(source: &SourceFile) -> bool {
@@ -2259,6 +2275,30 @@ fn declaration_is_nested_in_runtime_block(
     false
 }
 
+fn private_type_query_name(source: &SourceFile, root: NodeId) -> Option<String> {
+    let root = source.parse.arena.get(root)?;
+    source.parse.arena.iter().find_map(|(_, node)| {
+        if node.range.start < root.range.start || node.range.end > root.range.end {
+            return None;
+        }
+        let NodeData::TypeQueryNode(query) = &node.data else {
+            return None;
+        };
+        let (identifier, name) = leftmost_entity_identifier(&source.parse.arena, query.expr_name)?;
+        let symbol = source.binding.resolve_name_at(identifier, name)?;
+        let symbol = source.binding.symbols.get(symbol)?;
+        (!symbol.declarations.is_empty()
+            && symbol.declarations.iter().all(|declaration| {
+                declaration_is_nested_in_runtime_block(
+                    &source.parse.arena,
+                    *declaration,
+                    source.parse.source_file,
+                )
+            }))
+        .then(|| name.to_owned())
+    })
+}
+
 fn emit_diagnostic(source_file: &SourceFile, error: &ts_printer::EmitError) -> ProgramDiagnostic {
     ProgramDiagnostic {
         file_name: Some(source_file.file_name.clone()),
@@ -2313,6 +2353,21 @@ fn add_nonportable_inferred_type_diagnostics(source: &SourceFile, checking: &mut
             else {
                 continue;
             };
+            if let Some(annotation) = declaration.type_
+                && let Some(private_name) = private_type_query_name(source, annotation)
+                && let Some(name) = identifier_text(&source.parse.arena, declaration.name)
+            {
+                let message =
+                    message_by_code(4025).expect("TS4025 must be in the diagnostic catalog");
+                checking.diagnostics.push(CheckDiagnostic {
+                    node: declaration.name,
+                    diagnostic: Diagnostic::with_arguments(
+                        message,
+                        [name.to_owned(), private_name],
+                    ),
+                });
+                continue;
+            }
             if declaration.type_.is_some() {
                 continue;
             }
@@ -4190,8 +4245,17 @@ mod tests {
         fs.write_file("/project/dep.ts", "export interface Dep {}")
             .unwrap();
         fs.write_file(
+            "/project/node_modules/@types/pkg/index.d.ts",
+            "declare interface PackageType {}",
+        )
+        .unwrap();
+        fs.write_file(
             "/project/main.ts",
-            "///<reference path='dep.ts' preserve=\"true\" />\nexport const value = 1;",
+            concat!(
+                "///<reference path='dep.ts' preserve=\"true\" />\n",
+                "///<reference types='pkg' preserve=\"true\" />\n",
+                "export const value = 1;",
+            ),
         )
         .unwrap();
         let program = Program::new_with_options(
@@ -4212,9 +4276,10 @@ mod tests {
             .find(|file| file.file_name == "/project/main.d.ts")
             .unwrap();
         assert!(
-            declaration
-                .text
-                .starts_with("/// <reference path=\"dep.d.ts\" preserve=\"true\" />\n"),
+            declaration.text.starts_with(concat!(
+                "/// <reference path=\"dep.d.ts\" preserve=\"true\" />\n",
+                "/// <reference types=\"pkg\" preserve=\"true\" />\n",
+            )),
             "{}",
             declaration.text
         );
@@ -7662,6 +7727,42 @@ mod tests {
                 target: ScriptTarget::Es2015,
                 ..CompilerOptions::default()
             },
+        );
+        assert!(
+            !program
+                .emit()
+                .files
+                .iter()
+                .any(|file| file.file_name == "/project/main.d.ts")
+        );
+    }
+
+    #[test]
+    fn block_scoped_private_type_query_reports_exported_variable() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/main.ts",
+            "{ var a = \"\"; } export let b: typeof a;",
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["main.ts".to_owned()],
+            CompilerOptions {
+                declaration: true,
+                emit_declaration_only: true,
+                no_lib: true,
+                target: ScriptTarget::Es2015,
+                ..CompilerOptions::default()
+            },
+        );
+
+        assert!(
+            program
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code == Some(4025))
         );
         assert!(
             !program
