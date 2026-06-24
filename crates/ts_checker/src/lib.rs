@@ -1285,7 +1285,13 @@ impl<'a> ProgramChecker<'a> {
             parent = parent_symbol.parent;
         }
         names.reverse();
-        Some(name_constructor_return(descriptor, &names.join(".")))
+        let name = names.join(".");
+        let descriptor = name_constructor_return(descriptor, &name);
+        Some(TypeDescriptor::Named {
+            name: format!("typeof {name}"),
+            type_arguments: Vec::new(),
+            target: Box::new(descriptor),
+        })
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1908,6 +1914,7 @@ impl<'a> ProgramChecker<'a> {
         };
         runtime_meanings =
             self.collect_import_runtime_meanings(source_index, source, &file.statements.nodes);
+        let mut import_equals_qualifiers = HashMap::<String, String>::new();
         for statement in &file.statements.nodes {
             if let Some(NodeData::ImportEqualsDeclaration(import)) =
                 source.arena.get(*statement).map(|node| &node.data)
@@ -1925,6 +1932,7 @@ impl<'a> ProgramChecker<'a> {
                     preliminary,
                     completed,
                 );
+                let exported_names = module_exports.keys().cloned().collect::<BTreeSet<_>>();
                 let mut descriptor = module_exports.get("export=").cloned().unwrap_or_else(|| {
                     TypeDescriptor::Object {
                         properties: module_exports,
@@ -1978,7 +1986,15 @@ impl<'a> ProgramChecker<'a> {
                     descriptor = TypeDescriptor::ConstEnum(Box::new(descriptor));
                 }
                 if let Some(local_name) = identifier_text(source.arena, import.name) {
-                    rewrite_named_descriptor_qualifier(&mut descriptor, local_name);
+                    let qualifier = import_equals_qualifiers
+                        .entry(specifier.to_owned())
+                        .or_insert_with(|| local_name.to_owned())
+                        .clone();
+                    rewrite_exported_named_descriptor_qualifier(
+                        &mut descriptor,
+                        &qualifier,
+                        &exported_names,
+                    );
                 }
                 if specifier.starts_with('.')
                     && let Some((source_path, target_path)) =
@@ -2307,6 +2323,44 @@ impl<'a> ProgramChecker<'a> {
         result: &CheckResult,
         symbol_id: SymbolId,
     ) -> Option<TypeDescriptor> {
+        fn namespace_members(
+            source: &ProgramSource<'_>,
+            symbol: &ts_binder::Symbol,
+        ) -> BTreeMap<String, SymbolId> {
+            let mut members = symbol
+                .members
+                .iter()
+                .map(|(name, member)| (name.to_owned(), member))
+                .collect::<BTreeMap<_, _>>();
+            for declaration in &symbol.declarations {
+                let Some(NodeData::ModuleDeclaration(module)) =
+                    source.arena.get(*declaration).map(|node| &node.data)
+                else {
+                    continue;
+                };
+                let Some(body) = module.body else {
+                    continue;
+                };
+                let Some(NodeData::ModuleDeclaration(nested)) =
+                    source.arena.get(body).map(|node| &node.data)
+                else {
+                    continue;
+                };
+                let Some(name) = identifier_text(source.arena, nested.name) else {
+                    continue;
+                };
+                if let Some(member) = source
+                    .bindings
+                    .node_symbols
+                    .get(&nested.name)
+                    .or_else(|| source.bindings.node_symbols.get(&body))
+                {
+                    members.entry(name.to_owned()).or_insert(*member);
+                }
+            }
+            members
+        }
+
         #[derive(Clone, Copy)]
         enum Task {
             Enter(SymbolId),
@@ -2333,7 +2387,7 @@ impl<'a> ProgramChecker<'a> {
                         .flags
                         .contains(ts_binder::SymbolFlags::NAMESPACE_MODULE)
                     {
-                        for (_, member) in symbol.members.iter() {
+                        for (_, member) in namespace_members(source, symbol) {
                             if !visiting.contains(&member) && !descriptors.contains_key(&member) {
                                 stack.push(Task::Enter(member));
                             }
@@ -2346,9 +2400,8 @@ impl<'a> ProgramChecker<'a> {
                             .flags
                             .contains(ts_binder::SymbolFlags::NAMESPACE_MODULE)
                             .then(|| TypeDescriptor::Object {
-                                properties: symbol
-                                    .members
-                                    .iter()
+                                properties: namespace_members(source, symbol)
+                                    .into_iter()
                                     .filter_map(|(name, member)| {
                                         Self::describe_namespace_member_value(source, member)
                                             .or_else(|| {
@@ -2357,7 +2410,7 @@ impl<'a> ProgramChecker<'a> {
                                                     .and_then(Option::as_ref)
                                                     .cloned()
                                             })
-                                            .map(|descriptor| (name.to_owned(), descriptor))
+                                            .map(|descriptor| (name.clone(), descriptor))
                                     })
                                     .collect(),
                                 property_order: Vec::new(),
@@ -2676,22 +2729,18 @@ fn name_constructor_return(descriptor: TypeDescriptor, name: &str) -> TypeDescri
     }
 }
 
-fn rewrite_named_descriptor_qualifier(descriptor: &mut TypeDescriptor, qualifier: &str) {
-    rewrite_named_descriptor_qualifier_matching(descriptor, qualifier, None);
-}
-
 fn rewrite_exported_named_descriptor_qualifier(
     descriptor: &mut TypeDescriptor,
     qualifier: &str,
     exported_names: &BTreeSet<String>,
 ) {
-    rewrite_named_descriptor_qualifier_matching(descriptor, qualifier, Some(exported_names));
+    rewrite_named_descriptor_qualifier_matching(descriptor, qualifier, exported_names);
 }
 
 fn rewrite_named_descriptor_qualifier_matching(
     descriptor: &mut TypeDescriptor,
     qualifier: &str,
-    exported_names: Option<&BTreeSet<String>>,
+    exported_names: &BTreeSet<String>,
 ) {
     match descriptor {
         TypeDescriptor::Named {
@@ -2699,22 +2748,18 @@ fn rewrite_named_descriptor_qualifier_matching(
             type_arguments,
             target,
         } => {
-            if let Some(exported_names) = exported_names {
-                let (type_query, referenced_name) = name
-                    .strip_prefix("typeof ")
-                    .map_or((false, name.as_str()), |name| (true, name));
-                let root = referenced_name
-                    .split_once('.')
-                    .map_or(referenced_name, |(root, _)| root);
-                if exported_names.contains(root) {
-                    *name = if type_query {
-                        format!("typeof {qualifier}.{referenced_name}")
-                    } else {
-                        format!("{qualifier}.{referenced_name}")
-                    };
-                }
-            } else if let Some((_, suffix)) = name.split_once('.') {
-                *name = format!("{qualifier}.{suffix}");
+            let (type_query, referenced_name) = name
+                .strip_prefix("typeof ")
+                .map_or((false, name.as_str()), |name| (true, name));
+            let root = referenced_name
+                .split_once('.')
+                .map_or(referenced_name, |(root, _)| root);
+            if exported_names.contains(root) {
+                *name = if type_query {
+                    format!("typeof {qualifier}.{referenced_name}")
+                } else {
+                    format!("{qualifier}.{referenced_name}")
+                };
             }
             for argument in type_arguments {
                 rewrite_named_descriptor_qualifier_matching(argument, qualifier, exported_names);
@@ -2942,22 +2987,36 @@ impl<'a> Checker<'a> {
         self.result
     }
 
+    #[allow(clippy::too_many_lines)]
     fn exported_inferred_type_names(&self) -> BTreeSet<String> {
         fn visit(
             result: &CheckResult,
             type_id: TypeId,
             names: &mut BTreeSet<String>,
             visited: &mut HashSet<TypeId>,
+            local_import_equals_names: &BTreeSet<String>,
         ) {
             if !visited.insert(type_id) {
                 return;
             }
             if let Some(reference) = result.named_type_references.get(&type_id) {
-                if !result.import_type_references.contains_key(&type_id) {
+                let root = reference
+                    .name
+                    .split_once('.')
+                    .map_or(reference.name.as_str(), |(root, _)| root);
+                if !result.import_type_references.contains_key(&type_id)
+                    || local_import_equals_names.contains(root)
+                {
                     names.insert(reference.name.clone());
                 }
                 for argument in &reference.type_arguments {
-                    visit(result, *argument, names, visited);
+                    visit(
+                        result,
+                        *argument,
+                        names,
+                        visited,
+                        local_import_equals_names,
+                    );
                 }
             }
             let Some(kind) = result.types.get(type_id).map(|type_| &type_.kind) else {
@@ -2967,45 +3026,69 @@ impl<'a> Checker<'a> {
                 TypeKind::TypeParameter {
                     constraint: Some(constraint),
                     ..
-                } => visit(result, *constraint, names, visited),
-                TypeKind::Array(element) => visit(result, *element, names, visited),
+                } => visit(
+                    result,
+                    *constraint,
+                    names,
+                    visited,
+                    local_import_equals_names,
+                ),
+                TypeKind::Array(element) => visit(
+                    result,
+                    *element,
+                    names,
+                    visited,
+                    local_import_equals_names,
+                ),
                 TypeKind::Tuple(elements)
                 | TypeKind::ReadonlyTuple(elements)
                 | TypeKind::Union(elements)
                 | TypeKind::Intersection(elements) => {
                     for element in elements {
-                        visit(result, *element, names, visited);
+                        visit(result, *element, names, visited, local_import_equals_names);
                     }
                 }
                 TypeKind::Object(object) => {
                     for property in object.properties.values() {
-                        visit(result, *property, names, visited);
+                        visit(result, *property, names, visited, local_import_equals_names);
                     }
                     for index in [object.string_index_type, object.number_index_type]
                         .into_iter()
                         .flatten()
                     {
-                        visit(result, index, names, visited);
+                        visit(result, index, names, visited, local_import_equals_names);
                     }
                 }
                 TypeKind::Function(signature) | TypeKind::Constructor(signature) => {
                     for parameter in &signature.parameters {
-                        visit(result, *parameter, names, visited);
+                        visit(result, *parameter, names, visited, local_import_equals_names);
                     }
                     if let Some(rest) = signature.rest_parameter {
-                        visit(result, rest, names, visited);
+                        visit(result, rest, names, visited, local_import_equals_names);
                     }
-                    visit(result, signature.return_type, names, visited);
+                    visit(
+                        result,
+                        signature.return_type,
+                        names,
+                        visited,
+                        local_import_equals_names,
+                    );
                 }
                 TypeKind::Overload(signatures) => {
                     for signature in signatures {
                         for parameter in &signature.parameters {
-                            visit(result, *parameter, names, visited);
+                            visit(result, *parameter, names, visited, local_import_equals_names);
                         }
                         if let Some(rest) = signature.rest_parameter {
-                            visit(result, rest, names, visited);
+                            visit(result, rest, names, visited, local_import_equals_names);
                         }
-                        visit(result, signature.return_type, names, visited);
+                        visit(
+                            result,
+                            signature.return_type,
+                            names,
+                            visited,
+                            local_import_equals_names,
+                        );
                     }
                 }
                 _ => {}
@@ -3014,6 +3097,20 @@ impl<'a> Checker<'a> {
 
         let mut names = BTreeSet::new();
         let mut visited = HashSet::new();
+        let local_import_equals_names = self
+            .bindings
+            .symbols
+            .iter()
+            .filter(|symbol| {
+                symbol.declarations.iter().any(|declaration| {
+                    matches!(
+                        self.arena.get(*declaration).map(|node| &node.data),
+                        Some(NodeData::ImportEqualsDeclaration(_))
+                    )
+                })
+            })
+            .map(|symbol| symbol.name.clone())
+            .collect::<BTreeSet<_>>();
         for (_, symbol) in self.bindings.exports.iter() {
             let requires_inferred_reachability =
                 self.bindings.symbols.get(symbol).is_some_and(|symbol| {
@@ -3033,7 +3130,13 @@ impl<'a> Checker<'a> {
                 continue;
             }
             if let Some(type_id) = self.result.symbol_types.get(&symbol) {
-                visit(&self.result, *type_id, &mut names, &mut visited);
+                visit(
+                    &self.result,
+                    *type_id,
+                    &mut names,
+                    &mut visited,
+                    &local_import_equals_names,
+                );
             }
         }
         names
@@ -14414,6 +14517,20 @@ impl<'a> DeclarationReachability<'a> {
                     }
                     NodeData::SpreadAssignment(spread) => {
                         self.retain_expression_root(spread.expression);
+                    }
+                    NodeData::PropertyDeclaration(property)
+                        if self.modifiers_have(
+                            property.modifiers.as_ref(),
+                            SyntaxKind::PrivateKeyword,
+                        ) =>
+                    {
+                        if matches!(
+                            self.arena.get(property.name).map(|node| &node.data),
+                            Some(NodeData::ComputedPropertyName(_))
+                        ) {
+                            stack.push(property.name);
+                        }
+                        continue;
                     }
                     NodeData::PropertyDeclaration(property)
                         if property.type_.is_none() && property.initializer.is_some() =>

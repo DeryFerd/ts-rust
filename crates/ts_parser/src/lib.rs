@@ -3487,7 +3487,13 @@ impl<'a> Parser<'a> {
             let value = if self.current.kind == SyntaxKind::StringLiteral {
                 self.parse_string_literal()
             } else {
-                self.parse_identifier_name("Expected an import attribute value.")
+                let value = self.parse_binary_expression(2);
+                let range = self
+                    .arena
+                    .get(value)
+                    .map_or(TextRange::new(start, start), |node| node.range);
+                self.error_code_at(range, 2858, []);
+                value
             };
             attributes.push(self.alloc_node(
                 SyntaxKind::ImportAttribute,
@@ -3715,6 +3721,40 @@ impl<'a> Parser<'a> {
             NodeData::Token(Box::new(TokenData)),
             &[],
         );
+        let class_modifier_before_import = if matches!(
+            self.current.kind,
+            SyntaxKind::PublicKeyword
+                | SyntaxKind::PrivateKeyword
+                | SyntaxKind::ProtectedKeyword
+                | SyntaxKind::StaticKeyword
+                | SyntaxKind::ReadonlyKeyword
+        ) {
+            let checkpoint = self.scanner.mark();
+            let mut kind = self.current.kind;
+            while matches!(
+                kind,
+                SyntaxKind::PublicKeyword
+                    | SyntaxKind::PrivateKeyword
+                    | SyntaxKind::ProtectedKeyword
+                    | SyntaxKind::StaticKeyword
+                    | SyntaxKind::ReadonlyKeyword
+            ) {
+                kind = self.scanner.scan().kind;
+            }
+            self.scanner.rewind(checkpoint);
+            kind == SyntaxKind::ImportKeyword
+        } else {
+            false
+        };
+        if class_modifier_before_import {
+            let mut import_modifiers = vec![export_modifier];
+            while self.current.kind != SyntaxKind::ImportKeyword {
+                import_modifiers.push(self.consume_token_node());
+            }
+            let declaration = self.parse_statement();
+            self.attach_modifiers(declaration, import_modifiers, start);
+            return declaration;
+        }
         let is_type_only = self.current.kind == SyntaxKind::TypeKeyword
             && matches!(
                 self.next_token_kind(),

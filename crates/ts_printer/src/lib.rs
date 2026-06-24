@@ -1052,6 +1052,7 @@ pub fn emit_source_file_with_context(
         }
     }
     let needs_synthesized_empty_export = preserves_external_module_syntax
+        && settings.module != ModuleKind::Preserve
         && (!has_emitted_module_indicator || has_empty_export || has_recovered_module_clause);
     if needs_synthesized_empty_export {
         printer.emit_source_comments_between_with_ownership(
@@ -2543,11 +2544,13 @@ pub fn emit_declaration_file_with_semantics(
     let mut deferred_javascript_namespaces = Vec::new();
     if printer.javascript_source {
         for statement in &data.statements.nodes {
-            if matches!(
-                printer.arena.get(*statement).map(|node| &node.data),
-                Some(NodeData::ImportDeclaration(_) | NodeData::ImportEqualsDeclaration(_))
-            ) {
-                printer.emit_statement(*statement, false, source_file)?;
+            match printer.arena.get(*statement).map(|node| &node.data) {
+                Some(NodeData::ImportDeclaration(import))
+                    if printer.import_is_used_by_synthetic_class_base(*statement, import) => {}
+                Some(NodeData::ImportDeclaration(_) | NodeData::ImportEqualsDeclaration(_)) => {
+                    printer.emit_statement(*statement, false, source_file)?;
+                }
+                _ => {}
             }
         }
         for statement in &data.statements.nodes {
@@ -2580,6 +2583,16 @@ pub fn emit_declaration_file_with_semantics(
     }
     for statement in deferred_javascript_namespaces {
         printer.emit_statement(statement, false, source_file)?;
+    }
+    if printer.javascript_source {
+        for statement in &data.statements.nodes {
+            if let Some(NodeData::ImportDeclaration(import)) =
+                printer.arena.get(*statement).map(|node| &node.data)
+                && printer.import_is_used_by_synthetic_class_base(*statement, import)
+            {
+                printer.emit_javascript_synthetic_class_base_imports(*statement, import)?;
+            }
+        }
     }
     if !remove_comments {
         let trailing_start = data
@@ -4783,6 +4796,9 @@ impl DeclarationPrinter<'_> {
             Some(NodeData::Identifier(_) | NodeData::PropertyAccessExpression(_)) => {
                 let (type_id, argument) = self.recovered_heritage_call(expression)?;
                 (Some(type_id), argument)
+            }
+            Some(NodeData::ExpressionWithTypeArguments(_) | NodeData::QualifiedName(_)) => {
+                return None;
             }
             _ => (Some(self.node_types?.get(&expression).copied()?), None),
         };
@@ -17304,6 +17320,90 @@ impl DeclarationPrinter<'_> {
         Ok(())
     }
 
+    fn emit_javascript_synthetic_class_base_imports(
+        &mut self,
+        import_id: NodeId,
+        data: &ts_ast::ImportDeclarationData,
+    ) -> Result<(), EmitError> {
+        let Some(NodeData::ImportClause(clause)) = data
+            .import_clause
+            .and_then(|clause| self.arena.get(clause))
+            .map(|node| &node.data)
+        else {
+            return Ok(());
+        };
+        let module_specifier = |printer: &mut Self| -> Result<(), EmitError> {
+            match printer
+                .arena
+                .get(data.module_specifier)
+                .map(|node| &node.data)
+            {
+                Some(NodeData::StringLiteral(literal)) => {
+                    printer.write_source_quoted_string(data.module_specifier, &literal.text);
+                    Ok(())
+                }
+                _ => printer.emit_name(data.module_specifier),
+            }
+        };
+        if let Some(name) = clause.name
+            && let Some(text) = declaration_name_text(self.arena, name)
+            && self.import_binding_is_used_by_synthetic_class_base(import_id, text)
+        {
+            self.writer.write("import ");
+            self.emit_name(name)?;
+            self.writer.write(" from ");
+            module_specifier(self)?;
+            self.writer.write(";");
+            self.writer.newline();
+        }
+        match clause
+            .named_bindings
+            .and_then(|bindings| self.arena.get(bindings))
+            .map(|node| &node.data)
+        {
+            Some(NodeData::NamespaceImport(namespace)) => {
+                let Some(text) = declaration_name_text(self.arena, namespace.name) else {
+                    return Ok(());
+                };
+                if self.import_binding_is_used_by_synthetic_class_base(import_id, text) {
+                    self.writer.write("import * as ");
+                    self.emit_name(namespace.name)?;
+                    self.writer.write(" from ");
+                    module_specifier(self)?;
+                    self.writer.write(";");
+                    self.writer.newline();
+                }
+            }
+            Some(NodeData::NamedImports(imports)) => {
+                for specifier in &imports.elements.nodes {
+                    let Some(NodeData::ImportSpecifier(specifier)) =
+                        self.arena.get(*specifier).map(|node| &node.data)
+                    else {
+                        continue;
+                    };
+                    let Some(local) = declaration_name_text(self.arena, specifier.name) else {
+                        continue;
+                    };
+                    if !self.import_binding_is_used_by_synthetic_class_base(import_id, local) {
+                        continue;
+                    }
+                    self.writer.write("import { ");
+                    if let Some(imported) = specifier.property_name {
+                        self.emit_name(imported)?;
+                        self.writer.write(" as ");
+                    }
+                    self.emit_name(specifier.name)?;
+                    self.writer.write(" } from ");
+                    module_specifier(self)?;
+                    self.writer.write(";");
+                    self.writer.newline();
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     fn declaration_import_emits(
         &self,
         import_id: NodeId,
@@ -17519,6 +17619,9 @@ impl DeclarationPrinter<'_> {
         _import_id: NodeId,
         name: &str,
     ) -> bool {
+        if !self.javascript_source {
+            return false;
+        }
         self.arena.iter().any(|(_, node)| {
             let NodeData::ClassDeclaration(class) = &node.data else {
                 return false;
@@ -17540,15 +17643,6 @@ impl DeclarationPrinter<'_> {
                             else {
                                 return false;
                             };
-                            let parsed_call = matches!(
-                                self.arena.get(heritage.expression).map(|node| &node.data),
-                                Some(NodeData::CallExpression(_))
-                            );
-                            if !parsed_call
-                                && self.recovered_heritage_call(heritage.expression).is_none()
-                            {
-                                return false;
-                            }
                             declaration_name_text(self.arena, heritage.expression) == Some(name)
                                 || self.raw_heritage_argument(heritage.expression).as_deref()
                                     == Some(name)
@@ -18013,12 +18107,15 @@ fn declaration_is_module_indicator(arena: &NodeArena, node: &Node) -> bool {
         | NodeData::ExportDeclaration(_)
         | NodeData::ExportAssignment(_)
         | NodeData::NotEmittedStatement(_) => true,
-        NodeData::ImportEqualsDeclaration(import) => matches!(
-            arena
-                .get(import.module_reference)
-                .map(|reference| &reference.data),
-            Some(NodeData::ExternalModuleReference(_))
-        ),
+        NodeData::ImportEqualsDeclaration(import) => {
+            declaration_has_modifier(arena, node, SyntaxKind::ExportKeyword)
+                || matches!(
+                    arena
+                        .get(import.module_reference)
+                        .map(|reference| &reference.data),
+                    Some(NodeData::ExternalModuleReference(_))
+                )
+        }
         _ => declaration_has_modifier(arena, node, SyntaxKind::ExportKeyword),
     }
 }
@@ -18789,12 +18886,14 @@ enum DownlevelBindingIndex {
 }
 
 impl SystemModulePlan {
+    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_lines)]
     fn analyze(
         arena: &NodeArena,
         bindings: &BindResult,
         data: &ts_ast::SourceFileData,
         import_runtime_meanings: &BTreeMap<NodeId, bool>,
+        runtime_import_equals: &HashSet<NodeId>,
         automatic_jsx: AutomaticJsxUsage,
         jsx: JsxEmit,
         runtime_modules: &HashSet<NodeId>,
@@ -18895,6 +18994,11 @@ impl SystemModulePlan {
                         export_star: true,
                     });
                 }
+                continue;
+            }
+            if matches!(node.data, NodeData::ImportEqualsDeclaration(_))
+                && !runtime_import_equals.contains(statement)
+            {
                 continue;
             }
             if import_runtime_meanings.get(statement) == Some(&false) {
@@ -20780,6 +20884,19 @@ impl Printer<'_> {
             self.bindings,
             data,
             self.import_runtime_meanings,
+            &data
+                .statements
+                .nodes
+                .iter()
+                .copied()
+                .filter(|statement| {
+                    matches!(
+                        self.arena.get(*statement).map(|node| &node.data),
+                        Some(NodeData::ImportEqualsDeclaration(import))
+                            if self.import_equals_has_runtime_use(*statement, import)
+                    )
+                })
+                .collect(),
             self.automatic_jsx,
             self.settings.jsx,
             &runtime_modules,
@@ -22166,9 +22283,7 @@ impl Printer<'_> {
                 }
                 NodeData::ImportEqualsDeclaration(import)
                     if exported
-                        && self.settings.module == ModuleKind::CommonJs
-                        && !self.is_external_import_equals(import)
-                        && self.import_equals_has_runtime_use(*statement, import) =>
+                        && !self.is_external_import_equals(import) =>
                 {
                     if let Some(name) = declaration_name_text(self.arena, import.name)
                         && seen.insert(name.to_owned())
@@ -22509,7 +22624,11 @@ impl Printer<'_> {
                 self.import_name_has_runtime_alias_chain(name, &mut HashSet::new())
             });
             self.internal_import_equals_has_runtime_value(import)
-                && (exported || used || export_equals_target || alias_chain)
+                && (!self.import_equals_is_namespace_member(import)
+                    || exported
+                    || used
+                    || export_equals_target
+                    || alias_chain)
         }
     }
 
@@ -22518,9 +22637,9 @@ impl Printer<'_> {
             let NodeData::ExportAssignment(assignment) = &self.arena.get(*statement)?.data else {
                 return None;
             };
-            (assignment.is_export_equals
-                && self.entity_has_runtime_value(assignment.expression, &mut HashSet::new()))
-            .then_some(assignment.expression)
+            assignment
+                .is_export_equals
+                .then_some(assignment.expression)
         })
     }
 
@@ -42006,9 +42125,7 @@ impl Printer<'_> {
             .copied()
             .or_else(|| self.bindings.node_symbols.get(declaration_id).copied())
             .or_else(|| self.bindings.resolve_name_at(declaration.name, name));
-        if self.export_initializer_follows_reference_owned_import(statement.declaration_list)
-            || !self.commonjs_export_initializer_can_be_direct(initializer)
-        {
+        if !self.commonjs_export_initializer_can_be_direct(initializer) {
             return Ok(false);
         }
         if let Some(symbol) = symbol {
@@ -42076,35 +42193,6 @@ impl Printer<'_> {
             self.writer.write(line.trim_start());
             self.writer.newline();
         }
-    }
-
-    fn export_initializer_follows_reference_owned_import(&self, list: NodeId) -> bool {
-        let Some(statement_start) = self
-            .arena
-            .get(list)
-            .and_then(|list| list.parent)
-            .and_then(|statement| self.arena.get(statement))
-            .map(|statement| statement.range.start.get())
-        else {
-            return false;
-        };
-        self.arena.iter().any(|(id, node)| {
-            if node.range.start.get() >= statement_start
-                || !matches!(
-                    node.data,
-                    NodeData::ImportDeclaration(_) | NodeData::ImportEqualsDeclaration(_)
-                )
-                || !self.statement_emits_runtime(id, node)
-            {
-                return false;
-            }
-            let prefix_end = usize::try_from(node.range.start.get()).unwrap_or(0);
-            self.source_text.get(..prefix_end).is_some_and(|prefix| {
-                prefix
-                    .lines()
-                    .any(|line| is_reference_directive(line.trim_start()))
-            })
-        })
     }
 
     fn emit_namespace_export_variable_initializers(
@@ -42691,9 +42779,6 @@ impl Printer<'_> {
         if node_is_missing_identifier(self.arena, import.module_specifier) {
             return false;
         }
-        if import.attributes.is_some() {
-            return true;
-        }
         let Some(clause_id) = import.import_clause else {
             return true;
         };
@@ -43259,7 +43344,12 @@ impl Printer<'_> {
         }
         match &node.data {
             NodeData::Identifier(data) => {
-                let symbol = (!self.class_expression_name_exclusions.contains(&id))
+                let is_declaration_name = node
+                    .parent
+                    .and_then(|parent| self.arena.get(parent))
+                    .is_some_and(|parent| identifier_is_declaration_name(id, parent));
+                let symbol = (!is_declaration_name
+                    && !self.class_expression_name_exclusions.contains(&id))
                     .then(|| self.bindings.resolve_name_at(id, &data.text))
                     .flatten();
                 if let Some(rewrite) = symbol

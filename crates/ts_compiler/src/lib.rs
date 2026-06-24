@@ -536,20 +536,28 @@ impl Program {
                 let fixed_es_module = [".mts", ".mjs"]
                     .iter()
                     .any(|extension| lower_file_name.ends_with(extension));
-                let fixed_module_format = fixed_es_module
-                    || [".cts", ".cjs"]
-                        .iter()
-                        .any(|extension| lower_file_name.ends_with(extension));
-                if fixed_module_format
-                    || matches!(
-                        source_settings.module,
-                        ModuleKind::Node16
-                            | ModuleKind::Node18
-                            | ModuleKind::Node20
-                            | ModuleKind::NodeNext
-                    )
-                {
+                let fixed_commonjs_module = [".cts", ".cjs"]
+                    .iter()
+                    .any(|extension| lower_file_name.ends_with(extension));
+                if matches!(
+                    source_settings.module,
+                    ModuleKind::Node16
+                        | ModuleKind::Node18
+                        | ModuleKind::Node20
+                        | ModuleKind::NodeNext
+                ) {
                     source_settings.module = source_file.implied_node_format;
+                } else if source_settings.module == ModuleKind::CommonJs && fixed_es_module {
+                    source_settings.module = ModuleKind::EsNext;
+                } else if matches!(
+                    source_settings.module,
+                    ModuleKind::Es2015
+                        | ModuleKind::Es2020
+                        | ModuleKind::Es2022
+                        | ModuleKind::EsNext
+                ) && fixed_commonjs_module
+                {
+                    source_settings.module = ModuleKind::CommonJs;
                 }
                 let amd_dependencies = source_file
                     .parse

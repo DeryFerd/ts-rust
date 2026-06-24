@@ -334,6 +334,11 @@ fn parse_baseline_section_list(baseline: &str) -> Vec<(String, String)> {
     let mut current_text = String::new();
     for line in normalized.split_inclusive('\n') {
         let marker = line.trim_end_matches(['\r', '\n']);
+        if marker.starts_with("!!!! File ")
+            && marker.contains("differs from original emit in noCheck emit")
+        {
+            break;
+        }
         if let Some(name) = marker
             .strip_prefix("//// [")
             .and_then(|marker| marker.split_once(']').map(|(name, _)| name))
