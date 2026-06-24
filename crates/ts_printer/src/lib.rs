@@ -273,6 +273,7 @@ pub fn emit_source_file_with_context(
         generated_names: GeneratedNames::new(arena),
         runtime_identifier_uses: HashSet::new(),
         commonjs_default_imports: HashMap::new(),
+        commonjs_star_import_temps: HashMap::new(),
         commonjs_named_import_temps: HashMap::new(),
         commonjs_named_import_text_rewrites: HashMap::new(),
         commonjs_export_text_rewrites: HashMap::new(),
@@ -409,13 +410,23 @@ pub fn emit_source_file_with_context(
             .insert(factory_root.to_owned());
     }
     if settings.module == ModuleKind::CommonJs {
+        let (star_temps, star_rewrites, star_text_rewrites) = commonjs_star_imports(
+            arena,
+            &data.statements,
+            context.bindings,
+            &printer.runtime_identifier_uses,
+        );
+        printer
+            .generated_names
+            .used
+            .extend(star_temps.values().cloned());
+        printer.commonjs_star_import_temps = star_temps;
         printer.commonjs_default_imports = commonjs_default_imports(
             arena,
             &data.statements,
             context.bindings,
             &printer.runtime_identifier_uses,
-            context.import_runtime_meanings,
-            context.preserve_const_enums,
+            &printer.commonjs_star_import_temps,
         );
         printer
             .generated_names
@@ -427,13 +438,18 @@ pub fn emit_source_file_with_context(
             context.bindings,
             &printer.runtime_identifier_uses,
             &printer.commonjs_default_imports,
+            &printer.commonjs_star_import_temps,
         );
         printer
             .generated_names
             .used
             .extend(temps.values().cloned());
         printer.commonjs_named_import_temps = temps;
-        printer.commonjs_named_import_text_rewrites = text_rewrites;
+        printer.commonjs_named_import_text_rewrites = star_text_rewrites;
+        printer
+            .commonjs_named_import_text_rewrites
+            .extend(text_rewrites);
+        printer.identifier_rewrites.extend(star_rewrites);
         printer.identifier_rewrites.extend(rewrites);
     }
     printer.prepare_es5_block_scoped_rewrites();
@@ -447,11 +463,15 @@ pub fn emit_source_file_with_context(
         || (context.module_detection == ModuleDetectionKind::Auto && automatic_jsx.any());
     printer.is_external_module = is_external_module;
     let has_dynamic_import = source_has_dynamic_import(arena);
+    let needs_commonjs_imported_helper = settings.module == ModuleKind::CommonJs
+        && (printer.source_needs_import_star_helper(&data.statements)
+            || printer.source_needs_import_default_helper(&data.statements)
+            || source_needs_export_star_helper(arena, &data.statements));
     if settings.import_helpers
-        && !settings.no_emit_helpers
         && settings.module == ModuleKind::CommonJs
         && is_external_module
-        && ((settings.target < ScriptTarget::Es2017 && source_needs_awaiter_helper(arena))
+        && (needs_commonjs_imported_helper
+            || (settings.target < ScriptTarget::Es2017 && source_needs_awaiter_helper(arena))
             || (settings.target < ScriptTarget::Es2015
                 && source_needs_downlevel_generator_helper(arena)))
     {
@@ -590,12 +610,16 @@ pub fn emit_source_file_with_context(
         && settings.module == ModuleKind::CommonJs
         && is_external_module
         && !settings.no_emit_helpers
+        && printer.import_helpers_namespace.is_none()
         && printer.source_needs_import_star_helper(&data.statements);
     if preemit_isolated_metadata_import_star {
         printer.emit_create_binding_helper();
         printer.emit_set_module_default_helper();
     }
-    if needs_dynamic_import_helpers && !settings.no_emit_helpers {
+    if needs_dynamic_import_helpers
+        && !settings.no_emit_helpers
+        && printer.import_helpers_namespace.is_none()
+    {
         printer.emit_create_binding_helper();
         printer.emit_import_star_helper();
     }
@@ -749,10 +773,15 @@ pub fn emit_source_file_with_context(
             && !needs_dynamic_import_helpers
             && !preemit_isolated_metadata_import_star
             && !settings.no_emit_helpers
+            && printer.import_helpers_namespace.is_none()
         {
             printer.emit_create_binding_helper();
         }
-        if needs_import_star_helper && !needs_dynamic_import_helpers && !settings.no_emit_helpers {
+        if needs_import_star_helper
+            && !needs_dynamic_import_helpers
+            && !settings.no_emit_helpers
+            && printer.import_helpers_namespace.is_none()
+        {
             if preemit_isolated_metadata_import_star {
                 printer.emit_import_star_helper_body();
                 printer.emit_metadata_helper();
@@ -760,10 +789,16 @@ pub fn emit_source_file_with_context(
                 printer.emit_import_star_helper();
             }
         }
-        if needs_export_star_helper {
+        if needs_export_star_helper
+            && !settings.no_emit_helpers
+            && printer.import_helpers_namespace.is_none()
+        {
             printer.emit_export_star_helper();
         }
-        if !printer.commonjs_default_imports.is_empty() && !settings.no_emit_helpers {
+        if printer.source_needs_import_default_helper(&data.statements)
+            && !settings.no_emit_helpers
+            && printer.import_helpers_namespace.is_none()
+        {
             printer.emit_import_default_helper();
         }
         printer.prepare_source_class_expression_temps(source_file);
@@ -1497,29 +1532,148 @@ fn source_needs_export_star_helper(arena: &NodeArena, statements: &NodeList) -> 
     })
 }
 
-fn commonjs_default_imports(
+#[allow(clippy::too_many_lines)]
+fn commonjs_star_imports(
     arena: &NodeArena,
     statements: &NodeList,
     bindings: &BindResult,
     runtime_identifier_uses: &HashSet<String>,
-    import_runtime_meanings: &BTreeMap<NodeId, bool>,
-    preserve_const_enums: bool,
-) -> HashMap<String, String> {
-    let mut imports = HashMap::new();
+) -> (
+    HashMap<NodeId, String>,
+    HashMap<SymbolId, String>,
+    HashMap<String, String>,
+) {
+    let mut temps = HashMap::new();
+    let mut rewrites = HashMap::new();
+    let mut text_rewrites = HashMap::new();
     let mut module_name_counts = HashMap::<String, usize>::new();
     for statement in &statements.nodes {
-        if import_runtime_meanings.get(statement) == Some(&false) && !preserve_const_enums {
-            continue;
-        }
         let Some(NodeData::ImportDeclaration(import)) =
             arena.get(*statement).map(|node| &node.data)
         else {
             continue;
         };
-        let Some(NodeData::ImportClause(clause)) = import
-            .import_clause
-            .and_then(|clause| arena.get(clause))
+        let Some(clause_id) = import.import_clause else {
+            continue;
+        };
+        let Some(NodeData::ImportClause(clause)) = arena.get(clause_id).map(|node| &node.data)
+        else {
+            continue;
+        };
+        if clause.phase_modifier == Some(SyntaxKind::TypeKeyword) {
+            continue;
+        }
+        let mut defaults = Vec::new();
+        let mut named = Vec::new();
+        if let Some(name) = clause.name
+            && binding_has_runtime_identifier_use(arena, bindings, name, runtime_identifier_uses)
+        {
+            defaults.push(name);
+        }
+        if let Some(NodeData::NamedImports(imports)) = clause
+            .named_bindings
+            .and_then(|named| arena.get(named))
             .map(|node| &node.data)
+        {
+            for specifier_id in &imports.elements.nodes {
+                let Some(NodeData::ImportSpecifier(specifier)) =
+                    arena.get(*specifier_id).map(|node| &node.data)
+                else {
+                    continue;
+                };
+                let local_is_reexported = declaration_name_text(arena, specifier.name)
+                    .is_some_and(|name| import_name_is_reexported(arena, name));
+                if specifier.is_type_only
+                    || (!local_is_reexported
+                        && !binding_has_runtime_identifier_use(
+                            arena,
+                            bindings,
+                            specifier.name,
+                            runtime_identifier_uses,
+                        ))
+                {
+                    continue;
+                }
+                let is_default = specifier.property_name.is_some_and(|property| {
+                    declaration_name_text(arena, property) == Some("default")
+                });
+                if is_default {
+                    defaults.push(specifier.name);
+                } else {
+                    let imported = specifier
+                        .property_name
+                        .and_then(|name| declaration_name_text(arena, name))
+                        .or_else(|| declaration_name_text(arena, specifier.name))
+                        .unwrap_or_default()
+                        .to_owned();
+                    named.push((specifier.name, imported));
+                }
+            }
+        }
+        if defaults.is_empty() && named.is_empty() {
+            continue;
+        }
+        let base = commonjs_module_temp_base(arena, import.module_specifier);
+        let count = module_name_counts.entry(base.clone()).or_default();
+        *count += 1;
+        if defaults.is_empty() || named.is_empty() {
+            continue;
+        }
+        let temp = format!("{base}_{count}");
+        temps.insert(clause_id, temp.clone());
+        for binding in defaults {
+            let Some(local) = declaration_name_text(arena, binding) else {
+                continue;
+            };
+            let access = format!("{temp}.default");
+            if let Some(symbol) = bindings
+                .node_symbols
+                .get(&binding)
+                .copied()
+                .or_else(|| bindings.resolve_name_at(binding, local))
+            {
+                rewrites.insert(symbol, access.clone());
+            }
+            text_rewrites.insert(local.to_owned(), access);
+        }
+        for (binding, imported) in named {
+            let Some(local) = declaration_name_text(arena, binding) else {
+                continue;
+            };
+            let access = commonjs_import_access(&temp, &imported);
+            if let Some(symbol) = bindings
+                .node_symbols
+                .get(&binding)
+                .copied()
+                .or_else(|| bindings.resolve_name_at(binding, local))
+            {
+                rewrites.insert(symbol, access.clone());
+            }
+            text_rewrites.insert(local.to_owned(), access);
+        }
+    }
+    (temps, rewrites, text_rewrites)
+}
+
+fn commonjs_default_imports(
+    arena: &NodeArena,
+    statements: &NodeList,
+    bindings: &BindResult,
+    runtime_identifier_uses: &HashSet<String>,
+    star_imports: &HashMap<NodeId, String>,
+) -> HashMap<String, String> {
+    let mut imports = HashMap::new();
+    let mut module_name_counts = HashMap::<String, usize>::new();
+    for statement in &statements.nodes {
+        let Some(NodeData::ImportDeclaration(import)) =
+            arena.get(*statement).map(|node| &node.data)
+        else {
+            continue;
+        };
+        let Some(clause_id) = import.import_clause else {
+            continue;
+        };
+        let Some(NodeData::ImportClause(clause)) = arena.get(clause_id).map(|node| &node.data)
         else {
             continue;
         };
@@ -1556,12 +1710,14 @@ fn commonjs_default_imports(
                 let is_default = specifier.property_name.is_some_and(|property| {
                     declaration_name_text(arena, property) == Some("default")
                 });
-                if binding_has_runtime_identifier_use(
+                if (binding_has_runtime_identifier_use(
                     arena,
                     bindings,
                     specifier.name,
                     runtime_identifier_uses,
-                ) && let Some(name) = declaration_name_text(arena, specifier.name)
+                ) || declaration_name_text(arena, specifier.name)
+                    .is_some_and(|name| import_name_is_reexported(arena, name)))
+                    && let Some(name) = declaration_name_text(arena, specifier.name)
                 {
                     if is_default {
                         local_names.push(name.to_owned());
@@ -1584,6 +1740,9 @@ fn commonjs_default_imports(
         let base = commonjs_module_temp_base(arena, import.module_specifier);
         let count = module_name_counts.entry(base.clone()).or_default();
         *count += 1;
+        if star_imports.contains_key(&clause_id) {
+            continue;
+        }
         let temp = format!("{base}_{count}");
         for local_name in local_names {
             imports.insert(local_name, temp.clone());
@@ -1633,6 +1792,7 @@ fn commonjs_named_imports(
     bindings: &BindResult,
     runtime_identifier_uses: &HashSet<String>,
     default_imports: &HashMap<String, String>,
+    star_imports: &HashMap<NodeId, String>,
 ) -> (
     HashMap<NodeId, String>,
     HashMap<SymbolId, String>,
@@ -1657,6 +1817,9 @@ fn commonjs_named_imports(
         let Some(clause_id) = import.import_clause else {
             continue;
         };
+        if star_imports.contains_key(&clause_id) {
+            continue;
+        }
         let Some(NodeData::ImportClause(clause)) = arena.get(clause_id).map(|node| &node.data)
         else {
             continue;
@@ -13448,6 +13611,15 @@ impl DeclarationPrinter<'_> {
             let syntactic_name = (!computed_name)
                 .then(|| declaration_name_text(self.arena, name_node))
                 .flatten();
+            let unquoted_string_name = self
+                .arena
+                .get(name_node)
+                .and_then(|node| match &node.data {
+                    NodeData::StringLiteral(literal) if is_identifier_text(&literal.text) => {
+                        Some(literal.text.clone())
+                    }
+                    _ => None,
+                });
             let Some(name) = syntactic_name.map(str::to_owned).or_else(|| {
                 matches!(
                     self.arena.get(name_node).map(|node| &node.data),
@@ -13495,7 +13667,9 @@ impl DeclarationPrinter<'_> {
                 if method && name == "new" {
                     write_quoted(&mut self.writer, "new");
                 } else if !self.emit_computed_literal_property_name(name_node)? {
-                    if syntactic_name.is_some() {
+                    if let Some(unquoted) = &unquoted_string_name {
+                        self.writer.write(unquoted);
+                    } else if syntactic_name.is_some() {
                         let previous = self.canonical_literal_quotes;
                         self.canonical_literal_quotes = false;
                         let result = self.emit_name(name_node);
@@ -13522,7 +13696,9 @@ impl DeclarationPrinter<'_> {
             if method && name == "new" {
                 write_quoted(&mut self.writer, "new");
             } else if !self.emit_computed_literal_property_name(name_node)? {
-                if syntactic_name.is_some() {
+                if let Some(unquoted) = &unquoted_string_name {
+                    self.writer.write(unquoted);
+                } else if syntactic_name.is_some() {
                     let previous = self.canonical_literal_quotes;
                     self.canonical_literal_quotes = false;
                     let result = self.emit_name(name_node);
@@ -16387,7 +16563,14 @@ impl DeclarationPrinter<'_> {
                 NodeData::ShorthandPropertyAssignment(property) => (property.name, property.name),
                 _ => continue,
             };
-            self.emit_name(name)?;
+            if let Some(NodeData::StringLiteral(literal)) =
+                self.arena.get(name).map(|node| &node.data)
+                && is_identifier_text(&literal.text)
+            {
+                self.writer.write(&literal.text);
+            } else {
+                self.emit_name(name)?;
+            }
             self.writer.write(": ");
             if let Some(name) = self.widened_primitive_name(value) {
                 self.writer.write(name);
@@ -18780,6 +18963,7 @@ struct Printer<'a> {
     generated_names: GeneratedNames,
     runtime_identifier_uses: HashSet<String>,
     commonjs_default_imports: HashMap<String, String>,
+    commonjs_star_import_temps: HashMap<NodeId, String>,
     commonjs_named_import_temps: HashMap<NodeId, String>,
     commonjs_named_import_text_rewrites: HashMap<String, String>,
     commonjs_export_text_rewrites: HashMap<String, String>,
@@ -19030,6 +19214,14 @@ impl Printer<'_> {
             self.writer.write(".");
         }
         self.writer.write("__generator");
+    }
+
+    fn emit_helper_reference(&mut self, helper: &str) {
+        if let Some(namespace) = &self.import_helpers_namespace {
+            self.writer.write(namespace);
+            self.writer.write(".");
+        }
+        self.writer.write(helper);
     }
 
     fn prepare_private_field_lowerings(&mut self) {
@@ -21299,6 +21491,9 @@ impl Printer<'_> {
         }
         self.export_specifier_target_has_runtime_value(specifier)
             || self
+                .commonjs_export_import_declaration(specifier_id)
+                .is_some()
+            || self
                 .commonjs_export_variable_declaration(specifier_id)
                 .is_some()
             || self
@@ -21371,7 +21566,8 @@ impl Printer<'_> {
                 false
             }
             NodeData::ExportAssignment(assignment) => {
-                self.entity_has_runtime_value(assignment.expression, &mut HashSet::new())
+                !assignment.is_export_equals
+                    || self.entity_has_runtime_value(assignment.expression, &mut HashSet::new())
             }
             NodeData::FunctionDeclaration(function) => function.body.is_some(),
             NodeData::ModuleDeclaration(module) => {
@@ -21677,6 +21873,10 @@ impl Printer<'_> {
         let Some(node) = self.arena.get(statement) else {
             return false;
         };
+        if let NodeData::ExportDeclaration(export) = &node.data {
+            return export.module_specifier.is_none()
+                && self.named_export_clause_has_runtime_specifier(export) == Some(true);
+        }
         if self.namespace_erases_external_module_statement(node) {
             return false;
         }
@@ -22038,6 +22238,7 @@ impl Printer<'_> {
             return Ok(());
         }
         if let NodeData::ExportAssignment(assignment) = &node.data
+            && assignment.is_export_equals
             && !self.entity_has_runtime_value(assignment.expression, &mut HashSet::new())
         {
             return Ok(());
@@ -35151,9 +35352,12 @@ impl Printer<'_> {
                                 ))
                     }
                     NodeData::PropertyDeclaration(property) => {
-                        self.property_is_auto_accessor(property)
+                        !self.has_modifier(
+                            property.modifiers.as_ref(),
+                            SyntaxKind::DeclareKeyword,
+                        ) && (self.property_is_auto_accessor(property)
                             || !lower_fields
-                            || self.property_is_native_private_field(property)
+                            || self.property_is_native_private_field(property))
                     }
                     NodeData::GetAccessorDeclaration(accessor) => accessor.body.is_some(),
                     NodeData::SetAccessorDeclaration(accessor) => accessor.body.is_some(),
@@ -35174,6 +35378,16 @@ impl Printer<'_> {
             previous_end = node.range.end.get();
             previous_emitted = current_emitted;
             if self.class_member_is_abstract(&node) {
+                continue;
+            }
+            if matches!(
+                &node.data,
+                NodeData::PropertyDeclaration(property)
+                    if self.has_modifier(
+                        property.modifiers.as_ref(),
+                        SyntaxKind::DeclareKeyword,
+                    )
+            ) {
                 continue;
             }
             match &node.data {
@@ -35869,7 +36083,11 @@ impl Printer<'_> {
     }
 
     fn class_field_emits_runtime_value(&self, property: &ts_ast::PropertyDeclarationData) -> bool {
-        property.initializer.is_some() || self.settings.use_define_for_class_fields == Some(true)
+        !self.has_modifier(
+            property.modifiers.as_ref(),
+            SyntaxKind::DeclareKeyword,
+        ) && (property.initializer.is_some()
+            || self.settings.use_define_for_class_fields == Some(true))
     }
 
     fn computed_property_requires_runtime_evaluation(
@@ -37637,7 +37855,7 @@ impl Printer<'_> {
         match &node.data {
             NodeData::Identifier(identifier) => {
                 self.writer.write(".");
-                self.writer.write(&identifier.text);
+                self.write_source_identifier(name, &identifier.text);
             }
             NodeData::PrivateIdentifier(identifier) => {
                 self.writer.write(".");
@@ -38333,6 +38551,9 @@ impl Printer<'_> {
             self.writer.write("exports.");
             self.writer.write(&name);
         } else {
+            if !self.is_external_import_equals(data) {
+                self.emit_runtime_declaration_modifiers(data.modifiers.as_ref());
+            }
             self.writer.write(if self.is_external_import_equals(data) {
                 self.variable_keyword()
             } else {
@@ -38447,6 +38668,17 @@ impl Printer<'_> {
         let runtime_bindings = clause
             .named_bindings
             .filter(|bindings| self.import_bindings_have_runtime_use(*bindings));
+        if let Some(temp) = self.commonjs_star_import_temps.get(&clause_id).cloned() {
+            self.writer.write(self.variable_keyword());
+            self.writer.write(" ");
+            self.writer.write(&temp);
+            self.writer.write(" = ");
+            self.emit_helper_reference("__importStar");
+            self.writer.write("(require(");
+            self.emit_commonjs_module_specifier(data.module_specifier)?;
+            self.writer.write("));");
+            return Ok(());
+        }
         let named_temp = self.commonjs_named_import_temps.get(&clause_id).cloned();
         let default_local = clause
             .name
@@ -38461,7 +38693,9 @@ impl Printer<'_> {
             self.writer.write(self.variable_keyword());
             self.writer.write(" ");
             self.writer.write(temp);
-            self.writer.write(" = __importDefault(require(");
+            self.writer.write(" = ");
+            self.emit_helper_reference("__importDefault");
+            self.writer.write("(require(");
             self.emit_commonjs_module_specifier(data.module_specifier)?;
             self.writer.write("));");
             if self.commonjs_has_non_default_bindings(runtime_bindings) {
@@ -38488,7 +38722,9 @@ impl Printer<'_> {
             self.writer.write(" ");
             if let NodeData::NamespaceImport(namespace) = &bindings_node.data {
                 self.emit_expression(namespace.name, 0)?;
-                self.writer.write(" = __importStar(require(");
+                self.writer.write(" = ");
+                self.emit_helper_reference("__importStar");
+                self.writer.write("(require(");
             } else {
                 self.writer.write("{ ");
                 self.emit_commonjs_named_imports(bindings)?;
@@ -38712,7 +38948,8 @@ impl Printer<'_> {
         data: &ts_ast::ExportDeclarationData,
     ) -> Result<(), EmitError> {
         let Some(clause) = data.export_clause else {
-            self.writer.write("__exportStar(require(");
+            self.emit_helper_reference("__exportStar");
+            self.writer.write("(require(");
             if let Some(module) = data.module_specifier {
                 self.emit_commonjs_module_specifier(module)?;
             } else {
@@ -38777,9 +39014,17 @@ impl Printer<'_> {
                 write_quoted(&mut self.writer, exported_name);
                 self.writer
                     .write(", { enumerable: true, get: function () { return ");
-                self.writer.write(module_temp);
-                self.writer.write(".");
-                self.emit_expression(specifier.property_name.unwrap_or(specifier.name), 0)?;
+                let imported = specifier.property_name.unwrap_or(specifier.name);
+                if declaration_name_text(self.arena, imported) == Some("default") {
+                    self.emit_helper_reference("__importDefault");
+                    self.writer.write("(");
+                    self.writer.write(module_temp);
+                    self.writer.write(").default");
+                } else {
+                    self.writer.write(module_temp);
+                    self.writer.write(".");
+                    self.emit_expression(imported, 0)?;
+                }
                 self.writer.write("; } });");
             } else {
                 self.writer.write("exports.");
@@ -38799,6 +39044,7 @@ impl Printer<'_> {
         statements: &NodeList,
     ) -> Result<(), EmitError> {
         if !self.import_semantically_has_runtime_value(import_declaration)
+            && !self.import_declaration_has_commonjs_runtime_plan(import_declaration)
             && !self.const_enum_emit_mode.preserves_declarations()
         {
             return Ok(());
@@ -39097,7 +39343,8 @@ impl Printer<'_> {
                                 | NodeData::ImportSpecifier(_)
                                 | NodeData::NamespaceImport(_)
                         )
-                    ) || !self.import_binding_has_runtime_value(*declaration)
+                    ) || (!self.import_binding_has_runtime_value(*declaration)
+                        && !self.import_binding_has_commonjs_runtime_plan(*declaration))
                     {
                         return None;
                     }
@@ -39113,12 +39360,41 @@ impl Printer<'_> {
                     _ => None,
                 }?;
                 if declaration_name_text(self.arena, binding_name) != Some(name)
-                    || !self.import_binding_has_runtime_value(declaration)
+                    || (!self.import_binding_has_runtime_value(declaration)
+                        && !self.import_binding_has_commonjs_runtime_plan(declaration))
                 {
                     return None;
                 }
                 self.containing_import_declaration(declaration)
             })
+        })
+    }
+
+    fn import_binding_has_commonjs_runtime_plan(&self, declaration: NodeId) -> bool {
+        let binding = match self.arena.get(declaration).map(|node| &node.data) {
+            Some(NodeData::ImportClause(import)) => import.name,
+            Some(NodeData::ImportSpecifier(import)) => Some(import.name),
+            Some(NodeData::NamespaceImport(import)) => Some(import.name),
+            _ => None,
+        };
+        let Some(binding) = binding else {
+            return false;
+        };
+        let Some(name) = declaration_name_text(self.arena, binding) else {
+            return false;
+        };
+        self.commonjs_default_imports.contains_key(name)
+            || self.commonjs_named_import_text_rewrites.contains_key(name)
+            || self
+                .bindings
+                .resolve_name_at(binding, name)
+                .is_some_and(|symbol| self.identifier_rewrites.contains_key(&symbol))
+    }
+
+    fn import_declaration_has_commonjs_runtime_plan(&self, declaration: NodeId) -> bool {
+        self.arena.iter().any(|(candidate, _)| {
+            self.containing_import_declaration(candidate) == Some(declaration)
+                && self.import_binding_has_commonjs_runtime_plan(candidate)
         })
     }
 
@@ -39726,6 +40002,14 @@ impl Printer<'_> {
         else {
             return false;
         };
+        if self.identifier_resolves_to_default_import(expression, &identifier.text)
+            && (self.commonjs_default_imports.contains_key(&identifier.text)
+                || self.bindings.resolve_name_at(expression, &identifier.text).is_some_and(
+                    |symbol| self.identifier_rewrites.contains_key(&symbol),
+                ))
+        {
+            return true;
+        }
         let Some(symbol) = self.bindings.resolve_name_at(expression, &identifier.text) else {
             return false;
         };
@@ -39739,7 +40023,10 @@ impl Printer<'_> {
                                 self.arena.get(*declaration).map(|node| &node.data),
                                 Some(NodeData::ImportSpecifier(specifier))
                                     if !specifier.is_type_only
-                                        && !self.commonjs_import_specifier_is_default(*declaration)
+                            ) || matches!(
+                                self.arena.get(*declaration).map(|node| &node.data),
+                                Some(NodeData::ImportClause(clause))
+                                    if clause.phase_modifier != Some(SyntaxKind::TypeKeyword)
                             )
                         })
                     })
@@ -40038,6 +40325,7 @@ impl Printer<'_> {
             Some(NodeData::NamespaceImport(_))
         ) && !self.import_semantically_has_runtime_value(declaration)
             && !self.const_enum_emit_mode.preserves_declarations()
+            && !self.import_clause_has_non_erased_runtime_reference(clause_id)
         {
             return false;
         }
@@ -40087,6 +40375,9 @@ impl Printer<'_> {
     }
 
     fn source_needs_import_star_helper(&self, statements: &NodeList) -> bool {
+        if !self.commonjs_star_import_temps.is_empty() {
+            return true;
+        }
         statements.nodes.iter().any(|statement| {
             let Some(NodeData::ImportDeclaration(import)) =
                 self.arena.get(*statement).map(|node| &node.data)
@@ -40112,6 +40403,37 @@ impl Printer<'_> {
                 });
             runtime_namespace && self.import_has_runtime_use(*statement, import)
         })
+    }
+
+    fn source_needs_import_default_helper(&self, statements: &NodeList) -> bool {
+        !self.commonjs_default_imports.is_empty()
+            || statements.nodes.iter().any(|statement| {
+                let Some(NodeData::ExportDeclaration(export)) =
+                    self.arena.get(*statement).map(|node| &node.data)
+                else {
+                    return false;
+                };
+                let Some(NodeData::NamedExports(exports)) = export
+                    .module_specifier
+                    .and(export.export_clause)
+                    .and_then(|clause| self.arena.get(clause))
+                    .map(|node| &node.data)
+                else {
+                    return false;
+                };
+                exports.elements.nodes.iter().any(|specifier| {
+                    let Some(NodeData::ExportSpecifier(specifier)) =
+                        self.arena.get(*specifier).map(|node| &node.data)
+                    else {
+                        return false;
+                    };
+                    !specifier.is_type_only
+                        && declaration_name_text(
+                            self.arena,
+                            specifier.property_name.unwrap_or(specifier.name),
+                        ) == Some("default")
+                })
+            })
     }
 
     fn import_clause_has_non_erased_runtime_reference(&self, clause_id: NodeId) -> bool {
@@ -40818,7 +41140,9 @@ impl Printer<'_> {
                             .push((range, trivia[comment_start..comment_end].to_owned()));
                     }
                     match &name.data {
-                        NodeData::Identifier(name) => self.writer.write(&name.text),
+                        NodeData::Identifier(name) => {
+                            self.write_source_identifier(data.name, &name.text);
+                        }
                         NodeData::PrivateIdentifier(name) => self.writer.write(&name.text),
                         _ => self.emit_expression(data.name, 18)?,
                     }

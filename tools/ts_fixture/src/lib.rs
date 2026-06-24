@@ -570,9 +570,10 @@ fn compare_section_multisets(
     let mut expected_match = vec![None; expected.len()];
     let mut actual_matched = vec![false; actual.len()];
 
-    for (expected_index, (expected_name, _)) in expected.iter().enumerate() {
-        if let Some(actual_index) = actual.iter().enumerate().find_map(|(index, (name, _))| {
-            (!actual_matched[index] && name == expected_name).then_some(index)
+    for (expected_index, (expected_name, expected_text)) in expected.iter().enumerate() {
+        if let Some(actual_index) = actual.iter().enumerate().find_map(|(index, (name, text))| {
+            (!actual_matched[index] && name == expected_name && text == expected_text)
+                .then_some(index)
         }) {
             expected_match[expected_index] = Some(actual_index);
             actual_matched[actual_index] = true;
@@ -595,6 +596,13 @@ fn compare_section_multisets(
 
     for (expected_index, (expected_name, _)) in expected.iter().enumerate() {
         if expected_match[expected_index].is_some() {
+            continue;
+        }
+        if let Some(actual_index) = actual.iter().enumerate().find_map(|(index, (name, _))| {
+            (!actual_matched[index] && name == expected_name).then_some(index)
+        }) {
+            expected_match[expected_index] = Some(actual_index);
+            actual_matched[actual_index] = true;
             continue;
         }
         let basename = section_basename(expected_name);
