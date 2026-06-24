@@ -7881,9 +7881,14 @@ impl DeclarationPrinter<'_> {
         declaration: &ts_ast::VariableDeclarationData,
     ) -> Option<FunctionType> {
         let initializer = declaration.initializer?;
-        let body = match &self.arena.get(initializer)?.data {
-            NodeData::FunctionExpression(function) => function.body,
-            NodeData::ArrowFunction(function) => function.body,
+        let (body, expression_name) = match &self.arena.get(initializer)?.data {
+            NodeData::FunctionExpression(function) => (
+                function.body,
+                function
+                    .name
+                    .and_then(|name| declaration_name_text(self.arena, name)),
+            ),
+            NodeData::ArrowFunction(function) => (function.body, None),
             _ => return None,
         };
         let returned = match &self.arena.get(body)?.data {
@@ -7893,8 +7898,12 @@ impl DeclarationPrinter<'_> {
         let declaration_symbol = self.bindings.node_symbols.get(&declaration_id).copied();
         let returned_symbol = self.resolve_entity_expression_symbol(returned);
         let returns_self = declaration_symbol.is_some() && declaration_symbol == returned_symbol
-            || declaration_name_text(self.arena, declaration.name)
-                == declaration_name_text(self.arena, returned);
+            || declaration_name_text(self.arena, declaration.name).is_some_and(|name| {
+                declaration_name_text(self.arena, returned) == Some(name)
+            })
+            || expression_name.is_some_and(|name| {
+                declaration_name_text(self.arena, returned) == Some(name)
+            });
         if !returns_self {
             return None;
         }
@@ -22958,18 +22967,17 @@ impl Printer<'_> {
 
     fn reopened_namespace_member_rewrite(&self, identifier: NodeId, text: &str) -> Option<String> {
         let parent = self.arena.get(identifier)?.parent?;
-        if matches!(
+        let qualified_root = matches!(
             self.arena.get(parent).map(|node| &node.data),
             Some(NodeData::PropertyAccessExpression(access)) if access.expression == identifier
         ) || matches!(
             self.arena.get(parent).map(|node| &node.data),
             Some(NodeData::QualifiedName(name)) if name.left == identifier
-        ) {
-            return None;
-        }
+        );
         if !identifier_is_unqualified_value_reference(self.arena, identifier) {
             return None;
         }
+        let reference_symbol = self.bindings.resolve_name_at(identifier, text);
         let value_flags = SymbolFlags::FUNCTION
             | SymbolFlags::CLASS
             | SymbolFlags::FUNCTION_SCOPED_VARIABLE
@@ -22983,6 +22991,50 @@ impl Printer<'_> {
             let node = self.arena.get(id)?;
             if let NodeData::ModuleDeclaration(module) = &node.data {
                 let path = self.namespace_declaration_path(id)?;
+                if path.len() > 1 {
+                    let mut sibling_path = path.clone();
+                    sibling_path.pop();
+                    sibling_path.push(text.to_owned());
+                    let sibling = self.arena.iter().find_map(|(candidate_id, candidate)| {
+                        let NodeData::ModuleDeclaration(candidate) = &candidate.data else {
+                            return None;
+                        };
+                        if self.namespace_declaration_path(candidate_id).as_ref()
+                            != Some(&sibling_path)
+                            || !self
+                                .namespace_has_runtime_contents(candidate, &mut HashSet::new())
+                        {
+                            return None;
+                        }
+                        let candidate_symbol = self.bindings.node_symbols.get(&candidate.name)?;
+                        let same_symbol = reference_symbol.is_none_or(|reference| {
+                            reference == *candidate_symbol
+                                || self
+                                    .bindings
+                                    .symbols
+                                    .get(reference)
+                                    .and_then(|symbol| symbol.target)
+                                    == Some(*candidate_symbol)
+                                || self
+                                    .bindings
+                                    .symbols
+                                    .get(*candidate_symbol)
+                                    .and_then(|symbol| symbol.target)
+                                    == Some(reference)
+                        });
+                        same_symbol.then_some(())
+                    });
+                    if sibling.is_some()
+                        && let Some(container) =
+                            self.namespace_containers.iter().rev().nth(1)
+                    {
+                        return Some(format!("{container}.{text}"));
+                    }
+                }
+                if qualified_root {
+                    ancestor = node.parent;
+                    continue;
+                }
                 let reopened_member = self.arena.iter().find_map(|(candidate_id, candidate)| {
                     if candidate_id == id
                         || !matches!(candidate.data, NodeData::ModuleDeclaration(_))
@@ -35760,6 +35812,7 @@ impl Printer<'_> {
             };
             if self.nearest_var_scope(reference_scope) != Some(var_scope)
                 || self.scope_is_within(reference_scope, lexical_scope)
+                || self.node_is_within_parameter_initializer(id)
             {
                 return false;
             }
@@ -35785,6 +35838,24 @@ impl Printer<'_> {
                     == Some(var_scope);
             !reference_is_peer_block_binding
         })
+    }
+
+    fn node_is_within_parameter_initializer(&self, node: NodeId) -> bool {
+        let mut current = Some(node);
+        while let Some(id) = current {
+            let Some(current_node) = self.arena.get(id) else {
+                return false;
+            };
+            if let NodeData::ParameterDeclaration(parameter) = &current_node.data
+                && parameter
+                    .initializer
+                    .is_some_and(|initializer| self.node_is_within(node, initializer))
+            {
+                return true;
+            }
+            current = current_node.parent;
+        }
+        false
     }
 
     fn block_scoped_binding_collides_with_ancestor(
