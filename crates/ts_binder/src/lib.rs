@@ -340,6 +340,14 @@ impl<'a> Binder<'a> {
                     self.bind_node(*statement, block_scope, node_id, parent_symbol);
                 }
             }
+            NodeData::CatchClause(data) => {
+                let catch_scope = self.create_scope(ScopeKind::Block, node_id, Some(scope));
+                self.result.node_scopes.insert(node_id, catch_scope);
+                if let Some(variable) = data.variable_declaration {
+                    self.bind_node(variable, catch_scope, node_id, parent_symbol);
+                }
+                self.bind_node(data.block, catch_scope, node_id, parent_symbol);
+            }
             NodeData::ModuleBlock(data) => {
                 self.result.node_scopes.insert(node_id, scope);
                 for statement in &data.statements.nodes {

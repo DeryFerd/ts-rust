@@ -874,6 +874,12 @@ impl<'a> Parser<'a> {
                     self.bump();
                     continue;
                 }
+                if self.current.kind == SyntaxKind::DotToken
+                    && self.next_token_kind() == SyntaxKind::Identifier
+                {
+                    self.bump();
+                    continue;
+                }
                 break;
             }
             self.bump();
@@ -4983,9 +4989,17 @@ impl<'a> Parser<'a> {
         let start = self.current.range.start;
         let parameters = self.parse_parameter_list();
         let return_type = self.parse_optional_type_annotation();
+        let has_body_token = matches!(
+            self.current.kind,
+            SyntaxKind::EqualsGreaterThanToken | SyntaxKind::OpenBraceToken
+        );
         let arrow =
             self.parse_expected_token_node(SyntaxKind::EqualsGreaterThanToken, "Expected '=>'.");
-        let body = self.parse_arrow_function_body();
+        let body = if has_body_token {
+            self.parse_arrow_function_body()
+        } else {
+            self.missing_identifier(self.current.range.start)
+        };
         let mut children = parameters.nodes.clone();
         children.extend(return_type);
         children.push(arrow);
@@ -5474,13 +5488,32 @@ impl<'a> Parser<'a> {
                     &[name, initializer],
                 ));
             } else {
+                let (equals_token, object_assignment_initializer, end, children) =
+                    if self.current.kind == SyntaxKind::EqualsToken {
+                        let equals = self.consume();
+                        let equals_token = self.alloc_node(
+                            equals.kind,
+                            equals.range,
+                            NodeData::Token(Box::new(TokenData)),
+                            &[],
+                        );
+                        let initializer = self.parse_binary_expression(2);
+                        (
+                            Some(equals_token),
+                            Some(initializer),
+                            self.node_end(initializer),
+                            vec![name, equals_token, initializer],
+                        )
+                    } else {
+                        (None, None, self.node_end(name), vec![name])
+                    };
                 properties.push(self.alloc_node(
                     SyntaxKind::ShorthandPropertyAssignment,
-                    TextRange::new(property_start, self.node_end(name)),
+                    TextRange::new(property_start, end),
                     NodeData::ShorthandPropertyAssignment(Box::new(
                         ShorthandPropertyAssignmentData {
-                            equals_token: None,
-                            object_assignment_initializer: None,
+                            equals_token,
+                            object_assignment_initializer,
                             postfix_token: None,
                             symbol: None,
                             type_: name,
@@ -5489,7 +5522,7 @@ impl<'a> Parser<'a> {
                             name,
                         },
                     )),
-                    &[name],
+                    &children,
                 ));
             }
             if !matches!(

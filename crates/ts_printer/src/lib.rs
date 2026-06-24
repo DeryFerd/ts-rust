@@ -265,6 +265,9 @@ pub fn emit_source_file_with_context(
         async_control_counter: 0,
         commonjs_empty_binding_temps: HashMap::new(),
         commonjs_empty_binding_hoists: Vec::new(),
+        commonjs_destructuring_assignment_roots: HashSet::new(),
+        commonjs_destructuring_assignment_temps: HashMap::new(),
+        commonjs_destructuring_assignment_hoists: Vec::new(),
         namespace_destructuring_temps: HashMap::new(),
         private_method_plans: HashMap::new(),
         active_private_method_plan: None,
@@ -400,7 +403,14 @@ pub fn emit_source_file_with_context(
     }
     if settings.module == ModuleKind::CommonJs && is_external_module {
         printer.prepare_commonjs_empty_binding_temps(&data.statements);
-        let temps = printer.commonjs_empty_binding_hoists.clone();
+        printer.prepare_commonjs_destructuring_assignment_temps();
+        let mut temps = printer.commonjs_empty_binding_hoists.clone();
+        temps.extend(
+            printer
+                .commonjs_destructuring_assignment_hoists
+                .iter()
+                .cloned(),
+        );
         if !temps.is_empty() {
             printer.writer.write("var ");
             printer.writer.write(&temps.join(", "));
@@ -958,19 +968,40 @@ fn source_has_dynamic_import(arena: &NodeArena) -> bool {
 }
 
 fn source_needs_object_rest_helper(arena: &NodeArena) -> bool {
-    arena.iter().any(|(_, node)| {
+    arena.iter().any(|(node_id, node)| {
+        if let NodeData::BindingPattern(pattern) = &node.data
+            && node.kind == SyntaxKind::ObjectBindingPattern
+            && pattern.elements.nodes.iter().any(|element| {
+                matches!(
+                    arena.get(*element).map(|node| &node.data),
+                    Some(NodeData::BindingElement(element))
+                        if element.dot_dot_dot_token.is_some()
+                )
+            })
+        {
+            return true;
+        }
+        if let NodeData::ObjectLiteralExpression(object) = &node.data
+            && object.properties.nodes.iter().any(|property| {
+                matches!(
+                    arena.get(*property).map(|node| &node.data),
+                    Some(NodeData::SpreadAssignment(_))
+                )
+            })
+            && arena
+                .get(node_id)
+                .and_then(|node| node.parent)
+                .is_some_and(|parent| {
+                    matches!(
+                        arena.get(parent).map(|node| &node.data),
+                        Some(NodeData::BinaryExpression(binary)) if binary.left == node_id
+                    )
+                })
+        {
+            return true;
+        }
         let parameters = match &node.data {
-            NodeData::ArrowFunction(function)
-                if function.modifiers.as_ref().is_some_and(|modifiers| {
-                    modifiers.list.nodes.iter().any(|modifier| {
-                        arena
-                            .get(*modifier)
-                            .is_some_and(|modifier| modifier.kind == SyntaxKind::AsyncKeyword)
-                    })
-                }) =>
-            {
-                &function.parameters
-            }
+            NodeData::ArrowFunction(function) => &function.parameters,
             NodeData::FunctionDeclaration(function)
                 if function.body.is_some()
                     && !declaration_has_modifier_in_list(
@@ -8242,6 +8273,12 @@ impl DeclarationPrinter<'_> {
     ) -> Result<(), EmitError> {
         let node = self.node(name)?.clone();
         if matches!(node.data, NodeData::Identifier(_)) {
+            if let Some(statement) = self.containing_variable_statement(name)
+                && !self.variable_declarator_is_reachable(name, name, Some(statement), 2)
+                && !self.binding_name_is_explicitly_exported(name)
+            {
+                return Ok(());
+            }
             if *emitted {
                 self.writer.write(", ");
             }
@@ -8266,7 +8303,11 @@ impl DeclarationPrinter<'_> {
                 if !self.emit_destructuring_array_type(type_id)?
                     && !self.emit_destructuring_union_type(type_id)?
                 {
-                    self.emit_widened_semantic_type(type_id)?;
+                    if self.binding_is_const(name) {
+                        self.emit_semantic_type(type_id)?;
+                    } else {
+                        self.emit_widened_semantic_type(type_id)?;
+                    }
                 }
             } else if let Some(expression) = source_expression
                 && self.emit_array_literal_inferred_type(expression)
@@ -8400,6 +8441,49 @@ impl DeclarationPrinter<'_> {
             )?;
         }
         Ok(())
+    }
+
+    fn containing_variable_statement(&self, node: NodeId) -> Option<NodeId> {
+        let mut current = node;
+        while let Some(parent) = self.arena.get(current).and_then(|node| node.parent) {
+            if matches!(
+                self.arena.get(parent).map(|node| &node.data),
+                Some(NodeData::VariableStatement(_))
+            ) {
+                return Some(parent);
+            }
+            current = parent;
+        }
+        None
+    }
+
+    fn binding_is_const(&self, node: NodeId) -> bool {
+        let mut current = node;
+        while let Some(parent) = self.arena.get(current).and_then(|node| node.parent) {
+            if let Some(NodeData::VariableDeclarationList(_)) =
+                self.arena.get(parent).map(|node| &node.data)
+            {
+                return self
+                    .arena
+                    .get(parent)
+                    .is_some_and(|node| node.flags.0 & (1 << 1) != 0);
+            }
+            current = parent;
+        }
+        false
+    }
+
+    fn binding_name_is_explicitly_exported(&self, name: NodeId) -> bool {
+        let Some(local_name) = declaration_name_text(self.arena, name) else {
+            return false;
+        };
+        self.arena.iter().any(|(_, node)| {
+            let NodeData::ExportSpecifier(specifier) = &node.data else {
+                return false;
+            };
+            let local = specifier.property_name.unwrap_or(specifier.name);
+            declaration_name_text(self.arena, local) == Some(local_name)
+        })
     }
 
     fn asserted_initializer_type(&self, initializer: NodeId) -> Option<NodeId> {
@@ -17302,16 +17386,33 @@ fn simple_variable_names(arena: &NodeArena, list: NodeId) -> Vec<String> {
     else {
         return Vec::new();
     };
-    list.declarations
-        .nodes
-        .iter()
-        .filter_map(|declaration| {
-            let NodeData::VariableDeclaration(declaration) = &arena.get(*declaration)?.data else {
-                return None;
-            };
-            declaration_name_text(arena, declaration.name).map(str::to_owned)
-        })
-        .collect()
+    let mut names = Vec::new();
+    for declaration in &list.declarations.nodes {
+        let Some(NodeData::VariableDeclaration(declaration)) =
+            arena.get(*declaration).map(|node| &node.data)
+        else {
+            continue;
+        };
+        collect_binding_names(arena, declaration.name, &mut names);
+    }
+    names
+}
+
+fn collect_binding_names(arena: &NodeArena, name: NodeId, names: &mut Vec<String>) {
+    match arena.get(name).map(|node| &node.data) {
+        Some(NodeData::Identifier(identifier)) => names.push(identifier.text.clone()),
+        Some(NodeData::BindingPattern(pattern)) => {
+            for element in &pattern.elements.nodes {
+                if let Some(NodeData::BindingElement(element)) =
+                    arena.get(*element).map(|node| &node.data)
+                    && let Some(name) = element.name
+                {
+                    collect_binding_names(arena, name, names);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn collect_namespace_alias_rewrites(
@@ -17460,6 +17561,14 @@ struct PrivateDestructuringRewrite {
     storage: String,
 }
 
+#[derive(Clone)]
+enum CommonJsDestructuringValue {
+    Expression(NodeId),
+    Temp(String),
+    Property(Box<Self>, NodeId),
+    Element(Box<Self>, usize),
+}
+
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
 enum SemanticTypePrecedence {
     Function,
@@ -17516,6 +17625,9 @@ struct Printer<'a> {
     async_control_counter: u32,
     commonjs_empty_binding_temps: HashMap<NodeId, Vec<String>>,
     commonjs_empty_binding_hoists: Vec<String>,
+    commonjs_destructuring_assignment_roots: HashSet<NodeId>,
+    commonjs_destructuring_assignment_temps: HashMap<NodeId, String>,
+    commonjs_destructuring_assignment_hoists: Vec<String>,
     namespace_destructuring_temps: HashMap<NodeId, String>,
     private_method_plans: HashMap<NodeId, PrivateMethodPlan>,
     active_private_method_plan: Option<PrivateMethodPlan>,
@@ -18718,6 +18830,31 @@ impl Printer<'_> {
                     let Some(initializer) = declaration.initializer else {
                         continue;
                     };
+                    if let Some((_, name, property)) =
+                        self.single_object_binding_element(declaration.name)
+                    {
+                        let binding_name = declaration_name_text(self.arena, name)
+                            .expect("single object binding name is an identifier");
+                        if exported {
+                            self.writer.write(export_function);
+                            self.writer.write("(");
+                            write_quoted(&mut self.writer, binding_name);
+                            self.writer.write(", ");
+                        }
+                        self.emit_expression(name, 1)?;
+                        self.writer.write(" = ");
+                        self.emit_expression(initializer, 18)?;
+                        if self.decimal_integer_literal_needs_property_dot(initializer) {
+                            self.writer.write(".");
+                        }
+                        self.emit_downlevel_member_access(property)?;
+                        if exported {
+                            self.writer.write(")");
+                        }
+                        self.writer.write(";");
+                        self.writer.newline();
+                        continue;
+                    }
                     let name = declaration_name_text(self.arena, declaration.name);
                     if exported && let Some(name) = name {
                         self.writer.write(export_function);
@@ -20599,8 +20736,10 @@ impl Printer<'_> {
                                 .has_modifier(data.modifiers.as_ref(), SyntaxKind::ExportKeyword),
                     )?;
                     self.writer.write(";");
-                    let names = self.variable_declaration_names(data.declaration_list)?;
-                    self.emit_commonjs_declaration_exports(data.modifiers.as_ref(), &names);
+                    if !self.variable_list_is_uninitialized(data.declaration_list) {
+                        let names = self.variable_declaration_names(data.declaration_list)?;
+                        self.emit_commonjs_declaration_exports(data.modifiers.as_ref(), &names);
+                    }
                 }
             }
             NodeData::FunctionDeclaration(data) => {
@@ -22181,6 +22320,228 @@ impl Printer<'_> {
                 .extend(temps.iter().cloned());
             self.commonjs_empty_binding_temps.insert(*statement, temps);
         }
+    }
+
+    fn prepare_commonjs_destructuring_assignment_temps(&mut self) {
+        let mut assignments = self
+            .arena
+            .iter()
+            .filter_map(|(id, node)| {
+                let NodeData::BinaryExpression(binary) = &node.data else {
+                    return None;
+                };
+                if self
+                    .arena
+                    .get(binary.operator_token)
+                    .is_none_or(|operator| operator.kind != SyntaxKind::EqualsToken)
+                    || !matches!(
+                        self.arena.get(binary.left).map(|left| left.kind),
+                        Some(
+                            SyntaxKind::ObjectLiteralExpression
+                                | SyntaxKind::ArrayLiteralExpression
+                        )
+                    )
+                    || !self.commonjs_destructuring_pattern_updates_export(binary.left)
+                {
+                    return None;
+                }
+                Some((node.range.start.get(), id, binary.left))
+            })
+            .collect::<Vec<_>>();
+        assignments.sort_by_key(|(start, _, _)| *start);
+        for (_, expression, pattern) in assignments {
+            self.commonjs_destructuring_assignment_roots
+                .insert(expression);
+            self.prepare_commonjs_destructuring_pattern_temps(pattern);
+        }
+    }
+
+    fn prepare_commonjs_destructuring_pattern_temps(&mut self, pattern: NodeId) {
+        if self.commonjs_destructuring_pattern_value_use_count(pattern) > 1
+            && !self
+                .commonjs_destructuring_assignment_temps
+                .contains_key(&pattern)
+        {
+            let temp = self.generated_names.generate_temp();
+            self.commonjs_destructuring_assignment_hoists
+                .push(temp.clone());
+            self.commonjs_destructuring_assignment_temps
+                .insert(pattern, temp);
+        }
+        match self.arena.get(pattern).map(|node| &node.data) {
+            Some(NodeData::ObjectLiteralExpression(object)) => {
+                for property in &object.properties.nodes {
+                    match self.arena.get(*property).map(|node| &node.data) {
+                        Some(NodeData::PropertyAssignment(property)) => {
+                            self.prepare_commonjs_destructuring_pattern_temps(property.initializer);
+                        }
+                        Some(NodeData::ShorthandPropertyAssignment(property)) => {
+                            self.prepare_commonjs_destructuring_pattern_temps(property.name);
+                        }
+                        Some(NodeData::SpreadAssignment(spread)) => {
+                            self.prepare_commonjs_destructuring_pattern_temps(spread.expression);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Some(NodeData::ArrayLiteralExpression(array)) => {
+                for element in &array.elements.nodes {
+                    if let Some(NodeData::SpreadElement(spread)) =
+                        self.arena.get(*element).map(|node| &node.data)
+                    {
+                        self.prepare_commonjs_destructuring_pattern_temps(spread.expression);
+                    } else {
+                        self.prepare_commonjs_destructuring_pattern_temps(*element);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn commonjs_destructuring_pattern_value_use_count(&self, pattern: NodeId) -> usize {
+        match self.arena.get(pattern).map(|node| &node.data) {
+            Some(NodeData::ObjectLiteralExpression(object)) => object
+                .properties
+                .nodes
+                .iter()
+                .filter(
+                    |property| match self.arena.get(**property).map(|node| &node.data) {
+                        Some(NodeData::PropertyAssignment(property)) => {
+                            self.commonjs_destructuring_pattern_leaf_count(property.initializer)
+                                != 0
+                        }
+                        Some(NodeData::ShorthandPropertyAssignment(property)) => {
+                            self.commonjs_destructuring_pattern_leaf_count(property.name) != 0
+                        }
+                        Some(NodeData::SpreadAssignment(spread)) => {
+                            self.commonjs_destructuring_pattern_leaf_count(spread.expression) != 0
+                        }
+                        _ => false,
+                    },
+                )
+                .count(),
+            Some(NodeData::ArrayLiteralExpression(array)) => array
+                .elements
+                .nodes
+                .iter()
+                .filter(
+                    |element| match self.arena.get(**element).map(|node| &node.data) {
+                        Some(NodeData::OmittedExpression(_)) | None => false,
+                        Some(NodeData::SpreadElement(spread)) => {
+                            self.commonjs_destructuring_pattern_leaf_count(spread.expression) != 0
+                        }
+                        Some(_) => self.commonjs_destructuring_pattern_leaf_count(**element) != 0,
+                    },
+                )
+                .count(),
+            _ => 0,
+        }
+    }
+
+    fn commonjs_destructuring_pattern_leaf_count(&self, pattern: NodeId) -> usize {
+        match self.arena.get(pattern).map(|node| &node.data) {
+            Some(
+                NodeData::Identifier(_)
+                | NodeData::PropertyAccessExpression(_)
+                | NodeData::ElementAccessExpression(_),
+            ) => 1,
+            Some(NodeData::ObjectLiteralExpression(object)) => object
+                .properties
+                .nodes
+                .iter()
+                .map(
+                    |property| match self.arena.get(*property).map(|node| &node.data) {
+                        Some(NodeData::PropertyAssignment(property)) => {
+                            self.commonjs_destructuring_pattern_leaf_count(property.initializer)
+                        }
+                        Some(NodeData::ShorthandPropertyAssignment(property)) => {
+                            self.commonjs_destructuring_pattern_leaf_count(property.name)
+                        }
+                        Some(NodeData::SpreadAssignment(spread)) => {
+                            self.commonjs_destructuring_pattern_leaf_count(spread.expression)
+                        }
+                        _ => 0,
+                    },
+                )
+                .sum(),
+            Some(NodeData::ArrayLiteralExpression(array)) => array
+                .elements
+                .nodes
+                .iter()
+                .map(
+                    |element| match self.arena.get(*element).map(|node| &node.data) {
+                        Some(NodeData::OmittedExpression(_)) | None => 0,
+                        Some(NodeData::SpreadElement(spread)) => {
+                            self.commonjs_destructuring_pattern_leaf_count(spread.expression)
+                        }
+                        Some(_) => self.commonjs_destructuring_pattern_leaf_count(*element),
+                    },
+                )
+                .sum(),
+            _ => 0,
+        }
+    }
+
+    fn commonjs_destructuring_pattern_updates_export(&self, pattern: NodeId) -> bool {
+        match self.arena.get(pattern).map(|node| &node.data) {
+            Some(NodeData::Identifier(identifier)) => {
+                !self
+                    .commonjs_named_exports_for_local(&identifier.text)
+                    .is_empty()
+                    || self.identifier_has_exported_value_declaration(pattern, &identifier.text)
+            }
+            Some(NodeData::ObjectLiteralExpression(object)) => {
+                object.properties.nodes.iter().any(|property| {
+                    match self.arena.get(*property).map(|node| &node.data) {
+                        Some(NodeData::PropertyAssignment(property)) => {
+                            self.commonjs_destructuring_pattern_updates_export(property.initializer)
+                        }
+                        Some(NodeData::ShorthandPropertyAssignment(property)) => {
+                            self.commonjs_destructuring_pattern_updates_export(property.name)
+                        }
+                        Some(NodeData::SpreadAssignment(spread)) => {
+                            self.commonjs_destructuring_pattern_updates_export(spread.expression)
+                        }
+                        _ => false,
+                    }
+                })
+            }
+            Some(NodeData::ArrayLiteralExpression(array)) => {
+                array.elements.nodes.iter().any(|element| {
+                    match self.arena.get(*element).map(|node| &node.data) {
+                        Some(NodeData::SpreadElement(spread)) => {
+                            self.commonjs_destructuring_pattern_updates_export(spread.expression)
+                        }
+                        Some(NodeData::OmittedExpression(_)) | None => false,
+                        Some(_) => self.commonjs_destructuring_pattern_updates_export(*element),
+                    }
+                })
+            }
+            _ => false,
+        }
+    }
+
+    fn identifier_has_exported_value_declaration(&self, id: NodeId, name: &str) -> bool {
+        let Some(symbol) = self.bindings.resolve_name_at(id, name) else {
+            return false;
+        };
+        self.bindings.symbols.get(symbol).is_some_and(|symbol| {
+            symbol.declarations.iter().any(|declaration| {
+                let mut current = Some(*declaration);
+                while let Some(id) = current {
+                    let Some(node) = self.arena.get(id) else {
+                        break;
+                    };
+                    if declaration_has_modifier(self.arena, node, SyntaxKind::ExportKeyword) {
+                        return true;
+                    }
+                    current = node.parent;
+                }
+                false
+            })
+        })
     }
 
     fn binding_pattern_has_no_identifiers(&self, name: NodeId) -> bool {
@@ -24483,6 +24844,32 @@ impl Printer<'_> {
         Ok(())
     }
 
+    fn emit_arrow_body_with_object_rest_parameter(
+        &mut self,
+        body: NodeId,
+        pattern: NodeId,
+        parameter_temp: &str,
+    ) -> Result<(), EmitError> {
+        self.writer.write("{");
+        self.writer.newline();
+        self.writer.indent += 1;
+        self.emit_object_rest_parameter_prologue(pattern, parameter_temp)?;
+        if matches!(
+            self.arena.get(body).map(|node| &node.data),
+            Some(NodeData::Block(_))
+        ) {
+            self.emit_block_statements(body)?;
+        } else {
+            self.writer.write("return ");
+            self.emit_expression(body, 0)?;
+            self.writer.write(";");
+            self.writer.newline();
+        }
+        self.writer.indent -= 1;
+        self.writer.write("}");
+        Ok(())
+    }
+
     fn emit_block_statements(&mut self, body: NodeId) -> Result<(), EmitError> {
         let body_node = self.node(body)?.clone();
         let NodeData::Block(block) = &body_node.data else {
@@ -24667,6 +25054,17 @@ impl Printer<'_> {
                 )?;
                 continue;
             }
+            if self.settings.target < ScriptTarget::Es2018
+                && self.object_binding_pattern_has_rest(declaration.name)
+                && let Some(initializer) = declaration.initializer
+            {
+                self.emit_object_rest_variable_declarators(
+                    declaration.name,
+                    initializer,
+                    &mut emitted,
+                )?;
+                continue;
+            }
             self.emit_downlevel_declarator_start(&mut emitted);
             let comment_start = index
                 .checked_sub(1)
@@ -24714,6 +25112,173 @@ impl Printer<'_> {
             }
         }
         Ok(())
+    }
+
+    fn object_binding_pattern_has_rest(&self, pattern: NodeId) -> bool {
+        let Some(node) = self.arena.get(pattern) else {
+            return false;
+        };
+        let NodeData::BindingPattern(binding) = &node.data else {
+            return false;
+        };
+        node.kind == SyntaxKind::ObjectBindingPattern
+            && binding.elements.nodes.iter().any(|element| {
+                matches!(
+                    self.arena.get(*element).map(|node| &node.data),
+                    Some(NodeData::BindingElement(element))
+                        if element.dot_dot_dot_token.is_some()
+                )
+            })
+    }
+
+    fn emit_object_rest_variable_declarators(
+        &mut self,
+        pattern: NodeId,
+        initializer: NodeId,
+        emitted: &mut bool,
+    ) -> Result<(), EmitError> {
+        let pattern_node = self.node(pattern)?.clone();
+        let NodeData::BindingPattern(binding) = &pattern_node.data else {
+            return Err(Self::unsupported(pattern, pattern_node.kind));
+        };
+        let mut ordinary = Vec::new();
+        let mut rest = None;
+        for element in &binding.elements.nodes {
+            let element_node = self.node(*element)?.clone();
+            let NodeData::BindingElement(binding) = &element_node.data else {
+                continue;
+            };
+            if binding.dot_dot_dot_token.is_some() {
+                rest = binding.name;
+            } else {
+                ordinary.push(*element);
+            }
+        }
+        let Some(rest) = rest else {
+            return Ok(());
+        };
+        if ordinary.is_empty() {
+            self.emit_downlevel_declarator_start(emitted);
+            self.emit_expression(rest, 0)?;
+            self.writer.write(" = __rest(");
+            self.emit_expression(initializer, 1)?;
+            self.writer.write(", [])");
+            return Ok(());
+        }
+        let reusable_initializer = matches!(
+            self.arena.get(initializer).map(|node| &node.data),
+            Some(NodeData::Identifier(_))
+        );
+        let temp = (!reusable_initializer).then(|| self.object_rest_scoped_temp(pattern));
+        if let Some(temp) = temp.as_deref() {
+            self.emit_downlevel_declarator_start(emitted);
+            self.writer.write(temp);
+            self.writer.write(" = ");
+            self.emit_expression(initializer, 1)?;
+        }
+        self.emit_downlevel_declarator_start(emitted);
+        self.writer.write("{ ");
+        for (index, element_id) in ordinary.iter().enumerate() {
+            if index != 0 {
+                self.writer.write(", ");
+            }
+            self.emit_expression(*element_id, 0)?;
+        }
+        self.writer.write(" } = ");
+        if let Some(temp) = temp.as_deref() {
+            self.writer.write(temp);
+        } else {
+            self.emit_expression(initializer, 1)?;
+        }
+        self.emit_downlevel_declarator_start(emitted);
+        self.emit_expression(rest, 0)?;
+        self.writer.write(" = __rest(");
+        if let Some(temp) = temp.as_deref() {
+            self.writer.write(temp);
+        } else {
+            self.emit_expression(initializer, 1)?;
+        }
+        self.writer.write(", [");
+        for (index, element_id) in ordinary.iter().enumerate() {
+            if index != 0 {
+                self.writer.write(", ");
+            }
+            let NodeData::BindingElement(element) = &self.node(*element_id)?.data else {
+                continue;
+            };
+            let property = element
+                .property_name
+                .or(element.name)
+                .ok_or_else(|| Self::unsupported(*element_id, SyntaxKind::BindingElement))?;
+            let property = declaration_name_text(self.arena, property)
+                .ok_or_else(|| Self::unsupported(property, self.node(property).unwrap().kind))?;
+            write_quoted(&mut self.writer, property);
+        }
+        self.writer.write("])");
+        Ok(())
+    }
+
+    fn object_rest_scoped_temp(&self, pattern: NodeId) -> String {
+        let container = self.nearest_function_like_container(pattern);
+        let current_start = self
+            .arena
+            .get(pattern)
+            .map_or(u32::MAX, |node| node.range.start.get());
+        let prior = self
+            .arena
+            .iter()
+            .filter(|(_, node)| node.range.start.get() < current_start)
+            .filter(|(declaration_id, node)| {
+                let NodeData::VariableDeclaration(declaration) = &node.data else {
+                    return false;
+                };
+                self.nearest_function_like_container(*declaration_id) == container
+                    && self.object_binding_pattern_has_rest(declaration.name)
+                    && declaration.initializer.is_some_and(|initializer| {
+                        !matches!(
+                            self.arena.get(initializer).map(|node| &node.data),
+                            Some(NodeData::Identifier(_))
+                        )
+                    })
+                    && matches!(
+                        self.arena.get(declaration.name).map(|node| &node.data),
+                        Some(NodeData::BindingPattern(binding))
+                            if binding.elements.nodes.iter().any(|element| {
+                                matches!(
+                                    self.arena.get(*element).map(|node| &node.data),
+                                    Some(NodeData::BindingElement(element))
+                                        if element.dot_dot_dot_token.is_none()
+                                )
+                            })
+                    )
+            })
+            .count();
+        let suffix =
+            char::from_u32(u32::from(b'a') + u32::try_from(prior).unwrap_or(0)).unwrap_or('a');
+        format!("_{suffix}")
+    }
+
+    fn nearest_function_like_container(&self, node: NodeId) -> Option<NodeId> {
+        let mut current = Some(node);
+        while let Some(id) = current {
+            if matches!(
+                self.arena.get(id).map(|node| &node.data),
+                Some(
+                    NodeData::FunctionDeclaration(_)
+                        | NodeData::FunctionExpression(_)
+                        | NodeData::ArrowFunction(_)
+                        | NodeData::MethodDeclaration(_)
+                        | NodeData::ConstructorDeclaration(_)
+                        | NodeData::GetAccessorDeclaration(_)
+                        | NodeData::SetAccessorDeclaration(_)
+                        | NodeData::SourceFile(_)
+                )
+            ) {
+                return Some(id);
+            }
+            current = self.arena.get(id).and_then(|node| node.parent);
+        }
+        None
     }
 
     fn emit_initializer_leading_block_comments(&mut self, name: NodeId, initializer: NodeId) {
@@ -26992,6 +27557,9 @@ impl Printer<'_> {
         self.writer.write("function ");
         self.writer.write(name);
         if let Some((_, _, constructor)) = constructor {
+            let constructor_returns_on_all_paths = constructor
+                .body
+                .is_some_and(|body| self.statement_is_covered_by_returns(body));
             self.emit_parameters_without_initializers(&constructor.parameters)?;
             self.writer.write(" {");
             self.writer.newline();
@@ -27112,7 +27680,7 @@ impl Printer<'_> {
             if !emitted_fields {
                 self.emit_es5_instance_fields(data, "this", captures_field_this)?;
             }
-            if uses_this_alias {
+            if uses_this_alias && !constructor_returns_on_all_paths {
                 self.writer.write("return _this;");
                 self.writer.newline();
             }
@@ -27320,6 +27888,24 @@ impl Printer<'_> {
         }
         self.writer.write("))");
         Ok(())
+    }
+
+    fn statement_is_covered_by_returns(&self, statement: NodeId) -> bool {
+        match self.arena.get(statement).map(|node| &node.data) {
+            Some(NodeData::ReturnStatement(_)) => true,
+            Some(NodeData::Block(block)) => block
+                .statements
+                .nodes
+                .last()
+                .is_some_and(|statement| self.statement_is_covered_by_returns(*statement)),
+            Some(NodeData::IfStatement(statement)) => {
+                statement.else_statement.is_some_and(|else_statement| {
+                    self.statement_is_covered_by_returns(statement.then_statement)
+                        && self.statement_is_covered_by_returns(else_statement)
+                })
+            }
+            _ => false,
+        }
     }
 
     fn emit_downlevel_auto_accessor(
@@ -29486,7 +30072,10 @@ impl Printer<'_> {
             let NodeData::VariableDeclaration(variable) = &node.data else {
                 return None;
             };
-            (declaration_name_text(self.arena, variable.name) == Some(name)
+            (self
+                .binding_name_contains_identifier(variable.name, name)
+                .ok()
+                == Some(true)
                 && node
                     .parent
                     .and_then(|list| self.arena.get(list).and_then(|node| node.parent))
@@ -29754,6 +30343,9 @@ impl Printer<'_> {
             self.emit_expression(name, 0)?;
             self.writer.write(" = ");
             self.emit_expression(initializer, 18)?;
+            if self.decimal_integer_literal_needs_property_dot(initializer) {
+                self.writer.write(".");
+            }
             self.emit_downlevel_member_access(property)?;
             self.writer.write(";");
             return Ok(true);
@@ -31555,6 +32147,10 @@ impl Printer<'_> {
                         }
                         NodeData::ShorthandPropertyAssignment(property) => {
                             self.emit_shorthand_property(property.name)?;
+                            if let Some(initializer) = property.object_assignment_initializer {
+                                self.writer.write(" = ");
+                                self.emit_expression(initializer, 2)?;
+                            }
                         }
                         NodeData::SpreadAssignment(property) => {
                             self.writer.write("...");
@@ -31739,7 +32335,7 @@ impl Printer<'_> {
                 if is_async && !downlevel_async {
                     self.writer.write("async ");
                 }
-                let object_rest_parameter = downlevel_async
+                let object_rest_parameter = (self.settings.target < ScriptTarget::Es2018)
                     .then(|| self.async_arrow_object_rest_parameter(data))
                     .flatten();
                 if self.settings.target < ScriptTarget::Es2015 && downlevel_async {
@@ -31820,6 +32416,8 @@ impl Printer<'_> {
                                 .then_some(data.body);
                         self.emit_awaiter_call(data.body, expression_body, &this_argument)?;
                     }
+                } else if let Some(pattern) = object_rest_parameter {
+                    self.emit_arrow_body_with_object_rest_parameter(data.body, pattern, "_a")?;
                 } else if matches!(&self.node(data.body)?.data, NodeData::Block(_)) {
                     self.emit_function_body(data.body)?;
                 } else {
@@ -32543,6 +33141,61 @@ impl Printer<'_> {
         expression: NodeId,
         parent_precedence: u8,
     ) -> Result<(), EmitError> {
+        if self
+            .commonjs_destructuring_assignment_roots
+            .contains(&expression)
+        {
+            return self.emit_commonjs_destructuring_assignment(expression, parent_precedence);
+        }
+        if self.settings.target < ScriptTarget::Es2018
+            && let Some(NodeData::BinaryExpression(binary)) =
+                self.arena.get(expression).map(|node| &node.data)
+            && self
+                .arena
+                .get(binary.operator_token)
+                .is_some_and(|operator| operator.kind == SyntaxKind::EqualsToken)
+            && let Some(rest) = self.simple_object_rest_assignment_target(binary.left)
+        {
+            let wrap = parent_precedence > 1;
+            if wrap {
+                self.writer.write("(");
+            }
+            self.emit_expression(rest, 2)?;
+            self.writer.write(" = __rest(");
+            self.emit_expression(binary.right, 1)?;
+            self.writer.write(", [])");
+            if wrap {
+                self.writer.write(")");
+            }
+            return Ok(());
+        }
+        if let Some(NodeData::BinaryExpression(binary)) =
+            self.arena.get(expression).map(|node| &node.data)
+            && self
+                .arena
+                .get(binary.operator_token)
+                .is_some_and(|operator| operator.kind == SyntaxKind::EqualsToken)
+            && matches!(
+                self.arena.get(binary.left).map(|node| &node.data),
+                Some(NodeData::Identifier(_))
+            )
+            && !self
+                .commonjs_named_exports_for_assignment_target(binary.left)
+                .is_empty()
+        {
+            let wrap = parent_precedence > 1;
+            if wrap {
+                self.writer.write("(");
+            }
+            self.emit_commonjs_export_assignment_prefixes(binary.left);
+            self.emit_expression(binary.left, 2)?;
+            self.writer.write(" = ");
+            self.emit_expression(binary.right, 1)?;
+            if wrap {
+                self.writer.write(")");
+            }
+            return Ok(());
+        }
         if let Some(NodeData::BinaryExpression(binary)) =
             self.arena.get(expression).map(|node| &node.data)
             && self
@@ -32830,6 +33483,199 @@ impl Printer<'_> {
             }
         }
         Ok(())
+    }
+
+    fn emit_commonjs_destructuring_assignment(
+        &mut self,
+        expression: NodeId,
+        parent_precedence: u8,
+    ) -> Result<(), EmitError> {
+        let node = self.node(expression)?.clone();
+        let NodeData::BinaryExpression(binary) = &node.data else {
+            return Err(Self::unsupported(expression, node.kind));
+        };
+        let wrap = parent_precedence > 0;
+        if wrap {
+            self.writer.write("(");
+        }
+        let mut first = true;
+        self.emit_commonjs_destructuring_pattern(
+            binary.left,
+            CommonJsDestructuringValue::Expression(binary.right),
+            &mut first,
+        )?;
+        if wrap {
+            self.writer.write(")");
+        }
+        Ok(())
+    }
+
+    fn emit_commonjs_destructuring_pattern(
+        &mut self,
+        pattern: NodeId,
+        mut value: CommonJsDestructuringValue,
+        first: &mut bool,
+    ) -> Result<(), EmitError> {
+        if let Some(temp) = self
+            .commonjs_destructuring_assignment_temps
+            .get(&pattern)
+            .cloned()
+        {
+            self.emit_commonjs_destructuring_separator(first);
+            self.writer.write(&temp);
+            self.writer.write(" = ");
+            self.emit_commonjs_destructuring_value(&value)?;
+            value = CommonJsDestructuringValue::Temp(temp);
+        }
+        let node = self.node(pattern)?.clone();
+        match &node.data {
+            NodeData::ObjectLiteralExpression(object) => {
+                for property_id in &object.properties.nodes {
+                    let property = self.node(*property_id)?.clone();
+                    match &property.data {
+                        NodeData::PropertyAssignment(property) => {
+                            self.emit_commonjs_destructuring_pattern(
+                                property.initializer,
+                                CommonJsDestructuringValue::Property(
+                                    Box::new(value.clone()),
+                                    property.name,
+                                ),
+                                first,
+                            )?;
+                        }
+                        NodeData::ShorthandPropertyAssignment(property) => {
+                            self.emit_commonjs_destructuring_pattern(
+                                property.name,
+                                CommonJsDestructuringValue::Property(
+                                    Box::new(value.clone()),
+                                    property.name,
+                                ),
+                                first,
+                            )?;
+                        }
+                        NodeData::SpreadAssignment(spread) => {
+                            self.emit_commonjs_destructuring_pattern(
+                                spread.expression,
+                                value.clone(),
+                                first,
+                            )?;
+                        }
+                        _ => return Err(Self::unsupported(*property_id, property.kind)),
+                    }
+                }
+            }
+            NodeData::ArrayLiteralExpression(array) => {
+                for (index, element_id) in array.elements.nodes.iter().enumerate() {
+                    let element = self.node(*element_id)?.clone();
+                    match &element.data {
+                        NodeData::OmittedExpression(_) => {}
+                        NodeData::SpreadElement(spread) => {
+                            self.emit_commonjs_destructuring_pattern(
+                                spread.expression,
+                                value.clone(),
+                                first,
+                            )?;
+                        }
+                        _ => {
+                            self.emit_commonjs_destructuring_pattern(
+                                *element_id,
+                                CommonJsDestructuringValue::Element(Box::new(value.clone()), index),
+                                first,
+                            )?;
+                        }
+                    }
+                }
+            }
+            NodeData::Identifier(_) => {
+                self.emit_commonjs_destructuring_separator(first);
+                self.emit_commonjs_export_assignment_prefixes(pattern);
+                self.emit_expression(pattern, 2)?;
+                self.writer.write(" = ");
+                self.emit_commonjs_destructuring_value(&value)?;
+            }
+            NodeData::PropertyAccessExpression(_) | NodeData::ElementAccessExpression(_) => {
+                self.emit_commonjs_destructuring_separator(first);
+                self.emit_expression(pattern, 2)?;
+                self.writer.write(" = ");
+                self.emit_commonjs_destructuring_value(&value)?;
+            }
+            _ => return Err(Self::unsupported(pattern, node.kind)),
+        }
+        Ok(())
+    }
+
+    fn commonjs_named_exports_for_assignment_target(&self, target: NodeId) -> Vec<String> {
+        let Some(NodeData::Identifier(identifier)) = self.arena.get(target).map(|node| &node.data)
+        else {
+            return Vec::new();
+        };
+        let rewrite = self
+            .bindings
+            .resolve_name_at(target, &identifier.text)
+            .and_then(|symbol| self.identifier_rewrites.get(&symbol));
+        self.commonjs_named_exports_for_local(&identifier.text)
+            .into_iter()
+            .filter(|exported| {
+                rewrite.is_none_or(|rewrite| rewrite != &format!("exports.{exported}"))
+            })
+            .collect()
+    }
+
+    fn emit_commonjs_export_assignment_prefixes(&mut self, target: NodeId) {
+        let mut exported_names = self.commonjs_named_exports_for_assignment_target(target);
+        exported_names.reverse();
+        for exported in exported_names {
+            self.writer.write("exports.");
+            self.writer.write(&exported);
+            self.writer.write(" = ");
+        }
+    }
+
+    fn emit_commonjs_destructuring_separator(&mut self, first: &mut bool) {
+        if *first {
+            *first = false;
+        } else {
+            self.writer.write(", ");
+        }
+    }
+
+    fn emit_commonjs_destructuring_value(
+        &mut self,
+        value: &CommonJsDestructuringValue,
+    ) -> Result<(), EmitError> {
+        match value {
+            CommonJsDestructuringValue::Expression(expression) => {
+                self.emit_expression(*expression, 18)?;
+                if self.decimal_integer_literal_needs_property_dot(*expression) {
+                    self.writer.write(".");
+                }
+            }
+            CommonJsDestructuringValue::Temp(temp) => self.writer.write(temp),
+            CommonJsDestructuringValue::Property(value, name) => {
+                self.emit_commonjs_destructuring_value(value)?;
+                self.emit_downlevel_member_access(*name)?;
+            }
+            CommonJsDestructuringValue::Element(value, index) => {
+                self.emit_commonjs_destructuring_value(value)?;
+                self.writer.write("[");
+                self.writer.write(&index.to_string());
+                self.writer.write("]");
+            }
+        }
+        Ok(())
+    }
+
+    fn simple_object_rest_assignment_target(&self, left: NodeId) -> Option<NodeId> {
+        let NodeData::ObjectLiteralExpression(object) = &self.arena.get(left)?.data else {
+            return None;
+        };
+        let [property] = object.properties.nodes.as_slice() else {
+            return None;
+        };
+        let NodeData::SpreadAssignment(spread) = &self.arena.get(*property)?.data else {
+            return None;
+        };
+        Some(spread.expression)
     }
 
     fn source_range_has_comment(&self, start: u32, end: u32) -> bool {
@@ -33242,6 +34088,10 @@ impl Printer<'_> {
             }
             NodeData::ShorthandPropertyAssignment(property) => {
                 self.emit_shorthand_property(property.name)?;
+                if let Some(initializer) = property.object_assignment_initializer {
+                    self.writer.write(" = ");
+                    self.emit_expression(initializer, 2)?;
+                }
             }
             NodeData::MethodDeclaration(method) if method.body.is_some() => {
                 let downlevel_async = method.asterisk_token.is_none()

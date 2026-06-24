@@ -999,6 +999,7 @@ const SCALAR_OPTION_NAMES: &[&str] = &[
     "target",
     "tsBuildInfoFile",
     "useDefineForClassFields",
+    "useUnknownInCatchVariables",
     "verbatimModuleSyntax",
 ];
 
