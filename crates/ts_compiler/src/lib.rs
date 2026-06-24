@@ -616,6 +616,7 @@ impl Program {
                     inline_const_enums: !self.options.isolated_modules
                         && !self.options.verbatim_module_syntax,
                     emit_decorator_metadata: self.options.emit_decorator_metadata,
+                    es_module_interop: self.options.es_module_interop,
                     preserve_dynamic_import: matches!(
                         settings.module,
                         ModuleKind::Node16
@@ -833,7 +834,10 @@ impl Program {
                 && !settings.no_emit_helpers
                 && sources
                     .iter()
-                    .any(|source| source_needs_extends_helper(&source.parse.arena));
+                    .any(|source| {
+                        (!settings.import_helpers || !source_is_external_module(source))
+                            && source_needs_extends_helper(&source.parse.arena)
+                    });
             if bundle_needs_extends_helper {
                 code.push_str(BUNDLE_EXTENDS_HELPER);
             }
@@ -907,6 +911,7 @@ impl Program {
                     inline_const_enums: !self.options.isolated_modules
                         && !self.options.verbatim_module_syntax,
                     emit_decorator_metadata: self.options.emit_decorator_metadata,
+                    es_module_interop: self.options.es_module_interop,
                     preserve_dynamic_import: matches!(
                         settings.module,
                         ModuleKind::Node16
@@ -921,6 +926,7 @@ impl Program {
                     downlevel_iteration: self.options.downlevel_iteration,
                     module_detection: self.options.module_detection,
                 };
+                let mut emitted_uses_tslib_dependency = false;
                 match emit_source_file_with_context(
                     &source.parse.arena,
                     source.parse.source_file,
@@ -930,6 +936,7 @@ impl Program {
                     &emit_context,
                 ) {
                     Ok(emitted) => {
+                        emitted_uses_tslib_dependency = emitted.code.contains("\"tslib\"");
                         if !emitted.code.is_empty() {
                             if let Some(builder) = &mut map_builder {
                                 let source_index =
@@ -944,6 +951,11 @@ impl Program {
                 }
                 for base in amd_generated_dependency_bases(source) {
                     *amd_generated_name_offsets.entry(base).or_default() += 1;
+                }
+                if emitted_uses_tslib_dependency {
+                    *amd_generated_name_offsets
+                        .entry("tslib".to_owned())
+                        .or_default() += 1;
                 }
             }
             if let Some(mut map) = map_builder.map(|builder| builder.finish(None, map_sources)) {

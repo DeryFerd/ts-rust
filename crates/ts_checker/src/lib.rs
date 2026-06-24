@@ -3679,6 +3679,21 @@ impl<'a> Checker<'a> {
             ),
             _ => return None,
         };
+        if let NodeData::PropertyAccessExpression(access) = &self.arena.get(reference)?.data
+            && let Some(receiver_name) = identifier_text(self.arena, access.expression)
+            && let Some(receiver_symbol) =
+                self.enum_import_symbol(access.expression, receiver_name)
+            && let Some(receiver_type) = self.result.symbol_types.get(&receiver_symbol)
+            && let Some(TypeKind::Object(object)) = self
+                .result
+                .types
+                .get(*receiver_type)
+                .map(|type_| &type_.kind)
+            && let Some(member_type) = object.properties.get(name)
+            && let Some(value) = enum_constant_from_type(&self.result.types, *member_type)
+        {
+            return Some(value);
+        }
         let entity_symbol = matches!(
             self.arena.get(reference).map(|node| &node.data),
             Some(NodeData::PropertyAccessExpression(_))
