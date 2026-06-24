@@ -3192,7 +3192,8 @@ impl DeclarationPrinter<'_> {
                     self.emit_name(nested.name)?;
                     body = nested.body;
                 }
-                let inline_empty_body = node_is_in_ambient_context(self.arena, id)
+                let inline_empty_body = (node_is_in_ambient_context(self.arena, id)
+                    || (in_namespace && exported))
                     && body.is_some_and(|body| {
                     let Some(node) = self.arena.get(body) else {
                         return false;
@@ -6253,7 +6254,9 @@ impl DeclarationPrinter<'_> {
                         if let Some(object) = object {
                             let initializer =
                                 declaration.initializer.expect("object checked above");
-                            if matches!(
+                            let previous = self.canonical_literal_quotes;
+                            self.canonical_literal_quotes = true;
+                            let result = if matches!(
                                 self.arena.get(initializer).map(|node| &node.data),
                                 Some(NodeData::ObjectLiteralExpression(literal))
                                     if !literal.properties.nodes.iter().any(|property| {
@@ -6263,11 +6266,7 @@ impl DeclarationPrinter<'_> {
                                         )
                                     }) && !self.semantic_object_has_divergent_accessors(&object)
                             ) {
-                                self.emit_semantic_object_literal_type(
-                                    &object,
-                                    initializer,
-                                    false,
-                                )?;
+                                self.emit_semantic_object_literal_type(&object, initializer, false)
                             } else {
                                 let object_spread = matches!(
                                     self.arena.get(initializer).map(|node| &node.data),
@@ -6279,8 +6278,10 @@ impl DeclarationPrinter<'_> {
                                 );
                                 let methods = !object_spread
                                     && !self.initializer_uses_structural_mapped_alias(initializer);
-                                self.emit_semantic_object_type_with_methods(&object, methods)?;
-                            }
+                                self.emit_semantic_object_type_with_methods(&object, methods)
+                            };
+                            self.canonical_literal_quotes = previous;
+                            result?;
                         } else {
                             let auto_accessor_constructor = self
                                 .semantic_types
@@ -6302,7 +6303,11 @@ impl DeclarationPrinter<'_> {
                             if let Some(signature) = auto_accessor_constructor {
                                 self.emit_semantic_constructor_type(&signature, None)?;
                             } else {
-                                self.emit_semantic_type(type_id)?;
+                                let previous = self.canonical_literal_quotes;
+                                self.canonical_literal_quotes = true;
+                                let result = self.emit_semantic_type(type_id);
+                                self.canonical_literal_quotes = previous;
+                                result?;
                             }
                         }
                     }
@@ -14603,35 +14608,7 @@ impl DeclarationPrinter<'_> {
         if !has_private || public.is_empty() {
             return false;
         }
-        let sole_namespace_variable = matches!(
-            self.arena.get(scope).map(|node| &node.data),
-            Some(NodeData::ModuleBlock(_))
-        ) && match public.as_slice() {
-            [(_, node)] => match &node.data {
-                NodeData::VariableStatement(statement) => self
-                    .arena
-                    .get(statement.declaration_list)
-                    .and_then(|node| match &node.data {
-                        NodeData::VariableDeclarationList(list) => Some(list),
-                        _ => None,
-                    })
-                    .is_some_and(|list| {
-                        list.declarations.nodes.iter().all(|declaration| {
-                            matches!(
-                                self.arena.get(*declaration).map(|node| &node.data),
-                                Some(NodeData::VariableDeclaration(declaration))
-                                    if matches!(
-                                        self.arena.get(declaration.name).map(|node| &node.data),
-                                        Some(NodeData::Identifier(_))
-                                    )
-                            )
-                        })
-                    }),
-                _ => false,
-            },
-            _ => false,
-        };
-        !sole_namespace_variable
+        true
     }
 
     fn namespace_scope_requires_explicit_exports(&self, scope: NodeId) -> bool {
