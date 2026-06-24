@@ -3977,6 +3977,7 @@ impl<'a> Parser<'a> {
             | NodeData::PropertyAccessExpression(_)
             | NodeData::ElementAccessExpression(_)
             | NodeData::CallExpression(_)
+            | NodeData::NewExpression(_)
             | NodeData::NumericLiteral(_)
             | NodeData::BigIntLiteral(_)
             | NodeData::StringLiteral(_)
@@ -7444,6 +7445,34 @@ mod tests {
             SyntaxKind::ParenthesizedExpression
         );
         assert_eq!(first_statement, statements[0]);
+    }
+
+    #[test]
+    fn preserves_new_expressions_as_invalid_assignment_targets() {
+        let result = parse_source_file("var x = new y = 5;");
+        let (list, _) = variable_list(&result, source_statements(&result)[0]);
+        let declaration = declaration_nodes(&result, list)[0];
+        let NodeData::VariableDeclaration(declaration) =
+            &result.arena.get(declaration).unwrap().data
+        else {
+            panic!("expected variable declaration");
+        };
+        let NodeData::BinaryExpression(assignment) = &result
+            .arena
+            .get(declaration.initializer.unwrap())
+            .unwrap()
+            .data
+        else {
+            panic!("expected assignment expression");
+        };
+        assert_eq!(
+            result.arena.get(assignment.left).unwrap().kind,
+            SyntaxKind::NewExpression
+        );
+        assert_eq!(
+            result.arena.get(assignment.operator_token).unwrap().kind,
+            SyntaxKind::EqualsToken
+        );
     }
 
     #[test]
