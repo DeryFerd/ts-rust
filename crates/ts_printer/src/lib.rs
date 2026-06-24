@@ -310,6 +310,7 @@ pub fn emit_source_file_with_context(
         es5_async_new_temps: HashMap::new(),
         es5_async_binary_temps: HashMap::new(),
         es5_async_object_plans: HashMap::new(),
+        es5_async_switch_temps: HashMap::new(),
         es5_async_control_targets: Vec::new(),
         es5_async_hoisted_variable_lists: HashSet::new(),
         async_loop_counter: 0,
@@ -17478,6 +17479,7 @@ struct Es5AsyncCapturePlan {
     binary_temps: HashMap<NodeId, Vec<String>>,
     object_plans: HashMap<NodeId, Es5AsyncObjectPlan>,
     object_key_hoists: Vec<String>,
+    switch_temps: HashMap<NodeId, Option<String>>,
     state_parameter: Option<String>,
 }
 
@@ -18245,6 +18247,7 @@ struct Printer<'a> {
     es5_async_new_temps: HashMap<NodeId, Vec<String>>,
     es5_async_binary_temps: HashMap<NodeId, Vec<String>>,
     es5_async_object_plans: HashMap<NodeId, Es5AsyncObjectPlan>,
+    es5_async_switch_temps: HashMap<NodeId, Option<String>>,
     es5_async_control_targets: Vec<Es5AsyncControlTarget>,
     es5_async_hoisted_variable_lists: HashSet<NodeId>,
     async_loop_counter: u32,
@@ -25246,6 +25249,7 @@ impl Printer<'_> {
         let previous_new_temps = std::mem::take(&mut self.es5_async_new_temps);
         let previous_binary_temps = std::mem::take(&mut self.es5_async_binary_temps);
         let previous_object_plans = std::mem::take(&mut self.es5_async_object_plans);
+        let previous_switch_temps = std::mem::take(&mut self.es5_async_switch_temps);
         let previous_hoisted_variable_lists =
             std::mem::take(&mut self.es5_async_hoisted_variable_lists);
         let mut hoisted_for_names = Vec::new();
@@ -25267,6 +25271,7 @@ impl Printer<'_> {
                 binary_temps: HashMap::new(),
                 object_plans: HashMap::new(),
                 object_key_hoists: Vec::new(),
+                switch_temps: HashMap::new(),
                 state_parameter: None,
             }
         };
@@ -25280,6 +25285,7 @@ impl Printer<'_> {
             binary_temps,
             object_plans,
             object_key_hoists,
+            switch_temps,
             state_parameter: planned_state_parameter,
         } = capture_plan;
         self.es5_async_await_captures = await_captures;
@@ -25289,6 +25295,7 @@ impl Printer<'_> {
         self.es5_async_new_temps = new_temps;
         self.es5_async_binary_temps = binary_temps;
         self.es5_async_object_plans = object_plans;
+        self.es5_async_switch_temps = switch_temps;
         let state_parameter = planned_state_parameter
             .as_deref()
             .unwrap_or(requested_state_parameter);
@@ -25413,6 +25420,7 @@ impl Printer<'_> {
         self.es5_async_new_temps = previous_new_temps;
         self.es5_async_binary_temps = previous_binary_temps;
         self.es5_async_object_plans = previous_object_plans;
+        self.es5_async_switch_temps = previous_switch_temps;
         self.es5_async_hoisted_variable_lists = previous_hoisted_variable_lists;
         Ok(())
     }
@@ -25477,6 +25485,7 @@ impl Printer<'_> {
         let mut new_nodes = Vec::new();
         let mut binary_nodes = Vec::new();
         let mut object_nodes = Vec::new();
+        let mut switch_nodes = Vec::new();
         if let Some(NodeData::Block(block)) = self.arena.get(body).map(|node| &node.data) {
             for statement in &block.statements.nodes {
                 self.collect_es5_async_await_captures(*statement, &mut await_captures);
@@ -25486,6 +25495,7 @@ impl Printer<'_> {
                 self.collect_es5_async_new_temps(*statement, &mut new_nodes);
                 self.collect_es5_async_binary_temps(*statement, &mut binary_nodes);
                 self.collect_es5_async_object_plans(*statement, &mut object_nodes);
+                self.collect_es5_async_switch_plans(*statement, &mut switch_nodes);
             }
         }
         let mut claimed = HashSet::new();
@@ -25567,6 +25577,18 @@ impl Printer<'_> {
             temps.push(temp.clone());
             object_plans.insert(object, Es5AsyncObjectPlan { temp, key_temps });
         }
+        let mut switch_temps = HashMap::new();
+        for statement in switch_nodes {
+            let temp = if self.es5_async_switch_needs_cfg(statement) {
+                let temp = self.generate_block_temp(body, &claimed);
+                claimed.insert(temp.clone());
+                temps.push(temp.clone());
+                Some(temp)
+            } else {
+                None
+            };
+            switch_temps.insert(statement, temp);
+        }
         let state_parameter = (!temps.is_empty()).then(|| self.generate_block_temp(body, &claimed));
         Es5AsyncCapturePlan {
             temps,
@@ -25578,7 +25600,42 @@ impl Printer<'_> {
             binary_temps,
             object_plans,
             object_key_hoists,
+            switch_temps,
             state_parameter,
+        }
+    }
+
+    fn collect_es5_async_switch_plans(&self, statement: NodeId, switches: &mut Vec<NodeId>) {
+        match self.arena.get(statement).map(|node| &node.data) {
+            Some(NodeData::Block(block)) => {
+                for statement in &block.statements.nodes {
+                    self.collect_es5_async_switch_plans(*statement, switches);
+                }
+            }
+            Some(NodeData::IfStatement(statement)) => {
+                self.collect_es5_async_switch_plans(statement.then_statement, switches);
+                if let Some(statement) = statement.else_statement {
+                    self.collect_es5_async_switch_plans(statement, switches);
+                }
+            }
+            Some(NodeData::WhileStatement(statement)) => {
+                self.collect_es5_async_switch_plans(statement.statement, switches);
+            }
+            Some(NodeData::DoStatement(statement)) => {
+                self.collect_es5_async_switch_plans(statement.statement, switches);
+            }
+            Some(NodeData::ForStatement(statement)) => {
+                self.collect_es5_async_switch_plans(statement.statement, switches);
+            }
+            Some(NodeData::LabeledStatement(statement)) => {
+                self.collect_es5_async_switch_plans(statement.statement, switches);
+            }
+            Some(NodeData::SwitchStatement(_)) => {
+                if self.es5_async_switch_suspension_count(statement) != 0 {
+                    switches.push(statement);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -26024,6 +26081,23 @@ impl Printer<'_> {
                 is_last,
             );
         }
+        if let NodeData::SwitchStatement(switch_statement) = &node.data
+            && self.es5_async_switch_suspension_count(statement) != 0
+        {
+            let temp = self
+                .es5_async_switch_temps
+                .get(&statement)
+                .cloned()
+                .flatten();
+            return self.emit_es5_async_switch_statement(
+                statement,
+                switch_statement,
+                temp.as_deref(),
+                state,
+                case,
+                is_last,
+            );
+        }
         if let NodeData::IfStatement(if_statement) = &node.data
             && self.es5_async_simple_suspension_count(statement) != 0
         {
@@ -26428,6 +26502,220 @@ impl Printer<'_> {
             self.writer.write(" ");
         }
         *case = exit_case;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn emit_es5_async_switch_statement(
+        &mut self,
+        statement_id: NodeId,
+        statement: &ts_ast::SwitchStatementData,
+        temp: Option<&str>,
+        state: &str,
+        case: &mut usize,
+        is_last: bool,
+    ) -> Result<(), EmitError> {
+        if temp.is_none() {
+            let await_id = self
+                .es5_async_first_await(statement.expression)
+                .expect("planned switch discriminant await");
+            let NodeData::AwaitExpression(awaited) = &self.node(await_id)?.data else {
+                unreachable!("await expression identified above")
+            };
+            let awaited_expression = awaited.expression;
+            self.emit_es5_async_yield(awaited_expression, case, false)?;
+            let previous = self
+                .es5_async_expression_rewrites
+                .insert(await_id, format!("{state}.sent()"));
+            self.emit_switch(statement)?;
+            self.writer.newline();
+            self.restore_es5_async_expression_rewrite(await_id, previous);
+            return Ok(());
+        }
+        let temp = temp.expect("CFG switch temp");
+        let block_node = self.node(statement.case_block)?.clone();
+        let NodeData::CaseBlock(block) = &block_node.data else {
+            return Err(Self::unsupported(statement.case_block, block_node.kind));
+        };
+        let start_case = *case;
+        let dispatch_advance = self.es5_async_expression_await_count(statement.expression)
+            + block
+                .clauses
+                .nodes
+                .iter()
+                .map(|clause_id| {
+                    let Some(clause_node) = self.arena.get(*clause_id) else {
+                        return 0;
+                    };
+                    let NodeData::CaseOrDefaultClause(clause) = &clause_node.data else {
+                        return 0;
+                    };
+                    if clause_node.kind == SyntaxKind::DefaultClause {
+                        0
+                    } else {
+                        self.es5_async_expression_await_count(clause.expression)
+                    }
+                })
+                .sum::<usize>();
+        let mut clause_starts = Vec::new();
+        let mut next = start_case + dispatch_advance + 1;
+        for clause_id in &block.clauses.nodes {
+            clause_starts.push(next);
+            let clause_node = self.node(*clause_id)?.clone();
+            let NodeData::CaseOrDefaultClause(clause) = &clause_node.data else {
+                return Err(Self::unsupported(*clause_id, clause_node.kind));
+            };
+            next += clause
+                .statements
+                .nodes
+                .iter()
+                .map(|statement| self.es5_async_case_advance(*statement))
+                .sum::<usize>()
+                + 1;
+        }
+        let exit_case = next;
+        if !self.writer.line_start {
+            self.writer.newline();
+        }
+        if let Some(await_id) = self.es5_async_first_await(statement.expression) {
+            let NodeData::AwaitExpression(awaited) = &self.node(await_id)?.data else {
+                unreachable!("await expression identified above")
+            };
+            let awaited_expression = awaited.expression;
+            self.emit_es5_async_yield(awaited_expression, case, false)?;
+            self.writer.write(temp);
+            self.writer.write(" = ");
+            self.writer.write(state);
+            self.writer.write(".sent();");
+            self.writer.newline();
+        } else {
+            self.writer.write(temp);
+            self.writer.write(" = ");
+            self.emit_expression(statement.expression, 0)?;
+            self.writer.write(";");
+            self.writer.newline();
+        }
+
+        let default_target = block
+            .clauses
+            .nodes
+            .iter()
+            .position(|clause_id| {
+                self.arena
+                    .get(*clause_id)
+                    .is_some_and(|node| node.kind == SyntaxKind::DefaultClause)
+            })
+            .map_or(exit_case, |index| clause_starts[index]);
+        let mut pending = Vec::new();
+        for (index, clause_id) in block.clauses.nodes.iter().enumerate() {
+            let clause_node = self.node(*clause_id)?.clone();
+            let NodeData::CaseOrDefaultClause(clause) = &clause_node.data else {
+                return Err(Self::unsupported(*clause_id, clause_node.kind));
+            };
+            if clause_node.kind == SyntaxKind::DefaultClause {
+                continue;
+            }
+            if let Some(await_id) = self.es5_async_first_await(clause.expression) {
+                self.emit_es5_async_switch_tests(temp, &pending, state)?;
+                pending.clear();
+                let NodeData::AwaitExpression(awaited) = &self.node(await_id)?.data else {
+                    unreachable!("await expression identified above")
+                };
+                let awaited_expression = awaited.expression;
+                self.emit_es5_async_yield(awaited_expression, case, false)?;
+                pending.push((None, clause_starts[index]));
+            } else {
+                pending.push((Some(clause.expression), clause_starts[index]));
+            }
+        }
+        self.emit_es5_async_switch_tests(temp, &pending, state)?;
+        self.writer.write("return [3 /*break*/, ");
+        self.writer.write(&default_target.to_string());
+        self.writer.write("];");
+        self.writer.newline();
+
+        self.es5_async_control_targets.push(Es5AsyncControlTarget {
+            nodes: vec![statement_id],
+            break_case: exit_case,
+            continue_case: exit_case,
+        });
+        let mut body_result = Ok(());
+        for (index, clause_id) in block.clauses.nodes.iter().enumerate() {
+            let clause_node = self.node(*clause_id)?.clone();
+            let NodeData::CaseOrDefaultClause(clause) = &clause_node.data else {
+                body_result = Err(Self::unsupported(*clause_id, clause_node.kind));
+                break;
+            };
+            let inline =
+                clause.statements.nodes.first().is_some_and(|statement| {
+                    self.es5_async_branch_starts_with_suspension(*statement)
+                });
+            self.emit_es5_async_case_label(clause_starts[index], inline);
+            *case = clause_starts[index];
+            for statement in &clause.statements.nodes {
+                if let Err(error) =
+                    self.emit_es5_async_planned_statement(*statement, state, case, false)
+                {
+                    body_result = Err(error);
+                    break;
+                }
+            }
+            if body_result.is_err() {
+                break;
+            }
+            let completes =
+                clause.statements.nodes.last().is_none_or(|statement| {
+                    self.es5_async_statement_may_complete_normally(*statement)
+                });
+            if completes {
+                let target = clause_starts.get(index + 1).copied().unwrap_or(exit_case);
+                self.writer.write(state);
+                self.writer.write(".label = ");
+                self.writer.write(&target.to_string());
+                self.writer.write(";");
+                self.writer.newline();
+            }
+        }
+        self.es5_async_control_targets.pop();
+        body_result?;
+        self.emit_es5_async_case_label(exit_case, is_last);
+        if is_last {
+            self.writer.write(" ");
+        }
+        *case = exit_case;
+        Ok(())
+    }
+
+    fn emit_es5_async_switch_tests(
+        &mut self,
+        temp: &str,
+        tests: &[(Option<NodeId>, usize)],
+        state: &str,
+    ) -> Result<(), EmitError> {
+        if tests.is_empty() {
+            return Ok(());
+        }
+        self.writer.write("switch (");
+        self.writer.write(temp);
+        self.writer.write(") {");
+        self.writer.newline();
+        self.writer.indent += 1;
+        for (expression, target) in tests {
+            self.writer.write("case ");
+            if let Some(expression) = expression {
+                self.emit_expression(*expression, 0)?;
+            } else {
+                self.writer.write(state);
+                self.writer.write(".sent()");
+            }
+            self.writer.write(": return [3 /*break*/, ");
+            self.writer.write(&target.to_string());
+            self.writer.write("];");
+            self.writer.newline();
+        }
+        self.writer.indent -= 1;
+        self.writer.write("}");
+        self.writer.newline();
         Ok(())
     }
 
@@ -28390,6 +28678,7 @@ impl Printer<'_> {
                     )
                 }) + self.es5_async_simple_suspension_count(statement.statement)
             }
+            Some(NodeData::SwitchStatement(_)) => self.es5_async_switch_suspension_count(statement),
             Some(NodeData::LabeledStatement(statement)) => {
                 self.es5_async_simple_suspension_count(statement.statement)
             }
@@ -28487,6 +28776,7 @@ impl Printer<'_> {
                 }) + self.es5_async_case_advance(statement.statement)
                     + 3
             }
+            Some(NodeData::SwitchStatement(_)) => self.es5_async_switch_case_advance(statement),
             Some(NodeData::LabeledStatement(statement)) => {
                 self.es5_async_case_advance(statement.statement)
             }
@@ -29062,6 +29352,137 @@ impl Printer<'_> {
                     .then_some(name.expression)
             })
             .collect()
+    }
+
+    fn es5_async_switch_suspension_count(&self, statement: NodeId) -> usize {
+        let Some(NodeData::SwitchStatement(statement)) =
+            self.arena.get(statement).map(|node| &node.data)
+        else {
+            return 0;
+        };
+        let Some(NodeData::CaseBlock(block)) =
+            self.arena.get(statement.case_block).map(|node| &node.data)
+        else {
+            return 0;
+        };
+        self.es5_async_expression_await_count(statement.expression)
+            + block
+                .clauses
+                .nodes
+                .iter()
+                .map(|clause_id| {
+                    let Some(clause_node) = self.arena.get(*clause_id) else {
+                        return 0;
+                    };
+                    let Some(NodeData::CaseOrDefaultClause(clause)) = Some(&clause_node.data)
+                    else {
+                        return 0;
+                    };
+                    let expression = if clause_node.kind == SyntaxKind::DefaultClause {
+                        0
+                    } else {
+                        self.es5_async_expression_await_count(clause.expression)
+                    };
+                    expression
+                        + clause
+                            .statements
+                            .nodes
+                            .iter()
+                            .map(|statement| self.es5_async_simple_suspension_count(*statement))
+                            .sum::<usize>()
+                })
+                .sum::<usize>()
+    }
+
+    fn es5_async_switch_needs_cfg(&self, statement: NodeId) -> bool {
+        let Some(NodeData::SwitchStatement(statement)) =
+            self.arena.get(statement).map(|node| &node.data)
+        else {
+            return false;
+        };
+        self.es5_async_switch_suspension_count_for_parts(statement) != 0
+    }
+
+    fn es5_async_switch_suspension_count_for_parts(
+        &self,
+        statement: &ts_ast::SwitchStatementData,
+    ) -> usize {
+        let Some(NodeData::CaseBlock(block)) =
+            self.arena.get(statement.case_block).map(|node| &node.data)
+        else {
+            return 0;
+        };
+        block
+            .clauses
+            .nodes
+            .iter()
+            .map(|clause_id| {
+                let Some(clause_node) = self.arena.get(*clause_id) else {
+                    return 0;
+                };
+                let NodeData::CaseOrDefaultClause(clause) = &clause_node.data else {
+                    return 0;
+                };
+                let expression = if clause_node.kind == SyntaxKind::DefaultClause {
+                    0
+                } else {
+                    self.es5_async_expression_await_count(clause.expression)
+                };
+                expression
+                    + clause
+                        .statements
+                        .nodes
+                        .iter()
+                        .map(|statement| self.es5_async_simple_suspension_count(*statement))
+                        .sum::<usize>()
+            })
+            .sum()
+    }
+
+    fn es5_async_switch_case_advance(&self, statement: NodeId) -> usize {
+        let Some(NodeData::SwitchStatement(switch_statement)) =
+            self.arena.get(statement).map(|node| &node.data)
+        else {
+            return 0;
+        };
+        if !self.es5_async_switch_needs_cfg(statement) {
+            return self.es5_async_expression_await_count(switch_statement.expression);
+        }
+        let Some(NodeData::CaseBlock(block)) = self
+            .arena
+            .get(switch_statement.case_block)
+            .map(|node| &node.data)
+        else {
+            return 0;
+        };
+        self.es5_async_expression_await_count(switch_statement.expression)
+            + block
+                .clauses
+                .nodes
+                .iter()
+                .map(|clause_id| {
+                    let Some(clause_node) = self.arena.get(*clause_id) else {
+                        return 0;
+                    };
+                    let NodeData::CaseOrDefaultClause(clause) = &clause_node.data else {
+                        return 0;
+                    };
+                    let expression = if clause_node.kind == SyntaxKind::DefaultClause {
+                        0
+                    } else {
+                        self.es5_async_expression_await_count(clause.expression)
+                    };
+                    expression
+                        + clause
+                            .statements
+                            .nodes
+                            .iter()
+                            .map(|statement| self.es5_async_case_advance(*statement))
+                            .sum::<usize>()
+                })
+                .sum::<usize>()
+            + block.clauses.nodes.len()
+            + 1
     }
 
     fn es5_async_simple_await_in_expression(&self, expression: NodeId) -> Option<NodeId> {
