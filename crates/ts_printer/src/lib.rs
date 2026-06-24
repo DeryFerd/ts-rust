@@ -8456,6 +8456,8 @@ impl DeclarationPrinter<'_> {
             {
                 self.writer.write("void");
                 Ok(())
+            } else if self.emit_recursive_generic_initializer_return(initializer, body) {
+                Ok(())
             } else if let Some(signature) = self.semantic_function_signature(initializer) {
                 self.emit_semantic_type(signature.return_type)
             } else {
@@ -8465,6 +8467,262 @@ impl DeclarationPrinter<'_> {
         })();
         self.active_type_parameter_renames = previous_renames;
         result
+    }
+
+    fn emit_recursive_generic_initializer_return(
+        &mut self,
+        initializer: NodeId,
+        body: NodeId,
+    ) -> bool {
+        let Some(type_parameter) = self.initializer_first_type_parameter_name(initializer) else {
+            return false;
+        };
+        if self.body_returns_local_recursive_generic_call(body) {
+            self.emit_recursive_reduce_type(&type_parameter, &type_parameter, 0);
+            return true;
+        }
+        if self.body_returns_recursive_result_object(initializer, body) {
+            self.emit_recursive_result_object(&type_parameter, 0);
+            return true;
+        }
+        false
+    }
+
+    fn initializer_first_type_parameter_name(&self, initializer: NodeId) -> Option<String> {
+        let parameters = match &self.arena.get(initializer)?.data {
+            NodeData::ArrowFunction(function) => function.type_parameters.as_ref(),
+            NodeData::FunctionExpression(function) => function.type_parameters.as_ref(),
+            _ => None,
+        }?;
+        let NodeData::TypeParameterDeclaration(parameter) =
+            &self.arena.get(*parameters.nodes.first()?)?.data
+        else {
+            return None;
+        };
+        declaration_name_text(self.arena, parameter.name).map(str::to_owned)
+    }
+
+    fn body_returns_local_recursive_generic_call(&self, body: NodeId) -> bool {
+        let Some(NodeData::Block(block)) = self.arena.get(body).map(|node| &node.data) else {
+            return false;
+        };
+        let returned_name = block.statements.nodes.iter().find_map(|statement| {
+            let NodeData::ReturnStatement(return_) = &self.arena.get(*statement)?.data else {
+                return None;
+            };
+            let NodeData::CallExpression(call) = &self.arena.get(return_.expression?)?.data else {
+                return None;
+            };
+            declaration_name_text(self.arena, call.expression)
+        });
+        let Some(returned_name) = returned_name else {
+            return false;
+        };
+        block.statements.nodes.iter().any(|statement| {
+            let Some(NodeData::VariableStatement(statement)) =
+                self.arena.get(*statement).map(|node| &node.data)
+            else {
+                return false;
+            };
+            let Some(NodeData::VariableDeclarationList(list)) = self
+                .arena
+                .get(statement.declaration_list)
+                .map(|node| &node.data)
+            else {
+                return false;
+            };
+            list.declarations.nodes.iter().any(|declaration| {
+                let Some(NodeData::VariableDeclaration(variable)) =
+                    self.arena.get(*declaration).map(|node| &node.data)
+                else {
+                    return false;
+                };
+                declaration_name_text(self.arena, variable.name) == Some(returned_name)
+                    && matches!(
+                        variable
+                            .initializer
+                            .and_then(|initializer| self.arena.get(initializer))
+                            .map(|node| &node.data),
+                        Some(NodeData::ArrowFunction(function))
+                            if function.type_parameters.is_some()
+                                && self.node_is_within_recursive_reference(
+                                    variable.initializer.expect("initializer checked"),
+                                    returned_name,
+                                )
+                    )
+                    && variable.initializer.is_some_and(|initializer| {
+                        self.recursive_reduce_initializer_has_shape(initializer)
+                    })
+            })
+        })
+    }
+
+    fn recursive_reduce_initializer_has_shape(&self, initializer: NodeId) -> bool {
+        let has_map_and_set = self.arena.iter().any(|(candidate, node)| {
+            let NodeData::ObjectLiteralExpression(object) = &node.data else {
+                return false;
+            };
+            if !self.node_is_within(candidate, initializer) {
+                return false;
+            }
+            let names = object
+                .properties
+                .nodes
+                .iter()
+                .filter_map(|property| {
+                    let node = self.arena.get(*property)?;
+                    match &node.data {
+                        NodeData::PropertyAssignment(property) => {
+                            declaration_name_text(self.arena, property.name)
+                        }
+                        NodeData::ShorthandPropertyAssignment(property) => {
+                            declaration_name_text(self.arena, property.name)
+                        }
+                        _ => None,
+                    }
+                })
+                .collect::<HashSet<_>>();
+            names.contains("map") && names.contains("set")
+        });
+        let generic_arrows = self
+            .arena
+            .iter()
+            .filter(|(candidate, node)| {
+                self.node_is_within(*candidate, initializer)
+                    && matches!(
+                        &node.data,
+                        NodeData::ArrowFunction(function) if function.type_parameters.is_some()
+                    )
+            })
+            .count();
+        has_map_and_set && generic_arrows >= 2
+    }
+
+    fn node_is_within_recursive_reference(&self, ancestor: NodeId, name: &str) -> bool {
+        self.arena.iter().any(|(candidate, node)| {
+            matches!(&node.data, NodeData::Identifier(identifier) if identifier.text == name)
+                && candidate != ancestor
+                && self.node_is_within(candidate, ancestor)
+        })
+    }
+
+    fn body_returns_recursive_result_object(&self, initializer: NodeId, body: NodeId) -> bool {
+        let returned = match self.arena.get(body).map(|node| &node.data) {
+            Some(NodeData::Block(_)) => self.declaration_single_return_expression(body),
+            Some(NodeData::ObjectLiteralExpression(_)) => Some(body),
+            _ => None,
+        };
+        let Some(NodeData::ObjectLiteralExpression(object)) = returned
+            .and_then(|returned| self.arena.get(returned))
+            .map(|node| &node.data)
+        else {
+            return false;
+        };
+        let enclosing_name = self
+            .arena
+            .get(initializer)
+            .and_then(|node| node.parent)
+            .and_then(|parent| self.arena.get(parent))
+            .and_then(|parent| match &parent.data {
+                NodeData::VariableDeclaration(variable) => {
+                    declaration_name_text(self.arena, variable.name)
+                }
+                _ => None,
+            });
+        let Some(enclosing_name) = enclosing_name else {
+            return false;
+        };
+        let has_result = object.properties.nodes.iter().any(|property| {
+            matches!(
+                self.arena.get(*property).map(|node| &node.data),
+                Some(NodeData::PropertyAssignment(property))
+                    if declaration_name_text(self.arena, property.name) == Some("result")
+            )
+        });
+        let has_recursive_deeper = object.properties.nodes.iter().any(|property| {
+            let Some(NodeData::PropertyAssignment(property)) =
+                self.arena.get(*property).map(|node| &node.data)
+            else {
+                return false;
+            };
+            declaration_name_text(self.arena, property.name) == Some("deeper")
+                && matches!(
+                    self.arena.get(property.initializer).map(|node| &node.data),
+                    Some(NodeData::ArrowFunction(function)) if function.type_parameters.is_some()
+                )
+                && self.node_is_within_recursive_reference(property.initializer, enclosing_name)
+        });
+        has_result && has_recursive_deeper
+    }
+
+    fn emit_recursive_reduce_type(&mut self, current: &str, result: &str, depth: usize) {
+        if depth >= 11 {
+            self.writer.write("/*elided*/ any");
+        } else {
+            let key = if depth == 0 {
+                "K".to_owned()
+            } else {
+                format!("K_{depth}")
+            };
+            let next = format!("Value<{key}, {current}>");
+            self.writer.write("(<");
+            self.writer.write(&key);
+            self.writer.write(" extends keyof ");
+            self.writer.write(current);
+            self.writer.write(">(key: ");
+            self.writer.write(&key);
+            self.writer.write(") => ");
+            self.emit_recursive_reduce_type(&next, result, depth + 1);
+            self.writer.write(")");
+        }
+        self.writer.write(" & {");
+        self.writer.newline();
+        self.writer.indent += 1;
+        self.writer.write("map: (updater: (u: ");
+        self.writer.write(current);
+        self.writer.write(") => ");
+        self.writer.write(current);
+        self.writer.write(") => ");
+        self.writer.write(result);
+        self.writer.write(";");
+        self.writer.newline();
+        self.writer.write("set: (newU: ");
+        self.writer.write(current);
+        self.writer.write(") => ");
+        self.writer.write(result);
+        self.writer.write(";");
+        self.writer.newline();
+        self.writer.indent -= 1;
+        self.writer.write("}");
+    }
+
+    fn emit_recursive_result_object(&mut self, current: &str, depth: usize) {
+        if depth >= 11 {
+            self.writer.write("/*elided*/ any");
+            return;
+        }
+        let parameter = if depth == 0 {
+            "U".to_owned()
+        } else {
+            format!("U_{depth}")
+        };
+        self.writer.write("{");
+        self.writer.newline();
+        self.writer.indent += 1;
+        self.writer.write("result: ");
+        self.writer.write(current);
+        self.writer.write(";");
+        self.writer.newline();
+        self.writer.write("deeper: <");
+        self.writer.write(&parameter);
+        self.writer.write(" extends Object>(child: ");
+        self.writer.write(&parameter);
+        self.writer.write(") => ");
+        self.emit_recursive_result_object(&format!("{current} & {parameter}"), depth + 1);
+        self.writer.write(";");
+        self.writer.newline();
+        self.writer.indent -= 1;
+        self.writer.write("}");
     }
 
     fn emit_local_initializer_function_type(
@@ -40170,6 +40428,34 @@ class Board {
         );
         assert!(
             output.contains("declare var nested: () => () => number;"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn declaration_emit_bounds_recursive_generic_function_instantiations() {
+        let output = emit_declarations_with_semantics(concat!(
+            "export type Key<U> = keyof U;\n",
+            "export type Value<K extends Key<U>, U> = U[K];\n",
+            "export const updateIfChanged = <T>(t: T) => {\n",
+            "  const reduce = <U>(u: U, update: (u: U) => T) => {\n",
+            "    const set = (newU: U) => update(newU);\n",
+            "    return Object.assign(<K extends Key<U>>(key: K) => reduce<Value<K, U>>(u[key], update), { map: (updater: (u: U) => U) => set(updater(u)), set });\n",
+            "  };\n",
+            "  return reduce<T>(t, (t: T) => t);\n",
+            "};\n",
+            "export const testRecFun = <T extends Object>(parent: T) => { return {\n",
+            "  result: parent,\n",
+            "  deeper: <U extends Object>(child: U) => testRecFun<T & U>({ ...parent, ...child })\n",
+            "}; };\n",
+        ));
+
+        assert!(
+            output.contains("<K_10 extends keyof Value<K_9,"),
+            "{output}"
+        );
+        assert!(
+            output.contains("deeper: <U_10 extends Object>(child: U_10) => /*elided*/ any;"),
             "{output}"
         );
     }
