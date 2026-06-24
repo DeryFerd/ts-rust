@@ -4683,6 +4683,32 @@ impl<'a> Parser<'a> {
                             })),
                             &children,
                         );
+                    } else if matches!(
+                        self.current.kind,
+                        SyntaxKind::NoSubstitutionTemplateLiteral | SyntaxKind::TemplateHead
+                    ) {
+                        let template = if self.current.kind == SyntaxKind::TemplateHead {
+                            self.parse_template_expression()
+                        } else {
+                            self.parse_template_literal()
+                        };
+                        let mut children = vec![expression];
+                        children.extend(type_arguments.nodes.iter().copied());
+                        children.push(template);
+                        expression = self.alloc_node(
+                            SyntaxKind::TaggedTemplateExpression,
+                            TextRange::new(self.node_start(expression), self.node_end(template)),
+                            NodeData::TaggedTemplateExpression(Box::new(
+                                TaggedTemplateExpressionData {
+                                    question_dot_token: None,
+                                    tag: expression,
+                                    template,
+                                    type_arguments: Some(type_arguments),
+                                    facts: 0,
+                                },
+                            )),
+                            &children,
+                        );
                     } else {
                         let start = self.node_start(expression);
                         let end = type_arguments.range.end;
@@ -4804,6 +4830,10 @@ impl<'a> Parser<'a> {
         self.scanner.rewind(checkpoint);
         depth == 0
             && (token.kind == SyntaxKind::OpenParenToken
+                || matches!(
+                    token.kind,
+                    SyntaxKind::NoSubstitutionTemplateLiteral | SyntaxKind::TemplateHead
+                )
                 || token.kind.is_assignment_operator()
                 || matches!(
                     token.kind,
@@ -8232,6 +8262,7 @@ mod tests {
             f({value: [1, 2]}).value;
             const t = `a${f(1)}b${2}`;
             const tagged = f`value`;
+            const genericTagged = f<number>``;
         ";
         let result = parse_source_file(source);
         assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
@@ -8313,6 +8344,26 @@ mod tests {
                 .unwrap()
                 .kind,
             SyntaxKind::TaggedTemplateExpression
+        );
+        let (list, _) = variable_list(&result, statements[4]);
+        let declaration = declaration_nodes(&result, list)[0];
+        let NodeData::VariableDeclaration(declaration) =
+            &result.arena.get(declaration).unwrap().data
+        else {
+            panic!("expected generic tagged-template declaration");
+        };
+        let NodeData::TaggedTemplateExpression(tagged) = &result
+            .arena
+            .get(declaration.initializer.unwrap())
+            .unwrap()
+            .data
+        else {
+            panic!("expected generic tagged-template expression");
+        };
+        assert_eq!(tagged.type_arguments.as_ref().unwrap().nodes.len(), 1);
+        assert_eq!(
+            result.arena.get(tagged.tag).unwrap().kind,
+            SyntaxKind::Identifier
         );
     }
 
