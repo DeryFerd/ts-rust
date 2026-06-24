@@ -2250,7 +2250,14 @@ impl<'a> Parser<'a> {
         while name.kind.is_modifier() {
             name = self.scanner.scan();
         }
-        let colon = self.scanner.scan();
+        if name.kind == SyntaxKind::DotDotDotToken {
+            self.scanner.rewind(checkpoint);
+            return true;
+        }
+        let mut colon = self.scanner.scan();
+        if colon.kind == SyntaxKind::QuestionToken {
+            colon = self.scanner.scan();
+        }
         self.scanner.rewind(checkpoint);
         (name.kind == SyntaxKind::Identifier || name.kind.is_keyword())
             && colon.kind == SyntaxKind::ColonToken
@@ -6731,6 +6738,14 @@ impl<'a> Parser<'a> {
                 continue;
             }
             if self.current.kind != SyntaxKind::OpenBracketToken {
+                break;
+            }
+            if self
+                .current
+                .flags
+                .contains(ScannerTokenFlags::PRECEDING_LINE_BREAK)
+                && self.is_index_signature()
+            {
                 break;
             }
             self.bump();

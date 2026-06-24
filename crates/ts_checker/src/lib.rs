@@ -3145,6 +3145,7 @@ impl<'a> Checker<'a> {
     #[allow(clippy::too_many_lines)]
     fn seed_symbol_types(&mut self) {
         self.seed_import_equals_types();
+        self.seed_unique_symbol_types();
         let mut seeded_enum_declarations = HashSet::new();
         for symbol in self.bindings.symbols.iter() {
             if self.result.symbol_types.contains_key(&symbol.id) {
@@ -3318,6 +3319,34 @@ impl<'a> Checker<'a> {
         }
         self.seed_namespace_types();
         self.seed_import_equals_types();
+    }
+
+    fn seed_unique_symbol_types(&mut self) {
+        let declarations = self
+            .bindings
+            .symbols
+            .iter()
+            .flat_map(|symbol| {
+                symbol.declarations.iter().filter_map(|declaration| {
+                    let NodeData::VariableDeclaration(data) =
+                        &self.arena.get(*declaration)?.data
+                    else {
+                        return None;
+                    };
+                    Some((symbol.id, *declaration, data.as_ref().clone()))
+                })
+            })
+            .collect::<Vec<_>>();
+        for (symbol, declaration, data) in declarations {
+            let Some(type_id) = self.unique_symbol_type_for_variable(declaration, &data) else {
+                continue;
+            };
+            self.result.symbol_types.insert(symbol, type_id);
+            self.result.node_types.insert(declaration, type_id);
+            if let Some(initializer) = data.initializer {
+                self.result.node_types.insert(initializer, type_id);
+            }
+        }
     }
 
     fn seed_namespace_types(&mut self) {
@@ -3882,7 +3911,14 @@ impl<'a> Checker<'a> {
                 {
                     self.assignability_error(node_id, actual, expected);
                 }
-                let inferred = annotation
+                let unique_symbol = (annotation.is_none())
+                    .then(|| self.unique_symbol_type_for_variable(node_id, data))
+                    .flatten();
+                if let (Some(initializer), Some(unique_symbol)) = (data.initializer, unique_symbol) {
+                    self.result.node_types.insert(initializer, unique_symbol);
+                }
+                let inferred = unique_symbol
+                    .or(annotation)
                     .or(initializer.map(|value| {
                         if self.is_const_declaration(node_id)
                             && (matches!(
@@ -13702,6 +13738,54 @@ impl<'a> Checker<'a> {
             .and_then(|node| node.parent)
             .and_then(|parent| self.arena.get(parent))
             .is_some_and(|list| list.flags.0 & (1 << 1) != 0)
+    }
+
+    fn unique_symbol_type_for_variable(
+        &mut self,
+        declaration: NodeId,
+        data: &ts_ast::VariableDeclarationData,
+    ) -> Option<TypeId> {
+        if !self.is_const_declaration(declaration) {
+            return None;
+        }
+        let initializer = data.initializer?;
+        let NodeData::CallExpression(call) = &self.arena.get(initializer)?.data else {
+            return None;
+        };
+        let NodeData::Identifier(identifier) = &self.arena.get(call.expression)?.data else {
+            return None;
+        };
+        if identifier.text != "Symbol"
+            || self
+                .bindings
+                .resolve_name_at(call.expression, &identifier.text)
+                .is_some()
+        {
+            return None;
+        }
+        let name = self.property_name(data.name)?;
+        let reference_name = format!("typeof {name}");
+        if let Some(type_id) = self.result.node_types.get(&declaration).copied()
+            && self
+                .result
+                .named_type_references
+                .get(&type_id)
+                .is_some_and(|reference| reference.name == reference_name)
+        {
+            return Some(type_id);
+        }
+        let type_id = self.result.types.alloc(TypeKind::TypeParameter {
+            name: reference_name.clone(),
+            constraint: None,
+        });
+        self.result.named_type_references.insert(
+            type_id,
+            NamedTypeReference {
+                name: reference_name,
+                type_arguments: Vec::new(),
+            },
+        );
+        Some(type_id)
     }
 
     fn is_number_like(&self, type_id: TypeId) -> bool {

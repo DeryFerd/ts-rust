@@ -22104,6 +22104,44 @@ impl Printer<'_> {
         }
     }
 
+    fn discard_source_comments_between(&mut self, start: u32, end: u32) {
+        let start = usize::try_from(start).unwrap_or(usize::MAX);
+        let end = usize::try_from(end).unwrap_or(usize::MAX);
+        let Some(trivia) = self.source_text.get(start..end) else {
+            return;
+        };
+        let bytes = trivia.as_bytes();
+        let mut index = 0;
+        while index < bytes.len() {
+            let Some(offset) = [
+                trivia[index..].find("//"),
+                trivia[index..].find("/*"),
+            ]
+            .into_iter()
+            .flatten()
+            .min()
+            else {
+                break;
+            };
+            let comment_start = index + offset;
+            let line_comment = bytes[comment_start..].starts_with(b"//");
+            let comment_end = if line_comment {
+                bytes[comment_start..]
+                    .iter()
+                    .position(|byte| matches!(*byte, b'\n' | b'\r'))
+                    .map_or(bytes.len(), |offset| comment_start + offset)
+            } else {
+                bytes[comment_start + 2..]
+                    .windows(2)
+                    .position(|window| window == b"*/")
+                    .map_or(bytes.len(), |offset| comment_start + 2 + offset + 2)
+            };
+            self.emitted_source_comments
+                .insert((start + comment_start, start + comment_end));
+            index = comment_end.max(comment_start + 2);
+        }
+    }
+
     fn emit_leading_source_comments(&mut self, end: u32) {
         self.emit_leading_source_comments_excluding_with_mode(end, &[], false);
     }
@@ -38135,12 +38173,16 @@ impl Printer<'_> {
                     }
                     _ => false,
                 };
-            self.emit_source_comments_between_with_ownership(
-                previous_end,
-                node.range.start.get(),
-                previous_emitted,
-                current_emitted,
-            );
+            if previous_emitted || current_emitted {
+                self.emit_source_comments_between_with_ownership(
+                    previous_end,
+                    node.range.start.get(),
+                    previous_emitted,
+                    current_emitted,
+                );
+            } else {
+                self.discard_source_comments_between(previous_end, node.range.start.get());
+            }
             if previous_emitted {
                 self.emit_class_empty_elements_between(previous_end, node.range.start.get());
             }
@@ -38280,12 +38322,16 @@ impl Printer<'_> {
                 _ => return Err(Self::unsupported(*member, node.kind)),
             }
         }
-        self.emit_source_comments_between_with_ownership(
-            previous_end,
-            data.members.range.end.get(),
-            previous_emitted,
-            false,
-        );
+        if previous_emitted {
+            self.emit_source_comments_between_with_ownership(
+                previous_end,
+                data.members.range.end.get(),
+                true,
+                false,
+            );
+        } else {
+            self.discard_source_comments_between(previous_end, data.members.range.end.get());
+        }
         if previous_emitted {
             self.emit_class_empty_elements_between(previous_end, data.members.range.end.get());
         }
