@@ -8358,6 +8358,7 @@ impl DeclarationPrinter<'_> {
         };
         let keyword = if node.flags.0 & (1 << 1) != 0
             || (self.javascript_source
+                && self.module_file
                 && node.flags.0 & 1 == 0
                 && self.javascript_variable_list_is_effectively_const(data))
         {

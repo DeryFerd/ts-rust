@@ -586,7 +586,11 @@ struct ProgramChecker<'a> {
 }
 
 type DuplicateGlobal = (usize, NodeId, u32, String);
-type GlobalCollection = (BTreeMap<String, TypeDescriptor>, Vec<DuplicateGlobal>);
+type GlobalCollection = (
+    BTreeMap<String, TypeDescriptor>,
+    Vec<DuplicateGlobal>,
+    BTreeSet<String>,
+);
 type ImportCollection = (
     HashMap<SymbolId, TypeDescriptor>,
     HashMap<SymbolId, ImportTypeReference>,
@@ -609,6 +613,7 @@ impl<'a> ProgramChecker<'a> {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn check(self) -> ProgramCheckResult {
         fn visit_dependencies(
             index: usize,
@@ -645,7 +650,7 @@ impl<'a> ProgramChecker<'a> {
                 }
             })
             .collect::<Vec<_>>();
-        let (globals, duplicate_globals) = self.globals(&preliminary);
+        let (globals, duplicate_globals, global_variables) = self.globals(&preliminary);
         let mut states = vec![0_u8; self.sources.len()];
         let mut order = Vec::with_capacity(self.sources.len());
         for index in 0..self.sources.len() {
@@ -693,6 +698,10 @@ impl<'a> ProgramChecker<'a> {
                     Checker::new(source.arena, source.bindings)
                         .with_options(source.checker_options)
                         .with_environment(external_symbols, external_imports, external_names)
+                        .with_global_environment(
+                            is_external_module(source),
+                            global_variables.clone(),
+                        )
                         .check(source.source_file)
                 };
             if source.is_default_library || source.skip_diagnostics {
@@ -1764,6 +1773,7 @@ impl<'a> ProgramChecker<'a> {
         let mut globals = BTreeMap::new();
         let mut declarations = BTreeMap::<String, (usize, ts_binder::SymbolFlags)>::new();
         let mut duplicates = Vec::new();
+        let mut global_variables = BTreeSet::new();
         let referenced_names = self.referenced_global_names();
         let enum_member_name_counts = self.enum_member_name_counts(results);
         for (file_index, (source, result)) in self.sources.iter().zip(results).enumerate() {
@@ -1842,6 +1852,12 @@ impl<'a> ProgramChecker<'a> {
                 if let Some(descriptor) = descriptor {
                     globals.insert(name.to_owned(), descriptor);
                     declarations.insert(name.to_owned(), (file_index, symbol.flags));
+                    if symbol
+                        .flags
+                        .contains(ts_binder::SymbolFlags::FUNCTION_SCOPED_VARIABLE)
+                    {
+                        global_variables.insert(name.to_owned());
+                    }
                 }
             }
             Self::extend_unique_enum_member_globals(
@@ -1851,7 +1867,7 @@ impl<'a> ProgramChecker<'a> {
                 &mut globals,
             );
         }
-        (globals, duplicates)
+        (globals, duplicates, global_variables)
     }
 
     fn referenced_global_names(&self) -> BTreeSet<String> {
@@ -3021,6 +3037,8 @@ struct Checker<'a> {
     super_types: Vec<TypeId>,
     class_value_stack: Vec<SymbolId>,
     preserve_literal_inference: bool,
+    external_module: bool,
+    established_global_variables: BTreeSet<String>,
 }
 
 enum DeclaredObject {
@@ -3090,6 +3108,8 @@ impl<'a> Checker<'a> {
             super_types: Vec::new(),
             class_value_stack: Vec::new(),
             preserve_literal_inference: false,
+            external_module: false,
+            established_global_variables: BTreeSet::new(),
         }
     }
 
@@ -3102,6 +3122,16 @@ impl<'a> Checker<'a> {
         self.external_symbols = symbols;
         self.external_imports = imports;
         self.external_names = names;
+        self
+    }
+
+    fn with_global_environment(
+        mut self,
+        external_module: bool,
+        established_global_variables: BTreeSet<String>,
+    ) -> Self {
+        self.external_module = external_module;
+        self.established_global_variables = established_global_variables;
         self
     }
 
@@ -4073,6 +4103,34 @@ impl<'a> Checker<'a> {
         }
     }
 
+    fn established_global_variable_type(
+        &mut self,
+        declaration: NodeId,
+        data: &ts_ast::VariableDeclarationData,
+    ) -> Option<TypeId> {
+        if self.options.is_javascript_file || self.external_module {
+            return None;
+        }
+        let name = identifier_text(self.arena, data.name)?;
+        if !self.established_global_variables.contains(name) {
+            return None;
+        }
+        let list = self.arena.get(declaration)?.parent?;
+        if !matches!(self.arena.get(list)?.data, NodeData::VariableDeclarationList(_)) {
+            return None;
+        }
+        let statement = self.arena.get(list)?.parent?;
+        if !matches!(self.arena.get(statement)?.data, NodeData::VariableStatement(_)) {
+            return None;
+        }
+        let source_file = self.arena.get(statement)?.parent?;
+        if !matches!(self.arena.get(source_file)?.data, NodeData::SourceFile(_)) {
+            return None;
+        }
+        let descriptor = self.external_names.get(name)?.clone();
+        Some(self.import_type(&descriptor))
+    }
+
     #[allow(clippy::too_many_lines)]
     fn check_node(
         &mut self,
@@ -4157,6 +4215,9 @@ impl<'a> Checker<'a> {
                         }
                     }))
                     .unwrap_or_else(|| self.result.types.any());
+                let inferred = self
+                    .established_global_variable_type(node_id, data)
+                    .unwrap_or(inferred);
                 self.result.node_types.insert(node_id, inferred);
                 if let Some(symbol) = self.bindings.node_symbols.get(&node_id) {
                     self.result.symbol_types.insert(*symbol, inferred);

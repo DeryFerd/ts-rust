@@ -586,21 +586,7 @@ impl Program {
                     ),
                 );
                 let preserve_top_of_file_reference_directive =
-                    reference_directives(&source_file.source_text)
-                        .into_iter()
-                        .filter(|directive| matches!(directive.kind, ReferenceKind::Path))
-                        .any(|directive| {
-                            let referenced = resolve_path(
-                                &directory_path(&source_file.file_name),
-                                &[directive.value.as_str()],
-                            );
-                            let canonical = canonicalize(
-                                &referenced,
-                                &self.current_directory,
-                                self.case_sensitivity,
-                            );
-                            self.file_index.contains_key(&canonical)
-                        });
+                    self.source_has_resolved_path_reference(source_file);
                 let emit_context = EmitContext {
                     bindings: &source_file.binding,
                     amd_module_name: source_file.parse.amd_module_name.as_deref(),
@@ -938,7 +924,8 @@ impl Program {
                     preemitted_shebang: source_shebang(source).is_some(),
                     suppress_extends_helper: bundle_needs_extends_helper,
                     preemitted_comment_end: detached_comment.as_ref().map(|(_, end)| *end),
-                    preserve_top_of_file_reference_directive: false,
+                    preserve_top_of_file_reference_directive: self
+                        .source_has_resolved_path_reference(source),
                     amd_dependencies: &amd_dependencies,
                     amd_module_specifier_rewrites: &amd_module_specifier_rewrites,
                     amd_generated_name_offsets: &amd_generated_name_offsets,
@@ -1224,6 +1211,23 @@ impl Program {
                 &program.current_directory,
                 program.case_sensitivity,
             );
+            for directive in reference_directives(&source.source_text)
+                .into_iter()
+                .filter(|directive| matches!(directive.kind, ReferenceKind::Path))
+            {
+                let referenced = resolve_path(
+                    &directory_path(&source.file_name),
+                    &[directive.value.as_str()],
+                );
+                let referenced = canonicalize(
+                    &referenced,
+                    &program.current_directory,
+                    program.case_sensitivity,
+                );
+                if let Some(target) = program.file_index.get(&referenced) {
+                    visit(program, *target, visited, ordered);
+                }
+            }
             for ((containing, _), target) in &program.resolved_modules {
                 if containing != &canonical {
                     continue;
@@ -1261,6 +1265,24 @@ impl Program {
             || !canonical
                 .split('/')
                 .any(|component| component.eq_ignore_ascii_case("node_modules"))
+    }
+
+    fn source_has_resolved_path_reference(&self, source: &SourceFile) -> bool {
+        reference_directives(&source.source_text)
+            .into_iter()
+            .filter(|directive| matches!(directive.kind, ReferenceKind::Path))
+            .any(|directive| {
+                let referenced = resolve_path(
+                    &directory_path(&source.file_name),
+                    &[directive.value.as_str()],
+                );
+                let canonical = canonicalize(
+                    &referenced,
+                    &self.current_directory,
+                    self.case_sensitivity,
+                );
+                self.file_index.contains_key(&canonical)
+            })
     }
 
     fn source_imports_isolated_declaration_augmentation(&self, source: &SourceFile) -> bool {
