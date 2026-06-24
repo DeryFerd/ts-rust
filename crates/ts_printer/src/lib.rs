@@ -25324,7 +25324,7 @@ impl Printer<'_> {
                     |next| next.range.start,
                 );
             self.emit_source_comments_between_with_ownership(
-                self.enum_member_following_comment_start(node.range.end.get(), comment_end.get()),
+                node.range.end.get(),
                 comment_end.get(),
                 true,
                 false,
@@ -25361,22 +25361,6 @@ impl Printer<'_> {
         self.writer.write(" = {}));");
         self.enum_member_identifier_rewrites = saved_enum_member_rewrites;
         Ok(())
-    }
-
-    fn enum_member_following_comment_start(&self, start: u32, end: u32) -> u32 {
-        let start_index = usize::try_from(start).unwrap_or(usize::MAX);
-        let end_index = usize::try_from(end).unwrap_or(usize::MAX);
-        let Some(trivia) = self.source_text.get(start_index..end_index) else {
-            return start;
-        };
-        let line_end = trivia.find(['\n', '\r']).unwrap_or(trivia.len());
-        if trivia[..line_end].contains("//") {
-            let next_line = trivia[line_end..]
-                .find(|character| !matches!(character, '\n' | '\r'))
-                .map_or(trivia.len(), |offset| line_end + offset);
-            return start.saturating_add(u32::try_from(next_line).unwrap_or(u32::MAX));
-        }
-        start
     }
 
     fn enum_initializer_is_syntactically_string(
@@ -33134,6 +33118,27 @@ mod tests {
         assert_eq!(
             emit("enum Color { Red, Green = 4, Blue, Label = 'blue' }"),
             "var Color;\n(function (Color) {\n    Color[Color[\"Red\"] = 0] = \"Red\";\n    Color[Color[\"Green\"] = 4] = \"Green\";\n    Color[Color[\"Blue\"] = 5] = \"Blue\";\n    Color[\"Label\"] = \"blue\";\n})(Color || (Color = {}));\n"
+        );
+    }
+
+    #[test]
+    fn preserves_trailing_comments_on_lowered_enum_members() {
+        assert_eq!(
+            emit_with(
+                "enum Foo { a = 1 } enum Foo { b // should work fine\n}",
+                ScriptTarget::Es2015,
+                ModuleKind::EsNext,
+            )
+            .code,
+            concat!(
+                "var Foo;\n",
+                "(function (Foo) {\n",
+                "    Foo[Foo[\"a\"] = 1] = \"a\";\n",
+                "})(Foo || (Foo = {}));\n",
+                "(function (Foo) {\n",
+                "    Foo[Foo[\"b\"] = 0] = \"b\"; // should work fine\n",
+                "})(Foo || (Foo = {}));\n",
+            )
         );
     }
 
