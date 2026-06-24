@@ -15556,6 +15556,42 @@ fn describe_type_node_syntax(
                 exported_names,
             )))
         }
+        NodeData::UnionTypeNode(union) => TypeDescriptor::Union(
+            union
+                .types
+                .nodes
+                .iter()
+                .map(|member| {
+                    let type_id = checker.type_from_type_node(*member);
+                    let target = describe_source_type(source, &checker.result, type_id);
+                    describe_type_node_syntax(
+                        source,
+                        checker,
+                        *member,
+                        target,
+                        exported_names,
+                    )
+                })
+                .collect(),
+        ),
+        NodeData::IntersectionTypeNode(intersection) => TypeDescriptor::Intersection(
+            intersection
+                .types
+                .nodes
+                .iter()
+                .map(|member| {
+                    let type_id = checker.type_from_type_node(*member);
+                    let target = describe_source_type(source, &checker.result, type_id);
+                    describe_type_node_syntax(
+                        source,
+                        checker,
+                        *member,
+                        target,
+                        exported_names,
+                    )
+                })
+                .collect(),
+        ),
         NodeData::ParenthesizedTypeNode(parenthesized) => describe_type_node_syntax(
             source,
             checker,
@@ -15789,7 +15825,11 @@ fn describe_type_node_syntax(
                     target: Box::new(semantic_target),
                 };
             }
-            if qualified || is_core_library_name(&name) || exported_names.contains(&name) {
+            if qualified
+                || is_core_library_name(&name)
+                || exported_names.contains(&name)
+                || source_imports_reference_name(source, &name)
+            {
                 TypeDescriptor::Named {
                     name,
                     type_arguments,
@@ -16146,6 +16186,45 @@ fn describe_type_node_syntax(
         }
         _ => semantic_target,
     }
+}
+
+fn source_imports_reference_name(source: &ProgramSource<'_>, name: &str) -> bool {
+    source.arena.iter().any(|(_, node)| {
+        let NodeData::ImportDeclaration(import) = &node.data else {
+            return false;
+        };
+        let Some(NodeData::ImportClause(clause)) = import
+            .import_clause
+            .and_then(|clause| source.arena.get(clause))
+            .map(|node| &node.data)
+        else {
+            return false;
+        };
+        if clause
+            .name
+            .and_then(|binding| identifier_text(source.arena, binding))
+            == Some(name)
+        {
+            return true;
+        }
+        match clause
+            .named_bindings
+            .and_then(|bindings| source.arena.get(bindings))
+            .map(|node| &node.data)
+        {
+            Some(NodeData::NamespaceImport(namespace)) => {
+                identifier_text(source.arena, namespace.name) == Some(name)
+            }
+            Some(NodeData::NamedImports(imports)) => imports.elements.nodes.iter().any(|specifier| {
+                matches!(
+                    source.arena.get(*specifier).map(|node| &node.data),
+                    Some(NodeData::ImportSpecifier(specifier))
+                        if identifier_text(source.arena, specifier.name) == Some(name)
+                )
+            }),
+            _ => false,
+        }
+    })
 }
 
 fn local_const_object_index_descriptor(

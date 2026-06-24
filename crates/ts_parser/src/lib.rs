@@ -340,6 +340,7 @@ struct Parser<'a> {
     amd_dependencies: Vec<AmdDependency>,
     amd_module_names: Vec<AmdModuleName>,
     disallow_in: bool,
+    await_context: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -364,6 +365,7 @@ impl<'a> Parser<'a> {
             amd_dependencies,
             amd_module_names,
             disallow_in: false,
+            await_context: false,
         }
     }
 
@@ -3729,6 +3731,11 @@ impl<'a> Parser<'a> {
             self.attach_modifiers(declaration, vec![export_modifier], start);
             return declaration;
         }
+        if self.current.kind == SyntaxKind::ExportKeyword
+            && self.next_token_kind() == SyntaxKind::EqualsToken
+        {
+            self.bump();
+        }
         if self.current.kind == SyntaxKind::EqualsToken {
             self.bump();
             let expression = self.parse_binary_expression(0);
@@ -3789,7 +3796,10 @@ impl<'a> Parser<'a> {
                 SyntaxKind::FunctionKeyword
                     | SyntaxKind::ClassKeyword
                     | SyntaxKind::InterfaceKeyword
-            ) {
+                    | SyntaxKind::AbstractKeyword
+            ) || (self.current.kind == SyntaxKind::AsyncKeyword
+                && self.next_token_kind() == SyntaxKind::FunctionKeyword)
+            {
                 let declaration = self.parse_statement();
                 self.attach_modifiers(declaration, vec![export_modifier, default_modifier], start);
                 return declaration;
@@ -3842,6 +3852,11 @@ impl<'a> Parser<'a> {
             self.bump();
             if self.current.kind == SyntaxKind::StringLiteral {
                 Some(self.parse_string_literal())
+            } else if self.current.kind == SyntaxKind::Identifier
+                || self.current.kind.is_keyword()
+            {
+                self.error_current("Expected a module specifier.");
+                Some(self.parse_identifier_name("Expected a module specifier."))
             } else {
                 self.error_current("Expected a module specifier.");
                 None
@@ -4303,7 +4318,7 @@ impl<'a> Parser<'a> {
         let return_type = self.parse_optional_type_annotation();
         let arrow =
             self.parse_expected_token_node(SyntaxKind::EqualsGreaterThanToken, "Expected '=>'.");
-        let body = self.parse_arrow_function_body();
+        let body = self.parse_arrow_function_body_in_await_context(false);
         let mut children = Vec::new();
         extend_list_children(&mut children, type_parameters.as_ref());
         children.extend(parameters.nodes.iter().copied());
@@ -4365,7 +4380,7 @@ impl<'a> Parser<'a> {
         let return_type = self.parse_optional_type_annotation();
         let arrow =
             self.parse_expected_token_node(SyntaxKind::EqualsGreaterThanToken, "Expected '=>'.");
-        let body = self.parse_arrow_function_body();
+        let body = self.parse_arrow_function_body_in_await_context(true);
         let mut children = vec![async_modifier];
         extend_list_children(&mut children, type_parameters.as_ref());
         children.extend(parameters.nodes.iter().copied());
@@ -4415,7 +4430,9 @@ impl<'a> Parser<'a> {
         let async_function = self.current.kind == SyntaxKind::AsyncKeyword
             && !self.next_token_preceded_by_line_break()
             && self.next_token_kind() == SyntaxKind::FunctionKeyword;
-        if self.current.kind == SyntaxKind::AwaitKeyword {
+        if self.current.kind == SyntaxKind::AwaitKeyword
+            && (self.await_context || self.next_token_kind() != SyntaxKind::OpenParenToken)
+        {
             return self.parse_await_expression();
         }
         if self.current.kind == SyntaxKind::YieldKeyword {
@@ -5075,7 +5092,7 @@ impl<'a> Parser<'a> {
         let arrow =
             self.parse_expected_token_node(SyntaxKind::EqualsGreaterThanToken, "Expected '=>'.");
         let body = if has_body_token {
-            self.parse_arrow_function_body()
+            self.parse_arrow_function_body_in_await_context(false)
         } else {
             self.missing_identifier(self.current.range.start)
         };
@@ -5124,7 +5141,7 @@ impl<'a> Parser<'a> {
             &[name],
         );
         let arrow = self.consume_token_node();
-        let body = self.parse_arrow_function_body();
+        let body = self.parse_arrow_function_body_in_await_context(false);
         self.alloc_node(
             SyntaxKind::ArrowFunction,
             TextRange::new(start, self.node_end(body)),
@@ -5162,6 +5179,14 @@ impl<'a> Parser<'a> {
         let body = self.parse_binary_expression(2);
         let body = self.parenthesize_asserted_object_literal(body);
         self.collapse_redundant_parentheses_around_asserted_object(body)
+    }
+
+    fn parse_arrow_function_body_in_await_context(&mut self, await_context: bool) -> NodeId {
+        let previous = self.await_context;
+        self.await_context = await_context;
+        let body = self.parse_arrow_function_body();
+        self.await_context = previous;
+        body
     }
 
     fn parse_arrow_body_with_missing_open_brace(&mut self) -> NodeId {
