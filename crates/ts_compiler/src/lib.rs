@@ -84,6 +84,21 @@ fn prepend_emit_bom(files: &mut [OutputFile]) {
     }
 }
 
+fn is_valid_jsx_factory_expression(value: &str, allow_null: bool) -> bool {
+    (allow_null && value == "null")
+        || value.split('.').all(|part| {
+            !part.is_empty()
+                && part
+                    .chars()
+                    .next()
+                    .is_some_and(|character| character == '_' || character == '$' || character.is_alphabetic())
+                && part
+                    .chars()
+                    .skip(1)
+                    .all(|character| character == '_' || character == '$' || character.is_alphanumeric())
+        })
+}
+
 fn source_shebang(source: &SourceFile) -> Option<&str> {
     let text = source
         .source_text
@@ -479,6 +494,23 @@ impl Program {
             return output;
         }
         let settings = self.options.printer_settings();
+        let jsx_factory = self
+            .options
+            .jsx_factory
+            .as_ref()
+            .filter(|factory| is_valid_jsx_factory_expression(factory, false))
+            .cloned()
+            .or_else(|| {
+            self.options
+                .react_namespace
+                .as_ref()
+                .map(|namespace| format!("{namespace}.createElement"))
+        });
+        let jsx_fragment_factory = self
+            .options
+            .jsx_fragment_factory
+            .as_deref()
+            .filter(|factory| is_valid_jsx_factory_expression(factory, true));
         if !settings.emit_javascript && !settings.emit_declarations {
             return output;
         }
@@ -617,7 +649,8 @@ impl Program {
                     isolated_modules: self.options.isolated_modules,
                     strict_null_checks: self.options.strict_null_checks,
                     force_use_strict: fixed_es_module && settings.module == ModuleKind::CommonJs,
-                    jsx_factory: self.options.jsx_factory.as_deref(),
+                    jsx_factory: jsx_factory.as_deref(),
+                    jsx_fragment_factory,
                     downlevel_iteration: self.options.downlevel_iteration,
                     module_detection: self.options.module_detection,
                 };
@@ -783,6 +816,23 @@ impl Program {
     #[allow(clippy::too_many_lines)]
     fn emit_bundle(&self, settings: PrinterSettings) -> EmitOutput {
         let mut output = EmitOutput::default();
+        let jsx_factory = self
+            .options
+            .jsx_factory
+            .as_ref()
+            .filter(|factory| is_valid_jsx_factory_expression(factory, false))
+            .cloned()
+            .or_else(|| {
+            self.options
+                .react_namespace
+                .as_ref()
+                .map(|namespace| format!("{namespace}.createElement"))
+        });
+        let jsx_fragment_factory = self
+            .options
+            .jsx_fragment_factory
+            .as_deref()
+            .filter(|factory| is_valid_jsx_factory_expression(factory, true));
         let paths = ts_outputpaths::bundle_output_paths(&self.options, &self.current_directory)
             .expect("outFile was checked before bundle emission");
         let sources = self.bundle_sources();
@@ -958,7 +1008,8 @@ impl Program {
                     isolated_modules: self.options.isolated_modules,
                     strict_null_checks: self.options.strict_null_checks,
                     force_use_strict: false,
-                    jsx_factory: self.options.jsx_factory.as_deref(),
+                    jsx_factory: jsx_factory.as_deref(),
+                    jsx_fragment_factory,
                     downlevel_iteration: self.options.downlevel_iteration,
                     module_detection: self.options.module_detection,
                 };

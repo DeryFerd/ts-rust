@@ -127,6 +127,8 @@ pub struct CompilerOptions {
     pub target: ScriptTarget,
     pub jsx: JsxEmit,
     pub jsx_factory: Option<String>,
+    pub jsx_fragment_factory: Option<String>,
+    pub react_namespace: Option<String>,
     pub resolve_json_module: bool,
     pub source_map: bool,
     pub inline_source_map: bool,
@@ -195,6 +197,8 @@ impl Default for CompilerOptions {
             target: ScriptTarget::Es5,
             jsx: JsxEmit::None,
             jsx_factory: None,
+            jsx_fragment_factory: None,
+            react_namespace: None,
             resolve_json_module: false,
             source_map: false,
             inline_source_map: false,
@@ -304,6 +308,10 @@ impl CompilerOptions {
                 "importhelpers" => self.import_helpers = overrides.import_helpers,
                 "jsx" => self.jsx = overrides.jsx,
                 "jsxfactory" => self.jsx_factory.clone_from(&overrides.jsx_factory),
+                "jsxfragmentfactory" => self
+                    .jsx_fragment_factory
+                    .clone_from(&overrides.jsx_fragment_factory),
+                "reactnamespace" => self.react_namespace.clone_from(&overrides.react_namespace),
                 "module" => {
                     self.module = overrides.module;
                     if !names.contains("moduleresolution") {
@@ -632,6 +640,12 @@ pub fn parse_compiler_options_map(options: &BTreeMap<String, JsonValue>) -> Pars
             "target" => parsed.target = enum_value(original_name, value, &mut diagnostics, target),
             "jsx" => parsed.jsx = enum_value(original_name, value, &mut diagnostics, jsx),
             "jsxfactory" => parsed.jsx_factory = string(original_name, value, &mut diagnostics),
+            "jsxfragmentfactory" => {
+                parsed.jsx_fragment_factory = string(original_name, value, &mut diagnostics);
+            }
+            "reactnamespace" => {
+                parsed.react_namespace = string(original_name, value, &mut diagnostics);
+            }
             _ => diagnostics.push(diagnostic(5023, [original_name.as_str()])),
         }
     }
@@ -690,6 +704,8 @@ struct PartialOptions {
     target: Option<ScriptTarget>,
     jsx: Option<JsxEmit>,
     jsx_factory: Option<String>,
+    jsx_fragment_factory: Option<String>,
+    react_namespace: Option<String>,
     resolve_json_module: Option<bool>,
     source_map: Option<bool>,
     inline_source_map: Option<bool>,
@@ -779,6 +795,8 @@ impl PartialOptions {
             target: self.target.unwrap_or_default(),
             jsx: self.jsx.unwrap_or_default(),
             jsx_factory: self.jsx_factory,
+            jsx_fragment_factory: self.jsx_fragment_factory,
+            react_namespace: self.react_namespace,
             resolve_json_module: self.resolve_json_module.unwrap_or(false),
             source_map: self.source_map.unwrap_or(false),
             inline_source_map: self.inline_source_map.unwrap_or(false),

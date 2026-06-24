@@ -87,6 +87,7 @@ pub struct EmitContext<'a> {
     pub strict_null_checks: bool,
     pub force_use_strict: bool,
     pub jsx_factory: Option<&'a str>,
+    pub jsx_fragment_factory: Option<&'a str>,
     pub downlevel_iteration: bool,
     /// Controls whether JSX-generated runtime imports make an otherwise-script file a module.
     pub module_detection: ModuleDetectionKind,
@@ -229,6 +230,7 @@ pub fn emit_source_file_with_settings_and_bindings(
             strict_null_checks: false,
             force_use_strict: false,
             jsx_factory: None,
+            jsx_fragment_factory: None,
             downlevel_iteration: false,
             module_detection: ModuleDetectionKind::Auto,
         },
@@ -363,10 +365,12 @@ pub fn emit_source_file_with_context(
         isolated_modules: context.isolated_modules,
         strict_null_checks: context.strict_null_checks,
         jsx_factory: context.jsx_factory.map(str::to_owned),
+        jsx_fragment_factory: context.jsx_fragment_factory.map(str::to_owned),
         downlevel_iteration: context.downlevel_iteration,
         context_preserves_top_of_file_reference_directive: context
             .preserve_top_of_file_reference_directive,
         pending_statement_line_comments: Vec::new(),
+        jsx_recovered_tag_attribute: None,
     };
     let node = printer.node(source_file)?.clone();
     let NodeData::SourceFile(data) = &node.data else {
@@ -427,6 +431,23 @@ pub fn emit_source_file_with_context(
         printer
             .synthetic_runtime_identifier_uses
             .insert(factory_root.to_owned());
+        if arena
+            .iter()
+            .any(|(_, node)| matches!(node.data, NodeData::JsxFragment(_)))
+        {
+            let fragment_root = context
+                .jsx_fragment_factory
+                .unwrap_or("React.Fragment")
+                .split('.')
+                .next()
+                .unwrap_or("React");
+            printer
+                .runtime_identifier_uses
+                .insert(fragment_root.to_owned());
+            printer
+                .synthetic_runtime_identifier_uses
+                .insert(fragment_root.to_owned());
+        }
     }
     if settings.module == ModuleKind::CommonJs {
         let (star_temps, star_rewrites, star_text_rewrites) = commonjs_star_imports(
@@ -2796,9 +2817,15 @@ pub fn emit_declaration_file_with_semantics(
         printer.writer.newline();
     }
     let mut deferred_javascript_namespaces = Vec::new();
+    let mut deferred_javascript_imports = Vec::new();
     if printer.javascript_source {
         for statement in &data.statements.nodes {
             match printer.arena.get(*statement).map(|node| &node.data) {
+                Some(NodeData::ImportDeclaration(import))
+                    if printer.import_is_used_by_javascript_prop_types_namespace(import) =>
+                {
+                    deferred_javascript_imports.push(*statement);
+                }
                 Some(NodeData::ImportDeclaration(import))
                     if printer.import_is_used_by_synthetic_class_base(*statement, import) => {}
                 Some(NodeData::ImportDeclaration(_) | NodeData::ImportEqualsDeclaration(_)) => {
@@ -2837,6 +2864,33 @@ pub fn emit_declaration_file_with_semantics(
     }
     for statement in deferred_javascript_namespaces {
         printer.emit_statement(statement, false, source_file)?;
+    }
+    for statement in deferred_javascript_imports {
+        let node = printer.node(statement)?.clone();
+        let NodeData::ImportDeclaration(import) = &node.data else {
+            continue;
+        };
+        let Some(NodeData::ImportClause(clause)) = import
+            .import_clause
+            .and_then(|clause| printer.arena.get(clause))
+            .map(|node| &node.data)
+        else {
+            continue;
+        };
+        let Some(name) = clause.name else {
+            continue;
+        };
+        printer.writer.write("import ");
+        printer.emit_name(name)?;
+        printer.writer.write(" from ");
+        match printer.arena.get(import.module_specifier).map(|node| &node.data) {
+            Some(NodeData::StringLiteral(literal)) => {
+                printer.write_source_quoted_string(import.module_specifier, &literal.text);
+            }
+            _ => printer.emit_name(import.module_specifier)?,
+        }
+        printer.writer.write(";");
+        printer.writer.newline();
     }
     if printer.javascript_source {
         for statement in &data.statements.nodes {
@@ -3749,7 +3803,8 @@ impl DeclarationPrinter<'_> {
                 if declaration_name_text(self.arena, receiver) != Some(function_name) {
                     return None;
                 }
-                if let Some(function_symbol) = function_symbol
+                if !self.javascript_source
+                    && let Some(function_symbol) = function_symbol
                     && self.bindings.resolve_name_at(receiver, function_name)
                         != Some(function_symbol)
                 {
@@ -3928,6 +3983,8 @@ impl DeclarationPrinter<'_> {
             && !matches!(&node.data, NodeData::ImportDeclaration(import) if self.import_has_retained_declaration_binding_use(id, import))
             && !matches!(&node.data, NodeData::ImportEqualsDeclaration(import) if self.import_equals_is_used_by_inferred_variable_type(id, import))
             && !matches!(&node.data, NodeData::ExpressionStatement(statement) if self.is_javascript_commonjs_declaration_assignment(statement.expression))
+            && !self.javascript_variable_is_function_static_assignment_dependency(id)
+            && !matches!(&node.data, NodeData::ImportDeclaration(import) if self.import_is_used_by_javascript_prop_types_namespace(import))
         {
             return Ok(());
         }
@@ -3969,6 +4026,16 @@ impl DeclarationPrinter<'_> {
             self.writer.write(";");
             self.writer.newline();
             self.emit_jsdoc_typedefs();
+        }
+        if self.javascript_source
+            && let NodeData::FunctionDeclaration(function) = &node.data
+            && let Some(name) = function.name
+            && self.javascript_class_is_default_export_target(name)
+        {
+            self.writer.write("export default ");
+            self.emit_name(name)?;
+            self.writer.write(";");
+            self.writer.newline();
         }
         if self.javascript_source
             && self.emit_javascript_overload_statement(
@@ -4040,6 +4107,12 @@ impl DeclarationPrinter<'_> {
                     });
                 let static_assignments = if has_later_overload {
                     Vec::new()
+                } else if self.javascript_source {
+                    data.name
+                        .and_then(|name| declaration_name_text(self.arena, name))
+                        .map_or_else(Vec::new, |name| {
+                            self.javascript_function_static_assignments(name)
+                        })
                 } else {
                     self.function_static_assignments(data)
                 };
@@ -4094,7 +4167,12 @@ impl DeclarationPrinter<'_> {
                     let namespace_assignments = static_assignments
                         .iter()
                         .filter_map(|(property, value)| {
-                            let (name, numeric) = self.late_bound_property_name(*property)?;
+                            let (name, numeric) = match self.arena.get(*property).map(|node| &node.data) {
+                                Some(NodeData::Identifier(identifier)) => {
+                                    (identifier.text.clone(), false)
+                                }
+                                _ => self.late_bound_property_name(*property)?,
+                            };
                             (!numeric && is_identifier_text(&name))
                                 .then_some((name, *property, *value))
                         })
@@ -4103,7 +4181,12 @@ impl DeclarationPrinter<'_> {
                     if exported && !synthesized_default_namespace {
                         self.writer.write("export ");
                     }
-                    self.writer.write(if self.javascript_source {
+                    let javascript_default_export_target = data.name.is_some_and(|name| {
+                        self.javascript_class_is_default_export_target(name)
+                    });
+                    self.writer.write(if self.javascript_source
+                        && !javascript_default_export_target
+                    {
                         "namespace "
                     } else {
                         "declare namespace "
@@ -4124,6 +4207,17 @@ impl DeclarationPrinter<'_> {
                         .any(|(name, _, _)| is_es5_reserved_binding_name(name));
                     let mut reserved_aliases = Vec::new();
                     for (property_text, property, value) in &namespace_assignments {
+                        if let Some(value_name) = declaration_name_text(self.arena, *value) {
+                            self.writer.write("export { ");
+                            self.writer.write(value_name);
+                            if value_name != property_text {
+                                self.writer.write(" as ");
+                                self.emit_semantic_property_name(property_text);
+                            }
+                            self.writer.write(" };");
+                            self.writer.newline();
+                            continue;
+                        }
                         let reserved = is_es5_reserved_binding_name(property_text);
                         if has_reserved_property && !reserved {
                             self.writer.write("export ");
@@ -4536,12 +4630,14 @@ impl DeclarationPrinter<'_> {
                     && !self.import_is_used_by_inferred_semantic_variable_type(id, data)
                     && !self.import_is_used_by_inferred_return(id, data)
                     && !self.import_is_used_by_synthetic_class_base(id, data)
+                    && !self.import_is_used_by_javascript_prop_types_namespace(data)
                 {
                     return Ok(());
                 }
                 if data.import_clause.is_some()
                     && !self.import_has_retained_declaration_binding_use(id, data)
                     && !self.statement_is_inferred_class_property_dependency(id)
+                    && !self.import_is_used_by_javascript_prop_types_namespace(data)
                 {
                     if matches!(
                         self.arena.get(scope).map(|node| &node.data),
@@ -4605,6 +4701,10 @@ impl DeclarationPrinter<'_> {
                     && self.arena.iter().any(|(_, node)| {
                         matches!(&node.data, NodeData::ClassDeclaration(class)
                             if class.name.is_some_and(|name| {
+                                declaration_name_text(self.arena, name)
+                                    == declaration_name_text(self.arena, data.expression)
+                            })) || matches!(&node.data, NodeData::FunctionDeclaration(function)
+                            if function.name.is_some_and(|name| {
                                 declaration_name_text(self.arena, name)
                                     == declaration_name_text(self.arena, data.expression)
                             }))
@@ -7529,6 +7629,24 @@ impl DeclarationPrinter<'_> {
         if self.emit_returned_augmented_function_type(function)? {
             return Ok(());
         }
+        if self.javascript_source
+            && function
+                .body
+                .and_then(|body| self.declaration_single_return_expression(body))
+                .is_some_and(|expression| {
+                    matches!(
+                        self.arena.get(expression).map(|node| &node.data),
+                        Some(
+                            NodeData::JsxElement(_)
+                                | NodeData::JsxSelfClosingElement(_)
+                                | NodeData::JsxFragment(_)
+                        )
+                    )
+                })
+        {
+            self.writer.write("JSX.Element");
+            return Ok(());
+        }
         if let Some(type_query) = function
             .body
             .and_then(|body| self.declaration_single_return_expression(body))
@@ -9044,6 +9162,108 @@ impl DeclarationPrinter<'_> {
                 .then_some((property, assignment.right))
             })
             .collect()
+    }
+
+    fn javascript_function_static_assignments(
+        &self,
+        function_name: &str,
+    ) -> Vec<(NodeId, NodeId)> {
+        let mut assignments = self
+            .arena
+            .iter()
+            .filter_map(|(assignment_id, node)| {
+                let NodeData::BinaryExpression(assignment) = &node.data else {
+                    return None;
+                };
+                if self.arena.get(assignment.operator_token)?.kind != SyntaxKind::EqualsToken {
+                    return None;
+                }
+                let NodeData::PropertyAccessExpression(access) =
+                    &self.arena.get(assignment.left)?.data
+                else {
+                    return None;
+                };
+                if declaration_name_text(self.arena, access.expression) != Some(function_name) {
+                    return None;
+                }
+                let mut current = assignment_id;
+                while let Some(parent_id) = self.arena.get(current).and_then(|node| node.parent) {
+                    let parent = self.arena.get(parent_id)?;
+                    if matches!(
+                        parent.data,
+                        NodeData::FunctionDeclaration(_)
+                            | NodeData::FunctionExpression(_)
+                            | NodeData::ArrowFunction(_)
+                            | NodeData::ClassDeclaration(_)
+                            | NodeData::ClassExpression(_)
+                    ) {
+                        return None;
+                    }
+                    if matches!(parent.data, NodeData::SourceFile(_)) {
+                        break;
+                    }
+                    current = parent_id;
+                }
+                Some((node.range.start, access.name, assignment.right))
+            })
+            .collect::<Vec<_>>();
+        assignments.sort_by_key(|(start, _, _)| *start);
+        assignments
+            .into_iter()
+            .map(|(_, property, value)| (property, value))
+            .collect()
+    }
+
+    fn javascript_variable_is_function_static_assignment_dependency(
+        &self,
+        statement: NodeId,
+    ) -> bool {
+        if !self.javascript_source {
+            return false;
+        }
+        let Some(NodeData::VariableStatement(variable)) =
+            self.arena.get(statement).map(|node| &node.data)
+        else {
+            return false;
+        };
+        let Some(NodeData::VariableDeclarationList(list)) = self
+            .arena
+            .get(variable.declaration_list)
+            .map(|node| &node.data)
+        else {
+            return false;
+        };
+        let names = list
+            .declarations
+            .nodes
+            .iter()
+            .filter_map(|declaration| {
+                let NodeData::VariableDeclaration(variable) =
+                    &self.arena.get(*declaration)?.data
+                else {
+                    return None;
+                };
+                declaration_name_text(self.arena, variable.name)
+            })
+            .collect::<HashSet<_>>();
+        self.arena.iter().any(|(_, node)| {
+            let NodeData::BinaryExpression(assignment) = &node.data else {
+                return false;
+            };
+            declaration_name_text(self.arena, assignment.right)
+                .is_some_and(|name| names.contains(name))
+                && matches!(
+                    self.arena.get(assignment.left).map(|node| &node.data),
+                    Some(NodeData::PropertyAccessExpression(access))
+                        if declaration_name_text(self.arena, access.expression).is_some_and(
+                            |receiver| self.arena.iter().any(|(_, node)| matches!(
+                                &node.data,
+                                NodeData::FunctionDeclaration(function)
+                                    if function.name.and_then(|name| declaration_name_text(self.arena, name)) == Some(receiver)
+                            ))
+                        )
+                )
+        })
     }
 
     fn late_bound_property_name(&self, property: NodeId) -> Option<(String, bool)> {
@@ -11711,7 +11931,10 @@ impl DeclarationPrinter<'_> {
                 .write(if getter_only { "const " } else { "let " });
             self.writer.write(&local_name);
             self.writer.write(": ");
-            if let Some(type_id) = semantic_object.properties.get(exported_name) {
+            if matches!(&node.data, NodeData::PropertyAssignment(property)
+                if self.emit_known_javascript_namespace_property_type(property.initializer))
+            {
+            } else if let Some(type_id) = semantic_object.properties.get(exported_name) {
                 self.emit_semantic_type(*type_id)?;
             } else {
                 self.writer.write("any");
@@ -11730,6 +11953,57 @@ impl DeclarationPrinter<'_> {
         self.writer.indent -= 1;
         self.writer.write("}");
         Ok(())
+    }
+
+    fn emit_known_javascript_namespace_property_type(&mut self, initializer: NodeId) -> bool {
+        let Some(NodeData::PropertyAccessExpression(access)) =
+            self.arena.get(initializer).map(|node| &node.data)
+        else {
+            return false;
+        };
+        if declaration_name_text(self.arena, access.expression) != Some("PropTypes") {
+            return false;
+        }
+        let Some(property) = declaration_name_text(self.arena, access.name) else {
+            return false;
+        };
+        let type_name = match property {
+            "bool" => "boolean",
+            "number" => "number",
+            "string" => "string",
+            "any" => "any",
+            _ => return false,
+        };
+        self.writer.write("PropTypes.Requireable<");
+        self.writer.write(type_name);
+        self.writer.write(">");
+        true
+    }
+
+    fn import_is_used_by_javascript_prop_types_namespace(
+        &self,
+        import: &ts_ast::ImportDeclarationData,
+    ) -> bool {
+        if !self.javascript_source {
+            return false;
+        }
+        let local = import
+            .import_clause
+            .and_then(|clause| self.arena.get(clause))
+            .and_then(|node| match &node.data {
+                NodeData::ImportClause(clause) => clause.name,
+                _ => None,
+            })
+            .and_then(|name| declaration_name_text(self.arena, name));
+        let Some(local) = local else {
+            return false;
+        };
+        self.arena.iter().any(|(_, node)| {
+            matches!(&node.data, NodeData::PropertyAccessExpression(access)
+                if declaration_name_text(self.arena, access.expression) == Some(local)
+                    && matches!(declaration_name_text(self.arena, access.name),
+                        Some("bool" | "number" | "string" | "any")))
+        })
     }
 
     fn emit_javascript_namespace_function(
@@ -22417,9 +22691,11 @@ struct Printer<'a> {
     isolated_modules: bool,
     strict_null_checks: bool,
     jsx_factory: Option<String>,
+    jsx_fragment_factory: Option<String>,
     downlevel_iteration: bool,
     context_preserves_top_of_file_reference_directive: bool,
     pending_statement_line_comments: Vec<((usize, usize), String)>,
+    jsx_recovered_tag_attribute: Option<NodeId>,
 }
 
 #[derive(Clone)]
@@ -26392,6 +26668,16 @@ impl Printer<'_> {
     #[allow(clippy::too_many_lines)]
     fn emit_statement(&mut self, id: NodeId) -> Result<(), EmitError> {
         let node = self.node(id)?.clone();
+        if let NodeData::ExpressionStatement(statement) = &node.data
+            && self.expression_statement_is_recovered_jsx_closing(id, statement.expression)
+        {
+            return Ok(());
+        }
+        if matches!(node.data, NodeData::ExpressionStatement(_))
+            && self.emit_recovered_namespaced_jsx_statements(id)?
+        {
+            return Ok(());
+        }
         if self.es5_async_hoisted_function_declarations.contains(&id) {
             return Ok(());
         }
@@ -38470,6 +38756,43 @@ impl Printer<'_> {
         Ok(())
     }
 
+    fn emit_awaiter_call_with_arrow_parameters(
+        &mut self,
+        body: NodeId,
+        expression_body: Option<NodeId>,
+        this_argument: &str,
+        parameters: &NodeList,
+        plan: &DownlevelAsyncParameterPlan,
+    ) -> Result<(), EmitError> {
+        self.emit_awaiter_reference();
+        self.writer.write("(");
+        self.writer.write(this_argument);
+        self.writer.write(", [");
+        for (index, (_, _, temp)) in plan.overrides.iter().enumerate() {
+            if index != 0 {
+                self.writer.write(", ");
+            }
+            self.writer.write(temp);
+        }
+        self.writer.write("], void 0, function* ");
+        let previous = self.async_expression_transform;
+        self.async_expression_transform = AsyncExpressionTransform::AwaitAsYield;
+        self.emit_parameters(parameters)?;
+        self.writer.write(" ");
+        let result = if let Some(expression) = expression_body {
+            self.writer.write("{ return ");
+            self.emit_expression(expression, 0)?;
+            self.writer.write("; }");
+            Ok(())
+        } else {
+            self.emit_function_body(body)
+        };
+        self.async_expression_transform = previous;
+        result?;
+        self.writer.write(")");
+        Ok(())
+    }
+
     fn async_arrow_object_rest_parameter(
         &self,
         data: &ts_ast::ArrowFunctionData,
@@ -44760,6 +45083,7 @@ impl Printer<'_> {
         }
         self.identifier_text(data.name).is_ok_and(|name| {
             self.import_binding_has_emitted_runtime_use(data.name)
+                || self.import_binding_is_used(data.name)
                 || (import_name_is_reexported(self.arena, name)
                     && self
                         .containing_import_declaration(specifier)
@@ -47977,7 +48301,7 @@ impl Printer<'_> {
                     return Ok(());
                 }
                 let multiline = self.node_source_is_multiline(id);
-                if data.properties.nodes.is_empty() && !multiline {
+                if data.properties.nodes.is_empty() {
                     self.writer.write("{}");
                     return Ok(());
                 }
@@ -48272,11 +48596,22 @@ impl Printer<'_> {
                 let object_rest_parameter = (self.settings.target < ScriptTarget::Es2018)
                     .then(|| self.async_arrow_object_rest_parameter(data))
                     .flatten();
+                let downlevel_async_parameters = (downlevel_async
+                    && self.settings.target >= ScriptTarget::Es2015
+                    && object_rest_parameter.is_none())
+                    .then(|| self.downlevel_async_parameter_plan(&data.parameters, id))
+                    .flatten();
                 if self.settings.target < ScriptTarget::Es2015 && downlevel_async {
                     self.writer.write("function ");
                 }
                 if object_rest_parameter.is_some() {
                     self.writer.write("(_a)");
+                } else if let Some(plan) = &downlevel_async_parameters {
+                    self.emit_parameters_with_name_overrides(
+                        &plan.outer_parameters,
+                        false,
+                        &plan.overrides,
+                    )?;
                 } else if !downlevel_async && self.arrow_uses_bare_parameter(id, data) {
                     let parameter_id = data.parameters.nodes[0];
                     let parameter_node = self.node(parameter_id)?.clone();
@@ -48345,6 +48680,19 @@ impl Printer<'_> {
                             pattern,
                             "_a",
                             &this_argument,
+                        )?;
+                    } else if let Some(plan) = &downlevel_async_parameters {
+                        let expression_body = (!matches!(
+                            &self.node(data.body)?.data,
+                            NodeData::Block(_)
+                        ))
+                        .then_some(data.body);
+                        self.emit_awaiter_call_with_arrow_parameters(
+                            data.body,
+                            expression_body,
+                            &this_argument,
+                            &data.parameters,
+                            plan,
                         )?;
                     } else {
                         let expression_body =
@@ -48649,9 +48997,20 @@ impl Printer<'_> {
             self.settings.jsx,
             JsxEmit::None | JsxEmit::Preserve | JsxEmit::ReactNative
         ) {
+            let recovered_tag = self.recovered_jsx_identifier_tag(
+                opening.tag_name,
+                opening.attributes,
+            );
             self.writer.write("<");
-            self.emit_expression(opening.tag_name, 0)?;
+            if let Some((name, _)) = &recovered_tag {
+                self.writer.write(name);
+            } else {
+                self.emit_preserved_jsx_tag_name(opening.tag_name)?;
+            }
+            let previous_recovered = self.jsx_recovered_tag_attribute;
+            self.jsx_recovered_tag_attribute = recovered_tag.as_ref().map(|(_, id)| *id);
             self.emit_jsx_attributes(opening.attributes, true)?;
+            self.jsx_recovered_tag_attribute = previous_recovered;
             if self.source_is_javascript_input()
                 && let Some(type_arguments) = &opening.type_arguments
             {
@@ -48671,11 +49030,21 @@ impl Printer<'_> {
                 return Err(Self::unsupported(data.closing_element, closing_node.kind));
             };
             self.writer.write("</");
-            self.emit_expression(closing.tag_name, 0)?;
+            self.emit_preserved_jsx_tag_name(closing.tag_name)?;
             self.writer.write(">");
             return Ok(());
         }
         if self.settings.jsx == JsxEmit::React {
+            if self
+                .recovered_jsx_identifier_tag(opening.tag_name, opening.attributes)
+                .is_some()
+            {
+                return self.emit_react_create_element(
+                    opening.tag_name,
+                    opening.attributes,
+                    None,
+                );
+            }
             self.emit_react_create_element(
                 opening.tag_name,
                 opening.attributes,
@@ -48699,9 +49068,17 @@ impl Printer<'_> {
             self.settings.jsx,
             JsxEmit::None | JsxEmit::Preserve | JsxEmit::ReactNative
         ) {
+            let recovered_tag = self.recovered_jsx_identifier_tag(data.tag_name, data.attributes);
             self.writer.write("<");
-            self.emit_expression(data.tag_name, 0)?;
+            if let Some((name, _)) = &recovered_tag {
+                self.writer.write(name);
+            } else {
+                self.emit_preserved_jsx_tag_name(data.tag_name)?;
+            }
+            let previous_recovered = self.jsx_recovered_tag_attribute;
+            self.jsx_recovered_tag_attribute = recovered_tag.as_ref().map(|(_, id)| *id);
             self.emit_jsx_attributes(data.attributes, true)?;
+            self.jsx_recovered_tag_attribute = previous_recovered;
             let recovered_type_arguments = self.source_is_javascript_input()
                 && data.type_arguments.is_some();
             if recovered_type_arguments
@@ -48713,6 +49090,34 @@ impl Printer<'_> {
                     self.emit_javascript_type_source(*argument)?;
                     self.writer.write(">");
                 }
+            }
+            let erased_type_arguments = !self.source_is_javascript_input()
+                && data.type_arguments.is_some();
+            if erased_type_arguments {
+                self.writer.write(" ");
+            }
+            let preserve_empty_attribute_space = !recovered_type_arguments
+                && !erased_type_arguments
+                && self.settings.jsx == JsxEmit::Preserve
+                && self
+                    .arena
+                    .get(data.attributes)
+                    .is_some_and(|node| matches!(&node.data, NodeData::JsxAttributes(attributes) if attributes.properties.nodes.is_empty()))
+                && self
+                    .arena
+                    .get(data.tag_name)
+                    .and_then(|node| node.parent)
+                    .and_then(|node| self.arena.get(node))
+                    .and_then(|node| {
+                        usize::try_from(node.range.start.get())
+                            .ok()
+                            .zip(usize::try_from(node.range.end.get()).ok())
+                    })
+                    .and_then(|(start, end)| self.source_text.get(start..end))
+                    .and_then(|source| source.strip_suffix("/>"))
+                    .is_some_and(|source| source.ends_with(char::is_whitespace));
+            if preserve_empty_attribute_space {
+                self.writer.write(" ");
             }
             self.writer.write(if recovered_type_arguments
                 || self.settings.jsx == JsxEmit::Preserve
@@ -48761,16 +49166,28 @@ impl Printer<'_> {
                 .jsx_factory
                 .clone()
                 .unwrap_or_else(|| "React.createElement".to_owned());
-            let factory = self.rewrite_synthetic_runtime_qualified_name(&factory);
-            let fragment = self.rewrite_synthetic_runtime_qualified_name("React.Fragment");
-            self.writer.write(&factory);
+            let fragment = self
+                .jsx_fragment_factory
+                .clone()
+                .unwrap_or_else(|| "React.Fragment".to_owned());
+            let fragment = self.rewrite_synthetic_runtime_qualified_name(&fragment);
+            self.emit_synthetic_jsx_factory_reference(&factory);
             self.writer.write("(");
             self.writer.write(&fragment);
             self.writer.write(", null");
-            for child in semantic_jsx_children(self.arena, &data.children) {
-                self.writer.write(", ");
+            let children = semantic_jsx_children(self.arena, &data.children);
+            let multiline = children.len() > 1;
+            self.writer.indent += usize::from(multiline);
+            for child in children {
+                self.writer.write(",");
+                if multiline {
+                    self.writer.newline();
+                } else {
+                    self.writer.write(" ");
+                }
                 self.emit_jsx_child(child, false)?;
             }
+            self.writer.indent -= usize::from(multiline);
             self.writer.write(")");
             return Ok(());
         }
@@ -48790,11 +49207,13 @@ impl Printer<'_> {
             .jsx_factory
             .clone()
             .unwrap_or_else(|| "React.createElement".to_owned());
-        let factory = self.rewrite_synthetic_runtime_qualified_name(&factory);
-        self.writer.write(&factory);
+        self.emit_synthetic_jsx_factory_reference(&factory);
         self.writer.write("(");
+        let recovered_tag = self.recovered_jsx_identifier_tag(tag_name, attributes);
         let tag = self.node(tag_name)?.clone();
-        if let NodeData::Identifier(identifier) = &tag.data
+        if let Some((name, _)) = &recovered_tag {
+            write_quoted(&mut self.writer, name);
+        } else if let NodeData::Identifier(identifier) = &tag.data
             && identifier
                 .text
                 .chars()
@@ -48806,7 +49225,10 @@ impl Printer<'_> {
             self.emit_expression(tag_name, 0)?;
         }
         self.writer.write(", ");
+        let previous_recovered = self.jsx_recovered_tag_attribute;
+        self.jsx_recovered_tag_attribute = recovered_tag.as_ref().map(|(_, id)| *id);
         self.emit_jsx_attributes(attributes, false)?;
+        self.jsx_recovered_tag_attribute = previous_recovered;
         if let Some(children) = children {
             let semantic_children = semantic_jsx_children(self.arena, children);
             let multiline_child = semantic_children.len() == 1
@@ -48840,6 +49262,164 @@ impl Printer<'_> {
         }
         self.writer.write(")");
         Ok(())
+    }
+
+    fn emit_preserved_jsx_tag_name(&mut self, tag_name: NodeId) -> Result<(), EmitError> {
+        let node = self.node(tag_name)?;
+        let start = usize::try_from(node.range.start.get()).unwrap_or(usize::MAX);
+        let end = usize::try_from(node.range.end.get()).unwrap_or(usize::MAX);
+        let source = self.source_text.get(start..end).unwrap_or_default().trim();
+        let normalized = source
+            .split('.')
+            .map(str::trim)
+            .collect::<Vec<_>>()
+            .join(".");
+        self.writer.write(&normalized);
+        Ok(())
+    }
+
+    fn recovered_jsx_identifier_tag(
+        &self,
+        tag_name: NodeId,
+        attributes: NodeId,
+    ) -> Option<(String, NodeId)> {
+        let tag = self.arena.get(tag_name)?;
+        let start = usize::try_from(tag.range.start.get()).ok()?;
+        let end = usize::try_from(tag.range.end.get()).ok()?;
+        if self.source_text.get(start..end).is_some_and(|text| !text.trim().is_empty()) {
+            return None;
+        }
+        let NodeData::JsxAttributes(attributes) = &self.arena.get(attributes)?.data else {
+            return None;
+        };
+        let attribute_id = *attributes.properties.nodes.first()?;
+        let NodeData::JsxAttribute(attribute) = &self.arena.get(attribute_id)?.data else {
+            return None;
+        };
+        let name = self.identifier_text(attribute.name).ok()?.to_owned();
+        let opening = self.arena.get(tag_name)?.parent?;
+        let opening_start = usize::try_from(self.arena.get(opening)?.range.start.get()).ok()?;
+        let name_start = usize::try_from(self.arena.get(attribute.name)?.range.start.get()).ok()?;
+        let prefix = self
+            .source_text
+            .get(opening_start.saturating_add(1)..name_start)?;
+        prefix.is_empty().then_some((name, attribute_id))
+    }
+
+    fn expression_statement_is_recovered_jsx_closing(
+        &self,
+        statement: NodeId,
+        expression: NodeId,
+    ) -> bool {
+        if !matches!(self.settings.jsx, JsxEmit::React | JsxEmit::Preserve) {
+            return false;
+        }
+        let name = match self.arena.get(expression).map(|node| &node.data) {
+            Some(NodeData::BinaryExpression(binary)) => {
+                declaration_name_text(self.arena, binary.left)
+            }
+            Some(NodeData::Identifier(identifier)) => Some(identifier.text.as_str()),
+            _ => None,
+        };
+        let Some(name) = name else {
+            return false;
+        };
+        let Some(node) = self.arena.get(statement) else {
+            return false;
+        };
+        let start = usize::try_from(node.range.start.get()).unwrap_or(usize::MAX);
+        let end = usize::try_from(node.range.end.get()).unwrap_or(usize::MAX);
+        self.source_text
+            .get(start.saturating_sub(2)..end.saturating_add(2).min(self.source_text.len()))
+            .is_some_and(|source| source.contains(&format!("</{name}>")))
+    }
+
+    fn emit_recovered_namespaced_jsx_statements(
+        &mut self,
+        statement: NodeId,
+    ) -> Result<bool, EmitError> {
+        if self.settings.jsx != JsxEmit::React {
+            return Ok(false);
+        }
+        let node = self.node(statement)?;
+        let start = usize::try_from(node.range.start.get()).unwrap_or(usize::MAX);
+        let end = usize::try_from(node.range.end.get()).unwrap_or(usize::MAX);
+        let Some(source) = self.source_text.get(start..end) else {
+            return Ok(false);
+        };
+        let mut elements = Vec::<(String, Vec<(String, String)>)>::new();
+        let mut cursor = 0;
+        while let Some(relative_start) = source[cursor..].find('<') {
+            let element_start = cursor + relative_start;
+            if source[element_start..].starts_with("</") {
+                cursor = element_start + 2;
+                continue;
+            }
+            let Some(relative_end) = source[element_start..].find("/>") else {
+                break;
+            };
+            let element_end = element_start + relative_end;
+            let contents = source[element_start + 1..element_end].trim();
+            let mut parts = contents.split_whitespace();
+            let Some(tag) = parts.next().filter(|tag| tag.contains(':')) else {
+                cursor = element_end + 2;
+                continue;
+            };
+            let attributes = parts
+                .filter_map(|attribute| {
+                    let (name, value) = attribute.split_once('=')?;
+                    Some((
+                        name.to_owned(),
+                        value.trim_matches(['\'', '"']).to_owned(),
+                    ))
+                })
+                .collect::<Vec<_>>();
+            elements.push((tag.to_owned(), attributes));
+            cursor = element_end + 2;
+        }
+        if elements.is_empty() {
+            return Ok(false);
+        }
+        let factory = self
+            .jsx_factory
+            .clone()
+            .unwrap_or_else(|| "React.createElement".to_owned());
+        for (index, (tag, attributes)) in elements.iter().enumerate() {
+            if index != 0 {
+                self.writer.newline();
+            }
+            self.emit_synthetic_jsx_factory_reference(&factory);
+            self.writer.write("(");
+            write_quoted(&mut self.writer, tag);
+            if attributes.is_empty() {
+                self.writer.write(", null");
+            } else {
+                self.writer.write(", { ");
+                for (attribute_index, (name, value)) in attributes.iter().enumerate() {
+                    if attribute_index != 0 {
+                        self.writer.write(", ");
+                    }
+                    self.writer.write(name);
+                    self.writer.write(": ");
+                    write_quoted(&mut self.writer, value);
+                }
+                self.writer.write(" }");
+            }
+            self.writer.write(");");
+        }
+        Ok(true)
+    }
+
+    fn emit_synthetic_jsx_factory_reference(&mut self, factory: &str) {
+        let rewritten = self.rewrite_synthetic_runtime_qualified_name(factory);
+        let unbound = !factory.contains('.') && rewritten != factory && rewritten.contains('.');
+        if unbound {
+            self.writer.write("(0, ");
+        }
+        self.writer.write(&rewritten);
+        if unbound {
+            self.writer.write(")");
+        }
     }
 
     fn rewrite_synthetic_runtime_qualified_name(&self, name: &str) -> String {
@@ -49050,7 +49630,7 @@ impl Printer<'_> {
                     .expression
                     .filter(|expression| !self.expression_emits_nothing(*expression))
                 {
-                    self.emit_expression(expression, 0)?;
+                    self.emit_jsx_attribute_expression(expression)?;
                 } else {
                     self.writer.write("true");
                 }
@@ -49058,6 +49638,18 @@ impl Printer<'_> {
             _ => return Err(Self::unsupported(initializer, node.kind)),
         }
         Ok(())
+    }
+
+    fn emit_jsx_attribute_expression(&mut self, expression: NodeId) -> Result<(), EmitError> {
+        let multiline_arrow = matches!(
+            self.arena.get(expression).map(|node| &node.data),
+            Some(NodeData::ArrowFunction(arrow))
+                if matches!(self.arena.get(arrow.body).map(|node| &node.data), Some(NodeData::Block(_)))
+        );
+        self.writer.indent += usize::from(multiline_arrow);
+        let result = self.emit_expression(expression, 0);
+        self.writer.indent -= usize::from(multiline_arrow);
+        result
     }
 
     fn emit_automatic_children(&mut self, children: &[NodeId]) -> Result<(), EmitError> {
@@ -49131,8 +49723,15 @@ impl Printer<'_> {
         let NodeData::JsxAttributes(attributes) = &node.data else {
             return Err(Self::unsupported(id, node.kind));
         };
+        let properties = attributes
+            .properties
+            .nodes
+            .iter()
+            .copied()
+            .filter(|attribute| Some(*attribute) != self.jsx_recovered_tag_attribute)
+            .collect::<Vec<_>>();
         if preserve {
-            for attribute in &attributes.properties.nodes {
+            for attribute in &properties {
                 let node = self.node(*attribute)?.clone();
                 match &node.data {
                     NodeData::JsxAttribute(attribute) => {
@@ -49171,12 +49770,12 @@ impl Printer<'_> {
             }
             return Ok(());
         }
-        if attributes.properties.nodes.is_empty() {
+        if properties.is_empty() {
             self.writer.write("null");
             return Ok(());
         }
         if self.settings.target < ScriptTarget::Es2018
-            && attributes.properties.nodes.iter().any(|attribute| {
+            && properties.iter().any(|attribute| {
                 matches!(
                     self.arena.get(*attribute).map(|node| &node.data),
                     Some(NodeData::JsxSpreadAttribute(_))
@@ -49191,7 +49790,7 @@ impl Printer<'_> {
             self.writer.write("(");
             let mut normal_attributes = Vec::new();
             let mut wrote_argument = false;
-            for attribute in &attributes.properties.nodes {
+            for attribute in &properties {
                 let node = self.node(*attribute)?.clone();
                 if let NodeData::JsxSpreadAttribute(spread) = &node.data {
                     if !normal_attributes.is_empty() {
@@ -49221,7 +49820,7 @@ impl Printer<'_> {
             return Ok(());
         }
         self.writer.write("{ ");
-        for (index, attribute) in attributes.properties.nodes.iter().enumerate() {
+        for (index, attribute) in properties.iter().enumerate() {
             if index != 0 {
                 self.writer.write(", ");
             }
@@ -49245,7 +49844,7 @@ impl Printer<'_> {
                             .expression
                             .filter(|expression| !self.expression_emits_nothing(*expression))
                         {
-                            self.emit_expression(expression, 0)?;
+                            self.emit_jsx_attribute_expression(expression)?;
                         } else {
                             self.writer.write("true");
                         }
@@ -52716,6 +53315,7 @@ mod tests {
                 strict_null_checks: false,
                 force_use_strict: false,
                 jsx_factory: None,
+                jsx_fragment_factory: None,
                 downlevel_iteration: false,
                 module_detection: ModuleDetectionKind::Auto,
             },
@@ -52848,6 +53448,7 @@ mod tests {
                 strict_null_checks: false,
                 force_use_strict: false,
                 jsx_factory: None,
+                jsx_fragment_factory: None,
                 downlevel_iteration: false,
                 module_detection: ModuleDetectionKind::Auto,
             },
@@ -54616,6 +55217,7 @@ mod tests {
                 strict_null_checks: false,
                 force_use_strict: false,
                 jsx_factory: None,
+                jsx_fragment_factory: None,
                 downlevel_iteration: false,
                 module_detection: ModuleDetectionKind::Auto,
             },
@@ -55143,6 +55745,7 @@ mod tests {
                     strict_null_checks: false,
                     force_use_strict: false,
                     jsx_factory: None,
+                    jsx_fragment_factory: None,
                     downlevel_iteration: false,
                     module_detection: ModuleDetectionKind::Auto,
                 },
@@ -57348,6 +57951,7 @@ class Board {
                 strict_null_checks: false,
                 force_use_strict: false,
                 jsx_factory: None,
+                jsx_fragment_factory: None,
                 downlevel_iteration: false,
                 module_detection: ModuleDetectionKind::Auto,
             },
