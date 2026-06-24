@@ -11096,7 +11096,7 @@ impl DeclarationPrinter<'_> {
             self.writer.write("new (");
             self.emit_semantic_parameters(signature, None)?;
             self.writer.write("): ");
-            self.emit_semantic_type(signature.return_type)?;
+            self.emit_semantic_constructor_instance_type(signature.return_type)?;
             self.writer.write(";");
             self.writer.newline();
             self.writer.indent -= 1;
@@ -11304,7 +11304,7 @@ impl DeclarationPrinter<'_> {
                     self.writer.write("new (");
                     self.emit_semantic_parameters(signature, None)?;
                     self.writer.write(") => ");
-                    self.emit_semantic_type(signature.return_type)?;
+                    self.emit_semantic_constructor_instance_type(signature.return_type)?;
                 } else {
                     self.emit_semantic_object_type(&object)?;
                 }
@@ -11398,7 +11398,7 @@ impl DeclarationPrinter<'_> {
                 self.writer.write("new (");
                 self.emit_semantic_parameters(&signature, None)?;
                 self.writer.write(") => ");
-                self.emit_semantic_type(signature.return_type)?;
+                self.emit_semantic_constructor_instance_type(signature.return_type)?;
             }
             TypeKind::Overload(signatures) => {
                 for (index, signature) in signatures.iter().enumerate() {
@@ -11565,7 +11565,7 @@ impl DeclarationPrinter<'_> {
             self.writer.write("new (");
             self.emit_semantic_parameters(&constructor, None)?;
             self.writer.write("): ");
-            self.emit_semantic_type(constructor.return_type)?;
+            self.emit_semantic_constructor_instance_type(constructor.return_type)?;
             self.writer.write(";");
             self.writer.newline();
             for (name, property) in object.properties {
@@ -12161,7 +12161,7 @@ impl DeclarationPrinter<'_> {
             self.writer.write("new (");
             self.emit_semantic_parameters(signature, None)?;
             self.writer.write(") => ");
-            self.emit_semantic_type(signature.return_type)?;
+            self.emit_semantic_constructor_instance_type(signature.return_type)?;
             return Ok(());
         }
         self.writer.write("{");
@@ -12185,7 +12185,7 @@ impl DeclarationPrinter<'_> {
                 self.writer.write("new (");
                 self.emit_semantic_parameters(signature, None)?;
                 self.writer.write("): ");
-                self.emit_semantic_type(signature.return_type)?;
+                self.emit_semantic_constructor_instance_type(signature.return_type)?;
                 self.writer.write(";");
                 self.writer.newline();
             }
@@ -12388,6 +12388,21 @@ impl DeclarationPrinter<'_> {
         }
         self.writer.write("}");
         Ok(())
+    }
+
+    fn emit_semantic_constructor_instance_type(
+        &mut self,
+        type_id: TypeId,
+    ) -> Result<(), EmitError> {
+        if let Some(TypeKind::Object(object)) = self
+            .semantic_types
+            .and_then(|types| types.get(type_id))
+            .map(|type_| type_.kind.clone())
+        {
+            self.emit_semantic_object_type_with_methods(&object, true)
+        } else {
+            self.emit_semantic_type(type_id)
+        }
     }
 
     fn matching_source_type_literal(&self, object: &ObjectType) -> Option<NodeId> {
@@ -38458,6 +38473,27 @@ class Board {
                 "        timestamp: number;\n",
                 "    };\n",
                 "} & TBase;",
+            )),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn declaration_emit_preserves_methods_from_any_based_class_mixins() {
+        let output = emit_declarations_with_semantics(concat!(
+            "type Constructor = new (...args: any[]) => any;\n",
+            "export const mixin = (Base: Constructor) => {\n",
+            "    return class extends Base { get(value: string) {} };\n",
+            "};\n",
+        ));
+        assert!(
+            output.contains(concat!(
+                "export declare const mixin: (Base: Constructor) => {\n",
+                "    new (...args: any[]): {\n",
+                "        [x: string]: any;\n",
+                "        get(value: string): void;\n",
+                "    };\n",
+                "};",
             )),
             "{output}"
         );

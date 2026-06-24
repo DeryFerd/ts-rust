@@ -4769,16 +4769,25 @@ impl<'a> Checker<'a> {
                                 .collect::<Vec<_>>()
                         })
                         .unwrap_or_default();
-                    let Some(symbol) = self.resolve_identifier(heritage.expression, &name) else {
+                    let base = self
+                        .resolve_identifier(heritage.expression, &name)
+                        .and_then(|symbol| self.instantiate_declared_object(symbol, &arguments))
+                        .or_else(|| {
+                            let value = self.type_of_expression(heritage.expression);
+                            self.constructor_instance_type(value)
+                        });
+                    let Some(base) = base else {
                         continue;
                     };
-                    let Some(base) = self.instantiate_declared_object(symbol, &arguments) else {
-                        continue;
-                    };
-                    if let TypeKind::Object(base) =
+                    has_base = true;
+                    if matches!(
+                        self.result.types.get(base).map(|type_| &type_.kind),
+                        Some(TypeKind::Any)
+                    ) {
+                        string_index_type = Some(self.result.types.any());
+                    } else if let TypeKind::Object(base) =
                         self.result.types.get(base).unwrap().kind.clone()
                     {
-                        has_base = true;
                         string_index_type = base.string_index_type.or(string_index_type);
                         number_index_type = base.number_index_type.or(number_index_type);
                         call_signatures.extend(base.call_signatures);
@@ -4853,6 +4862,20 @@ impl<'a> Checker<'a> {
         }));
         self.type_parameter_scopes.pop();
         result
+    }
+
+    fn constructor_instance_type(&self, type_id: TypeId) -> Option<TypeId> {
+        match &self.result.types.get(type_id)?.kind {
+            TypeKind::Constructor(signature) => Some(signature.return_type),
+            TypeKind::TypeParameter {
+                constraint: Some(constraint),
+                ..
+            } => self.constructor_instance_type(*constraint),
+            TypeKind::Intersection(members) => members
+                .iter()
+                .find_map(|member| self.constructor_instance_type(*member)),
+            _ => None,
+        }
     }
 
     fn instantiate_declared_object(
