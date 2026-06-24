@@ -3402,7 +3402,7 @@ impl DeclarationPrinter<'_> {
         let Some(name) = declaration_name_text(self.arena, variable.name) else {
             return false;
         };
-        self.arena.iter().any(|(_, node)| {
+        let synthesized_export_dependency = self.arena.iter().any(|(_, node)| {
             let NodeData::ExportAssignment(export) = &node.data else {
                 return false;
             };
@@ -3414,7 +3414,42 @@ impl DeclarationPrinter<'_> {
                     .entity_expression_root_identifier(export.expression)
                     .and_then(|root| declaration_name_text(self.arena, root))
                     == Some(name)
-        })
+        });
+        synthesized_export_dependency
+            || self.arena.iter().any(|(_, node)| {
+                let NodeData::ClassDeclaration(class) = &node.data else {
+                    return false;
+                };
+                declaration_has_modifier(self.arena, node, SyntaxKind::DefaultKeyword)
+                    && class.heritage_clauses.as_ref().is_some_and(|clauses| {
+                        clauses.nodes.iter().any(|clause| {
+                            let Some(NodeData::HeritageClause(clause)) =
+                                self.arena.get(*clause).map(|node| &node.data)
+                            else {
+                                return false;
+                            };
+                            clause.token == SyntaxKind::ExtendsKeyword
+                                && clause.types.nodes.iter().any(|heritage| {
+                                    let Some(NodeData::ExpressionWithTypeArguments(heritage)) =
+                                        self.arena.get(*heritage).map(|node| &node.data)
+                                    else {
+                                        return false;
+                                    };
+                                    let expression = match self
+                                        .arena
+                                        .get(heritage.expression)
+                                        .map(|node| &node.data)
+                                    {
+                                        Some(NodeData::CallExpression(call)) => call.expression,
+                                        _ => heritage.expression,
+                                    };
+                                    self.entity_expression_root_identifier(expression)
+                                        .and_then(|root| declaration_name_text(self.arena, root))
+                                        == Some(name)
+                                })
+                        })
+                    })
+            })
     }
 
     fn syntactic_curried_class_base(
@@ -3901,11 +3936,17 @@ impl DeclarationPrinter<'_> {
     }
 
     fn heritage_factory_explicit_return_type(&self, expression: NodeId) -> Option<NodeId> {
-        let NodeData::CallExpression(call) = &self.arena.get(expression)?.data else {
-            return None;
+        let callee = match &self.arena.get(expression)?.data {
+            NodeData::CallExpression(call) => call.expression,
+            NodeData::Identifier(_) | NodeData::PropertyAccessExpression(_)
+                if self.raw_heritage_argument(expression).is_some() =>
+            {
+                expression
+            }
+            _ => return None,
         };
-        let name = declaration_name_text(self.arena, call.expression)?;
-        let symbol = self.bindings.resolve_name_at(call.expression, name)?;
+        let name = declaration_name_text(self.arena, callee)?;
+        let symbol = self.bindings.resolve_name_at(callee, name)?;
         self.bindings
             .symbols
             .get(symbol)?
@@ -6934,7 +6975,30 @@ impl DeclarationPrinter<'_> {
             }
         });
         self.writer.write("(");
-        self.emit_semantic_type_list(&members, " | ")?;
+        if let Some(order) = self
+            .array_literal_union_property_order(&members)
+            .or_else(|| self.shared_semantic_object_property_order(&members))
+        {
+            for (index, member) in members.iter().enumerate() {
+                if index != 0 {
+                    self.writer.write(" | ");
+                }
+                let Some(TypeKind::Object(object)) = self
+                    .semantic_types
+                    .and_then(|types| types.get(*member))
+                    .map(|type_| type_.kind.clone())
+                else {
+                    continue;
+                };
+                self.emit_semantic_object_type_with_methods_and_order(
+                    &object,
+                    false,
+                    Some(&order),
+                )?;
+            }
+        } else {
+            self.emit_semantic_type_list(&members, " | ")?;
+        }
         self.writer.write(")[]");
         Ok(true)
     }
@@ -11948,6 +12012,70 @@ impl DeclarationPrinter<'_> {
             (present.len() == object.properties.len()).then_some(present)
         });
         mapped_order.unwrap_or_else(|| object.properties.keys().cloned().collect())
+    }
+
+    fn shared_semantic_object_property_order(&self, types: &[TypeId]) -> Option<Vec<String>> {
+        let orders = types
+            .iter()
+            .map(|type_id| {
+                let TypeKind::Object(object) = &self
+                    .semantic_types
+                    .and_then(|types| types.get(*type_id))?
+                    .kind
+                else {
+                    return None;
+                };
+                Some(self.semantic_object_property_order(object))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let mut shared = Vec::new();
+        for order in orders {
+            for name in order {
+                if !shared.contains(&name) {
+                    shared.push(name);
+                }
+            }
+        }
+        Some(shared)
+    }
+
+    fn array_literal_union_property_order(&self, types: &[TypeId]) -> Option<Vec<String>> {
+        let objects = types
+            .iter()
+            .map(|type_id| {
+                let TypeKind::Object(object) = &self
+                    .semantic_types
+                    .and_then(|types| types.get(*type_id))?
+                    .kind
+                else {
+                    return None;
+                };
+                Some(object)
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let all_names = objects
+            .iter()
+            .flat_map(|object| object.properties.keys().cloned())
+            .collect::<BTreeSet<_>>();
+        self.arena.iter().find_map(|(_, node)| {
+            let NodeData::ArrayLiteralExpression(array) = &node.data else {
+                return None;
+            };
+            let mut order = Vec::new();
+            for element in &array.elements.nodes {
+                let NodeData::ObjectLiteralExpression(object) = &self.arena.get(*element)?.data
+                else {
+                    return None;
+                };
+                for property in &object.properties.nodes {
+                    let name = type_member_name_text(self.arena, *property)?.to_owned();
+                    if !order.contains(&name) {
+                        order.push(name);
+                    }
+                }
+            }
+            (order.iter().cloned().collect::<BTreeSet<_>>() == all_names).then_some(order)
+        })
     }
 
     fn emit_computed_object_method_return(
@@ -31579,7 +31707,7 @@ mod tests {
             emit_declarations_with_semantics("export let b = [{ foo: 0, m() {} }, { bar: 1 }];");
         for expected in [
             "foo: number;\n    m(): void;\n    bar?: undefined;",
-            "bar: number;\n    foo?: undefined;\n    m?: undefined;",
+            "foo?: undefined;\n    m?: undefined;\n    bar: number;",
         ] {
             assert!(
                 array.contains(expected),
@@ -37173,6 +37301,29 @@ class Board {
             output.contains("export declare class Result extends Result_base"),
             "{output}"
         );
+    }
+
+    #[test]
+    fn declaration_mapped_type_preserves_accessor_and_method_order() {
+        let output = emit_declarations_with_semantics(concat!(
+            "type Expand<T> = {} & { [P in keyof T]: T[P] };\n",
+            "type Shape<T = string> = {\n",
+            "  get readonlyProperty(): T;\n",
+            "  field: T;\n",
+            "  method(value: T): T;\n",
+            "};\n",
+            "export const value = (() => null! as Expand<Shape>)();\n",
+        ));
+        let accessor = output
+            .find("readonly readonlyProperty: string;")
+            .unwrap_or_else(|| panic!("{output}"));
+        let field = output
+            .find("field: string;")
+            .unwrap_or_else(|| panic!("{output}"));
+        let method = output
+            .find("method: (value: string) => string;")
+            .unwrap_or_else(|| panic!("{output}"));
+        assert!(accessor < field && field < method, "{output}");
     }
 
     #[test]

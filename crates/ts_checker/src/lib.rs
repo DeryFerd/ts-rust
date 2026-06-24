@@ -3898,6 +3898,9 @@ impl<'a> Checker<'a> {
                             self.result.node_types.insert(*member, constructor_type);
                             continue;
                         }
+                        if !properties.contains_key(&name) {
+                            property_order.push(name.clone());
+                        }
                         let method_type = if !self.options.is_javascript_file
                             && data.type_.is_none()
                             && data.body.is_some()
@@ -3990,6 +3993,9 @@ impl<'a> Checker<'a> {
                 }
                 NodeData::MethodSignatureDeclaration(data) => {
                     if let Some(name) = self.property_name(data.name) {
+                        if !properties.contains_key(&name) {
+                            property_order.push(name.clone());
+                        }
                         let method_type = self.signature_type(
                             &data.parameters.nodes,
                             data.type_,
@@ -4058,6 +4064,9 @@ impl<'a> Checker<'a> {
                 }
                 NodeData::GetAccessorDeclaration(data) => {
                     if let Some(name) = self.property_name(data.name) {
+                        if !properties.contains_key(&name) {
+                            property_order.push(name.clone());
+                        }
                         let this_type = self.result.types.alloc(TypeKind::Object(ObjectType {
                             properties: properties.clone(),
                             property_order: property_order.clone(),
@@ -4103,6 +4112,9 @@ impl<'a> Checker<'a> {
                 }
                 NodeData::SetAccessorDeclaration(data) => {
                     if let Some(name) = self.property_name(data.name) {
+                        if !properties.contains_key(&name) {
+                            property_order.push(name.clone());
+                        }
                         setter_properties.insert(name.clone());
                         let type_node = data
                             .parameters
@@ -9382,6 +9394,13 @@ impl<'a> Checker<'a> {
                     .named_type_references
                     .insert(substituted, reference);
             }
+        }
+        if substituted != type_id
+            && let Some(reference) = self.result.import_type_references.get(&type_id).cloned()
+        {
+            self.result
+                .import_type_references
+                .insert(substituted, reference);
         }
         substituted
     }
