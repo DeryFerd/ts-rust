@@ -92,6 +92,7 @@ pub struct CompilerOptions {
     pub declaration_map: bool,
     pub downlevel_iteration: bool,
     pub emit_declaration_only: bool,
+    pub emit_bom: bool,
     pub emit_decorator_metadata: bool,
     pub es_module_interop: bool,
     pub exact_optional_property_types: bool,
@@ -157,6 +158,7 @@ impl Default for CompilerOptions {
             declaration_map: false,
             downlevel_iteration: false,
             emit_declaration_only: false,
+            emit_bom: false,
             emit_decorator_metadata: false,
             es_module_interop: false,
             exact_optional_property_types: false,
@@ -290,6 +292,7 @@ impl CompilerOptions {
                 "emitdecoratormetadata" => {
                     self.emit_decorator_metadata = overrides.emit_decorator_metadata;
                 }
+                "emitbom" => self.emit_bom = overrides.emit_bom,
                 "importhelpers" => self.import_helpers = overrides.import_helpers,
                 "jsx" => self.jsx = overrides.jsx,
                 "jsxfactory" => self.jsx_factory.clone_from(&overrides.jsx_factory),
@@ -494,6 +497,9 @@ pub fn parse_compiler_options_map(options: &BTreeMap<String, JsonValue>) -> Pars
             "emitdeclarationonly" => {
                 parsed.emit_declaration_only = boolean(original_name, value, &mut diagnostics);
             }
+            "emitbom" => {
+                parsed.emit_bom = boolean(original_name, value, &mut diagnostics);
+            }
             "emitdecoratormetadata" => {
                 parsed.emit_decorator_metadata = boolean(original_name, value, &mut diagnostics);
             }
@@ -632,6 +638,7 @@ struct PartialOptions {
     declaration_map: Option<bool>,
     downlevel_iteration: Option<bool>,
     emit_declaration_only: Option<bool>,
+    emit_bom: Option<bool>,
     emit_decorator_metadata: Option<bool>,
     es_module_interop: Option<bool>,
     exact_optional_property_types: Option<bool>,
@@ -714,6 +721,7 @@ impl PartialOptions {
             declaration_map: self.declaration_map.unwrap_or(false),
             downlevel_iteration: self.downlevel_iteration.unwrap_or(false),
             emit_declaration_only,
+            emit_bom: self.emit_bom.unwrap_or(false),
             emit_decorator_metadata: self.emit_decorator_metadata.unwrap_or(false),
             es_module_interop,
             exact_optional_property_types: self.exact_optional_property_types.unwrap_or(false),

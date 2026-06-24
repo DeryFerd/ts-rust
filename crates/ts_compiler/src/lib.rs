@@ -70,6 +70,19 @@ pub struct EmitOutput {
     pub diagnostics: Vec<ProgramDiagnostic>,
 }
 
+fn prepend_emit_bom(files: &mut [OutputFile]) {
+    for file in files {
+        let lower = file.file_name.to_ascii_lowercase();
+        if [".js", ".jsx", ".mjs", ".cjs", ".d.ts", ".d.mts", ".d.cts"]
+            .iter()
+            .any(|extension| lower.ends_with(extension))
+            && !file.text.starts_with('\u{feff}')
+        {
+            file.text.insert(0, '\u{feff}');
+        }
+    }
+}
+
 /// A compilation's parsed source-file graph.
 #[derive(Debug, Default)]
 pub struct Program {
@@ -618,6 +631,9 @@ impl Program {
                 }
             }
         }
+        if self.options.emit_bom {
+            prepend_emit_bom(&mut output.files);
+        }
         if self.options.no_emit_on_error && !output.diagnostics.is_empty() {
             output.files.clear();
         }
@@ -911,6 +927,9 @@ impl Program {
             }
         }
 
+        if self.options.emit_bom {
+            prepend_emit_bom(&mut output.files);
+        }
         if self.options.no_emit_on_error && !output.diagnostics.is_empty() {
             output.files.clear();
         }

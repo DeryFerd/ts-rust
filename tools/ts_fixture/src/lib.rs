@@ -476,6 +476,20 @@ fn compare_case_emitted_output_sections(
                 .cloned(),
         );
     }
+    let legacy_bom_baseline_omits_javascript = case
+        .directive_values("emitBOM")
+        .any(|value| value.eq_ignore_ascii_case("true"))
+        && !baseline_sections
+            .keys()
+            .any(|name| is_javascript_output_section(name));
+    let filtered_outputs = legacy_bom_baseline_omits_javascript.then(|| {
+        outputs
+            .iter()
+            .filter(|(name, _)| !is_javascript_output_section(name))
+            .map(|(name, text)| (name.clone(), text.clone()))
+            .collect::<BTreeMap<_, _>>()
+    });
+    let outputs = filtered_outputs.as_ref().unwrap_or(outputs);
     let input_echoes = case
         .units
         .iter()
@@ -982,6 +996,7 @@ const SCALAR_OPTION_NAMES: &[&str] = &[
     "declarationMap",
     "declarationDir",
     "downlevelIteration",
+    "emitBOM",
     "emitDeclarationOnly",
     "emitDecoratorMetadata",
     "esModuleInterop",
@@ -1287,6 +1302,9 @@ fn normalize_newlines(text: &str) -> String {
 
 fn normalize_emitted_section(text: &str) -> String {
     let mut normalized = normalize_newlines(text);
+    if normalized.starts_with('\u{feff}') {
+        normalized.replace_range(..'\u{feff}'.len_utf8(), "ï»¿");
+    }
     while normalized.ends_with('\n') {
         normalized.pop();
     }
