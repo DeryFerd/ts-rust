@@ -3463,7 +3463,10 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_entity_name(&mut self) -> NodeId {
-        let mut entity = if self.current.kind == SyntaxKind::UndefinedKeyword
+        let mut entity = if matches!(
+            self.current.kind,
+            SyntaxKind::UndefinedKeyword | SyntaxKind::ThisKeyword
+        )
             || is_contextual_keyword(self.current.kind)
         {
             self.parse_identifier_name("Expected a module reference.")
@@ -9438,6 +9441,35 @@ mod tests {
         ] {
             assert!(kinds.contains(&expected), "missing {expected:?}");
         }
+    }
+
+    #[test]
+    fn parses_this_qualified_type_queries_without_orphaned_tokens() {
+        let result = parse_source_file("declare class C { get foo(): typeof this.foo; }");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let statements = source_statements(&result);
+        assert_eq!(statements.len(), 1);
+        let NodeData::ClassDeclaration(class) = &result.arena.get(statements[0]).unwrap().data
+        else {
+            panic!("expected class declaration");
+        };
+        let NodeData::GetAccessorDeclaration(accessor) =
+            &result.arena.get(class.members.nodes[0]).unwrap().data
+        else {
+            panic!("expected getter");
+        };
+        let NodeData::TypeQueryNode(query) =
+            &result.arena.get(accessor.type_.unwrap()).unwrap().data
+        else {
+            panic!("expected type query");
+        };
+        let NodeData::QualifiedName(name) = &result.arena.get(query.expr_name).unwrap().data else {
+            panic!("expected qualified this name");
+        };
+        let NodeData::Identifier(left) = &result.arena.get(name.left).unwrap().data else {
+            panic!("expected this identifier");
+        };
+        assert_eq!(left.text, "this");
     }
 
     #[test]
