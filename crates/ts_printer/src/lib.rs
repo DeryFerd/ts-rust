@@ -26876,9 +26876,11 @@ impl Printer<'_> {
         {
             return true;
         }
-        let preserves_reexported_binding = self.const_enum_emit_mode.preserves_declarations()
-            && import_clause_has_reexported_binding(self.arena, clause_id);
-        if preserves_reexported_binding {
+        let has_reexported_binding = import_clause_has_reexported_binding(self.arena, clause_id);
+        if has_reexported_binding
+            && (self.const_enum_emit_mode.preserves_declarations()
+                || self.import_semantically_has_runtime_value(declaration))
+        {
             return true;
         }
         let has_runtime_value = self.import_semantically_has_runtime_value(declaration)
@@ -35686,6 +35688,22 @@ class Board {
                 .code
                 .ends_with("const ts = __importStar(require(\"typescript\"));\nts.version;\n")
         );
+    }
+
+    #[test]
+    fn emits_commonjs_namespace_imports_reexported_as_local_bindings() {
+        let output = emit_with(
+            "import * as Debug from './debug'; export { Debug };",
+            ScriptTarget::Es2015,
+            ModuleKind::CommonJs,
+        )
+        .code;
+        assert!(output.contains("var __importStar ="), "{output}");
+        assert!(
+            output.contains("const Debug = __importStar(require(\"./debug\"));"),
+            "{output}"
+        );
+        assert!(output.contains("exports.Debug = Debug;"), "{output}");
     }
 
     #[test]
