@@ -4945,6 +4945,35 @@ mod tests {
     }
 
     #[test]
+    fn const_enum_fallbacks_do_not_capture_same_named_non_const_enums() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/scoped-enums.ts",
+            concat!(
+                "function ordinary() { return E.A; enum E { A } }\n",
+                "function constant() { return E.A; const enum E { A } }\n",
+                "const config = { a: After.A };\n",
+                "const enum After { A = 2 }\n",
+            ),
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/",
+            &["scoped-enums.ts".to_owned()],
+            CompilerOptions {
+                target: ScriptTarget::Es2015,
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        let javascript = &program.emit().files[0].text;
+        assert!(javascript.contains("return E.A;"), "{javascript}");
+        assert!(javascript.contains("return 0 /* E.A */;"), "{javascript}");
+        assert!(javascript.contains("a: 2 /* After.A */"), "{javascript}");
+    }
+
+    #[test]
     fn const_enum_property_accesses_inline_in_computed_names() {
         let fs = MemoryFileSystem::new(true);
         fs.write_file(

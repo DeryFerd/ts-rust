@@ -14115,7 +14115,8 @@ fn const_enum_access_fallbacks(
             Some(symbol) if symbol.flags.contains(ts_binder::SymbolFlags::CONST_ENUM) => {
                 symbol.name.clone()
             }
-            _ => aliases.get(root).map_or_else(
+            Some(_) => continue,
+            None => aliases.get(root).map_or_else(
                 || receiver_name.clone(),
                 |target| {
                     receiver_name
