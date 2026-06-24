@@ -10382,20 +10382,34 @@ impl<'a> Checker<'a> {
                 let recursive_alias =
                     symbol.is_some_and(|symbol| self.type_alias_is_recursive(symbol, &name));
                 let mut type_id = if let Some(symbol) = symbol {
-                    let type_id =
-                        if let Some(descriptor) = self.external_aliases.get(&symbol).cloned() {
-                            self.import_alias(&descriptor, &arguments)
-                        } else {
-                            self.instantiate_alias(symbol, &arguments)
-                                .or_else(|| self.instantiate_declared_object(symbol, &arguments))
-                                .unwrap_or_else(|| {
-                                    self.result
-                                        .symbol_types
-                                        .get(&symbol)
-                                        .copied()
-                                        .unwrap_or_else(|| self.result.types.unknown())
-                                })
-                        };
+                    let type_id = if !self.options.is_declaration_file
+                        && self.class_value_stack.contains(&symbol)
+                    {
+                        let placeholder = self
+                            .result
+                            .types
+                            .alloc(TypeKind::Object(ObjectType::default()));
+                        self.result.named_type_references.insert(
+                            placeholder,
+                            NamedTypeReference {
+                                name: name.clone(),
+                                type_arguments: arguments.clone(),
+                            },
+                        );
+                        placeholder
+                    } else if let Some(descriptor) = self.external_aliases.get(&symbol).cloned() {
+                        self.import_alias(&descriptor, &arguments)
+                    } else {
+                        self.instantiate_alias(symbol, &arguments)
+                            .or_else(|| self.instantiate_declared_object(symbol, &arguments))
+                            .unwrap_or_else(|| {
+                                self.result
+                                    .symbol_types
+                                    .get(&symbol)
+                                    .copied()
+                                    .unwrap_or_else(|| self.result.types.unknown())
+                            })
+                    };
                     if let Some(reference) = self.external_imports.get(&symbol).cloned() {
                         self.result
                             .import_type_references

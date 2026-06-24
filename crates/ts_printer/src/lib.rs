@@ -4187,8 +4187,8 @@ impl DeclarationPrinter<'_> {
                                     NodeData::Identifier(identifier_data)
                                         if names.contains(identifier_data.text.as_str())
                                 ) && self.node_is_within(identifier, *statement)
-                                    && !self.identifier_is_in_untyped_exported_variable(identifier)
-                                    && !self.identifier_is_in_unannotated_function_body(identifier)
+                                    && !self
+                                        .identifier_is_synthesized_export_initializer(identifier)
                             })
                     })
                 })
@@ -31290,6 +31290,27 @@ mod tests {
                 "}\n",
             )
         );
+    }
+
+    #[test]
+    fn declaration_emit_preserves_recursive_class_assertion_names() {
+        let output = emit_declarations_with_semantics(
+            "class Box { value() { return { item: <Box>null }; } }",
+        );
+        assert!(output.contains("item: Box;"), "{output}");
+    }
+
+    #[test]
+    fn declaration_emit_retains_namespace_imports_in_arrow_parameter_types() {
+        let output = emit_declarations_with_semantics(concat!(
+            "import * as things from './things';\n",
+            "export const value = (param: things.Thing) => null;",
+        ));
+        assert!(
+            output.starts_with("import * as things from './things';"),
+            "{output}"
+        );
+        assert!(output.contains("param: things.Thing"), "{output}");
     }
 
     #[test]
