@@ -3270,6 +3270,12 @@ impl<'a> Parser<'a> {
             None
         } else {
             let clause_start = self.current.range.start;
+            let phase_modifier = if self.current.kind == SyntaxKind::TypeKeyword {
+                self.bump();
+                Some(SyntaxKind::TypeKeyword)
+            } else {
+                None
+            };
             let name = if matches!(
                 self.current.kind,
                 SyntaxKind::Identifier | SyntaxKind::RequireKeyword
@@ -3305,7 +3311,7 @@ impl<'a> Parser<'a> {
                 NodeData::ImportClause(Box::new(ImportClauseData {
                     local_symbol: None,
                     named_bindings,
-                    phase_modifier: None,
+                    phase_modifier,
                     symbol: None,
                     facts: 0,
                     name,
@@ -3844,7 +3850,6 @@ impl<'a> Parser<'a> {
             self.parse_async_arrow_function()
         } else if minimum_precedence <= 2
             && self.current.kind == SyntaxKind::LessThanToken
-            && self.language_variant != LanguageVariant::Jsx
             && self.is_generic_arrow_function()
         {
             self.parse_generic_arrow_function()

@@ -1963,7 +1963,6 @@ impl<'a> ProgramChecker<'a> {
     ) {
         if let Some(descriptor) = exports.get(imported_name) {
             let mut descriptor = descriptor.clone();
-            paint_exported_named_descriptor_imports(&mut descriptor, module_name, exports);
             if module_name.starts_with('.')
                 && let Some((source_path, target_path)) = rebase_paths
             {
@@ -1975,6 +1974,7 @@ impl<'a> ProgramChecker<'a> {
             } else {
                 rebase_relative_import_references(&mut descriptor, module_name);
             }
+            paint_exported_named_descriptor_imports(&mut descriptor, module_name, exports);
             symbols.insert(symbol, descriptor);
             import_references.insert(
                 symbol,
@@ -14081,7 +14081,20 @@ fn describe_type_node_syntax(
                 operand_target,
                 exported_names,
             );
-            if matches!(semantic_target, TypeDescriptor::StringLiteral(_))
+            let indexed_operand = matches!(
+                source.arena.get(operator.type_).map(|node| &node.data),
+                Some(NodeData::IndexedAccessTypeNode(_))
+            ) || matches!(
+                source.arena.get(operator.type_).map(|node| &node.data),
+                Some(NodeData::ParenthesizedTypeNode(parenthesized))
+                    if matches!(
+                        source.arena.get(parenthesized.type_).map(|node| &node.data),
+                        Some(NodeData::IndexedAccessTypeNode(_))
+                    )
+            );
+            if (matches!(semantic_target, TypeDescriptor::StringLiteral(_))
+                || (indexed_operand
+                    && matches!(&semantic_target, TypeDescriptor::Union(members) if members.iter().all(|member| matches!(member, TypeDescriptor::StringLiteral(_))))))
                 && !matches!(operand, TypeDescriptor::Named { .. })
             {
                 semantic_target
@@ -14094,6 +14107,13 @@ fn describe_type_node_syntax(
             }
         }
         NodeData::IndexedAccessTypeNode(indexed) => {
+            if matches!(
+                semantic_target,
+                TypeDescriptor::Any | TypeDescriptor::Unknown
+            ) && let Some(value) = local_const_object_index_descriptor(source, indexed)
+            {
+                return value;
+            }
             let object_id = checker.type_from_type_node(indexed.object_type);
             let object_target = describe_source_type(source, &checker.result, object_id);
             let object = describe_type_node_syntax(
@@ -14126,6 +14146,58 @@ fn describe_type_node_syntax(
         }
         _ => semantic_target,
     }
+}
+
+fn local_const_object_index_descriptor(
+    source: &ProgramSource<'_>,
+    indexed: &ts_ast::IndexedAccessTypeNodeData,
+) -> Option<TypeDescriptor> {
+    let object_type = match &source.arena.get(indexed.object_type)?.data {
+        NodeData::ParenthesizedTypeNode(parenthesized) => parenthesized.type_,
+        _ => indexed.object_type,
+    };
+    let NodeData::TypeQueryNode(query) = &source.arena.get(object_type)?.data else {
+        return None;
+    };
+    let object_name = identifier_text(source.arena, query.expr_name)?;
+    let key = match &source.arena.get(indexed.index_type)?.data {
+        NodeData::LiteralTypeNode(literal) => string_literal_text(source.arena, literal.literal),
+        _ => None,
+    }?;
+    source.arena.iter().find_map(|(_, node)| {
+        let NodeData::VariableDeclaration(variable) = &node.data else {
+            return None;
+        };
+        if identifier_text(source.arena, variable.name) != Some(object_name) {
+            return None;
+        }
+        let initializer = variable.initializer?;
+        let object = match &source.arena.get(initializer)?.data {
+            NodeData::AsExpression(assertion) => assertion.expression,
+            NodeData::TypeAssertion(assertion) => assertion.expression,
+            _ => initializer,
+        };
+        let NodeData::ObjectLiteralExpression(object) = &source.arena.get(object)?.data else {
+            return None;
+        };
+        object.properties.nodes.iter().find_map(|property| {
+            let NodeData::PropertyAssignment(property) = &source.arena.get(*property)?.data else {
+                return None;
+            };
+            if module_export_name_text(source.arena, property.name) != Some(key) {
+                return None;
+            }
+            match &source.arena.get(property.initializer)?.data {
+                NodeData::StringLiteral(literal) => {
+                    Some(TypeDescriptor::StringLiteral(literal.text.clone()))
+                }
+                NodeData::NumericLiteral(literal) => {
+                    Some(TypeDescriptor::NumberLiteral(literal.text.clone()))
+                }
+                _ => None,
+            }
+        })
+    })
 }
 
 fn local_const_value_descriptor(source: &ProgramSource<'_>, name: &str) -> Option<TypeDescriptor> {
