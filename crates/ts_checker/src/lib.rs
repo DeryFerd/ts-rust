@@ -2452,7 +2452,7 @@ impl<'a> ProgramChecker<'a> {
                                 source.arena.get(*declaration).map(|node| &node.data)
                                 && let Some(type_id) = result.type_of_node(assignment.expression)
                             {
-                                let descriptor = describe_type(&result.types, type_id);
+                                let descriptor = describe_checked_type(result, type_id);
                                 return Some(if result.const_enum_types.contains(&type_id) {
                                     TypeDescriptor::ConstEnum(Box::new(descriptor))
                                 } else {
@@ -2462,7 +2462,7 @@ impl<'a> ProgramChecker<'a> {
                         }
                         let descriptor = result
                             .type_of_symbol(target)
-                            .map(|type_id| describe_type(&result.types, type_id))?;
+                            .map(|type_id| describe_checked_type(result, type_id))?;
                         Some(
                             if target_symbol
                                 .flags
@@ -3004,8 +3004,9 @@ impl<'a> Checker<'a> {
                     .name
                     .split_once('.')
                     .map_or(reference.name.as_str(), |(root, _)| root);
-                if !result.import_type_references.contains_key(&type_id)
-                    || local_import_equals_names.contains(root)
+                if !reference.name.starts_with("__type_predicate:")
+                    && (!result.import_type_references.contains_key(&type_id)
+                        || local_import_equals_names.contains(root))
                 {
                     names.insert(reference.name.clone());
                 }
@@ -6053,9 +6054,9 @@ impl<'a> Checker<'a> {
                 .map(|type_| type_.kind.clone())
         {
             let mut scope = HashMap::new();
-            for (index, parameter) in method.parameters.nodes.iter().enumerate() {
+            for (index, parameter_id) in method.parameters.nodes.iter().enumerate() {
                 let Some(NodeData::ParameterDeclaration(parameter)) =
-                    self.arena.get(*parameter).map(|node| &node.data)
+                    self.arena.get(*parameter_id).map(|node| &node.data)
                 else {
                     continue;
                 };
@@ -6063,25 +6064,42 @@ impl<'a> Checker<'a> {
                     && let Some(type_id) = current.parameters.get(index)
                 {
                     scope.insert(name, *type_id);
+                    if let Some(symbol) = self.bindings.node_symbols.get(parameter_id).copied() {
+                        self.result.symbol_types.insert(symbol, *type_id);
+                    }
                 }
             }
             self.local_scopes.push(scope);
-            let returns = self
-                .function_return_expressions(body)
+            let return_expressions = self.function_return_expressions(body);
+            let predicate = if return_expressions.len() == 1
+                && self.statement_definitely_terminates(body)
+            {
+                self.inferred_type_predicate(
+                    &method.parameters.nodes,
+                    body,
+                    return_expressions[0],
+                    &current,
+                )
+            } else {
+                None
+            };
+            let returns = return_expressions
                 .into_iter()
                 .map(|expression| self.inferred_method_return_expression_type(expression, body))
                 .collect::<Vec<_>>();
             self.local_scopes.pop();
-            let return_type = if returns.is_empty()
-                && method.asterisk_token.is_none()
-                && !self.has_ast_modifier(method.modifiers.as_ref(), SyntaxKind::AsyncKeyword)
-            {
-                Some(self.result.types.void())
-            } else if returns.is_empty() {
-                None
-            } else {
-                Some(self.result.types.union(returns))
-            };
+            let return_type = predicate.or_else(|| {
+                if returns.is_empty()
+                    && method.asterisk_token.is_none()
+                    && !self.has_ast_modifier(method.modifiers.as_ref(), SyntaxKind::AsyncKeyword)
+                {
+                    Some(self.result.types.void())
+                } else if returns.is_empty() {
+                    None
+                } else {
+                    Some(self.result.types.union(returns))
+                }
+            });
             if let Some(return_type) = return_type
                 && let Some(TypeKind::Function(current)) = self
                     .result
@@ -7081,6 +7099,16 @@ impl<'a> Checker<'a> {
             .arena
             .get(binary.operator_token)
             .map_or(SyntaxKind::Unknown, |node| node.kind);
+        if matches!(
+            operator,
+            SyntaxKind::AmpersandAmpersandToken | SyntaxKind::BarBarToken
+        ) {
+            let left = self.condition_narrowing(binary.left, truthy);
+            let right = self.condition_narrowing(binary.right, truthy);
+            let use_intersection = (operator == SyntaxKind::AmpersandAmpersandToken && truthy)
+                || (operator == SyntaxKind::BarBarToken && !truthy);
+            return self.combine_condition_narrowings(left, right, use_intersection);
+        }
         if operator == SyntaxKind::InKeyword {
             let Some(property) = self.literal_expression_name(binary.left) else {
                 return result;
@@ -7096,15 +7124,28 @@ impl<'a> Checker<'a> {
             let Some(subject) = self.narrowing_subject(binary.left) else {
                 return result;
             };
-            let Some(name) = self.property_name(binary.right) else {
-                return result;
-            };
-            let Some(target_symbol) = self.resolve_identifier(binary.right, &name) else {
-                return result;
-            };
-            let Some(target) = self.result.symbol_types.get(&target_symbol).copied() else {
-                return result;
-            };
+            let target = self.type_of_expression(binary.right);
+            let mut target = self
+                .result
+                .types
+                .get(target)
+                .and_then(|type_| self.construct_signatures(type_.kind.clone()))
+                .and_then(|signatures| signatures.first().map(|signature| signature.return_type))
+                .unwrap_or(target);
+            if !self.result.named_type_references.contains_key(&target)
+                && let Some(name) = self.property_name(binary.right)
+            {
+                let kind = self.result.types.get(target).unwrap().kind.clone();
+                let named = self.result.types.alloc(kind);
+                self.result.named_type_references.insert(
+                    named,
+                    NamedTypeReference {
+                        name,
+                        type_arguments: Vec::new(),
+                    },
+                );
+                target = named;
+            }
             let narrowed = self.narrow_by_assignability(subject, target, truthy);
             result.insert(subject, narrowed);
             return result;
@@ -7133,6 +7174,24 @@ impl<'a> Checker<'a> {
             result.insert(subject, narrowed);
             return result;
         }
+        if let Some((subject, comparison)) = self
+            .literal_equality_narrowing(binary.left, binary.right)
+            .or_else(|| self.literal_equality_narrowing(binary.right, binary.left))
+        {
+            let original = self.current_symbol_type(subject);
+            let narrowed = if include_match
+                && matches!(
+                    self.result.types.get(original).map(|type_| &type_.kind),
+                    Some(TypeKind::Any | TypeKind::Unknown)
+                )
+            {
+                comparison
+            } else {
+                self.narrow_to_comparison(subject, comparison, include_match)
+            };
+            result.insert(subject, narrowed);
+            return result;
+        }
         let (subject, comparison) = match (
             self.narrowing_subject(binary.left),
             self.narrowing_comparison(binary.right),
@@ -7147,6 +7206,16 @@ impl<'a> Checker<'a> {
             },
         };
         let original = self.current_symbol_type(subject);
+        if include_match
+            && matches!(
+                self.result.types.get(original).map(|type_| &type_.kind),
+                Some(TypeKind::Any | TypeKind::Unknown)
+            )
+        {
+            let narrowed = self.narrowing_comparison_type(comparison);
+            result.insert(subject, narrowed);
+            return result;
+        }
         let loose_null = matches!(
             operator,
             SyntaxKind::EqualsEqualsToken | SyntaxKind::ExclamationEqualsToken
@@ -7163,6 +7232,78 @@ impl<'a> Checker<'a> {
         });
         result.insert(subject, narrowed);
         result
+    }
+
+    fn literal_equality_narrowing(
+        &mut self,
+        subject: NodeId,
+        comparison: NodeId,
+    ) -> Option<(SymbolId, TypeId)> {
+        if !matches!(
+            self.arena.get(subject).map(|node| &node.data),
+            Some(NodeData::Identifier(_) | NodeData::NonNullExpression(_))
+        ) || !matches!(
+            self.arena.get(comparison).map(|node| &node.data),
+            Some(
+                NodeData::StringLiteral(_)
+                    | NodeData::NumericLiteral(_)
+                    | NodeData::BigIntLiteral(_)
+            )
+        ) && !matches!(
+            self.arena.get(comparison).map(|node| node.kind),
+            Some(SyntaxKind::TrueKeyword | SyntaxKind::FalseKeyword)
+        ) {
+            return None;
+        }
+        Some((
+            self.narrowing_subject(subject)?,
+            self.type_of_expression(comparison),
+        ))
+    }
+
+    fn combine_condition_narrowings(
+        &mut self,
+        mut left: HashMap<SymbolId, TypeId>,
+        right: HashMap<SymbolId, TypeId>,
+        use_intersection: bool,
+    ) -> HashMap<SymbolId, TypeId> {
+        for (symbol, right_type) in right {
+            left.entry(symbol)
+                .and_modify(|left_type| {
+                    *left_type = if use_intersection {
+                        self.result.types.intersection([*left_type, right_type])
+                    } else {
+                        self.result.types.union([*left_type, right_type])
+                    };
+                })
+                .or_insert(right_type);
+        }
+        left
+    }
+
+    fn narrowing_comparison_type(&mut self, comparison: NarrowingComparison) -> TypeId {
+        match comparison {
+            NarrowingComparison::Null => self.result.types.null(),
+            NarrowingComparison::Undefined => self.result.types.undefined(),
+            NarrowingComparison::String => self.result.types.string(),
+            NarrowingComparison::Number => self.result.types.number(),
+            NarrowingComparison::BigInt => self.result.types.bigint(),
+            NarrowingComparison::Boolean => self.result.types.boolean(),
+            NarrowingComparison::Function => {
+                let any = self.result.types.any();
+                self.result.types.alloc(TypeKind::Function(FunctionType {
+                    parameters: Vec::new(),
+                    parameter_names: Vec::new(),
+                    rest_parameter: Some(any),
+                    return_type: any,
+                    parameters_optional: true,
+                }))
+            }
+            NarrowingComparison::Object => self
+                .result
+                .types
+                .alloc(TypeKind::Object(ObjectType::default())),
+        }
     }
 
     fn current_symbol_type(&self, symbol: SymbolId) -> TypeId {
@@ -7622,6 +7763,26 @@ impl<'a> Checker<'a> {
         include_match: bool,
     ) -> TypeId {
         let original = self.current_symbol_type(subject);
+        if include_match
+            && matches!(
+                self.result.types.get(original).map(|type_| &type_.kind),
+                Some(TypeKind::Any | TypeKind::Unknown)
+            )
+        {
+            return target;
+        }
+        if include_match
+            && matches!(
+                self.result.types.get(original).map(|type_| &type_.kind),
+                Some(TypeKind::Object(object))
+                    if object.properties.is_empty()
+                        && object.call_signatures.is_empty()
+                        && object.construct_signatures.is_empty()
+            )
+            && self.is_assignable(target, original)
+        {
+            return target;
+        }
         let filtered = self
             .union_members(original)
             .into_iter()
@@ -7647,6 +7808,7 @@ impl<'a> Checker<'a> {
                 };
                 self.resolve_identifier(data.expression, &identifier.text)
             }
+            NodeData::NonNullExpression(data) => self.narrowing_subject(data.expression),
             _ => None,
         }
     }
@@ -8882,6 +9044,9 @@ impl<'a> Checker<'a> {
                     .insert(parameter_type, (type_node, type_parameters.clone()));
             }
             self.extend_binding_scope(parameter_data.name, parameter_type, &mut local_scope);
+            if let Some(symbol) = self.bindings.node_symbols.get(parameter).copied() {
+                self.result.symbol_types.insert(symbol, parameter_type);
+            }
             parameters.push(parameter_type);
         }
         self.local_scopes.push(local_scope);
@@ -8893,7 +9058,7 @@ impl<'a> Checker<'a> {
                     .as_ref()
                     .map(|signature| signature.return_type)
             });
-        let return_type = if matches!(
+        let mut return_type = if matches!(
             self.arena.get(data.body).map(|node| node.kind),
             Some(SyntaxKind::Block)
         ) {
@@ -8936,6 +9101,35 @@ impl<'a> Checker<'a> {
                 expected_return.unwrap_or_else(|| self.widen_literal(actual))
             }
         };
+        if data.type_.is_none() && expected_return.is_none() {
+            let returned = if matches!(
+                self.arena.get(data.body).map(|node| node.kind),
+                Some(SyntaxKind::Block)
+            ) {
+                let returns = self.function_return_expressions(data.body);
+                (returns.len() == 1 && self.statement_definitely_terminates(data.body))
+                    .then(|| returns[0])
+            } else {
+                Some(data.body)
+            };
+            if let Some(returned) = returned {
+                let signature = FunctionType {
+                    parameters: parameters.clone(),
+                    parameter_names: Vec::new(),
+                    rest_parameter: None,
+                    return_type,
+                    parameters_optional: false,
+                };
+                if let Some(predicate) = self.inferred_type_predicate(
+                    &data.parameters.nodes,
+                    data.body,
+                    returned,
+                    &signature,
+                ) {
+                    return_type = predicate;
+                }
+            }
+        }
         if let Some(returned_name) = identifier_text(self.arena, data.body)
             && let Some(parameter_index) = data.parameters.nodes.iter().position(|parameter| {
                 let Some(NodeData::ParameterDeclaration(parameter)) =
@@ -9182,6 +9376,13 @@ impl<'a> Checker<'a> {
                 self.non_widening_types.insert(property);
             }
             property
+        } else if let Some(property) = self.partial_union_property_type(receiver, name) {
+            self.error(
+                node,
+                2339,
+                [name.to_owned(), self.property_receiver_display(receiver)],
+            );
+            property
         } else if self.options.is_javascript_file && self.is_assignment_left_hand_side(node) {
             let property = self.result.types.any();
             if let Some(Type {
@@ -9200,6 +9401,17 @@ impl<'a> Checker<'a> {
             );
             self.result.types.any()
         }
+    }
+
+    fn partial_union_property_type(&mut self, receiver: TypeId, name: &str) -> Option<TypeId> {
+        let TypeKind::Union(members) = self.result.types.get(receiver)?.kind.clone() else {
+            return None;
+        };
+        let properties = members
+            .into_iter()
+            .filter_map(|member| self.lookup_property_type(member, name))
+            .collect::<Vec<_>>();
+        (!properties.is_empty()).then(|| self.result.types.union(properties))
     }
 
     fn array_flat_property_type(&mut self, receiver: TypeId, property: TypeId) -> Option<TypeId> {
@@ -9930,7 +10142,10 @@ impl<'a> Checker<'a> {
                     let parameter = self.signature_parameter_at(signature, index)?;
                     self.infer_type_parameters(parameter, *actual, &mut inference);
                     let expected = self.substitute_type(parameter, &inference);
-                    if !self.is_assignable(*actual, expected) {
+                    if (self.function_type_requires_predicate(expected)
+                        && !self.function_type_returns_predicate(*actual))
+                        || !self.is_assignable(*actual, expected)
+                    {
                         return None;
                     }
                 }
@@ -10018,6 +10233,47 @@ impl<'a> Checker<'a> {
         let result = self.substitute_type(signature.return_type, &inference);
         self.active_defaulted_type_parameters.clear();
         result
+    }
+
+    fn function_type_requires_predicate(&self, type_id: TypeId) -> bool {
+        match self.result.types.get(type_id).map(|type_| &type_.kind) {
+            Some(TypeKind::Function(signature)) => {
+                self.semantic_type_is_predicate(signature.return_type)
+            }
+            Some(TypeKind::Union(members) | TypeKind::Intersection(members)) => members
+                .iter()
+                .any(|member| self.function_type_requires_predicate(*member)),
+            _ => false,
+        }
+    }
+
+    fn function_type_returns_predicate(&self, type_id: TypeId) -> bool {
+        match self.result.types.get(type_id).map(|type_| &type_.kind) {
+            Some(TypeKind::Function(signature)) => {
+                self.semantic_type_is_predicate(signature.return_type)
+            }
+            Some(TypeKind::Overload(signatures)) => signatures
+                .iter()
+                .any(|signature| self.semantic_type_is_predicate(signature.return_type)),
+            _ => false,
+        }
+    }
+
+    fn semantic_type_is_predicate(&self, type_id: TypeId) -> bool {
+        self.result
+            .named_type_references
+            .get(&type_id)
+            .is_some_and(|reference| reference.name.starts_with("__type_predicate:"))
+    }
+
+    fn type_predicate_target(&self, type_id: TypeId) -> Option<TypeId> {
+        self.result
+            .named_type_references
+            .get(&type_id)
+            .filter(|reference| reference.name.starts_with("__type_predicate:"))?
+            .type_arguments
+            .first()
+            .copied()
     }
 
     fn literal_inference_type(&mut self, expression: NodeId) -> Option<TypeId> {
@@ -10239,6 +10495,12 @@ impl<'a> Checker<'a> {
         actual: TypeId,
         inference: &mut HashMap<TypeId, TypeId>,
     ) {
+        if let (Some(parameter_predicate), Some(actual_predicate)) = (
+            self.type_predicate_target(parameter),
+            self.type_predicate_target(actual),
+        ) {
+            self.infer_type_parameters(parameter_predicate, actual_predicate, inference);
+        }
         if let Some((type_node, parameters)) = self.mapped_return_templates.get(&parameter).cloned()
             && matches!(
                 self.arena.get(type_node).map(|node| &node.data),
@@ -10386,9 +10648,35 @@ impl<'a> Checker<'a> {
             TypeKind::Object(parameter_object) => {
                 match self.result.types.get(actual).unwrap().kind.clone() {
                     TypeKind::Object(actual_object) => {
-                        for (name, parameter) in parameter_object.properties {
-                            if let Some(actual) = actual_object.properties.get(&name) {
-                                self.infer_type_parameters(parameter, *actual, inference);
+                        for (name, parameter) in &parameter_object.properties {
+                            if let Some(actual) = actual_object.properties.get(name) {
+                                self.infer_type_parameters(*parameter, *actual, inference);
+                            }
+                        }
+                        if let Some(parameter) = parameter_object.string_index_type {
+                            for actual in actual_object
+                                .properties
+                                .values()
+                                .copied()
+                                .chain(actual_object.string_index_type)
+                                .chain(actual_object.number_index_type)
+                            {
+                                self.infer_type_parameters(parameter, actual, inference);
+                            }
+                        }
+                        if let Some(parameter) = parameter_object.number_index_type {
+                            for actual in actual_object
+                                .properties
+                                .iter()
+                                .filter(|(name, _)| name.parse::<f64>().is_ok())
+                                .map(|(_, actual)| *actual)
+                                .chain(
+                                    actual_object
+                                        .number_index_type
+                                        .or(actual_object.string_index_type),
+                                )
+                            {
+                                self.infer_type_parameters(parameter, actual, inference);
                             }
                         }
                         for (parameter, actual) in parameter_object
@@ -11697,9 +11985,9 @@ impl<'a> Checker<'a> {
             return None;
         };
         let mut local_scope = HashMap::new();
-        for (index, parameter) in data.parameters.nodes.iter().enumerate() {
+        for (index, parameter_id) in data.parameters.nodes.iter().enumerate() {
             let Some(NodeData::ParameterDeclaration(parameter)) =
-                self.arena.get(*parameter).map(|node| &node.data)
+                self.arena.get(*parameter_id).map(|node| &node.data)
             else {
                 continue;
             };
@@ -11710,6 +11998,9 @@ impl<'a> Checker<'a> {
                 type_id = self.without_undefined(type_id);
             }
             self.extend_binding_scope(parameter.name, type_id, &mut local_scope);
+            if let Some(symbol) = self.bindings.node_symbols.get(parameter_id).copied() {
+                self.result.symbol_types.insert(symbol, type_id);
+            }
         }
         self.local_scopes.push(local_scope);
         if let Some(NodeData::Block(block)) = self.arena.get(body).map(|node| &node.data) {
@@ -11755,8 +12046,14 @@ impl<'a> Checker<'a> {
             }
         }
         let returns = self.function_return_expressions(body);
+        let predicate = if returns.len() == 1 && self.statement_definitely_terminates(body) {
+            self.inferred_type_predicate(&data.parameters.nodes, body, returns[0], &signature)
+        } else {
+            None
+        };
         let mut return_types = returns
-            .into_iter()
+            .iter()
+            .copied()
             .map(|expression| {
                 let type_id = self.inferred_function_return_expression_type(expression, body);
                 self.widen_literal(type_id)
@@ -11769,7 +12066,324 @@ impl<'a> Checker<'a> {
             return_types.push(self.result.types.undefined());
         }
         self.local_scopes.pop();
-        (!return_types.is_empty()).then(|| self.result.types.union(return_types))
+        predicate.or_else(|| {
+            (!return_types.is_empty()).then(|| self.result.types.union(return_types))
+        })
+    }
+
+    fn inferred_type_predicate(
+        &mut self,
+        parameters: &[NodeId],
+        body: NodeId,
+        returned: NodeId,
+        signature: &FunctionType,
+    ) -> Option<TypeId> {
+        let condition = self.predicate_condition_expression(returned);
+        if let Some(predicate) = self.inferred_call_type_predicate(parameters, body, condition) {
+            return Some(predicate);
+        }
+        if !self.condition_can_infer_predicate(condition) {
+            return None;
+        }
+        let narrowing = self.condition_narrowing(condition, true);
+        let mut candidate = None;
+        for (index, parameter_id) in parameters.iter().enumerate() {
+            let NodeData::ParameterDeclaration(parameter) =
+                &self.arena.get(*parameter_id)?.data
+            else {
+                continue;
+            };
+            if matches!(self.arena.get(parameter.name)?.data, NodeData::BindingPattern(_)) {
+                continue;
+            }
+            let symbol = self.bindings.node_symbols.get(parameter_id).copied()?;
+            let original = signature.parameters.get(index).copied()?;
+            let narrowed = narrowing
+                .get(&symbol)
+                .copied()
+                .filter(|narrowed| *narrowed != original)
+                .or_else(|| self.generic_null_predicate_candidate(condition, symbol, original));
+            let Some(narrowed) = narrowed else {
+                continue;
+            };
+            if narrowed == original
+                || narrowed == self.result.types.never()
+                || matches!(
+                    self.result.types.get(original).map(|type_| &type_.kind),
+                    Some(TypeKind::Boolean)
+                )
+                || self.parameter_is_assigned_in_body(body, symbol)
+            {
+                continue;
+            }
+            let name = self.property_name(parameter.name)?;
+            if candidate.replace((name, narrowed)).is_some() {
+                return None;
+            }
+        }
+        let (name, narrowed) = candidate?;
+        let predicate = self.result.types.alloc(TypeKind::Boolean);
+        self.result.named_type_references.insert(
+            predicate,
+            NamedTypeReference {
+                name: format!("__type_predicate:{name}"),
+                type_arguments: vec![narrowed],
+            },
+        );
+        Some(predicate)
+    }
+
+    fn inferred_call_type_predicate(
+        &mut self,
+        parameters: &[NodeId],
+        body: NodeId,
+        condition: NodeId,
+    ) -> Option<TypeId> {
+        let (call_id, negated) = match &self.arena.get(condition)?.data {
+            NodeData::CallExpression(_) => (condition, false),
+            NodeData::PrefixUnaryExpression(prefix)
+                if prefix.operator == SyntaxKind::ExclamationToken
+                    && matches!(
+                        self.arena.get(prefix.operand).map(|node| &node.data),
+                        Some(NodeData::CallExpression(_))
+                    ) =>
+            {
+                (prefix.operand, true)
+            }
+            _ => return None,
+        };
+        let NodeData::CallExpression(call) = &self.arena.get(call_id)?.data else {
+            return None;
+        };
+        let call = call.as_ref().clone();
+        let returned_type = self
+            .result
+            .node_types
+            .get(&call_id)
+            .copied()
+            .unwrap_or_else(|| self.type_of_expression(call_id));
+        let predicate_target = self.type_predicate_target(returned_type)?;
+        let callee = self.type_of_expression(call.expression);
+        let signatures = self.callable_signatures(self.result.types.get(callee)?.kind.clone())?;
+        let signature = signatures
+            .iter()
+            .find(|signature| self.semantic_type_is_predicate(signature.return_type))?;
+        let predicate_name = self
+            .result
+            .named_type_references
+            .get(&signature.return_type)?
+            .name
+            .strip_prefix("__type_predicate:")?;
+        let argument_index = signature
+            .parameter_names
+            .iter()
+            .position(|name| name == predicate_name)?;
+        let argument = *call.arguments.nodes.get(argument_index)?;
+        let argument_symbol = self.narrowing_subject(argument)?;
+        for parameter_id in parameters {
+            let NodeData::ParameterDeclaration(parameter) =
+                &self.arena.get(*parameter_id)?.data
+            else {
+                continue;
+            };
+            let symbol = self.bindings.node_symbols.get(parameter_id).copied()?;
+            if symbol != argument_symbol || self.parameter_is_assigned_in_body(body, symbol) {
+                continue;
+            }
+            let narrowed = if negated {
+                let original = self.current_symbol_type(symbol);
+                let members = self
+                    .union_members(original)
+                    .into_iter()
+                    .filter(|member| !self.is_assignable(*member, predicate_target))
+                    .collect::<Vec<_>>();
+                self.result.types.union(members)
+            } else {
+                predicate_target
+            };
+            if narrowed == self.result.types.never() {
+                return None;
+            }
+            let name = self.property_name(parameter.name)?;
+            let predicate = self.result.types.alloc(TypeKind::Boolean);
+            self.result.named_type_references.insert(
+                predicate,
+                NamedTypeReference {
+                    name: format!("__type_predicate:{name}"),
+                    type_arguments: vec![narrowed],
+                },
+            );
+            return Some(predicate);
+        }
+        None
+    }
+
+    fn generic_null_predicate_candidate(
+        &mut self,
+        condition: NodeId,
+        symbol: SymbolId,
+        original: TypeId,
+    ) -> Option<TypeId> {
+        if !matches!(
+            self.result.types.get(original).map(|type_| &type_.kind),
+            Some(TypeKind::TypeParameter { .. })
+        ) {
+            return None;
+        }
+        let NodeData::BinaryExpression(binary) = &self.arena.get(condition)?.data else {
+            return None;
+        };
+        let operator = self.arena.get(binary.operator_token)?.kind;
+        if !matches!(
+            operator,
+            SyntaxKind::ExclamationEqualsToken | SyntaxKind::ExclamationEqualsEqualsToken
+        ) {
+            return None;
+        }
+        let excludes_null = (self.narrowing_subject(binary.left) == Some(symbol)
+            && matches!(
+                self.narrowing_comparison(binary.right),
+                Some(NarrowingComparison::Null)
+            )) || (self.narrowing_subject(binary.right) == Some(symbol)
+            && matches!(
+                self.narrowing_comparison(binary.left),
+                Some(NarrowingComparison::Null)
+            ));
+        if !excludes_null {
+            return None;
+        }
+        let non_null = self
+            .result
+            .types
+            .alloc(TypeKind::Object(ObjectType::default()));
+        let constraint = if operator == SyntaxKind::ExclamationEqualsEqualsToken {
+            let undefined = self.result.types.undefined();
+            self.result.types.union([non_null, undefined])
+        } else {
+            non_null
+        };
+        Some(self.result.types.intersection([original, constraint]))
+    }
+
+    fn predicate_condition_expression(&self, returned: NodeId) -> NodeId {
+        let mut current = returned;
+        let mut visited = HashSet::new();
+        while visited.insert(current) {
+            match self.arena.get(current).map(|node| &node.data) {
+                Some(NodeData::ParenthesizedExpression(expression)) => {
+                    current = expression.expression;
+                }
+                Some(NodeData::SatisfiesExpression(expression)) => {
+                    current = expression.expression;
+                }
+                Some(NodeData::Identifier(identifier)) => {
+                    let Some(symbol) = self.bindings.resolve_name_at(current, &identifier.text)
+                    else {
+                        break;
+                    };
+                    let Some(initializer) = self.bindings.symbols.get(symbol).and_then(|symbol| {
+                        symbol.declarations.iter().find_map(|declaration| {
+                            let NodeData::VariableDeclaration(variable) =
+                                &self.arena.get(*declaration)?.data
+                            else {
+                                return None;
+                            };
+                            self.is_const_declaration(*declaration)
+                                .then_some(variable.initializer)
+                                .flatten()
+                        })
+                    }) else {
+                        break;
+                    };
+                    current = initializer;
+                }
+                _ => break,
+            }
+        }
+        current
+    }
+
+    fn condition_can_infer_predicate(&self, condition: NodeId) -> bool {
+        match self.arena.get(condition).map(|node| &node.data) {
+            Some(NodeData::ParenthesizedExpression(expression)) => {
+                self.condition_can_infer_predicate(expression.expression)
+            }
+            Some(NodeData::BinaryExpression(binary)) => self
+                .arena
+                .get(binary.operator_token)
+                .is_some_and(|operator| {
+                    if operator.kind == SyntaxKind::BarBarToken {
+                        return self.condition_can_infer_predicate(binary.left)
+                            && (self.condition_can_infer_predicate(binary.right)
+                                || self.narrowing_subject(binary.right).is_some());
+                    }
+                    if operator.kind == SyntaxKind::AmpersandAmpersandToken {
+                        return self.condition_can_infer_predicate(binary.left)
+                            && self.condition_can_infer_predicate(binary.right);
+                    }
+                    matches!(
+                        operator.kind,
+                        SyntaxKind::EqualsEqualsToken
+                            | SyntaxKind::EqualsEqualsEqualsToken
+                            | SyntaxKind::ExclamationEqualsToken
+                            | SyntaxKind::ExclamationEqualsEqualsToken
+                            | SyntaxKind::InKeyword
+                            | SyntaxKind::InstanceOfKeyword
+                    )
+                }),
+            _ => false,
+        }
+    }
+
+    fn parameter_is_assigned_in_body(&self, body: NodeId, symbol: SymbolId) -> bool {
+        let mut pending = vec![body];
+        while let Some(node_id) = pending.pop() {
+            let Some(node) = self.arena.get(node_id) else {
+                continue;
+            };
+            if node_id != body
+                && matches!(
+                    node.data,
+                    NodeData::FunctionDeclaration(_)
+                        | NodeData::FunctionExpression(_)
+                        | NodeData::ArrowFunction(_)
+                        | NodeData::MethodDeclaration(_)
+                        | NodeData::ClassDeclaration(_)
+                        | NodeData::ClassExpression(_)
+                )
+            {
+                continue;
+            }
+            if let NodeData::BinaryExpression(binary) = &node.data
+                && self
+                    .arena
+                    .get(binary.operator_token)
+                    .is_some_and(|operator| operator.kind.is_assignment_operator())
+                && self.subtree_references_symbol(binary.left, symbol)
+            {
+                return true;
+            }
+            if let Some(children) = self.children.get(&node_id) {
+                pending.extend(children.iter().copied());
+            }
+        }
+        false
+    }
+
+    fn subtree_references_symbol(&self, root: NodeId, symbol: SymbolId) -> bool {
+        let mut pending = vec![root];
+        while let Some(node_id) = pending.pop() {
+            if let Some(NodeData::Identifier(identifier)) =
+                self.arena.get(node_id).map(|node| &node.data)
+                && self.bindings.resolve_name_at(node_id, &identifier.text) == Some(symbol)
+            {
+                return true;
+            }
+            if let Some(children) = self.children.get(&node_id) {
+                pending.extend(children.iter().copied());
+            }
+        }
+        false
     }
 
     fn inferred_function_return_expression_type(
@@ -12074,6 +12688,27 @@ impl<'a> Checker<'a> {
                     self.result.types.union([type_, undefined])
                 } else {
                     type_
+                }
+            }
+            NodeData::TypePredicateNode(data) => {
+                if data.asserts_modifier.is_some() {
+                    self.result.types.void()
+                } else if let Some(narrowed) = data.type_ {
+                    let narrowed = self.type_from_type_node(narrowed);
+                    let predicate = self.result.types.alloc(TypeKind::Boolean);
+                    let parameter = self
+                        .property_name(data.parameter_name)
+                        .unwrap_or_else(|| "value".into());
+                    self.result.named_type_references.insert(
+                        predicate,
+                        NamedTypeReference {
+                            name: format!("__type_predicate:{parameter}"),
+                            type_arguments: vec![narrowed],
+                        },
+                    );
+                    predicate
+                } else {
+                    self.result.types.boolean()
                 }
             }
             NodeData::ArrayTypeNode(data) => {
@@ -13121,6 +13756,19 @@ impl<'a> Checker<'a> {
         }
         let source_kind = &self.result.types.get(source).unwrap().kind;
         let target_kind = &self.result.types.get(target).unwrap().kind;
+        let source_predicate = self.type_predicate_target(source);
+        let target_predicate = self.type_predicate_target(target);
+        if let Some(target_predicate) = target_predicate {
+            return source_predicate.is_some_and(|source_predicate| {
+                self.is_assignable(source_predicate, target_predicate)
+            });
+        }
+        if source_predicate.is_some() && matches!(target_kind, TypeKind::Boolean) {
+            return true;
+        }
+        if matches!((source_kind, target_kind), (TypeKind::Boolean, TypeKind::Boolean)) {
+            return true;
+        }
         if !self.options.strict_null_checks
             && matches!(source_kind, TypeKind::Null | TypeKind::Undefined)
         {

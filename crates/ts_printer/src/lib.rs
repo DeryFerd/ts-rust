@@ -11997,6 +11997,15 @@ impl DeclarationPrinter<'_> {
                             .is_some_and(|body| !self.block_has_value_return(body))
                     {
                         self.writer.write("void");
+                    } else if data.type_.is_none()
+                        && self
+                            .named_type_references
+                            .and_then(|references| references.get(&signature.return_type))
+                            .is_some_and(|reference| {
+                                reference.name.starts_with("__type_predicate:")
+                            })
+                    {
+                        self.emit_semantic_type(signature.return_type)?;
                     } else if let Some(expression) = data
                         .body
                         .and_then(|body| self.declaration_single_return_expression(body))
@@ -12819,8 +12828,15 @@ impl DeclarationPrinter<'_> {
                 return Err(Self::unsupported(*parameter, node.kind));
             };
             self.emit_declaration_parameter_comments(previous_end, node.range.start.get());
-            if self.member_has_modifier(data.modifiers.as_ref(), SyntaxKind::ConstKeyword) {
-                self.writer.write("const ");
+            if let Some(modifiers) = data.modifiers.as_ref() {
+                for modifier in &modifiers.list.nodes {
+                    match self.arena.get(*modifier).map(|node| node.kind) {
+                        Some(SyntaxKind::InKeyword) => self.writer.write("in "),
+                        Some(SyntaxKind::OutKeyword) => self.writer.write("out "),
+                        Some(SyntaxKind::ConstKeyword) => self.writer.write("const "),
+                        _ => {}
+                    }
+                }
             }
             self.emit_name(data.name)?;
             if let Some(constraint) = data.constraint {
@@ -13242,6 +13258,17 @@ impl DeclarationPrinter<'_> {
         if let Some(reference) = self
             .named_type_references
             .and_then(|references| references.get(&id))
+            && let Some(parameter) = reference.name.strip_prefix("__type_predicate:")
+            && let [narrowed] = reference.type_arguments.as_slice()
+        {
+            self.writer.write(parameter);
+            self.writer.write(" is ");
+            self.emit_semantic_type(*narrowed)?;
+            return Ok(());
+        }
+        if let Some(reference) = self
+            .named_type_references
+            .and_then(|references| references.get(&id))
             && self.named_type_reference_is_declaration_visible(&reference.name)
             && !matches!(
                 self.semantic_types
@@ -13354,22 +13381,7 @@ impl DeclarationPrinter<'_> {
                     }
                     unique.push(member);
                 }
-                if unique.iter().any(|member| {
-                    self.named_type_references
-                        .is_some_and(|references| references.contains_key(member))
-                }) {
-                    unique.sort_by_key(|member| {
-                        match self
-                            .semantic_types
-                            .and_then(|types| types.get(*member))
-                            .map(|type_| &type_.kind)
-                        {
-                            Some(TypeKind::Null) => 1,
-                            Some(TypeKind::Undefined) => 2,
-                            _ => 0,
-                        }
-                    });
-                } else if unique
+                if unique
                     .iter()
                     .all(|member| self.dynamic_import_object_specifier(*member).is_some())
                 {
@@ -13379,7 +13391,18 @@ impl DeclarationPrinter<'_> {
                             .to_owned()
                     });
                 }
-                if unique.len() == 2
+                unique.sort_by_key(|member| {
+                    match self
+                        .semantic_types
+                        .and_then(|types| types.get(*member))
+                        .map(|type_| &type_.kind)
+                    {
+                        Some(TypeKind::Null) => 1,
+                        Some(TypeKind::Undefined) => 2,
+                        _ => 0,
+                    }
+                });
+                if unique.len() >= 2
                     && matches!(
                         self.semantic_types
                             .and_then(|types| types.get(unique[0]))
@@ -37091,6 +37114,8 @@ impl Printer<'_> {
         let comment_start =
             start.saturating_add(u32::try_from(equals + 1 + comment).unwrap_or(u32::MAX));
         if line_comment == Some(comment) {
+            let trailing_equals_line_comment =
+                !initializer_trivia[..comment].contains(['\n', '\r']);
             let absolute_start = usize::try_from(comment_start).unwrap_or(usize::MAX);
             let absolute_end = usize::try_from(end).unwrap_or(usize::MAX);
             let Some(comment_trivia) = self.source_text.get(absolute_start..absolute_end) else {
@@ -37106,6 +37131,9 @@ impl Printer<'_> {
             if self.emitted_source_comments.insert(range) {
                 self.writer.write(&comment_trivia[..comment_end]);
                 self.writer.newline_preserving_trailing_spaces();
+                if trailing_equals_line_comment {
+                    self.writer.write(" ");
+                }
             }
         } else {
             self.emit_block_comment_trivia(comment_start, end, true);
@@ -44626,13 +44654,13 @@ impl Printer<'_> {
                         let dot = self
                             .source_punctuation_between(expression_end, name_start, b'.')
                             .unwrap_or(expression_end);
+                        self.writer.indent += 1;
                         self.emit_source_comments_between_with_ownership(
                             expression_end,
                             dot,
                             true,
-                            false,
+                            true,
                         );
-                        self.writer.indent += 1;
                         if !self.writer.line_start {
                             self.writer.newline();
                         }
@@ -48462,29 +48490,39 @@ impl Printer<'_> {
     }
 
     fn source_has_line_break_before_property(&self, expression: NodeId, name: NodeId) -> bool {
-        self.source_property_separator(expression, name)
-            .is_some_and(|separator| {
-                let dot = separator.find('.').unwrap_or(separator.len());
-                separator[..dot].contains(['\n', '\r'])
-            })
+        let Some((start, end, dot)) = self.source_property_separator_ranges(expression, name) else {
+            return false;
+        };
+        self.source_text
+            .get(start..dot.min(end))
+            .is_some_and(|separator| separator.contains(['\n', '\r']))
     }
 
     fn source_has_line_break_after_property_dot(&self, expression: NodeId, name: NodeId) -> bool {
-        self.source_property_separator(expression, name)
-            .is_some_and(|separator| {
-                let Some(dot) = separator.find('.') else {
-                    return false;
-                };
-                separator[dot + 1..].contains(['\n', '\r'])
-            })
+        let Some((_, end, dot)) = self.source_property_separator_ranges(expression, name) else {
+            return false;
+        };
+        self.source_text
+            .get(dot.saturating_add(1)..end)
+            .is_some_and(|separator| separator.contains(['\n', '\r']))
     }
 
-    fn source_property_separator(&self, expression: NodeId, name: NodeId) -> Option<&str> {
+    fn source_property_separator_ranges(
+        &self,
+        expression: NodeId,
+        name: NodeId,
+    ) -> Option<(usize, usize, usize)> {
         let expression = self.arena.get(expression)?;
         let name = self.arena.get(name)?;
         let start = usize::try_from(expression.range.end.get()).unwrap_or(usize::MAX);
         let end = usize::try_from(name.range.start.get()).unwrap_or(usize::MAX);
-        self.source_text.get(start..end)
+        let dot = usize::try_from(self.source_punctuation_between(
+            expression.range.end.get(),
+            name.range.start.get(),
+            b'.',
+        )?)
+        .ok()?;
+        Some((start, end, dot))
     }
 
     fn write_source_quoted_string(&mut self, id: NodeId, text: &str) {

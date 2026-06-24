@@ -1420,11 +1420,18 @@ impl<'a> Parser<'a> {
             && self.current.kind != SyntaxKind::EndOfFile
         {
             let parameter_start = self.current.range.start;
-            let modifier_nodes = if self.current.kind == SyntaxKind::ConstKeyword {
-                vec![self.consume_token_node()]
-            } else {
-                Vec::new()
-            };
+            let mut modifier_nodes = Vec::new();
+            loop {
+                let is_const = self.current.kind == SyntaxKind::ConstKeyword;
+                let is_variance = matches!(
+                    self.current.kind,
+                    SyntaxKind::InKeyword | SyntaxKind::OutKeyword
+                ) && self.type_parameter_variance_modifier_has_name();
+                if !is_const && !is_variance {
+                    break;
+                }
+                modifier_nodes.push(self.consume_token_node());
+            }
             let modifiers = (!modifier_nodes.is_empty()).then(|| ModifierList {
                 list: NodeList {
                     range: TextRange::new(parameter_start, self.current.range.start),
@@ -1486,6 +1493,27 @@ impl<'a> Parser<'a> {
             nodes: parameters,
             has_trailing_comma: false,
         })
+    }
+
+    fn type_parameter_variance_modifier_has_name(&mut self) -> bool {
+        let checkpoint = self.scanner.mark();
+        let mut next = self.scanner.scan().kind;
+        while matches!(
+            next,
+            SyntaxKind::ConstKeyword | SyntaxKind::InKeyword | SyntaxKind::OutKeyword
+        ) {
+            next = self.scanner.scan().kind;
+        }
+        self.scanner.rewind(checkpoint);
+        (next == SyntaxKind::Identifier || next.is_keyword())
+            && !matches!(
+                next,
+                SyntaxKind::ExtendsKeyword
+                    | SyntaxKind::EqualsToken
+                    | SyntaxKind::CommaToken
+                    | SyntaxKind::GreaterThanToken
+                    | SyntaxKind::EndOfFile
+            )
     }
 
     fn parse_optional_type_annotation(&mut self) -> Option<NodeId> {
