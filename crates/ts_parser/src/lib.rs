@@ -4790,6 +4790,10 @@ impl<'a> Parser<'a> {
                     if parenthesis_depth == 0 {
                         token = self.scanner.scan();
                         let result = if token.kind == SyntaxKind::ColonToken {
+                            if previous_kind == SyntaxKind::OpenParenToken || typed_parameter {
+                                self.scanner.rewind(checkpoint);
+                                return true;
+                            }
                             let mut delimiter_depth = 0_i32;
                             loop {
                                 token = self.scanner.scan();
@@ -7999,6 +8003,17 @@ mod tests {
                 .unwrap()
                 .kind,
             SyntaxKind::ArrowFunction
+        );
+
+        let missing_after_return_type =
+            parse_source_file("var b = (): void {}; var e = (x: number): void;");
+        assert_eq!(
+            missing_after_return_type
+                .arena
+                .iter()
+                .filter(|(_, node)| matches!(node.data, NodeData::ArrowFunction(_)))
+                .count(),
+            2
         );
 
         let object = parse_source_file(
