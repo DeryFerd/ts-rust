@@ -532,14 +532,11 @@ impl<'a> Parser<'a> {
             && self.next_token_kind() == SyntaxKind::EnumKeyword;
         let is_module_declaration = match self.current.kind {
             SyntaxKind::GlobalKeyword => self.next_token_kind() == SyntaxKind::OpenBraceToken,
-            SyntaxKind::NamespaceKeyword => matches!(
-                self.next_token_kind(),
-                SyntaxKind::Identifier | SyntaxKind::RequireKeyword
-            ),
-            SyntaxKind::ModuleKeyword => matches!(
-                self.next_token_kind(),
-                SyntaxKind::Identifier | SyntaxKind::RequireKeyword | SyntaxKind::StringLiteral
-            ),
+            SyntaxKind::NamespaceKeyword => is_module_name_token(self.next_token_kind()),
+            SyntaxKind::ModuleKeyword => {
+                let next = self.next_token_kind();
+                next == SyntaxKind::StringLiteral || is_module_name_token(next)
+            }
             _ => false,
         };
         let abstract_starts_expression = self.current.kind == SyntaxKind::AbstractKeyword
@@ -3184,7 +3181,7 @@ impl<'a> Parser<'a> {
         } else if self.current.kind == SyntaxKind::StringLiteral {
             self.parse_string_literal()
         } else {
-            self.parse_identifier("Expected a module name.")
+            self.parse_identifier_name("Expected a module name.")
         };
         let body = if allows_dotted_name && self.current.kind == SyntaxKind::DotToken {
             self.bump();
@@ -3197,7 +3194,7 @@ impl<'a> Parser<'a> {
 
     fn parse_nested_module_declaration(&mut self, keyword: SyntaxKind) -> NodeId {
         let start = self.current.range.start;
-        let name = self.parse_identifier("Expected a module name.");
+        let name = self.parse_identifier_name("Expected a module name.");
         let body = if self.current.kind == SyntaxKind::DotToken {
             self.bump();
             Some(self.parse_nested_module_declaration(keyword))
@@ -7638,6 +7635,11 @@ fn is_import_binding_identifier_kind(kind: SyntaxKind) -> bool {
         kind,
         SyntaxKind::Identifier | SyntaxKind::RequireKeyword | SyntaxKind::YieldKeyword
     ) || is_contextual_keyword(kind)
+}
+
+fn is_module_name_token(kind: SyntaxKind) -> bool {
+    matches!(kind, SyntaxKind::Identifier | SyntaxKind::RequireKeyword)
+        || is_contextual_keyword(kind)
 }
 
 fn can_parse_module_export_name(kind: SyntaxKind) -> bool {

@@ -2595,6 +2595,23 @@ fn add_nonportable_inferred_type_diagnostics(source: &SourceFile, checking: &mut
             }) else {
                 continue;
             };
+            if identifier_text(&source.parse.arena, declaration.name) == Some("globalThis")
+                && checking
+                    .named_type_references
+                    .get(&type_id)
+                    .is_some_and(|reference| reference.name == "typeof globalThis")
+            {
+                let message =
+                    message_by_code(4025).expect("TS4025 must be in the diagnostic catalog");
+                checking.diagnostics.push(CheckDiagnostic {
+                    node: declaration.name,
+                    diagnostic: Diagnostic::with_arguments(
+                        message,
+                        ["globalThis", "globalThis"],
+                    ),
+                });
+                continue;
+            }
             let imported_computed_name_is_accessible =
                 inaccessible_computed_symbol_name(checking, type_id, &mut BTreeSet::new())
                     .is_some_and(|qualifier| {

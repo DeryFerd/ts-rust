@@ -8432,6 +8432,17 @@ impl<'a> Checker<'a> {
             }
             return type_id;
         }
+        if name == "globalThis" {
+            let type_id = self.result.types.alloc(TypeKind::Unknown);
+            self.result.named_type_references.insert(
+                type_id,
+                NamedTypeReference {
+                    name: "typeof globalThis".into(),
+                    type_arguments: Vec::new(),
+                },
+            );
+            return type_id;
+        }
         if let Some(descriptor) = self.external_names.get(name).cloned() {
             return self.import_type(&descriptor);
         }
