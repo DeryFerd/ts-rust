@@ -689,7 +689,7 @@ pub fn emit_source_file_with_context(
         let mut temps = printer
             .decorator_metadata_guard_temps
             .values()
-            .cloned()
+            .flat_map(|plan| plan.temps.iter().cloned())
             .collect::<Vec<_>>();
         temps.sort();
         temps.dedup();
@@ -1941,28 +1941,6 @@ fn binding_has_runtime_identifier_use(
         return false;
     };
     if !runtime_identifier_uses.contains(name) {
-        return false;
-    }
-    if arena.iter().any(|(_, node)| match &node.data {
-        NodeData::VariableDeclaration(variable) => {
-            declaration_name_text(arena, variable.name) == Some(name)
-        }
-        NodeData::FunctionDeclaration(function) => {
-            function.body.is_some()
-                && function
-                    .name
-                    .and_then(|name| declaration_name_text(arena, name))
-                    == Some(name)
-        }
-        NodeData::ClassDeclaration(class) => class
-            .name
-            .and_then(|name| declaration_name_text(arena, name))
-            == Some(name),
-        NodeData::EnumDeclaration(enumeration) => {
-            declaration_name_text(arena, enumeration.name) == Some(name)
-        }
-        _ => false,
-    }) {
         return false;
     }
     let symbol = bindings
@@ -3348,34 +3326,64 @@ impl DeclarationPrinter<'_> {
         &self,
         function: &ts_ast::FunctionDeclarationData,
     ) -> Vec<(NodeId, NodeId)> {
-        let Some(function_name) = function
-            .name
-            .and_then(|name| declaration_name_text(self.arena, name))
+        let Some(function_name_id) = function.name else {
+            return Vec::new();
+        };
+        let Some(function_name) = declaration_name_text(self.arena, function_name_id)
         else {
             return Vec::new();
         };
+        if self.arena.iter().any(|(_, node)| {
+            matches!(
+                &node.data,
+                NodeData::ModuleDeclaration(module)
+                    if declaration_name_text(self.arena, module.name) == Some(function_name)
+                        && declaration_has_modifier(
+                            self.arena,
+                            node,
+                            SyntaxKind::DeclareKeyword,
+                        )
+            )
+        }) {
+            return Vec::new();
+        }
+        let function_symbol = self
+            .bindings
+            .node_symbols
+            .get(&function_name_id)
+            .copied()
+            .or_else(|| self.bindings.resolve_name_at(function_name_id, function_name));
         let mut seen = HashSet::new();
-        self.arena
+        let mut assignments = self
+            .arena
             .iter()
-            .filter_map(|(_, node)| {
-                if !node.parent.is_some_and(|parent| {
-                    matches!(
-                        self.arena.get(parent).map(|node| &node.data),
-                        Some(NodeData::SourceFile(_))
-                    )
-                }) {
-                    return None;
-                }
-                let NodeData::ExpressionStatement(statement) = &node.data else {
-                    return None;
-                };
-                let NodeData::BinaryExpression(assignment) =
-                    &self.arena.get(statement.expression)?.data
-                else {
+            .filter_map(|(assignment_id, node)| {
+                let NodeData::BinaryExpression(assignment) = &node.data else {
                     return None;
                 };
                 if self.arena.get(assignment.operator_token)?.kind != SyntaxKind::EqualsToken {
                     return None;
+                }
+                let mut current = assignment_id;
+                while let Some(parent) = self.arena.get(current).and_then(|node| node.parent) {
+                    let parent_node = self.arena.get(parent)?;
+                    if matches!(
+                        parent_node.data,
+                        NodeData::FunctionDeclaration(_)
+                            | NodeData::FunctionExpression(_)
+                            | NodeData::ArrowFunction(_)
+                            | NodeData::MethodDeclaration(_)
+                            | NodeData::GetAccessorDeclaration(_)
+                            | NodeData::SetAccessorDeclaration(_)
+                            | NodeData::ClassDeclaration(_)
+                            | NodeData::ClassExpression(_)
+                    ) {
+                        return None;
+                    }
+                    if matches!(parent_node.data, NodeData::SourceFile(_)) {
+                        break;
+                    }
+                    current = parent;
                 }
                 let (receiver, property) = match &self.arena.get(assignment.left)?.data {
                     NodeData::PropertyAccessExpression(access) => (access.expression, access.name),
@@ -3387,10 +3395,21 @@ impl DeclarationPrinter<'_> {
                 if declaration_name_text(self.arena, receiver) != Some(function_name) {
                     return None;
                 }
+                if let Some(function_symbol) = function_symbol
+                    && self.bindings.resolve_name_at(receiver, function_name)
+                        != Some(function_symbol)
+                {
+                    return None;
+                }
                 let property_name = self.late_bound_property_name(property)?.0;
                 seen.insert(property_name)
-                    .then_some((property, assignment.right))
+                    .then_some((node.range.start, property, assignment.right))
             })
+            .collect::<Vec<_>>();
+        assignments.sort_by_key(|assignment| assignment.0);
+        assignments
+            .into_iter()
+            .map(|(_, property, value)| (property, value))
             .collect()
     }
 
@@ -3493,9 +3512,27 @@ impl DeclarationPrinter<'_> {
             return Ok(());
         }
         if let Some(type_id) = self.node_types.and_then(|types| types.get(&value).copied()) {
-            self.emit_widened_semantic_type(type_id)
+            if matches!(
+                self.semantic_types
+                    .and_then(|types| types.get(type_id))
+                    .map(|type_| &type_.kind),
+                Some(TypeKind::Object(_))
+            ) {
+                self.emit_computed_method_widened_return(type_id)
+            } else {
+                self.emit_widened_semantic_type(type_id)
+            }
         } else {
-            self.writer.write("any");
+            self.writer.write(match self.arena.get(value).map(|node| &node.data) {
+                Some(NodeData::NumericLiteral(_)) => "number",
+                Some(NodeData::StringLiteral(_)) => "string",
+                Some(NodeData::KeywordExpression(_))
+                    if self.arena.get(value).is_some_and(|node| {
+                        matches!(node.kind, SyntaxKind::TrueKeyword | SyntaxKind::FalseKeyword)
+                    }) => "boolean",
+                Some(NodeData::ArrayLiteralExpression(_)) => "any[]",
+                _ => "any",
+            });
             Ok(())
         }
     }
@@ -6219,6 +6256,12 @@ impl DeclarationPrinter<'_> {
         function: &ts_ast::FunctionDeclarationData,
         return_type: TypeId,
     ) -> Result<(), EmitError> {
+        if self
+            .import_type_references
+            .is_some_and(|references| references.contains_key(&return_type))
+        {
+            return self.emit_widened_semantic_type(return_type);
+        }
         if self.emit_returned_augmented_function_type(function)? {
             return Ok(());
         }
@@ -10403,6 +10446,28 @@ impl DeclarationPrinter<'_> {
             {
                 self.emit_type(type_node)?;
             } else if let Some(type_id) = type_id {
+                let assignment_initializer = parameter.initializer.and_then(|initializer| {
+                    let initializer = self.unwrap_parenthesized(initializer);
+                    let NodeData::BinaryExpression(assignment) =
+                        &self.arena.get(initializer)?.data
+                    else {
+                        return None;
+                    };
+                    (self.arena.get(assignment.operator_token)?.kind
+                        == SyntaxKind::EqualsToken)
+                        .then_some(assignment.right)
+                });
+                if matches!(
+                    self.semantic_types
+                        .and_then(|types| types.get(type_id))
+                        .map(|type_| &type_.kind),
+                    Some(TypeKind::Any)
+                ) && let Some(initializer) = assignment_initializer
+                {
+                    self.emit_function_static_assignment_type(initializer)?;
+                    previous_end = node.range.end.get();
+                    continue;
+                }
                 let initializer_includes_undefined = parameter
                     .initializer
                     .is_some_and(|initializer| self.expression_contains_undefined(initializer));
@@ -18340,6 +18405,14 @@ struct Stage3DecoratedClassPlan {
     members: Vec<Stage3DecoratedMemberPlan>,
 }
 
+#[derive(Clone)]
+struct DecoratorMetadataGuardPlan {
+    root: NodeId,
+    segments: Vec<String>,
+    temps: Vec<String>,
+    progressive: bool,
+}
+
 impl GeneratedNames {
     fn new(arena: &NodeArena) -> Self {
         Self {
@@ -19030,7 +19103,7 @@ struct Printer<'a> {
     commonjs_named_import_text_rewrites: HashMap<String, String>,
     commonjs_export_text_rewrites: HashMap<String, String>,
     commonjs_anonymous_default_names: HashMap<NodeId, String>,
-    decorator_metadata_guard_temps: HashMap<NodeId, String>,
+    decorator_metadata_guard_temps: HashMap<NodeId, DecoratorMetadataGuardPlan>,
     import_helpers_namespace: Option<String>,
     has_runtime_export_equals: bool,
     bindings: &'a BindResult,
@@ -19222,15 +19295,56 @@ impl Printer<'_> {
             });
             let guarded_unresolved_global = root_symbol.is_none()
                 && matches!(root_name, Some("Map" | "Set" | "WeakMap" | "WeakSet"));
-            if guarded_unresolved_global || (qualified && default_import) {
+            let progressive = qualified
+                && self
+                    .resolve_entity_symbol(reference.type_name, &mut HashSet::new())
+                    .is_none();
+            if progressive {
+                let Some(root) = root else {
+                    continue;
+                };
+                let mut segments = Vec::new();
+                let mut current = reference.type_name;
+                while let Some(NodeData::QualifiedName(name)) =
+                    self.arena.get(current).map(|node| &node.data)
+                {
+                    if let Some(segment) = declaration_name_text(self.arena, name.right) {
+                        segments.push(segment.to_owned());
+                    }
+                    current = name.left;
+                }
+                segments.reverse();
+                let temps = (0..segments.len())
+                    .map(|_| self.generated_names.generate_temp())
+                    .collect();
+                self.decorator_metadata_guard_temps.insert(
+                    type_reference,
+                    DecoratorMetadataGuardPlan {
+                        root,
+                        segments,
+                        temps,
+                        progressive: true,
+                    },
+                );
+            } else if guarded_unresolved_global || (qualified && default_import) {
                 let entity = entity_name_string(self.arena, reference.type_name)
                     .unwrap_or_else(|| format!("{type_reference:?}"));
                 let temp = entity_temps
                     .entry(entity)
                     .or_insert_with(|| self.generated_names.generate_temp())
                     .clone();
-                self.decorator_metadata_guard_temps
-                    .insert(type_reference, temp);
+                let Some(root) = root else {
+                    continue;
+                };
+                self.decorator_metadata_guard_temps.insert(
+                    type_reference,
+                    DecoratorMetadataGuardPlan {
+                        root,
+                        segments: Vec::new(),
+                        temps: vec![temp],
+                        progressive: false,
+                    },
+                );
             }
         }
     }
@@ -19250,7 +19364,7 @@ impl Printer<'_> {
             .decorator_metadata_guard_temps
             .iter()
             .filter(|(type_reference, _)| self.node_is_within(**type_reference, class_id))
-            .map(|(_, temp)| temp.clone())
+            .flat_map(|(_, plan)| plan.temps.iter().cloned())
             .collect::<Vec<_>>();
         temps.sort();
         temps.dedup();
@@ -35169,18 +35283,56 @@ impl Printer<'_> {
                     self.writer.write("Object");
                     return Ok(());
                 }
-                if let Some(temp) = self.decorator_metadata_guard_temps.get(&type_node).cloned() {
+                if let Some(plan) = self.decorator_metadata_guard_temps.get(&type_node).cloned() {
+                    if plan.progressive {
+                        let final_temp = plan.temps.last().expect("qualified guard temp");
+                        self.writer.write("typeof (");
+                        self.writer.write(final_temp);
+                        self.writer.write(" = typeof ");
+                        self.emit_runtime_metadata_entity(plan.root)?;
+                        self.writer.write(" !== \"undefined\"");
+                        let mut receiver = None::<String>;
+                        for (index, segment) in plan.segments.iter().enumerate() {
+                            let is_last = index + 1 == plan.segments.len();
+                            self.writer.write(" && ");
+                            if is_last {
+                                if let Some(receiver) = &receiver {
+                                    self.writer.write(receiver);
+                                } else {
+                                    self.emit_runtime_metadata_entity(plan.root)?;
+                                }
+                                self.writer.write(".");
+                                self.writer.write(segment);
+                            } else {
+                                let temp = &plan.temps[index];
+                                self.writer.write("(");
+                                self.writer.write(temp);
+                                self.writer.write(" = ");
+                                if let Some(receiver) = &receiver {
+                                    self.writer.write(receiver);
+                                } else {
+                                    self.emit_runtime_metadata_entity(plan.root)?;
+                                }
+                                self.writer.write(".");
+                                self.writer.write(segment);
+                                self.writer.write(") !== void 0");
+                                receiver = Some(temp.clone());
+                            }
+                        }
+                        self.writer.write(") === \"function\" ? ");
+                        self.writer.write(final_temp);
+                        self.writer.write(" : Object");
+                        return Ok(());
+                    }
+                    let temp = plan.temps.first().expect("guard temp");
                     self.writer.write("typeof (");
-                    self.writer.write(&temp);
+                    self.writer.write(temp);
                     self.writer.write(" = typeof ");
-                    self.emit_runtime_metadata_entity(
-                        entity_root_identifier(self.arena, reference.type_name)
-                            .unwrap_or(reference.type_name),
-                    )?;
+                    self.emit_runtime_metadata_entity(plan.root)?;
                     self.writer.write(" !== \"undefined\" && ");
                     self.emit_runtime_metadata_entity(reference.type_name)?;
                     self.writer.write(") === \"function\" ? ");
-                    self.writer.write(&temp);
+                    self.writer.write(temp);
                     self.writer.write(" : Object");
                     return Ok(());
                 }
@@ -41530,10 +41682,9 @@ impl Printer<'_> {
                         self.emit_block_comment_trivia(comment_start, expression_start, false);
                     }
                     self.emit_expression(data.expression, 0)?;
-                    self.emit_inline_block_comments_between(
+                    self.emit_binary_comment_trivia(
                         self.node(data.expression)?.range.end.get(),
                         node.range.end.get().saturating_sub(1),
-                        true,
                     );
                     self.writer.remove_trailing_spaces();
                     self.writer.write(")");
@@ -43932,6 +44083,7 @@ impl Printer<'_> {
         };
         let bytes = trivia.as_bytes();
         let mut cursor = 0;
+        let mut emitted_any = false;
         while cursor < bytes.len() {
             let line = trivia[cursor..].find("//").map(|offset| cursor + offset);
             let block = trivia[cursor..].find("/*").map(|offset| cursor + offset);
@@ -43943,6 +44095,23 @@ impl Printer<'_> {
             }) else {
                 break;
             };
+            let is_line = bytes[comment_start..].starts_with(b"//");
+            let comment_end = if is_line {
+                bytes[comment_start..]
+                    .iter()
+                    .position(|byte| matches!(*byte, b'\n' | b'\r'))
+                    .map_or(bytes.len(), |offset| comment_start + offset)
+            } else {
+                bytes[comment_start + 2..]
+                    .windows(2)
+                    .position(|window| window == b"*/")
+                    .map_or(bytes.len(), |offset| comment_start + 2 + offset + 2)
+            };
+            let range = (start + comment_start, start + comment_end);
+            if self.emitted_source_comments.contains(&range) {
+                cursor = comment_end;
+                continue;
+            }
             let leading = &trivia[cursor..comment_start];
             if leading.contains(['\n', '\r']) {
                 if !self.writer.line_start {
@@ -43951,33 +44120,24 @@ impl Printer<'_> {
             } else if !leading.is_empty() && !self.writer.line_start {
                 self.writer.write(" ");
             }
-            if bytes[comment_start..].starts_with(b"//") {
-                let comment_end = bytes[comment_start..]
-                    .iter()
-                    .position(|byte| matches!(*byte, b'\n' | b'\r'))
-                    .map_or(bytes.len(), |offset| comment_start + offset);
-                let range = (start + comment_start, start + comment_end);
-                if self.emitted_source_comments.insert(range) {
-                    self.writer.write(&trivia[comment_start..comment_end]);
-                    self.writer.newline_preserving_trailing_spaces();
-                }
+            self.emitted_source_comments.insert(range);
+            emitted_any = true;
+            if is_line {
+                self.writer.write(&trivia[comment_start..comment_end]);
+                self.writer.newline_preserving_trailing_spaces();
                 cursor = comment_end;
             } else {
-                let comment_end = bytes[comment_start + 2..]
-                    .windows(2)
-                    .position(|window| window == b"*/")
-                    .map_or(bytes.len(), |offset| comment_start + 2 + offset + 2);
-                let range = (start + comment_start, start + comment_end);
-                if self.emitted_source_comments.insert(range) {
-                    self.emit_normalized_block_comment(
-                        &trivia[comment_start..comment_end],
-                        range.0,
-                        false,
-                        false,
-                    );
-                }
+                self.emit_normalized_block_comment(
+                    &trivia[comment_start..comment_end],
+                    range.0,
+                    false,
+                    false,
+                );
                 cursor = comment_end;
             }
+        }
+        if !emitted_any {
+            return;
         }
         let trailing = &trivia[cursor..];
         if trailing.contains(['\n', '\r']) {
@@ -44168,107 +44328,87 @@ impl Printer<'_> {
         &mut self,
         data: &ts_ast::ObjectLiteralExpressionData,
     ) -> Result<(), EmitError> {
-        if data.properties.nodes.len() > 1
-            && data.properties.nodes.iter().all(|property| {
-                matches!(
-                    self.arena.get(*property).map(|node| &node.data),
-                    Some(NodeData::SpreadAssignment(_))
-                )
-            })
-        {
-            for _ in 0..data.properties.nodes.len() {
-                self.writer.write("Object.assign(");
-            }
-            self.writer.write("{}");
-            for property in &data.properties.nodes {
-                let Some(NodeData::SpreadAssignment(spread)) =
-                    self.arena.get(*property).map(|node| &node.data)
-                else {
-                    unreachable!("all properties were checked as spreads");
-                };
-                self.writer.write(", ");
-                self.emit_expression(spread.expression, 1)?;
-                self.writer.write(")");
-            }
-            return Ok(());
-        }
-        if let [first, remaining @ ..] = data.properties.nodes.as_slice()
-            && let Some(NodeData::SpreadAssignment(spread)) =
-                self.arena.get(*first).map(|node| &node.data)
-            && self.expression_contains_super(spread.expression)
-            && remaining.iter().all(|property| {
-                !matches!(
-                    self.arena.get(*property).map(|node| &node.data),
-                    Some(NodeData::SpreadAssignment(_))
-                )
-            })
-        {
-            self.writer.write("Object.assign(Object.assign({}, ");
-            self.emit_expression(spread.expression, 1)?;
-            self.writer.write("), { ");
-            for (index, property) in remaining.iter().enumerate() {
-                if index != 0 {
-                    self.writer.write(", ");
-                }
-                let node = self.node(*property)?.clone();
-                self.emit_object_property(*property, &node)?;
-            }
-            self.writer.write(" })");
-            return Ok(());
-        }
-        self.writer.write("Object.assign(");
-        let mut emitted_argument = false;
-        let mut object_open = false;
-        let mut properties_in_object = 0_usize;
+        let mut chunks = Vec::<(bool, Vec<NodeId>)>::new();
         for property in &data.properties.nodes {
-            let node = self.node(*property)?.clone();
-            if let NodeData::SpreadAssignment(spread) = &node.data {
-                if object_open {
-                    self.writer.write(" }");
-                    object_open = false;
-                }
-                if !emitted_argument {
-                    if matches!(
-                        self.arena.get(spread.expression).map(|node| &node.data),
-                        Some(NodeData::ObjectLiteralExpression(_))
-                    ) {
-                        self.emit_expression(spread.expression, 1)?;
-                        emitted_argument = true;
-                        continue;
-                    }
-                    self.writer.write("{}");
-                    emitted_argument = true;
-                }
-                self.writer.write(", ");
-                self.emit_expression(spread.expression, 1)?;
-                continue;
+            let is_spread = matches!(
+                self.arena.get(*property).map(|node| &node.data),
+                Some(NodeData::SpreadAssignment(_))
+            );
+            if is_spread || chunks.last().is_none_or(|chunk| chunk.0) {
+                chunks.push((is_spread, vec![*property]));
+            } else if let Some((_, properties)) = chunks.last_mut() {
+                properties.push(*property);
             }
-            if !object_open {
-                if emitted_argument {
-                    self.writer.write(", ");
-                }
-                self.writer.write("{ ");
-                object_open = true;
-                emitted_argument = true;
-                properties_in_object = 0;
-            }
-            if properties_in_object != 0 {
-                self.writer.write(", ");
-            }
-            self.emit_object_property(*property, &node)?;
-            properties_in_object += 1;
         }
-        if object_open {
-            self.writer.write(" }");
+        let first_spread_expression = chunks.first().and_then(|(is_spread, properties)| {
+            if !is_spread {
+                return None;
+            }
+            let NodeData::SpreadAssignment(spread) = &self.arena.get(properties[0])?.data else {
+                return None;
+            };
+            Some(spread.expression)
+        });
+        let first_spread_is_object = first_spread_expression.is_some_and(|expression| {
+            matches!(
+                self.arena.get(expression).map(|node| &node.data),
+                Some(NodeData::ObjectLiteralExpression(_))
+            )
+        });
+        let target_is_first_chunk = first_spread_is_object
+            || chunks.first().is_some_and(|chunk| !chunk.0);
+        let appended_chunks = if target_is_first_chunk {
+            chunks.len().saturating_sub(1)
+        } else {
+            chunks.len()
+        };
+        let assign_count = appended_chunks.max(usize::from(first_spread_is_object));
+        for _ in 0..assign_count {
+            self.writer.write("Object.assign(");
         }
-        self.writer.write(")");
+        let mut next_chunk = 0;
+        if first_spread_is_object {
+            self.emit_expression(first_spread_expression.expect("checked"), 1)?;
+            next_chunk = 1;
+        } else if chunks.first().is_some_and(|chunk| !chunk.0) {
+            self.emit_downlevel_object_property_chunk(&chunks[0].1)?;
+            next_chunk = 1;
+        } else {
+            self.writer.write("{}");
+        }
+        for (is_spread, properties) in &chunks[next_chunk..] {
+            self.writer.write(", ");
+            if *is_spread {
+                let NodeData::SpreadAssignment(spread) = &self.node(properties[0])?.data else {
+                    unreachable!("spread chunk checked above");
+                };
+                let expression = spread.expression;
+                self.emit_expression(expression, 1)?;
+            } else {
+                self.emit_downlevel_object_property_chunk(properties)?;
+            }
+            self.writer.write(")");
+        }
+        if assign_count != 0 && next_chunk == chunks.len() {
+            self.writer.write(")");
+        }
         Ok(())
     }
 
-    fn expression_contains_super(&self, expression: NodeId) -> bool {
-        self.arena.iter().any(|(id, node)| {
-            node.kind == SyntaxKind::SuperKeyword && self.node_is_within(id, expression)
-        })
+    fn emit_downlevel_object_property_chunk(
+        &mut self,
+        properties: &[NodeId],
+    ) -> Result<(), EmitError> {
+        self.writer.write("{ ");
+        for (index, property) in properties.iter().enumerate() {
+            if index != 0 {
+                self.writer.write(", ");
+            }
+            let node = self.node(*property)?.clone();
+            self.emit_object_property(*property, &node)?;
+        }
+        self.writer.write(" }");
+        Ok(())
     }
 
     fn emit_downlevel_array_spread(
@@ -44609,12 +44749,16 @@ impl Printer<'_> {
                 previous_end = comma_position.saturating_add(1);
             }
         }
-        self.emit_source_comments_between_with_trailing(
-            previous_end,
-            self.node(id)?.range.end.get().saturating_sub(1),
-            true,
-        );
-        if !self.writer.line_start {
+        let close = self.node(id)?.range.end.get().saturating_sub(1);
+        let close_starts_new_line = self
+            .source_text
+            .get(
+                usize::try_from(previous_end).unwrap_or(usize::MAX)
+                    ..usize::try_from(close).unwrap_or(usize::MAX),
+            )
+            .is_some_and(|trivia| trivia.contains(['\n', '\r']));
+        self.emit_source_comments_between_with_trailing(previous_end, close, true);
+        if !self.writer.line_start && close_starts_new_line {
             self.writer.newline();
         }
         self.writer.indent -= 1;

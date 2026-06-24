@@ -8403,15 +8403,24 @@ impl<'a> Checker<'a> {
 
     fn jsdoc_type_from_text(&mut self, type_text: &str) -> Option<TypeId> {
         let type_text = type_text.trim();
-        if let Some(specifier) = jsdoc_typeof_import_specifier(type_text) {
+        if let Some((specifier, qualifier, is_typeof)) = jsdoc_import_type(type_text) {
             let descriptor = self.external_names.get(specifier)?.clone();
+            let descriptor = if qualifier.is_empty() {
+                descriptor
+            } else {
+                descriptor_property(&descriptor, qualifier)?
+            };
             let type_id = self.import_type(&descriptor);
             self.result.import_type_references.insert(
                 type_id,
                 ImportTypeReference {
                     module_specifier: specifier.to_owned(),
-                    qualifier: "export=".into(),
-                    is_typeof: false,
+                    qualifier: if qualifier.is_empty() {
+                        "export=".into()
+                    } else {
+                        qualifier.to_owned()
+                    },
+                    is_typeof,
                 },
             );
             return Some(type_id);
@@ -17544,14 +17553,20 @@ fn jsdoc_tag_type_and_remainder(tag: &str) -> Option<(&str, &str)> {
     Some((tag[..type_end].trim(), tag[type_end..].trim_start()))
 }
 
-fn jsdoc_typeof_import_specifier(type_text: &str) -> Option<&str> {
-    let import = type_text.strip_prefix("typeof")?.trim_start();
-    let argument = import.strip_prefix("import(")?.strip_suffix(')')?.trim();
+fn jsdoc_import_type(type_text: &str) -> Option<(&str, &str, bool)> {
+    let (import, is_typeof) = type_text
+        .strip_prefix("typeof")
+        .map_or((type_text, false), |import| (import.trim_start(), true));
+    let import = import.strip_prefix("import(")?;
+    let close = import.find(')')?;
+    let argument = import[..close].trim();
     let quote = argument.as_bytes().first().copied()?;
     if !matches!(quote, b'\'' | b'"') || argument.as_bytes().last().copied()? != quote {
         return None;
     }
-    argument.get(1..argument.len().checked_sub(1)?)
+    let specifier = argument.get(1..argument.len().checked_sub(1)?)?;
+    let qualifier = import[close + 1..].trim().strip_prefix('.').unwrap_or_default();
+    Some((specifier, qualifier, is_typeof))
 }
 
 #[derive(Clone, Copy)]
