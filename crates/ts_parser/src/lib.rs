@@ -2489,7 +2489,13 @@ impl<'a> Parser<'a> {
     fn parse_signature_member(&mut self, start: TextPos, kind: SyntaxKind) -> NodeId {
         let type_parameters = self.parse_type_parameters();
         let parameters = self.parse_parameter_list();
-        let return_type = self.parse_optional_type_annotation();
+        let return_type = if self.current.kind == SyntaxKind::EqualsGreaterThanToken {
+            self.error_current("Expected ':'.");
+            self.bump();
+            Some(self.parse_type())
+        } else {
+            self.parse_optional_type_annotation()
+        };
         let fallback = return_type.map_or(parameters.range.end, |node| self.node_end(node));
         let end = self.parse_type_member_terminator(fallback);
         let mut children = Vec::new();
@@ -5569,6 +5575,34 @@ impl<'a> Parser<'a> {
             self.scanner.rewind(checkpoint);
             return false;
         }
+        if matches!(token.kind, SyntaxKind::CloseParenToken | SyntaxKind::DotDotDotToken) {
+            self.scanner.rewind(checkpoint);
+            return true;
+        }
+        if token.kind == SyntaxKind::Identifier
+            || token.kind == SyntaxKind::ThisKeyword
+            || token.kind.is_keyword()
+        {
+            token = self.scanner.scan();
+            if matches!(
+                token.kind,
+                SyntaxKind::ColonToken
+                    | SyntaxKind::CommaToken
+                    | SyntaxKind::QuestionToken
+                    | SyntaxKind::EqualsToken
+            ) {
+                self.scanner.rewind(checkpoint);
+                return true;
+            }
+            if token.kind == SyntaxKind::CloseParenToken
+                && self.scanner.scan().kind == SyntaxKind::EqualsGreaterThanToken
+            {
+                self.scanner.rewind(checkpoint);
+                return true;
+            }
+        }
+        self.scanner.rewind(checkpoint.clone());
+        token = self.scanner.scan();
         while token.kind != SyntaxKind::EndOfFile {
             match token.kind {
                 SyntaxKind::OpenParenToken => depth += 1,
@@ -7424,12 +7458,16 @@ impl<'a> Parser<'a> {
     fn parse_function_type(&mut self, type_parameters: Option<NodeList>) -> NodeId {
         let start = type_parameters
             .as_ref()
-            .map_or(self.current.range.start, |parameters| {
-                parameters.range.start
-            });
+            .map_or(self.current.range.start, |parameters| parameters.range.start);
         let parameters = self.parse_parameter_list();
-        self.expect_and_bump(SyntaxKind::EqualsGreaterThanToken, "Expected '=>'.");
-        let return_type = self.parse_type();
+        let return_type = if self.current.kind == SyntaxKind::ColonToken {
+            self.error_current("Expected '=>'.");
+            self.bump();
+            self.missing_identifier(self.current.range.start)
+        } else {
+            self.expect_and_bump(SyntaxKind::EqualsGreaterThanToken, "Expected '=>'.");
+            self.parse_type()
+        };
         let mut children = Vec::new();
         extend_list_children(&mut children, type_parameters.as_ref());
         children.extend(parameters.nodes.iter().copied());
@@ -11147,6 +11185,44 @@ mod tests {
             panic!("expected type literal");
         };
         assert_eq!(literal.members.nodes.len(), 4);
+    }
+
+    #[test]
+    fn recovers_swapped_signature_and_function_return_tokens() {
+        let result = parse_source_file(
+            "type F1 = { (n: number) => string; } type F2 = (n: number): string;",
+        );
+        let statements = source_statements(&result);
+        assert_eq!(statements.len(), 3);
+
+        let NodeData::TypeAliasDeclaration(first) =
+            &result.arena.get(statements[0]).unwrap().data
+        else {
+            panic!("expected first type alias");
+        };
+        let NodeData::TypeLiteralNode(literal) = &result.arena.get(first.type_).unwrap().data else {
+            panic!("expected type literal");
+        };
+        let NodeData::CallSignatureDeclaration(signature) =
+            &result.arena.get(literal.members.nodes[0]).unwrap().data
+        else {
+            panic!("expected recovered call signature");
+        };
+        assert!(signature.type_.is_some());
+
+        let NodeData::TypeAliasDeclaration(second) =
+            &result.arena.get(statements[1]).unwrap().data
+        else {
+            panic!("expected second type alias");
+        };
+        assert!(matches!(
+            &result.arena.get(second.type_).unwrap().data,
+            NodeData::FunctionTypeNode(function) if function.type_.is_some()
+        ));
+        assert_eq!(
+            result.arena.get(statements[2]).unwrap().kind,
+            SyntaxKind::ExpressionStatement
+        );
     }
 
     #[test]
