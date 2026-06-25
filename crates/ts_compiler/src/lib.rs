@@ -2970,26 +2970,7 @@ fn has_unserializable_exported_anonymous_class(source: &SourceFile) -> bool {
                 .members
                 .nodes
                 .iter()
-                .any(|member| {
-                    let modifiers = match &source.parse.arena.get(*member).map(|node| &node.data) {
-                        Some(NodeData::PropertyDeclaration(member)) => member.modifiers.as_ref(),
-                        Some(NodeData::MethodDeclaration(member)) => member.modifiers.as_ref(),
-                        Some(NodeData::GetAccessorDeclaration(member)) => member.modifiers.as_ref(),
-                        Some(NodeData::SetAccessorDeclaration(member)) => member.modifiers.as_ref(),
-                        _ => None,
-                    };
-                    modifiers.is_some_and(|modifiers| {
-                        modifiers.list.nodes.iter().any(|modifier| {
-                            source.parse.arena.get(*modifier).is_some_and(|modifier| {
-                                matches!(
-                                    modifier.kind,
-                                    ts_ast::SyntaxKind::PrivateKeyword
-                                        | ts_ast::SyntaxKind::ProtectedKeyword
-                                )
-                            })
-                        })
-                    })
-                })
+                .any(|member| anonymous_class_member_is_private(&source.parse.arena, *member))
                 .then(|| identifier_text(&source.parse.arena, variable.name).map(str::to_owned))
                 .flatten()
         })
@@ -3033,6 +3014,39 @@ fn has_unserializable_exported_anonymous_class(source: &SourceFile) -> bool {
                             if private_mixins.contains(&identifier.text)
                     )
             })
+    })
+}
+
+fn anonymous_class_member_is_private(arena: &ts_ast::NodeArena, member: NodeId) -> bool {
+    let (name, modifiers) = match &arena.get(member).map(|node| &node.data) {
+        Some(NodeData::PropertyDeclaration(member)) => {
+            (Some(member.name), member.modifiers.as_ref())
+        }
+        Some(NodeData::MethodDeclaration(member)) => {
+            (Some(member.name), member.modifiers.as_ref())
+        }
+        Some(NodeData::GetAccessorDeclaration(member)) => {
+            (Some(member.name), member.modifiers.as_ref())
+        }
+        Some(NodeData::SetAccessorDeclaration(member)) => {
+            (Some(member.name), member.modifiers.as_ref())
+        }
+        _ => (None, None),
+    };
+    name.is_some_and(|name| {
+        matches!(
+            arena.get(name).map(|node| &node.data),
+            Some(NodeData::PrivateIdentifier(_))
+        )
+    }) || modifiers.is_some_and(|modifiers| {
+        modifiers.list.nodes.iter().any(|modifier| {
+            arena.get(*modifier).is_some_and(|modifier| {
+                matches!(
+                    modifier.kind,
+                    ts_ast::SyntaxKind::PrivateKeyword | ts_ast::SyntaxKind::ProtectedKeyword
+                )
+            })
+        })
     })
 }
 
@@ -9265,6 +9279,34 @@ export function create() { return new M.Value(); }"#,
             CompilerOptions {
                 declaration: true,
                 module: ModuleKind::CommonJs,
+                no_lib: true,
+                target: ScriptTarget::Es2015,
+                ..CompilerOptions::default()
+            },
+        );
+        assert!(
+            !program
+                .emit()
+                .files
+                .iter()
+                .any(|file| file.file_name == "/project/main.d.ts")
+        );
+    }
+
+    #[test]
+    fn exported_anonymous_class_private_name_suppresses_declaration_output() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/main.ts",
+            "export const Value = class { #value = 1; };",
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["main.ts".to_owned()],
+            CompilerOptions {
+                declaration: true,
                 no_lib: true,
                 target: ScriptTarget::Es2015,
                 ..CompilerOptions::default()

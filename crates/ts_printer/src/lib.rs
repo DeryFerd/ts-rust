@@ -372,6 +372,8 @@ pub fn emit_source_file_with_context(
         active_private_method_plan: None,
         private_field_plans: HashMap::new(),
         active_private_field_plan: None,
+        anonymous_private_class_plans: HashMap::new(),
+        active_anonymous_private_class: None,
         private_destructuring_rewrites: HashMap::new(),
         preemitted_source_prologues: HashSet::new(),
         captured_loop_body: None,
@@ -429,6 +431,7 @@ pub fn emit_source_file_with_context(
     if settings.target < ScriptTarget::Es2022 {
         printer.prepare_private_method_lowerings();
         printer.prepare_private_field_lowerings();
+        printer.prepare_anonymous_private_class_lowerings();
     }
     let source_end = node.range.end.get();
     printer.runtime_identifier_uses = runtime_identifier_uses(arena, source_file);
@@ -24749,6 +24752,21 @@ struct PrivateFieldPlan {
 }
 
 #[derive(Clone)]
+struct AnonymousPrivateStaticField {
+    storage: String,
+    initializer: Option<NodeId>,
+}
+
+#[derive(Clone)]
+struct AnonymousPrivateClassPlan {
+    scope: NodeId,
+    brand: Option<String>,
+    fields: Vec<PrivateFieldInfo>,
+    methods: Vec<PrivateMethodInfo>,
+    static_fields: Vec<AnonymousPrivateStaticField>,
+}
+
+#[derive(Clone)]
 struct PrivateDestructuringRewrite {
     receiver: NodeId,
     receiver_temp: String,
@@ -24885,6 +24903,8 @@ struct Printer<'a> {
     active_private_method_plan: Option<PrivateMethodPlan>,
     private_field_plans: HashMap<NodeId, PrivateFieldPlan>,
     active_private_field_plan: Option<PrivateFieldPlan>,
+    anonymous_private_class_plans: HashMap<NodeId, AnonymousPrivateClassPlan>,
+    active_anonymous_private_class: Option<NodeId>,
     private_destructuring_rewrites: HashMap<NodeId, PrivateDestructuringRewrite>,
     preemitted_source_prologues: HashSet<NodeId>,
     captured_loop_body: Option<NodeId>,
@@ -25273,6 +25293,162 @@ impl Printer<'_> {
     }
 
     #[allow(clippy::too_many_lines)]
+    fn prepare_anonymous_private_class_lowerings(&mut self) {
+        let classes = self
+            .arena
+            .iter()
+            .filter_map(|(id, node)| {
+                let NodeData::ClassExpression(class) = &node.data else {
+                    return None;
+                };
+                (class.name.is_none() && !node_is_in_ambient_context(self.arena, id))
+                    .then_some((id, class.clone()))
+            })
+            .collect::<Vec<_>>();
+        for (class_id, class) in classes {
+            let private_methods = class
+                .members
+                .nodes
+                .iter()
+                .filter_map(|member| {
+                    let NodeData::MethodDeclaration(method) = &self.arena.get(*member)?.data else {
+                        return None;
+                    };
+                    if method.body.is_none()
+                        || declaration_has_modifier_in_list(
+                            self.arena,
+                            method.modifiers.as_ref(),
+                            SyntaxKind::StaticKeyword,
+                        )
+                    {
+                        return None;
+                    }
+                    let NodeData::PrivateIdentifier(name) = &self.arena.get(method.name)?.data
+                    else {
+                        return None;
+                    };
+                    Some((*member, name.text.trim_start_matches('#').to_owned()))
+                })
+                .collect::<Vec<_>>();
+            let has_private_methods = !private_methods.is_empty();
+            let inferred_name = self
+                .class_expression_inferred_name(class_id)
+                .unwrap_or_else(|| "class".to_owned());
+            let prefix = (!has_private_methods).then_some(inferred_name.as_str());
+            let mut fields = Vec::new();
+            let mut static_fields = Vec::new();
+            for member in &class.members.nodes {
+                let Some(NodeData::PropertyDeclaration(property)) =
+                    self.arena.get(*member).map(|node| &node.data)
+                else {
+                    continue;
+                };
+                let Some(NodeData::PrivateIdentifier(name)) =
+                    self.arena.get(property.name).map(|node| &node.data)
+                else {
+                    continue;
+                };
+                let private_name = name.text.trim_start_matches('#').to_owned();
+                let preferred = prefix.map_or_else(
+                    || format!("_{private_name}"),
+                    |prefix| format!("_{prefix}_{private_name}"),
+                );
+                let storage = self
+                    .generated_names
+                    .claim(&preferred)
+                    .unwrap_or_else(|| self.generated_names.generate(&preferred));
+                if declaration_has_modifier_in_list(
+                    self.arena,
+                    property.modifiers.as_ref(),
+                    SyntaxKind::StaticKeyword,
+                ) {
+                    static_fields.push(AnonymousPrivateStaticField {
+                        storage,
+                        initializer: property.initializer,
+                    });
+                } else {
+                    fields.push(PrivateFieldInfo {
+                        private_name,
+                        storage,
+                        declaration_order: fields.len(),
+                    });
+                }
+            }
+            if fields.is_empty() && static_fields.is_empty() && private_methods.is_empty() {
+                continue;
+            }
+            let brand = has_private_methods.then(|| {
+                self.generated_names
+                    .claim("_instances")
+                    .unwrap_or_else(|| self.generated_names.generate("_instances"))
+            });
+            let methods = private_methods
+                .into_iter()
+                .map(|(method, private_name)| {
+                    let preferred = format!("_{private_name}");
+                    let function_name = self
+                        .generated_names
+                        .claim(&preferred)
+                        .unwrap_or_else(|| self.generated_names.generate(&preferred));
+                    PrivateMethodInfo {
+                        method,
+                        private_name,
+                        function_name,
+                    }
+                })
+                .collect();
+            let Some(scope) = self.private_field_storage_scope(class_id) else {
+                continue;
+            };
+            self.anonymous_private_class_plans.insert(
+                class_id,
+                AnonymousPrivateClassPlan {
+                    scope,
+                    brand,
+                    fields,
+                    methods,
+                    static_fields,
+                },
+            );
+        }
+    }
+
+    fn append_anonymous_private_class_declarations(
+        &self,
+        class_id: NodeId,
+        scope: NodeId,
+        before_class_temp: bool,
+        declarations: &mut Vec<String>,
+    ) {
+        let Some(plan) = self
+            .anonymous_private_class_plans
+            .get(&class_id)
+            .filter(|plan| plan.scope == scope)
+        else {
+            return;
+        };
+        if let Some(brand) = &plan.brand {
+            if !before_class_temp {
+                return;
+            }
+            declarations.push(brand.clone());
+            declarations.extend(plan.fields.iter().map(|field| field.storage.clone()));
+            declarations.extend(
+                plan.methods
+                    .iter()
+                    .map(|method| method.function_name.clone()),
+            );
+        } else if !before_class_temp {
+            declarations.extend(
+                plan.static_fields
+                    .iter()
+                    .map(|field| field.storage.clone()),
+            );
+            declarations.extend(plan.fields.iter().map(|field| field.storage.clone()));
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
     fn prepare_private_method_lowerings(&mut self) {
         let mut declaration_order = 0;
         for (class_id, node) in self.arena.iter() {
@@ -25397,6 +25573,18 @@ impl Printer<'_> {
             .name
             .and_then(|name| self.private_method_plans.get(&name))
             .cloned()
+            .or_else(|| {
+                let class_id = self.active_anonymous_private_class?;
+                let plan = self.anonymous_private_class_plans.get(&class_id)?;
+                Some(PrivateMethodPlan {
+                    brand: plan.brand.clone()?,
+                    capture: None,
+                    declarations: Vec::new(),
+                    methods: plan.methods.clone(),
+                    class_name: class_id,
+                    class_symbol: None,
+                })
+            })
     }
 
     fn private_field_plan(&self, class: &ts_ast::ClassDeclarationData) -> Option<PrivateFieldPlan> {
@@ -25404,6 +25592,14 @@ impl Printer<'_> {
             .name
             .and_then(|name| self.private_field_plans.get(&name))
             .cloned()
+            .or_else(|| {
+                let class_id = self.active_anonymous_private_class?;
+                let plan = self.anonymous_private_class_plans.get(&class_id)?;
+                (!plan.fields.is_empty()).then(|| PrivateFieldPlan {
+                    scope: plan.scope,
+                    fields: plan.fields.clone(),
+                })
+            })
     }
 
     fn active_private_field(&self, name: NodeId) -> Option<&PrivateFieldInfo> {
@@ -32765,6 +32961,12 @@ impl Printer<'_> {
         let mut claimed = HashSet::new();
         let mut temps = Vec::new();
         for (_, class_expression) in class_expressions {
+            self.append_anonymous_private_class_declarations(
+                class_expression,
+                block_id,
+                true,
+                &mut temps,
+            );
             if let Some(NodeData::ClassExpression(class)) =
                 self.arena.get(class_expression).map(|node| &node.data)
             {
@@ -32781,6 +32983,12 @@ impl Printer<'_> {
             self.class_expression_temps
                 .insert(class_expression, temp.clone());
             temps.push(temp);
+            self.append_anonymous_private_class_declarations(
+                class_expression,
+                block_id,
+                false,
+                &mut temps,
+            );
         }
         if is_function_body {
             self.prepare_downlevel_nullish_temps(block_id, &mut claimed, &mut temps);
@@ -32888,6 +33096,14 @@ impl Printer<'_> {
         classes.sort_by_key(|(start, _, _, _)| *start);
 
         for (_, class_id, members, is_expression) in &classes {
+            if *is_expression {
+                self.append_anonymous_private_class_declarations(
+                    *class_id,
+                    source_file,
+                    true,
+                    &mut field_temps,
+                );
+            }
             if !*is_expression
                 && members.iter().any(|member| {
                     matches!(
@@ -32982,6 +33198,14 @@ impl Printer<'_> {
                 claimed.insert(temp.clone());
                 self.class_expression_temps.insert(*class_id, temp.clone());
                 field_temps.push(temp);
+            }
+            if *is_expression {
+                self.append_anonymous_private_class_declarations(
+                    *class_id,
+                    source_file,
+                    false,
+                    &mut field_temps,
+                );
             }
         }
         self.prepare_downlevel_nullish_temps(source_file, &mut claimed, &mut field_temps);
@@ -33367,6 +33591,12 @@ impl Printer<'_> {
         let mut claimed = HashSet::new();
         let mut temps = Vec::new();
         for (_, class_id) in classes {
+            self.append_anonymous_private_class_declarations(
+                class_id,
+                body,
+                true,
+                &mut temps,
+            );
             let Some(NodeData::ClassExpression(class)) =
                 self.arena.get(class_id).map(|node| &node.data)
             else {
@@ -33383,6 +33613,12 @@ impl Printer<'_> {
             claimed.insert(temp.clone());
             self.class_expression_temps.insert(class_id, temp.clone());
             temps.push(temp);
+            self.append_anonymous_private_class_declarations(
+                class_id,
+                body,
+                false,
+                &mut temps,
+            );
         }
         temps
     }
@@ -44719,14 +44955,16 @@ impl Printer<'_> {
                 self.emit_expression(name, 0)?;
                 self.writer.write(";");
             }
-            if let Some(plan) = &private_plan {
-                self.emit_private_method_initializers(data, plan)?;
-                self.emit_private_lowered_static_elements(data, plan)?;
-            } else {
-                self.emit_native_static_fields(data)?;
-            }
-            if let Some(plan) = &private_field_plan {
-                self.emit_private_field_initializers(plan);
+            if self.active_anonymous_private_class.is_none() {
+                if let Some(plan) = &private_plan {
+                    self.emit_private_method_initializers(data, plan)?;
+                    self.emit_private_lowered_static_elements(data, plan)?;
+                } else {
+                    self.emit_native_static_fields(data)?;
+                }
+                if let Some(plan) = &private_field_plan {
+                    self.emit_private_field_initializers(plan);
+                }
             }
         }
         if let Some(plan) = &private_plan {
@@ -45471,6 +45709,7 @@ impl Printer<'_> {
         downlevel_name: Option<&str>,
         wrap: bool,
     ) -> Result<(), EmitError> {
+        let anonymous_private_plan = self.anonymous_private_class_plans.get(&id).cloned();
         let class_name_rewrite = data.name.and_then(|name| {
             let text = declaration_name_text(self.arena, name)?;
             data.local_symbol
@@ -45504,12 +45743,41 @@ impl Printer<'_> {
         self.writer.write(temp);
         self.writer.write(" = ");
         self.writer.indent += 1;
+        let previous_anonymous_private_class = self.active_anonymous_private_class;
+        self.active_anonymous_private_class = anonymous_private_plan.as_ref().map(|_| id);
         if let Some(name) = downlevel_name {
             self.emit_downlevel_class_value(&core, name)?;
         } else {
             self.emit_class(&core)?;
         }
+        self.active_anonymous_private_class = previous_anonymous_private_class;
         self.writer.write(",");
+        if let Some(plan) = &anonymous_private_plan {
+            for field in &plan.fields {
+                self.writer.newline();
+                self.writer.write(&field.storage);
+                self.writer.write(" = new WeakMap(),");
+            }
+            if let Some(brand) = &plan.brand {
+                self.writer.newline();
+                self.writer.write(brand);
+                self.writer.write(" = new WeakSet(),");
+            }
+            for private_method in &plan.methods {
+                let node = self.node(private_method.method)?.clone();
+                let NodeData::MethodDeclaration(method) = &node.data else {
+                    return Err(Self::unsupported(private_method.method, node.kind));
+                };
+                self.writer.newline();
+                self.writer.write(&private_method.function_name);
+                self.writer.write(" = function ");
+                self.writer.write(&private_method.function_name);
+                self.emit_parameters(&method.parameters)?;
+                self.writer.write(" ");
+                self.emit_function_body(method.body.expect("private method has a body"))?;
+                self.writer.write(",");
+            }
+        }
         if data.name.is_none()
             && self.class_expression_needs_inferred_name_restore(data)
             && let Some(name) = self.class_expression_inferred_name(id)
@@ -45521,6 +45789,19 @@ impl Printer<'_> {
             self.writer.write(", ");
             write_quoted(&mut self.writer, &name);
             self.writer.write("),");
+        }
+        if let Some(plan) = &anonymous_private_plan {
+            for field in &plan.static_fields {
+                self.writer.newline();
+                self.writer.write(&field.storage);
+                self.writer.write(" = { value: ");
+                if let Some(initializer) = field.initializer {
+                    self.emit_expression(initializer, 1)?;
+                } else {
+                    self.writer.write("void 0");
+                }
+                self.writer.write(" },");
+            }
         }
         for member in &data.members.nodes {
             let node = self.node(*member)?.clone();
@@ -45539,7 +45820,11 @@ impl Printer<'_> {
                         && self.has_modifier(
                             property.modifiers.as_ref(),
                             SyntaxKind::StaticKeyword,
-                        ) =>
+                        ) && !(anonymous_private_plan.is_some()
+                            && matches!(
+                                self.arena.get(property.name).map(|node| &node.data),
+                                Some(NodeData::PrivateIdentifier(_))
+                            )) =>
                 {
                     self.writer.newline();
                     if self.settings.use_define_for_class_fields == Some(true) {
@@ -45625,6 +45910,12 @@ impl Printer<'_> {
                 };
                 match &node.data {
                     NodeData::PropertyDeclaration(property) => {
+                        if matches!(
+                            self.arena.get(property.name).map(|node| &node.data),
+                            Some(NodeData::PrivateIdentifier(_))
+                        ) {
+                            return true;
+                        }
                         if self.class_field_emits_runtime_value(property)
                             && self.has_modifier(
                                 property.modifiers.as_ref(),
@@ -45641,6 +45932,10 @@ impl Printer<'_> {
                                 self.runtime_computed_class_member_name(*member).is_some()
                             })
                     }
+                    NodeData::MethodDeclaration(method) => matches!(
+                        self.arena.get(method.name).map(|node| &node.data),
+                        Some(NodeData::PrivateIdentifier(_))
+                    ),
                     NodeData::ClassStaticBlockDeclaration(_) => true,
                     _ => false,
                 }
@@ -59806,6 +60101,61 @@ mod tests {
         );
         assert!(!output.starts_with("var _C_value;"), "{output}");
         assert!(output.contains("_C_value = new WeakMap();"), "{output}");
+    }
+
+    #[test]
+    fn lowers_private_elements_in_anonymous_class_expressions() {
+        let output = emit_with(
+            concat!(
+                "export const ClassExpression = class { ",
+                "#context = 0; #method() { return 42; } public value = 1; };\n",
+                "export const ClassExpressionStatic = class { ",
+                "static #staticPrivate = \"hidden\"; #instancePrivate = true; ",
+                "public exposed = \"visible\"; };",
+            ),
+            ScriptTarget::Es2015,
+            ModuleKind::EsNext,
+        )
+        .code;
+        assert!(
+            output.contains(concat!(
+                "var _instances, _context, _method, _a, _b, ",
+                "_ClassExpressionStatic_staticPrivate, ",
+                "_ClassExpressionStatic_instancePrivate;",
+            )),
+            "{output}"
+        );
+        assert!(
+            output.contains("_context = new WeakMap(),")
+                && output.contains("_instances = new WeakSet(),")
+                && output.contains("_method = function _method() { return 42; },")
+                && output.contains("_a);"),
+            "{output}"
+        );
+        assert!(
+            output.contains("_ClassExpressionStatic_instancePrivate = new WeakMap(),")
+                && output.contains("__setFunctionName(_b, \"ClassExpressionStatic\"),")
+                && output
+                    .contains("_ClassExpressionStatic_staticPrivate = { value: \"hidden\" },")
+                && output.contains("_b);"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn scopes_anonymous_class_private_storage_to_the_function() {
+        let output = emit_with(
+            "function outer() { const Value = class { #value = 1; }; }",
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(
+            output.contains("function outer() { var _a, _Value_value;"),
+            "{output}"
+        );
+        assert!(!output.starts_with("var _Value_value;"), "{output}");
+        assert!(output.contains("_Value_value = new WeakMap(),"), "{output}");
     }
 
     #[test]
