@@ -16,7 +16,9 @@ use ts_core::{TextPos, TextRange};
 use ts_diagnostics::{Diagnostic, message_by_code};
 use ts_glob::{DiscoveryOptions, discover_files};
 use ts_module::{ResolutionOptions, Resolver, automatic_type_directive_names, parse_package_json};
-use ts_options::{CompilerOptions, ModuleKind, PrinterSettings, parse_project_options};
+use ts_options::{
+    CompilerOptions, ModuleDetectionKind, ModuleKind, PrinterSettings, parse_project_options,
+};
 use ts_parser::{
     ParseResult, parse_javascript_source_file, parse_jsx_source_file, parse_source_file,
 };
@@ -690,6 +692,13 @@ impl Program {
                 .as_deref()
                 .is_some_and(|file_name| self.output_overwrites_input(file_name));
             if settings.emit_javascript && !javascript_output_overwrites_input {
+                let node_module_kind = matches!(
+                    settings.module,
+                    ModuleKind::Node16
+                        | ModuleKind::Node18
+                        | ModuleKind::Node20
+                        | ModuleKind::NodeNext
+                );
                 let mut source_settings =
                     source_printer_settings(settings, &source_file.source_text);
                 let lower_file_name = source_file.file_name.to_ascii_lowercase();
@@ -806,7 +815,11 @@ impl Program {
                     jsx_fragment_factory,
                     jsx_import_source,
                     downlevel_iteration: self.options.downlevel_iteration,
-                    module_detection: self.options.module_detection,
+                    module_detection: if node_module_kind {
+                        ModuleDetectionKind::Force
+                    } else {
+                        self.options.module_detection
+                    },
                 };
                 match emit_source_file_with_context(
                     &source_file.parse.arena,

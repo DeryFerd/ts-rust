@@ -31234,8 +31234,22 @@ impl Printer<'_> {
             NodeData::TryStatement(data) => self.emit_try(data)?,
             NodeData::ThrowStatement(data) => {
                 self.writer.write("throw ");
-                self.emit_expression(data.expression, 0)?;
-                self.writer.write(";");
+                let keyword_end = node.range.start.get().saturating_add(5);
+                let expression_start = self.node(data.expression)?.range.start.get();
+                let has_line_break = usize::try_from(keyword_end)
+                    .ok()
+                    .zip(usize::try_from(expression_start).ok())
+                    .and_then(|(start, end)| self.source_text.get(start..end))
+                    .is_some_and(|trivia| trivia.contains(['\n', '\r']));
+                if has_line_break {
+                    self.writer.write(";");
+                    self.writer.newline();
+                    self.emit_expression(data.expression, 0)?;
+                    self.writer.write(";");
+                } else {
+                    self.emit_expression(data.expression, 0)?;
+                    self.writer.write(";");
+                }
             }
             NodeData::BreakStatement(data) => {
                 if let Some(target) = self.es5_async_control_case(id, false) {
