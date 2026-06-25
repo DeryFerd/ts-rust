@@ -16289,7 +16289,7 @@ impl<'a> DeclarationReachability<'a> {
             is_declaration_file || !external,
             is_declaration_file,
         );
-        analyzer.seed_roots();
+        analyzer.seed_scope_roots(source_file);
         for name in inferred_type_names {
             analyzer.retain_name(name);
         }
@@ -16367,43 +16367,34 @@ impl<'a> DeclarationReachability<'a> {
         }
     }
 
-    fn seed_roots(&mut self) {
-        let scopes = self.scopes.clone();
-        for (scope, statements) in scopes {
-            let already_rooted = self
-                .retained
-                .get(&scope)
-                .is_some_and(|retained| !retained.is_empty());
-            if already_rooted {
-                continue;
-            }
-            for statement in statements {
-                let exported_declaration = self
-                    .arena
-                    .get(statement)
-                    .is_some_and(|node| !matches!(node.data, NodeData::ImportDeclaration(_)))
-                    && self.node_has_modifier(statement, SyntaxKind::ExportKeyword);
-                if exported_declaration
-                    || matches!(
-                        self.arena.get(statement).map(|node| &node.data),
-                        Some(NodeData::ExportDeclaration(_) | NodeData::ExportAssignment(_))
-                    )
-                    || matches!(
-                        self.arena.get(statement).map(|node| &node.data),
-                        Some(NodeData::ImportDeclaration(import))
-                            if import.import_clause.is_none()
-                    )
-                    || matches!(
-                        self.arena.get(statement).map(|node| &node.data),
-                        Some(NodeData::ModuleDeclaration(module))
-                            if matches!(
-                                self.arena.get(module.name).map(|node| &node.data),
-                                Some(NodeData::StringLiteral(_))
-                            )
-                    )
-                {
-                    self.retain(statement);
-                }
+    fn seed_scope_roots(&mut self, scope: NodeId) {
+        let statements = self.scopes.get(&scope).cloned().unwrap_or_default();
+        for statement in statements {
+            let exported_declaration = self
+                .arena
+                .get(statement)
+                .is_some_and(|node| !matches!(node.data, NodeData::ImportDeclaration(_)))
+                && self.node_has_modifier(statement, SyntaxKind::ExportKeyword);
+            if exported_declaration
+                || matches!(
+                    self.arena.get(statement).map(|node| &node.data),
+                    Some(NodeData::ExportDeclaration(_) | NodeData::ExportAssignment(_))
+                )
+                || matches!(
+                    self.arena.get(statement).map(|node| &node.data),
+                    Some(NodeData::ImportDeclaration(import))
+                        if import.import_clause.is_none()
+                )
+                || matches!(
+                    self.arena.get(statement).map(|node| &node.data),
+                    Some(NodeData::ModuleDeclaration(module))
+                        if matches!(
+                            self.arena.get(module.name).map(|node| &node.data),
+                            Some(NodeData::StringLiteral(_))
+                        )
+                )
+            {
+                self.retain(statement);
             }
         }
     }
@@ -16943,6 +16934,25 @@ impl<'a> DeclarationReachability<'a> {
         };
         if self.retained.entry(scope).or_default().insert(statement) {
             self.pending.push_back(statement);
+            let module_body = self.arena.get(statement).and_then(|node| match &node.data {
+                NodeData::ModuleDeclaration(module) => module.body,
+                _ => None,
+            });
+            if let Some(body) = module_body {
+                let mut nested_body = Some(body);
+                while let Some(current) = nested_body {
+                    match self.arena.get(current).map(|node| &node.data) {
+                        Some(NodeData::ModuleBlock(_)) => {
+                            self.seed_scope_roots(current);
+                            break;
+                        }
+                        Some(NodeData::ModuleDeclaration(module)) => {
+                            nested_body = module.body;
+                        }
+                        _ => break,
+                    }
+                }
+            }
         }
     }
 
