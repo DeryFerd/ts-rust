@@ -26381,11 +26381,14 @@ impl Printer<'_> {
                         && !remainder.contains(['\n', '\r'])
                         && remainder.trim().is_empty();
                     let inline_after = inline_with_next || inline_with_node;
+                    let terminal_comment = self.source_text[comment_range.1..]
+                        .trim()
+                        .is_empty();
                     self.emit_normalized_block_comment(
                         &trivia[index..comment_end],
                         comment_range.0,
                         !inline_after,
-                        comment_range.1 == self.source_text.len(),
+                        terminal_comment,
                     );
                     if inline_after {
                         self.writer.write(" ");
@@ -58307,6 +58310,15 @@ mod tests {
             )
             .code,
             "let value = 1;\n/* retained\n*/ \n"
+        );
+        assert_eq!(
+            emit_with(
+                "let value = 1;\n/** oops � oops */\n",
+                ScriptTarget::Es2015,
+                ModuleKind::None,
+            )
+            .code,
+            "let value = 1;\n/** oops � oops */ \n"
         );
     }
 
