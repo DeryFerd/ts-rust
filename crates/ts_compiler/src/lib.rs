@@ -779,7 +779,8 @@ impl Program {
                     );
                 }
                 let preserve_top_of_file_reference_directive =
-                    self.source_has_resolved_path_reference(source_file);
+                    self.source_has_resolved_path_reference(source_file)
+                        || has_preserved_reference_directive(&source_file.source_text);
                 let emit_context = EmitContext {
                     bindings: &source_file.binding,
                     amd_module_name: source_file.parse.amd_module_name.as_deref(),
@@ -938,6 +939,7 @@ impl Program {
                     &source_file.source_text,
                     self.options.declaration_map,
                     Some(&source_file.checking.declaration_reachability),
+                    Some(&source_file.checking.import_runtime_meanings),
                     Some(&enum_member_values),
                     Some(&source_file.checking.types),
                     Some(&declaration_node_types),
@@ -1233,7 +1235,8 @@ impl Program {
                     suppress_extends_helper: bundle_needs_extends_helper,
                     preemitted_comment_end: detached_comment.as_ref().map(|(_, end)| *end),
                     preserve_top_of_file_reference_directive: self
-                        .source_has_resolved_path_reference(source),
+                        .source_has_resolved_path_reference(source)
+                        || has_preserved_reference_directive(&source.source_text),
                     amd_dependencies: &amd_dependencies,
                     amd_module_specifier_rewrites: &amd_module_specifier_rewrites,
                     amd_generated_name_offsets: &amd_generated_name_offsets,
@@ -1427,6 +1430,7 @@ impl Program {
                     &source.source_text,
                     false,
                     Some(&source.checking.declaration_reachability),
+                    Some(&source.checking.import_runtime_meanings),
                     Some(&enum_member_values),
                     Some(&source.checking.types),
                     Some(&declaration_node_types),
@@ -2613,6 +2617,16 @@ fn reference_directives(source: &str) -> Vec<ReferenceDirective> {
             })
         })
         .collect()
+}
+
+fn has_preserved_reference_directive(source: &str) -> bool {
+    source.lines().any(|line| {
+        let trimmed = line.trim_start();
+        trimmed.starts_with("///")
+            && trimmed.contains("<reference")
+            && (trimmed.contains("preserve=\"true\"")
+                || trimmed.contains("preserve='true'"))
+    })
 }
 
 fn has_no_default_lib_directive(source: &str) -> bool {

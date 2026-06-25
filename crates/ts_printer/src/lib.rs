@@ -3156,6 +3156,7 @@ pub fn emit_declaration_file_with_semantics(
         source_text,
         declaration_map,
         declaration_reachability,
+        None,
         enum_member_values,
         semantic_types,
         node_types,
@@ -3184,6 +3185,7 @@ pub fn emit_declaration_file_with_semantics_and_options(
     source_text: &str,
     declaration_map: bool,
     declaration_reachability: Option<&BTreeMap<NodeId, BTreeSet<NodeId>>>,
+    import_runtime_meanings: Option<&BTreeMap<NodeId, bool>>,
     enum_member_values: Option<&BTreeMap<NodeId, EmitConstantValue>>,
     semantic_types: Option<&TypeArena>,
     node_types: Option<&BTreeMap<NodeId, TypeId>>,
@@ -3209,6 +3211,7 @@ pub fn emit_declaration_file_with_semantics_and_options(
         extension_only_module_file: false,
         overload_names: HashSet::new(),
         declaration_reachability,
+        import_runtime_meanings,
         enum_member_values,
         semantic_types,
         node_types,
@@ -3419,6 +3422,7 @@ struct DeclarationPrinter<'a> {
     extension_only_module_file: bool,
     overload_names: HashSet<String>,
     declaration_reachability: Option<&'a BTreeMap<NodeId, BTreeSet<NodeId>>>,
+    import_runtime_meanings: Option<&'a BTreeMap<NodeId, bool>>,
     enum_member_values: Option<&'a BTreeMap<NodeId, EmitConstantValue>>,
     semantic_types: Option<&'a TypeArena>,
     node_types: Option<&'a BTreeMap<NodeId, TypeId>>,
@@ -8367,6 +8371,25 @@ impl DeclarationPrinter<'_> {
                 return false;
             }
             current = parent;
+        }
+        false
+    }
+
+    fn identifier_is_within_type_query(&self, identifier: NodeId) -> bool {
+        let mut current = identifier;
+        while let Some(parent) = self.arena.get(current).and_then(|node| node.parent) {
+            let Some(parent_node) = self.arena.get(parent) else {
+                return false;
+            };
+            match parent_node.data {
+                NodeData::TypeQueryNode(_) => return true,
+                NodeData::SourceFile(_)
+                | NodeData::VariableStatement(_)
+                | NodeData::FunctionDeclaration(_)
+                | NodeData::InterfaceDeclaration(_)
+                | NodeData::TypeAliasDeclaration(_) => return false,
+                _ => current = parent,
+            }
         }
         false
     }
@@ -22964,6 +22987,14 @@ impl DeclarationPrinter<'_> {
                                 && (binding_symbol.is_none_or(|symbol| {
                                     self.bindings.resolve_name_at(identifier, name) == Some(symbol)
                                 }) || self.identifier_is_in_erased_type_context(identifier))
+                                && !(self.identifier_is_within_type_query(identifier)
+                                    && (self.import_runtime_meanings.is_some_and(|meanings| {
+                                        meanings.get(&import_id) == Some(&false)
+                                    })
+                                        || binding_symbol.is_some_and(|symbol| {
+                                            self.bindings.resolve_name_at(identifier, name)
+                                                != Some(symbol)
+                                        })))
                                 && (!self.identifier_is_in_exported_variable_initializer(
                                     identifier,
                                 )
@@ -28294,8 +28325,11 @@ impl Printer<'_> {
                     && self.context_preserves_top_of_file_reference_directive
                     && self.source_text[..comment_range.0]
                         .trim_start_matches('\u{feff}')
-                        .trim()
-                        .is_empty();
+                        .lines()
+                        .all(|line| {
+                            let line = line.trim();
+                            line.is_empty() || is_reference_directive(line)
+                        });
                 if is_reference_directive(comment)
                     && (include_owned
                         || top_of_file
@@ -29908,8 +29942,68 @@ impl Printer<'_> {
         )
     }
 
+    fn recovered_type_predicate_function_body(&self, id: NodeId, node: &Node) -> Option<NodeId> {
+        let NodeData::FunctionDeclaration(function) = &node.data else {
+            return None;
+        };
+        if function.body.is_some() {
+            return None;
+        }
+        let parent = node.parent.and_then(|parent| self.arena.get(parent))?;
+        let statements = match &parent.data {
+            NodeData::SourceFile(file) => &file.statements.nodes,
+            NodeData::ModuleBlock(block) => &block.statements.nodes,
+            NodeData::Block(block) => &block.statements.nodes,
+            _ => return None,
+        };
+        let index = statements.iter().position(|statement| *statement == id)?;
+        let is_statement = *statements.get(index + 1)?;
+        let type_statement = *statements.get(index + 2)?;
+        let body = *statements.get(index + 3)?;
+        let expression_identifier = |statement| {
+            let NodeData::ExpressionStatement(statement) = &self.arena.get(statement)?.data else {
+                return None;
+            };
+            declaration_name_text(self.arena, statement.expression)
+        };
+        (expression_identifier(is_statement) == Some("is")
+            && expression_identifier(type_statement).is_some()
+            && matches!(
+                self.arena.get(body).map(|node| &node.data),
+                Some(NodeData::Block(_))
+            ))
+        .then_some(body)
+    }
+
+    fn statement_is_recovered_type_predicate_tail(&self, id: NodeId, node: &Node) -> bool {
+        let Some(parent) = node.parent.and_then(|parent| self.arena.get(parent)) else {
+            return false;
+        };
+        let statements = match &parent.data {
+            NodeData::SourceFile(file) => &file.statements.nodes,
+            NodeData::ModuleBlock(block) => &block.statements.nodes,
+            NodeData::Block(block) => &block.statements.nodes,
+            _ => return false,
+        };
+        let Some(index) = statements.iter().position(|statement| *statement == id) else {
+            return false;
+        };
+        (1..=3).any(|distance| {
+            let Some(owner_index) = index.checked_sub(distance) else {
+                return false;
+            };
+            let owner = statements[owner_index];
+            self.arena.get(owner).is_some_and(|owner_node| {
+                self.recovered_type_predicate_function_body(owner, owner_node)
+                    .is_some_and(|body| statements.get(owner_index + 3) == Some(&body))
+            })
+        })
+    }
+
     fn statement_emits_runtime(&self, id: NodeId, node: &Node) -> bool {
-        if self.expression_statement_is_type_alias_recovery_tail(id, node) {
+        if self.expression_statement_is_type_alias_recovery_tail(id, node)
+            || self.statement_is_recovered_type_predicate_tail(id, node)
+        {
             return false;
         }
         if let NodeData::TypeAliasDeclaration(alias) = &node.data
@@ -29966,7 +30060,10 @@ impl Printer<'_> {
             NodeData::ExportAssignment(assignment) => {
                 self.export_assignment_has_runtime_value(assignment.expression)
             }
-            NodeData::FunctionDeclaration(function) => function.body.is_some(),
+            NodeData::FunctionDeclaration(function) => {
+                function.body.is_some()
+                    || self.recovered_type_predicate_function_body(id, node).is_some()
+            }
             NodeData::ModuleDeclaration(module) => {
                 self.namespace_has_runtime_contents(module, &mut HashSet::new())
             }
@@ -30882,6 +30979,25 @@ impl Printer<'_> {
     #[allow(clippy::too_many_lines)]
     fn emit_statement(&mut self, id: NodeId) -> Result<(), EmitError> {
         let node = self.node(id)?.clone();
+        if self.statement_is_recovered_type_predicate_tail(id, &node) {
+            return Ok(());
+        }
+        if let NodeData::FunctionDeclaration(function) = &node.data
+            && let Some(body) = self.recovered_type_predicate_function_body(id, &node)
+        {
+            self.record_mapping(&node);
+            self.emit_runtime_declaration_modifiers(id, function.modifiers.as_ref());
+            self.writer.write("function ");
+            if let Some(name) = function.name {
+                self.emit_expression(name, 0)?;
+            }
+            self.emit_parameters(&function.parameters)?;
+            self.writer.write(" ");
+            self.emit_block(body)?;
+            self.record_mapping_at(self.node(body)?.range.end.get());
+            self.writer.newline();
+            return Ok(());
+        }
         if self.expression_statement_is_type_alias_recovery_tail(id, &node) {
             return Ok(());
         }

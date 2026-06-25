@@ -14489,7 +14489,9 @@ impl<'a> Checker<'a> {
                 }
             }
             NodeData::TypeQueryNode(data) => {
-                let type_id = self.type_of_expression(data.expr_name);
+                let type_id = self
+                    .entity_name_type(data.expr_name)
+                    .unwrap_or_else(|| self.type_of_expression(data.expr_name));
                 let Some(name) = self.entity_name_text(data.expr_name) else {
                     return type_id;
                 };
@@ -22701,6 +22703,41 @@ mod tests {
             panic!("expected strict defaults function");
         };
         assert_eq!(strict_defaults.parameters[1], strict.types.null());
+    }
+
+    #[test]
+    fn infers_arrow_return_from_type_query_annotated_variable() {
+        let parsed = parse_source_file(
+            "export let value = 1; export let x: typeof value; export let y = () => x;",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+
+        let root = bindings.root_scope().unwrap();
+        let value = root.symbols.get("value").unwrap();
+        let x = root.symbols.get("x").unwrap();
+        let x_declaration = bindings.symbols.get(x).unwrap().declarations[0];
+        let NodeData::VariableDeclaration(x_variable) =
+            &parsed.arena.get(x_declaration).unwrap().data
+        else {
+            panic!("expected x variable declaration");
+        };
+        let NodeData::TypeQueryNode(query) =
+            &parsed.arena.get(x_variable.type_.unwrap()).unwrap().data
+        else {
+            panic!("expected x type query");
+        };
+        assert_eq!(bindings.resolve_name_at(query.expr_name, "value"), Some(value));
+        assert_eq!(result.type_of_symbol(value), Some(result.types.number()));
+        assert_eq!(result.type_of_symbol(x), Some(result.types.number()));
+        let y = root.symbols.get("y").unwrap();
+        let y_type = result.type_of_symbol(y).unwrap();
+        let TypeKind::Function(signature) = &result.types.get(y_type).unwrap().kind else {
+            panic!("expected y to have a function type");
+        };
+        assert_eq!(signature.return_type, result.types.number());
     }
 
     #[test]
