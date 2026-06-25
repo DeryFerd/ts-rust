@@ -258,6 +258,11 @@ pub fn emit_source_file_with_context(
     if !settings.emit_javascript {
         return Ok(EmitResult::default());
     }
+    let lower_source_name = source_name.to_ascii_lowercase();
+    let source_uses_tabs = [".js", ".jsx", ".mjs", ".cjs"]
+        .iter()
+        .any(|extension| lower_source_name.ends_with(extension))
+        && source_text.lines().any(|line| line.starts_with('\t'));
     let automatic_jsx = AutomaticJsxUsage::analyze(arena, settings.jsx);
     let enum_access_fallbacks = const_enum_access_fallbacks(
         arena,
@@ -267,7 +272,10 @@ pub fn emit_source_file_with_context(
     );
     let mut printer = Printer {
         arena,
-        writer: Writer::default(),
+        writer: Writer {
+            use_tabs: source_uses_tabs,
+            ..Writer::default()
+        },
         settings,
         source_map: settings.source_map.then(SourceMapBuilder::new),
         source_text,
@@ -2326,7 +2334,8 @@ fn commonjs_named_imports(
                 specifier.name,
                 runtime_identifier_uses,
                 synthetic_runtime_identifier_uses,
-            ) {
+            ) && !import_name_is_reexported(arena, local)
+            {
                 continue;
             }
             let imported = specifier
@@ -22368,6 +22377,7 @@ fn is_es5_reserved_binding_name(text: &str) -> bool {
 struct Writer {
     output: String,
     indent: usize,
+    use_tabs: bool,
     line_start: bool,
     line: u32,
     column: u32,
@@ -22381,8 +22391,13 @@ impl Writer {
     fn write(&mut self, text: &str) {
         if self.line_start {
             for _ in 0..self.indent {
-                self.output.push_str("    ");
-                self.column += 4;
+                if self.use_tabs {
+                    self.output.push('\t');
+                    self.column += 1;
+                } else {
+                    self.output.push_str("    ");
+                    self.column += 4;
+                }
             }
             self.line_start = false;
         }

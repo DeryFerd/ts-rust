@@ -1445,10 +1445,35 @@ impl Program {
             &self.current_directory,
             self.case_sensitivity,
         );
-        self.root_file_names.contains(&canonical)
-            || !canonical
-                .split('/')
-                .any(|component| component.eq_ignore_ascii_case("node_modules"))
+        if self.root_file_names.contains(&canonical) {
+            return true;
+        }
+        if canonical
+            .split('/')
+            .any(|component| component.eq_ignore_ascii_case("node_modules"))
+        {
+            return false;
+        }
+        let extension = Path::new(&source.file_name)
+            .extension()
+            .and_then(|extension| extension.to_str());
+        if extension.is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("tsx") || extension.eq_ignore_ascii_case("jsx")
+        })
+            && self.options.jsx == ts_options::JsxEmit::None
+        {
+            return false;
+        }
+        if extension.is_some_and(|extension| {
+            ["js", "jsx", "mjs", "cjs"]
+                .iter()
+                .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+        })
+            && !self.options.allow_js
+        {
+            return false;
+        }
+        true
     }
 
     fn source_has_resolved_path_reference(&self, source: &SourceFile) -> bool {
