@@ -12563,13 +12563,32 @@ impl DeclarationPrinter<'_> {
         ) {
             return Ok(false);
         }
-        let Some(initializer) = initializer
-            .filter(|initializer| self.is_enum_member_initializer(*initializer))
-        else {
+        let enum_initializer = initializer
+            .filter(|initializer| self.is_enum_member_initializer(*initializer));
+        let fresh_literal = self.named_type_references.is_some_and(|references| {
+            references
+                .get(&type_id)
+                .is_some_and(|reference| reference.name == "__fresh_literal")
+        });
+        if enum_initializer.is_none() && !fresh_literal {
             return Ok(false);
-        };
+        }
         self.writer.write(" = ");
-        self.emit_enum_member_initializer(initializer)?;
+        if let Some(initializer) = enum_initializer {
+            self.emit_enum_member_initializer(initializer)?;
+        } else {
+            match kind {
+                TypeKind::BooleanLiteral(value) => {
+                    self.writer.write(if value { "true" } else { "false" });
+                }
+                TypeKind::NumberLiteral(value) => self.writer.write(&value),
+                TypeKind::StringLiteral(value) => write_quoted(&mut self.writer, &value),
+                TypeKind::BigIntLiteral(value) => {
+                    self.writer.write(&canonical_bigint_literal(&value));
+                }
+                _ => unreachable!("literal kind checked above"),
+            }
+        }
         Ok(true)
     }
 

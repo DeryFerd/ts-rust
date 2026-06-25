@@ -694,7 +694,10 @@ impl<'a> Parser<'a> {
         matches!(
             self.current.kind,
             SyntaxKind::InterfaceKeyword | SyntaxKind::TypeKeyword
-        ) && is_module_name_token(self.next_token_kind())
+        ) && {
+            let next = self.next_token_kind();
+            next == SyntaxKind::Identifier || next.is_keyword()
+        }
     }
 
     fn parse_contextual_type_declaration(&mut self) -> NodeId {
@@ -984,7 +987,8 @@ impl<'a> Parser<'a> {
             return false;
         }
         let next = self.next_token_kind();
-        is_import_binding_identifier_kind(next)
+        next == SyntaxKind::LetKeyword
+            || is_import_binding_identifier_kind(next)
             || matches!(
                 next,
                 SyntaxKind::OpenBraceToken | SyntaxKind::OpenBracketToken
@@ -13790,6 +13794,42 @@ mod tests {
             panic!("expected variable declaration list");
         };
         assert_eq!(list.declarations.nodes.len(), 1);
+    }
+
+    #[test]
+    fn recovers_reserved_words_as_declaration_names() {
+        let result = parse_source_file(
+            "let let = 1; interface implements {} enum package {}",
+        );
+        let statements = source_statements(&result);
+        assert_eq!(statements.len(), 3, "{:?}", result.diagnostics);
+
+        let (list, _) = variable_list(&result, statements[0]);
+        let NodeData::VariableDeclaration(variable) =
+            &result.arena.get(declaration_nodes(&result, list)[0]).unwrap().data
+        else {
+            panic!("expected variable declaration");
+        };
+        assert!(matches!(
+            &result.arena.get(variable.name).unwrap().data,
+            NodeData::Identifier(identifier) if identifier.text == "let"
+        ));
+        assert!(matches!(
+            &result.arena.get(statements[1]).unwrap().data,
+            NodeData::InterfaceDeclaration(interface)
+                if matches!(
+                    &result.arena.get(interface.name).unwrap().data,
+                    NodeData::Identifier(identifier) if identifier.text == "implements"
+                )
+        ));
+        assert!(matches!(
+            &result.arena.get(statements[2]).unwrap().data,
+            NodeData::EnumDeclaration(enum_)
+                if matches!(
+                    &result.arena.get(enum_.name).unwrap().data,
+                    NodeData::Identifier(identifier) if identifier.text == "package"
+                )
+        ));
     }
 
     fn find_descendant_kind(

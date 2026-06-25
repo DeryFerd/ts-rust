@@ -3386,6 +3386,26 @@ struct JsDocSignatureTypes {
     return_type: Option<TypeId>,
 }
 
+#[derive(Clone, Copy)]
+enum InferenceVariance {
+    Covariant,
+    Contravariant,
+}
+
+impl InferenceVariance {
+    const fn flipped(self) -> Self {
+        match self {
+            Self::Covariant => Self::Contravariant,
+            Self::Contravariant => Self::Covariant,
+        }
+    }
+}
+
+#[derive(Default)]
+struct InferenceContext {
+    covariant: HashSet<TypeId>,
+}
+
 impl<'a> Checker<'a> {
     fn new(arena: &'a NodeArena, bindings: &'a BindResult) -> Self {
         let mut children = HashMap::<NodeId, Vec<NodeId>>::new();
@@ -8685,6 +8705,9 @@ impl<'a> Checker<'a> {
                         TypeKind::Array(element) => Some(element),
                         _ => None,
                     }
+                }).filter(|element| {
+                    !data.elements.nodes.is_empty()
+                        || !self.type_contains_type_parameter(*element)
                 });
                 let mut element_types = Vec::with_capacity(data.elements.nodes.len());
                 for (index, element) in data.elements.nodes.iter().enumerate() {
@@ -10939,9 +10962,16 @@ impl<'a> Checker<'a> {
                     return None;
                 }
                 let mut inference = HashMap::new();
+                let mut inference_context = InferenceContext::default();
                 for (index, actual) in actuals.iter().enumerate() {
                     let parameter = self.signature_parameter_at(signature, index)?;
-                    self.infer_type_parameters(parameter, *actual, &mut inference);
+                    self.infer_type_parameters(
+                        parameter,
+                        *actual,
+                        &mut inference,
+                        &mut inference_context,
+                        InferenceVariance::Covariant,
+                    );
                     let expected = self.substitute_type(parameter, &inference);
                     if (self.function_type_requires_predicate(expected)
                         && !self.function_type_returns_predicate(*actual))
@@ -10955,6 +10985,7 @@ impl<'a> Checker<'a> {
                 self.apply_type_parameter_defaults(signature, &mut inference);
                 self.apply_uninferred_overload_type_parameters(signature, &mut inference);
                 let result = self.substitute_type(signature.return_type, &inference);
+                self.mark_direct_literal_call_result(result, arguments);
                 if let Some(reference) = constructed_import_reference.clone() {
                     self.result
                         .import_type_references
@@ -10985,13 +11016,19 @@ impl<'a> Checker<'a> {
             self.error(node, 2554, [expected, arguments.len().to_string()]);
         }
         let mut inference = HashMap::new();
+        let mut inference_context = InferenceContext::default();
         for (index, argument) in arguments.iter().enumerate() {
             let Some(parameter) = self.signature_parameter_at(signature, index) else {
                 self.type_of_expression(*argument);
                 continue;
             };
             let inferred_object_properties =
-                self.infer_object_literal_properties(parameter, *argument, &mut inference);
+                self.infer_object_literal_properties(
+                    parameter,
+                    *argument,
+                    &mut inference,
+                    &mut inference_context,
+                );
             let actual = if self.mapped_return_templates.contains_key(&parameter) {
                 self.type_of_expression(*argument)
             } else {
@@ -11015,7 +11052,13 @@ impl<'a> Checker<'a> {
                 actual
             };
             if !inferred_object_properties {
-                self.infer_type_parameters(parameter, inference_actual, &mut inference);
+                self.infer_type_parameters(
+                    parameter,
+                    inference_actual,
+                    &mut inference,
+                    &mut inference_context,
+                    InferenceVariance::Covariant,
+                );
             }
             self.preserve_literal_inference = preserve_literal_inference;
             self.infer_named_type_parameters_from_argument(parameter, *argument, &mut inference);
@@ -11038,6 +11081,7 @@ impl<'a> Checker<'a> {
         }
         self.apply_type_parameter_defaults(signature, &mut inference);
         let result = self.substitute_type(signature.return_type, &inference);
+        self.mark_direct_literal_call_result(result, arguments);
         if let Some(reference) = constructed_import_reference {
             self.result
                 .import_type_references
@@ -11046,6 +11090,34 @@ impl<'a> Checker<'a> {
         }
         self.active_defaulted_type_parameters.clear();
         result
+    }
+
+    fn mark_direct_literal_call_result(&mut self, result: TypeId, arguments: &[NodeId]) {
+        let Some(result_kind) = self.result.types.get(result).map(|type_| type_.kind.clone()) else {
+            return;
+        };
+        if !matches!(
+            &result_kind,
+            TypeKind::BooleanLiteral(_)
+                | TypeKind::NumberLiteral(_)
+                | TypeKind::StringLiteral(_)
+                | TypeKind::BigIntLiteral(_)
+        ) || !arguments.iter().any(|argument| {
+            self.result
+                .node_types
+                .get(argument)
+                .and_then(|actual| self.result.types.get(*actual))
+                .is_some_and(|actual| actual.kind == result_kind)
+        }) {
+            return;
+        }
+        self.result.named_type_references.insert(
+            result,
+            NamedTypeReference {
+                name: "__fresh_literal".into(),
+                type_arguments: Vec::new(),
+            },
+        );
     }
 
     fn function_type_requires_predicate(&self, type_id: TypeId) -> bool {
@@ -11307,12 +11379,20 @@ impl<'a> Checker<'a> {
         parameter: TypeId,
         actual: TypeId,
         inference: &mut HashMap<TypeId, TypeId>,
+        context: &mut InferenceContext,
+        variance: InferenceVariance,
     ) {
         if let (Some(parameter_predicate), Some(actual_predicate)) = (
             self.type_predicate_target(parameter),
             self.type_predicate_target(actual),
         ) {
-            self.infer_type_parameters(parameter_predicate, actual_predicate, inference);
+            self.infer_type_parameters(
+                parameter_predicate,
+                actual_predicate,
+                inference,
+                context,
+                variance,
+            );
         }
         let reverse_mapped_parameter = self
             .reverse_mapped_type_parameters
@@ -11325,7 +11405,13 @@ impl<'a> Checker<'a> {
             && let Some(reversed) =
                 self.reverse_mapped_inference_type(actual, &mut HashSet::new())
         {
-            self.infer_type_parameters(type_parameter, reversed, inference);
+            self.infer_type_parameters(
+                type_parameter,
+                reversed,
+                inference,
+                context,
+                variance,
+            );
         }
         if let Some((type_node, parameters)) = self.mapped_return_templates.get(&parameter).cloned()
             && matches!(
@@ -11363,8 +11449,21 @@ impl<'a> Checker<'a> {
                 .into_iter()
                 .zip(actual_reference.type_arguments)
             {
-                self.infer_type_parameters(parameter, actual, inference);
+                self.infer_type_parameters(parameter, actual, inference, context, variance);
             }
+        }
+        if let Some(reference) = self.result.named_type_references.get(&parameter).cloned()
+            && matches!(reference.name.as_str(), "Array" | "ReadonlyArray")
+            && let [element] = reference.type_arguments.as_slice()
+            && let Some(actual_element) = self.array_like_element_type(actual)
+        {
+            self.infer_type_parameters(
+                *element,
+                actual_element,
+                inference,
+                context,
+                variance,
+            );
         }
         if let Some(reference) = self.result.named_type_references.get(&parameter).cloned()
             && let Some(TypeKind::Object(actual_object)) = self
@@ -11410,22 +11509,71 @@ impl<'a> Checker<'a> {
                 } else {
                     self.widen_literal(actual)
                 };
-                inference
-                    .entry(parameter)
-                    .and_modify(|current| {
-                        let current_uninformative = self.inference_type_is_uninformative(*current);
-                        let actual_uninformative = self.inference_type_is_uninformative(actual);
-                        if current_uninformative && !actual_uninformative {
-                            *current = actual;
-                        } else if !actual_uninformative {
-                            *current = self.result.types.union([*current, actual]);
+                let actual_is_never = actual == self.result.types.never();
+                match variance {
+                    InferenceVariance::Covariant if !actual_is_never => {
+                        if context.covariant.insert(parameter) {
+                            inference.insert(parameter, actual);
+                        } else {
+                            inference
+                                .entry(parameter)
+                                .and_modify(|current| {
+                                    let current_uninformative =
+                                        self.inference_type_is_uninformative(*current);
+                                    let actual_uninformative =
+                                        self.inference_type_is_uninformative(actual);
+                                    if current_uninformative && !actual_uninformative {
+                                        *current = actual;
+                                    } else if !actual_uninformative {
+                                        *current = self.result.types.union([*current, actual]);
+                                    }
+                                })
+                                .or_insert(actual);
                         }
-                    })
-                    .or_insert(actual);
+                    }
+                    InferenceVariance::Contravariant
+                        if context.covariant.contains(&parameter) => {}
+                    InferenceVariance::Contravariant => {
+                        inference
+                            .entry(parameter)
+                            .and_modify(|current| {
+                                let current_is_object = self
+                                    .result
+                                    .named_type_references
+                                    .get(current)
+                                    .is_some_and(|reference| reference.name == "Object");
+                                let actual_is_object = self
+                                    .result
+                                    .named_type_references
+                                    .get(&actual)
+                                    .is_some_and(|reference| reference.name == "Object");
+                                if *current == self.result.types.never()
+                                    || current_is_object
+                                    || self.is_assignable(actual, *current)
+                                {
+                                    *current = actual;
+                                } else if !actual_is_object
+                                    && !self.is_assignable(*current, actual)
+                                {
+                                    *current = self.result.types.intersection([*current, actual]);
+                                }
+                            })
+                            .or_insert(actual);
+                    }
+                    InferenceVariance::Covariant => {
+                        inference.entry(parameter).or_insert(actual);
+                    }
+                }
             }
             TypeKind::Array(parameter_element) => {
                 if let Some(actual_element) = self.array_like_element_type(actual) {
-                    self.infer_type_parameters(parameter_element, actual_element, inference);
+                    self.infer_type_parameters(
+                        parameter_element,
+                        actual_element,
+                        inference,
+                        context,
+                        variance,
+                    );
                 }
             }
             TypeKind::Tuple(parameter_elements) | TypeKind::ReadonlyTuple(parameter_elements) => {
@@ -11433,7 +11581,13 @@ impl<'a> Checker<'a> {
                     self.result.types.get(actual).unwrap().kind.clone()
                 {
                     for (parameter, actual) in parameter_elements.iter().zip(&actual_elements) {
-                        self.infer_type_parameters(*parameter, *actual, inference);
+                        self.infer_type_parameters(
+                            *parameter,
+                            *actual,
+                            inference,
+                            context,
+                            variance,
+                        );
                     }
                 }
             }
@@ -11450,7 +11604,13 @@ impl<'a> Checker<'a> {
                             self.result.types.get(*member).map(|type_| &type_.kind),
                             Some(TypeKind::TypeParameter { .. })
                         ) {
-                            self.infer_type_parameters(*member, *payload, inference);
+                            self.infer_type_parameters(
+                                *member,
+                                *payload,
+                                inference,
+                                context,
+                                variance,
+                            );
                         }
                     }
                     return;
@@ -11462,13 +11622,15 @@ impl<'a> Checker<'a> {
                 let best = scores.iter().map(|(_, score)| *score).max().unwrap_or(0);
                 for (member, score) in scores {
                     if score == best {
-                        self.infer_type_parameters(member, actual, inference);
+                        self.infer_type_parameters(
+                            member, actual, inference, context, variance,
+                        );
                     }
                 }
             }
             TypeKind::Intersection(members) => {
                 for member in members {
-                    self.infer_type_parameters(member, actual, inference);
+                    self.infer_type_parameters(member, actual, inference, context, variance);
                 }
             }
             TypeKind::Object(parameter_object) => {
@@ -11476,7 +11638,13 @@ impl<'a> Checker<'a> {
                     TypeKind::Object(actual_object) => {
                         for (name, parameter) in &parameter_object.properties {
                             if let Some(actual) = actual_object.properties.get(name) {
-                                self.infer_type_parameters(*parameter, *actual, inference);
+                                self.infer_type_parameters(
+                                    *parameter,
+                                    *actual,
+                                    inference,
+                                    context,
+                                    variance,
+                                );
                             }
                         }
                         if let Some(parameter) = parameter_object.string_index_type {
@@ -11487,7 +11655,9 @@ impl<'a> Checker<'a> {
                                 .chain(actual_object.string_index_type)
                                 .chain(actual_object.number_index_type)
                             {
-                                self.infer_type_parameters(parameter, actual, inference);
+                                self.infer_type_parameters(
+                                    parameter, actual, inference, context, variance,
+                                );
                             }
                         }
                         if let Some(parameter) = parameter_object.number_index_type {
@@ -11502,7 +11672,9 @@ impl<'a> Checker<'a> {
                                         .or(actual_object.string_index_type),
                                 )
                             {
-                                self.infer_type_parameters(parameter, actual, inference);
+                                self.infer_type_parameters(
+                                    parameter, actual, inference, context, variance,
+                                );
                             }
                         }
                         for (parameter, actual) in parameter_object
@@ -11510,29 +11682,39 @@ impl<'a> Checker<'a> {
                             .iter()
                             .zip(&actual_object.call_signatures)
                         {
-                            self.infer_signature_type_parameters(parameter, actual, inference);
+                            self.infer_signature_type_parameters(
+                                parameter, actual, inference, context, variance,
+                            );
                         }
                         for (parameter, actual) in parameter_object
                             .construct_signatures
                             .iter()
                             .zip(&actual_object.construct_signatures)
                         {
-                            self.infer_signature_type_parameters(parameter, actual, inference);
+                            self.infer_signature_type_parameters(
+                                parameter, actual, inference, context, variance,
+                            );
                         }
                     }
                     TypeKind::Function(actual) => {
                         if let Some(parameter) = parameter_object.call_signatures.first() {
-                            self.infer_signature_type_parameters(parameter, &actual, inference);
+                            self.infer_signature_type_parameters(
+                                parameter, &actual, inference, context, variance,
+                            );
                         }
                     }
                     TypeKind::Constructor(actual) => {
                         if let Some(parameter) = parameter_object.construct_signatures.first() {
-                            self.infer_signature_type_parameters(parameter, &actual, inference);
+                            self.infer_signature_type_parameters(
+                                parameter, &actual, inference, context, variance,
+                            );
                         }
                     }
                     TypeKind::Intersection(actual_members) => {
                         for actual in actual_members {
-                            self.infer_type_parameters(parameter, actual, inference);
+                            self.infer_type_parameters(
+                                parameter, actual, inference, context, variance,
+                            );
                         }
                     }
                     _ => {}
@@ -11546,6 +11728,8 @@ impl<'a> Checker<'a> {
                         &parameter_signature,
                         &actual_signature,
                         inference,
+                        context,
+                        variance,
                     );
                 }
             }
@@ -11557,6 +11741,8 @@ impl<'a> Checker<'a> {
                         &parameter_signature,
                         &actual_signature,
                         inference,
+                        context,
+                        variance,
                     );
                 }
             }
@@ -11632,14 +11818,34 @@ impl<'a> Checker<'a> {
         parameter: &FunctionType,
         actual: &FunctionType,
         inference: &mut HashMap<TypeId, TypeId>,
+        context: &mut InferenceContext,
+        variance: InferenceVariance,
     ) {
         for (parameter, actual) in parameter.parameters.iter().zip(&actual.parameters) {
-            self.infer_type_parameters(*parameter, *actual, inference);
+            self.infer_type_parameters(
+                *parameter,
+                *actual,
+                inference,
+                context,
+                variance.flipped(),
+            );
         }
         if let (Some(parameter), Some(actual)) = (parameter.rest_parameter, actual.rest_parameter) {
-            self.infer_type_parameters(parameter, actual, inference);
+            self.infer_type_parameters(
+                parameter,
+                actual,
+                inference,
+                context,
+                variance.flipped(),
+            );
         }
-        self.infer_type_parameters(parameter.return_type, actual.return_type, inference);
+        self.infer_type_parameters(
+            parameter.return_type,
+            actual.return_type,
+            inference,
+            context,
+            variance,
+        );
     }
 
     fn inference_type_is_uninformative(&self, type_id: TypeId) -> bool {
@@ -11665,6 +11871,7 @@ impl<'a> Checker<'a> {
         parameter: TypeId,
         argument: NodeId,
         inference: &mut HashMap<TypeId, TypeId>,
+        context: &mut InferenceContext,
     ) -> bool {
         let Some(NodeData::ObjectLiteralExpression(object)) =
             self.arena.get(argument).map(|node| &node.data)
@@ -11672,7 +11879,7 @@ impl<'a> Checker<'a> {
             return false;
         };
         let properties = object.properties.nodes.clone();
-        let Some(context) = self.contextual_object_type(parameter) else {
+        let Some(object_context) = self.contextual_object_type(parameter) else {
             return false;
         };
         let mut inferred = false;
@@ -11685,14 +11892,20 @@ impl<'a> Checker<'a> {
             let Some(name) = self.property_name(property.name) else {
                 continue;
             };
-            let Some(expected) = context.properties.get(&name).copied() else {
+            let Some(expected) = object_context.properties.get(&name).copied() else {
                 continue;
             };
             let initializer = property.initializer;
             let contextual = self.substitute_type(expected, inference);
             self.clear_cached_expression_types(initializer);
             let actual = self.type_of_expression_context(initializer, Some(contextual));
-            self.infer_type_parameters(expected, actual, inference);
+            self.infer_type_parameters(
+                expected,
+                actual,
+                inference,
+                context,
+                InferenceVariance::Covariant,
+            );
             inferred = true;
         }
         inferred
@@ -23145,6 +23358,32 @@ mod tests {
         assert_eq!(returned.parameter_names, ["s", "s_1"]);
         assert_eq!(returned.rest_parameter, None);
         assert_eq!(returned.return_type, result.types.void());
+    }
+
+    #[test]
+    fn infers_strict_function_variance_and_empty_readonly_arrays() {
+        let parsed = parse_source_file(
+            r#"
+                interface ReadonlyArray<T> { readonly [index: number]: T; }
+                declare function choose<T>(left: (x: T) => void, right: (x: T) => void): T;
+                declare function read<T>(values: ReadonlyArray<T>): T;
+                declare function object(x: Object): void;
+                declare function string(x: string): void;
+                const selected = choose(object, string);
+                const empty = read([]);
+            "#,
+        );
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        let root = bindings.root_scope().unwrap();
+        let selected = result
+            .type_of_symbol(root.symbols.get("selected").unwrap())
+            .unwrap();
+        let empty = result
+            .type_of_symbol(root.symbols.get("empty").unwrap())
+            .unwrap();
+        assert_eq!(result.types.display(selected), "string");
+        assert_eq!(result.types.display(empty), "never");
     }
 
     #[test]
