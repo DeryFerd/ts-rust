@@ -338,6 +338,12 @@ pub fn parse_jsdoc_comment(source: &str) -> JsDocParseResult {
     }
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum TypeParseContext {
+    Normal,
+    TupleElement,
+}
+
 struct Parser<'a> {
     scanner: Scanner<'a>,
     current: Token<'a>,
@@ -350,6 +356,7 @@ struct Parser<'a> {
     amd_module_names: Vec<AmdModuleName>,
     disallow_in: bool,
     await_context: bool,
+    type_parse_context: TypeParseContext,
 }
 
 impl<'a> Parser<'a> {
@@ -384,6 +391,7 @@ impl<'a> Parser<'a> {
             amd_module_names,
             disallow_in: false,
             await_context: false,
+            type_parse_context: TypeParseContext::Normal,
         }
     }
 
@@ -7371,6 +7379,7 @@ impl<'a> Parser<'a> {
                     .flags
                     .contains(ScannerTokenFlags::PRECEDING_LINE_BREAK)
                 && !self.next_token_starts_type()
+                && !self.postfix_question_belongs_to_tuple()
             {
                 let end = self.consume().range.end;
                 type_node = self.alloc_node(
@@ -7425,6 +7434,14 @@ impl<'a> Parser<'a> {
             );
         }
         type_node
+    }
+
+    fn postfix_question_belongs_to_tuple(&mut self) -> bool {
+        self.type_parse_context == TypeParseContext::TupleElement
+            && matches!(
+                self.next_token_kind(),
+                SyntaxKind::CommaToken | SyntaxKind::CloseBracketToken
+            )
     }
 
     fn alloc_non_nullable_type(&mut self, type_node: NodeId, range: TextRange) -> NodeId {
@@ -8156,10 +8173,11 @@ impl<'a> Parser<'a> {
             let dot_dot_dot_token = (self.current.kind == SyntaxKind::DotDotDotToken)
                 .then(|| self.consume_token_node());
             let named = self.current.kind == SyntaxKind::Identifier
-                && matches!(
-                    self.next_token_kind(),
-                    SyntaxKind::ColonToken | SyntaxKind::QuestionToken
-                );
+                && (self.next_token_kind() == SyntaxKind::ColonToken
+                    || self.next_tokens_are(
+                        SyntaxKind::QuestionToken,
+                        SyntaxKind::ColonToken,
+                    ));
             if named {
                 let name = self.parse_identifier("Expected a tuple element name.");
                 let question_token = (self.current.kind == SyntaxKind::QuestionToken)
@@ -8195,7 +8213,10 @@ impl<'a> Parser<'a> {
                     &[dot_dot_dot_token, type_node],
                 ));
             } else {
+                let previous_context = self.type_parse_context;
+                self.type_parse_context = TypeParseContext::TupleElement;
                 let type_node = self.parse_type();
+                self.type_parse_context = previous_context;
                 if self.current.kind == SyntaxKind::QuestionToken {
                     let end = self.consume().range.end;
                     elements.push(self.alloc_node(
@@ -13038,7 +13059,9 @@ mod tests {
 
     #[test]
     fn optional_tuple_annotation_stops_before_variable_initializer() {
-        let result = parse_source_file("let [value = { a: 1 }]: [{ a: number }?] = [];");
+        let result = parse_source_file(
+            "let [value = { a: 1 }]: [{ a: number }?] = []; type Alias<T> = [T?];",
+        );
         assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
         let (list, _) = variable_list(&result, source_statements(&result)[0]);
         let declaration = declaration_nodes(&result, list)[0];
@@ -13054,6 +13077,18 @@ mod tests {
             panic!("expected tuple annotation");
         };
         assert_eq!(tuple.elements.nodes.len(), 1);
+        assert_eq!(
+            result.arena.get(tuple.elements.nodes[0]).unwrap().kind,
+            SyntaxKind::OptionalType
+        );
+        let NodeData::TypeAliasDeclaration(alias) =
+            &result.arena.get(source_statements(&result)[1]).unwrap().data
+        else {
+            panic!("expected type alias");
+        };
+        let NodeData::TupleTypeNode(tuple) = &result.arena.get(alias.type_).unwrap().data else {
+            panic!("expected tuple alias");
+        };
         assert_eq!(
             result.arena.get(tuple.elements.nodes[0]).unwrap().kind,
             SyntaxKind::OptionalType
