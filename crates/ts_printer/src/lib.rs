@@ -29858,7 +29858,60 @@ impl Printer<'_> {
         Ok(true)
     }
 
+    fn expression_statement_is_type_alias_recovery_tail(
+        &self,
+        id: NodeId,
+        node: &Node,
+    ) -> bool {
+        if !matches!(node.data, NodeData::ExpressionStatement(_)) {
+            return false;
+        }
+        let source_starts_with_equals = usize::try_from(node.range.start.get())
+            .ok()
+            .zip(usize::try_from(node.range.end.get()).ok())
+            .and_then(|(start, end)| self.source_text.get(start..end))
+            .is_some_and(|source| source.trim_start().starts_with('='));
+        if !source_starts_with_equals {
+            return false;
+        }
+        let Some(parent) = node.parent.and_then(|parent| self.arena.get(parent)) else {
+            return false;
+        };
+        let statements = match &parent.data {
+            NodeData::SourceFile(file) => &file.statements.nodes,
+            NodeData::ModuleBlock(block) => &block.statements.nodes,
+            NodeData::Block(block) => &block.statements.nodes,
+            _ => return false,
+        };
+        let Some(index) = statements.iter().position(|statement| *statement == id) else {
+            return false;
+        };
+        let Some(previous) = index
+            .checked_sub(1)
+            .and_then(|previous| statements.get(previous))
+            .and_then(|previous| self.arena.get(*previous))
+        else {
+            return false;
+        };
+        matches!(
+            &previous.data,
+            NodeData::TypeAliasDeclaration(alias)
+                if declaration_name_text(self.arena, alias.name) == Some("undefined")
+                    || self.arena.get(alias.name).is_some_and(|name| {
+                        name.kind == SyntaxKind::UndefinedKeyword
+                    })
+                    || usize::try_from(previous.range.start.get())
+                        .ok()
+                        .zip(usize::try_from(previous.range.end.get()).ok())
+                        .and_then(|(start, end)| self.source_text.get(start..end))
+                        .is_some_and(|source| source.trim_end().ends_with(" undefined"))
+        )
+    }
+
     fn statement_emits_runtime(&self, id: NodeId, node: &Node) -> bool {
+        if self.expression_statement_is_type_alias_recovery_tail(id, node) {
+            return false;
+        }
         if let NodeData::TypeAliasDeclaration(alias) = &node.data
             && self.recovered_type_alias_declare_break(alias).is_some()
         {
@@ -30371,6 +30424,9 @@ impl Printer<'_> {
         let Some(node) = self.arena.get(statement) else {
             return false;
         };
+        if self.expression_statement_is_type_alias_recovery_tail(statement, node) {
+            return false;
+        }
         if let NodeData::ExportDeclaration(export) = &node.data {
             return export.module_specifier.is_none()
                 && self.named_export_clause_has_runtime_specifier(export) == Some(true);
@@ -30826,6 +30882,9 @@ impl Printer<'_> {
     #[allow(clippy::too_many_lines)]
     fn emit_statement(&mut self, id: NodeId) -> Result<(), EmitError> {
         let node = self.node(id)?.clone();
+        if self.expression_statement_is_type_alias_recovery_tail(id, &node) {
+            return Ok(());
+        }
         if let NodeData::TypeAliasDeclaration(alias) = &node.data
             && self.emit_recovered_type_alias_declare_break(alias)?
         {
