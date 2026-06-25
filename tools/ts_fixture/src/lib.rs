@@ -775,12 +775,9 @@ fn compile_case_variant(case: &Case, variant: &OptionVariant) -> std::io::Result
             )?;
         }
         if is_compilation_unit(&path)
-            && project_directory.as_ref().is_none_or(|directory| {
-                path_is_within_directory(&path, directory)
-                    && !path
-                        .split('/')
-                        .any(|component| component.eq_ignore_ascii_case("node_modules"))
-            })
+            && !path
+                .split('/')
+                .any(|component| component.eq_ignore_ascii_case("node_modules"))
         {
             roots.push(path);
         }
@@ -1528,6 +1525,25 @@ mod tests {
         );
         assert_eq!(case.directives[1].line, 2);
         assert_eq!(case.directives[1].raw_text, "// @strict: true");
+    }
+
+    #[test]
+    fn does_not_promote_node_modules_units_to_compilation_roots() {
+        let case = Case::parse(
+            "dependencyUnit.ts",
+            concat!(
+                "// @target: es2015\n",
+                "// @filename: /main.ts\nexport const main = 1;\n",
+                "// @filename: /node_modules/pkg/index.ts\nexport const dependency = 1;\n",
+            ),
+        )
+        .unwrap();
+        let compilation = compile_case(&case).unwrap();
+        assert!(compilation.outputs.keys().any(|path| path.ends_with("main.js")));
+        assert!(compilation
+            .outputs
+            .keys()
+            .all(|path| !path.contains("node_modules")));
     }
 
     #[test]
