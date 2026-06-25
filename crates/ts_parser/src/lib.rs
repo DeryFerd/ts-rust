@@ -5556,6 +5556,10 @@ impl<'a> Parser<'a> {
         let checkpoint = self.scanner.mark();
         let mut depth = 1_u32;
         let mut token = self.scanner.scan();
+        if token.kind == SyntaxKind::OpenParenToken {
+            self.scanner.rewind(checkpoint);
+            return false;
+        }
         while token.kind != SyntaxKind::EndOfFile {
             match token.kind {
                 SyntaxKind::OpenParenToken => depth += 1,
@@ -9311,6 +9315,38 @@ mod tests {
                 .data,
             NodeData::ArrowFunction(_)
         ));
+    }
+
+    #[test]
+    fn parses_generic_arrow_after_parenthesized_function_return_type() {
+        let result = parse_source_file("const fn = <T>(): (() => T) => null as any;");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let (list, _) = variable_list(&result, source_statements(&result)[0]);
+        let declaration = declaration_nodes(&result, list)[0];
+        let NodeData::VariableDeclaration(declaration) =
+            &result.arena.get(declaration).unwrap().data
+        else {
+            panic!("expected variable declaration");
+        };
+        let NodeData::ArrowFunction(arrow) = &result
+            .arena
+            .get(declaration.initializer.unwrap())
+            .unwrap()
+            .data
+        else {
+            panic!("expected arrow function");
+        };
+        assert!(matches!(
+            &result.arena.get(arrow.type_.unwrap()).unwrap().data,
+            NodeData::ParenthesizedTypeNode(_)
+        ));
+        let NodeData::AsExpression(body) = &result.arena.get(arrow.body).unwrap().data else {
+            panic!("expected asserted null body");
+        };
+        assert_eq!(
+            result.arena.get(body.expression).unwrap().kind,
+            SyntaxKind::NullKeyword
+        );
     }
 
     #[test]
