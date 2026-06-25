@@ -339,7 +339,7 @@ fn parse_baseline_section_list(baseline: &str) -> Vec<(String, String)> {
         }
         if let Some(name) = marker
             .strip_prefix("//// [")
-            .and_then(|marker| marker.split_once(']').map(|(name, _)| name))
+            .and_then(|marker| marker.rsplit_once(']').map(|(name, _)| name))
         {
             if let Some(name) = current_name.replace(name.to_owned()) {
                 sections.push((name, std::mem::take(&mut current_text)));
@@ -1938,6 +1938,18 @@ mod tests {
         assert_eq!(sections.len(), 2);
         assert_eq!(sections["input.ts"], "const value: number = 1;\n");
         assert_eq!(sections["input.js"], "const value = 1;\n");
+    }
+
+    #[test]
+    fn parses_baseline_section_names_containing_brackets() {
+        let sections = parse_baseline_sections(concat!(
+            "//// [input[one].ts] ////\n",
+            "const value: number = 1;\n",
+            "//// [input[one].js] ////\n",
+            "const value = 1;\n",
+        ));
+        assert_eq!(sections["input[one].ts"], "const value: number = 1;\n");
+        assert_eq!(sections["input[one].js"], "const value = 1;\n");
     }
 
     #[test]

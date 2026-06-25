@@ -902,9 +902,9 @@ impl Program {
                             source_map.file = file_name.rsplit('/').next().map(str::to_owned);
                             if let Some(map_file_name) = paths.declaration_map.clone() {
                                 emitted.code.push_str("//# sourceMappingURL=");
-                                emitted.code.push_str(
+                                emitted.code.push_str(&percent_encode_source_map_url(
                                     map_file_name.rsplit('/').next().unwrap_or(&map_file_name),
-                                );
+                                ));
                                 emitted.code.push('\n');
                                 output.files.push(OutputFile {
                                     file_name: map_file_name,
@@ -1429,7 +1429,9 @@ impl Program {
                 map.file = file_name.rsplit('/').next().map(str::to_owned);
                 if let Some(map_file_name) = paths.declaration_map.clone() {
                     code.push_str("//# sourceMappingURL=");
-                    code.push_str(map_file_name.rsplit('/').next().unwrap_or(&map_file_name));
+                    code.push_str(&percent_encode_source_map_url(
+                        map_file_name.rsplit('/').next().unwrap_or(&map_file_name),
+                    ));
                     code.push('\n');
                     output.files.push(OutputFile {
                         file_name: map_file_name,
@@ -1622,9 +1624,14 @@ impl Program {
 
     fn source_map_url(&self, generated_file: &str, map_file: &str) -> String {
         let Some(logical_map) = self.logical_source_map_path(map_file) else {
-            return map_file.rsplit('/').next().unwrap_or(map_file).to_owned();
+            return percent_encode_source_map_url(
+                map_file.rsplit('/').next().unwrap_or(map_file),
+            );
         };
-        relative_path(&directory_path(generated_file), &logical_map)
+        percent_encode_source_map_url(&relative_path(
+            &directory_path(generated_file),
+            &logical_map,
+        ))
     }
 
     fn logical_source_map_path(&self, map_file: &str) -> Option<String> {
@@ -4855,6 +4862,44 @@ fn base64_encode(bytes: &[u8]) -> String {
     encoded
 }
 
+fn percent_encode_source_map_url(url: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(url.len());
+    for byte in url.bytes() {
+        if byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'-' | b'_'
+                    | b'.'
+                    | b'!'
+                    | b'~'
+                    | b'*'
+                    | b'\''
+                    | b'('
+                    | b')'
+                    | b';'
+                    | b'/'
+                    | b'?'
+                    | b':'
+                    | b'@'
+                    | b'&'
+                    | b'='
+                    | b'+'
+                    | b'$'
+                    | b','
+                    | b'#'
+            )
+        {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+    }
+    encoded
+}
+
 fn module_specifiers(parse: &ParseResult) -> Vec<(String, TextRange, bool, bool)> {
     let mut specifiers = parse
         .arena
@@ -5265,7 +5310,7 @@ mod tests {
     use ts_options::{CompilerOptions, ModuleKind, ScriptTarget};
     use ts_vfs::{FileSystem, MemoryFileSystem};
 
-    use super::{Program, defer_export_only_bundle_imports};
+    use super::{Program, defer_export_only_bundle_imports, percent_encode_source_map_url};
 
     #[test]
     fn parses_and_indexes_explicit_roots() {
@@ -10295,6 +10340,14 @@ export function create() { return new M.Value(); }"#,
                 .files
                 .iter()
                 .all(|file| file.file_name != "/project/main.d.ts")
+        );
+    }
+
+    #[test]
+    fn percent_encodes_source_map_urls_without_encoding_path_separators() {
+        assert_eq!(
+            percent_encode_source_map_url("../maps/① file[one].js.map"),
+            "../maps/%E2%91%A0%20file%5Bone%5D.js.map"
         );
     }
 }

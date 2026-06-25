@@ -18632,6 +18632,41 @@ impl DeclarationPrinter<'_> {
                     self.writer.newline();
                     continue;
                 }
+                let overload = self
+                    .semantic_types
+                    .and_then(|types| types.get(*type_id))
+                    .and_then(|type_| match &type_.kind {
+                        TypeKind::Overload(signatures) => Some(signatures.clone()),
+                        TypeKind::Object(overload)
+                            if overload.call_signatures.len() > 1
+                                && overload.properties.is_empty()
+                                && overload.construct_signatures.is_empty()
+                                && overload.number_index_type.is_none()
+                                && overload.string_index_type.is_none() =>
+                        {
+                            Some(overload.call_signatures.clone())
+                        }
+                        _ => None,
+                    });
+                if methods
+                    && let Some(signatures) = overload.as_ref()
+                    && let Some(members) =
+                        self.source_class_expression_overload_members(object, &name)
+                    && signatures.len() >= members.len()
+                {
+                    for (signature, member) in signatures.iter().zip(members) {
+                        self.emit_leading_jsdoc(member);
+                        self.emit_semantic_property_name(&name);
+                        self.emit_inferred_semantic_type_parameters(signature)?;
+                        self.writer.write("(");
+                        self.emit_semantic_parameters(signature, None)?;
+                        self.writer.write("): ");
+                        self.emit_semantic_type(signature.return_type)?;
+                        self.writer.write(";");
+                        self.writer.newline();
+                    }
+                    continue;
+                }
                 if object.readonly_properties.contains(&name) {
                     self.writer.write("readonly ");
                 }
@@ -18674,13 +18709,6 @@ impl DeclarationPrinter<'_> {
                     });
                 let recursive_this_method =
                     self.source_object_method_returns_this(object, &name);
-                let overload = self
-                    .semantic_types
-                    .and_then(|types| types.get(*type_id))
-                    .and_then(|type_| match &type_.kind {
-                        TypeKind::Overload(signatures) => Some(signatures.clone()),
-                        _ => None,
-                    });
                 if let Some(signatures) = overload {
                     self.writer.write(": {");
                     self.writer.newline();
@@ -18836,6 +18864,64 @@ impl DeclarationPrinter<'_> {
                             ) && type_member_name_text(self.arena, *member) == Some(name)
                     )
                 })
+        })
+    }
+
+    fn source_class_expression_overload_members(
+        &self,
+        object: &ObjectType,
+        name: &str,
+    ) -> Option<Vec<NodeId>> {
+        self.arena.iter().find_map(|(_, node)| {
+            let NodeData::ClassExpression(class) = &node.data else {
+                return None;
+            };
+            let instance_names = class
+                .members
+                .nodes
+                .iter()
+                .filter_map(|member| {
+                    let member_node = self.arena.get(*member)?;
+                    let modifiers = match &member_node.data {
+                        NodeData::PropertyDeclaration(member) => member.modifiers.as_ref(),
+                        NodeData::MethodDeclaration(member) => member.modifiers.as_ref(),
+                        NodeData::GetAccessorDeclaration(member) => member.modifiers.as_ref(),
+                        NodeData::SetAccessorDeclaration(member) => member.modifiers.as_ref(),
+                        _ => return None,
+                    };
+                    (!self.member_has_modifier(modifiers, SyntaxKind::StaticKeyword))
+                        .then(|| type_member_name_text(self.arena, *member))
+                        .flatten()
+                        .map(str::to_owned)
+                })
+                .collect::<BTreeSet<_>>();
+            if instance_names.len() != object.properties.len()
+                || !object
+                    .properties
+                    .keys()
+                    .all(|property| instance_names.contains(property))
+            {
+                return None;
+            }
+            let members = class
+                .members
+                .nodes
+                .iter()
+                .copied()
+                .filter(|member| {
+                    matches!(
+                        self.arena.get(*member).map(|node| &node.data),
+                        Some(NodeData::MethodDeclaration(method))
+                            if method.body.is_none()
+                                && !self.member_has_modifier(
+                                    method.modifiers.as_ref(),
+                                    SyntaxKind::StaticKeyword,
+                                )
+                                && type_member_name_text(self.arena, *member) == Some(name)
+                    )
+                })
+                .collect::<Vec<_>>();
+            (!members.is_empty()).then_some(members)
         })
     }
 
@@ -43892,10 +43978,8 @@ impl Printer<'_> {
                     let mut count = 0;
                     for element in &pattern.elements.nodes {
                         match arena.get(*element).map(|node| &node.data) {
-                            Some(NodeData::OmittedExpression(_)) => {}
                             Some(NodeData::BindingElement(element))
-                                if element.dot_dot_dot_token.is_none()
-                                    && element.initializer.is_none() =>
+                                if element.initializer.is_none() =>
                             {
                                 count += leaf_count(arena, element.name?)?;
                             }
@@ -44061,6 +44145,27 @@ impl Printer<'_> {
                 self.writer.write(temp);
             } else {
                 self.emit_parameter_binding_name(data.name)?;
+            }
+            let name_end = self.node(data.name)?.range.end.get();
+            let erased_tail_end = data.initializer.map_or(node.range.end.get(), |initializer| {
+                self.arena
+                    .get(initializer)
+                    .map_or(node.range.end.get(), |initializer| {
+                        initializer.range.start.get()
+                    })
+            });
+            if self.trivia_has_block_comment(name_end, erased_tail_end) {
+                if self
+                    .source_text
+                    .get(
+                        usize::try_from(name_end).unwrap_or(usize::MAX)
+                            ..usize::try_from(erased_tail_end).unwrap_or(usize::MAX),
+                    )
+                    .is_some_and(|trivia| trivia.starts_with("/*"))
+                {
+                    self.writer.write(" ");
+                }
+                self.emit_block_comment_trivia(name_end, erased_tail_end, false);
             }
             if emit_initializers && let Some(initializer) = data.initializer {
                 self.writer.write(" = ");
@@ -59720,6 +59825,24 @@ mod tests {
             .code,
             "for (var _i = 0, _a = rows(); _i < _a.length; _i++) {\n    var _b = _a[_i], x = _b[0], y = _b[1];\n    use(x, y);\n}\n"
         );
+        assert_eq!(
+            emit_with(
+                "for (let [, second] = make(), i = 0; i < 1; i++) use(second);",
+                ScriptTarget::Es5,
+                ModuleKind::EsNext,
+            )
+            .code,
+            "for (var _a = make(), second = _a[1], i = 0; i < 1; i++)\n    use(second);\n"
+        );
+        assert_eq!(
+            emit_with(
+                "for (let [...all] = make(), i = 0; i < 1; i++) use(all);",
+                ScriptTarget::Es5,
+                ModuleKind::EsNext,
+            )
+            .code,
+            "for (var all = make().slice(0), i = 0; i < 1; i++)\n    use(all);\n"
+        );
     }
 
     #[test]
@@ -59751,6 +59874,15 @@ mod tests {
             "{output}"
         );
         assert!(output.contains("function (/** item */ item)"), "{output}");
+        assert_eq!(
+            emit_with(
+                "function f(value: string, ...rest /* keep */: string[]) {}",
+                ScriptTarget::Es2015,
+                ModuleKind::None,
+            )
+            .code,
+            "function f(value, ...rest /* keep */) { }\n"
+        );
     }
 
     #[test]
