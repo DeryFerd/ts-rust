@@ -1233,6 +1233,16 @@ pub fn emit_source_file_with_context(
         printer.writer.newline();
     }
     printer.emit_automatic_jsx_prelude();
+    if settings.target < ScriptTarget::Es2015
+        && printer.body_has_downlevel_arrow_this(source_file)
+    {
+        let alias = printer.generate_this_capture_name(source_file);
+        printer.writer.write("var ");
+        printer.writer.write(&alias);
+        printer.writer.write(" = this;");
+        printer.writer.newline();
+        printer.capture_arrow_this = Some(alias);
+    }
     if settings.module == ModuleKind::CommonJs
         && is_external_module
         && let Some(start) = first_statement_start
@@ -32031,6 +32041,18 @@ impl Printer<'_> {
             return self.emit_statement(body);
         };
         let mut previous_end = body_node.range.start.get().saturating_add(1);
+        if self.body_opening_line_comment_is_unowned(body) {
+            let comment_end = block
+                .statements
+                .nodes
+                .first()
+                .and_then(|statement| self.arena.get(*statement))
+                .map_or_else(
+                    || body_node.range.end.get().saturating_sub(1),
+                    |statement| statement.range.start.get(),
+                );
+            previous_end = self.position_after_immediate_line_comment(previous_end, comment_end);
+        }
         let mut previous_emitted = false;
         for statement in &block.statements.nodes {
             let statement_node = self.node(*statement)?.clone();
@@ -35177,9 +35199,46 @@ impl Printer<'_> {
         self.writer.newline();
         let previous = self.capture_arrow_this.clone();
         self.capture_arrow_this = Some(alias);
-        let result = self.emit_block_statements(body);
+        let body_node = self.node(body)?.clone();
+        let NodeData::Block(block) = &body_node.data else {
+            return Err(Self::unsupported(body, body_node.kind));
+        };
+        let mut previous_end = body_node.range.start.get().saturating_add(1);
+        let mut skip_first_leading_comment = false;
+        if self.body_opening_line_comment_is_unowned(body) {
+            let comment_start = previous_end;
+            let comment_end = block
+                .statements
+                .nodes
+                .first()
+                .and_then(|statement| self.arena.get(*statement))
+                .map_or_else(
+                    || body_node.range.end.get().saturating_sub(1),
+                    |statement| statement.range.start.get(),
+                );
+            previous_end = self.position_after_immediate_line_comment(previous_end, comment_end);
+            skip_first_leading_comment = previous_end != comment_start;
+        }
+        let mut previous_emitted = true;
+        for (index, statement) in block.statements.nodes.iter().enumerate() {
+            let statement_node = self.node(*statement)?.clone();
+            if !(skip_first_leading_comment && index == 0) {
+                self.emit_source_comments_between_with_trailing(
+                    previous_end,
+                    statement_node.range.start.get(),
+                    previous_emitted,
+                );
+            }
+            self.emit_statement(*statement)?;
+            previous_end = statement_node.range.end.get();
+            previous_emitted = statement_emits_javascript(self.arena, &statement_node);
+        }
+        self.emit_source_comments_between_with_trailing(
+            previous_end,
+            body_node.range.end.get().saturating_sub(1),
+            previous_emitted,
+        );
         self.capture_arrow_this = previous;
-        result?;
         self.writer.indent -= 1;
         self.writer.write("}");
         Ok(())
@@ -48076,6 +48135,10 @@ impl Printer<'_> {
                 &field_object_temps,
                 (captures_field_this || captures_constructor_body_this) && base.is_none(),
             );
+            let previous_super_context = super_capture.as_ref().and_then(|capture| {
+                self.downlevel_super_context
+                    .replace((capture.clone(), false))
+            });
             let previous_arrow_this_capture = self.capture_arrow_this.clone();
             if captures_constructor_body_this {
                 self.capture_arrow_this = Some("_this".to_owned());
@@ -48211,6 +48274,9 @@ impl Printer<'_> {
             }
             self.this_alias = previous_this_alias;
             self.capture_arrow_this = previous_arrow_this_capture;
+            if super_capture.is_some() {
+                self.downlevel_super_context = previous_super_context;
+            }
             self.writer.indent -= 1;
             self.writer.write("}");
             self.writer.newline();
@@ -48345,7 +48411,16 @@ impl Printer<'_> {
                                 data, index,
                             )?;
                         }
-                        self.emit_downlevel_accessor(data, name, index)?;
+                        let is_static = self
+                            .accessor_info(*member)
+                            .is_some_and(|(_, _, is_static, _)| is_static);
+                        let previous_super = self.downlevel_super_context.replace((
+                            super_capture.clone().unwrap_or_else(|| "_super".into()),
+                            is_static,
+                        ));
+                        let result = self.emit_downlevel_accessor(data, name, index);
+                        self.downlevel_super_context = previous_super;
+                        result?;
                     }
                     NodeData::PropertyDeclaration(property)
                         if self.property_is_auto_accessor(property) =>
@@ -48820,7 +48895,28 @@ impl Printer<'_> {
 
     fn body_has_downlevel_arrow_this(&self, body: NodeId) -> bool {
         self.arena.iter().any(|(id, node)| {
-            if node.kind != SyntaxKind::ThisKeyword {
+            let lexical_this = node.kind == SyntaxKind::ThisKeyword
+                || (node.kind == SyntaxKind::SuperKeyword
+                    && self
+                        .arena
+                        .get(id)
+                        .and_then(|node| node.parent)
+                        .and_then(|access| {
+                            let access_node = self.arena.get(access)?;
+                            let is_super_access = match &access_node.data {
+                                NodeData::PropertyAccessExpression(data) => data.expression == id,
+                                NodeData::ElementAccessExpression(data) => data.expression == id,
+                                _ => false,
+                            };
+                            is_super_access.then_some((access, access_node.parent?))
+                        })
+                        .is_some_and(|(access, call)| {
+                            matches!(
+                                self.arena.get(call).map(|node| &node.data),
+                                Some(NodeData::CallExpression(data)) if data.expression == access
+                            )
+                        }));
+            if !lexical_this {
                 return false;
             }
             let mut current = id;
@@ -48833,10 +48929,12 @@ impl Printer<'_> {
                     Some(NodeData::ArrowFunction(_)) => inside_arrow = true,
                     Some(
                         NodeData::FunctionDeclaration(_)
-                        | NodeData::FunctionExpression(_)
-                        | NodeData::MethodDeclaration(_)
-                        | NodeData::GetAccessorDeclaration(_)
-                        | NodeData::SetAccessorDeclaration(_),
+                            | NodeData::FunctionExpression(_)
+                            | NodeData::MethodDeclaration(_)
+                            | NodeData::GetAccessorDeclaration(_)
+                            | NodeData::SetAccessorDeclaration(_)
+                            | NodeData::ClassDeclaration(_)
+                            | NodeData::ClassExpression(_),
                     ) => return false,
                     _ => {}
                 }
@@ -52832,14 +52930,22 @@ impl Printer<'_> {
                         SyntaxKind::UndefinedKeyword => "undefined",
                         SyntaxKind::ThisKeyword => "this",
                         SyntaxKind::SuperKeyword => {
-                            if let Some((base, true)) = self.downlevel_super_context.clone()
-                                && let Some(receiver) = self.class_static_this_capture.clone()
-                            {
-                                self.writer.write("Reflect.get(");
-                                self.writer.write(&base);
-                                self.writer.write(", \"\", ");
-                                self.writer.write(&receiver);
-                                self.writer.write(")");
+                            if let Some((base, is_static)) = self.downlevel_super_context.clone() {
+                                if is_static
+                                    && let Some(receiver) = self.class_static_this_capture.clone()
+                                {
+                                    self.writer.write("Reflect.get(");
+                                    self.writer.write(&base);
+                                    self.writer.write(", \"\", ");
+                                    self.writer.write(&receiver);
+                                    self.writer.write(")");
+                                } else {
+                                    self.writer.write(&base);
+                                    if !is_static {
+                                        self.writer.write(".prototype");
+                                    }
+                                    self.writer.write(".");
+                                }
                             } else {
                                 self.writer.write("super");
                                 let is_access_or_call_target = node.parent.is_some_and(|parent| {
@@ -52852,6 +52958,9 @@ impl Printer<'_> {
                                         }
                                         Some(NodeData::CallExpression(call)) => {
                                             call.expression == id
+                                        }
+                                        Some(NodeData::NewExpression(new_expression)) => {
+                                            new_expression.expression == id
                                         }
                                         _ => false,
                                     }
@@ -53359,7 +53468,9 @@ impl Printer<'_> {
                         self.writer.write(".prototype");
                     }
                     self.emit_downlevel_member_access(property)?;
-                    self.writer.write(".call(this");
+                    self.writer.write(".call(");
+                    self.writer
+                        .write(self.this_alias.as_deref().unwrap_or("this"));
                     if self.argument_list_has_expression(&data.arguments) {
                         self.writer.write(", ");
                         self.emit_argument_list(&data.arguments)?;
@@ -53989,14 +54100,34 @@ impl Printer<'_> {
                             } else {
                                 self.writer.write(": ");
                             }
-                            if for_of_destructuring && !multiline {
+                            let override_super = self.settings.target < ScriptTarget::Es2015
+                                && match self
+                                    .arena
+                                    .get(property.initializer)
+                                    .map(|node| &node.data)
+                                {
+                                    Some(NodeData::FunctionExpression(_)) => true,
+                                    Some(NodeData::ArrowFunction(_)) => {
+                                        self.downlevel_super_context.is_none()
+                                    }
+                                    _ => false,
+                                };
+                            let previous_super = override_super.then(|| {
+                                self.downlevel_super_context
+                                    .replace(("_super".to_owned(), true))
+                            });
+                            let result = if for_of_destructuring && !multiline {
                                 self.writer.indent += 1;
                                 let result = self.emit_expression(property.initializer, 1);
                                 self.writer.indent -= 1;
-                                result?;
+                                result
                             } else {
-                                self.emit_expression(property.initializer, 1)?;
+                                self.emit_expression(property.initializer, 1)
+                            };
+                            if override_super {
+                                self.downlevel_super_context = previous_super.flatten();
                             }
+                            result?;
                         }
                         NodeData::ShorthandPropertyAssignment(property) => {
                             self.emit_shorthand_property(property.name)?;
@@ -54029,6 +54160,11 @@ impl Printer<'_> {
                             self.emit_expression(property.expression, 1)?;
                         }
                         NodeData::MethodDeclaration(method) if method.body.is_some() => {
+                            let override_super = self.settings.target < ScriptTarget::Es2015;
+                            let previous_super = override_super.then(|| {
+                                self.downlevel_super_context
+                                    .replace(("_super".to_owned(), true))
+                            });
                             let downlevel_async = method.asterisk_token.is_none()
                                 && self.has_modifier(
                                     method.modifiers.as_ref(),
@@ -54070,8 +54206,16 @@ impl Printer<'_> {
                                     )?;
                                 }
                             }
+                            if override_super {
+                                self.downlevel_super_context = previous_super.flatten();
+                            }
                         }
                         NodeData::GetAccessorDeclaration(accessor) => {
+                            let override_super = self.settings.target < ScriptTarget::Es2015;
+                            let previous_super = override_super.then(|| {
+                                self.downlevel_super_context
+                                    .replace(("_super".to_owned(), true))
+                            });
                             self.writer.write("get ");
                             self.emit_expression(accessor.name, 0)?;
                             self.emit_parameters(&accessor.parameters)?;
@@ -54084,8 +54228,16 @@ impl Printer<'_> {
                             } else {
                                 self.emit_accessor_body(accessor.body)?;
                             }
+                            if override_super {
+                                self.downlevel_super_context = previous_super.flatten();
+                            }
                         }
                         NodeData::SetAccessorDeclaration(accessor) => {
+                            let override_super = self.settings.target < ScriptTarget::Es2015;
+                            let previous_super = override_super.then(|| {
+                                self.downlevel_super_context
+                                    .replace(("_super".to_owned(), true))
+                            });
                             self.writer.write("set ");
                             self.emit_expression(accessor.name, 0)?;
                             let binding_parameters = if self.settings.target < ScriptTarget::Es2015
@@ -54120,6 +54272,9 @@ impl Printer<'_> {
                                 )?;
                             } else {
                                 self.emit_accessor_body(accessor.body)?;
+                            }
+                            if override_super {
+                                self.downlevel_super_context = previous_super.flatten();
                             }
                         }
                         _ => return Err(Self::unsupported(*property, node.kind)),
@@ -64187,6 +64342,53 @@ mod tests {
             .expect("lowered static super initializer");
         let comment = recovered.find("// static field").expect("static field comment");
         assert!(static_initializer < comment, "{recovered}");
+    }
+
+    #[test]
+    fn lowers_es5_super_across_constructors_arrows_and_object_members() {
+        let class_output = emit_with(
+            concat!(
+                "class Base { method() {} } ",
+                "class Derived extends Base { ",
+                "constructor() { super(); super.method(); } ",
+                "run() { const arrow = () => super.method(); ",
+                "const object = { method() { super.method(); }, ",
+                "fn: function () { super.method(); } }; } }",
+            ),
+            ScriptTarget::Es5,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(
+            class_output.contains("_super.prototype.method.call(_this);"),
+            "{class_output}"
+        );
+        assert!(class_output.contains("var _this = this;"), "{class_output}");
+        assert!(
+            class_output.contains("_super.method.call(this);"),
+            "{class_output}"
+        );
+
+        let object_output = emit_with_parse_errors(
+            "const object = { arrow: () => super.method() };",
+            ScriptTarget::Es5,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(object_output.starts_with("var _this = this;\n"), "{object_output}");
+        assert!(
+            object_output.contains("_super.method.call(_this)"),
+            "{object_output}"
+        );
+
+        let recovered_new = emit_with_parse_errors(
+            "new super(value => String(value));",
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(recovered_new.contains("new super("), "{recovered_new}");
+        assert!(!recovered_new.contains("new super.("), "{recovered_new}");
     }
 
     #[test]
