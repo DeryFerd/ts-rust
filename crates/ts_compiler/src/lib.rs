@@ -5532,6 +5532,50 @@ mod tests {
     }
 
     #[test]
+    fn preserves_resolved_script_path_references_with_commonjs_output() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/node.d.ts",
+            "declare function require(moduleName: string): any;",
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/ns.ts",
+            concat!(
+                "/// <reference path=\"node.d.ts\"/>\n",
+                "namespace myAssert { export type cool = 'cool'; }\n",
+                "var myAssert = require('assert');\n",
+            ),
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["ns.ts".to_owned()],
+            CompilerOptions {
+                module: ModuleKind::CommonJs,
+                target: ScriptTarget::Es2015,
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        let output = program.emit();
+        let javascript = output
+            .files
+            .iter()
+            .find(|file| file.file_name == "/project/ns.js")
+            .unwrap();
+        assert_eq!(
+            javascript.text,
+            concat!(
+                "\"use strict\";\n",
+                "/// <reference path=\"node.d.ts\"/>\n",
+                "var myAssert = require('assert');\n",
+            )
+        );
+    }
+
+    #[test]
     fn declaration_emit_preserves_non_nullable_generic_logical_or_return() {
         let fs = MemoryFileSystem::new(true);
         fs.write_file(

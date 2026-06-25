@@ -1253,8 +1253,32 @@ impl<'a> Parser<'a> {
         while self.current.kind != SyntaxKind::CloseParenToken
             && self.current.kind != SyntaxKind::EndOfFile
         {
-            parameters.push(self.parse_parameter());
+            let parameter = self.parse_parameter();
+            parameters.push(parameter);
             if self.current.kind != SyntaxKind::CommaToken {
+                let recovers_modifier_after_rest =
+                    matches!(
+                        self.arena.get(parameter).map(|node| &node.data),
+                        Some(NodeData::ParameterDeclaration(parameter))
+                            if parameter.dot_dot_dot_token.is_some()
+                                && matches!(
+                                    self.arena.get(parameter.name).map(|node| &node.data),
+                                    Some(NodeData::Identifier(identifier))
+                                        if matches!(
+                                            identifier.text.as_str(),
+                                            "override"
+                                                | "private"
+                                                | "protected"
+                                                | "public"
+                                                | "readonly"
+                                        )
+                                )
+                    ) && (self.current.kind == SyntaxKind::Identifier
+                        || self.current.kind.is_keyword());
+                if recovers_modifier_after_rest {
+                    self.error_current("Expected ','.");
+                    continue;
+                }
                 break;
             }
             self.bump();

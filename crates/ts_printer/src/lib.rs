@@ -27097,7 +27097,7 @@ impl Printer<'_> {
                     .map_or(bytes.len(), |offset| index + offset);
                 let comment = &trivia[index..comment_end];
                 let comment_range = (start + index, start + comment_end);
-                let top_of_file = self.settings.module == ModuleKind::None
+                let top_of_file = !self.is_external_module
                     && self.context_preserves_top_of_file_reference_directive
                     && self.source_text[..comment_range.0]
                         .trim_start_matches('\u{feff}')
@@ -32252,44 +32252,9 @@ impl Printer<'_> {
                 if name_node.kind == SyntaxKind::ObjectBindingPattern =>
             {
                 for element_id in &pattern.elements.nodes {
-                    let element_node = self.node(*element_id)?.clone();
-                    let NodeData::BindingElement(element) = &element_node.data else {
-                        return Err(Self::unsupported(*element_id, element_node.kind));
-                    };
-                    let Some(element_name) = element.name else {
-                        continue;
-                    };
-                    if element.dot_dot_dot_token.is_some() {
-                        return Err(Self::unsupported(*element_id, element_node.kind));
-                    }
-                    let property = element.property_name.unwrap_or(element_name);
-                    let index = match &self.node(property)?.data {
-                        NodeData::ComputedPropertyName(computed) => {
-                            let expression = computed.expression;
-                            let temp = self.generated_names.generate_temp();
-                            self.emit_downlevel_declarator_start(emitted);
-                            self.writer.write(&temp);
-                            self.writer.write(" = ");
-                            self.emit_expression(expression, 1)?;
-                            DownlevelBindingIndex::Name(temp)
-                        }
-                        NodeData::Identifier(identifier) => {
-                            DownlevelBindingIndex::String(identifier.text.clone())
-                        }
-                        NodeData::StringLiteral(literal) => {
-                            DownlevelBindingIndex::String(literal.text.clone())
-                        }
-                        NodeData::NumericLiteral(literal) => {
-                            DownlevelBindingIndex::String(literal.text.clone())
-                        }
-                        _ => return Err(Self::unsupported(property, self.node(property)?.kind)),
-                    };
-                    let element_value =
-                        DownlevelBindingValue::Element(Box::new(value.clone()), index);
-                    self.emit_downlevel_binding_declarators(
-                        element_name,
-                        element_value,
-                        element.initializer,
+                    self.emit_downlevel_object_binding_element_declarator(
+                        *element_id,
+                        &value,
                         emitted,
                         inline_single_leaf_nested,
                     )?;
@@ -32298,6 +32263,35 @@ impl Printer<'_> {
             _ => return Err(Self::unsupported(name, name_node.kind)),
         }
         Ok(())
+    }
+
+    fn emit_downlevel_object_binding_element_declarator(
+        &mut self,
+        element_id: NodeId,
+        value: &DownlevelBindingValue,
+        emitted: &mut bool,
+        inline_single_leaf_nested: bool,
+    ) -> Result<(), EmitError> {
+        let element_node = self.node(element_id)?.clone();
+        let NodeData::BindingElement(element) = &element_node.data else {
+            return Err(Self::unsupported(element_id, element_node.kind));
+        };
+        let Some(element_name) = element.name else {
+            return Ok(());
+        };
+        if element.dot_dot_dot_token.is_some() {
+            return Err(Self::unsupported(element_id, element_node.kind));
+        }
+        let property = element.property_name.unwrap_or(element_name);
+        let index = self.downlevel_binding_property_index(property, emitted)?;
+        let element_value = DownlevelBindingValue::Element(Box::new(value.clone()), index);
+        self.emit_downlevel_binding_declarators(
+            element_name,
+            element_value,
+            element.initializer,
+            emitted,
+            inline_single_leaf_nested,
+        )
     }
 
     fn array_binding_comma_count(&self, start: u32, end: u32) -> usize {
@@ -33955,6 +33949,18 @@ impl Printer<'_> {
         let NodeData::Block(block) = &body_node.data else {
             return Err(Self::unsupported(body, body_node.kind));
         };
+        if self.settings.target >= ScriptTarget::Es2015
+            && block.statements.nodes.is_empty()
+            && !self.node_source_is_multiline(body)
+            && class_temps.is_empty()
+            && !downlevel_parameter_defaults
+        {
+            self.writer.write("{ ");
+            self.emit_downlevel_binding_parameter_prologues(binding_parameters)?;
+            self.writer.remove_trailing_newline();
+            self.writer.write(" }");
+            return Ok(());
+        }
         let prologue_count = block
             .statements
             .nodes
@@ -33977,7 +33983,9 @@ impl Printer<'_> {
             self.emit_parameter_default_prologues_with_overrides(parameters, binding_parameters)?;
         }
         self.emit_downlevel_binding_parameter_prologues(binding_parameters)?;
-        if self.parameters_have_rest_parameter(parameters) {
+        if self.settings.target < ScriptTarget::Es2015
+            && self.parameters_have_rest_parameter(parameters)
+        {
             self.emit_downlevel_rest_parameter_prologue(parameters)?;
         }
         for statement in &block.statements.nodes[prologue_count..] {
@@ -43017,37 +43025,48 @@ impl Printer<'_> {
             self.writer.write(" = ");
             self.emit_downlevel_binding_value(initializer)?;
         }
-        self.emit_downlevel_declarator_start(emitted);
-        self.writer.write("{ ");
-        let mut previous_end = pattern_node.range.start.get().saturating_add(1);
-        for (index, element_id) in ordinary.iter().enumerate() {
-            if index != 0 {
-                self.writer.write(", ");
+        let ordinary_value = temp.as_ref().map_or_else(
+            || initializer.clone(),
+            |temp| DownlevelBindingValue::Name(temp.clone()),
+        );
+        if self.settings.target < ScriptTarget::Es2015 {
+            for element in &ordinary {
+                self.emit_downlevel_object_binding_element_declarator(
+                    *element,
+                    &ordinary_value,
+                    emitted,
+                    false,
+                )?;
             }
-            let element_node = self.node(*element_id)?.clone();
-            if index == 0
-                && !self.settings.remove_comments
-                && self.source_range_contains_comment(
+        } else {
+            self.emit_downlevel_declarator_start(emitted);
+            self.writer.write("{ ");
+            let mut previous_end = pattern_node.range.start.get().saturating_add(1);
+            for (index, element_id) in ordinary.iter().enumerate() {
+                if index != 0 {
+                    self.writer.write(", ");
+                }
+                let element_node = self.node(*element_id)?.clone();
+                if index == 0
+                    && !self.settings.remove_comments
+                    && self.source_range_contains_comment(
+                        previous_end,
+                        element_node.range.start.get(),
+                    )
+                {
+                    self.writer.newline_preserving_trailing_spaces();
+                }
+                self.emit_source_comments_between_with_ownership(
                     previous_end,
                     element_node.range.start.get(),
-                )
-            {
-                self.writer.newline_preserving_trailing_spaces();
+                    true,
+                    true,
+                );
+                self.emit_expression(*element_id, 0)?;
+                previous_end = element_node.range.end.get();
             }
-            self.emit_source_comments_between_with_ownership(
-                previous_end,
-                element_node.range.start.get(),
-                true,
-                true,
-            );
-            self.emit_expression(*element_id, 0)?;
-            previous_end = element_node.range.end.get();
-        }
-        self.writer.write(" } = ");
-        if let Some(temp) = temp.as_deref() {
-            self.writer.write(temp);
-        } else {
-            self.emit_downlevel_binding_value(initializer)?;
+            self.writer.write(" } = ");
+            self.emit_downlevel_binding_value(&ordinary_value)?;
         }
         self.emit_downlevel_declarator_start(emitted);
         self.emit_expression(rest, 0)?;
@@ -43165,7 +43184,7 @@ impl Printer<'_> {
                 Ok(DownlevelBindingIndex::String(literal.text.clone()))
             }
             NodeData::NumericLiteral(literal) => {
-                Ok(DownlevelBindingIndex::String(literal.text.clone()))
+                Ok(DownlevelBindingIndex::Name(literal.text.clone()))
             }
             _ => Err(Self::unsupported(property, self.node(property)?.kind)),
         }
@@ -59278,6 +59297,22 @@ mod tests {
     }
 
     #[test]
+    fn downlevels_ordinary_object_rest_bindings_for_es5() {
+        let output = emit_with(
+            "const { 0: a, ...b } = [0, 1, 2];",
+            ScriptTarget::Es5,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(
+            output.contains(
+                "var _a = [0, 1, 2], a = _a[0], b = __rest(_a, [\"0\"]);"
+            ),
+            "{output}"
+        );
+    }
+
+    #[test]
     fn downlevels_nested_object_rest_assignment_patterns() {
         let output = emit_with(
             "var x, y; [{ ...x }] = [{ abc: 1 }]; for ([{ ...y }] of [[{ abc: 1 }]]) ;",
@@ -59922,6 +59957,56 @@ mod tests {
                 "    }",
             )),
             "{output}"
+        );
+    }
+
+    #[test]
+    fn lowers_numeric_object_rest_parameter_properties_for_es2015() {
+        let output = emit_with(
+            "function f(...{ 0: a = 1, 1: b = true, ...rest: rest }) { }",
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(
+            output.contains(concat!(
+                "function f(..._a) { var { 0: a = 1, 1: b = true } = _a, ",
+                "rest = __rest(_a, [\"0\", \"1\"]); }",
+            )),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn recovers_parameter_modifier_after_rest_token() {
+        let source = "class C { constructor(...public rest: string[]) {} }";
+        let parsed = parse_source_file(source);
+        assert!(!parsed.diagnostics.is_empty());
+        assert_eq!(
+            emit_source_file_with_settings(
+                &parsed.arena,
+                parsed.source_file,
+                "input.ts",
+                source,
+                PrinterSettings {
+                    always_strict: false,
+                    target: ScriptTarget::Es2015,
+                    module: ModuleKind::None,
+                    jsx: JsxEmit::Preserve,
+                    emit_javascript: true,
+                    emit_declarations: false,
+                    source_map: false,
+                    inline_source_map: false,
+                    import_helpers: false,
+                    no_emit_helpers: false,
+                    experimental_decorators: false,
+                    remove_comments: false,
+                    use_define_for_class_fields: None,
+                },
+            )
+            .unwrap()
+            .code,
+            "class C {\n    constructor(...public, rest) { }\n}\n"
         );
     }
 
