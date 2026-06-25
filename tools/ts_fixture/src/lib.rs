@@ -802,6 +802,12 @@ fn compile_case_variant(case: &Case, variant: &OptionVariant) -> std::io::Result
     }
 
     let mut compiler_options = fixture_compiler_options(case, variant);
+    if compiler_options.root_dir.is_none()
+        && let Some(project_directory) = project_directory.as_ref()
+        && !project_directory.is_empty()
+    {
+        compiler_options.root_dir = Some(project_directory.clone());
+    }
     // Compiler baselines generally assume libraries. Keeping this enabled is
     // important for diagnostic fidelity even though syntax-only corpus tests
     // use the cheaper parser path directly.

@@ -110,12 +110,10 @@ pub fn source_file_path_in_new_directory(
             .get(..common.len())
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case(&common)),
     };
-    let relative = if in_common {
-        &source[common.len()..]
-    } else {
-        source.trim_start_matches('/')
-    };
-    resolve_path(new_directory, &[relative])
+    if !in_common {
+        return source;
+    }
+    resolve_path(new_directory, &[&source[common.len()..]])
 }
 
 #[must_use]
@@ -256,6 +254,20 @@ mod tests {
                 CaseSensitivity::Insensitive,
             ),
             "/dist/a.ts"
+        );
+    }
+
+    #[test]
+    fn leaves_sources_outside_the_common_directory_in_place() {
+        assert_eq!(
+            source_file_path_in_new_directory(
+                "/outside/file.ts",
+                "/project/dist",
+                "/project",
+                "/project/src",
+                CaseSensitivity::Sensitive,
+            ),
+            "/outside/file.ts"
         );
     }
 
