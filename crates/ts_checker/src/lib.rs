@@ -926,6 +926,21 @@ impl<'a> ProgramChecker<'a> {
                 descriptor.map(|descriptor| (name, descriptor))
             })
             .collect::<BTreeMap<_, _>>();
+        for (name, (instance_augmentation, namespace_augmentation)) in
+            self.module_augmentation_exports(target, preliminary, completed)
+        {
+            let Some(existing) = exports.get_mut(&name) else {
+                continue;
+            };
+            if let Some(instance) = instance_augmentation
+                && !merge_constructor_instance_descriptor(existing, &instance)
+            {
+                merge_global_descriptor(existing, instance);
+            }
+            if let Some(namespace) = namespace_augmentation {
+                merge_class_value_namespace_descriptor(existing, namespace);
+            }
+        }
         let local_export_renames = export_symbols
             .iter()
             .filter_map(|(exported, symbol)| {
@@ -1316,6 +1331,108 @@ impl<'a> ProgramChecker<'a> {
         for descriptor in exports.values_mut() {
             resolve_imported_type_queries(descriptor, &imported);
             paint_imported_named_descriptor_references(descriptor, &imported_type_references);
+        }
+        exports
+    }
+
+    fn module_augmentation_exports(
+        &self,
+        target: usize,
+        preliminary: &[CheckResult],
+        completed: &[CheckResult],
+    ) -> BTreeMap<String, (Option<TypeDescriptor>, Option<TypeDescriptor>)> {
+        let mut exports = BTreeMap::<
+            String,
+            (Option<TypeDescriptor>, Option<TypeDescriptor>),
+        >::new();
+        for (source_index, source) in self.sources.iter().enumerate() {
+            if source_index == target || !is_external_module(source) {
+                continue;
+            }
+            let result = completed
+                .get(source_index)
+                .unwrap_or(&preliminary[source_index]);
+            for (_, node) in source.arena.iter() {
+                let NodeData::ModuleDeclaration(module) = &node.data else {
+                    continue;
+                };
+                let Some(specifier) = string_literal_text(source.arena, module.name) else {
+                    continue;
+                };
+                if source.resolved_modules.get(specifier).copied() != Some(target) {
+                    continue;
+                }
+                let module_symbol = source
+                    .bindings
+                    .node_symbols
+                    .get(&module.name)
+                    .copied()
+                    .or_else(|| {
+                        source
+                            .bindings
+                            .root_scope()
+                            .and_then(|scope| scope.symbols.get(specifier))
+                    });
+                let Some(module_symbol) = module_symbol
+                    .and_then(|symbol| source.bindings.symbols.get(symbol))
+                else {
+                    continue;
+                };
+                for (name, member) in module_symbol.members.iter() {
+                    let Some(symbol) = source.bindings.symbols.get(member) else {
+                        continue;
+                    };
+                    let entry = exports.entry(name.to_owned()).or_default();
+                    if symbol.declarations.iter().any(|declaration| {
+                        matches!(
+                            source.arena.get(*declaration).map(|node| &node.data),
+                            Some(NodeData::InterfaceDeclaration(_))
+                        )
+                    }) && let Some(descriptor) = describe_declaration_symbol(
+                        source,
+                        Some(result),
+                        member,
+                    )
+                    {
+                        merge_module_augmentation_part(
+                            &mut entry.0,
+                            module_augmentation_instance_descriptor(descriptor),
+                        );
+                    }
+                    let properties = symbol
+                        .members
+                        .iter()
+                        .filter(|(_, member)| {
+                            self.symbol_has_runtime_value(
+                                source_index,
+                                *member,
+                                &mut HashSet::new(),
+                            )
+                        })
+                        .filter_map(|(name, member)| {
+                            Self::describe_symbol(source, result, member)
+                                .map(|descriptor| (name.to_owned(), descriptor))
+                        })
+                        .collect::<BTreeMap<_, _>>();
+                    if !properties.is_empty() {
+                        merge_module_augmentation_part(
+                            &mut entry.1,
+                            TypeDescriptor::Object {
+                                properties,
+                                property_order: Vec::new(),
+                                numeric_properties: BTreeSet::new(),
+                                string_index_type: None,
+                                number_index_type: None,
+                                call_signatures: Vec::new(),
+                                construct_signatures: Vec::new(),
+                                optional_properties: BTreeSet::new(),
+                                readonly_properties: BTreeSet::new(),
+                                getter_properties: BTreeSet::new(),
+                            },
+                        );
+                    }
+                }
+            }
         }
         exports
     }
@@ -10349,7 +10466,8 @@ impl<'a> Checker<'a> {
                 if object
                     .properties
                     .keys()
-                    .any(|name| receiver_properties.contains(name)) =>
+                    .any(|name| receiver_properties.contains(name))
+                    && !self.result.named_type_references.contains_key(&type_id) =>
             {
                 self.result
                     .import_type_references
@@ -20816,6 +20934,80 @@ fn global_declarations_merge(
             && new.contains(ts_binder::SymbolFlags::NAMESPACE_MODULE))
 }
 
+fn merge_module_augmentation_part(
+    existing: &mut Option<TypeDescriptor>,
+    new: TypeDescriptor,
+) {
+    if let Some(existing) = existing {
+        merge_global_descriptor(existing, new);
+    } else {
+        *existing = Some(new);
+    }
+}
+
+fn module_augmentation_instance_descriptor(descriptor: TypeDescriptor) -> TypeDescriptor {
+    match descriptor {
+        TypeDescriptor::Intersection(mut members) if !members.is_empty() => {
+            module_augmentation_instance_descriptor(members.remove(0))
+        }
+        descriptor => descriptor,
+    }
+}
+
+fn merge_constructor_instance_descriptor(
+    descriptor: &mut TypeDescriptor,
+    augmentation: &TypeDescriptor,
+) -> bool {
+    match descriptor {
+        TypeDescriptor::Named { target, .. }
+        | TypeDescriptor::Import { target, .. }
+        | TypeDescriptor::ConstEnum(target) => {
+            merge_constructor_instance_descriptor(target, augmentation)
+        }
+        TypeDescriptor::Constructor { return_type, .. } => {
+            merge_descriptor_object_target(return_type, augmentation.clone());
+            true
+        }
+        TypeDescriptor::Intersection(members) | TypeDescriptor::Overload(members) => members
+            .iter_mut()
+            .any(|member| merge_constructor_instance_descriptor(member, augmentation)),
+        TypeDescriptor::Alias { body, .. } => {
+            merge_constructor_instance_descriptor(body, augmentation)
+        }
+        _ => false,
+    }
+}
+
+fn merge_descriptor_object_target(descriptor: &mut TypeDescriptor, augmentation: TypeDescriptor) {
+    match descriptor {
+        TypeDescriptor::Named { target, .. }
+        | TypeDescriptor::Import { target, .. }
+        | TypeDescriptor::ConstEnum(target)
+        | TypeDescriptor::Alias { body: target, .. } => {
+            merge_descriptor_object_target(target, augmentation);
+        }
+        _ => merge_global_descriptor(descriptor, augmentation),
+    }
+}
+
+fn merge_class_value_namespace_descriptor(
+    descriptor: &mut TypeDescriptor,
+    namespace: TypeDescriptor,
+) {
+    let (TypeDescriptor::Named { target, .. } | TypeDescriptor::Import { target, .. }) = descriptor
+    else {
+        let previous = std::mem::replace(descriptor, TypeDescriptor::Any);
+        *descriptor = TypeDescriptor::Intersection(vec![previous, namespace]);
+        return;
+    };
+    if let TypeDescriptor::Intersection(members) = target.as_mut() {
+        members.push(namespace);
+    } else {
+        let previous = std::mem::replace(target.as_mut(), TypeDescriptor::Any);
+        **target = TypeDescriptor::Intersection(vec![previous, namespace]);
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn merge_global_descriptor(existing: &mut TypeDescriptor, new: TypeDescriptor) {
     match (existing, new) {
@@ -27713,6 +27905,95 @@ mod tests {
 
         assert!(!retained.contains(&source.statements.nodes[0]));
         assert!(retained.contains(&source.statements.nodes[1]));
+    }
+
+    #[test]
+    fn merges_instance_and_static_module_augmentations_into_imported_classes() {
+        let global = parse_source_file("interface Lib { x; }");
+        let main = parse_source_file("export class Cls { x; }");
+        let augmentation = parse_source_file(concat!(
+            "import { Cls } from './main'; ",
+            "Cls.prototype.foo = function() { return undefined; }; ",
+            "declare module './main' { ",
+            "interface Cls { foo(): Lib; } ",
+            "namespace Cls { function bar(): Lib; } ",
+            "}"
+        ));
+        let consumer = parse_source_file(concat!(
+            "import { Cls } from './main'; import './augmentation'; ",
+            "export const foo = new Cls().foo(); ",
+            "export const bar = Cls.bar();"
+        ));
+        let global_bindings = bind_source_file(&global.arena, global.source_file);
+        let main_bindings = bind_source_file(&main.arena, main.source_file);
+        let augmentation_bindings =
+            bind_source_file(&augmentation.arena, augmentation.source_file);
+        let consumer_bindings = bind_source_file(&consumer.arena, consumer.source_file);
+        let no_modules = BTreeMap::new();
+        let augmentation_modules = BTreeMap::from([("./main".into(), 1)]);
+        let consumer_modules =
+            BTreeMap::from([("./main".into(), 1), ("./augmentation".into(), 2)]);
+        let checked = check_program(&[
+            ProgramSource {
+                arena: &global.arena,
+                source_file: global.source_file,
+                bindings: &global_bindings,
+                resolved_modules: &no_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+            ProgramSource {
+                arena: &main.arena,
+                source_file: main.source_file,
+                bindings: &main_bindings,
+                resolved_modules: &no_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+            ProgramSource {
+                arena: &augmentation.arena,
+                source_file: augmentation.source_file,
+                bindings: &augmentation_bindings,
+                resolved_modules: &augmentation_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+            ProgramSource {
+                arena: &consumer.arena,
+                source_file: consumer.source_file,
+                bindings: &consumer_bindings,
+                resolved_modules: &consumer_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+        ]);
+        assert!(
+            checked.files[3].diagnostics.is_empty(),
+            "{:?}",
+            checked.files[3].diagnostics
+        );
+        let root = consumer_bindings.root_scope().unwrap();
+        let foo = root.symbols.get("foo").unwrap();
+        let bar = root.symbols.get("bar").unwrap();
+        for symbol in [foo, bar] {
+            let type_id = checked.files[3].type_of_symbol(symbol).unwrap();
+            assert_eq!(
+                checked.files[3]
+                    .named_type_references
+                    .get(&type_id)
+                    .map(|reference| reference.name.as_str()),
+                Some("Lib")
+            );
+            assert!(
+                !checked.files[3]
+                    .import_type_references
+                    .contains_key(&type_id)
+            );
+        }
     }
 
     #[test]
