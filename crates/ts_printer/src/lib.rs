@@ -1397,6 +1397,24 @@ pub fn emit_source_file_with_context(
             previous_emitted,
         );
     }
+    if data.statements.nodes.last().is_some_and(|statement| {
+        arena.get(*statement).is_some_and(|node| {
+            matches!(&node.data, NodeData::ExpressionStatement(statement)
+                if matches!(
+                    arena.get(statement.expression).map(|node| &node.data),
+                    Some(NodeData::PropertyAccessExpression(_))
+                ))
+                && usize::try_from(node.range.end.get())
+                    .ok()
+                    .zip(usize::try_from(source_end).ok())
+                    .and_then(|(start, end)| source_text.get(start..end))
+                    .is_some_and(|trivia| trivia.contains("/*"))
+        })
+    }) {
+        printer.writer.remove_trailing_newline();
+        printer.writer.remove_trailing_spaces();
+        printer.writer.newline();
+    }
     if matches!(settings.module, ModuleKind::CommonJs | ModuleKind::Preserve)
         && let Some(expression) = export_equals_expression
     {
@@ -27110,6 +27128,18 @@ impl Printer<'_> {
             .then(|| u32::try_from(start + line_start + comment_start).ok())?
     }
 
+    fn position_starts_property_access_statement(&self, position: usize) -> bool {
+        let position = u32::try_from(position).unwrap_or(u32::MAX);
+        self.arena.iter().any(|(_, node)| {
+            node.range.start.get() == position
+                && matches!(&node.data, NodeData::ExpressionStatement(statement)
+                    if matches!(
+                        self.arena.get(statement.expression).map(|node| &node.data),
+                        Some(NodeData::PropertyAccessExpression(_))
+                    ))
+        })
+    }
+
     fn emit_source_comments_between_with_ownership(
         &mut self,
         start: u32,
@@ -27189,12 +27219,15 @@ impl Printer<'_> {
                     let until_next = next_comment.map_or(remainder, |next| &remainder[..next]);
                     let inline_with_next =
                         next_comment.is_some() && !until_next.contains(['\n', '\r']);
-                    let touches_parenthesized_node = comment_range.1 == end
-                        && self.source_text.as_bytes().get(end) == Some(&b'(');
+                    let touches_property_access_statement = comment_range.1 == end
+                        && self.position_starts_property_access_statement(end);
                     let inline_with_node = next_comment.is_none()
                         && !immediate_trailing
                         && preserve_leading
-                        && (comment_range.1 < end || touches_parenthesized_node)
+                        && (comment_range.1 < end
+                            || (comment_range.1 == end
+                                && self.source_text.as_bytes().get(end) == Some(&b'('))
+                            || touches_property_access_statement)
                         && !remainder.contains(['\n', '\r'])
                         && remainder.trim().is_empty();
                     let inline_after = inline_with_next || inline_with_node;
@@ -27390,10 +27423,13 @@ impl Printer<'_> {
                 {
                     let inline_with_next =
                         next_comment.is_some_and(|next| !remainder[..next].contains(['\n', '\r']));
-                    let touches_parenthesized_node = comment_end == end
-                        && self.source_text.as_bytes().get(end) == Some(&b'(');
+                    let touches_property_access_statement = comment_end == end
+                        && self.position_starts_property_access_statement(end);
                     let inline_with_node = next_comment.is_none()
-                        && (comment_end < end || touches_parenthesized_node)
+                        && (comment_end < end
+                            || (comment_end == end
+                                && self.source_text.as_bytes().get(end) == Some(&b'('))
+                            || touches_property_access_statement)
                         && !remainder.contains(['\n', '\r'])
                         && remainder.trim().is_empty();
                     let inline_after = inline_with_next || inline_with_node;
@@ -51630,6 +51666,16 @@ impl Printer<'_> {
                             true,
                             true,
                         );
+                        if block_comment_before_dot
+                            && usize::try_from(expression_end)
+                                .ok()
+                                .zip(usize::try_from(source_dot).ok())
+                                .and_then(|(start, end)| self.source_text.get(start..end))
+                                .is_some_and(|trivia| trivia.trim_end().ends_with("*/"))
+                        {
+                            self.writer.remove_trailing_newline();
+                            self.writer.write(" ");
+                        }
                         if !self.writer.line_start && !block_comment_before_dot {
                             self.writer.newline();
                         }
@@ -51656,9 +51702,17 @@ impl Printer<'_> {
                     if self.trivia_has_block_comment(after_dot, name_start) {
                         self.emit_block_comment_trivia(source_dot, name_start, false);
                     }
+                    let after_dot_indent = usize::from(!missing_name)
+                        * (1 + usize::from(break_before_dot));
                     if break_after_dot {
-                        self.writer.indent += usize::from(!missing_name);
+                        self.writer.indent += after_dot_indent;
                         self.writer.newline();
+                        self.emit_source_comments_between_with_ownership(
+                            after_dot,
+                            name_start,
+                            true,
+                            true,
+                        );
                     }
                     if missing_name
                         && let Some((start, trivia)) = usize::try_from(expression_end)
@@ -51686,7 +51740,7 @@ impl Printer<'_> {
                     }
                     self.record_mapping_at(name.range.end.get());
                     if break_after_dot {
-                        self.writer.indent -= usize::from(!missing_name);
+                        self.writer.indent -= after_dot_indent;
                     }
                 }
             }
@@ -55143,6 +55197,56 @@ impl Printer<'_> {
         }
     }
 
+    fn emit_repeated_inline_block_comments(&mut self, start: u32, end: u32) {
+        if self.settings.remove_comments {
+            return;
+        }
+        let Some(trivia) = usize::try_from(start)
+            .ok()
+            .zip(usize::try_from(end).ok())
+            .and_then(|(start, end)| self.source_text.get(start..end))
+        else {
+            return;
+        };
+        if trivia.contains(['\n', '\r']) {
+            return;
+        }
+        let mut cursor = 0;
+        while let Some(relative_start) = trivia[cursor..].find("/*") {
+            let comment_start = cursor + relative_start;
+            let Some(relative_end) = trivia[comment_start + 2..].find("*/") else {
+                break;
+            };
+            let comment_end = comment_start + 2 + relative_end + 2;
+            self.writer.write(" ");
+            self.writer.write(&trivia[comment_start..comment_end]);
+            cursor = comment_end;
+        }
+    }
+
+    fn suppress_block_comments_between(&mut self, start: u32, end: u32) {
+        let Some((absolute_start, trivia)) = usize::try_from(start)
+            .ok()
+            .zip(usize::try_from(end).ok())
+            .and_then(|(start, end)| self.source_text.get(start..end).map(|text| (start, text)))
+        else {
+            return;
+        };
+        let mut cursor = 0;
+        while let Some(relative_start) = trivia[cursor..].find("/*") {
+            let comment_start = cursor + relative_start;
+            let Some(relative_end) = trivia[comment_start + 2..].find("*/") else {
+                break;
+            };
+            let comment_end = comment_start + 2 + relative_end + 2;
+            self.emitted_source_comments.insert((
+                absolute_start + comment_start,
+                absolute_start + comment_end,
+            ));
+            cursor = comment_end;
+        }
+    }
+
     fn is_optional_access_expression(&self, expression: NodeId) -> bool {
         matches!(
             self.arena.get(expression).map(|node| &node.data),
@@ -55232,14 +55336,16 @@ impl Printer<'_> {
     ) -> Result<(), EmitError> {
         let mut optional = expression;
         let receiver;
+        let question_dot_token;
         let mut names = Vec::new();
         loop {
             let NodeData::PropertyAccessExpression(access) = &self.node(optional)?.data else {
                 return Err(Self::unsupported(optional, self.node(optional)?.kind));
             };
             names.push(access.name);
-            if access.question_dot_token.is_some() {
+            if let Some(token) = access.question_dot_token {
                 receiver = access.expression;
+                question_dot_token = token;
                 break;
             }
             optional = access.expression;
@@ -55249,6 +55355,8 @@ impl Printer<'_> {
         if wrap {
             self.writer.write("(");
         }
+        let receiver_end = self.node(receiver)?.range.end.get();
+        let question_dot_range = self.node(question_dot_token)?.range;
         if let Some(temp) = self.downlevel_optional_temps.get(&optional).cloned() {
             self.writer.write("(");
             self.writer.write(&temp);
@@ -55261,13 +55369,45 @@ impl Printer<'_> {
             self.writer.write(&temp);
         } else {
             self.emit_expression(receiver, 10)?;
+            self.emit_repeated_inline_block_comments(
+                receiver_end,
+                question_dot_range.start.get(),
+            );
             self.writer.write(" === null || ");
             self.emit_expression(receiver, 10)?;
+            self.emit_repeated_inline_block_comments(
+                receiver_end,
+                question_dot_range.start.get(),
+            );
             self.writer.write(" === void 0 ? void 0 : ");
             self.emit_expression(receiver, 18)?;
+            if usize::try_from(receiver_end)
+                .ok()
+                .zip(usize::try_from(question_dot_range.start.get()).ok())
+                .and_then(|(start, end)| self.source_text.get(start..end))
+                .is_some_and(|trivia| trivia.starts_with("/*"))
+            {
+                self.writer.write(" ");
+            }
+            self.emit_binary_comment_trivia(receiver_end, question_dot_range.start.get());
+            if usize::try_from(receiver_end)
+                .ok()
+                .zip(usize::try_from(question_dot_range.start.get()).ok())
+                .and_then(|(start, end)| self.source_text.get(start..end))
+                .is_some_and(|trivia| {
+                    trivia.contains(['\n', '\r']) && trivia.contains("/*")
+                })
+            {
+                self.writer.write(" ");
+            }
         }
-        for name in names {
+        for (index, name) in names.into_iter().enumerate() {
             self.writer.write(".");
+            if index == 0 {
+                let name_start = self.node(name)?.range.start.get();
+                self.suppress_block_comments_between(question_dot_range.end.get(), name_start);
+                self.emit_binary_comment_trivia(question_dot_range.end.get(), name_start);
+            }
             self.emit_expression(name, 18)?;
         }
         if wrap {
@@ -57603,6 +57743,40 @@ mod tests {
         )
         .code;
         assert_eq!(output, "point. /*read*/x;\npoint. /*write*/x = 1;\n");
+    }
+
+    #[test]
+    fn preserves_comments_inside_property_access_chains() {
+        let output = emit_with(
+            concat!(
+                "/*1*/Array\n/*2*/./*3*/\n",
+                "    // normal\n    toString/*4*/\n",
+                "/*5*/Array/*6*/?./*7*/\n",
+                "    // optional\n    toString/*8*/",
+            ),
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(
+            output.contains(concat!(
+                "/*1*/ Array\n",
+                "    /*2*/ . /*3*/\n",
+                "        // normal\n",
+                "        toString; /*4*/",
+            )),
+            "{output}"
+        );
+        assert!(
+            output.contains(concat!(
+                "/*5*/ Array /*6*/ === null || Array /*6*/ === void 0 ? ",
+                "void 0 : Array /*6*/.\n",
+                "// optional\n",
+                "toString; /*8*/",
+            )),
+            "{output}"
+        );
+        assert!(!output.ends_with(" \n"), "{output:?}");
     }
 
     #[test]
