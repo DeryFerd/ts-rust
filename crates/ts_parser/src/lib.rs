@@ -1999,6 +1999,14 @@ impl<'a> Parser<'a> {
                 recovered_at_statement = true;
                 break;
             }
+            if !signature_only
+                && self.current.kind == SyntaxKind::TryKeyword
+                && self.next_token_kind() == SyntaxKind::OpenBraceToken
+            {
+                self.error_current("Declaration expected.");
+                recovered_at_statement = true;
+                break;
+            }
             let before = (self.current.kind, self.current.range);
             if matches!(
                 self.current.kind,
@@ -12501,6 +12509,31 @@ mod tests {
         assert!(matches!(
             result.arena.get(statements[2]).unwrap().data,
             NodeData::EmptyStatement(_)
+        ));
+    }
+
+    #[test]
+    fn recovers_try_statement_from_inside_a_class() {
+        let result = parse_source_file(
+            "class C { try { public value = initialize(); } catch (error) {} method(); {} }",
+        );
+        let statements = source_statements(&result);
+        assert_eq!(statements.len(), 4, "{:?}", result.diagnostics);
+        assert!(matches!(
+            result.arena.get(statements[0]).unwrap().data,
+            NodeData::ClassDeclaration(_)
+        ));
+        assert!(matches!(
+            result.arena.get(statements[1]).unwrap().data,
+            NodeData::TryStatement(_)
+        ));
+        assert!(matches!(
+            result.arena.get(statements[2]).unwrap().data,
+            NodeData::ExpressionStatement(_)
+        ));
+        assert!(matches!(
+            result.arena.get(statements[3]).unwrap().data,
+            NodeData::Block(_)
         ));
     }
 
