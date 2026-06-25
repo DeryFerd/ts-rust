@@ -26149,6 +26149,27 @@ impl Printer<'_> {
         }
     }
 
+    fn expression_ends_with_missing_new(&self, expression: NodeId) -> bool {
+        match self.arena.get(expression).map(|node| &node.data) {
+            Some(NodeData::NewExpression(new_expression)) => self
+                .arena
+                .get(new_expression.expression)
+                .is_some_and(|node| {
+                    matches!(
+                        &node.data,
+                        NodeData::Identifier(identifier) if identifier.text.is_empty()
+                    )
+                }),
+            Some(NodeData::BinaryExpression(binary)) => {
+                self.expression_ends_with_missing_new(binary.right)
+            }
+            Some(NodeData::ParenthesizedExpression(parenthesized)) => {
+                self.expression_ends_with_missing_new(parenthesized.expression)
+            }
+            _ => false,
+        }
+    }
+
     fn emit_inline_block_comments_between(
         &mut self,
         start: u32,
@@ -50394,7 +50415,9 @@ impl Printer<'_> {
                         self.node(data.expression)?.range.end.get(),
                         node.range.end.get().saturating_sub(1),
                     );
-                    self.writer.remove_trailing_spaces();
+                    if !self.expression_ends_with_missing_new(data.expression) {
+                        self.writer.remove_trailing_spaces();
+                    }
                     let indent_closing = !has_leading_line_comment && self.writer.line_start;
                     self.writer.indent += usize::from(indent_closing);
                     self.writer.write(")");
@@ -55977,6 +56000,17 @@ mod tests {
         assert_eq!(canonical_bigint_literal("123_456n"), "123456n");
         assert_eq!(canonical_bigint_literal("0bn"), "0n");
         assert_eq!(canonical_bigint_literal("0xn"), "0x0n");
+    }
+
+    #[test]
+    fn preserves_operand_gap_for_a_recovered_bare_new_expression() {
+        let source = "(a,\nnew)";
+        let parsed = parse_source_file(source);
+        assert!(!parsed.diagnostics.is_empty());
+        let output = emit_source_file(&parsed.arena, parsed.source_file)
+            .unwrap()
+            .code;
+        assert_eq!(output, "(a, new );\n");
     }
 
     fn emit_declarations_with_semantics(source: &str) -> String {
