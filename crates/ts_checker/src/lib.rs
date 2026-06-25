@@ -533,7 +533,10 @@ enum TypeDescriptor {
     StringLiteral(String),
     BigIntLiteral(String),
     ConstEnum(Box<Self>),
-    TypeParameter(String),
+    TypeParameter {
+        name: String,
+        constraint: Option<Box<Self>>,
+    },
     Import {
         reference: ImportTypeReference,
         target: Box<Self>,
@@ -1466,6 +1469,9 @@ impl<'a> ProgramChecker<'a> {
         name: &str,
         visited: &mut HashSet<(usize, SymbolId)>,
     ) -> bool {
+        if self.module_augmentation_export_has_runtime_value(target, name) {
+            return true;
+        }
         if self.module_export_name_is_explicitly_type_only(target, name) {
             return false;
         }
@@ -1527,6 +1533,9 @@ impl<'a> ProgramChecker<'a> {
     }
 
     fn module_export_name_is_explicitly_type_only(&self, target: usize, name: &str) -> bool {
+        if self.module_augmentation_export_has_runtime_value(target, name) {
+            return false;
+        }
         let Some(source) = self.sources.get(target) else {
             return false;
         };
@@ -1558,6 +1567,49 @@ impl<'a> ProgramChecker<'a> {
                     && module_export_name_text(source.arena, specifier.name) == Some(name)
             })
         })
+    }
+
+    fn module_augmentation_export_has_runtime_value(&self, target: usize, name: &str) -> bool {
+        self.sources
+            .iter()
+            .enumerate()
+            .any(|(source_index, source)| {
+                if !is_external_module(source) {
+                    return false;
+                }
+                source.arena.iter().any(|(_, node)| {
+                    let NodeData::ModuleDeclaration(module) = &node.data else {
+                        return false;
+                    };
+                    let Some(specifier) = string_literal_text(source.arena, module.name) else {
+                        return false;
+                    };
+                    if source.resolved_modules.get(specifier).copied() != Some(target) {
+                        return false;
+                    }
+                    let module_symbol = source
+                        .bindings
+                        .node_symbols
+                        .get(&module.name)
+                        .copied()
+                        .or_else(|| {
+                            source
+                                .bindings
+                                .root_scope()
+                                .and_then(|scope| scope.symbols.get(specifier))
+                        });
+                    let member = module_symbol
+                        .and_then(|symbol| source.bindings.symbols.get(symbol))
+                        .and_then(|symbol| symbol.members.get(name));
+                    member.is_some_and(|member| {
+                        self.symbol_has_runtime_value(
+                            source_index,
+                            member,
+                            &mut HashSet::new(),
+                        )
+                    })
+                })
+            })
     }
 
     fn export_star_targets(&self, source_index: usize) -> Vec<usize> {
@@ -1769,6 +1821,7 @@ impl<'a> ProgramChecker<'a> {
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     fn globals(&self, results: &[CheckResult]) -> GlobalCollection {
         let mut globals = BTreeMap::new();
         let mut declarations = BTreeMap::<String, (usize, ts_binder::SymbolFlags)>::new();
@@ -1787,6 +1840,10 @@ impl<'a> ProgramChecker<'a> {
                 let Some(symbol) = source.bindings.symbols.get(symbol_id) else {
                     continue;
                 };
+                let value_descriptor = (source.is_default_library
+                    && referenced_names.contains(name))
+                .then(|| Self::describe_default_library_value_symbol(source, symbol_id))
+                .flatten();
                 if symbol.declarations.iter().all(|declaration| {
                     matches!(
                         source.arena.get(*declaration).map(|node| &node.data),
@@ -1838,6 +1895,14 @@ impl<'a> ProgramChecker<'a> {
                     {
                         merge_global_descriptor(existing, descriptor);
                     }
+                    if let Some(descriptor) = value_descriptor {
+                        let value_name = format!("typeof {name}");
+                        if let Some(existing) = globals.get_mut(&value_name) {
+                            merge_global_descriptor(existing, descriptor);
+                        } else {
+                            globals.insert(value_name, descriptor);
+                        }
+                    }
                     continue;
                 }
                 let descriptor = if source.is_default_library {
@@ -1858,6 +1923,9 @@ impl<'a> ProgramChecker<'a> {
                     {
                         global_variables.insert(name.to_owned());
                     }
+                }
+                if let Some(descriptor) = value_descriptor {
+                    globals.insert(format!("typeof {name}"), descriptor);
                 }
             }
             Self::extend_unique_enum_member_globals(
@@ -1993,6 +2061,28 @@ impl<'a> ProgramChecker<'a> {
             return Some(TypeDescriptor::Any);
         }
         describe_declaration_symbol(source, None, symbol_id).or(Some(TypeDescriptor::Any))
+    }
+
+    fn describe_default_library_value_symbol(
+        source: &ProgramSource<'_>,
+        symbol_id: SymbolId,
+    ) -> Option<TypeDescriptor> {
+        let symbol = source.bindings.symbols.get(symbol_id)?;
+        let target = symbol.declarations.iter().find_map(|declaration| {
+            let NodeData::VariableDeclaration(variable) = &source.arena.get(*declaration)?.data
+            else {
+                return None;
+            };
+            let NodeData::TypeReferenceNode(reference) =
+                &source.arena.get(variable.type_?)?.data
+            else {
+                return None;
+            };
+            Self::resolve_entity_symbol(source, reference.type_name)
+        })?;
+        (target != symbol_id)
+            .then(|| describe_declaration_symbol(source, None, target))
+            .flatten()
     }
 
     #[allow(clippy::too_many_lines)]
@@ -2728,7 +2818,7 @@ fn descriptor_contains_serialized_reference(descriptor: &TypeDescriptor) -> bool
 
 fn descriptor_contains_type_parameter(descriptor: &TypeDescriptor) -> bool {
     match descriptor {
-        TypeDescriptor::TypeParameter(_) => true,
+        TypeDescriptor::TypeParameter { .. } => true,
         TypeDescriptor::Import { target, .. } | TypeDescriptor::ConstEnum(target) => {
             descriptor_contains_type_parameter(target)
         }
@@ -9081,7 +9171,13 @@ impl<'a> Checker<'a> {
             );
             return type_id;
         }
-        if let Some(descriptor) = self.external_names.get(name).cloned() {
+        let value_name = format!("typeof {name}");
+        if let Some(descriptor) = self
+            .external_names
+            .get(&value_name)
+            .or_else(|| self.external_names.get(name))
+            .cloned()
+        {
             return self.import_type(&descriptor);
         }
         self.error(node, 2304, [name.to_owned()]);
@@ -9890,6 +9986,9 @@ impl<'a> Checker<'a> {
             TypeKind::Object(object) => self.object_property_type(&object, name, true),
             TypeKind::Array(_) if name == "length" => Some(self.result.types.number()),
             TypeKind::Array(element) => {
+                if name == "[Symbol.unscopables]" {
+                    return self.array_unscopables_type(element);
+                }
                 let descriptor = self.external_names.get("Array")?.clone();
                 let array = self.import_alias(&descriptor, &[element]);
                 match self.result.types.get(array)?.kind.clone() {
@@ -10052,6 +10151,10 @@ impl<'a> Checker<'a> {
         match self.result.types.get(object)?.kind.clone() {
             TypeKind::Any => Some(self.result.types.any()),
             TypeKind::Array(element) if self.is_number_like(index) => Some(element),
+            TypeKind::Array(_) => match index_kind {
+                TypeKind::StringLiteral(name) => self.lookup_property_type(object, &name),
+                _ => None,
+            },
             TypeKind::Tuple(elements) | TypeKind::ReadonlyTuple(elements) => match index_kind {
                 TypeKind::NumberLiteral(value) => value
                     .parse::<usize>()
@@ -11819,11 +11922,78 @@ impl<'a> Checker<'a> {
         self.instantiate_synthetic_mapped_type(name.strip_prefix("__mapped:")?, arguments)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn instantiate_core_utility_type(
         &mut self,
         name: &str,
         arguments: &[TypeId],
     ) -> Option<TypeId> {
+        if name == "Pick" {
+            let [source, selected] = arguments else {
+                return None;
+            };
+            let selected = self
+                .literal_keys(*selected)
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect::<BTreeSet<_>>();
+            let mut object = self.contextual_object_type(*source)?;
+            object
+                .properties
+                .retain(|property, _| selected.contains(property));
+            object
+                .property_order
+                .retain(|property| selected.contains(property));
+            object
+                .numeric_properties
+                .retain(|property| selected.contains(property));
+            object
+                .optional_properties
+                .retain(|property| selected.contains(property));
+            object
+                .readonly_properties
+                .retain(|property| selected.contains(property));
+            object
+                .getter_properties
+                .retain(|property| selected.contains(property));
+            object
+                .setter_properties
+                .retain(|property| selected.contains(property));
+            object
+                .setter_property_types
+                .retain(|property, _| selected.contains(property));
+            return Some(self.result.types.alloc(TypeKind::Object(object)));
+        }
+        if name == "Partial" {
+            let [source] = arguments else {
+                return None;
+            };
+            let mut object = self.contextual_object_type(*source)?;
+            object.optional_properties.extend(object.properties.keys().cloned());
+            if self.options.strict_null_checks && !self.options.exact_optional_property_types {
+                let undefined = self.result.types.undefined();
+                for property in object.properties.values_mut() {
+                    if !self.type_includes_undefined(*property) {
+                        *property = self.result.types.union([*property, undefined]);
+                    }
+                }
+            }
+            return Some(self.result.types.alloc(TypeKind::Object(object)));
+        }
+        if name == "Exclude" {
+            let [source, excluded] = arguments else {
+                return None;
+            };
+            if self.type_contains_type_parameter(*source) {
+                return None;
+            }
+            let retained = self
+                .union_members(*source)
+                .into_iter()
+                .filter(|member| !self.is_assignable(*member, *excluded))
+                .collect::<Vec<_>>();
+            return Some(self.result.types.union(retained));
+        }
         if name != "Omit" {
             return None;
         }
@@ -12475,6 +12645,7 @@ impl<'a> Checker<'a> {
         )
     }
 
+    #[allow(clippy::too_many_lines)]
     fn infer_function_return_type(
         &mut self,
         data: &ts_ast::FunctionDeclarationData,
@@ -12537,6 +12708,25 @@ impl<'a> Checker<'a> {
                                 .map(|initializer| self.type_of_expression(initializer))
                         })
                         .unwrap_or_else(|| self.result.types.any());
+                    if let Some(type_node) = variable.type_
+                        && matches!(
+                            self.arena.get(type_node).map(|node| &node.data),
+                            Some(NodeData::MappedTypeNode(_))
+                        )
+                    {
+                        let type_parameters = self
+                            .type_parameter_scopes
+                            .iter()
+                            .flat_map(|scope| {
+                                scope.iter().map(|(name, type_id)| (name.clone(), *type_id))
+                            })
+                            .collect::<HashMap<_, _>>();
+                        if !type_parameters.is_empty() {
+                            self.mapped_return_templates
+                                .insert(type_id, (type_node, type_parameters));
+                            self.non_widening_types.insert(type_id);
+                        }
+                    }
                     self.local_scopes
                         .last_mut()
                         .expect("local scope exists")
@@ -13133,7 +13323,6 @@ impl<'a> Checker<'a> {
                 self.result.types.any()
             };
             if is_rest {
-                parameter_names.pop();
                 rest_parameter = Some(parameter_type);
             } else {
                 parameter_types.push(parameter_type);
@@ -13645,13 +13834,10 @@ impl<'a> Checker<'a> {
                 }
                 self.result.types.union(keys)
             }
-            TypeKind::Tuple(_) | TypeKind::ReadonlyTuple(_) | TypeKind::Array(_) => {
-                let length = self
-                    .result
-                    .types
-                    .alloc(TypeKind::StringLiteral("length".into()));
-                let number = self.result.types.number();
-                self.result.types.union([number, length])
+            TypeKind::Array(element) => self.array_keyof_type(element),
+            TypeKind::Tuple(elements) | TypeKind::ReadonlyTuple(elements) => {
+                let element = self.result.types.union(elements);
+                self.array_keyof_type(element)
             }
             TypeKind::Union(members) => {
                 let mut common = self.type_keys(members[0]);
@@ -13674,6 +13860,82 @@ impl<'a> Checker<'a> {
             } => self.keyof_type(constraint),
             _ => self.result.types.never(),
         }
+    }
+
+    fn array_keyof_type(&mut self, element: TypeId) -> TypeId {
+        let Some(descriptor) = self.external_names.get("Array").cloned() else {
+            let length = self
+                .result
+                .types
+                .alloc(TypeKind::StringLiteral("length".into()));
+            let number = self.result.types.number();
+            return self.result.types.union([number, length]);
+        };
+        let array = self.import_alias(&descriptor, &[element]);
+        let Some(TypeKind::Object(object)) = self
+            .result
+            .types
+            .get(array)
+            .map(|type_| type_.kind.clone())
+        else {
+            let length = self
+                .result
+                .types
+                .alloc(TypeKind::StringLiteral("length".into()));
+            let number = self.result.types.number();
+            return self.result.types.union([number, length]);
+        };
+        let mut names = Self::object_property_names(&object);
+        Self::insert_array_unscopables_name(&mut names);
+        let mut keys = names
+            .into_iter()
+            .map(|name| self.result.types.alloc(TypeKind::StringLiteral(name)))
+            .collect::<Vec<_>>();
+        keys.push(self.result.types.number());
+        self.result.types.union(keys)
+    }
+
+    fn insert_array_unscopables_name(names: &mut Vec<String>) {
+        let name = "[Symbol.unscopables]";
+        if names.iter().any(|existing| existing == name) {
+            return;
+        }
+        let index = names
+            .iter()
+            .position(|existing| existing == "includes")
+            .unwrap_or(names.len());
+        names.insert(index, name.into());
+    }
+
+    fn array_unscopables_type(&mut self, element: TypeId) -> Option<TypeId> {
+        let descriptor = self.external_names.get("Array")?.clone();
+        let array = self.import_alias(&descriptor, &[element]);
+        let TypeKind::Object(object) = self.result.types.get(array)?.kind.clone() else {
+            return None;
+        };
+        let mut property_order = Self::object_property_names(&object);
+        Self::insert_array_unscopables_name(&mut property_order);
+        if !property_order.iter().any(|name| name == "length") {
+            property_order.insert(0, "length".into());
+        }
+        let boolean = self.result.types.boolean();
+        let undefined = self.result.types.undefined();
+        let value = self.result.types.union([boolean, undefined]);
+        let properties = property_order
+            .iter()
+            .cloned()
+            .map(|name| (name, value))
+            .collect::<BTreeMap<_, _>>();
+        let optional_properties = property_order.iter().cloned().collect();
+        let readonly_properties = BTreeSet::from(["[Symbol.unscopables]".into()]);
+        Some(self.result.types.alloc(TypeKind::Object(ObjectType {
+            properties,
+            property_order,
+            number_index_type: Some(value),
+            optional_properties,
+            readonly_properties,
+            ..ObjectType::default()
+        })))
     }
 
     fn conditional_type(&mut self, data: &ts_ast::ConditionalTypeNodeData) -> TypeId {
@@ -13970,22 +14232,22 @@ impl<'a> Checker<'a> {
             return self.result.types.unknown();
         };
         let constraint = self.type_from_type_node(constraint);
+        let homomorphic_object = self.mapped_source_object(parameter.constraint.unwrap());
         if let Some(name_type) = data.name_type {
             let members = self.union_members(constraint);
             let mut properties = BTreeMap::new();
             let mut property_order = Vec::new();
             let mut optional_properties = BTreeSet::new();
             let mut readonly_properties = BTreeSet::new();
+            let mut number_index_type = None;
             for member in members {
-                if !matches!(
-                    self.result.types.get(member).map(|type_| &type_.kind),
-                    Some(TypeKind::Object(_))
-                ) {
-                    continue;
-                }
                 self.type_parameter_scopes
                     .push(HashMap::from([(name.clone(), member)]));
                 let mapped_name = self.type_from_type_node(name_type);
+                let maps_number_index = matches!(
+                    self.result.types.get(mapped_name).map(|type_| &type_.kind),
+                    Some(TypeKind::Number)
+                );
                 let output_names = self
                     .literal_keys(mapped_name)
                     .into_iter()
@@ -13996,10 +14258,22 @@ impl<'a> Checker<'a> {
                     None => self.result.types.any(),
                 };
                 self.type_parameter_scopes.pop();
-                if output_names.is_empty() {
+                if output_names.is_empty() && !maps_number_index {
                     continue;
                 }
-                let is_optional = self.mapped_modifier(data.question_token) == Some(true);
+                let source_names = self
+                    .literal_keys(member)
+                    .into_iter()
+                    .map(|(name, _)| name)
+                    .collect::<Vec<_>>();
+                let preserve_optional = homomorphic_object.as_ref().is_some_and(|object| {
+                    source_names
+                        .iter()
+                        .any(|name| object.optional_properties.contains(name))
+                });
+                let is_optional = self
+                    .mapped_modifier(data.question_token)
+                    .unwrap_or(preserve_optional);
                 if is_optional
                     && self.options.strict_null_checks
                     && !self.options.exact_optional_property_types
@@ -14008,7 +14282,19 @@ impl<'a> Checker<'a> {
                     let undefined = self.result.types.undefined();
                     property_type = self.result.types.union([property_type, undefined]);
                 }
-                let is_readonly = self.mapped_modifier(data.readonly_token) == Some(true);
+                let preserve_readonly = homomorphic_object.as_ref().is_some_and(|object| {
+                    source_names
+                        .iter()
+                        .any(|name| object.readonly_properties.contains(name))
+                });
+                let is_readonly = self
+                    .mapped_modifier(data.readonly_token)
+                    .unwrap_or(preserve_readonly);
+                if maps_number_index {
+                    number_index_type = Some(number_index_type.map_or(property_type, |existing| {
+                        self.result.types.union([existing, property_type])
+                    }));
+                }
                 for output_name in output_names {
                     if !property_order.contains(&output_name) {
                         property_order.push(output_name.clone());
@@ -14022,10 +14308,11 @@ impl<'a> Checker<'a> {
                     properties.insert(output_name, property_type);
                 }
             }
-            if !properties.is_empty() {
+            if !properties.is_empty() || number_index_type.is_some() {
                 return self.result.types.alloc(TypeKind::Object(ObjectType {
                     properties,
                     property_order,
+                    number_index_type,
                     optional_properties,
                     readonly_properties,
                     ..ObjectType::default()
@@ -14033,7 +14320,6 @@ impl<'a> Checker<'a> {
             }
         }
         let keys = self.literal_keys(constraint);
-        let homomorphic_object = self.mapped_source_object(parameter.constraint.unwrap());
         let mut properties = BTreeMap::new();
         let mut property_order = Vec::new();
         let mut optional_properties = BTreeSet::new();
@@ -14125,10 +14411,32 @@ impl<'a> Checker<'a> {
             return None;
         }
         let source = self.type_from_type_node(operator.type_);
-        let TypeKind::Object(object) = self.result.types.get(source)?.kind.clone() else {
-            return None;
-        };
-        Some(object)
+        if let Some(object) = self.contextual_object_type(source) {
+            return Some(object);
+        }
+        match self.result.types.get(source)?.kind.clone() {
+            TypeKind::Array(element) => {
+                let descriptor = self.external_names.get("Array")?.clone();
+                let array = self.import_alias(&descriptor, &[element]);
+                let TypeKind::Object(mut object) = self.result.types.get(array)?.kind.clone() else {
+                    return None;
+                };
+                let unscopables = self.array_unscopables_type(element)?;
+                let name = "[Symbol.unscopables]".to_owned();
+                if !object.property_order.contains(&name) {
+                    let index = object
+                        .property_order
+                        .iter()
+                        .position(|existing| existing == "includes")
+                        .unwrap_or(object.property_order.len());
+                    object.property_order.insert(index, name.clone());
+                }
+                object.properties.insert(name.clone(), unscopables);
+                object.readonly_properties.insert(name);
+                Some(object)
+            }
+            _ => None,
+        }
     }
 
     fn mapped_modifier(&self, token: Option<NodeId>) -> Option<bool> {
@@ -14563,13 +14871,16 @@ impl<'a> Checker<'a> {
     fn import_type(&mut self, descriptor: &TypeDescriptor) -> TypeId {
         match descriptor {
             TypeDescriptor::Any => self.result.types.any(),
-            TypeDescriptor::TypeParameter(name) => {
+            TypeDescriptor::TypeParameter { name, constraint } => {
                 if let Some(type_id) = self.imported_type_parameters.get(name) {
                     *type_id
                 } else {
+                    let constraint = constraint
+                        .as_deref()
+                        .map(|constraint| self.import_type(constraint));
                     let type_id = self.result.types.alloc(TypeKind::TypeParameter {
                         name: name.clone(),
-                        constraint: None,
+                        constraint,
                     });
                     self.imported_type_parameters.insert(name.clone(), type_id);
                     type_id
@@ -14601,6 +14912,13 @@ impl<'a> Checker<'a> {
                     let target = self.import_type(target);
                     let default_type = self.import_type(default_type);
                     self.type_parameter_defaults.insert(target, default_type);
+                    self.result.named_type_references.insert(
+                        target,
+                        NamedTypeReference {
+                            name: "__default_type_parameter".into(),
+                            type_arguments: vec![default_type],
+                        },
+                    );
                     return target;
                 }
                 let target = self.import_type(target);
@@ -14915,6 +15233,8 @@ impl<'a> Checker<'a> {
                             || self.result.import_type_references.contains_key(&property)
                         {
                             property
+                        } else if optional_properties.contains(&name) {
+                            self.widen_optional_property_type(property)
                         } else {
                             self.widen_literal(property)
                         };
@@ -14956,6 +15276,34 @@ impl<'a> Checker<'a> {
             self.result.named_type_references.insert(widened, reference);
         }
         widened
+    }
+
+    fn widen_optional_property_type(&mut self, type_id: TypeId) -> TypeId {
+        match self
+            .result
+            .types
+            .get(type_id)
+            .map(|type_| type_.kind.clone())
+        {
+            Some(TypeKind::Null | TypeKind::Undefined) => type_id,
+            Some(TypeKind::Union(members)) => {
+                let members = members
+                    .into_iter()
+                    .map(|member| {
+                        if matches!(
+                            self.result.types.get(member).map(|type_| &type_.kind),
+                            Some(TypeKind::Null | TypeKind::Undefined)
+                        ) {
+                            member
+                        } else {
+                            self.widen_literal(member)
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                self.result.types.union(members)
+            }
+            _ => self.widen_literal(type_id),
+        }
     }
 
     fn is_const_declaration(&self, declaration: NodeId) -> bool {
@@ -15248,7 +15596,10 @@ impl<'a> Checker<'a> {
             NodeData::NumericLiteral(data) => Some(data.text.clone()),
             NodeData::NoSubstitutionTemplateLiteral(data) => Some(data.text.clone()),
             NodeData::ComputedPropertyName(computed) => {
-                self.computed_property_name(computed.expression)
+                self.computed_property_name(computed.expression).or_else(|| {
+                    self.value_expression_text(computed.expression)
+                        .map(|text| format!("[{text}]"))
+                })
             }
             _ => None,
         }
@@ -17301,6 +17652,36 @@ fn describe_type_node_syntax(
             checker.type_parameter_scopes.pop();
             described
         }
+        NodeData::TypePredicateNode(predicate) => {
+            let parameter = if source
+                .arena
+                .get(predicate.parameter_name)
+                .is_some_and(|node| node.kind == SyntaxKind::ThisType)
+            {
+                "this".to_owned()
+            } else {
+                checker
+                    .property_name(predicate.parameter_name)
+                    .unwrap_or_else(|| "value".into())
+            };
+            let Some(narrowed) = predicate.type_ else {
+                return semantic_target;
+            };
+            let narrowed_id = checker.type_from_type_node(narrowed);
+            let narrowed_target = describe_source_type(source, &checker.result, narrowed_id);
+            let narrowed = describe_type_node_syntax(
+                source,
+                checker,
+                narrowed,
+                narrowed_target,
+                exported_names,
+            );
+            TypeDescriptor::Named {
+                name: format!("__type_predicate:{parameter}"),
+                type_arguments: vec![narrowed],
+                target: Box::new(TypeDescriptor::Boolean),
+            }
+        }
         NodeData::TypeQueryNode(query) => {
             let Some(name) = checker.entity_name_text(query.expr_name) else {
                 return semantic_target;
@@ -17344,7 +17725,33 @@ fn describe_type_node_syntax(
                 source.arena.get(reference.type_name).map(|node| &node.data),
                 Some(NodeData::QualifiedName(_))
             );
-            if matches!(semantic_target, TypeDescriptor::TypeParameter(_)) {
+            if let Some((type_parameter, default_type)) = checker
+                .type_parameter_scopes
+                .iter()
+                .rev()
+                .find_map(|scope| scope.get(&name))
+                .and_then(|type_id| {
+                    checker
+                        .type_parameter_defaults
+                        .get(type_id)
+                        .map(|default_type| (*type_id, *default_type))
+                })
+            {
+                let default_type = describe_source_type(source, &checker.result, default_type);
+                let target = describe_source_type(source, &checker.result, type_parameter);
+                return TypeDescriptor::Named {
+                    name: "__default_type_parameter".into(),
+                    type_arguments: vec![default_type],
+                    target: Box::new(target),
+                };
+            }
+            if matches!(
+                &semantic_target,
+                TypeDescriptor::TypeParameter {
+                    name: parameter_name,
+                    ..
+                } if parameter_name == &name
+            ) {
                 return semantic_target;
             }
             if matches!(semantic_target, TypeDescriptor::Unknown)
@@ -17430,6 +17837,13 @@ fn describe_type_node_syntax(
                     })
                 })
             {
+                if checker.type_alias_is_recursive(symbol, &name) {
+                    return TypeDescriptor::Named {
+                        name,
+                        type_arguments,
+                        target: Box::new(semantic_target),
+                    };
+                }
                 let TypeDescriptor::Alias { parameters, body } = describe_alias(source, alias)
                 else {
                     unreachable!("describe_alias always returns an alias descriptor");
@@ -17566,6 +17980,7 @@ fn describe_type_node_syntax(
                 };
             }
             if qualified
+                || source.is_default_library
                 || is_core_library_name(&name)
                 || exported_names.contains(&name)
                 || source_imports_reference_name(source, &name)
@@ -17905,7 +18320,7 @@ fn describe_type_node_syntax(
             );
             if !matches!(
                 object,
-                TypeDescriptor::Named { .. } | TypeDescriptor::TypeParameter(_)
+                TypeDescriptor::Named { .. } | TypeDescriptor::TypeParameter { .. }
             ) {
                 return semantic_target;
             }
@@ -18155,49 +18570,185 @@ fn homomorphic_identity_alias_body(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn describe_interface_member_syntax(
     source: &ProgramSource<'_>,
     declarations: &[&ts_ast::Node],
     mut descriptor: TypeDescriptor,
 ) -> TypeDescriptor {
-    let TypeDescriptor::Object { properties, .. } = &mut descriptor else {
-        return descriptor;
+    let alias_parameters = match &descriptor {
+        TypeDescriptor::Alias { parameters, .. } => parameters.clone(),
+        _ => Vec::new(),
+    };
+    let array_self_parameter = declarations.iter().find_map(|declaration| {
+        let NodeData::InterfaceDeclaration(interface) = &declaration.data else {
+            return None;
+        };
+        (identifier_text(source.arena, interface.name) == Some("Array"))
+            .then(|| alias_parameters.first().cloned())
+            .flatten()
+    });
+    let properties = match &mut descriptor {
+        TypeDescriptor::Object { properties, .. } => properties,
+        TypeDescriptor::Alias { body, .. } => {
+            let TypeDescriptor::Object { properties, .. } = body.as_mut() else {
+                return descriptor;
+            };
+            properties
+        }
+        _ => return descriptor,
     };
     let mut checker =
         Checker::new(source.arena, source.bindings).with_options(source.checker_options);
     checker.seed_symbol_types();
+    let type_parameter_scope = alias_parameters
+        .into_iter()
+        .map(|name| {
+            let type_id = checker.result.types.alloc(TypeKind::TypeParameter {
+                name: name.clone(),
+                constraint: None,
+            });
+            (name, type_id)
+        })
+        .collect();
+    checker.type_parameter_scopes.push(type_parameter_scope);
     let exported_names = exported_reference_names(source);
+    let mut overload_indices = BTreeMap::<String, usize>::new();
     for declaration in declarations {
         let NodeData::InterfaceDeclaration(interface) = &declaration.data else {
             continue;
         };
         for member in &interface.members.nodes {
-            let (name_node, return_node) = match source.arena.get(*member).map(|node| &node.data) {
-                Some(NodeData::MethodSignatureDeclaration(method)) => (method.name, method.type_),
+            let (name_node, type_parameters, parameters, return_node) =
+                match source.arena.get(*member).map(|node| &node.data) {
+                Some(NodeData::MethodSignatureDeclaration(method)) => {
+                    (
+                        method.name,
+                        method.type_parameters.as_ref(),
+                        &method.parameters,
+                        method.type_,
+                    )
+                }
                 Some(NodeData::MethodDeclaration(method)) if method.body.is_none() => {
-                    (method.name, method.type_)
+                    (
+                        method.name,
+                        method.type_parameters.as_ref(),
+                        &method.parameters,
+                        method.type_,
+                    )
                 }
                 _ => continue,
             };
             let Some(name) = checker.property_name(name_node) else {
                 continue;
             };
-            let Some(TypeDescriptor::Function { return_type, .. }) = properties.get_mut(&name)
+            let Some(property) = properties.get_mut(&name) else {
+                continue;
+            };
+            let signature = match property {
+                TypeDescriptor::Function { .. } => property,
+                TypeDescriptor::Overload(signatures) => {
+                    let index = overload_indices.entry(name.clone()).or_default();
+                    let signature = signatures.get_mut(*index);
+                    *index += 1;
+                    let Some(signature) = signature else {
+                        continue;
+                    };
+                    signature
+                }
+                _ => continue,
+            };
+            let TypeDescriptor::Function {
+                parameters: descriptor_parameters,
+                return_type,
+                ..
+            } = signature
             else {
                 continue;
             };
-            let Some(return_node) = return_node else {
-                continue;
-            };
-            **return_type = describe_type_node_syntax(
-                source,
-                &mut checker,
-                return_node,
-                (**return_type).clone(),
-                &exported_names,
-            );
+            let mut method_scope = HashMap::new();
+            if let Some(type_parameters) = type_parameters {
+                for type_parameter in &type_parameters.nodes {
+                    let Some(NodeData::TypeParameterDeclaration(type_parameter)) =
+                        source.arena.get(*type_parameter).map(|node| &node.data)
+                    else {
+                        continue;
+                    };
+                    let Some(name) = checker.property_name(type_parameter.name) else {
+                        continue;
+                    };
+                    let constraint = type_parameter
+                        .constraint
+                        .map(|constraint| checker.type_from_type_node(constraint));
+                    let type_id = checker.result.types.alloc(TypeKind::TypeParameter {
+                        name: name.clone(),
+                        constraint,
+                    });
+                    if let Some(default_type) = type_parameter.default_type {
+                        let default_type = checker.type_from_type_node(default_type);
+                        checker
+                            .type_parameter_defaults
+                            .insert(type_id, default_type);
+                        checker.result.named_type_references.insert(
+                            type_id,
+                            NamedTypeReference {
+                                name: "__default_type_parameter".into(),
+                                type_arguments: vec![default_type],
+                            },
+                        );
+                    }
+                    method_scope.insert(name, type_id);
+                }
+            }
+            checker.type_parameter_scopes.push(method_scope);
+            for (index, parameter) in parameters.nodes.iter().enumerate() {
+                let Some(NodeData::ParameterDeclaration(parameter)) =
+                    source.arena.get(*parameter).map(|node| &node.data)
+                else {
+                    continue;
+                };
+                let (Some(type_node), Some(target)) =
+                    (parameter.type_, descriptor_parameters.get(index).cloned())
+                else {
+                    continue;
+                };
+                let mut described = describe_type_node_syntax(
+                    source,
+                    &mut checker,
+                    type_node,
+                    target,
+                    &exported_names,
+                );
+                if parameter.question_token.is_some() || parameter.initializer.is_some() {
+                    described = TypeDescriptor::Union(vec![described, TypeDescriptor::Undefined]);
+                }
+                descriptor_parameters[index] = described;
+            }
+            if let Some(return_node) = return_node {
+                **return_type = if source
+                    .arena
+                    .get(return_node)
+                    .is_some_and(|node| node.kind == SyntaxKind::ThisType)
+                    && let Some(parameter) = &array_self_parameter
+                {
+                    TypeDescriptor::Array(Box::new(TypeDescriptor::TypeParameter {
+                        name: parameter.clone(),
+                        constraint: None,
+                    }))
+                } else {
+                    describe_type_node_syntax(
+                        source,
+                        &mut checker,
+                        return_node,
+                        (**return_type).clone(),
+                        &exported_names,
+                    )
+                };
+            }
+            checker.type_parameter_scopes.pop();
         }
     }
+    checker.type_parameter_scopes.pop();
     descriptor
 }
 
@@ -18316,7 +18867,10 @@ fn describe_declaration_symbol(
                     let replacement = TypeDescriptor::Named {
                         name: "__default_type_parameter".into(),
                         type_arguments: vec![default],
-                        target: Box::new(TypeDescriptor::TypeParameter(parameter.clone())),
+                        target: Box::new(TypeDescriptor::TypeParameter {
+                            name: parameter.clone(),
+                            constraint: None,
+                        }),
                     };
                     descriptor = substitute_descriptor(
                         &descriptor,
@@ -18438,9 +18992,10 @@ fn describe_declaration_symbol(
         }
         let mut checker =
             Checker::new(source.arena, source.bindings).with_options(source.checker_options);
+        checker.seed_symbol_types();
         let (parameters, arguments) =
             descriptor_parameters(&mut checker, first.type_parameters.as_ref());
-        let mut properties = BTreeMap::new();
+        let mut combined = ObjectType::default();
         for declaration in &declarations {
             let NodeData::InterfaceDeclaration(data) = &declaration.data else {
                 continue;
@@ -18452,15 +19007,29 @@ fn describe_declaration_symbol(
                 &arguments,
             );
             if let TypeKind::Object(object) = checker.result.types.get(object)?.kind.clone() {
-                properties.extend(object.properties);
+                for name in object.property_order {
+                    if !combined.property_order.contains(&name) {
+                        combined.property_order.push(name);
+                    }
+                }
+                combined.properties.extend(object.properties);
+                combined.numeric_properties.extend(object.numeric_properties);
+                combined.optional_properties.extend(object.optional_properties);
+                combined.readonly_properties.extend(object.readonly_properties);
+                combined.getter_properties.extend(object.getter_properties);
+                combined.setter_properties.extend(object.setter_properties);
+                combined
+                    .setter_property_types
+                    .extend(object.setter_property_types);
+                combined.call_signatures.extend(object.call_signatures);
+                combined.construct_signatures.extend(object.construct_signatures);
+                combined.string_index_type = object.string_index_type.or(combined.string_index_type);
+                combined.number_index_type = object.number_index_type.or(combined.number_index_type);
             }
         }
-        let body = checker.result.types.alloc(TypeKind::Object(ObjectType {
-            properties,
-            ..ObjectType::default()
-        }));
+        let body = checker.result.types.alloc(TypeKind::Object(combined));
         let body = describe_source_type(source, &checker.result, body);
-        let mut descriptor = if parameters.is_empty() {
+        let descriptor = if parameters.is_empty() {
             body
         } else {
             TypeDescriptor::Alias {
@@ -18468,21 +19037,6 @@ fn describe_declaration_symbol(
                 body: Box::new(body),
             }
         };
-        if let Some(variable) = declarations.iter().find_map(|node| {
-            let NodeData::VariableDeclaration(variable) = &node.data else {
-                return None;
-            };
-            Some(variable.as_ref())
-        }) && let Some(NodeData::TypeReferenceNode(reference)) = variable
-            .type_
-            .and_then(|annotation| source.arena.get(annotation))
-            .map(|node| &node.data)
-            && let Some(target) = ProgramChecker::resolve_entity_symbol(source, reference.type_name)
-            && target != symbol_id
-            && let Some(static_descriptor) = describe_declaration_symbol(source, None, target)
-        {
-            merge_global_descriptor(&mut descriptor, static_descriptor);
-        }
         return Some(describe_interface_member_syntax(
             source,
             &declarations,
@@ -18665,7 +19219,10 @@ fn describe_declaration_symbol(
                 let replacement = TypeDescriptor::Named {
                     name: "__default_type_parameter".into(),
                     type_arguments: vec![default],
-                    target: Box::new(TypeDescriptor::TypeParameter(parameter.clone())),
+                    target: Box::new(TypeDescriptor::TypeParameter {
+                        name: parameter.clone(),
+                        constraint: None,
+                    }),
                 };
                 *descriptor =
                     substitute_descriptor(descriptor, &BTreeMap::from([(parameter, replacement)]));
@@ -18897,7 +19454,10 @@ fn describe_type_with_imports_inner(
         TypeKind::NumberLiteral(value) => TypeDescriptor::NumberLiteral(value.clone()),
         TypeKind::StringLiteral(value) => TypeDescriptor::StringLiteral(value.clone()),
         TypeKind::BigIntLiteral(value) => TypeDescriptor::BigIntLiteral(value.clone()),
-        TypeKind::TypeParameter { name, .. } => TypeDescriptor::TypeParameter(name.clone()),
+        TypeKind::TypeParameter { name, constraint } => TypeDescriptor::TypeParameter {
+            name: name.clone(),
+            constraint: constraint.map(|constraint| Box::new(describe(constraint))),
+        },
         TypeKind::Array(element) => TypeDescriptor::Array(Box::new(describe(*element))),
         TypeKind::Tuple(elements) => {
             TypeDescriptor::Tuple(elements.iter().map(|element| describe(*element)).collect())
@@ -19024,10 +19584,15 @@ fn substitute_descriptor(
     substitutions: &BTreeMap<String, TypeDescriptor>,
 ) -> TypeDescriptor {
     match descriptor {
-        TypeDescriptor::TypeParameter(name) => substitutions
+        TypeDescriptor::TypeParameter { name, constraint } => substitutions
             .get(name)
             .cloned()
-            .unwrap_or_else(|| descriptor.clone()),
+            .unwrap_or_else(|| TypeDescriptor::TypeParameter {
+                name: name.clone(),
+                constraint: constraint.as_ref().map(|constraint| {
+                    Box::new(substitute_descriptor(constraint, substitutions))
+                }),
+            }),
         TypeDescriptor::Import { reference, target } => TypeDescriptor::Import {
             reference: reference.clone(),
             target: Box::new(substitute_descriptor(target, substitutions)),
@@ -19200,6 +19765,7 @@ fn merge_global_descriptor(existing: &mut TypeDescriptor, new: TypeDescriptor) {
         (
             TypeDescriptor::Object {
                 properties: existing,
+                property_order: existing_order,
                 string_index_type: existing_string_index,
                 number_index_type: existing_number_index,
                 call_signatures: existing_calls,
@@ -19211,6 +19777,7 @@ fn merge_global_descriptor(existing: &mut TypeDescriptor, new: TypeDescriptor) {
             },
             TypeDescriptor::Object {
                 properties: new,
+                property_order: new_order,
                 string_index_type: new_string_index,
                 number_index_type: new_number_index,
                 call_signatures: new_calls,
@@ -19221,6 +19788,11 @@ fn merge_global_descriptor(existing: &mut TypeDescriptor, new: TypeDescriptor) {
                 ..
             },
         ) => {
+            for name in new_order {
+                if !existing_order.contains(&name) {
+                    existing_order.push(name);
+                }
+            }
             for (name, descriptor) in new {
                 if let Some(existing) = existing.get_mut(&name) {
                     merge_global_descriptor(existing, descriptor);
@@ -19240,6 +19812,7 @@ fn merge_global_descriptor(existing: &mut TypeDescriptor, new: TypeDescriptor) {
             TypeDescriptor::Alias { body, .. },
             TypeDescriptor::Object {
                 properties: new,
+                property_order: new_order,
                 string_index_type: new_string_index,
                 number_index_type: new_number_index,
                 call_signatures: new_calls,
@@ -19252,6 +19825,7 @@ fn merge_global_descriptor(existing: &mut TypeDescriptor, new: TypeDescriptor) {
         ) => {
             if let TypeDescriptor::Object {
                 properties: existing,
+                property_order: existing_order,
                 string_index_type: existing_string_index,
                 number_index_type: existing_number_index,
                 call_signatures: existing_calls,
@@ -19262,6 +19836,11 @@ fn merge_global_descriptor(existing: &mut TypeDescriptor, new: TypeDescriptor) {
                 ..
             } = body.as_mut()
             {
+                for name in new_order {
+                    if !existing_order.contains(&name) {
+                        existing_order.push(name);
+                    }
+                }
                 for (name, descriptor) in new {
                     if let Some(existing) = existing.get_mut(&name) {
                         merge_global_descriptor(existing, descriptor);
@@ -19291,6 +19870,7 @@ fn merge_global_descriptor(existing: &mut TypeDescriptor, new: TypeDescriptor) {
             if let (
                 TypeDescriptor::Object {
                     properties: existing,
+                    property_order: existing_order,
                     string_index_type: existing_string_index,
                     number_index_type: existing_number_index,
                     call_signatures: existing_calls,
@@ -19302,6 +19882,7 @@ fn merge_global_descriptor(existing: &mut TypeDescriptor, new: TypeDescriptor) {
                 },
                 TypeDescriptor::Object {
                     properties: new,
+                    property_order: new_order,
                     string_index_type: new_string_index,
                     number_index_type: new_number_index,
                     call_signatures: new_calls,
@@ -19313,6 +19894,11 @@ fn merge_global_descriptor(existing: &mut TypeDescriptor, new: TypeDescriptor) {
                 },
             ) = (existing_body.as_mut(), *new_body)
             {
+                for name in new_order {
+                    if !existing_order.contains(&name) {
+                        existing_order.push(name);
+                    }
+                }
                 for (name, descriptor) in new {
                     if let Some(existing) = existing.get_mut(&name) {
                         merge_global_descriptor(existing, descriptor);
@@ -19328,6 +19914,21 @@ fn merge_global_descriptor(existing: &mut TypeDescriptor, new: TypeDescriptor) {
                 existing_calls.extend(new_calls);
                 existing_constructs.extend(new_constructs);
             }
+        }
+        (existing @ TypeDescriptor::Function { .. }, new @ TypeDescriptor::Function { .. }) => {
+            let previous = std::mem::replace(existing, TypeDescriptor::Any);
+            *existing = TypeDescriptor::Overload(vec![previous, new]);
+        }
+        (TypeDescriptor::Overload(existing), new @ TypeDescriptor::Function { .. }) => {
+            existing.push(new);
+        }
+        (existing @ TypeDescriptor::Function { .. }, TypeDescriptor::Overload(mut new)) => {
+            let previous = std::mem::replace(existing, TypeDescriptor::Any);
+            new.insert(0, previous);
+            *existing = TypeDescriptor::Overload(new);
+        }
+        (TypeDescriptor::Overload(existing), TypeDescriptor::Overload(new)) => {
+            existing.extend(new);
         }
         _ => {}
     }
@@ -22121,7 +22722,10 @@ mod tests {
         let parsed = parse_source_file(&source);
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         let bindings = bind_source_file(&parsed.arena, parsed.source_file);
-        let parameter = TypeDescriptor::TypeParameter("base".into());
+        let parameter = TypeDescriptor::TypeParameter {
+            name: "base".into(),
+            constraint: None,
+        };
         let omit = TypeDescriptor::Alias {
             parameters: vec!["base".into(), "keys".into()],
             body: Box::new(TypeDescriptor::Intersection(vec![
@@ -24502,6 +25106,77 @@ mod tests {
     }
 
     #[test]
+    fn module_augmentation_value_overrides_type_only_reexport_runtime_meaning() {
+        let common = parse_source_file("export declare function Row(): void;");
+        let index = parse_source_file("export type { Row } from './common';");
+        let augmentation = parse_source_file(
+            "import '.'; declare module '.' { const Row: () => void; }",
+        );
+        let consumer = parse_source_file("import { Row } from '.'; Row();");
+        let common_bindings = bind_source_file(&common.arena, common.source_file);
+        let index_bindings = bind_source_file(&index.arena, index.source_file);
+        let augmentation_bindings =
+            bind_source_file(&augmentation.arena, augmentation.source_file);
+        let consumer_bindings = bind_source_file(&consumer.arena, consumer.source_file);
+        let no_modules = BTreeMap::new();
+        let index_modules = BTreeMap::from([("./common".into(), 0)]);
+        let augmentation_modules = BTreeMap::from([(".".into(), 1)]);
+        let consumer_modules = BTreeMap::from([(".".into(), 1)]);
+        let declaration_options = CheckerOptions {
+            is_declaration_file: true,
+            ..CheckerOptions::default()
+        };
+        let checked = check_program(&[
+            ProgramSource {
+                arena: &common.arena,
+                source_file: common.source_file,
+                bindings: &common_bindings,
+                resolved_modules: &no_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: declaration_options,
+            },
+            ProgramSource {
+                arena: &index.arena,
+                source_file: index.source_file,
+                bindings: &index_bindings,
+                resolved_modules: &index_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: declaration_options,
+            },
+            ProgramSource {
+                arena: &augmentation.arena,
+                source_file: augmentation.source_file,
+                bindings: &augmentation_bindings,
+                resolved_modules: &augmentation_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: declaration_options,
+            },
+            ProgramSource {
+                arena: &consumer.arena,
+                source_file: consumer.source_file,
+                bindings: &consumer_bindings,
+                resolved_modules: &consumer_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+        ]);
+        let NodeData::SourceFile(source) = &consumer.arena.get(consumer.source_file).unwrap().data
+        else {
+            panic!("expected source file");
+        };
+        assert_eq!(
+            checked.files[3]
+                .import_runtime_meanings
+                .get(&source.statements.nodes[0]),
+            Some(&true)
+        );
+    }
+
+    #[test]
     fn arbitrary_module_export_names_keep_runtime_imports() {
         let dependency = parse_source_file("const foo = 0n; export { foo as \"0n\" };");
         let consumer = parse_source_file("import { \"0n\" as foo } from './dep'; foo;");
@@ -25954,6 +26629,31 @@ mod tests {
         let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
         let value = bindings.root_scope().unwrap().symbols.get("value").unwrap();
         assert!(result.type_of_symbol(value).is_some());
+    }
+
+    #[test]
+    fn publishes_recursive_mapped_alias_descriptors_without_recursing() {
+        let parsed = parse_source_file(
+            r#"
+                interface A { a: A }
+                declare let a: A;
+                type Deep<T> = { [K in keyof T]: Deep<T[K]> };
+                declare function foo<T>(deep: Deep<T>): T;
+            "#,
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let no_modules = BTreeMap::new();
+        let checked = check_program(&[ProgramSource {
+            arena: &parsed.arena,
+            source_file: parsed.source_file,
+            bindings: &bindings,
+            resolved_modules: &no_modules,
+            is_default_library: false,
+            skip_diagnostics: false,
+            checker_options: CheckerOptions::default(),
+        }]);
+        assert!(checked.files[0].diagnostics.is_empty());
     }
 
     #[test]

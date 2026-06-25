@@ -7925,11 +7925,18 @@ impl DeclarationPrinter<'_> {
             result?;
             return Ok(());
         }
-        if let Some(annotation) = function
-            .body
-            .and_then(|body| self.returned_local_variable_type_annotation(body))
-        {
-            self.emit_type(annotation)?;
+        if let Some((body, annotation)) = function.body.and_then(|body| {
+            self.returned_local_variable_type_annotation(body)
+                .map(|annotation| (body, annotation))
+        }) {
+            if matches!(
+                self.arena.get(annotation).map(|node| &node.data),
+                Some(NodeData::MappedTypeNode(_))
+            ) {
+                self.emit_compact_local_alias_type(body, annotation, &mut HashSet::new())?;
+            } else {
+                self.emit_type(annotation)?;
+            }
             return Ok(());
         }
         let kind = self
@@ -12721,7 +12728,18 @@ impl DeclarationPrinter<'_> {
             .semantic_types
             .and_then(|types| types.get(type_id))
             .and_then(|type_| match &type_.kind {
-                TypeKind::Union(members) if omit_undefined => Some(members.clone()),
+                TypeKind::Union(members)
+                    if omit_undefined
+                        && !members.iter().any(|member| {
+                            self.named_type_references
+                                .and_then(|references| references.get(member))
+                                .is_some_and(|reference| {
+                                    reference.name == "__default_type_parameter"
+                                })
+                        }) =>
+                {
+                    Some(members.clone())
+                }
                 _ => None,
             });
         let Some(members) = members else {
@@ -16239,13 +16257,37 @@ impl DeclarationPrinter<'_> {
         if let Some(reference) = self
             .named_type_references
             .and_then(|references| references.get(&id))
+            && reference.name == "__default_type_parameter"
+            && let Some(TypeKind::TypeParameter { name, .. }) = self
+                .semantic_types
+                .and_then(|types| types.get(id))
+                .map(|type_| &type_.kind)
+        {
+            self.writer.write(name);
+            return Ok(());
+        }
+        if let Some(reference) = self
+            .named_type_references
+            .and_then(|references| references.get(&id))
+            && reference.name == "ReadonlyArray"
+            && let [element] = reference.type_arguments.as_slice()
+        {
+            self.writer.write("readonly ");
+            self.emit_semantic_type_with_precedence(*element, SemanticTypePrecedence::Array)?;
+            self.writer.write("[]");
+            return Ok(());
+        }
+        if let Some(reference) = self
+            .named_type_references
+            .and_then(|references| references.get(&id))
             && reference.name != "__private_pick_mapped"
             && self.named_type_reference_is_declaration_visible(&reference.name)
             && !matches!(
                 self.semantic_types
                     .and_then(|types| types.get(id))
                     .map(|type_| &type_.kind),
-                Some(TypeKind::TypeParameter { .. })
+                Some(TypeKind::TypeParameter { name, .. })
+                    if !name.starts_with("__cyclic_alias__")
             )
         {
             let display_name = self
@@ -16989,14 +17031,165 @@ impl DeclarationPrinter<'_> {
             if !signature.parameters.is_empty() {
                 self.writer.write(", ");
             }
-            self.writer.write("...args: ");
+            self.writer.write("...");
+            self.writer.write(
+                signature
+                    .parameter_names
+                    .get(signature.parameters.len())
+                    .map_or("args", String::as_str),
+            );
+            self.writer.write(": ");
             self.emit_semantic_type(rest)?;
         }
         Ok(())
     }
 
+    fn emit_inferred_semantic_type_parameters(
+        &mut self,
+        signature: &FunctionType,
+    ) -> Result<(), EmitError> {
+        let mut parameters = Vec::<(String, Option<TypeId>, Option<TypeId>)>::new();
+        let mut visited = HashSet::new();
+        self.collect_signature_semantic_type_parameters(signature, &mut visited, &mut parameters);
+        if parameters.is_empty() {
+            return Ok(());
+        }
+        self.writer.write("<");
+        for (index, (name, constraint, default_type)) in parameters.into_iter().enumerate() {
+            if index != 0 {
+                self.writer.write(", ");
+            }
+            self.writer.write(&name);
+            if let Some(constraint) = constraint {
+                self.writer.write(" extends ");
+                self.emit_semantic_type(constraint)?;
+            }
+            if let Some(default_type) = default_type {
+                self.writer.write(" = ");
+                self.emit_semantic_type(default_type)?;
+            }
+        }
+        self.writer.write(">");
+        Ok(())
+    }
+
+    fn collect_semantic_type_parameters(
+        &self,
+        type_id: TypeId,
+        visited: &mut HashSet<TypeId>,
+        parameters: &mut Vec<(String, Option<TypeId>, Option<TypeId>)>,
+    ) {
+        if !visited.insert(type_id) {
+            return;
+        }
+        if let Some(reference) = self
+            .named_type_references
+            .and_then(|references| references.get(&type_id))
+        {
+            for argument in &reference.type_arguments {
+                self.collect_semantic_type_parameters(*argument, visited, parameters);
+            }
+        }
+        let Some(kind) = self
+            .semantic_types
+            .and_then(|types| types.get(type_id))
+            .map(|type_| &type_.kind)
+        else {
+            return;
+        };
+        match kind {
+            TypeKind::TypeParameter { name, constraint } => {
+                if !name.starts_with("__")
+                    && !parameters
+                        .iter()
+                        .any(|(existing, _, _)| existing == name)
+                {
+                    let default_type = self
+                        .named_type_references
+                        .and_then(|references| references.get(&type_id))
+                        .filter(|reference| reference.name == "__default_type_parameter")
+                        .and_then(|reference| reference.type_arguments.first())
+                        .copied();
+                    parameters.push((name.clone(), *constraint, default_type));
+                }
+            }
+            TypeKind::Array(element) => {
+                self.collect_semantic_type_parameters(*element, visited, parameters);
+            }
+            TypeKind::Tuple(members)
+            | TypeKind::ReadonlyTuple(members)
+            | TypeKind::Union(members)
+            | TypeKind::Intersection(members) => {
+                for member in members {
+                    self.collect_semantic_type_parameters(*member, visited, parameters);
+                }
+            }
+            TypeKind::Object(object) => {
+                for property in object
+                    .properties
+                    .values()
+                    .copied()
+                    .chain(object.string_index_type)
+                    .chain(object.number_index_type)
+                {
+                    self.collect_semantic_type_parameters(property, visited, parameters);
+                }
+                for signature in object
+                    .call_signatures
+                    .iter()
+                    .chain(&object.construct_signatures)
+                {
+                    self.collect_signature_semantic_type_parameters(
+                        signature,
+                        visited,
+                        parameters,
+                    );
+                }
+            }
+            TypeKind::Function(signature) | TypeKind::Constructor(signature) => {
+                self.collect_signature_semantic_type_parameters(signature, visited, parameters);
+            }
+            TypeKind::Overload(signatures) => {
+                for signature in signatures {
+                    self.collect_signature_semantic_type_parameters(
+                        signature,
+                        visited,
+                        parameters,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_signature_semantic_type_parameters(
+        &self,
+        signature: &FunctionType,
+        visited: &mut HashSet<TypeId>,
+        parameters: &mut Vec<(String, Option<TypeId>, Option<TypeId>)>,
+    ) {
+        for type_id in std::iter::once(signature.return_type)
+            .chain(signature.parameters.iter().copied())
+            .chain(signature.rest_parameter)
+        {
+            self.collect_semantic_type_parameters(type_id, visited, parameters);
+        }
+    }
+
     fn semantic_parameter_is_optional(&self, signature: &FunctionType, index: usize) -> bool {
         if signature.parameters_optional {
+            return true;
+        }
+        if signature
+            .parameters
+            .get(index)
+            .is_some_and(|parameter| self.semantic_type_includes_undefined(*parameter))
+            && signature
+                .parameters
+                .iter()
+                .skip(index + 1)
+                .all(|parameter| self.semantic_type_includes_undefined(*parameter))
+        {
             return true;
         }
         self.arena.iter().any(|(_, node)| {
@@ -17543,7 +17736,29 @@ impl DeclarationPrinter<'_> {
                         }
                         _ => None,
                     });
-                if let Some(signature) = function {
+                let overload = self
+                    .semantic_types
+                    .and_then(|types| types.get(*type_id))
+                    .and_then(|type_| match &type_.kind {
+                        TypeKind::Overload(signatures) => Some(signatures.clone()),
+                        _ => None,
+                    });
+                if let Some(signatures) = overload {
+                    self.writer.write(": {");
+                    self.writer.newline();
+                    self.writer.indent += 1;
+                    for signature in signatures {
+                        self.emit_inferred_semantic_type_parameters(&signature)?;
+                        self.writer.write("(");
+                        self.emit_semantic_parameters(&signature, None)?;
+                        self.writer.write("): ");
+                        self.emit_semantic_type(signature.return_type)?;
+                        self.writer.write(";");
+                        self.writer.newline();
+                    }
+                    self.writer.indent -= 1;
+                    self.writer.write("}");
+                } else if let Some(signature) = function {
                     let elide_self_references =
                         self.source_class_expression_method_has_self_type(object, &name);
                     let self_reference_replacement = elide_self_references
@@ -17599,6 +17814,16 @@ impl DeclarationPrinter<'_> {
                         } else {
                             self.emit_semantic_type(signature.return_type)?;
                         }
+                    } else if let Some(signature) = self
+                        .semantic_types
+                        .and_then(|types| types.get(*type_id))
+                        .and_then(|type_| match &type_.kind {
+                            TypeKind::Function(signature) => Some(signature.clone()),
+                            _ => None,
+                        })
+                    {
+                        self.emit_inferred_semantic_type_parameters(&signature)?;
+                        self.emit_semantic_function_type(&signature)?;
                     } else if optional && {
                         let explicit = self
                             .source_type_literal_property_explicitly_includes_undefined(
@@ -18005,7 +18230,20 @@ impl DeclarationPrinter<'_> {
         object: &ObjectType,
         name: &str,
     ) -> Option<bool> {
-        self.matching_source_type_literal(object)
+        self.arena
+            .iter()
+            .find_map(|(id, node)| {
+                if !matches!(node.data, NodeData::TypeLiteralNode(_)) {
+                    return None;
+                }
+                self.node_types
+                    .and_then(|types| types.get(&id).copied())
+                    .and_then(|type_id| self.semantic_types?.get(type_id))
+                    .is_some_and(|type_| {
+                        matches!(&type_.kind, TypeKind::Object(candidate) if candidate == object)
+                    })
+                    .then_some(id)
+            })
             .and_then(|id| self.arena.get(id))
             .and_then(|node| match &node.data {
                 NodeData::TypeLiteralNode(type_literal) => Some(type_literal),
@@ -19234,8 +19472,6 @@ impl DeclarationPrinter<'_> {
         self.writer.write(": ");
         if let Some(value) = mapped.type_ {
             self.emit_compact_local_alias_type(body, value, active)?;
-        } else {
-            self.writer.write("any");
         }
         self.writer.write("; }");
         Ok(())
@@ -19521,8 +19757,6 @@ impl DeclarationPrinter<'_> {
                 self.writer.write(": ");
                 if let Some(type_) = data.type_ {
                     self.emit_type(type_)?;
-                } else {
-                    self.writer.write("any");
                 }
                 self.writer.write(";");
                 self.writer.newline();
@@ -53936,6 +54170,35 @@ mod tests {
                 "    };\n",
                 "};"
             )),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn declaration_emit_preserves_missing_mapped_value_type() {
+        let source = "type T0<T> = { [K in keyof T] };";
+        let parsed = parse_source_file(source);
+        let output = emit_declaration_file(
+            &parsed.arena,
+            parsed.source_file,
+            "input.ts",
+            source,
+            false,
+        )
+        .unwrap()
+        .code;
+        assert!(output.contains("[K in keyof T]: ;"), "{output}");
+    }
+
+    #[test]
+    fn declaration_emit_compacts_returned_local_mapped_annotation() {
+        let output = emit_declarations_with_semantics(concat!(
+            "export function f<T>(value: T) { ",
+            "const result: { [P in keyof T]: T[P] } = null as any; ",
+            "return result; }",
+        ));
+        assert!(
+            output.contains("(value: T): { [P in keyof T]: T[P]; };"),
             "{output}"
         );
     }
