@@ -2610,6 +2610,9 @@ impl<'a> ProgramChecker<'a> {
                     &mut HashSet::new(),
                 ));
             }
+            if let Some(runtime) = self.local_import_binding_runtime_meaning(source, name) {
+                return Some(runtime);
+            }
             let mut found = false;
             let runtime = self
                 .sources
@@ -2643,6 +2646,99 @@ impl<'a> ProgramChecker<'a> {
         (exports.contains_key(name)
             || self.module_export_name_is_explicitly_type_only(target, name))
         .then_some(false)
+    }
+
+    fn local_import_binding_runtime_meaning(
+        &self,
+        source: &ProgramSource<'_>,
+        name: &str,
+    ) -> Option<bool> {
+        let NodeData::SourceFile(file) = &source.arena.get(source.source_file)?.data else {
+            return None;
+        };
+        for statement in &file.statements.nodes {
+            let Some(NodeData::ImportDeclaration(import)) =
+                source.arena.get(*statement).map(|node| &node.data)
+            else {
+                continue;
+            };
+            let Some(module) = string_literal_text(source.arena, import.module_specifier) else {
+                continue;
+            };
+            let Some(target) = self.local_import_target(source, module) else {
+                continue;
+            };
+            let Some(NodeData::ImportClause(clause)) = import
+                .import_clause
+                .and_then(|clause| source.arena.get(clause))
+                .map(|node| &node.data)
+            else {
+                continue;
+            };
+            if clause.name.is_some_and(|binding| {
+                module_export_name_text(source.arena, binding) == Some(name)
+            }) {
+                return Some(self.module_export_name_has_runtime_value(
+                    target,
+                    "default",
+                    &mut HashSet::new(),
+                ));
+            }
+            let Some(bindings) = clause.named_bindings else {
+                continue;
+            };
+            match source.arena.get(bindings).map(|node| &node.data) {
+                Some(NodeData::NamespaceImport(namespace))
+                    if module_export_name_text(source.arena, namespace.name) == Some(name) =>
+                {
+                    return Some(true);
+                }
+                Some(NodeData::NamedImports(imports)) => {
+                    for import in &imports.elements.nodes {
+                        let Some(NodeData::ImportSpecifier(import)) =
+                            source.arena.get(*import).map(|node| &node.data)
+                        else {
+                            continue;
+                        };
+                        if module_export_name_text(source.arena, import.name) != Some(name) {
+                            continue;
+                        }
+                        let imported = import.property_name.unwrap_or(import.name);
+                        let imported = module_export_name_text(source.arena, imported)?;
+                        return Some(self.module_export_name_has_runtime_value(
+                            target,
+                            imported,
+                            &mut HashSet::new(),
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn local_import_target(&self, source: &ProgramSource<'_>, module: &str) -> Option<usize> {
+        source.resolved_modules.get(module).copied().or_else(|| {
+            let module_name = module
+                .trim_start_matches("./")
+                .rsplit('/')
+                .next()
+                .unwrap_or(module);
+            self.source_paths.and_then(|paths| {
+                paths.iter().position(|path| {
+                    let file = path.rsplit(['/', '\\']).next().unwrap_or(path);
+                    let stem = file
+                        .strip_suffix(".d.ts")
+                        .or_else(|| file.strip_suffix(".tsx"))
+                        .or_else(|| file.strip_suffix(".ts"))
+                        .or_else(|| file.strip_suffix(".jsx"))
+                        .or_else(|| file.strip_suffix(".js"))
+                        .unwrap_or(file);
+                    stem == module_name
+                })
+            })
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
