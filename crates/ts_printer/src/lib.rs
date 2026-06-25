@@ -21165,12 +21165,12 @@ impl DeclarationPrinter<'_> {
                 .then_some((*statement, node))
             })
             .collect::<Vec<_>>();
-        let has_private = retained.iter().any(|statement| {
-            self.arena.get(*statement).is_some_and(|node| {
+        let is_private_dependency = |statement| {
+            self.arena.get(statement).is_some_and(|node| {
                 !declaration_has_modifier(self.arena, node, SyntaxKind::ExportKeyword)
-                    && !self.private_declaration_is_only_referenced_from_private_members(*statement)
+                    && !self.private_declaration_is_only_referenced_from_private_members(statement)
                     && !self
-                        .javascript_variable_is_only_literal_computed_property_dependency(*statement)
+                        .javascript_variable_is_only_literal_computed_property_dependency(statement)
                     && !matches!(
                         &node.data,
                         NodeData::ModuleDeclaration(module)
@@ -21190,10 +21190,19 @@ impl DeclarationPrinter<'_> {
                             | NodeData::ModuleDeclaration(_)
                     )
             })
-        });
+        };
+        let has_private = retained
+            .iter()
+            .any(|statement| is_private_dependency(*statement));
         if !has_private || public.is_empty() {
             return false;
         }
+        let has_local_private = retained.iter().any(|statement| {
+            self.arena
+                .get(*statement)
+                .is_some_and(|node| node.parent == Some(scope))
+                && is_private_dependency(*statement)
+        });
         let sole_annotated_namespace_variable = matches!(
             self.arena.get(scope).map(|node| &node.data),
             Some(NodeData::ModuleBlock(_))
@@ -21223,7 +21232,7 @@ impl DeclarationPrinter<'_> {
             },
             _ => false,
         };
-        !sole_annotated_namespace_variable
+        !sole_annotated_namespace_variable || has_local_private
     }
 
     fn private_declaration_is_only_referenced_from_private_members(
@@ -63062,6 +63071,21 @@ class Board {
         assert!(!external.contains("export class External"), "{external}");
         assert!(!external.contains("export namespace N"), "{external}");
         assert!(!external.contains("export class C"), "{external}");
+    }
+
+    #[test]
+    fn declaration_emit_preserves_local_namespace_privacy_for_single_annotated_variable() {
+        let output = emit_declarations_with_semantics(concat!(
+            "namespace Outer { namespace Inner { export var value: number; } ",
+            "export var visible: typeof Inner; }",
+        ));
+        assert!(
+            output.contains("export var visible: typeof Inner;"),
+            "{output}"
+        );
+        assert!(output.contains("namespace Inner"), "{output}");
+        assert!(!output.contains("export namespace Inner"), "{output}");
+        assert!(output.contains("export {};"), "{output}");
     }
 
     #[test]
