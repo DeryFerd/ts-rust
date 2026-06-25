@@ -1351,6 +1351,7 @@ impl<'a> ProgramChecker<'a> {
                 if clause.phase_modifier == Some(SyntaxKind::TypeKeyword) {
                     return Some(false);
                 }
+                let mut has_unresolved_binding = false;
                 let mut has_value = clause.name.is_some_and(|_| {
                     self.module_export_has_runtime_value(
                         target,
@@ -1373,21 +1374,29 @@ impl<'a> ProgramChecker<'a> {
                                 .module_has_runtime_export(target, &mut HashSet::new());
                         }
                         NodeData::NamedImports(imports) => {
-                            has_value |= imports.elements.nodes.iter().any(|specifier| {
+                            for specifier in &imports.elements.nodes {
                                 let Some(NodeData::ImportSpecifier(import)) =
                                     source.arena.get(*specifier).map(|node| &node.data)
                                 else {
-                                    return false;
+                                    continue;
                                 };
                                 if import.is_type_only {
-                                    return false;
+                                    continue;
                                 }
                                 let imported = import.property_name.unwrap_or(import.name);
                                 let Some(name) = module_export_name_text(source.arena, imported)
                                 else {
-                                    return false;
+                                    continue;
                                 };
-                                self.module_export_has_runtime_value(
+                                if name != "default"
+                                    && !exports.contains_key(name)
+                                    && !self
+                                        .module_export_name_is_explicitly_type_only(target, name)
+                                {
+                                    has_unresolved_binding = true;
+                                    continue;
+                                }
+                                has_value |= self.module_export_has_runtime_value(
                                     target,
                                     &exports,
                                     name,
@@ -1396,13 +1405,13 @@ impl<'a> ProgramChecker<'a> {
                                     target,
                                     name,
                                     &mut HashSet::new(),
-                                )
-                            });
+                                );
+                            }
                         }
                         _ => return Some(true),
                     }
                 }
-                Some(has_value)
+                (!has_unresolved_binding).then_some(has_value)
             }
             NodeData::ImportEqualsDeclaration(import) => {
                 if import.is_type_only {
@@ -25013,6 +25022,7 @@ mod tests {
                 import { ClassValue } from "./dependency";
                 import { functionValue } from "./dependency";
                 import { TypeOnly } from "./dependency";
+                import { Missing } from "./dependency";
             "#,
         );
         assert!(
@@ -25060,9 +25070,10 @@ mod tests {
         for statement in &source.statements.nodes[..4] {
             assert_eq!(meanings.get(statement), Some(&true), "{statement:?}");
         }
-        for statement in &source.statements.nodes[4..] {
+        for statement in &source.statements.nodes[4..5] {
             assert_eq!(meanings.get(statement), Some(&false), "{statement:?}");
         }
+        assert!(!meanings.contains_key(&source.statements.nodes[5]));
     }
 
     #[test]

@@ -22,8 +22,9 @@ use ts_ast::{
     JsxClosingFragmentData, JsxElementData, JsxExpressionData, JsxFragmentData,
     JsxNamespacedNameData, JsxOpeningElementData, JsxOpeningFragmentData, JsxSelfClosingElementData,
     JsxSpreadAttributeData, JsxTextData, KeywordExpressionData, KeywordTypeNodeData,
-    LabeledStatementData, LiteralTypeNodeData, MappedTypeNodeData, MethodDeclarationData,
-    MethodSignatureDeclarationData, ModifierList, ModuleBlockData, ModuleDeclarationData,
+    LabeledStatementData, LiteralTypeNodeData, MappedTypeNodeData, MetaPropertyData,
+    MethodDeclarationData, MethodSignatureDeclarationData, ModifierList, ModuleBlockData,
+    ModuleDeclarationData,
     NamedExportsData, NamedImportsData, NamedTupleMemberData, NamespaceExportData,
     NamespaceExportDeclarationData, NamespaceImportData, NewExpressionData,
     NoSubstitutionTemplateLiteralData, Node, NodeArena, NodeData, NodeFlags, NodeId, NodeList,
@@ -1978,6 +1979,9 @@ impl<'a> Parser<'a> {
         {
             return true;
         }
+        if self.current.kind.is_modifier() && !self.current_modifier_is_member_name() {
+            return true;
+        }
         if matches!(
             self.current.kind,
             SyntaxKind::OpenParenToken
@@ -2339,9 +2343,7 @@ impl<'a> Parser<'a> {
     fn parse_type_member(&mut self) -> NodeId {
         let start = self.current.range.start;
         let mut modifier_nodes = Vec::new();
-        while self.current.kind == SyntaxKind::ReadonlyKeyword
-            && !self.current_modifier_is_member_name()
-        {
+        while self.current.kind.is_modifier() && !self.current_modifier_is_member_name() {
             modifier_nodes.push(self.consume_token_node());
         }
         let modifiers = (!modifier_nodes.is_empty()).then(|| ModifierList {
@@ -5132,7 +5134,11 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_new_expression(&mut self) -> NodeId {
-        let start = self.consume().range.start;
+        let keyword = self.consume();
+        let start = keyword.range.start;
+        if self.current.kind == SyntaxKind::DotToken {
+            return self.parse_new_meta_property(keyword.range);
+        }
         let mut expression = self.parse_primary_expression();
         loop {
             match self.current.kind {
@@ -5227,6 +5233,37 @@ impl<'a> Parser<'a> {
                 facts: 0,
             })),
             &children,
+        )
+    }
+
+    fn parse_new_meta_property(&mut self, keyword_range: TextRange) -> NodeId {
+        self.bump();
+        let name = self.parse_property_name_after_dot();
+        let text = match self.arena.get(name).map(|node| &node.data) {
+            Some(NodeData::Identifier(identifier)) => identifier.text.clone(),
+            _ => String::new(),
+        };
+        if text != "target" {
+            let range = self
+                .arena
+                .get(name)
+                .map_or(keyword_range, |name| name.range);
+            self.error_code_at(
+                range,
+                17012,
+                [text, "new".to_owned(), "target".to_owned()],
+            );
+        }
+        self.alloc_node(
+            SyntaxKind::MetaProperty,
+            TextRange::new(keyword_range.start, self.node_end(name)),
+            NodeData::MetaProperty(Box::new(MetaPropertyData {
+                flow_node: None,
+                keyword_token: SyntaxKind::NewKeyword,
+                facts: 0,
+                name,
+            })),
+            &[name],
         )
     }
 
@@ -5854,15 +5891,7 @@ impl<'a> Parser<'a> {
                 continue;
             }
             let mut modifier_nodes = Vec::new();
-            if self.current.kind == SyntaxKind::AsyncKeyword
-                && !matches!(
-                    self.next_token_kind(),
-                    SyntaxKind::OpenParenToken
-                        | SyntaxKind::ColonToken
-                        | SyntaxKind::CommaToken
-                        | SyntaxKind::CloseBraceToken
-                )
-            {
+            while self.current.kind.is_modifier() && !self.current_modifier_is_member_name() {
                 modifier_nodes.push(self.consume_token_node());
             }
             let modifiers = (!modifier_nodes.is_empty()).then(|| ModifierList {
@@ -5932,6 +5961,8 @@ impl<'a> Parser<'a> {
                     has_recovered_missing_colon = true;
                 }
                 let initializer = self.parse_binary_expression(2);
+                let mut children = modifier_nodes.clone();
+                children.extend([name, initializer]);
                 properties.push(self.alloc_node(
                     SyntaxKind::PropertyAssignment,
                     TextRange::new(property_start, self.node_end(initializer)),
@@ -5941,13 +5972,13 @@ impl<'a> Parser<'a> {
                         symbol: None,
                         type_: initializer,
                         facts: 0,
-                        modifiers: None,
+                        modifiers,
                         name,
                     })),
-                    &[name, initializer],
+                    &children,
                 ));
             } else {
-                let (equals_token, object_assignment_initializer, end, children) =
+                let (equals_token, object_assignment_initializer, end, mut children) =
                     if self.current.kind == SyntaxKind::EqualsToken {
                         let equals = self.consume();
                         let equals_token = self.alloc_node(
@@ -5966,6 +5997,7 @@ impl<'a> Parser<'a> {
                     } else {
                         (None, None, self.node_end(name), vec![name])
                     };
+                children.splice(0..0, modifier_nodes.iter().copied());
                 properties.push(self.alloc_node(
                     SyntaxKind::ShorthandPropertyAssignment,
                     TextRange::new(property_start, end),
@@ -5977,7 +6009,7 @@ impl<'a> Parser<'a> {
                             symbol: None,
                             type_: name,
                             facts: 0,
-                            modifiers: None,
+                            modifiers,
                             name,
                         },
                     )),
@@ -12569,6 +12601,56 @@ mod tests {
         assert_eq!(
             result.arena.get(call.arguments.nodes[0]).unwrap().kind,
             SyntaxKind::ElementAccessExpression
+        );
+    }
+
+    #[test]
+    fn recovers_invalid_member_modifiers_and_misspelled_new_meta_property() {
+        let result = parse_source_file(concat!(
+            "const value = { public field: 1 }; ",
+            "interface Shape { public [key: string]: number; } ",
+            "function f() { new.targ; }",
+        ));
+        let object = find_descendant_kind(
+            &result,
+            result.source_file,
+            SyntaxKind::ObjectLiteralExpression,
+        )
+        .expect("object literal");
+        let NodeData::ObjectLiteralExpression(object) = &result.arena.get(object).unwrap().data
+        else {
+            panic!("expected object literal");
+        };
+        let NodeData::PropertyAssignment(property) =
+            &result.arena.get(object.properties.nodes[0]).unwrap().data
+        else {
+            panic!("expected property assignment");
+        };
+        assert_eq!(property.modifiers.as_ref().unwrap().list.nodes.len(), 1);
+
+        let index = find_descendant_kind(
+            &result,
+            result.source_file,
+            SyntaxKind::IndexSignature,
+        )
+        .expect("index signature");
+        let NodeData::IndexSignatureDeclaration(index) = &result.arena.get(index).unwrap().data
+        else {
+            panic!("expected index signature");
+        };
+        assert_eq!(index.modifiers.as_ref().unwrap().list.nodes.len(), 1);
+
+        let meta = find_descendant_kind(&result, result.source_file, SyntaxKind::MetaProperty)
+            .expect("meta property");
+        let NodeData::MetaProperty(meta) = &result.arena.get(meta).unwrap().data else {
+            panic!("expected meta property");
+        };
+        assert_eq!(meta.keyword_token, SyntaxKind::NewKeyword);
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == Some(17012))
         );
     }
 

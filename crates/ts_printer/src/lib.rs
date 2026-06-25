@@ -4086,6 +4086,13 @@ impl DeclarationPrinter<'_> {
             && !matches!(&node.data, NodeData::ImportDeclaration(import) if self.import_is_used_by_synthetic_class_base(id, import))
             && !matches!(&node.data, NodeData::ImportDeclaration(import) if self.import_has_retained_declaration_binding_use(id, import))
             && !matches!(&node.data, NodeData::ImportEqualsDeclaration(import) if self.import_equals_is_used_by_inferred_variable_type(id, import))
+            && !matches!(
+                &node.data,
+                NodeData::ImportEqualsDeclaration(import)
+                    if declaration_name_text(self.arena, import.name).is_some_and(|name| {
+                        self.import_binding_is_used_in_retained_declaration(id, name)
+                    })
+            )
             && !matches!(&node.data, NodeData::ExpressionStatement(statement) if self.is_javascript_commonjs_declaration_assignment(statement.expression))
             && !self.javascript_variable_is_function_static_assignment_dependency(id)
             && !matches!(&node.data, NodeData::ImportDeclaration(import) if self.import_is_used_by_javascript_prop_types_namespace(import))
@@ -21142,6 +21149,11 @@ impl DeclarationPrinter<'_> {
             .get(import_id)
             .and_then(|node| match &node.data {
                 NodeData::ImportDeclaration(import) => self.import_binding_node(import, name),
+                NodeData::ImportEqualsDeclaration(import)
+                    if declaration_name_text(self.arena, import.name) == Some(name) =>
+                {
+                    Some((import.name, false))
+                }
                 _ => None,
             })
             .and_then(|(binding, _)| {
@@ -21161,9 +21173,9 @@ impl DeclarationPrinter<'_> {
                                 NodeData::Identifier(identifier_data)
                                     if identifier_data.text == name
                             ) && self.node_is_within(identifier, *statement)
-                                && binding_symbol.is_none_or(|symbol| {
+                                && (binding_symbol.is_none_or(|symbol| {
                                     self.bindings.resolve_name_at(identifier, name) == Some(symbol)
-                                })
+                                }) || self.identifier_is_in_erased_type_context(identifier))
                                 && (!self.identifier_is_in_exported_variable_initializer(
                                     identifier,
                                 )
@@ -26751,9 +26763,13 @@ impl Printer<'_> {
         if import.is_type_only {
             return false;
         }
-        let has_runtime_reference = self
-            .identifier_text(import.name)
-            .is_ok_and(|name| self.import_name_has_non_erased_runtime_reference(name));
+        let has_runtime_reference = self.import_binding_has_emitted_runtime_use(import.name)
+            || self.identifier_text(import.name).is_ok_and(|name| {
+                self.synthetic_runtime_identifier_uses.contains(name)
+                    || (name == "React"
+                        && self.settings.jsx == JsxEmit::React
+                        && source_has_jsx(self.arena))
+            });
         let has_runtime_alias_chain = self
             .identifier_text(import.name)
             .is_ok_and(|name| self.import_name_has_runtime_alias_chain(name, &mut HashSet::new()));
@@ -47763,6 +47779,17 @@ impl Printer<'_> {
                 {
                     return false;
                 }
+                if matches!(
+                    parent.data,
+                    NodeData::PropertyAccessExpression(_) | NodeData::ElementAccessExpression(_)
+                ) && self.const_enum_emit_mode.inlines_accesses()
+                    && (self.enum_access_values.contains_key(&parent_id)
+                        || (self.enum_access_fallbacks.contains_key(&parent_id)
+                            && !self.import_name_semantically_has_runtime_value(name)))
+                    && !in_computed_property_name
+                {
+                    return false;
+                }
                 if let NodeData::ExportAssignment(assignment) = &parent.data {
                     return self.export_assignment_has_runtime_value(assignment.expression);
                 }
@@ -48038,16 +48065,6 @@ impl Printer<'_> {
         })
     }
 
-    fn import_name_has_non_erased_runtime_reference(&self, name: &str) -> bool {
-        if name == "React" && self.settings.jsx == JsxEmit::React && source_has_jsx(self.arena) {
-            return true;
-        }
-        if self.runtime_identifier_uses.contains(name) {
-            return true;
-        }
-        self.import_name_has_non_erased_runtime_reference_with_visited(name, &mut HashSet::new())
-    }
-
     fn import_equals_is_namespace_member(
         &self,
         import: &ts_ast::ImportEqualsDeclarationData,
@@ -48087,106 +48104,6 @@ impl Printer<'_> {
                 alias != name && self.import_name_has_runtime_alias_chain(alias, visited)
             })
         })
-    }
-
-    fn import_name_has_non_erased_runtime_reference_with_visited(
-        &self,
-        name: &str,
-        visited: &mut HashSet<String>,
-    ) -> bool {
-        if !visited.insert(name.to_owned()) {
-            return false;
-        }
-        for (_, node) in self.arena.iter() {
-            let NodeData::ImportEqualsDeclaration(import) = &node.data else {
-                continue;
-            };
-            if import.is_type_only
-                || entity_root_identifier_text(self.arena, import.module_reference) != Some(name)
-            {
-                continue;
-            }
-            if self.import_binding_is_used(import.name) {
-                return true;
-            }
-            let Some(alias) = declaration_name_text(self.arena, import.name) else {
-                continue;
-            };
-            if alias != name
-                && self.import_name_has_non_erased_runtime_reference_with_visited(alias, visited)
-            {
-                return true;
-            }
-        }
-        for (id, node) in self.arena.iter() {
-            let NodeData::Identifier(identifier) = &node.data else {
-                continue;
-            };
-            if identifier.text != name {
-                continue;
-            }
-            let mut current = id;
-            while let Some(parent_id) = self.arena.get(current).and_then(|node| node.parent) {
-                let Some(parent) = self.arena.get(parent_id) else {
-                    return true;
-                };
-                if node_is_erased_type_context(parent) {
-                    break;
-                }
-                if matches!(parent.data, NodeData::ImportDeclaration(_)) {
-                    break;
-                }
-                if let NodeData::ImportEqualsDeclaration(import) = &parent.data {
-                    if import.is_type_only {
-                        break;
-                    }
-                    if self.import_binding_is_used(import.name) {
-                        return true;
-                    }
-                    let Some(alias) = declaration_name_text(self.arena, import.name) else {
-                        break;
-                    };
-                    if alias != name
-                        && self.import_name_has_non_erased_runtime_reference_with_visited(
-                            alias, visited,
-                        )
-                    {
-                        return true;
-                    }
-                    break;
-                }
-                if let NodeData::ExportAssignment(assignment) = &parent.data {
-                    return self
-                        .entity_has_runtime_value(assignment.expression, &mut HashSet::new());
-                }
-                if matches!(parent.data, NodeData::ExportDeclaration(_))
-                    && !self.const_enum_emit_mode.preserves_declarations()
-                {
-                    break;
-                }
-                if matches!(
-                    parent.data,
-                    NodeData::PropertyAccessExpression(_) | NodeData::ElementAccessExpression(_)
-                ) && self.const_enum_emit_mode.inlines_accesses()
-                    && (self.enum_access_values.contains_key(&parent_id)
-                        || (self.enum_access_fallbacks.contains_key(&parent_id)
-                            && !self.import_name_semantically_has_runtime_value(name)))
-                    && !identifier_is_within_computed_property_name(self.arena, id)
-                {
-                    break;
-                }
-                current = parent_id;
-            }
-            if self
-                .arena
-                .get(current)
-                .and_then(|node| node.parent)
-                .is_none()
-            {
-                return true;
-            }
-        }
-        false
     }
 
     fn import_name_semantically_has_runtime_value(&self, name: &str) -> bool {
@@ -48430,6 +48347,14 @@ impl Printer<'_> {
             return Ok(());
         }
         match &node.data {
+            NodeData::MetaProperty(data) => {
+                self.writer.write(match data.keyword_token {
+                    SyntaxKind::ImportKeyword => "import",
+                    _ => "new",
+                });
+                self.writer.write(".");
+                self.emit_expression(data.name, 0)?;
+            }
             NodeData::Identifier(data) => {
                 let is_declaration_name = node
                     .parent
@@ -53540,7 +53465,10 @@ impl Printer<'_> {
     }
 
     fn arrow_uses_bare_parameter(&self, id: NodeId, data: &ts_ast::ArrowFunctionData) -> bool {
-        if self.source_text.is_empty() || data.parameters.nodes.len() != 1 {
+        if self.source_text.is_empty()
+            || data.parameters.nodes.len() != 1
+            || self.has_modifier(data.modifiers.as_ref(), SyntaxKind::AsyncKeyword)
+        {
             return false;
         }
         let Some(node) = self.arena.get(id) else {
@@ -55744,6 +55672,16 @@ mod tests {
             .code,
             "const value = new Box(() => { return result; }); // trailing\n"
         );
+    }
+
+    #[test]
+    fn parenthesizes_single_async_arrow_parameters() {
+        let output = emit_with(
+            "promise.then(async value => value);",
+            ScriptTarget::Es2018,
+            ModuleKind::None,
+        );
+        assert_eq!(output.code, "promise.then(async (value) => value);\n");
     }
 
     #[test]
@@ -58707,6 +58645,20 @@ class Board {
             )
         );
         assert!(!output.contains("<reference"));
+    }
+
+    #[test]
+    fn drops_reference_directive_with_type_only_import_equals_owner() {
+        let source = concat!(
+            "///<reference path='types.d.ts' preserve=\"true\" />\n",
+            "import Model = require(\"model\");\n",
+            "class Main { value: Model; }\n",
+            "export = Main;\n",
+        );
+        let output = emit_with(source, ScriptTarget::Es2015, ModuleKind::CommonJs).code;
+        assert!(!output.contains("<reference"), "{output}");
+        assert!(!output.contains("require(\"model\")"), "{output}");
+        assert!(output.contains("class Main"), "{output}");
     }
 
     #[test]
