@@ -63089,6 +63089,26 @@ class Board {
     }
 
     #[test]
+    fn declaration_emit_shortens_inferred_class_names_only_in_their_lexical_namespace() {
+        let output = emit_declarations_with_semantics(concat!(
+            "export namespace Hidden { export class Visible {} ",
+            "export class Local { static get value() { return new Hidden.Visible(); } } } ",
+            "export class External { static get value() { return new Hidden.Visible(); } } ",
+            "export namespace Other { export class Nested { ",
+            "static get value() { return new Hidden.Visible(); } } }",
+        ));
+        assert!(
+            output.contains("static get value(): Visible;"),
+            "{output}"
+        );
+        assert_eq!(
+            output.matches("static get value(): Hidden.Visible;").count(),
+            2,
+            "{output}"
+        );
+    }
+
+    #[test]
     fn declaration_emit_handles_private_constructors_and_conflicting_member_names() {
         let constructors = emit_declarations_with_semantics(
             "interface Hidden {} export class C { private constructor(private hidden: Hidden, public visible: number) {} }",

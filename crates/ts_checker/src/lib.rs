@@ -15679,6 +15679,37 @@ impl<'a> Checker<'a> {
         }
     }
 
+    fn shortest_resolvable_value_name(
+        &self,
+        expression: NodeId,
+        symbol: SymbolId,
+        name: &str,
+    ) -> String {
+        let parts = name.split('.').collect::<Vec<_>>();
+        for start in (0..parts.len()).rev() {
+            let Some(mut candidate) = self.bindings.resolve_name_at(expression, parts[start]) else {
+                continue;
+            };
+            let mut resolved = true;
+            for part in &parts[start + 1..] {
+                let Some(member) = self
+                    .bindings
+                    .symbols
+                    .get(candidate)
+                    .and_then(|candidate| candidate.members.get(part))
+                else {
+                    resolved = false;
+                    break;
+                };
+                candidate = member;
+            }
+            if resolved && candidate == symbol {
+                return parts[start..].join(".");
+            }
+        }
+        name.to_owned()
+    }
+
     fn preserve_constructed_type_name(
         &mut self,
         type_id: TypeId,
@@ -15724,6 +15755,8 @@ impl<'a> Checker<'a> {
                 .any(|scope| scope.contains_key(&name))
         {
             name = format!("globalThis.{name}");
+        } else if name.contains('.') {
+            name = self.shortest_resolvable_value_name(expression, symbol, &name);
         }
         let inferred_arguments = self
             .result
