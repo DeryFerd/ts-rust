@@ -5573,6 +5573,40 @@ mod tests {
                 "var myAssert = require('assert');\n",
             )
         );
+
+        fs.write_file("/project/dep.ts", "export namespace M { }")
+            .unwrap();
+        fs.write_file(
+            "/project/external.ts",
+            concat!(
+                "/// <reference path='dep.ts'/>\n",
+                "declare namespace bar { interface alpha { } }\n",
+                "import f = require('./dep');\n",
+                "namespace bar { var x: alpha; }\n",
+            ),
+        )
+        .unwrap();
+        let external = Program::new_with_options(
+            &fs,
+            "/project",
+            &["external.ts".to_owned()],
+            CompilerOptions {
+                module: ModuleKind::CommonJs,
+                target: ScriptTarget::Es2015,
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        )
+        .emit();
+        let javascript = external
+            .files
+            .iter()
+            .find(|file| file.file_name == "/project/external.js")
+            .unwrap();
+        let marker = javascript.text.find("Object.defineProperty").unwrap();
+        let reference = javascript.text.find("/// <reference path='dep.ts'/>").unwrap();
+        let namespace = javascript.text.find("var bar;").unwrap();
+        assert!(marker < reference && reference < namespace, "{}", javascript.text);
     }
 
     #[test]
@@ -8952,6 +8986,94 @@ export function create() { return new M.Value(); }"#,
                 "export namespace t2 {\n    let v: string;\n    let setter: any;\n}\n",
                 "export namespace t3 {\n    let p_1: string;\n    export { p_1 as p };\n    export let value: string;\n}\n",
             )
+        );
+    }
+
+    #[test]
+    fn javascript_declaration_emit_keeps_trailing_jsdoc_typedefs() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/types.js",
+            concat!(
+                "export {};\n",
+                "/**\n",
+                " * @typedef {Record<Keyword, ParamValueTyped>} ParamStateRecord a Record containing\n",
+                " * keyword pairs with descriptions of parameters.\n",
+                " */\n",
+            ),
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/",
+            &["types.js".to_owned()],
+            CompilerOptions {
+                check_js: true,
+                declaration: true,
+                emit_declaration_only: true,
+                module: ModuleKind::Preserve,
+                no_lib: true,
+                target: ScriptTarget::Es2015,
+                ..CompilerOptions::default()
+            },
+        );
+        let declaration = program
+            .emit()
+            .files
+            .into_iter()
+            .find(|file| file.file_name == "/types.d.ts")
+            .unwrap();
+        assert_eq!(
+            declaration.text,
+            concat!(
+                "/**\n",
+                " * a Record containing\n",
+                " * keyword pairs with descriptions of parameters.\n",
+                " */\n",
+                "export type ParamStateRecord = Record<Keyword, ParamValueTyped>;\n",
+            )
+        );
+    }
+
+    #[test]
+    fn declaration_emit_infers_deep_reverse_mapped_types() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/input.ts",
+            concat!(
+                "export type NativeTypeValidator<T> = (value: any) => T | undefined;\n",
+                "export type Validator<T> = NativeTypeValidator<T> | ObjectValidator<T>;\n",
+                "export type ObjectValidator<O> = { [K in keyof O]: Validator<O[K]> };\n",
+                "export declare const validate: <V>(value: ObjectValidator<V>) => (input: any) => V;\n",
+                "export declare const stringValidator: NativeTypeValidator<string>;\n",
+                "export const validator = validate({ nested: { leaf: stringValidator } });\n",
+            ),
+        )
+        .unwrap();
+        let declaration = Program::new_with_options(
+            &fs,
+            "/project",
+            &["input.ts".to_owned()],
+            CompilerOptions {
+                declaration: true,
+                emit_declaration_only: true,
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        )
+        .emit()
+        .files
+        .into_iter()
+        .find(|file| file.file_name == "/project/input.d.ts")
+        .unwrap();
+        assert!(
+            declaration.text.contains(concat!(
+                "export declare const validator: (input: any) => {\n",
+                "    nested: {\n",
+                "        leaf: string;\n",
+            )),
+            "{}",
+            declaration.text
         );
     }
 

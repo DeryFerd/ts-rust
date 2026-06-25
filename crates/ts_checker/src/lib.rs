@@ -3292,6 +3292,7 @@ struct Checker<'a> {
     type_parameter_defaults: HashMap<TypeId, TypeId>,
     active_defaulted_type_parameters: HashSet<TypeId>,
     mapped_return_templates: HashMap<TypeId, (NodeId, HashMap<String, TypeId>)>,
+    reverse_mapped_type_parameters: HashMap<TypeId, Vec<TypeId>>,
     non_widening_types: HashSet<TypeId>,
     local_scopes: Vec<HashMap<String, TypeId>>,
     narrowings: Vec<HashMap<SymbolId, TypeId>>,
@@ -3363,6 +3364,7 @@ impl<'a> Checker<'a> {
             type_parameter_defaults: HashMap::new(),
             active_defaulted_type_parameters: HashSet::new(),
             mapped_return_templates: HashMap::new(),
+            reverse_mapped_type_parameters: HashMap::new(),
             non_widening_types: HashSet::new(),
             local_scopes: Vec::new(),
             narrowings: Vec::new(),
@@ -11262,6 +11264,19 @@ impl<'a> Checker<'a> {
         ) {
             self.infer_type_parameters(parameter_predicate, actual_predicate, inference);
         }
+        let reverse_mapped_parameter = self
+            .reverse_mapped_type_parameters
+            .get(&parameter)
+            .and_then(|parameters| match parameters.as_slice() {
+                [parameter] => Some(*parameter),
+                _ => None,
+            });
+        if let Some(type_parameter) = reverse_mapped_parameter
+            && let Some(reversed) =
+                self.reverse_mapped_inference_type(actual, &mut HashSet::new())
+        {
+            self.infer_type_parameters(type_parameter, reversed, inference);
+        }
         if let Some((type_node, parameters)) = self.mapped_return_templates.get(&parameter).cloned()
             && matches!(
                 self.arena.get(type_node).map(|node| &node.data),
@@ -11499,6 +11514,54 @@ impl<'a> Checker<'a> {
         }
     }
 
+    fn reverse_mapped_inference_type(
+        &mut self,
+        actual: TypeId,
+        visiting: &mut HashSet<TypeId>,
+    ) -> Option<TypeId> {
+        if !visiting.insert(actual) {
+            return None;
+        }
+        let named_argument = self
+            .result
+            .named_type_references
+            .get(&actual)
+            .and_then(|reference| match reference.type_arguments.as_slice() {
+                [argument] => Some(*argument),
+                _ => None,
+            });
+        if let Some(argument) = named_argument {
+            visiting.remove(&actual);
+            return Some(argument);
+        }
+        let reversed = match self.result.types.get(actual)?.kind.clone() {
+            TypeKind::Function(signature) => Some(self.non_nullish_type(signature.return_type)),
+            TypeKind::Object(mut object) => {
+                for property in object.properties.values_mut() {
+                    *property = self
+                        .reverse_mapped_inference_type(*property, visiting)
+                        .unwrap_or(*property);
+                }
+                if let Some(index) = object.string_index_type.as_mut() {
+                    *index = self
+                        .reverse_mapped_inference_type(*index, visiting)
+                        .unwrap_or(*index);
+                }
+                if let Some(index) = object.number_index_type.as_mut() {
+                    *index = self
+                        .reverse_mapped_inference_type(*index, visiting)
+                        .unwrap_or(*index);
+                }
+                object.call_signatures.clear();
+                object.construct_signatures.clear();
+                Some(self.result.types.alloc(TypeKind::Object(object)))
+            }
+            _ => Some(actual),
+        };
+        visiting.remove(&actual);
+        reversed
+    }
+
     fn type_is_literal_or_literal_union(&self, type_id: TypeId) -> bool {
         match self.result.types.get(type_id).map(|type_| &type_.kind) {
             Some(
@@ -11562,6 +11625,7 @@ impl<'a> Checker<'a> {
         let Some(context) = self.contextual_object_type(parameter) else {
             return false;
         };
+        let mut inferred = false;
         for property in properties {
             let Some(NodeData::PropertyAssignment(property)) =
                 self.arena.get(property).map(|node| &node.data)
@@ -11579,8 +11643,9 @@ impl<'a> Checker<'a> {
             self.clear_cached_expression_types(initializer);
             let actual = self.type_of_expression_context(initializer, Some(contextual));
             self.infer_type_parameters(expected, actual, inference);
+            inferred = true;
         }
-        true
+        inferred
     }
 
     fn clear_cached_expression_types(&mut self, node: NodeId) {
@@ -11690,6 +11755,37 @@ impl<'a> Checker<'a> {
                     self.arena.get(alias.type_).map(|node| &node.data),
                     Some(NodeData::IndexedAccessTypeNode(_))
                 )
+            })
+        })
+    }
+
+    fn type_alias_is_homomorphic_mapped(&self, symbol: SymbolId) -> bool {
+        self.bindings.symbols.get(symbol).is_some_and(|symbol| {
+            symbol.declarations.iter().any(|declaration| {
+                let Some(NodeData::TypeAliasDeclaration(alias)) =
+                    self.arena.get(*declaration).map(|node| &node.data)
+                else {
+                    return false;
+                };
+                let Some(NodeData::MappedTypeNode(mapped)) =
+                    self.arena.get(alias.type_).map(|node| &node.data)
+                else {
+                    return false;
+                };
+                let Some(NodeData::TypeParameterDeclaration(parameter)) = self
+                    .arena
+                    .get(mapped.type_parameter)
+                    .map(|node| &node.data)
+                else {
+                    return false;
+                };
+                parameter.constraint.is_some_and(|constraint| {
+                    matches!(
+                        self.arena.get(constraint).map(|node| &node.data),
+                        Some(NodeData::TypeOperatorNode(operator))
+                            if operator.operator == SyntaxKind::KeyOfKeyword
+                    )
+                })
             })
         })
     }
@@ -13853,6 +13949,8 @@ impl<'a> Checker<'a> {
                 });
                 let indexed_mapped_alias =
                     symbol.is_some_and(|symbol| self.type_alias_is_indexed_access(symbol));
+                let homomorphic_mapped_alias =
+                    symbol.is_some_and(|symbol| self.type_alias_is_homomorphic_mapped(symbol));
                 let structurally_serialized_alias = symbol.is_some_and(|symbol| {
                     self.bindings.symbols.get(symbol).is_some_and(|symbol| {
                         symbol.declarations.iter().any(|declaration| {
@@ -13924,6 +14022,10 @@ impl<'a> Checker<'a> {
                 } else {
                     self.unresolved_type_name(data.type_name, name.clone())
                 };
+                if homomorphic_mapped_alias && !arguments.is_empty() {
+                    self.reverse_mapped_type_parameters
+                        .insert(type_id, arguments.clone());
+                }
                 if !conditional_alias
                     && !indexed_mapped_alias
                     && !structurally_serialized_alias

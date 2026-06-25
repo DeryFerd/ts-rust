@@ -1339,7 +1339,10 @@ pub fn emit_source_file_with_context(
             } else {
                 node.range.end.get()
             };
-            if current_emitted || settings.module != ModuleKind::None {
+            if current_emitted
+                || (settings.module != ModuleKind::None
+                    && !printer.context_preserves_top_of_file_reference_directive)
+            {
                 reference_owner_start = node.range.end.get();
             }
         }
@@ -3264,12 +3267,12 @@ impl DeclarationPrinter<'_> {
                 break;
             };
             let comment_end = comment_start + 3 + relative_end + 2;
-            self.writer.write(
-                &suffix[comment_start..comment_end]
-                    .replace("\r\n", "\n")
-                    .replace('\r', "\n"),
-            );
-            self.writer.newline();
+            let comment = &suffix[comment_start..comment_end];
+            if !comment.contains("@typedef") {
+                self.writer
+                    .write(&comment.replace("\r\n", "\n").replace('\r', "\n"));
+                self.writer.newline();
+            }
             cursor = comment_end;
         }
     }
@@ -4292,6 +4295,12 @@ impl DeclarationPrinter<'_> {
         scope: NodeId,
     ) -> Result<(), EmitError> {
         let node = self.node(id)?.clone();
+        if self.javascript_source
+            && !self.jsdoc_typedef_names().is_empty()
+            && export_declaration_is_empty(self.arena, &node)
+        {
+            return Ok(());
+        }
         if self.extension_only_module_file
             && !in_namespace
             && !declaration_has_modifier(self.arena, &node, SyntaxKind::ExportKeyword)
@@ -14163,6 +14172,10 @@ impl DeclarationPrinter<'_> {
                 else {
                     continue;
                 };
+                let description_start = tag
+                    .find(name)
+                    .map_or(tag.len(), |start| start + name.len());
+                self.emit_jsdoc_tag_description(tag, description_start);
                 if self.module_file {
                     self.writer.write("export ");
                 }
@@ -14227,14 +14240,19 @@ impl DeclarationPrinter<'_> {
             else {
                 continue;
             };
-            let Some(name) = tag[type_end + 1..]
-                .split_whitespace()
-                .next()
-                .map(|name| name.trim_end_matches("*/"))
-                .filter(|name| !name.is_empty())
-            else {
+            let after_type = &tag[type_end + 1..];
+            let leading = after_type.len() - after_type.trim_start().len();
+            let Some(name) = after_type[leading..].split_whitespace().next() else {
                 continue;
             };
+            let name = name.trim_end_matches("*/");
+            if name.is_empty() {
+                continue;
+            }
+            self.emit_jsdoc_tag_description(
+                tag,
+                type_end + 1 + leading + name.len(),
+            );
             if self.module_file {
                 self.writer.write("export ");
             }
@@ -14269,6 +14287,43 @@ impl DeclarationPrinter<'_> {
             self.writer.newline();
         }
         self.emit_jsdoc_callbacks();
+    }
+
+    fn emit_jsdoc_tag_description(&mut self, tag: &str, first_line_start: usize) {
+        let mut description = Vec::new();
+        let first = tag
+            .get(first_line_start..)
+            .and_then(|description| description.lines().next())
+            .unwrap_or_default()
+            .trim()
+            .trim_end_matches("*/")
+            .trim();
+        if !first.is_empty() && !first.starts_with('@') {
+            description.push(format!(" {first}"));
+        }
+        for line in tag.lines().skip(1) {
+            let line = line.trim_start();
+            if line == "*/" {
+                continue;
+            }
+            let line = line.strip_prefix('*').unwrap_or(line).trim_end();
+            if line.trim().is_empty() || line.trim_start().starts_with('@') {
+                continue;
+            }
+            description.push(line.to_owned());
+        }
+        if description.is_empty() {
+            return;
+        }
+        self.writer.write("/**");
+        self.writer.newline();
+        for line in description {
+            self.writer.write(" *");
+            self.writer.write(&line);
+            self.writer.newline();
+        }
+        self.writer.write(" */");
+        self.writer.newline();
     }
 
     fn jsdoc_property_tags(comment: &str) -> Vec<(String, String, bool)> {
@@ -66829,5 +66884,36 @@ class Board {
             "const emoji = \"🤷‍♂️\";\n\nexport function decl() {}\n",
         );
         assert!(output.contains("export declare function decl(): void;"));
+    }
+
+    #[test]
+    fn declaration_emit_keeps_trailing_jsdoc_typedefs_after_empty_exports() {
+        let source = concat!(
+            "export {};\n",
+            "/**\n",
+            " * @typedef {Record<Keyword, ParamValueTyped>} ParamStateRecord a Record containing\n",
+            " * keyword pairs with descriptions of parameters.\n",
+            " */\n",
+        );
+        let parsed = parse_source_file(source);
+        let output = emit_declaration_file(
+            &parsed.arena,
+            parsed.source_file,
+            "types.js",
+            source,
+            false,
+        )
+        .unwrap()
+        .code;
+        assert_eq!(
+            output,
+            concat!(
+                "/**\n",
+                " * a Record containing\n",
+                " * keyword pairs with descriptions of parameters.\n",
+                " */\n",
+                "export type ParamStateRecord = Record<Keyword, ParamValueTyped>;\n",
+            )
+        );
     }
 }
