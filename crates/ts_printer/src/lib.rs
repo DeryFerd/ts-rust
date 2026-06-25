@@ -2824,6 +2824,7 @@ pub fn emit_declaration_file_with_semantics(
     }
     let mut deferred_javascript_namespaces = Vec::new();
     let mut deferred_javascript_imports = Vec::new();
+    let mut deferred_javascript_symbols = Vec::new();
     if printer.javascript_source {
         for statement in &data.statements.nodes {
             match printer.arena.get(*statement).map(|node| &node.data) {
@@ -2862,11 +2863,16 @@ pub fn emit_declaration_file_with_semantics(
         {
             continue;
         }
-        if printer.javascript_object_namespace_requires_deferral(*statement) {
+        if printer.javascript_symbol_variable_requires_deferral(*statement) {
+            deferred_javascript_symbols.push(*statement);
+        } else if printer.javascript_object_namespace_requires_deferral(*statement) {
             deferred_javascript_namespaces.push(*statement);
         } else {
             printer.emit_statement(*statement, false, source_file)?;
         }
+    }
+    for statement in deferred_javascript_symbols {
+        printer.emit_statement(statement, false, source_file)?;
     }
     for statement in deferred_javascript_namespaces {
         printer.emit_statement(statement, false, source_file)?;
@@ -3454,6 +3460,109 @@ impl DeclarationPrinter<'_> {
         }
     }
 
+    fn javascript_variable_is_only_literal_computed_property_dependency(
+        &self,
+        statement: NodeId,
+    ) -> bool {
+        if !self.javascript_source
+            || self.arena.get(statement).is_some_and(|statement| {
+                declaration_has_modifier(self.arena, statement, SyntaxKind::ExportKeyword)
+            })
+        {
+            return false;
+        }
+        let Some(NodeData::VariableStatement(variable)) =
+            self.arena.get(statement).map(|node| &node.data)
+        else {
+            return false;
+        };
+        let Some(list_node) = self.arena.get(variable.declaration_list) else {
+            return false;
+        };
+        let NodeData::VariableDeclarationList(list) = &list_node.data else {
+            return false;
+        };
+        if list_node.flags.0 & (1 << 1) == 0 || list.declarations.nodes.len() != 1 {
+            return false;
+        }
+        let declaration_id = list.declarations.nodes[0];
+        let Some(NodeData::VariableDeclaration(declaration)) =
+            self.arena.get(declaration_id).map(|node| &node.data)
+        else {
+            return false;
+        };
+        let Some(name) = declaration_name_text(self.arena, declaration.name) else {
+            return false;
+        };
+        if !declaration
+            .initializer
+            .is_some_and(|initializer| self.is_literal_expression(initializer))
+        {
+            return false;
+        }
+        let mut found_property = false;
+        for (identifier, node) in self.arena.iter() {
+            let NodeData::Identifier(identifier_data) = &node.data else {
+                continue;
+            };
+            if identifier_data.text != name || identifier == declaration.name {
+                continue;
+            }
+            let Some(computed) = node.parent else {
+                return false;
+            };
+            if matches!(
+                self.arena.get(computed).map(|node| &node.data),
+                Some(NodeData::ElementAccessExpression(access))
+                    if access.argument_expression == identifier
+            ) {
+                let mut ancestor = self.arena.get(computed).and_then(|node| node.parent);
+                let mut erased_reference = false;
+                while let Some(candidate) = ancestor {
+                    match self.arena.get(candidate).map(|node| &node.data) {
+                        Some(
+                            NodeData::MethodDeclaration(_)
+                            | NodeData::ConstructorDeclaration(_),
+                        ) => {
+                            let Some(class) =
+                                self.arena.get(candidate).and_then(|node| node.parent)
+                            else {
+                                return false;
+                            };
+                            if self.javascript_constructor_is_redundant(class, candidate) {
+                                erased_reference = true;
+                                break;
+                            }
+                            return false;
+                        }
+                        _ => {
+                            ancestor = self.arena.get(candidate).and_then(|node| node.parent);
+                        }
+                    }
+                }
+                if erased_reference {
+                    continue;
+                }
+            }
+            let Some(NodeData::ComputedPropertyName(_)) =
+                self.arena.get(computed).map(|node| &node.data)
+            else {
+                return false;
+            };
+            let Some(property) = self.arena.get(computed).and_then(|node| node.parent) else {
+                return false;
+            };
+            if !matches!(
+                self.arena.get(property).map(|node| &node.data),
+                Some(NodeData::PropertyDeclaration(_))
+            ) {
+                return false;
+            }
+            found_property = true;
+        }
+        found_property
+    }
+
     fn statement_is_structurally_consumed_local_mixin(&self, statement: NodeId) -> bool {
         let Some(node) = self.arena.get(statement) else {
             return false;
@@ -3960,6 +4069,9 @@ impl DeclarationPrinter<'_> {
         scope: NodeId,
     ) -> Result<(), EmitError> {
         let node = self.node(id)?.clone();
+        if self.javascript_variable_is_only_literal_computed_property_dependency(id) {
+            return Ok(());
+        }
         if self.module_file && self.statement_is_structurally_consumed_local_mixin(id) {
             return Ok(());
         }
@@ -4213,7 +4325,11 @@ impl DeclarationPrinter<'_> {
                         .any(|(name, _, _)| is_es5_reserved_binding_name(name));
                     let mut reserved_aliases = Vec::new();
                     for (property_text, property, value) in &namespace_assignments {
-                        if let Some(value_name) = declaration_name_text(self.arena, *value) {
+                        if matches!(
+                            self.arena.get(*value).map(|node| &node.data),
+                            Some(NodeData::Identifier(_))
+                        ) && let Some(value_name) = declaration_name_text(self.arena, *value)
+                        {
                             self.writer.write("export { ");
                             self.writer.write(value_name);
                             if value_name != property_text {
@@ -4425,6 +4541,8 @@ impl DeclarationPrinter<'_> {
                         || self
                             .class_member_is_duplicate_private_method(&data.members, member_index)
                         || self.javascript_property_repeats_base_type(data, *member)
+                        || (self.javascript_source
+                            && self.javascript_constructor_is_redundant(id, *member))
                     {
                         continue;
                     }
@@ -11808,6 +11926,58 @@ impl DeclarationPrinter<'_> {
         })
     }
 
+    fn javascript_symbol_variable_requires_deferral(&self, statement_id: NodeId) -> bool {
+        if !self.javascript_source {
+            return false;
+        }
+        let Some(statement_node) = self.arena.get(statement_id) else {
+            return false;
+        };
+        let statement_start = statement_node.range.start;
+        let NodeData::VariableStatement(variable) = &statement_node.data else {
+            return false;
+        };
+        let Some(NodeData::VariableDeclarationList(list)) = self
+            .arena
+            .get(variable.declaration_list)
+            .map(|node| &node.data)
+        else {
+            return false;
+        };
+        list.declarations.nodes.iter().any(|declaration| {
+            let Some(NodeData::VariableDeclaration(declaration)) =
+                self.arena.get(*declaration).map(|node| &node.data)
+            else {
+                return false;
+            };
+            let Some(name) = declaration_name_text(self.arena, declaration.name) else {
+                return false;
+            };
+            let Some(NodeData::CallExpression(call)) = declaration
+                .initializer
+                .and_then(|initializer| self.arena.get(initializer))
+                .map(|node| &node.data)
+            else {
+                return false;
+            };
+            if declaration_name_text(self.arena, call.expression) != Some("Symbol") {
+                return false;
+            }
+            self.arena.iter().any(|(_, node)| {
+                let NodeData::MethodDeclaration(method) = &node.data else {
+                    return false;
+                };
+                let Some(NodeData::ComputedPropertyName(computed)) =
+                    self.arena.get(method.name).map(|node| &node.data)
+                else {
+                    return false;
+                };
+                node.range.start > statement_start
+                    && declaration_name_text(self.arena, computed.expression) == Some(name)
+            })
+        })
+    }
+
     #[allow(clippy::too_many_lines)]
     fn emit_javascript_object_namespace(
         &mut self,
@@ -12399,6 +12569,68 @@ impl DeclarationPrinter<'_> {
                 .and_then(|body| self.declaration_single_return_expression(body))
                 .and_then(|expression| self.jsdoc_type_hint(expression))
         })
+    }
+
+    fn class_accessor_backing_jsdoc_hint(&self, member: NodeId, name: NodeId) -> Option<String> {
+        let class = self.arena.get(member)?.parent?;
+        let members = match &self.arena.get(class)?.data {
+            NodeData::ClassDeclaration(class) => &class.members,
+            NodeData::ClassExpression(class) => &class.members,
+            _ => return None,
+        };
+        let accessor_name = declaration_name_text(self.arena, name)?;
+        let backing_name = members.nodes.iter().find_map(|candidate| {
+            let NodeData::GetAccessorDeclaration(getter) = &self.arena.get(*candidate)?.data else {
+                return None;
+            };
+            if declaration_name_text(self.arena, getter.name) != Some(accessor_name) {
+                return None;
+            }
+            let expression = getter
+                .body
+                .and_then(|body| self.declaration_single_return_expression(body))?;
+            match &self.arena.get(expression)?.data {
+                NodeData::ElementAccessExpression(access)
+                    if self
+                        .arena
+                        .get(access.expression)
+                        .is_some_and(|node| node.kind == SyntaxKind::ThisKeyword) =>
+                {
+                    declaration_name_text(self.arena, access.argument_expression)
+                        .map(str::to_owned)
+                }
+                NodeData::PropertyAccessExpression(access)
+                    if self
+                        .arena
+                        .get(access.expression)
+                        .is_some_and(|node| node.kind == SyntaxKind::ThisKeyword) =>
+                {
+                    declaration_name_text(self.arena, access.name).map(str::to_owned)
+                }
+                _ => None,
+            }
+        })?;
+        let hint = members.nodes.iter().find_map(|candidate| {
+            let NodeData::PropertyDeclaration(property) = &self.arena.get(*candidate)?.data else {
+                return None;
+            };
+            let property_name = match &self.arena.get(property.name)?.data {
+                NodeData::ComputedPropertyName(computed) => {
+                    declaration_name_text(self.arena, computed.expression)
+                }
+                _ => declaration_name_text(self.arena, property.name),
+            }?;
+            (property_name == backing_name)
+                .then(|| self.jsdoc_type_hint(*candidate))
+                .flatten()
+        })?;
+        let mut members = hint
+            .split('|')
+            .map(str::trim)
+            .filter(|member| !member.is_empty())
+            .collect::<Vec<_>>();
+        members.sort_by_key(|member| *member == "null" || *member == "undefined");
+        Some(members.join(" | "))
     }
 
     fn emit_declaration_parameter_comments(&mut self, start: u32, end: u32) {
@@ -13963,13 +14195,34 @@ impl DeclarationPrinter<'_> {
                 }
                 self.emit_declaration_member_modifiers(data.modifiers.as_ref());
                 if self.javascript_source
+                    && ![
+                        SyntaxKind::PublicKeyword,
+                        SyntaxKind::PrivateKeyword,
+                        SyntaxKind::ProtectedKeyword,
+                    ]
+                    .into_iter()
+                    .any(|kind| self.member_has_modifier(data.modifiers.as_ref(), kind))
+                {
+                    self.emit_jsdoc_access_modifier(id);
+                }
+                if self.javascript_source
                     && self
                         .leading_jsdoc_comment(id)
                         .is_some_and(|comment| comment.contains("@readonly"))
                 {
                     self.writer.write("readonly ");
                 }
-                self.emit_name(data.name)?;
+                if self.javascript_source
+                    && matches!(
+                        self.arena.get(data.name).map(|node| &node.data),
+                        Some(NodeData::ComputedPropertyName(_))
+                    )
+                    && let Some(name) = self.type_member_semantic_name(id)
+                {
+                    self.emit_semantic_property_name(&name);
+                } else {
+                    self.emit_name(data.name)?;
+                }
                 if data.postfix_token.is_some_and(|token| {
                     self.arena
                         .get(token)
@@ -14204,8 +14457,34 @@ impl DeclarationPrinter<'_> {
                     .and_then(|method| method.parent)
                     .and_then(|class| self.arena.get(class))
                     .is_some_and(|class| matches!(class.data, NodeData::ClassExpression(_)));
-                if (class_expression_member
+                let asynchronous = self.member_has_modifier(
+                    data.modifiers.as_ref(),
+                    SyntaxKind::AsyncKeyword,
+                ) || self
+                    .arena
+                    .get(data.name)
+                    .and_then(|name| usize::try_from(name.range.start.get()).ok())
+                    .and_then(|end| {
+                        let start = self.source_text[..end]
+                            .rfind(['\n', '\r'])
+                            .map_or(0, |line| line + 1);
+                        self.source_text.get(start..end)
+                    })
+                    .is_some_and(|prefix| prefix.split_whitespace().any(|word| word == "async"))
+                    || matches!(
+                        self.arena.get(data.name).map(|node| &node.data),
+                        Some(NodeData::ComputedPropertyName(computed))
+                            if declaration_name_text(self.arena, computed.expression).is_some_and(|key| {
+                                let computed_name = format!("[{key}]");
+                                self.source_text.lines().any(|line| {
+                                    line.trim_start().starts_with("async ")
+                                        && line.contains(&computed_name)
+                                })
+                            })
+                    );
+                if ((class_expression_member || self.javascript_source)
                     && self.computed_method_requires_symbol_property(data.name))
+                    || self.javascript_computed_method_is_rebound(data.name)
                     || optional_computed
                     || computed_property_access
                     || self.computed_method_has_non_symbol_identifier_key(data.name)
@@ -14230,7 +14509,9 @@ impl DeclarationPrinter<'_> {
                                 self.node_types
                                     .and_then(|types| types.get(&expression).copied())
                             });
-                        if data.type_.is_none()
+                        if data.type_.is_none() && asynchronous {
+                            self.emit_async_semantic_return_type(signature.return_type)?;
+                        } else if data.type_.is_none()
                             && data
                                 .body
                                 .is_some_and(|body| !self.block_has_value_return(body))
@@ -14248,6 +14529,8 @@ impl DeclarationPrinter<'_> {
                         self.writer.write(" => ");
                         if let Some(type_) = data.type_ {
                             self.emit_type(type_)?;
+                        } else if asynchronous {
+                            self.writer.write("Promise<void>");
                         } else if data
                             .body
                             .is_some_and(|body| !self.block_has_value_return(body))
@@ -14453,6 +14736,11 @@ impl DeclarationPrinter<'_> {
                     self.writer.write(": ");
                     self.emit_jsdoc_type_hint(&hint);
                 } else if data.type_.is_none()
+                    && let Some(hint) = self.class_accessor_backing_jsdoc_hint(id, data.name)
+                {
+                    self.writer.write(": ");
+                    self.emit_jsdoc_type_hint(&hint);
+                } else if data.type_.is_none()
                     && let Some(type_id) = self.node_types.and_then(|types| types.get(&id).copied())
                 {
                     self.writer.write(": ");
@@ -14501,6 +14789,10 @@ impl DeclarationPrinter<'_> {
                     if let Some(hint) = self.jsdoc_parameter_type_hint(id, parameter.name) {
                         self.emit_jsdoc_type_hint(&hint);
                     } else if let Some(hint) = self.class_getter_jsdoc_return_hint(id, data.name) {
+                        self.emit_jsdoc_type_hint(&hint);
+                    } else if let Some(hint) =
+                        self.class_accessor_backing_jsdoc_hint(id, data.name)
+                    {
                         self.emit_jsdoc_type_hint(&hint);
                     } else if let Some(type_id) =
                         self.class_member_semantic_property_type(id, data.name)
@@ -14735,6 +15027,11 @@ impl DeclarationPrinter<'_> {
             if !Self::javascript_instance_property_is_declarable(&name) {
                 continue;
             }
+            if self.javascript_class_has_declared_property(class_id, &name) {
+                self.emitted_javascript_class_properties
+                    .insert((class_id, name));
+                continue;
+            }
             if !self
                 .emitted_javascript_class_properties
                 .insert((class_id, name.clone()))
@@ -14785,6 +15082,76 @@ impl DeclarationPrinter<'_> {
             self.writer.newline();
         }
         Ok(())
+    }
+
+    fn javascript_class_has_declared_property(&self, class_id: NodeId, name: &str) -> bool {
+        let members = match self.arena.get(class_id).map(|node| &node.data) {
+            Some(NodeData::ClassDeclaration(class)) => &class.members,
+            Some(NodeData::ClassExpression(class)) => &class.members,
+            _ => return false,
+        };
+        members.nodes.iter().any(|member| {
+            let member_name = match self.arena.get(*member).map(|node| &node.data) {
+                Some(NodeData::PropertyDeclaration(property)) => property.name,
+                Some(NodeData::MethodDeclaration(method)) => method.name,
+                _ => return false,
+            };
+            self.type_member_semantic_name(*member).as_deref() == Some(name)
+                || matches!(
+                    self.arena.get(member_name).map(|node| &node.data),
+                    Some(NodeData::ComputedPropertyName(computed))
+                        if declaration_name_text(self.arena, computed.expression) == Some(name)
+                )
+        })
+    }
+
+    fn javascript_constructor_is_redundant(
+        &self,
+        class_id: NodeId,
+        member_id: NodeId,
+    ) -> bool {
+        let (parameters, body) = match self.arena.get(member_id).map(|node| &node.data) {
+            Some(NodeData::MethodDeclaration(method))
+                if declaration_name_text(self.arena, method.name) == Some("constructor") =>
+            {
+                (&method.parameters, method.body)
+            }
+            Some(NodeData::ConstructorDeclaration(constructor)) => {
+                (&constructor.parameters, constructor.body)
+            }
+            _ => return false,
+        };
+        if !parameters.nodes.is_empty() || self.leading_jsdoc_comment(member_id).is_some() {
+            return false;
+        }
+        let Some(NodeData::Block(body)) =
+            body.and_then(|body| self.arena.get(body)).map(|node| &node.data)
+        else {
+            return false;
+        };
+        !body.statements.nodes.is_empty()
+            && body.statements.nodes.iter().all(|statement| {
+                let Some(NodeData::ExpressionStatement(statement)) =
+                    self.arena.get(*statement).map(|node| &node.data)
+                else {
+                    return false;
+                };
+                let Some(NodeData::BinaryExpression(assignment)) = self
+                    .arena
+                    .get(statement.expression)
+                    .map(|node| &node.data)
+                else {
+                    return false;
+                };
+                self.arena
+                    .get(assignment.operator_token)
+                    .is_some_and(|operator| operator.kind == SyntaxKind::EqualsToken)
+                    && self
+                        .javascript_this_property_name(assignment.left)
+                        .is_some_and(|name| {
+                            self.javascript_class_has_declared_property(class_id, &name)
+                        })
+            })
     }
 
     fn javascript_assignment_parameter_hint(
@@ -15174,6 +15541,27 @@ impl DeclarationPrinter<'_> {
                 _ => continue,
             };
             self.writer.write(text);
+        }
+    }
+
+    fn emit_jsdoc_access_modifier(&mut self, member: NodeId) {
+        let Some(comment) = self.leading_jsdoc_comment(member) else {
+            return;
+        };
+        for (tag, modifier) in [
+            ("@private", "private "),
+            ("@protected", "protected "),
+            ("@public", "public "),
+        ] {
+            if comment.lines().any(|line| {
+                line.trim()
+                    .trim_start_matches('*')
+                    .trim_start()
+                    .starts_with(tag)
+            }) {
+                self.writer.write(modifier);
+                return;
+            }
         }
     }
 
@@ -18070,6 +18458,39 @@ impl DeclarationPrinter<'_> {
         })
     }
 
+    fn javascript_computed_method_is_rebound(&self, name: NodeId) -> bool {
+        if !self.javascript_source {
+            return false;
+        }
+        let Some(NodeData::ComputedPropertyName(computed)) =
+            self.arena.get(name).map(|node| &node.data)
+        else {
+            return false;
+        };
+        let Some(key) = declaration_name_text(self.arena, computed.expression) else {
+            return false;
+        };
+        let Some(class) = self
+            .arena
+            .get(name)
+            .and_then(|node| node.parent)
+            .and_then(|method| self.arena.get(method))
+            .and_then(|method| method.parent)
+        else {
+            return false;
+        };
+        self.arena.iter().any(|(assignment_id, node)| {
+            let NodeData::BinaryExpression(assignment) = &node.data else {
+                return false;
+            };
+            self.node_is_within(assignment_id, class)
+                && self
+                    .javascript_this_property_name(assignment.left)
+                    .as_deref()
+                    == Some(key)
+        })
+    }
+
     fn computed_method_has_non_symbol_identifier_key(&self, name: NodeId) -> bool {
         let Some(NodeData::ComputedPropertyName(computed)) =
             self.arena.get(name).map(|node| &node.data)
@@ -19811,6 +20232,8 @@ impl DeclarationPrinter<'_> {
         let has_private = retained.iter().any(|statement| {
             self.arena.get(*statement).is_some_and(|node| {
                 !declaration_has_modifier(self.arena, node, SyntaxKind::ExportKeyword)
+                    && !self
+                        .javascript_variable_is_only_literal_computed_property_dependency(*statement)
                     && matches!(
                         node.data,
                         NodeData::VariableStatement(_)
@@ -24508,6 +24931,18 @@ impl Printer<'_> {
             preserve_immediate_trailing,
             true,
         );
+    }
+
+    fn emit_keyword_operand_gap(&mut self, keyword_end: u32, operand: NodeId) {
+        let comment_count = self.emitted_source_comments.len();
+        let operand_start = self
+            .arena
+            .get(operand)
+            .map_or(keyword_end, |node| node.range.start.get());
+        self.emit_inline_block_comments_between(keyword_end, operand_start, true);
+        if self.emitted_source_comments.len() == comment_count {
+            self.writer.write(" ");
+        }
     }
 
     fn emit_inline_block_comments_between(
@@ -29858,6 +30293,8 @@ impl Printer<'_> {
         };
         for statement in &data.statements.nodes {
             let statement_node = self.node(*statement)?.clone();
+            let current_owns_source_comments =
+                self.statement_emits_in_place(*statement, &statement_node);
             let direct_await = matches!(
                 &statement_node.data,
                 NodeData::ExpressionStatement(expression)
@@ -29875,10 +30312,11 @@ impl Printer<'_> {
                 })
                 .flatten();
             let comment_end = inline_comment_start.unwrap_or(statement_node.range.start.get());
-            self.emit_source_comments_between_with_trailing(
+            self.emit_source_comments_between_with_ownership(
                 previous_end,
                 comment_end,
                 previous_emitted || previous_end == node.range.start.get().saturating_add(1),
+                current_owns_source_comments,
             );
             if self.block_comment_touches_range_end(previous_end, comment_end)
                 && matches!(statement_node.data, NodeData::Block(_))
@@ -29896,7 +30334,7 @@ impl Printer<'_> {
             }
             self.emit_statement(*statement)?;
             previous_end = statement_node.range.end.get();
-            previous_emitted = statement_emits_javascript(self.arena, &statement_node);
+            previous_emitted = current_owns_source_comments;
         }
         self.emit_source_comments_between_with_trailing(
             previous_end,
@@ -42402,6 +42840,15 @@ impl Printer<'_> {
         let mut emitted_fields = false;
         let mut emitted_temps = false;
         if prologue_count == 0 {
+            if let Some(first_statement) = body.statements.nodes.first()
+                && let Some(first_statement) = self.arena.get(*first_statement)
+            {
+                self.emit_source_comments_between_with_trailing(
+                    body_node.range.start.get().saturating_add(1),
+                    first_statement.range.start.get(),
+                    false,
+                );
+            }
             self.emit_constructor_generated_temps(&generated_temps);
             emitted_temps = true;
             if !has_base {
@@ -48037,7 +48484,11 @@ impl Printer<'_> {
                 if wrap {
                     self.writer.write("(");
                 }
-                self.writer.write("typeof ");
+                self.writer.write("typeof");
+                self.emit_keyword_operand_gap(
+                    node.range.start.get().saturating_add(6),
+                    data.expression,
+                );
                 self.emit_expression(data.expression, 16)?;
                 if wrap {
                     self.writer.write(")");
@@ -48048,7 +48499,11 @@ impl Printer<'_> {
                 if wrap {
                     self.writer.write("(");
                 }
-                self.writer.write("void ");
+                self.writer.write("void");
+                self.emit_keyword_operand_gap(
+                    node.range.start.get().saturating_add(4),
+                    data.expression,
+                );
                 self.emit_expression(data.expression, 16)?;
                 if wrap {
                     self.writer.write(")");
@@ -48059,7 +48514,11 @@ impl Printer<'_> {
                 if wrap {
                     self.writer.write("(");
                 }
-                self.writer.write("delete ");
+                self.writer.write("delete");
+                self.emit_keyword_operand_gap(
+                    node.range.start.get().saturating_add(6),
+                    data.expression,
+                );
                 self.emit_expression(data.expression, 16)?;
                 if wrap {
                     self.writer.write(")");
@@ -48175,7 +48634,11 @@ impl Printer<'_> {
                 if wrap {
                     self.writer.write("(");
                 }
-                self.writer.write("new ");
+                self.writer.write("new");
+                self.emit_keyword_operand_gap(
+                    node.range.start.get().saturating_add(3),
+                    data.expression,
+                );
                 self.emit_expression(data.expression, 18)?;
                 if let Some(arguments) = &data.arguments {
                     self.writer.write("(");

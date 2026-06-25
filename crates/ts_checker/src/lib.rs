@@ -8414,8 +8414,9 @@ impl<'a> Checker<'a> {
             }
             NodeData::ElementAccessExpression(data) => {
                 let receiver = self.type_of_expression(data.expression);
-                if let Some((property, _)) =
-                    self.canonical_computed_key(data.argument_expression, &mut HashSet::new())
+                let canonical =
+                    self.canonical_computed_key(data.argument_expression, &mut HashSet::new());
+                if let Some((property, false)) = canonical
                     && let Some(value) = self.lookup_property_type(receiver, &property)
                 {
                     self.record_const_enum_access(node_id, receiver, value);
