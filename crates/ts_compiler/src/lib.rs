@@ -1827,16 +1827,15 @@ impl Program {
                     resolved_modules,
                     is_default_library: source_file.is_default_library,
                     skip_diagnostics: self.options.no_check
+                        || (!self.options.check_js
+                            && is_javascript_file_name(&source_file.file_name))
                         || (self.options.skip_lib_check
                             && ts_path::is_declaration_file(&source_file.file_name)),
                     checker_options: CheckerOptions {
                         allow_unreachable_code: self.options.allow_unreachable_code,
                         exact_optional_property_types: self.options.exact_optional_property_types,
                         is_declaration_file: ts_path::is_declaration_file(&source_file.file_name),
-                        is_javascript_file: matches!(
-                            ts_path::script_kind_from_path(&source_file.file_name),
-                            ts_path::ScriptKind::Js | ts_path::ScriptKind::Jsx
-                        ),
+                        is_javascript_file: is_javascript_file_name(&source_file.file_name),
                         no_fallthrough_cases_in_switch: self.options.no_fallthrough_cases_in_switch,
                         strict_null_checks: self.options.strict_null_checks,
                         no_implicit_any: self.options.no_implicit_any,
@@ -4214,6 +4213,13 @@ fn declaration_node_types_for_emit(
         node_types.insert(id, type_id);
     }
     node_types
+}
+
+fn is_javascript_file_name(file_name: &str) -> bool {
+    matches!(
+        ts_path::script_kind_from_path(file_name),
+        ts_path::ScriptKind::Js | ts_path::ScriptKind::Jsx
+    )
 }
 
 fn source_is_external_module(source: &SourceFile) -> bool {
@@ -6628,6 +6634,48 @@ mod tests {
                 .any(|diagnostic| matches!(diagnostic.code, Some(2307 | 2322)))
         );
         assert_eq!(program.emit().files.len(), 1);
+    }
+
+    #[test]
+    fn check_js_controls_javascript_semantic_diagnostics() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/input.js", "const value = true; value.missing;")
+            .unwrap();
+        let unchecked = Program::new_with_options(
+            &fs,
+            "/",
+            &["input.js".to_owned()],
+            CompilerOptions {
+                allow_js: true,
+                check_js: false,
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        assert!(
+            !unchecked
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code == Some(2339))
+        );
+
+        let checked = Program::new_with_options(
+            &fs,
+            "/",
+            &["input.js".to_owned()],
+            CompilerOptions {
+                allow_js: true,
+                check_js: true,
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        assert!(
+            checked
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code == Some(2339))
+        );
     }
 
     #[test]

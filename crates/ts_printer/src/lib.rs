@@ -40874,7 +40874,7 @@ impl Printer<'_> {
                 return Err(Self::unsupported(*declaration, declaration_node.kind));
             };
             if self.settings.target < ScriptTarget::Es2018
-                && self.object_binding_pattern_has_rest(declaration.name)
+                && self.binding_pattern_contains_object_rest(declaration.name)
                 && let Some(initializer) = declaration.initializer
             {
                 self.emit_object_rest_variable_declarators(
@@ -41082,11 +41082,51 @@ impl Printer<'_> {
             })
     }
 
+    fn binding_pattern_contains_object_rest(&self, pattern: NodeId) -> bool {
+        if self.object_binding_pattern_has_rest(pattern) {
+            return true;
+        }
+        let Some(node) = self.arena.get(pattern) else {
+            return false;
+        };
+        let NodeData::BindingPattern(binding) = &node.data else {
+            return false;
+        };
+        if node.kind != SyntaxKind::ObjectBindingPattern {
+            return false;
+        }
+        binding.elements.nodes.iter().any(|element| {
+            let Some(NodeData::BindingElement(element)) =
+                self.arena.get(*element).map(|node| &node.data)
+            else {
+                return false;
+            };
+            element
+                .name
+                .is_some_and(|name| self.binding_pattern_contains_object_rest(name))
+        })
+    }
+
     #[allow(clippy::too_many_lines)]
     fn emit_object_rest_variable_declarators(
         &mut self,
         pattern: NodeId,
         initializer: NodeId,
+        emitted: &mut bool,
+    ) -> Result<(), EmitError> {
+        let initializer = DownlevelBindingValue::Node(initializer);
+        self.emit_object_rest_variable_declarators_from_value(
+            pattern,
+            &initializer,
+            emitted,
+        )
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn emit_object_rest_variable_declarators_from_value(
+        &mut self,
+        pattern: NodeId,
+        initializer: &DownlevelBindingValue,
         emitted: &mut bool,
     ) -> Result<(), EmitError> {
         let pattern_node = self.node(pattern)?.clone();
@@ -41107,7 +41147,11 @@ impl Printer<'_> {
             }
         }
         let Some(rest) = rest else {
-            return Ok(());
+            return self.emit_nested_object_rest_variable_declarators(
+                pattern,
+                initializer,
+                emitted,
+            );
         };
         if ordinary.is_empty() {
             self.emit_downlevel_declarator_start(emitted);
@@ -41115,20 +41159,25 @@ impl Printer<'_> {
             self.writer.write(" = ");
             self.emit_helper_reference("__rest");
             self.writer.write("(");
-            self.emit_expression(initializer, 1)?;
+            self.emit_downlevel_binding_value(initializer)?;
             self.writer.write(", [])");
             return Ok(());
         }
-        let reusable_initializer = matches!(
-            self.arena.get(initializer).map(|node| &node.data),
-            Some(NodeData::Identifier(_))
-        );
+        let reusable_initializer = matches!(initializer, DownlevelBindingValue::Name(_))
+            || matches!(
+                initializer,
+                DownlevelBindingValue::Node(initializer)
+                    if matches!(
+                        self.arena.get(*initializer).map(|node| &node.data),
+                        Some(NodeData::Identifier(_))
+                    )
+            );
         let temp = (!reusable_initializer).then(|| self.object_rest_scoped_temp(pattern));
         if let Some(temp) = temp.as_deref() {
             self.emit_downlevel_declarator_start(emitted);
             self.writer.write(temp);
             self.writer.write(" = ");
-            self.emit_expression(initializer, 1)?;
+            self.emit_downlevel_binding_value(initializer)?;
         }
         self.emit_downlevel_declarator_start(emitted);
         self.writer.write("{ ");
@@ -41160,7 +41209,7 @@ impl Printer<'_> {
         if let Some(temp) = temp.as_deref() {
             self.writer.write(temp);
         } else {
-            self.emit_expression(initializer, 1)?;
+            self.emit_downlevel_binding_value(initializer)?;
         }
         self.emit_downlevel_declarator_start(emitted);
         self.emit_expression(rest, 0)?;
@@ -41170,7 +41219,7 @@ impl Printer<'_> {
         if let Some(temp) = temp.as_deref() {
             self.writer.write(temp);
         } else {
-            self.emit_expression(initializer, 1)?;
+            self.emit_downlevel_binding_value(initializer)?;
         }
         self.writer.write(", [");
         for (index, element_id) in ordinary.iter().enumerate() {
@@ -41192,6 +41241,98 @@ impl Printer<'_> {
         Ok(())
     }
 
+    fn emit_nested_object_rest_variable_declarators(
+        &mut self,
+        pattern: NodeId,
+        initializer: &DownlevelBindingValue,
+        emitted: &mut bool,
+    ) -> Result<(), EmitError> {
+        let pattern_node = self.node(pattern)?.clone();
+        let NodeData::BindingPattern(binding) = &pattern_node.data else {
+            return Err(Self::unsupported(pattern, pattern_node.kind));
+        };
+        let mut ordinary = Vec::new();
+        let mut nested = Vec::new();
+        for element_id in &binding.elements.nodes {
+            let element_node = self.node(*element_id)?.clone();
+            let NodeData::BindingElement(element) = &element_node.data else {
+                continue;
+            };
+            if element
+                .name
+                .is_some_and(|name| self.binding_pattern_contains_object_rest(name))
+            {
+                nested.push(*element_id);
+            } else {
+                ordinary.push(*element_id);
+            }
+        }
+        if !ordinary.is_empty() {
+            self.emit_downlevel_declarator_start(emitted);
+            self.writer.write("{ ");
+            for (index, element) in ordinary.iter().enumerate() {
+                if index != 0 {
+                    self.writer.write(", ");
+                }
+                self.emit_expression(*element, 0)?;
+            }
+            self.writer.write(" } = ");
+            self.emit_downlevel_binding_value(initializer)?;
+        }
+        for element_id in nested {
+            let element_node = self.node(element_id)?.clone();
+            let NodeData::BindingElement(element) = &element_node.data else {
+                continue;
+            };
+            let Some(element_name) = element.name else {
+                continue;
+            };
+            let property = element.property_name.unwrap_or(element_name);
+            let index = self.downlevel_binding_property_index(property, emitted)?;
+            let nested_value =
+                DownlevelBindingValue::Element(Box::new(initializer.clone()), index);
+            let temp = self.object_rest_scoped_temp(element_name);
+            self.emit_downlevel_declarator_start(emitted);
+            self.writer.write(&temp);
+            self.writer.write(" = ");
+            self.emit_downlevel_binding_value(&nested_value)?;
+            self.emit_object_rest_variable_declarators_from_value(
+                element_name,
+                &DownlevelBindingValue::Name(temp),
+                emitted,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn downlevel_binding_property_index(
+        &mut self,
+        property: NodeId,
+        emitted: &mut bool,
+    ) -> Result<DownlevelBindingIndex, EmitError> {
+        match &self.node(property)?.data {
+            NodeData::ComputedPropertyName(computed) => {
+                let expression = computed.expression;
+                let temp = self.generated_names.generate_temp();
+                self.emit_downlevel_declarator_start(emitted);
+                self.writer.write(&temp);
+                self.writer.write(" = ");
+                self.emit_expression(expression, 1)?;
+                Ok(DownlevelBindingIndex::Name(temp))
+            }
+            NodeData::Identifier(identifier) => {
+                Ok(DownlevelBindingIndex::String(identifier.text.clone()))
+            }
+            NodeData::StringLiteral(literal) => {
+                Ok(DownlevelBindingIndex::String(literal.text.clone()))
+            }
+            NodeData::NumericLiteral(literal) => {
+                Ok(DownlevelBindingIndex::String(literal.text.clone()))
+            }
+            _ => Err(Self::unsupported(property, self.node(property)?.kind)),
+        }
+    }
+
     fn object_rest_scoped_temp(&self, pattern: NodeId) -> String {
         let container = self.nearest_function_like_container(pattern);
         let current_start = self
@@ -41206,13 +41347,15 @@ impl Printer<'_> {
                 let NodeData::VariableDeclaration(declaration) = &node.data else {
                     return false;
                 };
-                self.nearest_function_like_container(*declaration_id) == container
-                    && self.object_binding_pattern_has_rest(declaration.name)
+                !self.node_is_within(pattern, *declaration_id)
+                    && self.nearest_function_like_container(*declaration_id) == container
+                    && self.binding_pattern_contains_object_rest(declaration.name)
                     && declaration.initializer.is_some_and(|initializer| {
-                        !matches!(
-                            self.arena.get(initializer).map(|node| &node.data),
-                            Some(NodeData::Identifier(_))
-                        )
+                        !self.object_binding_pattern_has_rest(declaration.name)
+                            || !matches!(
+                                self.arena.get(initializer).map(|node| &node.data),
+                                Some(NodeData::Identifier(_))
+                            )
                     })
                     && matches!(
                         self.arena.get(declaration.name).map(|node| &node.data),
@@ -56285,6 +56428,33 @@ mod tests {
         assert!(output.contains("var x0_1;"), "{output}");
         assert!(output.contains("var z_1;"), "{output}");
         assert!(output.contains("(z_1 = { z: 0 }.z);"), "{output}");
+    }
+
+    #[test]
+    fn downlevels_nested_object_rest_bindings_for_es2015() {
+        let output = emit_with(
+            concat!(
+                "function read(value) {\n",
+                "    const { f: { a, ...first } } = value;\n",
+                "    const { g: { c, ...second } } = value;\n",
+                "}\n",
+            ),
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(
+            output.contains(
+                "const _a = value.f, { a } = _a, first = __rest(_a, [\"a\"]);"
+            ),
+            "{output}"
+        );
+        assert!(
+            output.contains(
+                "const _b = value.g, { c } = _b, second = __rest(_b, [\"c\"]);"
+            ),
+            "{output}"
+        );
     }
 
     #[test]

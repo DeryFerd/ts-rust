@@ -997,6 +997,9 @@ fn directive_json_value(name: &str, value: &str) -> ts_config::JsonValue {
                 .collect(),
         );
     }
+    if matches!(name.to_ascii_lowercase().as_str(), "outdir" | "outfile") {
+        return ts_config::JsonValue::String(value.trim().to_owned());
+    }
     match value {
         value if value.eq_ignore_ascii_case("true") => ts_config::JsonValue::Bool(true),
         value if value.eq_ignore_ascii_case("false") => ts_config::JsonValue::Bool(false),
@@ -2343,6 +2346,18 @@ mod tests {
                 run.comparison.differences
             );
         }
+    }
+
+    #[test]
+    fn preserves_boolean_looking_out_dir_as_a_path() {
+        let case = Case::parse(
+            "output.ts",
+            "// @allowJs: true\n// @outDir: true\n// @filename: input.js\nvalue;\n",
+        )
+        .unwrap();
+        let variant = expand_option_matrix(&case).remove(0);
+        let options = fixture_compiler_options(&case, &variant);
+        assert_eq!(options.out_dir.as_deref(), Some("true"));
     }
 
     #[test]
