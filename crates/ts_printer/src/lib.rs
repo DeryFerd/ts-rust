@@ -26538,6 +26538,7 @@ impl Printer<'_> {
                     || comment.contains("@license")
                     || (!self.settings.remove_comments && is_amd_dependency_directive(comment));
                 if (!pinned_only || pinned)
+                    && !self.settings.remove_comments
                     && !is_reference_directive(comment)
                     && !excluded.iter().any(|(start, end)| {
                         usize::try_from(*start).is_ok_and(|start| start <= index)
@@ -26557,18 +26558,21 @@ impl Printer<'_> {
                 let comment = &prefix[index..comment_end];
                 let comment_range = (index, comment_end);
                 let pinned = comment.starts_with("/*!") || comment.contains("@license");
+                let remainder = &prefix[comment_end..];
+                let next_comment = [remainder.find("/*"), remainder.find("//")]
+                    .into_iter()
+                    .flatten()
+                    .min();
+                let until_next = next_comment.map_or(remainder, |next| &remainder[..next]);
+                let detached_pinned = contains_blank_line(until_next);
                 if (!pinned_only || pinned)
+                    && (!self.settings.remove_comments || detached_pinned)
                     && !excluded.iter().any(|(start, end)| {
                         usize::try_from(*start).is_ok_and(|start| start <= index)
                             && usize::try_from(*end).is_ok_and(|end| comment_end <= end)
                     })
                     && self.emitted_source_comments.insert(comment_range)
                 {
-                    let remainder = &prefix[comment_end..];
-                    let next_comment = [remainder.find("/*"), remainder.find("//")]
-                        .into_iter()
-                        .flatten()
-                        .min();
                     let inline_with_next =
                         next_comment.is_some_and(|next| !remainder[..next].contains(['\n', '\r']));
                     let touches_parenthesized_node = comment_end == end
@@ -62643,6 +62647,31 @@ class Board {
         )
         .unwrap();
         assert_eq!(result.code, "const value = 1;\n");
+    }
+
+    #[test]
+    fn remove_comments_keeps_only_detached_pinned_block_headers() {
+        let source = concat!(
+            "/*! detached */\n\n",
+            "//! attached line\n",
+            "/*! attached block */\n",
+            "class C {}",
+        );
+        let parsed = parse_source_file(source);
+        let mut settings = ts_options::CompilerOptions::default().printer_settings();
+        settings.always_strict = false;
+        settings.target = ScriptTarget::Es2015;
+        settings.module = ModuleKind::None;
+        settings.remove_comments = true;
+        let result = emit_source_file_with_settings(
+            &parsed.arena,
+            parsed.source_file,
+            "source.ts",
+            source,
+            settings,
+        )
+        .unwrap();
+        assert_eq!(result.code, "/*! detached */\nclass C {\n}\n");
     }
 
     #[test]
