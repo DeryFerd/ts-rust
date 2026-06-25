@@ -7442,12 +7442,16 @@ impl<'a> Checker<'a> {
             else {
                 continue;
             };
-            let type_id = if let Some(initializer) = element.initializer {
+            let mut type_id = if let Some(initializer) = element.initializer {
                 let type_id = self.type_of_expression(initializer);
                 self.widen_literal(type_id)
             } else {
                 self.result.types.any()
             };
+            if element.initializer.is_some() && !self.options.exact_optional_property_types {
+                let undefined = self.result.types.undefined();
+                type_id = self.result.types.union([type_id, undefined]);
+            }
             object.properties.insert(property_name.clone(), type_id);
             if element.initializer.is_some() {
                 object.optional_properties.insert(property_name);
@@ -21686,6 +21690,29 @@ mod tests {
             &result.types.get(value).unwrap().kind,
             TypeKind::Union(members) if members.contains(&result.types.undefined())
         ));
+    }
+
+    #[test]
+    fn inferred_binding_default_properties_include_undefined() {
+        let parsed = parse_source_file("const fn = ({ headers = {} }) => {};");
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        let function = bindings.root_scope().unwrap().symbols.get("fn").unwrap();
+        let function_type = result.type_of_symbol(function).unwrap();
+        let TypeKind::Function(function) = &result.types.get(function_type).unwrap().kind else {
+            panic!("expected function type");
+        };
+        let TypeKind::Object(options) = &result.types.get(function.parameters[0]).unwrap().kind
+        else {
+            panic!("expected object parameter");
+        };
+        assert!(options.optional_properties.contains("headers"));
+        let TypeKind::Union(members) =
+            &result.types.get(options.properties["headers"]).unwrap().kind
+        else {
+            panic!("expected optional property union");
+        };
+        assert!(members.contains(&result.types.undefined()));
     }
 
     #[test]

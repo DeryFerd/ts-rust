@@ -28672,7 +28672,7 @@ impl Printer<'_> {
                 } else if !downlevel_binding_parameters.is_empty() {
                     self.emit_parameters_with_name_overrides(
                         &data.parameters,
-                        false,
+                        self.settings.target >= ScriptTarget::Es2015,
                         &downlevel_binding_parameters,
                     )?;
                 } else if downlevel_parameter_defaults && parameter_class_temps.is_empty() {
@@ -32737,9 +32737,22 @@ impl Printer<'_> {
         downlevel_parameter_defaults: bool,
         binding_parameters: &[(NodeId, NodeId, String)],
     ) -> Result<(), EmitError> {
+        let body_node = self.node(body)?.clone();
+        let NodeData::Block(block) = &body_node.data else {
+            return Err(Self::unsupported(body, body_node.kind));
+        };
+        let prologue_count = block
+            .statements
+            .nodes
+            .iter()
+            .take_while(|statement| self.statement_is_string_prologue(**statement))
+            .count();
         self.writer.write("{");
         self.writer.newline();
         self.writer.indent += 1;
+        for statement in &block.statements.nodes[..prologue_count] {
+            self.emit_statement(*statement)?;
+        }
         if !class_temps.is_empty() {
             self.writer.write("var ");
             self.writer.write(&class_temps.join(", "));
@@ -32749,6 +32762,22 @@ impl Printer<'_> {
         if downlevel_parameter_defaults {
             self.emit_parameter_default_prologues_with_overrides(parameters, binding_parameters)?;
         }
+        self.emit_downlevel_binding_parameter_prologues(binding_parameters)?;
+        if self.parameters_have_rest_parameter(parameters) {
+            self.emit_downlevel_rest_parameter_prologue(parameters)?;
+        }
+        for statement in &block.statements.nodes[prologue_count..] {
+            self.emit_statement(*statement)?;
+        }
+        self.writer.indent -= 1;
+        self.writer.write("}");
+        Ok(())
+    }
+
+    fn emit_downlevel_binding_parameter_prologues(
+        &mut self,
+        binding_parameters: &[(NodeId, NodeId, String)],
+    ) -> Result<(), EmitError> {
         for (_, pattern, temp) in binding_parameters {
             if self.node(*pattern)?.kind == SyntaxKind::ObjectBindingPattern
                 && self.object_binding_pattern_has_rest(*pattern)
@@ -32768,12 +32797,6 @@ impl Printer<'_> {
                 self.writer.newline();
             }
         }
-        if self.parameters_have_rest_parameter(parameters) {
-            self.emit_downlevel_rest_parameter_prologue(parameters)?;
-        }
-        self.emit_block_statements(body)?;
-        self.writer.indent -= 1;
-        self.writer.write("}");
         Ok(())
     }
 
@@ -44932,13 +44955,27 @@ impl Printer<'_> {
         let NodeData::Block(body) = &body_node.data else {
             return Err(Self::unsupported(body_id, body_node.kind));
         };
+        let downlevel_binding_parameters = if self.settings.target < ScriptTarget::Es2018 {
+            self.downlevel_binding_parameters(&method.parameters, body_id)
+        } else {
+            Vec::new()
+        };
         self.writer.write("constructor");
-        self.emit_parameters(&method.parameters)?;
+        if downlevel_binding_parameters.is_empty() {
+            self.emit_parameters(&method.parameters)?;
+        } else {
+            self.emit_parameters_with_name_overrides(
+                &method.parameters,
+                self.settings.target >= ScriptTarget::Es2015,
+                &downlevel_binding_parameters,
+            )?;
+        }
         if body.statements.nodes.is_empty()
             && !self.node_source_is_multiline(body_id)
             && !self.has_instance_field_initializers(data)
             && !self.has_parameter_properties(&method.parameters)
             && self.active_private_method_plan.is_none()
+            && downlevel_binding_parameters.is_empty()
         {
             self.writer.write(" { }");
             self.writer.newline();
@@ -44947,6 +44984,7 @@ impl Printer<'_> {
         if !self.has_instance_field_initializers(data)
             && !self.has_parameter_properties(&method.parameters)
             && self.active_private_method_plan.is_none()
+            && downlevel_binding_parameters.is_empty()
             && !body.statements.nodes.iter().any(|statement| {
                 self.erased_constructor_modifier_precedes_property_assignment(*statement)
             })
@@ -44969,6 +45007,7 @@ impl Printer<'_> {
             .count();
         let mut emitted_fields = false;
         let mut emitted_temps = false;
+        let mut emitted_binding_parameters = false;
         if prologue_count == 0 {
             if let Some(first_statement) = body.statements.nodes.first()
                 && let Some(first_statement) = self.arena.get(*first_statement)
@@ -44981,6 +45020,8 @@ impl Printer<'_> {
             }
             self.emit_constructor_generated_temps(&generated_temps);
             emitted_temps = true;
+            self.emit_downlevel_binding_parameter_prologues(&downlevel_binding_parameters)?;
+            emitted_binding_parameters = true;
             if !has_base {
                 self.emit_private_brand_initializer("this");
                 self.emit_parameter_properties(&method.parameters, "this")?;
@@ -45001,6 +45042,8 @@ impl Printer<'_> {
             if statement_index == prologue_count && !emitted_temps {
                 self.emit_constructor_generated_temps(&generated_temps);
                 emitted_temps = true;
+                self.emit_downlevel_binding_parameter_prologues(&downlevel_binding_parameters)?;
+                emitted_binding_parameters = true;
                 if !has_base {
                     self.emit_private_brand_initializer("this");
                     self.emit_parameter_properties(&method.parameters, "this")?;
@@ -45054,6 +45097,9 @@ impl Printer<'_> {
         if !emitted_fields {
             if !emitted_temps {
                 self.emit_constructor_generated_temps(&generated_temps);
+            }
+            if !emitted_binding_parameters {
+                self.emit_downlevel_binding_parameter_prologues(&downlevel_binding_parameters)?;
             }
             self.emit_private_brand_initializer("this");
             self.emit_parameter_properties(&method.parameters, "this")?;
@@ -57928,7 +57974,14 @@ mod tests {
     #[test]
     fn lowers_es2015_object_rest_parameters_in_function_declarations() {
         let output = emit_with(
-            "function first({ enum: _enum, ...rest }: P) { return rest; } function second({ function: _function, ...rest }: P) { return rest; }",
+            concat!(
+                "function first({ enum: _enum, ...rest }: P) { return rest; } ",
+                "function second({ function: _function, ...rest }: P) { return rest; } ",
+                "function third({ value = {}, ...rest }: P = {}) { ",
+                "\"use strict\"; \"custom\"; return rest; } ",
+                "class C { constructor({ value = {}, ...rest }: P = {}) { ",
+                "\"use strict\"; \"custom\"; use(rest); } }",
+            ),
             ScriptTarget::Es2015,
             ModuleKind::None,
         )
@@ -57944,6 +57997,28 @@ mod tests {
             output.contains(
                 "function second(_a) {\n    var { function: _function } = _a, rest = __rest(_a, [\"function\"]);\n    return rest;\n}"
             ),
+            "{output}"
+        );
+        assert!(
+            output.contains(concat!(
+                "function third(_a = {}) {\n",
+                "    \"use strict\";\n",
+                "    \"custom\";\n",
+                "    var { value = {} } = _a, rest = __rest(_a, [\"value\"]);\n",
+                "    return rest;\n",
+                "}",
+            )),
+            "{output}"
+        );
+        assert!(
+            output.contains(concat!(
+                "constructor(_a = {}) {\n",
+                "        \"use strict\";\n",
+                "        \"custom\";\n",
+                "        var { value = {} } = _a, rest = __rest(_a, [\"value\"]);\n",
+                "        use(rest);\n",
+                "    }",
+            )),
             "{output}"
         );
     }
