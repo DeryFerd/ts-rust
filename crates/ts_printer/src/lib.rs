@@ -42231,6 +42231,26 @@ impl Printer<'_> {
                 self.writer.write(" = void 0");
             }
         }
+        if let Some(initializer) = data
+            .declarations
+            .nodes
+            .last()
+            .and_then(|declaration| self.arena.get(*declaration))
+            .and_then(|node| match &node.data {
+                NodeData::VariableDeclaration(declaration) => declaration.initializer,
+                _ => None,
+            })
+        {
+            let trailing_end = node
+                .parent
+                .and_then(|parent| self.arena.get(parent))
+                .map_or(node.range.end.get(), |parent| parent.range.end.get());
+            self.emit_inline_block_comments_between(
+                self.node(initializer)?.range.end.get(),
+                trailing_end,
+                true,
+            );
+        }
         let ends_with_missing_initializer = data
             .declarations
             .nodes
@@ -51214,6 +51234,14 @@ impl Printer<'_> {
                             self.writer.newline();
                         }
                     } else if block_comment_before_dot {
+                        if usize::try_from(expression_end)
+                            .ok()
+                            .zip(usize::try_from(source_dot).ok())
+                            .and_then(|(start, end)| self.source_text.get(start..end))
+                            .is_some_and(|trivia| trivia.starts_with("/*"))
+                        {
+                            self.writer.write(" ");
+                        }
                         self.emit_block_comment_trivia(expression_end, source_dot, false);
                     }
                     self.writer.write(if data.question_dot_token.is_some() {
@@ -57119,6 +57147,20 @@ mod tests {
         )
         .code;
         assert_eq!(output, "point. /*read*/x;\npoint. /*write*/x = 1;\n");
+    }
+
+    #[test]
+    fn preserves_block_comments_between_chained_calls() {
+        let output = emit_with(
+            "var value = start()/*first*/.next()/*last*/;",
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert_eq!(
+            output,
+            "var value = start() /*first*/.next() /*last*/;\n"
+        );
     }
 
     #[test]
