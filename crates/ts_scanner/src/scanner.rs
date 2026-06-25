@@ -229,6 +229,16 @@ impl<'a> Scanner<'a> {
             match ch {
                 '\'' | '"' => self.scan_string(ch),
                 '`' => self.scan_template(),
+                '#' if self.peek_next() == Some('!') => {
+                    let start = self.byte_pos;
+                    self.bump();
+                    self.error(
+                        start,
+                        self.byte_pos + 1,
+                        "'#!' can only be used at the start of a file.",
+                    );
+                    SyntaxKind::Unknown
+                }
                 '#' => self.scan_private_identifier(),
                 '.' if self.peek_next().is_some_and(|next| next.is_ascii_digit()) => {
                     self.scan_number()

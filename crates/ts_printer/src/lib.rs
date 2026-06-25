@@ -1085,15 +1085,7 @@ pub fn emit_source_file_with_context(
             printer.writer.newline();
         }
         let preinitialized_exports = printer.commonjs_preinitialized_export_names(&data.statements);
-        if !preinitialized_exports.is_empty() {
-            for name in preinitialized_exports.iter().rev() {
-                printer.writer.write("exports.");
-                printer.writer.write(name);
-                printer.writer.write(" = ");
-            }
-            printer.writer.write("void 0;");
-            printer.writer.newline();
-        }
+        printer.emit_commonjs_preinitialized_exports(&preinitialized_exports);
         printer.prepare_uninitialized_export_rewrites(&data.statements);
         if export_equals_expression.is_none() {
             for statement in &data.statements.nodes {
@@ -11252,7 +11244,7 @@ impl DeclarationPrinter<'_> {
             .extend(self.initializer_type_parameter_renames(initializer, type_parameters));
         let result = (|| {
             self.emit_type_parameters(type_parameters)?;
-            self.emit_parameters(parameters)?;
+            self.emit_compact_initializer_parameters(parameters, body)?;
             self.writer.write(" => ");
             let asynchronous = self.initializer_is_async_function(initializer);
             if asynchronous {
@@ -13818,6 +13810,48 @@ impl DeclarationPrinter<'_> {
         Ok(())
     }
 
+    fn emit_compact_initializer_parameters(
+        &mut self,
+        parameters: &NodeList,
+        body: NodeId,
+    ) -> Result<(), EmitError> {
+        self.writer.write("(");
+        let mut previous_end = parameters.range.start.get().saturating_add(1);
+        for (index, parameter) in parameters.nodes.iter().enumerate() {
+            if index != 0 {
+                self.writer.write(", ");
+            }
+            let node = self.node(*parameter)?.clone();
+            let NodeData::ParameterDeclaration(data) = &node.data else {
+                return Err(Self::unsupported(*parameter, node.kind));
+            };
+            self.emit_declaration_parameter_comments(previous_end, node.range.start.get());
+            if data.dot_dot_dot_token.is_some() {
+                self.writer.write("...");
+            }
+            self.emit_declaration_binding_name(data.name)?;
+            if data.question_token.is_some() {
+                self.writer.write("?");
+            }
+            self.writer.write(": ");
+            if let Some(type_) = data.type_ {
+                let previous = self.canonical_literal_quotes;
+                self.canonical_literal_quotes = true;
+                let result =
+                    self.emit_compact_local_alias_type(body, type_, &mut HashSet::new());
+                self.canonical_literal_quotes = previous;
+                result?;
+            } else if data.dot_dot_dot_token.is_some() {
+                self.writer.write("any[]");
+            } else {
+                self.writer.write("any");
+            }
+            previous_end = node.range.end.get();
+        }
+        self.writer.write(")");
+        Ok(())
+    }
+
     fn emit_inferred_declaration_parameters(
         &mut self,
         parameters: &NodeList,
@@ -16072,6 +16106,24 @@ impl DeclarationPrinter<'_> {
             }
             self.writer.write(">");
             self.emit_semantic_function_type(&signature.clone())?;
+            return Ok(());
+        }
+        if let Some(reference) = self
+            .named_type_references
+            .and_then(|references| references.get(&id))
+            && reference.name == "__private_homomorphic_mapped"
+            && let [argument] = reference.type_arguments.as_slice()
+        {
+            self.semantic_infer_count += 1;
+            let infer = format!("T_{}", self.semantic_infer_count);
+            self.emit_semantic_type(*argument)?;
+            self.writer.write(" extends infer ");
+            self.writer.write(&infer);
+            self.writer.write(" ? { [K in keyof ");
+            self.writer.write(&infer);
+            self.writer.write("]: ");
+            self.writer.write(&infer);
+            self.writer.write("[K]; } : never");
             return Ok(());
         }
         if let Some(reference) = self
@@ -24135,15 +24187,7 @@ impl Printer<'_> {
             self.writer.newline();
         }
         let preinitialized_exports = self.commonjs_preinitialized_export_names(&data.statements);
-        if !preinitialized_exports.is_empty() {
-            for name in preinitialized_exports.iter().rev() {
-                self.writer.write("exports.");
-                self.writer.write(name);
-                self.writer.write(" = ");
-            }
-            self.writer.write("void 0;");
-            self.writer.newline();
-        }
+        self.emit_commonjs_preinitialized_exports(&preinitialized_exports);
         self.prepare_uninitialized_export_rewrites(&data.statements);
         if self.is_external_module && export_equals_expression.is_none() {
             for statement in &data.statements.nodes {
@@ -26021,6 +26065,18 @@ impl Printer<'_> {
         names
     }
 
+    fn emit_commonjs_preinitialized_exports(&mut self, names: &[String]) {
+        for chunk in names.chunks(50) {
+            for name in chunk.iter().rev() {
+                self.writer.write("exports.");
+                self.writer.write(name);
+                self.writer.write(" = ");
+            }
+            self.writer.write("void 0;");
+            self.writer.newline();
+        }
+    }
+
     fn prepare_uninitialized_export_rewrites(&mut self, statements: &NodeList) {
         for statement in &statements.nodes {
             let Some(node) = self.arena.get(*statement) else {
@@ -26416,11 +26472,44 @@ impl Printer<'_> {
             .identifier_text(import.name)
             .is_ok_and(|name| self.import_name_has_runtime_alias_chain(name, &mut HashSet::new()));
         let is_export_equals_target = self.import_is_export_equals_target(import.name);
+        let is_named_export = self
+            .identifier_text(import.name)
+            .is_ok_and(|name| self.import_name_is_local_value_export(name));
         (self.has_modifier(import.modifiers.as_ref(), SyntaxKind::ExportKeyword)
             && self.import_semantically_has_runtime_value(declaration))
-            || (self.import_semantically_has_runtime_value(declaration) && has_runtime_reference)
+            || has_runtime_reference
+            || is_named_export
             || is_export_equals_target
             || has_runtime_alias_chain
+    }
+
+    fn import_name_is_local_value_export(&self, name: &str) -> bool {
+        self.arena.iter().any(|(_, node)| {
+            let NodeData::ExportDeclaration(export) = &node.data else {
+                return false;
+            };
+            if export.is_type_only || export.module_specifier.is_some() {
+                return false;
+            }
+            let Some(NodeData::NamedExports(exports)) = export
+                .export_clause
+                .and_then(|clause| self.arena.get(clause))
+                .map(|node| &node.data)
+            else {
+                return false;
+            };
+            exports.elements.nodes.iter().any(|specifier| {
+                matches!(
+                    self.arena.get(*specifier).map(|node| &node.data),
+                    Some(NodeData::ExportSpecifier(specifier))
+                        if !specifier.is_type_only
+                            && declaration_name_text(
+                                self.arena,
+                                specifier.property_name.unwrap_or(specifier.name),
+                            ) == Some(name)
+                )
+            })
+        })
     }
 
     fn import_is_export_equals_target(&self, import_name: NodeId) -> bool {
@@ -49286,6 +49375,23 @@ impl Printer<'_> {
                     self.emit_arrow_body_with_object_rest_parameter(data.body, pattern, "_a")?;
                 } else if matches!(&self.node(data.body)?.data, NodeData::Block(_)) {
                     self.emit_function_body(data.body)?;
+                } else if self.settings.target < ScriptTarget::Es2020
+                    && matches!(
+                        self.arena.get(data.body).map(|node| &node.data),
+                        Some(NodeData::CallExpression(call))
+                            if call.question_dot_token.is_some()
+                                && self.downlevel_nullish_left_needs_temp(call.expression)
+                    )
+                {
+                    let temp = self.generate_block_temp(id, &HashSet::new());
+                    self.downlevel_optional_temps.insert(data.body, temp.clone());
+                    self.writer.write("{ var ");
+                    self.writer.write(&temp);
+                    self.writer.write("; return ");
+                    let result = self.emit_expression(data.body, 1);
+                    self.downlevel_optional_temps.remove(&data.body);
+                    result?;
+                    self.writer.write("; }");
                 } else {
                     self.emit_arrow_body_line_comments(id, data.body);
                     let parenthesize = self.arrow_expression_starts_with_object_literal(data.body);
@@ -51663,16 +51769,17 @@ impl Printer<'_> {
         if wrap {
             self.writer.write("(");
         }
-        if let Some(temp) = self.downlevel_optional_temps.get(&optional).cloned() {
+        let temp = self.downlevel_optional_temps.get(&optional).cloned();
+        if let Some(temp) = &temp {
             self.writer.write("(");
-            self.writer.write(&temp);
+            self.writer.write(temp);
             self.writer.write(" = ");
             self.emit_expression(expression, 1)?;
             self.writer.write(")");
             self.writer.write(" === null || ");
-            self.writer.write(&temp);
+            self.writer.write(temp);
             self.writer.write(" === void 0 ? void 0 : ");
-            self.writer.write(&temp);
+            self.writer.write(temp);
         } else {
             self.emit_expression(expression, 10)?;
             self.writer.write(" === null || ");
@@ -51680,9 +51787,26 @@ impl Printer<'_> {
             self.writer.write(" === void 0 ? void 0 : ");
             self.emit_expression(expression, 18)?;
         }
-        self.writer.write("(");
-        self.emit_expression_list(arguments)?;
-        self.writer.write(")");
+        let receiver = match self.arena.get(expression).map(|node| &node.data) {
+            Some(NodeData::PropertyAccessExpression(access)) => Some(access.expression),
+            Some(NodeData::ElementAccessExpression(access)) => Some(access.expression),
+            _ => None,
+        };
+        if temp.is_some()
+            && let Some(receiver) = receiver
+        {
+            self.writer.write(".call(");
+            self.emit_expression(receiver, 1)?;
+            if !arguments.nodes.is_empty() {
+                self.writer.write(", ");
+                self.emit_expression_list(arguments)?;
+            }
+            self.writer.write(")");
+        } else {
+            self.writer.write("(");
+            self.emit_expression_list(arguments)?;
+            self.writer.write(")");
+        }
         if wrap {
             self.writer.write(")");
         }
@@ -57030,6 +57154,24 @@ mod tests {
     }
 
     #[test]
+    fn downlevels_optional_computed_calls_in_concise_arrows_with_receiver() {
+        let output = emit_with(
+            "const call = (p) => handlers[p.t]?.(p);",
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert_eq!(
+            output,
+            concat!(
+                "const call = (p) => { var _a; return ",
+                "(_a = handlers[p.t]) === null || _a === void 0 ? void 0 : ",
+                "_a.call(handlers, p); };\n",
+            )
+        );
+    }
+
+    #[test]
     fn downlevel_object_spread_groups_properties_in_source_order() {
         let source = concat!(
             "const leading = { before: one(), [computed()]: two(), ...spread(), after: three() };",
@@ -58440,6 +58582,18 @@ class Board {
     }
 
     #[test]
+    fn retains_external_import_equals_reexported_by_name() {
+        let output = emit_with(
+            "import x = require('something'); export { x };",
+            ScriptTarget::Es2015,
+            ModuleKind::CommonJs,
+        )
+        .code;
+        assert!(output.contains("const x = require(\"something\");"), "{output}");
+        assert!(output.contains("exports.x = x;"), "{output}");
+    }
+
+    #[test]
     fn emits_recovered_contextual_keyword_import_equals_aliases() {
         let source = "import fs = module(\"fs\");";
         let parsed = parse_source_file(source);
@@ -59092,6 +59246,21 @@ class Board {
         ] {
             assert!(result.code.contains(assignment), "{}", result.code);
         }
+    }
+
+    #[test]
+    fn chunks_large_commonjs_export_preinitialization_chains() {
+        let source = (0..51)
+            .map(|index| format!("export const exp{index} = {index};"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let output = emit_with(&source, ScriptTarget::Es5, ModuleKind::CommonJs).code;
+        assert_eq!(output.matches("void 0;").count(), 2, "{output}");
+        assert!(
+            output.contains("exports.exp49 = exports.exp48 ="),
+            "{output}"
+        );
+        assert!(output.contains("exports.exp50 = void 0;"), "{output}");
     }
 
     #[test]

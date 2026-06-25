@@ -8356,6 +8356,7 @@ impl<'a> Checker<'a> {
                     self.result.types.alloc(TypeKind::Array(element))
                 }
             }
+            NodeData::SpreadElement(data) => self.type_of_expression(data.expression),
             NodeData::ArrowFunction(data) => self.arrow_type(node_id, data, contextual_type),
             NodeData::FunctionExpression(data) => {
                 self.function_expression_type(node_id, data, contextual_type)
@@ -8488,6 +8489,11 @@ impl<'a> Checker<'a> {
                 }
                 let getter_call = self.property_access_is_getter(data.expression);
                 let callee = self.type_of_expression(data.expression);
+                let callee = if data.question_dot_token.is_some() {
+                    self.non_nullish_type(callee)
+                } else {
+                    callee
+                };
                 let callee = data.type_arguments.as_ref().map_or(callee, |arguments| {
                     self.instantiate_explicit_call_signature(
                         data.expression,
@@ -8550,6 +8556,12 @@ impl<'a> Checker<'a> {
                         } else {
                             result
                         }
+                    } else {
+                        result
+                    };
+                    let result = if data.question_dot_token.is_some() {
+                        let undefined = self.result.types.undefined();
+                        self.result.types.union([result, undefined])
                     } else {
                         result
                     };
@@ -9892,8 +9904,25 @@ impl<'a> Checker<'a> {
                         .alloc(TypeKind::NumberLiteral(elements.len().to_string())),
                 )
             }
+            TypeKind::Tuple(elements) | TypeKind::ReadonlyTuple(elements) => {
+                let element = self.result.types.union(elements);
+                let descriptor = self.external_names.get("Array")?.clone();
+                let array = self.import_alias(&descriptor, &[element]);
+                match self.result.types.get(array)?.kind.clone() {
+                    TypeKind::Object(object) => self.object_property_type(&object, name, true),
+                    _ => None,
+                }
+            }
             TypeKind::String | TypeKind::StringLiteral(_) if name == "length" => {
                 Some(self.result.types.number())
+            }
+            TypeKind::String | TypeKind::StringLiteral(_) => {
+                let descriptor = self.external_names.get("String")?.clone();
+                let string = self.import_alias(&descriptor, &[]);
+                match self.result.types.get(string)?.kind.clone() {
+                    TypeKind::Object(object) => self.object_property_type(&object, name, true),
+                    _ => None,
+                }
             }
             TypeKind::Union(members) => {
                 let properties = members
@@ -10449,6 +10478,32 @@ impl<'a> Checker<'a> {
                 self.type_of_expression(*argument);
             }
             return self.result.types.any();
+        }
+        if !construct
+            && let TypeKind::Union(members) = &callee_kind
+        {
+            let signatures = members
+                .iter()
+                .map(|member| {
+                    self.result
+                        .types
+                        .get(*member)
+                        .and_then(|type_| self.callable_signatures(type_.kind.clone()))
+                })
+                .collect::<Option<Vec<_>>>();
+            if let Some(signatures) = signatures {
+                for argument in arguments {
+                    self.type_of_expression(*argument);
+                }
+                let returns = signatures
+                    .into_iter()
+                    .flatten()
+                    .map(|signature| signature.return_type)
+                    .collect::<Vec<_>>();
+                if !returns.is_empty() {
+                    return self.result.types.union(returns);
+                }
+            }
         }
         let signatures = if construct {
             self.construct_signatures(callee_kind)
@@ -17336,6 +17391,19 @@ fn describe_type_node_syntax(
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
+            if !exported_names.contains(&name)
+                && type_arguments
+                    .iter()
+                    .any(descriptor_contains_type_parameter)
+                && type_arguments.len() == 1
+                && is_homomorphic_identity_alias(source, checker, &name)
+            {
+                return TypeDescriptor::Named {
+                    name: "__private_homomorphic_mapped".into(),
+                    type_arguments,
+                    target: Box::new(semantic_target),
+                };
+            }
             if !exported_names.contains(&name)
                 && type_arguments
                     .iter()

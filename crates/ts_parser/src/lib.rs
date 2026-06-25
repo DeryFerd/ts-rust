@@ -439,6 +439,12 @@ impl<'a> Parser<'a> {
             if recover_static_member && self.starts_recovered_class_member() {
                 break;
             }
+            if self.current.kind == SyntaxKind::Unknown && self.current.text == "#" {
+                let range = self.current.range;
+                self.invalid_token_recovery_ranges.push(range);
+                self.bump();
+                continue;
+            }
             if self.current.kind == SyntaxKind::Unknown
                 && self.current.text == "\\"
                 && self.next_token_kind() == SyntaxKind::Identifier
@@ -5698,7 +5704,8 @@ impl<'a> Parser<'a> {
             _ => {
                 let position = self.current.range.start;
                 self.error_current("Expected an expression.");
-                if binary_precedence(self.current.kind).is_none()
+                if self.current.kind != SyntaxKind::Unknown
+                    && binary_precedence(self.current.kind).is_none()
                     && !is_expression_terminator(self.current.kind)
                 {
                     self.bump();
@@ -12323,6 +12330,26 @@ mod tests {
             panic!("expected source file");
         };
         &data.statements.nodes
+    }
+
+    #[test]
+    fn preserves_unary_expression_after_invalid_variable_initializer_tokens() {
+        let result = parse_source_file("const a =!@#!@$\nconst b = !@#!@#!@#!\n");
+        let kinds = source_statements(&result)
+            .iter()
+            .map(|statement| result.arena.get(*statement).unwrap().kind)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            [
+                SyntaxKind::VariableStatement,
+                SyntaxKind::ExpressionStatement,
+                SyntaxKind::VariableStatement,
+                SyntaxKind::ExpressionStatement,
+                SyntaxKind::ExpressionStatement,
+                SyntaxKind::ExpressionStatement,
+            ]
+        );
     }
 
     #[test]
