@@ -26201,8 +26201,9 @@ impl Printer<'_> {
         }
     }
 
-    fn expression_ends_with_missing_new(&self, expression: NodeId) -> bool {
+    fn expression_ends_with_missing_gap(&self, expression: NodeId) -> bool {
         match self.arena.get(expression).map(|node| &node.data) {
+            Some(NodeData::Identifier(identifier)) => identifier.text.is_empty(),
             Some(NodeData::NewExpression(new_expression)) => self
                 .arena
                 .get(new_expression.expression)
@@ -26213,10 +26214,10 @@ impl Printer<'_> {
                     )
                 }),
             Some(NodeData::BinaryExpression(binary)) => {
-                self.expression_ends_with_missing_new(binary.right)
+                self.expression_ends_with_missing_gap(binary.right)
             }
             Some(NodeData::ParenthesizedExpression(parenthesized)) => {
-                self.expression_ends_with_missing_new(parenthesized.expression)
+                self.expression_ends_with_missing_gap(parenthesized.expression)
             }
             _ => false,
         }
@@ -50532,7 +50533,7 @@ impl Printer<'_> {
                         self.node(data.expression)?.range.end.get(),
                         node.range.end.get().saturating_sub(1),
                     );
-                    if !self.expression_ends_with_missing_new(data.expression) {
+                    if !self.expression_ends_with_missing_gap(data.expression) {
                         self.writer.remove_trailing_spaces();
                     }
                     let indent_closing = !has_leading_line_comment && self.writer.line_start;
@@ -56134,6 +56135,17 @@ mod tests {
             .unwrap()
             .code;
         assert_eq!(output, "(a, new );\n");
+    }
+
+    #[test]
+    fn preserves_a_recovered_missing_binary_operand_gap() {
+        let source = "x = (y = z ==== 'function') {";
+        let parsed = parse_source_file(source);
+        assert!(!parsed.diagnostics.is_empty());
+        let output = emit_source_file(&parsed.arena, parsed.source_file)
+            .unwrap()
+            .code;
+        assert!(output.contains("x = (y = z === ) ="), "{output}");
     }
 
     #[test]

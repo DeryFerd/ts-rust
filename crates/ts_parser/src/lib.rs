@@ -5509,6 +5509,7 @@ impl<'a> Parser<'a> {
         )
     }
 
+    #[allow(clippy::too_many_lines)]
     fn is_parenthesized_arrow(&mut self) -> bool {
         let checkpoint = self.scanner.mark();
         let mut parenthesis_depth = 1_u32;
@@ -5518,9 +5519,17 @@ impl<'a> Parser<'a> {
         let mut top_level_question = false;
         let mut at_parameter_start = true;
         let mut invalid_parameter_start = false;
+        let mut invalid_parameter_expression = false;
         let mut previous_kind = SyntaxKind::OpenParenToken;
         let mut token = self.scanner.scan();
         while token.kind != SyntaxKind::EndOfFile {
+            if invalid_arrow_parameter_expression(
+                (parenthesis_depth, brace_depth, bracket_depth),
+                previous_kind,
+                token.kind,
+            ) {
+                invalid_parameter_expression = true;
+            }
             if at_parameter_start
                 && parenthesis_depth == 1
                 && brace_depth == 0
@@ -5539,7 +5548,7 @@ impl<'a> Parser<'a> {
                     parenthesis_depth -= 1;
                     if parenthesis_depth == 0 {
                         token = self.scanner.scan();
-                        let result = if invalid_parameter_start {
+                        let result = if invalid_parameter_start || invalid_parameter_expression {
                             false
                         } else if token.kind == SyntaxKind::ColonToken {
                             if previous_kind == SyntaxKind::OpenParenToken || typed_parameter {
@@ -8557,6 +8566,14 @@ fn invalid_arrow_parameter_start(kind: SyntaxKind) -> bool {
     )
 }
 
+fn invalid_arrow_parameter_expression(
+    depths: (u32, u32, u32),
+    previous: SyntaxKind,
+    current: SyntaxKind,
+) -> bool {
+    depths == (1, 0, 0) && previous.is_binary_operator() && current.is_assignment_operator()
+}
+
 fn binary_precedence(kind: SyntaxKind) -> Option<(u8, bool)> {
     let (precedence, right_associative) = match kind {
         SyntaxKind::CommaToken => (1, false),
@@ -9789,6 +9806,19 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn rejects_an_arrow_lookahead_with_an_unparsed_binary_operand() {
+        let result = parse_source_file("x = (y = z ==== 'function') {");
+        assert!(result
+            .arena
+            .iter()
+            .all(|(_, node)| !matches!(node.data, NodeData::ArrowFunction(_))));
+        assert!(result
+            .arena
+            .iter()
+            .any(|(_, node)| matches!(node.data, NodeData::Block(_))));
     }
 
     #[test]
