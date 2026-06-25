@@ -238,6 +238,7 @@ pub struct Program {
     file_index: BTreeMap<String, usize>,
     root_file_names: BTreeSet<String>,
     resolved_modules: BTreeMap<(String, String), String>,
+    package_export_specifiers: BTreeMap<String, String>,
     diagnostics: Vec<ProgramDiagnostic>,
     current_directory: String,
     case_sensitivity: CaseSensitivity,
@@ -361,6 +362,9 @@ impl Program {
             for (specifier, range, can_resolve_ambient, side_effect_only) in specifiers {
                 let result = resolver.resolve(&specifier, &containing_file);
                 if let Some(resolved) = result.resolved {
+                    if let Some(package_json) = resolved.package_json.as_deref() {
+                        self.register_package_export_specifiers(file_system, package_json);
+                    }
                     let containing = canonicalize(
                         &containing_file,
                         &self.current_directory,
@@ -400,6 +404,46 @@ impl Program {
                 }
             }
             file_index += 1;
+        }
+    }
+
+    fn register_package_export_specifiers(
+        &mut self,
+        file_system: &dyn FileSystem,
+        package_json_path: &str,
+    ) {
+        let Some(package) = file_system
+            .read_file(package_json_path)
+            .ok()
+            .and_then(|contents| parse_package_json(&contents).ok())
+        else {
+            return;
+        };
+        let (Some(name), Some(exports)) = (package.name, package.exports) else {
+            return;
+        };
+        let Some(exports) = exports.as_object() else {
+            return;
+        };
+        let directory = directory_path(package_json_path);
+        for (key, value) in exports {
+            let Some(target) = package_export_string_target(value) else {
+                continue;
+            };
+            let target = resolve_path(&directory, &[target]);
+            let target = canonicalize(
+                ts_path::remove_file_extension(&target),
+                &self.current_directory,
+                self.case_sensitivity,
+            );
+            let specifier = if key == "." {
+                name.clone()
+            } else if let Some(subpath) = key.strip_prefix("./") {
+                format!("{name}/{subpath}")
+            } else {
+                continue;
+            };
+            self.package_export_specifiers.insert(target, specifier);
         }
     }
 
@@ -872,6 +916,8 @@ impl Program {
                 }
                 let declaration_node_types =
                     declaration_node_types_for_emit(source_file, self.options.strict_null_checks);
+                let declaration_import_type_references =
+                    self.preferred_declaration_import_type_references(source_file);
                 match emit_declaration_file_with_semantics_and_options(
                     &source_file.parse.arena,
                     source_file.parse.source_file,
@@ -882,7 +928,7 @@ impl Program {
                     Some(&enum_member_values),
                     Some(&source_file.checking.types),
                     Some(&declaration_node_types),
-                    Some(&source_file.checking.import_type_references),
+                    Some(&declaration_import_type_references),
                     Some(&source_file.checking.named_type_references),
                     settings.remove_comments,
                     self.options.rewrite_relative_import_extensions,
@@ -1359,6 +1405,8 @@ impl Program {
                 let enum_member_values = enum_values_for_emit(&source.checking.enum_member_values);
                 let declaration_node_types =
                     declaration_node_types_for_emit(source, self.options.strict_null_checks);
+                let declaration_import_type_references =
+                    self.preferred_declaration_import_type_references(source);
                 match emit_declaration_file_with_semantics_and_options(
                     &source.parse.arena,
                     source.parse.source_file,
@@ -1369,7 +1417,7 @@ impl Program {
                     Some(&enum_member_values),
                     Some(&source.checking.types),
                     Some(&declaration_node_types),
-                    Some(&source.checking.import_type_references),
+                    Some(&declaration_import_type_references),
                     Some(&source.checking.named_type_references),
                     settings.remove_comments,
                     self.options.rewrite_relative_import_extensions,
@@ -1556,6 +1604,40 @@ impl Program {
             return false;
         }
         true
+    }
+
+    fn preferred_declaration_import_type_references(
+        &self,
+        source: &SourceFile,
+    ) -> BTreeMap<TypeId, ts_checker::ImportTypeReference> {
+        let mut references = source.checking.import_type_references.clone();
+        for reference in references.values_mut() {
+            let qualifier = reference
+                .qualifier
+                .split_once('.')
+                .map_or(reference.qualifier.as_str(), |(root, _)| root);
+            let referenced_file = ts_path::base_file_name(ts_path::remove_file_extension(
+                &reference.module_specifier,
+            ));
+            let preferred = self.source_files.iter().find_map(|candidate| {
+                if candidate.binding.exports.get(qualifier).is_none()
+                    || ts_path::base_file_name(module_file_stem(&candidate.file_name))
+                        != referenced_file
+                {
+                    return None;
+                }
+                let target = canonicalize(
+                    module_file_stem(&candidate.file_name),
+                    &self.current_directory,
+                    self.case_sensitivity,
+                );
+                self.package_export_specifiers.get(&target)
+            });
+            if let Some(preferred) = preferred {
+                reference.module_specifier.clone_from(preferred);
+            }
+        }
+        references
     }
 
     fn source_has_resolved_path_reference(&self, source: &SourceFile) -> bool {
@@ -2466,6 +2548,24 @@ fn implied_node_format(file_system: &dyn FileSystem, file_name: &str) -> ModuleK
         directory = parent;
     }
     ModuleKind::CommonJs
+}
+
+fn package_export_string_target(value: &serde_json::Value) -> Option<&str> {
+    if let Some(target) = value.as_str() {
+        return Some(target);
+    }
+    let object = value.as_object()?;
+    ["types", "import", "default", "require"]
+        .into_iter()
+        .find_map(|condition| object.get(condition).and_then(package_export_string_target))
+        .or_else(|| object.values().find_map(package_export_string_target))
+}
+
+fn module_file_stem(path: &str) -> &str {
+    [".d.ts", ".d.mts", ".d.cts"]
+        .into_iter()
+        .find_map(|suffix| path.strip_suffix(suffix))
+        .unwrap_or_else(|| ts_path::remove_file_extension(path))
 }
 
 #[derive(Clone, Copy)]

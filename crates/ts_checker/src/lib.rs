@@ -3499,9 +3499,9 @@ impl<'a> Checker<'a> {
         for (symbol, descriptor) in std::mem::take(&mut self.external_symbols) {
             if matches!(descriptor, TypeDescriptor::Object { .. }) {
                 self.structural_external_symbols.insert(symbol);
-                if descriptor_contains_serialized_reference(&descriptor) {
-                    self.serialized_structural_external_symbols.insert(symbol);
-                }
+            }
+            if descriptor_contains_serialized_reference(&descriptor) {
+                self.serialized_structural_external_symbols.insert(symbol);
             }
             if matches!(descriptor, TypeDescriptor::Alias { .. }) {
                 self.external_aliases.insert(symbol, descriptor.clone());
@@ -6698,6 +6698,11 @@ impl<'a> Checker<'a> {
                 .get(signature)
                 .map(|type_| type_.kind.clone())
         {
+            let type_parameter_scope = self.inferred_type_parameter_scope(
+                method.type_parameters.as_ref(),
+                signature,
+            );
+            self.type_parameter_scopes.push(type_parameter_scope);
             let mut scope = HashMap::new();
             for (index, parameter_id) in method.parameters.nodes.iter().enumerate() {
                 let Some(NodeData::ParameterDeclaration(parameter)) =
@@ -6733,6 +6738,7 @@ impl<'a> Checker<'a> {
                 .map(|expression| self.inferred_method_return_expression_type(expression, body))
                 .collect::<Vec<_>>();
             self.local_scopes.pop();
+            self.type_parameter_scopes.pop();
             let return_type = predicate.or_else(|| {
                 if returns.is_empty()
                     && method.asterisk_token.is_none()
@@ -8900,6 +8906,36 @@ impl<'a> Checker<'a> {
                         self.preserve_literal_inference || contextual_type.is_none();
                     let result =
                         self.call_expression_type(node_id, callee, &data.arguments.nodes, false);
+                    let result = if let Some(type_arguments) = &data.type_arguments
+                        && !type_arguments.nodes.is_empty()
+                        && !self.result.named_type_references.contains_key(&result)
+                        && let Some(mut reference) =
+                            self.result.import_type_references.get(&result).cloned()
+                        && !reference.qualifier.is_empty()
+                        && reference.qualifier != "export="
+                    {
+                        let arguments = type_arguments
+                            .nodes
+                            .iter()
+                            .map(|argument| self.type_from_type_node(*argument))
+                            .collect::<Vec<_>>();
+                        let kind = self.result.types.get(result).unwrap().kind.clone();
+                        let named = self.result.types.alloc(kind);
+                        reference.is_typeof = false;
+                        self.result
+                            .import_type_references
+                            .insert(named, reference.clone());
+                        self.result.named_type_references.insert(
+                            named,
+                            NamedTypeReference {
+                                name: reference.qualifier,
+                                type_arguments: arguments,
+                            },
+                        );
+                        named
+                    } else {
+                        result
+                    };
                     let result = if self
                         .arena
                         .get(data.expression)
@@ -10193,13 +10229,16 @@ impl<'a> Checker<'a> {
             return;
         }
         match self.result.types.get(type_id).unwrap().kind.clone() {
-            TypeKind::Function(signature) | TypeKind::Constructor(signature) => self
-                .propagate_import_reference(
+            TypeKind::Function(signature) | TypeKind::Constructor(signature) => {
+                let mut return_reference = reference.clone();
+                return_reference.is_typeof = false;
+                self.propagate_import_reference(
                     signature.return_type,
                     receiver_properties,
-                    reference,
+                    &return_reference,
                     visited,
-                ),
+                );
+            }
             TypeKind::Union(members) | TypeKind::Intersection(members) => {
                 for member in members {
                     self.propagate_import_reference(
@@ -12885,7 +12924,8 @@ impl<'a> Checker<'a> {
         if data.type_.is_none()
             && let Some(body) = data.body
         {
-            let scope = self.inferred_function_type_parameter_scope(data, function);
+            let scope =
+                self.inferred_type_parameter_scope(data.type_parameters.as_ref(), function);
             self.type_parameter_scopes.push(scope);
             let inferred = self
                 .infer_function_return_type(data, function, body)
@@ -12929,13 +12969,12 @@ impl<'a> Checker<'a> {
         function
     }
 
-    fn inferred_function_type_parameter_scope(
+    fn inferred_type_parameter_scope(
         &mut self,
-        data: &ts_ast::FunctionDeclarationData,
+        type_parameters: Option<&ts_ast::NodeList>,
         function: TypeId,
     ) -> HashMap<String, TypeId> {
-        let wanted = data
-            .type_parameters
+        let wanted = type_parameters
             .iter()
             .flat_map(|parameters| &parameters.nodes)
             .filter_map(|parameter| {
@@ -12963,7 +13002,7 @@ impl<'a> Checker<'a> {
             );
         }
         self.type_parameter_scopes.push(HashMap::new());
-        if let Some(type_parameters) = &data.type_parameters {
+        if let Some(type_parameters) = type_parameters {
             for type_parameter in &type_parameters.nodes {
                 let Some(NodeData::TypeParameterDeclaration(parameter)) =
                     self.arena.get(*type_parameter).map(|node| &node.data)
@@ -14268,10 +14307,23 @@ impl<'a> Checker<'a> {
                         type_id = self.constructor_instance_type(type_id).unwrap_or(type_id);
                     }
                     if let Some(reference) = self.external_imports.get(&symbol).cloned() {
-                        self.result
+                        let nested_nonportable = self
+                            .result
                             .import_type_references
-                            .entry(type_id)
-                            .or_insert(reference);
+                            .get(&type_id)
+                            .is_some_and(|reference| {
+                                reference.module_specifier.contains("/node_modules/")
+                            });
+                        if self.external_aliases.contains_key(&symbol) && !nested_nonportable {
+                            let kind = self.result.types.get(type_id).unwrap().kind.clone();
+                            type_id = self.result.types.alloc(kind);
+                            self.result.import_type_references.insert(type_id, reference);
+                        } else {
+                            self.result
+                                .import_type_references
+                                .entry(type_id)
+                                .or_insert(reference);
+                        }
                     }
                     type_id
                 } else if self.external_names.contains_key(&name)
@@ -15697,7 +15749,13 @@ impl<'a> Checker<'a> {
                 let type_arguments = type_arguments
                     .iter()
                     .map(|argument| self.import_type(argument))
-                    .collect();
+                    .collect::<Vec<_>>();
+                if name == "ReturnType"
+                    && let [argument] = type_arguments.as_slice()
+                    && let Some(return_type) = self.callable_return_type(*argument)
+                {
+                    return return_type;
+                }
                 let kind = self.result.types.get(target).unwrap().kind.clone();
                 let named = self.result.types.alloc(kind);
                 self.result.named_type_references.insert(
@@ -26400,6 +26458,169 @@ mod tests {
                 qualifier: "B".into(),
                 is_typeof: false,
             })
+        );
+    }
+
+    #[test]
+    fn inferred_generic_method_return_keeps_method_type_parameter() {
+        let parsed = parse_source_file(concat!(
+            "type Constructor<T> = (...args: any[]) => T;\n",
+            "class BindingKey<T> {\n",
+            "  static create<T extends Constructor<any>>(ctor: T) {\n",
+            "    return new BindingKey<T>();\n",
+            "  }\n",
+            "}\n",
+        ));
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        let method = parsed
+            .arena
+            .iter()
+            .find_map(|(id, node)| {
+                matches!(&node.data, NodeData::MethodDeclaration(method)
+                    if identifier_text(&parsed.arena, method.name) == Some("create"))
+                .then_some(id)
+            })
+            .expect("create method");
+        let method_type = result.node_types[&method];
+        let TypeKind::Function(signature) = &result.types.get(method_type).unwrap().kind else {
+            panic!("expected method signature");
+        };
+        let reference = result
+            .named_type_references
+            .get(&signature.return_type)
+            .expect("named method return");
+        assert_eq!(reference.name, "BindingKey");
+        assert_eq!(reference.type_arguments.len(), 1);
+        assert!(matches!(
+            result.types.get(reference.type_arguments[0]).map(|type_| &type_.kind),
+            Some(TypeKind::TypeParameter { name, .. }) if name == "T"
+        ));
+    }
+
+    #[test]
+    fn imported_generic_static_method_substitutes_explicit_type_argument() {
+        let value_promise =
+            parse_source_file("export type Constructor<T> = (...args: any[]) => T;\n");
+        let dependency = parse_source_file(concat!(
+            "import { Constructor } from 'pkg';\n",
+            "export class BindingKey<T> {\n",
+            "  readonly __type: T;\n",
+            "  static create<T extends Constructor<any>>(ctor: T) {\n",
+            "    return new BindingKey<T>();\n",
+            "  }\n",
+            "}\n",
+        ));
+        let entry = parse_source_file(concat!(
+            "export * from './value-promise';\n",
+            "export * from './bindingkey';\n",
+        ));
+        let application = parse_source_file(concat!(
+            "import { Constructor } from 'pkg';\n",
+            "export type ControllerClass = Constructor<any>;\n",
+        ));
+        let consumer = parse_source_file(concat!(
+            "import { ControllerClass } from './application';\n",
+            "import { BindingKey } from 'pkg';\n",
+            "export const key = BindingKey.create<ControllerClass>(null as any);\n",
+        ));
+        let value_promise_bindings =
+            bind_source_file(&value_promise.arena, value_promise.source_file);
+        let dependency_bindings =
+            bind_source_file(&dependency.arena, dependency.source_file);
+        let entry_bindings = bind_source_file(&entry.arena, entry.source_file);
+        let application_bindings =
+            bind_source_file(&application.arena, application.source_file);
+        let consumer_bindings = bind_source_file(&consumer.arena, consumer.source_file);
+        let no_modules = BTreeMap::new();
+        let application_modules = BTreeMap::from([("pkg".into(), 4)]);
+        let dependency_modules = BTreeMap::from([("pkg".into(), 4)]);
+        let entry_modules = BTreeMap::from([
+            ("./value-promise".into(), 2),
+            ("./bindingkey".into(), 3),
+        ]);
+        let consumer_modules = BTreeMap::from([
+            ("./application".into(), 0),
+            ("pkg".into(), 4),
+        ]);
+        let checked = check_program(&[
+            ProgramSource {
+                arena: &application.arena,
+                source_file: application.source_file,
+                bindings: &application_bindings,
+                resolved_modules: &application_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+            ProgramSource {
+                arena: &consumer.arena,
+                source_file: consumer.source_file,
+                bindings: &consumer_bindings,
+                resolved_modules: &consumer_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+            ProgramSource {
+                arena: &value_promise.arena,
+                source_file: value_promise.source_file,
+                bindings: &value_promise_bindings,
+                resolved_modules: &no_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions {
+                    is_declaration_file: true,
+                    ..CheckerOptions::default()
+                },
+            },
+            ProgramSource {
+                arena: &dependency.arena,
+                source_file: dependency.source_file,
+                bindings: &dependency_bindings,
+                resolved_modules: &dependency_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions {
+                    is_declaration_file: true,
+                    ..CheckerOptions::default()
+                },
+            },
+            ProgramSource {
+                arena: &entry.arena,
+                source_file: entry.source_file,
+                bindings: &entry_bindings,
+                resolved_modules: &entry_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions {
+                    is_declaration_file: true,
+                    ..CheckerOptions::default()
+                },
+            },
+        ]);
+        let key = consumer_bindings.root_scope().unwrap().symbols.get("key").unwrap();
+        let key_type = checked.files[1].type_of_symbol(key).unwrap();
+        let reference = checked.files[1]
+            .named_type_references
+            .get(&key_type)
+            .expect("named BindingKey result");
+        assert_eq!(reference.name, "BindingKey");
+        assert_eq!(reference.type_arguments.len(), 1);
+        assert_eq!(
+            checked.files[1]
+                .import_type_references
+                .get(&reference.type_arguments[0]),
+            Some(&ImportTypeReference {
+                module_specifier: "./application".into(),
+                qualifier: "ControllerClass".into(),
+                is_typeof: false,
+            }),
+            "argument type: {}; named: {:?}",
+            checked.files[1].types.display(reference.type_arguments[0]),
+            checked.files[1]
+                .named_type_references
+                .get(&reference.type_arguments[0]),
         );
     }
 

@@ -7438,10 +7438,48 @@ impl DeclarationPrinter<'_> {
             }
             false
         });
-        syntactic_return
+        let returned_type_assertion = names
+            .iter()
+            .any(|name| self.returned_type_assertion_references_name(name));
+        let semantic_return = returned_type_assertion
+            || (syntactic_return && self.inferred_return_references_import(import));
+        semantic_return
             || names
                 .iter()
                 .any(|name| self.inferred_parameter_references_name(name))
+    }
+
+    fn inferred_return_references_import(
+        &self,
+        import: &ts_ast::ImportDeclarationData,
+    ) -> bool {
+        self.arena.iter().any(|(id, node)| {
+            if !matches!(
+                node.data,
+                NodeData::FunctionDeclaration(_)
+                    | NodeData::FunctionExpression(_)
+                    | NodeData::ArrowFunction(_)
+                    | NodeData::MethodDeclaration(_)
+                    | NodeData::GetAccessorDeclaration(_)
+            ) {
+                return false;
+            }
+            self.semantic_function_signature(id).is_some_and(|signature| {
+                self.semantic_type_references_import(
+                    signature.return_type,
+                    import,
+                    &mut HashSet::new(),
+                )
+            })
+        })
+    }
+
+    fn returned_type_assertion_references_name(&self, name: &str) -> bool {
+        self.arena.iter().any(|(id, node)| {
+            matches!(&node.data, NodeData::Identifier(identifier)
+                if identifier.text == name)
+                && self.identifier_is_in_returned_type_assertion(id)
+        })
     }
 
     fn inferred_parameter_references_name(&self, name: &str) -> bool {
@@ -15702,7 +15740,9 @@ impl DeclarationPrinter<'_> {
                                     .map(|type_id| (expression, type_id))
                             })
                     {
-                        if self.object_literal_spreads_call(expression) {
+                        if self.semantic_type_contains_type_parameter(signature.return_type)
+                            || self.object_literal_spreads_call(expression)
+                        {
                             self.emit_semantic_type(signature.return_type)?;
                         } else {
                             self.emit_widened_semantic_type(type_id)?;
@@ -17547,7 +17587,13 @@ impl DeclarationPrinter<'_> {
                 symbol.declarations.iter().any(|declaration| {
                     if matches!(
                         self.arena.get(*declaration).map(|node| &node.data),
-                        Some(NodeData::TypeParameterDeclaration(_))
+                        Some(
+                            NodeData::TypeParameterDeclaration(_)
+                                | NodeData::ImportSpecifier(_)
+                                | NodeData::ImportClause(_)
+                                | NodeData::NamespaceImport(_)
+                                | NodeData::ImportEqualsDeclaration(_)
+                        )
                     ) {
                         return true;
                     }
@@ -22563,6 +22609,7 @@ impl DeclarationPrinter<'_> {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn import_binding_is_used_in_retained_declaration(
         &self,
         import_id: NodeId,
@@ -22601,6 +22648,12 @@ impl DeclarationPrinter<'_> {
         if self.statement_is_inferred_class_property_dependency(import_id) {
             return true;
         }
+        if let Some(NodeData::ImportDeclaration(import)) =
+            self.arena.get(import_id).map(|node| &node.data)
+            && self.import_is_used_by_inferred_semantic_variable_type(import_id, import)
+        {
+            return true;
+        }
         if self.exported_declaration_type_references_name(name) {
             return true;
         }
@@ -22608,7 +22661,17 @@ impl DeclarationPrinter<'_> {
             return true;
         }
         if self.inferred_return_references_name(name) {
-            return true;
+            if self.returned_type_assertion_references_name(name) {
+                return true;
+            }
+            let Some(NodeData::ImportDeclaration(import)) =
+                self.arena.get(import_id).map(|node| &node.data)
+            else {
+                return true;
+            };
+            if self.inferred_return_references_import(import) {
+                return true;
+            }
         }
         if self.inferred_parameter_references_name(name) {
             return true;
