@@ -21100,6 +21100,7 @@ impl DeclarationPrinter<'_> {
         import_id: NodeId,
         name: &str,
     ) -> bool {
+        let augmentation_member_module = self.same_name_named_import_module(import_id, name);
         if self.import_binding_is_used_by_synthetic_class_base(import_id, name) {
             return true;
         }
@@ -21173,6 +21174,12 @@ impl DeclarationPrinter<'_> {
                                 NodeData::Identifier(identifier_data)
                                     if identifier_data.text == name
                             ) && self.node_is_within(identifier, *statement)
+                                && !augmentation_member_module.is_some_and(|module_name| {
+                                    self.identifier_is_within_named_module(
+                                        identifier,
+                                        module_name,
+                                    )
+                                })
                                 && (binding_symbol.is_none_or(|symbol| {
                                     self.bindings.resolve_name_at(identifier, name) == Some(symbol)
                                 }) || self.identifier_is_in_erased_type_context(identifier))
@@ -21186,6 +21193,47 @@ impl DeclarationPrinter<'_> {
                 })
             })
         })
+    }
+
+    fn same_name_named_import_module(&self, import_id: NodeId, name: &str) -> Option<&str> {
+        let NodeData::ImportDeclaration(import) = &self.arena.get(import_id)?.data else {
+            return None;
+        };
+        let NodeData::ImportClause(clause) = &self.arena.get(import.import_clause?)?.data else {
+            return None;
+        };
+        let NodeData::NamedImports(imports) = &self.arena.get(clause.named_bindings?)?.data else {
+            return None;
+        };
+        imports.elements.nodes.iter().find_map(|specifier| {
+            let NodeData::ImportSpecifier(specifier) = &self.arena.get(*specifier)?.data else {
+                return None;
+            };
+            let local_name = declaration_name_text(self.arena, specifier.name)?;
+            let imported_name = specifier
+                .property_name
+                .and_then(|property| declaration_name_text(self.arena, property))
+                .unwrap_or(local_name);
+            (local_name == name && imported_name == name)
+                .then(|| string_literal_text(self.arena, import.module_specifier))
+                .flatten()
+        })
+    }
+
+    fn identifier_is_within_named_module(&self, identifier: NodeId, module_name: &str) -> bool {
+        let mut current = self.arena.get(identifier).and_then(|node| node.parent);
+        while let Some(id) = current {
+            let Some(node) = self.arena.get(id) else {
+                return false;
+            };
+            if let NodeData::ModuleDeclaration(module) = &node.data
+                && string_literal_text(self.arena, module.name) == Some(module_name)
+            {
+                return true;
+            }
+            current = node.parent;
+        }
+        false
     }
 
     fn import_binding_is_used_by_synthetic_class_base(
@@ -26730,13 +26778,8 @@ impl Printer<'_> {
             let alias_chain = self.identifier_text(import.name).is_ok_and(|name| {
                 self.import_name_has_runtime_alias_chain(name, &mut HashSet::new())
             });
-            let unresolved_local_target = self
-                .resolve_entity_symbol(import.module_reference, &mut HashSet::new())
-                .is_none()
-                && !self.entity_root_is_import_alias(import.module_reference);
             self.internal_import_equals_has_runtime_value(import)
-                && ((!self.import_equals_is_namespace_member(import)
-                    && unresolved_local_target)
+                && ((!self.import_equals_is_namespace_member(import))
                     || exported
                     || used
                     || export_equals_target
@@ -26852,39 +26895,6 @@ impl Printer<'_> {
         import: &ts_ast::ImportEqualsDeclarationData,
     ) -> bool {
         self.internal_import_equals_has_runtime_value_with_visited(import, &mut HashSet::new())
-    }
-
-    fn entity_root_is_import_alias(&self, mut entity: NodeId) -> bool {
-        while let Some(NodeData::QualifiedName(qualified)) =
-            self.arena.get(entity).map(|node| &node.data)
-        {
-            entity = qualified.left;
-        }
-        let Some(name) = declaration_name_text(self.arena, entity) else {
-            return false;
-        };
-        let Some(symbol) = self
-            .bindings
-            .node_symbols
-            .get(&entity)
-            .copied()
-            .or_else(|| self.bindings.resolve_name_at(entity, name))
-        else {
-            return false;
-        };
-        self.bindings.symbols.get(symbol).is_some_and(|symbol| {
-            symbol.declarations.iter().any(|declaration| {
-                matches!(
-                    self.arena.get(*declaration).map(|node| &node.data),
-                    Some(
-                        NodeData::ImportEqualsDeclaration(_)
-                            | NodeData::ImportSpecifier(_)
-                            | NodeData::ImportClause(_)
-                            | NodeData::NamespaceImport(_)
-                    )
-                )
-            })
-        })
     }
 
     fn internal_import_equals_has_runtime_value_with_visited(
@@ -59464,6 +59474,25 @@ class Board {
     }
 
     #[test]
+    fn emits_resolved_top_level_namespace_aliases_used_only_as_types() {
+        let result = emit_with(
+            concat!(
+                "namespace Models { export interface Shape {} export class Model {} }\n",
+                "import ModelsAlias = Models;\n",
+                "namespace Consumer { let shape: ModelsAlias.Shape; }",
+            ),
+            ScriptTarget::Es2015,
+            ModuleKind::CommonJs,
+        );
+        assert!(
+            result.code.contains("var ModelsAlias = Models;"),
+            "{}",
+            result.code
+        );
+        assert!(!result.code.contains("__esModule"), "{}", result.code);
+    }
+
+    #[test]
     fn elides_imports_used_only_in_type_positions() {
         let source = "import Types = require('types'); import Runtime = require('runtime'); import 'side'; interface Box { value: Types.Value; } class Derived extends Runtime.Base {}";
         let result = emit_with(source, ScriptTarget::Es2015, ModuleKind::CommonJs);
@@ -60357,6 +60386,33 @@ class Board {
             "{output}"
         );
         assert!(output.contains("    export {};"), "{output}");
+    }
+
+    #[test]
+    fn declaration_emit_drops_import_used_only_by_matching_module_augmentation() {
+        let output = emit_declarations_with_semantics(concat!(
+            "import { Observable } from \"./observable\";\n",
+            "(<any>Observable.prototype).map = function() {};\n",
+            "declare module \"./observable\" {\n",
+            "    interface Observable<T> { map(): Observable<T>; }\n",
+            "}\n",
+        ));
+        assert!(!output.contains("import { Observable }"), "{output}");
+        assert!(
+            output.starts_with("declare module \"./observable\" {"),
+            "{output}"
+        );
+        assert!(output.ends_with("export {};\n"), "{output}");
+
+        let aliased = emit_declarations_with_semantics(concat!(
+            "import { Observable as ObservableSource } from \"./observable\";\n",
+            "declare module \"./observable\" {\n",
+            "    interface Derived extends ObservableSource<unknown> {}\n",
+            "}\n",
+        ));
+        let expected_alias =
+            "import { Observable as ObservableSource } from \"./observable\";";
+        assert!(aliased.contains(expected_alias), "{aliased}");
     }
 
     #[test]

@@ -2225,10 +2225,16 @@ impl Program {
             for directive in directives {
                 match directive.kind {
                     ReferenceKind::Path => {
-                        let file_name = resolve_path(
+                        let unresolved_file_name = resolve_path(
                             &directory_path(&containing_file),
                             &[directive.value.as_str()],
                         );
+                        let file_name = resolve_reference_path(
+                            file_system,
+                            &unresolved_file_name,
+                            self.options.allow_js,
+                        )
+                        .unwrap_or(unresolved_file_name);
                         self.load_file(file_system, &file_name, true);
                     }
                     ReferenceKind::Types => {
@@ -2279,6 +2285,28 @@ impl Program {
             implied_node_format: ModuleKind::CommonJs,
         });
     }
+}
+
+fn resolve_reference_path(
+    file_system: &dyn FileSystem,
+    file_name: &str,
+    allow_javascript: bool,
+) -> Option<String> {
+    if file_system.file_exists(file_name) {
+        return Some(file_name.to_owned());
+    }
+    if Path::new(file_name).extension().is_some() {
+        return None;
+    }
+    let extensions: &[&str] = if allow_javascript {
+        &[".ts", ".tsx", ".d.ts", ".js", ".jsx"]
+    } else {
+        &[".ts", ".tsx", ".d.ts"]
+    };
+    extensions
+        .iter()
+        .map(|extension| format!("{file_name}{extension}"))
+        .find(|candidate| file_system.file_exists(candidate))
 }
 
 fn implied_node_format(file_system: &dyn FileSystem, file_name: &str) -> ModuleKind {
@@ -5264,9 +5292,10 @@ mod tests {
             "/project/main.ts",
             concat!(
                 "/// <reference path='./globals.d.ts' />\n",
+                "/// <reference path='./extensionless' />\n",
                 "/// <reference types=\"pkg\" />\n",
                 "/// <reference lib='es2015.promise' />\n",
-                "GLOBAL; NESTED; PACKAGE_GLOBAL; Promise;\n",
+                "GLOBAL; NESTED; EXTENSIONLESS; PACKAGE_GLOBAL; Promise;\n",
             ),
         )
         .unwrap();
@@ -5277,6 +5306,11 @@ mod tests {
         .unwrap();
         fs.write_file("/project/nested.d.ts", "declare const NESTED: number;")
             .unwrap();
+        fs.write_file(
+            "/project/extensionless.ts",
+            "declare const EXTENSIONLESS: symbol;",
+        )
+        .unwrap();
         fs.write_file(
             "/project/node_modules/@types/pkg/index.d.ts",
             "declare const PACKAGE_GLOBAL: boolean;",
@@ -5299,6 +5333,7 @@ mod tests {
         for file in [
             "/project/globals.d.ts",
             "/project/nested.d.ts",
+            "/project/extensionless.ts",
             "/project/node_modules/@types/pkg/index.d.ts",
             "/__typescript/lib/lib.es2015.promise.d.ts",
         ] {
