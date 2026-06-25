@@ -49986,17 +49986,7 @@ impl Printer<'_> {
             }
             NodeData::QualifiedName(data) => self.emit_qualified_name(data)?,
             NodeData::PrivateIdentifier(data) => self.writer.write(&data.text),
-            NodeData::NumericLiteral(data) => {
-                if data.token_flags.0 & (1 << 5) != 0 {
-                    let digits = data.text.trim_start_matches('0');
-                    let digits = if digits.is_empty() { "0" } else { digits };
-                    self.writer.write(
-                        &ts_jsnum::Number::from_string(&format!("0o{digits}")).to_string(),
-                    );
-                } else {
-                    self.writer.write(&data.text);
-                }
-            }
+            NodeData::NumericLiteral(data) => self.write_numeric_literal(data),
             NodeData::BigIntLiteral(data) => self.writer.write(&data.text.to_ascii_lowercase()),
             NodeData::StringLiteral(data) => {
                 if data.token_flags.0 & (1 << 2) != 0 {
@@ -50293,36 +50283,42 @@ impl Printer<'_> {
                     )?;
                 } else {
                     self.emit_expression(data.expression, 18)?;
+                    let expression_end = self.node(data.expression)?.range.end.get();
+                    let name_start = self.node(data.name)?.range.start.get();
+                    let source_dot = self
+                        .source_punctuation_between(expression_end, name_start, b'.')
+                        .unwrap_or(expression_end);
+                    let break_before_dot =
+                        self.source_has_line_break_before_property(data.expression, data.name);
+                    let block_comment_before_dot = !self.settings.remove_comments
+                        && self.trivia_has_block_comment(expression_end, source_dot);
                     if data.question_dot_token.is_none()
                         && self.decimal_integer_literal_needs_property_dot(data.expression)
+                        && !break_before_dot
+                        && !block_comment_before_dot
                     {
                         self.writer.write(".");
                     }
-                    let break_before_dot =
-                        self.source_has_line_break_before_property(data.expression, data.name);
                     let break_after_dot =
                         self.source_has_line_break_after_property_dot(data.expression, data.name);
-                    let expression_end = self.node(data.expression)?.range.end.get();
-                    let name_start = self.node(data.name)?.range.start.get();
                     let name = self.node(data.name)?.clone();
                     let missing_name = matches!(
                         &name.data,
                         NodeData::Identifier(identifier) if identifier.text.is_empty()
                     );
                     if break_before_dot {
-                        let dot = self
-                            .source_punctuation_between(expression_end, name_start, b'.')
-                            .unwrap_or(expression_end);
                         self.writer.indent += 1;
                         self.emit_source_comments_between_with_ownership(
                             expression_end,
-                            dot,
+                            source_dot,
                             true,
                             true,
                         );
-                        if !self.writer.line_start {
+                        if !self.writer.line_start && !block_comment_before_dot {
                             self.writer.newline();
                         }
+                    } else if block_comment_before_dot {
+                        self.emit_block_comment_trivia(expression_end, source_dot, false);
                     }
                     self.writer.write(if data.question_dot_token.is_some() {
                         "?."
@@ -50332,8 +50328,9 @@ impl Printer<'_> {
                     if break_before_dot {
                         self.writer.indent -= 1;
                     }
-                    if self.trivia_has_block_comment(expression_end, name_start) {
-                        self.emit_block_comment_trivia(expression_end, name_start, false);
+                    let after_dot = source_dot.saturating_add(1);
+                    if self.trivia_has_block_comment(after_dot, name_start) {
+                        self.emit_block_comment_trivia(source_dot, name_start, false);
                     }
                     if break_after_dot {
                         self.writer.indent += usize::from(!missing_name);
@@ -55078,6 +55075,30 @@ impl Printer<'_> {
         }
     }
 
+    fn write_numeric_literal(&mut self, literal: &ts_ast::NumericLiteralData) {
+        if literal.token_flags.0 & (1 << 5) != 0 {
+            let digits = literal.text.trim_start_matches('0');
+            let digits = if digits.is_empty() { "0" } else { digits };
+            self.writer.write(
+                &ts_jsnum::Number::from_string(&format!("0o{digits}")).to_string(),
+            );
+            return;
+        }
+        let bytes = literal.text.as_bytes();
+        let invalid_leading_zero = bytes.len() > 1
+            && bytes[0] == b'0'
+            && bytes[1].is_ascii_digit();
+        if invalid_leading_zero
+            || (self.settings.target < ScriptTarget::Es2021 && literal.text.contains('_'))
+        {
+            let normalized = literal.text.replace('_', "");
+            self.writer
+                .write(&ts_jsnum::Number::from_string(&normalized).to_string());
+        } else {
+            self.writer.write(&literal.text);
+        }
+    }
+
     fn node_source_is_multiline(&self, id: NodeId) -> bool {
         let Some(node) = self.arena.get(id) else {
             return false;
@@ -56393,6 +56414,29 @@ mod tests {
             "{array}"
         );
         assert!(!array.contains("let b ="), "{array}");
+    }
+
+    #[test]
+    fn downlevels_numeric_separators_before_es2021() {
+        let source = "1_000_000_000_000; 0b1010_0001_1000_0101; 0xA0_B0_C0;";
+        assert_eq!(
+            emit_with(source, ScriptTarget::Es2019, ModuleKind::None).code,
+            "1000000000000;\n41349;\n10531008;\n"
+        );
+        assert_eq!(
+            emit_with(source, ScriptTarget::EsNext, ModuleKind::None).code,
+            "1_000_000_000_000;\n0b1010_0001_1000_0101;\n0xA0_B0_C0;\n"
+        );
+    }
+
+    #[test]
+    fn line_break_disambiguates_numeric_property_access() {
+        let source =
+            "var a = 3\n.toString(); var b = 3 .toString(); var c = 0 /* gap */.toString();";
+        assert_eq!(
+            emit_with(source, ScriptTarget::Es2015, ModuleKind::None).code,
+            "var a = 3\n    .toString();\nvar b = 3..toString();\nvar c = 0 /* gap */.toString();\n"
+        );
     }
 
     fn emit_with(source: &str, target: ScriptTarget, module: ModuleKind) -> super::EmitResult {

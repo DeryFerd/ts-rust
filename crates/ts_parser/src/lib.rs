@@ -974,6 +974,15 @@ impl<'a> Parser<'a> {
                     self.bump();
                     continue;
                 }
+                if self.current.kind == SyntaxKind::Identifier
+                    && !self
+                        .current
+                        .flags
+                        .contains(ScannerTokenFlags::PRECEDING_LINE_BREAK)
+                {
+                    self.error_current("Expected ','.");
+                    continue;
+                }
                 break;
             }
             self.bump();
@@ -12733,6 +12742,52 @@ mod tests {
                 .iter()
                 .any(|diagnostic| diagnostic.code == Some(17012))
         );
+    }
+
+    #[test]
+    fn recovers_identifier_after_trailing_decimal_as_variable_declarator() {
+        let result = parse_source_file("var test2 = 2.toString();");
+        let NodeData::SourceFile(source) = &result.arena.get(result.source_file).unwrap().data
+        else {
+            panic!("expected source file");
+        };
+        let NodeData::VariableStatement(statement) =
+            &result.arena.get(source.statements.nodes[0]).unwrap().data
+        else {
+            panic!("expected variable statement");
+        };
+        let NodeData::VariableDeclarationList(list) =
+            &result.arena.get(statement.declaration_list).unwrap().data
+        else {
+            panic!("expected variable declaration list");
+        };
+        assert_eq!(list.declarations.nodes.len(), 2);
+        let NodeData::VariableDeclaration(second) =
+            &result.arena.get(list.declarations.nodes[1]).unwrap().data
+        else {
+            panic!("expected variable declaration");
+        };
+        assert!(matches!(
+            &result.arena.get(second.name).unwrap().data,
+            NodeData::Identifier(identifier) if identifier.text == "toString"
+        ));
+
+        let asi = parse_source_file("var value = other\nnext();");
+        let NodeData::SourceFile(source) = &asi.arena.get(asi.source_file).unwrap().data else {
+            panic!("expected source file");
+        };
+        assert_eq!(source.statements.nodes.len(), 2);
+        let NodeData::VariableStatement(statement) =
+            &asi.arena.get(source.statements.nodes[0]).unwrap().data
+        else {
+            panic!("expected variable statement");
+        };
+        let NodeData::VariableDeclarationList(list) =
+            &asi.arena.get(statement.declaration_list).unwrap().data
+        else {
+            panic!("expected variable declaration list");
+        };
+        assert_eq!(list.declarations.nodes.len(), 1);
     }
 
     fn find_descendant_kind(

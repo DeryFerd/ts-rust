@@ -922,14 +922,15 @@ impl<'a> Scanner<'a> {
             if normalized.bytes().all(|byte| matches!(byte, b'0'..=b'7')) {
                 self.last_flags.insert(TokenFlags::OCTAL);
                 self.error(start, self.byte_pos, "Octal literals are not allowed.");
-            } else {
-                self.last_flags.insert(TokenFlags::CONTAINS_LEADING_ZERO);
-                self.error(
-                    start,
-                    self.byte_pos,
-                    "Decimals with leading zeros are not allowed.",
-                );
+                self.last_value = Some(JsString::from_utf8(&normalized));
+                return SyntaxKind::NumericLiteral;
             }
+            self.last_flags.insert(TokenFlags::CONTAINS_LEADING_ZERO);
+            self.error(
+                start,
+                self.byte_pos,
+                "Decimals with leading zeros are not allowed.",
+            );
         }
         if self.peek() == Some('.') {
             can_be_bigint = false;
@@ -1822,6 +1823,34 @@ mod tests {
             assert!(token.flags.contains(expected_flag));
         }
         assert!(scanner.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn legacy_octal_stops_before_fraction_or_exponent() {
+        let mut scanner = Scanner::new("00.5 01e5 08.5 08e5 0_0.5_5");
+
+        let octal = scanner.scan();
+        assert_eq!(octal.text, "00");
+        assert!(octal.flags.contains(TokenFlags::OCTAL));
+        assert_eq!(scanner.scan().text, ".5");
+
+        let octal = scanner.scan();
+        assert_eq!(octal.text, "01");
+        assert!(octal.flags.contains(TokenFlags::OCTAL));
+        assert_eq!(scanner.scan().text, "e5");
+
+        let decimal = scanner.scan();
+        assert_eq!(decimal.text, "08.5");
+        assert!(!decimal.flags.contains(TokenFlags::OCTAL));
+
+        let decimal = scanner.scan();
+        assert_eq!(decimal.text, "08e5");
+        assert!(!decimal.flags.contains(TokenFlags::OCTAL));
+
+        let separated = scanner.scan();
+        assert_eq!(separated.text, "0_0.5_5");
+        assert!(!separated.flags.contains(TokenFlags::OCTAL));
+        assert_eq!(scanner.scan().kind, SyntaxKind::EndOfFile);
     }
 
     #[test]
