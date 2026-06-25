@@ -24254,20 +24254,8 @@ impl SystemModulePlan {
                     dependency.named_exports.extend(named_exports);
                 } else {
                     let base = module_identifier_base(specifier);
-                    let reexport_count = data
-                        .statements
-                        .nodes
-                        .iter()
-                        .filter(|statement| {
-                            matches!(
-                                arena.get(**statement).map(|node| &node.data),
-                                Some(NodeData::ExportDeclaration(candidate))
-                                    if candidate.module_specifier.and_then(|module| string_literal_text(arena, module)) == Some(specifier)
-                                        && matches!(candidate.export_clause.and_then(|clause| arena.get(clause)).map(|node| &node.data), Some(NodeData::NamedExports(_)))
-                            )
-                        })
-                        .count();
-                    let parameter = names.generate(&format!("{base}_{reexport_count}"));
+                    let storage = names.generate(&base);
+                    let parameter = names.generate(&storage);
                     dependencies.push(SystemDependency {
                         specifier: specifier.to_owned(),
                         storages: Vec::new(),
@@ -62088,6 +62076,28 @@ mod tests {
                 "});\n",
             )
         );
+    }
+
+    #[test]
+    fn system_merges_named_reexports_without_advancing_the_module_temp() {
+        let output = emit_with(
+            concat!(
+                "export { value } from './b';\n",
+                "export { default as fallback } from './b';\n",
+            ),
+            ScriptTarget::Es2015,
+            ModuleKind::System,
+        )
+        .code;
+        assert!(
+            output.contains(concat!(
+                "System.register([\"./b\"], function (exports_1, context_1) {\n",
+                "    \"use strict\";",
+            )),
+            "{output}"
+        );
+        assert!(output.contains("function (b_1_1) {"), "{output}");
+        assert!(!output.contains("function (b_2_1) {"), "{output}");
     }
 
     #[test]
