@@ -1455,16 +1455,9 @@ impl UnitBuilder {
     }
 
     fn finish(self) -> Unit {
-        let source_text = SourceText::from_bytes(self.source_bytes);
-        let normalized = normalize_newlines(source_text.as_scannable_str());
-        let normalized = normalized.strip_prefix('\n').unwrap_or(&normalized);
-        let mut normalized = normalized.trim_end_matches('\n').to_owned();
-        if !normalized.is_empty() {
-            normalized.push('\n');
-        }
         Unit {
             path: self.path,
-            source_text: SourceText::from(normalized),
+            source_text: SourceText::from_bytes(self.source_bytes),
             start_line: self.start_line,
         }
     }
@@ -1591,6 +1584,17 @@ mod tests {
         assert_eq!(case.units[1].start_line, 7);
         assert_eq!(case.directives.len(), 4);
         assert!(case.directives[2].is_filename());
+    }
+
+    #[test]
+    fn preserves_trailing_blank_lines_in_virtual_units() {
+        let case = Case::parse(
+            "trailing.ts",
+            "// @filename: a.js\r\nvalue;\r\n\r\n",
+        )
+        .unwrap();
+
+        assert_eq!(case.units[0].source_text, "value;\r\n\r\n");
     }
 
     #[test]
