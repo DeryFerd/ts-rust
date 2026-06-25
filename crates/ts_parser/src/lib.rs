@@ -17,8 +17,9 @@ use ts_ast::{
     ImportAttributeData, ImportAttributesData, ImportClauseData, ImportDeclarationData,
     ImportEqualsDeclarationData, ImportSpecifierData, ImportTypeNodeData,
     IndexSignatureDeclarationData, IndexedAccessTypeNodeData, InferTypeNodeData,
-    InterfaceDeclarationData, IntersectionTypeNodeData, JsDocData, JsDocNullableTypeData,
-    JsDocTextData, JsDocUnknownTagData, JsxAttributeData, JsxAttributesData, JsxClosingElementData,
+    InterfaceDeclarationData, IntersectionTypeNodeData, JsDocData, JsDocNonNullableTypeData,
+    JsDocNullableTypeData, JsDocTextData, JsDocUnknownTagData, JsxAttributeData,
+    JsxAttributesData, JsxClosingElementData,
     JsxClosingFragmentData, JsxElementData, JsxExpressionData, JsxFragmentData,
     JsxNamespacedNameData, JsxOpeningElementData, JsxOpeningFragmentData, JsxSelfClosingElementData,
     JsxSpreadAttributeData, JsxTextData, KeywordExpressionData, KeywordTypeNodeData,
@@ -7240,6 +7241,14 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_type_operator_or_postfix(&mut self) -> NodeId {
+        if self.current.kind == SyntaxKind::ExclamationToken {
+            let start = self.consume().range.start;
+            let type_node = self.parse_type_operator_or_postfix();
+            return self.alloc_non_nullable_type(
+                type_node,
+                TextRange::new(start, self.node_end(type_node)),
+            );
+        }
         if matches!(
             self.current.kind,
             SyntaxKind::KeyOfKeyword | SyntaxKind::ReadonlyKeyword | SyntaxKind::UniqueKeyword
@@ -7258,6 +7267,19 @@ impl<'a> Parser<'a> {
         }
         let mut type_node = self.parse_primary_type();
         loop {
+            if self.current.kind == SyntaxKind::ExclamationToken
+                && !self
+                    .current
+                    .flags
+                    .contains(ScannerTokenFlags::PRECEDING_LINE_BREAK)
+            {
+                let end = self.consume().range.end;
+                type_node = self.alloc_non_nullable_type(
+                    type_node,
+                    TextRange::new(self.node_start(type_node), end),
+                );
+                continue;
+            }
             if self.current.kind == SyntaxKind::QuestionToken
                 && !self
                     .current
@@ -7318,6 +7340,17 @@ impl<'a> Parser<'a> {
             );
         }
         type_node
+    }
+
+    fn alloc_non_nullable_type(&mut self, type_node: NodeId, range: TextRange) -> NodeId {
+        self.alloc_node(
+            SyntaxKind::JsDocNonNullableType,
+            range,
+            NodeData::JsDocNonNullableType(Box::new(JsDocNonNullableTypeData {
+                type_: type_node,
+            })),
+            &[type_node],
+        )
     }
 
     fn line_broken_bracket_starts_method(&mut self) -> bool {
@@ -11299,6 +11332,24 @@ mod tests {
         ] {
             assert!(kinds.contains(&expected), "missing {expected:?}");
         }
+    }
+
+    #[test]
+    fn consumes_invalid_prefix_and_postfix_non_nullable_types() {
+        let result = parse_source_file(concat!(
+            "function first(value: string!): !number {}\n",
+            "const postfix = 1 as any!;\n",
+            "const prefix: !number = 1;\n",
+        ));
+        assert_eq!(source_statements(&result).len(), 3);
+        assert_eq!(
+            result
+                .arena
+                .iter()
+                .filter(|(_, node)| matches!(node.data, NodeData::JsDocNonNullableType(_)))
+                .count(),
+            4
+        );
     }
 
     #[test]

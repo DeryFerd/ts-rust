@@ -20392,6 +20392,7 @@ impl DeclarationPrinter<'_> {
                 self.writer.write("?");
                 self.emit_type(data.type_)?;
             }
+            NodeData::JsDocNonNullableType(data) => self.emit_type(data.type_)?,
             NodeData::RestTypeNode(data) => {
                 self.writer.write("...");
                 self.emit_type(data.type_)?;
@@ -52004,6 +52005,9 @@ impl Printer<'_> {
         match &node.data {
             NodeData::JsDocNullableType(data) => {
                 self.writer.write("?");
+                self.emit_jsdoc_recovery_type(data.type_)?;
+            }
+            NodeData::JsDocNonNullableType(data) => {
                 self.emit_jsdoc_recovery_type(data.type_)?;
             }
             NodeData::KeywordTypeNode(_) => self.writer.write(keyword_type_text(node.kind)),
