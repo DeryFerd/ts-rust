@@ -34980,7 +34980,31 @@ impl Printer<'_> {
                             && node.kind == SyntaxKind::SuperKeyword
                     })
                 });
-            if !*is_expression && (has_static_block || lowered_static_field_uses_super) {
+            let has_private_method_plan = self
+                .arena
+                .get(*class_id)
+                .and_then(|node| match &node.data {
+                    NodeData::ClassDeclaration(class) => class.name,
+                    NodeData::ClassExpression(class) => class.name,
+                    _ => None,
+                })
+                .is_some_and(|name| self.private_method_plans.contains_key(&name));
+            let lowered_static_field_uses_this = !has_private_method_plan
+                && self.settings.target < ScriptTarget::Es2022
+                && members.iter().any(|member| {
+                    matches!(
+                        self.arena.get(*member).map(|node| &node.data),
+                        Some(NodeData::PropertyDeclaration(property))
+                            if self.property_is_static(property)
+                                && property.initializer.is_some()
+                    ) && self.arena.iter().any(|(candidate, node)| {
+                        self.node_is_within(candidate, *member)
+                            && node.kind == SyntaxKind::ThisKeyword
+                    })
+                });
+            let lower_static_fields =
+                lowered_static_field_uses_super || lowered_static_field_uses_this;
+            if !*is_expression && (has_static_block || lower_static_fields) {
                 let capture = self.generate_block_temp(source_file, &claimed);
                 claimed.insert(capture.clone());
                 field_temps.push(capture.clone());
@@ -35014,7 +35038,7 @@ impl Printer<'_> {
                     StaticBlockDeclarationPlan {
                         capture,
                         base_capture,
-                        lower_static_fields: lowered_static_field_uses_super,
+                        lower_static_fields,
                     },
                 );
             }
@@ -46517,7 +46541,10 @@ impl Printer<'_> {
                     Some(SyntaxKind::TrueKeyword | SyntaxKind::FalseKeyword) => {
                         RuntimeMetadataType::Builtin("Boolean")
                     }
-                    Some(SyntaxKind::StringLiteral) => RuntimeMetadataType::Builtin("String"),
+                    Some(
+                        SyntaxKind::StringLiteral
+                        | SyntaxKind::NoSubstitutionTemplateLiteral,
+                    ) => RuntimeMetadataType::Builtin("String"),
                     Some(
                         SyntaxKind::NumericLiteral
                         | SyntaxKind::MinusToken
