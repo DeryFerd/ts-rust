@@ -20632,7 +20632,9 @@ impl DeclarationPrinter<'_> {
                     self.writer.write(&data.text);
                 }
             }
-            NodeData::BigIntLiteral(data) => self.writer.write(&data.text.to_ascii_lowercase()),
+            NodeData::BigIntLiteral(data) => {
+                self.writer.write(&canonical_bigint_literal(&data.text));
+            }
             NodeData::ComputedPropertyName(data) => {
                 self.writer.write("[");
                 self.emit_name(data.expression)?;
@@ -20975,7 +20977,9 @@ impl DeclarationPrinter<'_> {
                     self.writer.write(&data.text);
                 }
             }
-            NodeData::BigIntLiteral(data) => self.writer.write(&data.text.to_ascii_lowercase()),
+            NodeData::BigIntLiteral(data) => {
+                self.writer.write(&canonical_bigint_literal(&data.text));
+            }
             NodeData::StringLiteral(data) => {
                 let quote = if self.canonical_literal_quotes {
                     '"'
@@ -50141,7 +50145,9 @@ impl Printer<'_> {
             NodeData::QualifiedName(data) => self.emit_qualified_name(data)?,
             NodeData::PrivateIdentifier(data) => self.writer.write(&data.text),
             NodeData::NumericLiteral(data) => self.write_numeric_literal(data),
-            NodeData::BigIntLiteral(data) => self.writer.write(&data.text.to_ascii_lowercase()),
+            NodeData::BigIntLiteral(data) => {
+                self.writer.write(&canonical_bigint_literal(&data.text));
+            }
             NodeData::StringLiteral(data) => {
                 if data.token_flags.0 & (1 << 2) != 0 {
                     let start = usize::try_from(node.range.start.get()).unwrap_or(usize::MAX);
@@ -55496,7 +55502,7 @@ impl Printer<'_> {
             NodeData::NumericLiteral(data) => {
                 Ok((ts_jsnum::Number::from_string(&data.text).to_string(), true))
             }
-            NodeData::BigIntLiteral(data) => Ok((data.text.to_ascii_lowercase(), true)),
+            NodeData::BigIntLiteral(data) => Ok((canonical_bigint_literal(&data.text), true)),
             NodeData::ComputedPropertyName(data) => self.enum_member_name_text(data.expression),
             _ => Err(Self::unsupported(id, node.kind)),
         }
@@ -55778,6 +55784,29 @@ fn is_amd_dependency_directive(comment: &str) -> bool {
         .is_some_and(|character| character.is_whitespace() || matches!(character, '/' | '>'))
 }
 
+fn canonical_bigint_literal(text: &str) -> String {
+    let normalized = text.to_ascii_lowercase().replace('_', "");
+    let without_suffix = normalized.strip_suffix('n').unwrap_or(&normalized);
+    if let Some(digits) = without_suffix.strip_prefix("0b") {
+        return if digits.is_empty() {
+            "0n".to_owned()
+        } else {
+            format!("{}n", ts_jsnum::parse_pseudo_big_int(&normalized))
+        };
+    }
+    if let Some(digits) = without_suffix.strip_prefix("0o") {
+        return if digits.is_empty() {
+            "0n".to_owned()
+        } else {
+            format!("{}n", ts_jsnum::parse_pseudo_big_int(&normalized))
+        };
+    }
+    if let Some(digits) = without_suffix.strip_prefix("0x") {
+        return format!("0x{}n", if digits.is_empty() { "0" } else { digits });
+    }
+    format!("{without_suffix}n")
+}
+
 fn write_quoted(writer: &mut Writer, text: &str) {
     write_quoted_with(writer, text, '"');
 }
@@ -55925,7 +55954,8 @@ mod tests {
     use ts_parser::{parse_jsx_source_file, parse_source_file};
 
     use super::{
-        AmdDependency, EmitConstantValue, EmitContext, emit_declaration_file,
+        AmdDependency, EmitConstantValue, EmitContext, canonical_bigint_literal,
+        emit_declaration_file,
         emit_declaration_file_with_reachability, emit_declaration_file_with_semantics,
         emit_source_file, emit_source_file_with_context, emit_source_file_with_settings,
         original_position,
@@ -55937,6 +55967,16 @@ mod tests {
         emit_source_file(&parsed.arena, parsed.source_file)
             .unwrap()
             .code
+    }
+
+    #[test]
+    fn canonicalizes_bigint_literal_spellings() {
+        assert_eq!(canonical_bigint_literal("0b101n"), "5n");
+        assert_eq!(canonical_bigint_literal("0o1234_567n"), "342391n");
+        assert_eq!(canonical_bigint_literal("0x0_AB_CDefn"), "0x0abcdefn");
+        assert_eq!(canonical_bigint_literal("123_456n"), "123456n");
+        assert_eq!(canonical_bigint_literal("0bn"), "0n");
+        assert_eq!(canonical_bigint_literal("0xn"), "0x0n");
     }
 
     fn emit_declarations_with_semantics(source: &str) -> String {
