@@ -1496,6 +1496,9 @@ impl Program {
                     .file_index
                     .get(target)
                     .and_then(|index| self.source_files.get(*index))?;
+                if ts_path::is_declaration_file(&target.file_name) {
+                    return None;
+                }
                 Some((
                     specifier.clone(),
                     amd_bundle_module_name(target, bundle_root),
@@ -1543,7 +1546,9 @@ impl Program {
                     .file_index
                     .get(target)
                     .and_then(|index| self.source_files.get(*index))?;
-                if !self.source_should_emit(target) {
+                if ts_path::is_declaration_file(&target.file_name)
+                    || !self.source_should_emit(target)
+                {
                     return None;
                 }
                 Some((
@@ -4177,6 +4182,13 @@ fn declaration_node_types_for_emit(
 }
 
 fn source_is_external_module(source: &SourceFile) -> bool {
+    let lower = source.file_name.to_ascii_lowercase();
+    if [".mts", ".cts", ".mjs", ".cjs"]
+        .iter()
+        .any(|extension| lower.ends_with(extension))
+    {
+        return true;
+    }
     if !source.binding.exports.is_empty() {
         return true;
     }
@@ -4478,6 +4490,9 @@ fn append_bundle_declaration_module(
             if trimmed.starts_with("///") && trimmed.contains("<amd-module") {
                 continue;
             }
+        }
+        if line.trim() == "export {};" {
+            continue;
         }
         let line = line.strip_prefix("export declare ").map_or_else(
             || line.strip_prefix("declare ").unwrap_or(line).to_owned(),

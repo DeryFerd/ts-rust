@@ -349,6 +349,7 @@ pub fn emit_source_file_with_context(
         commonjs_destructuring_assignment_roots: HashSet::new(),
         commonjs_destructuring_assignment_temps: HashMap::new(),
         commonjs_destructuring_assignment_hoists: Vec::new(),
+        commonjs_postfix_export_temps: HashMap::new(),
         downlevel_nullish_temps: HashMap::new(),
         downlevel_optional_temps: HashMap::new(),
         namespace_destructuring_temps: HashMap::new(),
@@ -535,6 +536,7 @@ pub fn emit_source_file_with_context(
             .is_some_and(|statement| declaration_is_module_indicator(arena, statement))
     });
     let is_external_module = has_explicit_module_indicator
+        || source_name_implies_external_module(source_name)
         || context.module_detection == ModuleDetectionKind::Force
         || (context.module_detection == ModuleDetectionKind::Auto && automatic_jsx.any());
     printer.is_external_module = is_external_module;
@@ -2734,6 +2736,7 @@ pub fn emit_declaration_file_with_semantics(
         source_name,
         source_line_starts: declaration_map.then(|| line_starts(source_text)),
         module_file: false,
+        extension_only_module_file: false,
         overload_names: HashSet::new(),
         declaration_reachability,
         enum_member_values,
@@ -2759,11 +2762,15 @@ pub fn emit_declaration_file_with_semantics(
     let NodeData::SourceFile(data) = &node.data else {
         return Err(DeclarationPrinter::unsupported(source_file, node.kind));
     };
-    printer.module_file = data.statements.nodes.iter().any(|statement| {
+    let has_explicit_module_indicator = data.statements.nodes.iter().any(|statement| {
         printer
             .node(*statement)
             .is_ok_and(|node| declaration_is_module_indicator(printer.arena, node))
     });
+    printer.extension_only_module_file =
+        source_name_implies_external_module(source_name) && !has_explicit_module_indicator;
+    printer.module_file =
+        source_name_implies_external_module(source_name) || has_explicit_module_indicator;
     if let Some(first_statement_start) = data
         .statements
         .nodes
@@ -2938,6 +2945,7 @@ struct DeclarationPrinter<'a> {
     source_name: &'a str,
     source_line_starts: Option<Vec<usize>>,
     module_file: bool,
+    extension_only_module_file: bool,
     overload_names: HashSet<String>,
     declaration_reachability: Option<&'a BTreeMap<NodeId, BTreeSet<NodeId>>>,
     enum_member_values: Option<&'a BTreeMap<NodeId, EmitConstantValue>>,
@@ -4055,6 +4063,22 @@ impl DeclarationPrinter<'_> {
         scope: NodeId,
     ) -> Result<(), EmitError> {
         let node = self.node(id)?.clone();
+        if self.extension_only_module_file
+            && !in_namespace
+            && !declaration_has_modifier(self.arena, &node, SyntaxKind::ExportKeyword)
+            && matches!(
+                node.data,
+                NodeData::VariableStatement(_)
+                    | NodeData::FunctionDeclaration(_)
+                    | NodeData::ClassDeclaration(_)
+                    | NodeData::InterfaceDeclaration(_)
+                    | NodeData::TypeAliasDeclaration(_)
+                    | NodeData::EnumDeclaration(_)
+                    | NodeData::ModuleDeclaration(_)
+            )
+        {
+            return Ok(());
+        }
         if self.javascript_variable_is_only_literal_computed_property_dependency(id) {
             return Ok(());
         }
@@ -20540,6 +20564,8 @@ impl DeclarationPrinter<'_> {
         else {
             return false;
         };
+        let string_modules_are_augmentations =
+            self.source_scope_has_explicit_module_syntax(scope);
         let public = retained
             .iter()
             .filter_map(|statement| {
@@ -20548,7 +20574,16 @@ impl DeclarationPrinter<'_> {
                     || matches!(
                         node.data,
                         NodeData::ExportDeclaration(_) | NodeData::ExportAssignment(_)
-                    ))
+                    )
+                    || (string_modules_are_augmentations
+                        && matches!(
+                            &node.data,
+                            NodeData::ModuleDeclaration(module)
+                                if matches!(
+                                    self.arena.get(module.name).map(|name| &name.data),
+                                    Some(NodeData::StringLiteral(_))
+                                )
+                        )))
                 .then_some((*statement, node))
             })
             .collect::<Vec<_>>();
@@ -20557,6 +20592,14 @@ impl DeclarationPrinter<'_> {
                 !declaration_has_modifier(self.arena, node, SyntaxKind::ExportKeyword)
                     && !self
                         .javascript_variable_is_only_literal_computed_property_dependency(*statement)
+                    && !matches!(
+                        &node.data,
+                        NodeData::ModuleDeclaration(module)
+                            if matches!(
+                                self.arena.get(module.name).map(|name| &name.data),
+                                Some(NodeData::StringLiteral(_))
+                            )
+                    )
                     && matches!(
                         node.data,
                         NodeData::VariableStatement(_)
@@ -20602,6 +20645,33 @@ impl DeclarationPrinter<'_> {
             _ => false,
         };
         !sole_annotated_namespace_variable
+    }
+
+    fn source_scope_has_explicit_module_syntax(&self, scope: NodeId) -> bool {
+        matches!(
+            self.arena.get(scope).map(|node| &node.data),
+            Some(NodeData::SourceFile(file))
+                if file.statements.nodes.iter().any(|statement| {
+                    self.arena.get(*statement).is_some_and(|node| {
+                        declaration_has_modifier(
+                            self.arena,
+                            node,
+                            SyntaxKind::ExportKeyword,
+                        ) || match &node.data {
+                            NodeData::ImportDeclaration(_)
+                            | NodeData::ExportDeclaration(_)
+                            | NodeData::ExportAssignment(_) => true,
+                            NodeData::ImportEqualsDeclaration(import) => matches!(
+                                self.arena
+                                    .get(import.module_reference)
+                                    .map(|node| &node.data),
+                                Some(NodeData::ExternalModuleReference(_))
+                            ),
+                            _ => false,
+                        }
+                    })
+                })
+        )
     }
 
     fn namespace_scope_requires_explicit_exports(&self, scope: NodeId) -> bool {
@@ -20741,6 +20811,7 @@ impl DeclarationPrinter<'_> {
         else {
             return false;
         };
+        let has_privacy_boundary = self.namespace_scope_has_privacy_boundary(scope);
         if self.namespace_scope_has_synthetic_class_base(scope) {
             return true;
         }
@@ -20797,7 +20868,10 @@ impl DeclarationPrinter<'_> {
                     )
             )
         });
-        if can_use_existing_module_marker
+        if !(self.source_scope_has_explicit_module_syntax(scope)
+            && has_privacy_boundary
+            && has_string_module_augmentation)
+            && can_use_existing_module_marker
             && retained.iter().any(|statement| {
                 self.arena.get(*statement).is_some_and(|node| {
                     (has_string_module_augmentation
@@ -20824,7 +20898,7 @@ impl DeclarationPrinter<'_> {
         }) {
             return false;
         }
-        self.namespace_scope_has_privacy_boundary(scope)
+        has_privacy_boundary
             || self.namespace_scope_has_synthetic_class_base(scope)
             || self.arena.iter().any(|(statement, node)| {
                 node.parent == Some(scope)
@@ -21716,6 +21790,13 @@ fn rewrite_relative_import_extension(specifier: &str, enabled: bool) -> String {
         }
     }
     specifier.to_owned()
+}
+
+fn source_name_implies_external_module(source_name: &str) -> bool {
+    let lower = source_name.to_ascii_lowercase();
+    [".mts", ".cts", ".mjs", ".cjs"]
+        .iter()
+        .any(|extension| lower.ends_with(extension))
 }
 
 fn rewrite_relative_declaration_import_extension(specifier: &str, enabled: bool) -> String {
@@ -23491,6 +23572,7 @@ struct Printer<'a> {
     commonjs_destructuring_assignment_roots: HashSet<NodeId>,
     commonjs_destructuring_assignment_temps: HashMap<NodeId, String>,
     commonjs_destructuring_assignment_hoists: Vec<String>,
+    commonjs_postfix_export_temps: HashMap<NodeId, String>,
     downlevel_nullish_temps: HashMap<NodeId, String>,
     downlevel_optional_temps: HashMap<NodeId, String>,
     namespace_destructuring_temps: HashMap<NodeId, String>,
@@ -27613,6 +27695,12 @@ impl Printer<'_> {
     #[allow(clippy::too_many_lines)]
     fn emit_statement(&mut self, id: NodeId) -> Result<(), EmitError> {
         let node = self.node(id)?.clone();
+        let misplaced_module_statement = node.parent.is_some_and(|parent| {
+            !matches!(
+                self.arena.get(parent).map(|node| &node.data),
+                Some(NodeData::SourceFile(_) | NodeData::ModuleBlock(_))
+            )
+        });
         if let NodeData::ExpressionStatement(statement) = &node.data
             && self.expression_statement_is_recovered_jsx_closing(id, statement.expression)
         {
@@ -27638,6 +27726,7 @@ impl Printer<'_> {
             return Ok(());
         }
         if !self.namespace_containers.is_empty()
+            && self.node_is_direct_namespace_member(id)
             && self.namespace_erases_external_module_statement(&node)
         {
             return Ok(());
@@ -27665,6 +27754,7 @@ impl Printer<'_> {
             return Ok(());
         }
         if let NodeData::ExportDeclaration(export) = &node.data
+            && !misplaced_module_statement
             && (export.is_type_only || export.export_clause.is_some())
             && self.import_runtime_meanings.get(&id) == Some(&false)
             && self.named_export_clause_has_runtime_specifier(export) != Some(true)
@@ -27683,24 +27773,22 @@ impl Printer<'_> {
         ) {
             return Ok(());
         }
-        if let NodeData::ExportAssignment(assignment) = &node.data
-            && assignment.is_export_equals
-            && !self.entity_has_runtime_value(assignment.expression, &mut HashSet::new())
-        {
-            return Ok(());
-        }
         match &node.data {
             NodeData::NotEmittedStatement(_) => return Ok(()),
             NodeData::ExportDeclaration(export)
-                if self.named_export_clause_has_runtime_specifier(export) == Some(false) =>
+                if !misplaced_module_statement
+                    && self.named_export_clause_has_runtime_specifier(export) == Some(false) =>
             {
                 return Ok(());
             }
-            NodeData::ImportDeclaration(import) if !self.import_has_runtime_use(id, import) => {
+            NodeData::ImportDeclaration(import)
+                if !misplaced_module_statement && !self.import_has_runtime_use(id, import) =>
+            {
                 return Ok(());
             }
             NodeData::ImportEqualsDeclaration(import)
-                if !self.import_equals_has_runtime_use(id, import) =>
+                if !(self.import_equals_has_runtime_use(id, import)
+                    || misplaced_module_statement && self.is_external_import_equals(import)) =>
             {
                 return Ok(());
             }
@@ -28226,8 +28314,39 @@ impl Printer<'_> {
                 self.writer.write(") ");
                 self.emit_embedded(data.statement)?;
             }
+            NodeData::ImportDeclaration(data) if misplaced_module_statement => {
+                let source = usize::try_from(node.range.start.get())
+                    .ok()
+                    .zip(usize::try_from(node.range.end.get()).ok())
+                    .and_then(|(start, end)| self.source_text.get(start..end));
+                if let Some(source) = source {
+                    self.writer.write(source);
+                } else {
+                    self.emit_import(data)?;
+                }
+            }
             NodeData::ImportDeclaration(data) => self.emit_import(data)?,
             NodeData::ImportEqualsDeclaration(data) => {
+                if misplaced_module_statement && self.is_external_import_equals(data) {
+                    if self.has_modifier(data.modifiers.as_ref(), SyntaxKind::ExportKeyword) {
+                        self.writer.write("export ");
+                    }
+                    self.writer.write("import ");
+                    if data.is_type_only {
+                        self.writer.write("type ");
+                    }
+                    self.emit_expression(data.name, 0)?;
+                    self.writer.write(" = require(");
+                    let reference = self.node(data.module_reference)?;
+                    let NodeData::ExternalModuleReference(reference) = &reference.data else {
+                        return Err(Self::unsupported(data.module_reference, reference.kind));
+                    };
+                    let expression = reference.expression;
+                    self.emit_expression(expression, 0)?;
+                    self.writer.write(");");
+                    self.writer.newline();
+                    return Ok(());
+                }
                 if !self.is_external_import_equals(data)
                     && self.import_equals_is_namespace_member(data)
                     && !self.has_modifier(data.modifiers.as_ref(), SyntaxKind::ExportKeyword)
@@ -28245,6 +28364,17 @@ impl Printer<'_> {
             }
             NodeData::ExportAssignment(data) => {
                 if data.is_export_equals {
+                    if misplaced_module_statement {
+                        let source = usize::try_from(node.range.start.get())
+                            .ok()
+                            .zip(usize::try_from(node.range.end.get()).ok())
+                            .and_then(|(start, end)| self.source_text.get(start..end));
+                        if let Some(source) = source {
+                            self.writer.write(source);
+                            self.writer.newline();
+                            return Ok(());
+                        }
+                    }
                     if node.parent.is_some_and(|parent| {
                         matches!(
                             self.arena.get(parent).map(|node| &node.data),
@@ -28321,6 +28451,15 @@ impl Printer<'_> {
                         self.writer.remove_trailing_spaces();
                     }
                     self.writer.write(";");
+                }
+            }
+            NodeData::ExportDeclaration(_) if misplaced_module_statement => {
+                let source = usize::try_from(node.range.start.get())
+                    .ok()
+                    .zip(usize::try_from(node.range.end.get()).ok())
+                    .and_then(|(start, end)| self.source_text.get(start..end));
+                if let Some(source) = source {
+                    self.writer.write(source);
                 }
             }
             NodeData::ExportDeclaration(data) => self.emit_export(data)?,
@@ -31041,10 +31180,28 @@ impl Printer<'_> {
     #[allow(clippy::too_many_lines)]
     fn prepare_source_class_expression_temps(&mut self, source_file: NodeId) {
         if self.settings.target >= ScriptTarget::Es2022 {
+            let mut claimed = HashSet::new();
+            let mut temps = Vec::new();
+            self.prepare_commonjs_postfix_export_temps(
+                source_file,
+                &mut claimed,
+                &mut temps,
+            );
+            if !temps.is_empty() {
+                self.writer.write("var ");
+                self.writer.write(&temps.join(", "));
+                self.writer.write(";");
+                self.writer.newline();
+            }
             return;
         }
         let mut claimed = HashSet::new();
         let mut field_temps = Vec::new();
+        self.prepare_commonjs_postfix_export_temps(
+            source_file,
+            &mut claimed,
+            &mut field_temps,
+        );
         if self.settings.target < ScriptTarget::Es2015 {
             self.prepare_source_computed_object_literal_temps(
                 source_file,
@@ -31210,6 +31367,46 @@ impl Printer<'_> {
             self.writer.write(&decorator_temps.join(", "));
             self.writer.write(";");
             self.writer.newline();
+        }
+    }
+
+    fn prepare_commonjs_postfix_export_temps(
+        &mut self,
+        source_file: NodeId,
+        claimed: &mut HashSet<String>,
+        temps: &mut Vec<String>,
+    ) {
+        if !self.commonjs_module_transform {
+            return;
+        }
+        let mut updates = self
+            .arena
+            .iter()
+            .filter_map(|(id, node)| {
+                let NodeData::PostfixUnaryExpression(unary) = &node.data else {
+                    return None;
+                };
+                (matches!(unary.operator, SyntaxKind::PlusPlusToken | SyntaxKind::MinusMinusToken)
+                    && self.node_is_within(id, source_file)
+                    && !self
+                        .commonjs_named_exports_for_assignment_target(unary.operand)
+                        .is_empty()
+                    && !node.parent.is_some_and(|parent| {
+                        matches!(
+                            self.arena.get(parent).map(|node| &node.data),
+                            Some(NodeData::ExpressionStatement(_))
+                        )
+                    }))
+                .then_some((node.range.start, id))
+            })
+            .collect::<Vec<_>>();
+        updates.sort_by_key(|(start, _)| *start);
+        for (_, update) in updates {
+            let temp = self.generate_block_temp(source_file, claimed);
+            claimed.insert(temp.clone());
+            self.commonjs_postfix_export_temps
+                .insert(update, temp.clone());
+            temps.push(temp);
         }
     }
 
@@ -49345,6 +49542,24 @@ impl Printer<'_> {
                 }
             }
             NodeData::PostfixUnaryExpression(data) => {
+                if let Some(temp) = self.commonjs_postfix_export_temps.get(&id).cloned() {
+                    self.writer.write("(");
+                    self.emit_commonjs_export_assignment_prefixes(data.operand);
+                    self.writer.write("(");
+                    self.writer.write(&temp);
+                    self.writer.write(" = ");
+                    self.emit_expression(data.operand, 17)?;
+                    self.writer.write(
+                        operator_text(data.operator)
+                            .ok_or_else(|| Self::unsupported(id, node.kind))?,
+                    );
+                    self.writer.write(", ");
+                    self.emit_expression(data.operand, 0)?;
+                    self.writer.write("), ");
+                    self.writer.write(&temp);
+                    self.writer.write(")");
+                    return Ok(());
+                }
                 let commonjs_discarded_export = matches!(
                     data.operator,
                     SyntaxKind::PlusPlusToken | SyntaxKind::MinusMinusToken
@@ -57585,6 +57800,101 @@ mod tests {
                 "    };\n",
                 "});\n",
             )
+        );
+    }
+
+    #[test]
+    fn module_extensions_force_javascript_and_declaration_module_markers() {
+        let source = "const value = 1;";
+        let parsed = parse_source_file(source);
+        let emit = |source_name, module| {
+            emit_source_file_with_settings(
+                &parsed.arena,
+                parsed.source_file,
+                source_name,
+                source,
+                PrinterSettings {
+                    always_strict: false,
+                    target: ScriptTarget::EsNext,
+                    module,
+                    jsx: JsxEmit::Preserve,
+                    emit_javascript: true,
+                    emit_declarations: false,
+                    source_map: false,
+                    inline_source_map: false,
+                    import_helpers: false,
+                    no_emit_helpers: false,
+                    experimental_decorators: false,
+                    remove_comments: false,
+                    use_define_for_class_fields: None,
+                },
+            )
+            .unwrap()
+            .code
+        };
+        assert_eq!(
+            emit("input.cts", ModuleKind::CommonJs),
+            concat!(
+                "\"use strict\";\n",
+                "Object.defineProperty(exports, \"__esModule\", { value: true });\n",
+                "const value = 1;\n",
+            )
+        );
+        assert_eq!(
+            emit("input.mts", ModuleKind::EsNext),
+            "const value = 1;\nexport {};\n"
+        );
+        assert_eq!(
+            emit_declaration_file(
+                &parsed.arena,
+                parsed.source_file,
+                "input.cts",
+                source,
+                false,
+            )
+            .unwrap()
+            .code,
+            "export {};\n"
+        );
+    }
+
+    #[test]
+    fn preserves_module_syntax_recovered_inside_ordinary_blocks() {
+        let output = emit_with(
+            concat!(
+                "{\n",
+                "  export = Missing;\n",
+                "  export { value };\n",
+                "  import Alias = require(\"pkg\");\n",
+                "  import * as Namespace from \"pkg\";\n",
+                "}\n",
+            ),
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        for statement in [
+            "export = Missing;",
+            "export { value };",
+            "import Alias = require(\"pkg\");",
+            "import * as Namespace from \"pkg\";",
+        ] {
+            assert!(output.contains(statement), "{output}");
+        }
+    }
+
+    #[test]
+    fn commonjs_postfix_export_updates_preserve_the_old_value() {
+        let output = emit_with(
+            "let value = 1; export function read() { return value++; } export { value };",
+            ScriptTarget::Es2015,
+            ModuleKind::CommonJs,
+        )
+        .code;
+        assert!(output.contains("var _a;"), "{output}");
+        assert!(
+            output.contains("return (exports.value = (_a = value++, value), _a);"),
+            "{output}"
         );
     }
 
