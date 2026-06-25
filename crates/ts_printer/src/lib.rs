@@ -364,6 +364,9 @@ pub fn emit_source_file_with_context(
         commonjs_postfix_export_temps: HashMap::new(),
         downlevel_nullish_temps: HashMap::new(),
         downlevel_optional_temps: HashMap::new(),
+        downlevel_spread_call_temps: HashMap::new(),
+        nested_object_rest_assignment_temps: HashMap::new(),
+        nested_object_rest_for_of_temps: HashMap::new(),
         namespace_destructuring_temps: HashMap::new(),
         private_method_plans: HashMap::new(),
         active_private_method_plan: None,
@@ -373,6 +376,7 @@ pub fn emit_source_file_with_context(
         preemitted_source_prologues: HashSet::new(),
         captured_loop_body: None,
         downlevel_super_context: None,
+        downlevel_constructor_super_capture: None,
         is_external_module: false,
         emit_decorator_metadata: context.emit_decorator_metadata,
         es_module_interop: context.es_module_interop,
@@ -1082,6 +1086,14 @@ pub fn emit_source_file_with_context(
         printer.writer.write(" } from \"tslib\";");
         printer.writer.newline();
     }
+    let nested_object_rest_temps =
+        printer.prepare_source_nested_object_rest_temps(source_file);
+    if !nested_object_rest_temps.is_empty() {
+        printer.writer.write("var ");
+        printer.writer.write(&nested_object_rest_temps.join(", "));
+        printer.writer.write(";");
+        printer.writer.newline();
+    }
     if !(settings.module == ModuleKind::CommonJs && is_external_module)
         && data.statements.nodes.first().is_some_and(|statement| {
             arena
@@ -1609,6 +1621,28 @@ fn source_needs_object_rest_helper(arena: &NodeArena) -> bool {
         {
             return true;
         }
+        let nested_pattern = match &node.data {
+            NodeData::BinaryExpression(binary)
+                if arena
+                    .get(binary.operator_token)
+                    .is_some_and(|operator| operator.kind == SyntaxKind::EqualsToken) =>
+            {
+                Some(binary.left)
+            }
+            NodeData::ForInOrOfStatement(for_of)
+                if node.kind == SyntaxKind::ForOfStatement =>
+            {
+                Some(for_of.initializer)
+            }
+            _ => None,
+        };
+        if nested_pattern.is_some_and(|pattern| {
+            let mut targets = Vec::new();
+            collect_nested_simple_object_rest_targets(arena, pattern, &mut targets);
+            !targets.is_empty()
+        }) {
+            return true;
+        }
         let parameters = match &node.data {
             NodeData::ArrowFunction(function) => &function.parameters,
             NodeData::FunctionDeclaration(function)
@@ -1646,6 +1680,34 @@ fn source_needs_object_rest_helper(arena: &NodeArena) -> bool {
             })
         })
     })
+}
+
+fn collect_nested_simple_object_rest_targets(
+    arena: &NodeArena,
+    pattern: NodeId,
+    targets: &mut Vec<NodeId>,
+) {
+    match arena.get(pattern).map(|node| &node.data) {
+        Some(NodeData::ArrayLiteralExpression(array)) => {
+            for element in &array.elements.nodes {
+                collect_nested_simple_object_rest_targets(arena, *element, targets);
+            }
+        }
+        Some(NodeData::ObjectLiteralExpression(object)) => {
+            let [property] = object.properties.nodes.as_slice() else {
+                return;
+            };
+            if let Some(NodeData::SpreadAssignment(spread)) =
+                arena.get(*property).map(|node| &node.data)
+            {
+                targets.push(spread.expression);
+            }
+        }
+        Some(NodeData::ParenthesizedExpression(parenthesized)) => {
+            collect_nested_simple_object_rest_targets(arena, parenthesized.expression, targets);
+        }
+        _ => {}
+    }
 }
 
 fn source_needs_legacy_decorate_helper(arena: &NodeArena) -> bool {
@@ -23058,6 +23120,7 @@ impl SystemModulePlan {
         bindings: &BindResult,
         data: &ts_ast::SourceFileData,
         import_runtime_meanings: &BTreeMap<NodeId, bool>,
+        runtime_imports: &HashSet<NodeId>,
         runtime_import_equals: &HashSet<NodeId>,
         automatic_jsx: AutomaticJsxUsage,
         jsx: JsxEmit,
@@ -23259,6 +23322,11 @@ impl SystemModulePlan {
             }
             if matches!(node.data, NodeData::ImportEqualsDeclaration(_))
                 && !runtime_import_equals.contains(statement)
+            {
+                continue;
+            }
+            if matches!(node.data, NodeData::ImportDeclaration(_))
+                && !runtime_imports.contains(statement)
             {
                 continue;
             }
@@ -23997,6 +24065,9 @@ struct Printer<'a> {
     commonjs_postfix_export_temps: HashMap<NodeId, String>,
     downlevel_nullish_temps: HashMap<NodeId, String>,
     downlevel_optional_temps: HashMap<NodeId, String>,
+    downlevel_spread_call_temps: HashMap<NodeId, String>,
+    nested_object_rest_assignment_temps: HashMap<NodeId, Vec<String>>,
+    nested_object_rest_for_of_temps: HashMap<NodeId, Vec<String>>,
     namespace_destructuring_temps: HashMap<NodeId, String>,
     private_method_plans: HashMap<NodeId, PrivateMethodPlan>,
     active_private_method_plan: Option<PrivateMethodPlan>,
@@ -24006,6 +24077,7 @@ struct Printer<'a> {
     preemitted_source_prologues: HashSet<NodeId>,
     captured_loop_body: Option<NodeId>,
     downlevel_super_context: Option<(String, bool)>,
+    downlevel_constructor_super_capture: Option<String>,
     is_external_module: bool,
     emit_decorator_metadata: bool,
     es_module_interop: bool,
@@ -25252,6 +25324,19 @@ impl Printer<'_> {
             self.bindings,
             data,
             self.import_runtime_meanings,
+            &data
+                .statements
+                .nodes
+                .iter()
+                .copied()
+                .filter(|statement| {
+                    matches!(
+                        self.arena.get(*statement).map(|node| &node.data),
+                        Some(NodeData::ImportDeclaration(import))
+                            if self.import_has_runtime_use(*statement, import)
+                    )
+                })
+                .collect(),
             &data
                 .statements
                 .nodes
@@ -29343,6 +29428,41 @@ impl Printer<'_> {
         {
             return Ok(false);
         }
+        if let Some(temps) = self
+            .nested_object_rest_for_of_temps
+            .get(&data.initializer)
+            .cloned()
+        {
+            let value = self.generated_names.generate_temp();
+            self.writer.write("for (let ");
+            self.writer.write(&value);
+            self.writer.write(" of ");
+            self.emit_expression(data.expression, 0)?;
+            self.writer.write(") {");
+            self.writer.newline();
+            self.writer.indent += 1;
+            self.emit_nested_simple_object_rest_assignment(
+                data.initializer,
+                None,
+                Some(&value),
+                &temps,
+                0,
+            )?;
+            self.writer.write(";");
+            self.writer.newline();
+            if matches!(self.node(data.statement)?.data, NodeData::Block(_)) {
+                self.emit_block_statements(data.statement)?;
+            } else if self
+                .arena
+                .get(data.statement)
+                .is_some_and(|statement| self.statement_emits_runtime(data.statement, statement))
+            {
+                self.emit_statement(data.statement)?;
+            }
+            self.writer.indent -= 1;
+            self.writer.write("}");
+            return Ok(true);
+        }
         let initializer_node = self.node(data.initializer)?.clone();
         let NodeData::VariableDeclarationList(list) = &initializer_node.data else {
             return Ok(false);
@@ -29838,30 +29958,9 @@ impl Printer<'_> {
             return Ok(false);
         };
         let captured_initializer_names = self.es5_captured_for_initializer_names(data);
-        let captured_body_declaration = block.statements.nodes.iter().any(|statement| {
-            let Some(NodeData::VariableStatement(statement)) =
-                self.arena.get(*statement).map(|node| &node.data)
-            else {
-                return false;
-            };
-            let Some(list_node) = self.arena.get(statement.declaration_list) else {
-                return false;
-            };
-            let NodeData::VariableDeclarationList(list) = &list_node.data else {
-                return false;
-            };
-            variable_list_is_block_scoped(list_node)
-                && list.declarations.nodes.iter().any(|declaration| {
-                    matches!(
-                        self.arena.get(*declaration).map(|node| &node.data),
-                        Some(NodeData::VariableDeclaration(declaration))
-                            if self.block_scoped_declaration_is_captured(
-                                declaration.name,
-                                data.statement,
-                            )
-                    )
-                })
-        });
+        let captured_body_declaration = self.loop_body_has_captured_block_scoped_declaration(
+            data.statement,
+        );
         if captured_initializer_names.is_empty() && !captured_body_declaration {
             return Ok(false);
         }
@@ -29952,6 +30051,36 @@ impl Printer<'_> {
         self.writer.indent -= 1;
         self.writer.write("}");
         Ok(true)
+    }
+
+    fn loop_body_has_captured_block_scoped_declaration(&self, body: NodeId) -> bool {
+        let Some(NodeData::Block(block)) = self.arena.get(body).map(|node| &node.data) else {
+            return false;
+        };
+        block.statements.nodes.iter().any(|statement| {
+            let Some(NodeData::VariableStatement(statement)) =
+                self.arena.get(*statement).map(|node| &node.data)
+            else {
+                return false;
+            };
+            let Some(list_node) = self.arena.get(statement.declaration_list) else {
+                return false;
+            };
+            let NodeData::VariableDeclarationList(list) = &list_node.data else {
+                return false;
+            };
+            variable_list_is_block_scoped(list_node)
+                && list.declarations.nodes.iter().any(|declaration| {
+                    matches!(
+                        self.arena.get(*declaration).map(|node| &node.data),
+                        Some(NodeData::VariableDeclaration(declaration))
+                            if self.block_scoped_declaration_is_captured(
+                                declaration.name,
+                                body,
+                            )
+                    )
+                })
+        })
     }
 
     fn es5_captured_for_initializer_names(&self, data: &ts_ast::ForStatementData) -> Vec<String> {
@@ -30062,6 +30191,7 @@ impl Printer<'_> {
         self.writer.newline();
     }
 
+    #[allow(clippy::too_many_lines)]
     fn emit_es5_captured_for_of_loop(
         &mut self,
         id: NodeId,
@@ -30085,12 +30215,28 @@ impl Printer<'_> {
         else {
             return Ok(false);
         };
-        let Some(parameter) = declaration_name_text(self.arena, declaration.name) else {
-            return Ok(false);
-        };
-        if !self.block_scoped_declaration_is_captured(declaration.name, data.statement) {
+        let mut parameters = Vec::new();
+        collect_binding_names(self.arena, declaration.name, &mut parameters);
+        if parameters.is_empty() {
             return Ok(false);
         }
+        let mut binding_identifiers = Vec::new();
+        self.collect_binding_identifier_nodes(declaration.name, &mut binding_identifiers);
+        let initializer_captured = binding_identifiers.iter().any(|(_, name)| {
+            self.block_scoped_declaration_is_captured(*name, data.statement)
+        });
+        if !initializer_captured
+            && !self.loop_body_has_captured_block_scoped_declaration(data.statement)
+        {
+            return Ok(false);
+        }
+        let (counter, rhs, binding_temp) =
+            self.scoped_downlevel_for_of_names(id, data.expression);
+        let spread_temps = self.prepare_synthetic_loop_spread_call_temps(
+            data.statement,
+            [&counter, &rhs],
+            binding_temp.as_ref(),
+        );
         let loop_name = self.generated_names.generate("_loop");
         let previous_this_alias = self.this_alias.clone();
         let local_this_alias = (previous_this_alias.is_none()
@@ -30102,10 +30248,16 @@ impl Printer<'_> {
         self.writer.write("var ");
         self.writer.write(&loop_name);
         self.writer.write(" = function (");
-        self.writer.write(parameter);
+        self.writer.write(&parameters.join(", "));
         self.writer.write(") {");
         self.writer.newline();
         self.writer.indent += 1;
+        if !spread_temps.is_empty() {
+            self.writer.write("var ");
+            self.writer.write(&spread_temps.join(", "));
+            self.writer.write(";");
+            self.writer.newline();
+        }
         let previous_captured_loop_body = self.captured_loop_body.replace(data.statement);
         let result = self.emit_synthetic_loop_helper_body(data.statement);
         self.captured_loop_body = previous_captured_loop_body;
@@ -30121,7 +30273,6 @@ impl Printer<'_> {
             self.writer.newline();
         }
 
-        let (counter, rhs, _) = self.scoped_downlevel_for_of_names(id, data.expression);
         self.writer.write("for (var ");
         self.writer.write(&counter);
         self.writer.write(" = 0, ");
@@ -30137,22 +30288,81 @@ impl Printer<'_> {
         self.writer.write("++) {");
         self.writer.newline();
         self.writer.indent += 1;
-        self.writer.write("var ");
-        self.writer.write(parameter);
-        self.writer.write(" = ");
-        self.writer.write(&rhs);
-        self.writer.write("[");
-        self.writer.write(&counter);
-        self.writer.write("];");
-        self.writer.newline();
+        let value = DownlevelBindingValue::Element(
+            Box::new(DownlevelBindingValue::Name(rhs)),
+            DownlevelBindingIndex::Name(counter),
+        );
+        self.emit_downlevel_for_of_binding(
+            data.initializer,
+            &value,
+            binding_temp.as_deref(),
+        )?;
         self.writer.write(&loop_name);
         self.writer.write("(");
-        self.writer.write(parameter);
+        self.writer.write(&parameters.join(", "));
         self.writer.write(");");
         self.writer.newline();
         self.writer.indent -= 1;
         self.writer.write("}");
         Ok(true)
+    }
+
+    fn prepare_synthetic_loop_spread_call_temps(
+        &mut self,
+        body: NodeId,
+        loop_names: [&str; 2],
+        binding_temp: Option<&String>,
+    ) -> Vec<String> {
+        let mut calls = self
+            .arena
+            .iter()
+            .filter_map(|(id, node)| {
+                let NodeData::CallExpression(call) = &node.data else {
+                    return None;
+                };
+                if !self.node_belongs_to_temp_scope(id, body)
+                    || !call.arguments.nodes.iter().any(|argument| {
+                        matches!(
+                            self.arena.get(*argument).map(|node| &node.data),
+                            Some(NodeData::SpreadElement(_))
+                        )
+                    })
+                {
+                    return None;
+                }
+                let NodeData::PropertyAccessExpression(access) =
+                    &self.arena.get(call.expression)?.data
+                else {
+                    return None;
+                };
+                (!matches!(
+                    self.arena.get(access.expression).map(|node| node.kind),
+                    Some(
+                        SyntaxKind::Identifier | SyntaxKind::ThisKeyword | SyntaxKind::SuperKeyword
+                    )
+                ))
+                .then_some((node.range.start, id))
+            })
+            .collect::<Vec<_>>();
+        calls.sort_by_key(|(start, _)| *start);
+        let mut used = self
+            .arena
+            .iter()
+            .filter_map(|(_, node)| match &node.data {
+                NodeData::Identifier(identifier) => Some(identifier.text.clone()),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        used.extend(loop_names.into_iter().map(str::to_owned));
+        used.extend(binding_temp.cloned());
+        calls
+            .into_iter()
+            .map(|(_, call)| {
+                let temp = Self::generate_scoped_temp(&mut used);
+                self.downlevel_spread_call_temps.insert(call, temp.clone());
+                temp
+            })
+            .collect()
     }
 
     fn emit_synthetic_loop_helper_body(&mut self, body: NodeId) -> Result<(), EmitError> {
@@ -31880,6 +32090,63 @@ impl Printer<'_> {
         }
     }
 
+    fn prepare_source_nested_object_rest_temps(&mut self, source_file: NodeId) -> Vec<String> {
+        if self.settings.target >= ScriptTarget::Es2018 {
+            return Vec::new();
+        }
+        let mut patterns = self
+            .arena
+            .iter()
+            .filter_map(|(id, node)| {
+                if !self.node_is_within(id, source_file)
+                    || self.nearest_function_like_container(id) != Some(source_file)
+                {
+                    return None;
+                }
+                let (pattern, for_of) = match &node.data {
+                    NodeData::BinaryExpression(binary)
+                        if self
+                            .arena
+                            .get(binary.operator_token)
+                            .is_some_and(|operator| {
+                                operator.kind == SyntaxKind::EqualsToken
+                            }) => (binary.left, false),
+                    NodeData::ForInOrOfStatement(data)
+                        if node.kind == SyntaxKind::ForOfStatement =>
+                    {
+                        (data.initializer, true)
+                    }
+                    _ => return None,
+                };
+                if !matches!(
+                    self.arena.get(pattern).map(|node| &node.data),
+                    Some(NodeData::ArrayLiteralExpression(_))
+                ) {
+                    return None;
+                }
+                let mut targets = Vec::new();
+                collect_nested_simple_object_rest_targets(self.arena, pattern, &mut targets);
+                (!targets.is_empty()).then_some((node.range.start, id, pattern, for_of, targets.len()))
+            })
+            .collect::<Vec<_>>();
+        patterns.sort_by_key(|(start, ..)| *start);
+        let mut temps = Vec::new();
+        for (_, expression, pattern, for_of, count) in patterns {
+            let allocated = (0..count)
+                .map(|_| self.generated_names.generate_temp())
+                .collect::<Vec<_>>();
+            if for_of {
+                self.nested_object_rest_for_of_temps
+                    .insert(pattern, allocated.clone());
+            } else {
+                self.nested_object_rest_assignment_temps
+                    .insert(expression, allocated.clone());
+            }
+            temps.extend(allocated);
+        }
+        temps
+    }
+
     fn prepare_commonjs_postfix_export_temps(
         &mut self,
         source_file: NodeId,
@@ -32431,10 +32698,24 @@ impl Printer<'_> {
                 {
                     return None;
                 }
-                Some((node.range.start.get(), id, optional))
+                Some((node.range, id, optional))
             })
             .collect::<Vec<_>>();
-        expressions.sort_by_key(|(start, _, _)| *start);
+        expressions.sort_by(|(left, ..), (right, ..)| {
+            let left_contains_right = left.start <= right.start
+                && right.end <= left.end
+                && (left.start < right.start || right.end < left.end);
+            let right_contains_left = right.start <= left.start
+                && left.end <= right.end
+                && (right.start < left.start || left.end < right.end);
+            if left_contains_right {
+                std::cmp::Ordering::Greater
+            } else if right_contains_left {
+                std::cmp::Ordering::Less
+            } else {
+                left.start.cmp(&right.start)
+            }
+        });
         for (_, expression, optional) in expressions {
             let already_allocated = if optional {
                 self.downlevel_optional_temps.contains_key(&expression)
@@ -32491,9 +32772,7 @@ impl Printer<'_> {
                 | NodeData::StringLiteral(_),
             )
             | None => false,
-            Some(NodeData::ParenthesizedExpression(expression)) => {
-                self.downlevel_nullish_left_needs_temp(expression.expression)
-            }
+            Some(NodeData::ParenthesizedExpression(_)) => true,
             Some(NodeData::AsExpression(expression)) => {
                 self.downlevel_nullish_left_needs_temp(expression.expression)
             }
@@ -44992,6 +45271,18 @@ impl Printer<'_> {
                     || self.has_parameter_properties(&constructor.parameters)
                     || super_statement_index
                         .is_none_or(|index| index.saturating_add(1) < body.statements.nodes.len());
+                let nested_super_calls = super_statement_index.is_none()
+                    && self.constructor_body_has_super_call(body_id);
+                let previous_constructor_super_capture =
+                    self.downlevel_constructor_super_capture.clone();
+                if nested_super_calls {
+                    self.writer.write("var _this = this;");
+                    self.writer.newline();
+                    self.this_alias = Some("_this".to_owned());
+                    uses_this_alias = true;
+                    self.downlevel_constructor_super_capture
+                        .clone_from(&super_capture);
+                }
                 let mut previous_end = body_node.range.start.get().saturating_add(1);
                 if self.body_opening_line_comment_is_unowned(body_id) {
                     let comment_end = body
@@ -45073,6 +45364,7 @@ impl Printer<'_> {
                     body_node.range.end.get().saturating_sub(1),
                     previous_emitted,
                 );
+                self.downlevel_constructor_super_capture = previous_constructor_super_capture;
             }
             if !emitted_fields {
                 self.emit_es5_instance_fields(data, "this", captures_field_this)?;
@@ -46202,6 +46494,19 @@ impl Printer<'_> {
             return Ok(false);
         };
         Ok(self.node(call.expression)?.kind == SyntaxKind::SuperKeyword)
+    }
+
+    fn constructor_body_has_super_call(&self, body: NodeId) -> bool {
+        self.arena.iter().any(|(id, node)| {
+            let NodeData::CallExpression(call) = &node.data else {
+                return false;
+            };
+            self.node_belongs_to_temp_scope(id, body)
+                && self
+                    .arena
+                    .get(call.expression)
+                    .is_some_and(|callee| callee.kind == SyntaxKind::SuperKeyword)
+        })
     }
 
     fn constructor_modifier_precedes_property_assignment(
@@ -49735,7 +50040,11 @@ impl Printer<'_> {
                                 NodeData::NewExpression(new_expression)
                                     if new_expression.expression == id
                             )
-                        });
+                        })
+                        && matches!(
+                            self.node(asserted_expression)?.data,
+                            NodeData::ObjectLiteralExpression(_)
+                        );
                     let comment_start = node.range.start.get().saturating_add(1);
                     let asserted_start = self.node(asserted_expression)?.range.start.get();
                     let keep_for_leading_comment =
@@ -49986,6 +50295,14 @@ impl Printer<'_> {
                 }
             }
             NodeData::CallExpression(data) => {
+                let downlevel_constructor_super = self
+                    .downlevel_constructor_super_capture
+                    .clone()
+                    .filter(|_| {
+                        self.arena
+                            .get(data.expression)
+                            .is_some_and(|callee| callee.kind == SyntaxKind::SuperKeyword)
+                    });
                 let downlevel_super_call =
                     self.downlevel_super_context
                         .clone()
@@ -50008,7 +50325,16 @@ impl Printer<'_> {
                             .map(|method| (access.expression, method)),
                         _ => None,
                     });
-                if let Some((capture, is_static, property)) = downlevel_super_call {
+                if let Some(capture) = downlevel_constructor_super {
+                    self.writer.write("_this = ");
+                    self.writer.write(&capture);
+                    self.writer.write(".call(this");
+                    if self.argument_list_has_expression(&data.arguments) {
+                        self.writer.write(", ");
+                        self.emit_argument_list(&data.arguments)?;
+                    }
+                    self.writer.write(") || this");
+                } else if let Some((capture, is_static, property)) = downlevel_super_call {
                     self.writer.write(&capture);
                     if !is_static {
                         self.writer.write(".prototype");
@@ -50063,7 +50389,7 @@ impl Printer<'_> {
                         )
                     })
                 {
-                    self.emit_downlevel_spread_call(data)?;
+                    self.emit_downlevel_spread_call(id, data)?;
                 } else {
                     let unbound_receiver = self.commonjs_module_transform
                         && self.commonjs_call_requires_unbound_receiver(data.expression);
@@ -50315,7 +50641,14 @@ impl Printer<'_> {
                     self.writer.write("))()");
                     return Ok(());
                 }
-                let wrap = data.arguments.is_none() && parent_precedence > 17;
+                let nested_new_target = node.parent.is_some_and(|parent| {
+                    matches!(
+                        self.arena.get(parent).map(|node| &node.data),
+                        Some(NodeData::NewExpression(parent)) if parent.expression == id
+                    )
+                });
+                let wrap =
+                    data.arguments.is_none() && parent_precedence > 17 && !nested_new_target;
                 if wrap {
                     self.writer.write("(");
                 }
@@ -52540,6 +52873,23 @@ impl Printer<'_> {
             return Ok(());
         }
         if self.settings.target < ScriptTarget::Es2018
+            && let Some(temps) = self
+                .nested_object_rest_assignment_temps
+                .get(&expression)
+                .cloned()
+            && let Some(NodeData::BinaryExpression(binary)) =
+                self.arena.get(expression).map(|node| &node.data)
+        {
+            self.emit_nested_simple_object_rest_assignment(
+                binary.left,
+                Some(binary.right),
+                None,
+                &temps,
+                parent_precedence,
+            )?;
+            return Ok(());
+        }
+        if self.settings.target < ScriptTarget::Es2018
             && let Some(NodeData::BinaryExpression(binary)) =
                 self.arena.get(expression).map(|node| &node.data)
             && self
@@ -53078,6 +53428,79 @@ impl Printer<'_> {
             return None;
         };
         Some(spread.expression)
+    }
+
+    fn emit_nested_simple_object_rest_assignment(
+        &mut self,
+        pattern: NodeId,
+        value: Option<NodeId>,
+        value_name: Option<&str>,
+        temps: &[String],
+        parent_precedence: u8,
+    ) -> Result<(), EmitError> {
+        let wrap = parent_precedence > 1;
+        if wrap {
+            self.writer.write("(");
+        }
+        let mut temp_index = 0;
+        self.emit_nested_simple_object_rest_pattern(pattern, temps, &mut temp_index)?;
+        self.writer.write(" = ");
+        if let Some(value) = value {
+            self.emit_expression(value, 1)?;
+        } else {
+            self.writer.write(value_name.expect("nested rest assignment value"));
+        }
+        let mut targets = Vec::new();
+        collect_nested_simple_object_rest_targets(self.arena, pattern, &mut targets);
+        for (target, temp) in targets.into_iter().zip(temps) {
+            self.writer.write(", ");
+            self.emit_expression(target, 2)?;
+            self.writer.write(" = ");
+            self.emit_helper_reference("__rest");
+            self.writer.write("(");
+            self.writer.write(temp);
+            self.writer.write(", [])");
+        }
+        if wrap {
+            self.writer.write(")");
+        }
+        Ok(())
+    }
+
+    fn emit_nested_simple_object_rest_pattern(
+        &mut self,
+        pattern: NodeId,
+        temps: &[String],
+        temp_index: &mut usize,
+    ) -> Result<(), EmitError> {
+        match self.arena.get(pattern).map(|node| &node.data) {
+            Some(NodeData::ArrayLiteralExpression(array)) => {
+                let elements = array.elements.nodes.clone();
+                self.writer.write("[");
+                for (index, element) in elements.into_iter().enumerate() {
+                    if index != 0 {
+                        self.writer.write(", ");
+                    }
+                    self.emit_nested_simple_object_rest_pattern(element, temps, temp_index)?;
+                }
+                self.writer.write("]");
+            }
+            Some(NodeData::ObjectLiteralExpression(_))
+                if self.simple_object_rest_assignment_target(pattern).is_some() =>
+            {
+                self.writer.write(&temps[*temp_index]);
+                *temp_index += 1;
+            }
+            Some(NodeData::ParenthesizedExpression(parenthesized)) => {
+                self.emit_nested_simple_object_rest_pattern(
+                    parenthesized.expression,
+                    temps,
+                    temp_index,
+                )?;
+            }
+            _ => self.emit_expression(pattern, 0)?,
+        }
+        Ok(())
     }
 
     fn source_range_has_comment(&self, start: u32, end: u32) -> bool {
@@ -53664,18 +54087,36 @@ impl Printer<'_> {
 
     fn emit_downlevel_spread_call(
         &mut self,
+        id: NodeId,
         call: &ts_ast::CallExpressionData,
     ) -> Result<(), EmitError> {
-        self.emit_expression(call.expression, 18)?;
+        let temp = self.downlevel_spread_call_temps.get(&id).cloned();
+        if let Some(temp) = temp.as_ref()
+            && let Some(NodeData::PropertyAccessExpression(access)) =
+                self.arena.get(call.expression).map(|node| &node.data)
+        {
+            self.writer.write("(");
+            self.writer.write(temp);
+            self.writer.write(" = ");
+            self.emit_expression(access.expression, 1)?;
+            self.writer.write(")");
+            self.emit_downlevel_member_access(access.name)?;
+        } else {
+            self.emit_expression(call.expression, 18)?;
+        }
         self.writer.write(".apply(");
-        match self.arena.get(call.expression).map(|node| &node.data) {
-            Some(NodeData::PropertyAccessExpression(access)) => {
-                self.emit_expression(access.expression, 1)?;
+        if let Some(temp) = temp {
+            self.writer.write(&temp);
+        } else {
+            match self.arena.get(call.expression).map(|node| &node.data) {
+                Some(NodeData::PropertyAccessExpression(access)) => {
+                    self.emit_expression(access.expression, 1)?;
+                }
+                Some(NodeData::ElementAccessExpression(access)) => {
+                    self.emit_expression(access.expression, 1)?;
+                }
+                _ => self.writer.write("void 0"),
             }
-            Some(NodeData::ElementAccessExpression(access)) => {
-                self.emit_expression(access.expression, 1)?;
-            }
-            _ => self.writer.write("void 0"),
         }
         self.writer.write(", ");
         self.emit_es5_spread_argument_array(&call.arguments.nodes, false)?;
@@ -53688,6 +54129,18 @@ impl Printer<'_> {
         arguments: &[NodeId],
         leading_void: bool,
     ) -> Result<(), EmitError> {
+        if !leading_void
+            && let [argument] = arguments
+            && let Some(NodeData::SpreadElement(spread)) =
+                self.arena.get(*argument).map(|node| &node.data)
+            && matches!(
+                self.arena.get(spread.expression).map(|node| &node.data),
+                Some(NodeData::ArrayLiteralExpression(array)) if array.elements.nodes.is_empty()
+            )
+        {
+            self.writer.write("[]");
+            return Ok(());
+        }
         let Some(spread_index) = arguments.iter().position(|argument| {
             matches!(
                 self.arena.get(*argument).map(|node| &node.data),
@@ -56298,6 +56751,35 @@ mod tests {
     }
 
     #[test]
+    fn captures_body_local_bindings_in_converted_for_of_loops() {
+        let output = emit_with(
+            concat!(
+                "function baz(x) { return [[x, x]]; } ",
+                "function foo(set) { ",
+                "for (const [value, i] of baz(set.values)) { ",
+                "const bar = []; (() => bar); set.values.push(...[]); ",
+                "} }",
+            ),
+            ScriptTarget::Es5,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(
+            output.contains("var _loop_1 = function (value, i)"),
+            "{output}"
+        );
+        assert!(output.contains("var _c;"), "{output}");
+        assert!(
+            output.contains("(_c = set.values).push.apply(_c, []);"),
+            "{output}"
+        );
+        assert!(
+            output.contains("var _b = _a[_i], value = _b[0], i = _b[1];"),
+            "{output}"
+        );
+    }
+
+    #[test]
     fn preserves_continue_statement_internal_comments() {
         let output = emit_with(
             "label: for (;;) { /*1*/ continue /*2*/ label /*3*/; }",
@@ -56563,6 +57045,26 @@ mod tests {
             output.contains(
                 "const _b = value.g, { c } = _b, second = __rest(_b, [\"c\"]);"
             ),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn downlevels_nested_object_rest_assignment_patterns() {
+        let output = emit_with(
+            "var x, y; [{ ...x }] = [{ abc: 1 }]; for ([{ ...y }] of [[{ abc: 1 }]]) ;",
+            ScriptTarget::Es2017,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(output.contains("var _a, _b;"), "{output}");
+        assert!(
+            output.contains("[_a] = [{ abc: 1 }], x = __rest(_a, []);"),
+            "{output}"
+        );
+        assert!(output.contains("for (let _c of [[{ abc: 1 }]])"), "{output}");
+        assert!(
+            output.contains("[_b] = _c, y = __rest(_b, []);"),
             "{output}"
         );
     }
@@ -57550,6 +58052,19 @@ mod tests {
             )
             .code,
             "var x = new y = 5;\n"
+        );
+    }
+
+    #[test]
+    fn erases_parenthesized_new_target_assertions_and_prints_nested_new() {
+        assert_eq!(
+            emit_with(
+                "var cast = new (<any>Test3)(); var nested = new new Date;",
+                ScriptTarget::Es2015,
+                ModuleKind::None,
+            )
+            .code,
+            "var cast = new Test3();\nvar nested = new new Date;\n"
         );
     }
 
@@ -58825,6 +59340,19 @@ mod tests {
     }
 
     #[test]
+    fn system_modules_elide_unused_import_dependencies() {
+        let output = emit_with(
+            "import { C } from \"projB\";",
+            ScriptTarget::Es2015,
+            ModuleKind::System,
+        )
+        .code;
+        assert!(output.starts_with("System.register([],"), "{output}");
+        assert!(output.contains("setters: []"), "{output}");
+        assert!(!output.contains("projB"), "{output}");
+    }
+
+    #[test]
     fn module_extensions_force_javascript_and_declaration_module_markers() {
         let source = "const value = 1;";
         let parsed = parse_source_file(source);
@@ -59107,6 +59635,29 @@ mod tests {
     }
 
     #[test]
+    fn downlevel_nullish_coalescing_preserves_parenthesized_left_temps() {
+        let output = emit_with(
+            "const first = (\"literal\") ?? fallback; const second = ((\"nested\")) ?? fallback;",
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(output.starts_with("var _a, _b;\n"), "{output}");
+        assert!(
+            output.contains(
+                "const first = (_a = (\"literal\")) !== null && _a !== void 0 ? _a : fallback;"
+            ),
+            "{output}"
+        );
+        assert!(
+            output.contains(
+                "const second = (_b = ((\"nested\"))) !== null && _b !== void 0 ? _b : fallback;"
+            ),
+            "{output}"
+        );
+    }
+
+    #[test]
     fn preserves_parsed_modern_syntax_for_esnext() {
         assert_eq!(
             emit(
@@ -59359,6 +59910,31 @@ mod tests {
             "{output}"
         );
         assert!(output.contains("after(_this);"), "{output}");
+        assert!(output.contains("return _this;"), "{output}");
+    }
+
+    #[test]
+    fn captures_super_calls_nested_in_derived_constructor_control_flow() {
+        let output = emit_with(
+            concat!(
+                "class Base {} ",
+                "class Derived extends Base { constructor() { ",
+                "try { super(true); } catch (error) { super(false); } ",
+                "} }",
+            ),
+            ScriptTarget::Es5,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(output.contains("var _this = this;"), "{output}");
+        assert!(
+            output.contains("_this = _super.call(this, true) || this;"),
+            "{output}"
+        );
+        assert!(
+            output.contains("_this = _super.call(this, false) || this;"),
+            "{output}"
+        );
         assert!(output.contains("return _this;"), "{output}");
     }
 

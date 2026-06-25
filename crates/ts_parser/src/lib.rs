@@ -5155,7 +5155,7 @@ impl<'a> Parser<'a> {
         if self.current.kind == SyntaxKind::DotToken {
             return self.parse_new_meta_property(keyword.range);
         }
-        let mut expression = self.parse_primary_expression();
+        let mut expression = self.parse_new_expression_target();
         loop {
             match self.current.kind {
                 SyntaxKind::DotToken => {
@@ -5250,6 +5250,14 @@ impl<'a> Parser<'a> {
             })),
             &children,
         )
+    }
+
+    fn parse_new_expression_target(&mut self) -> NodeId {
+        if self.current.kind == SyntaxKind::NewKeyword {
+            self.parse_new_expression()
+        } else {
+            self.parse_primary_expression()
+        }
     }
 
     fn parse_new_meta_property(&mut self, keyword_range: TextRange) -> NodeId {
@@ -8935,6 +8943,31 @@ mod tests {
             };
             assert_eq!(new_expression.arguments.is_some(), index == 1);
         }
+    }
+
+    #[test]
+    fn parses_nested_new_expressions() {
+        let result = parse_source_file("const value = new new Date;");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let (list, _) = variable_list(&result, source_statements(&result)[0]);
+        let declaration = declaration_nodes(&result, list)[0];
+        let NodeData::VariableDeclaration(declaration) =
+            &result.arena.get(declaration).unwrap().data
+        else {
+            panic!("expected variable declaration");
+        };
+        let NodeData::NewExpression(outer) = &result
+            .arena
+            .get(declaration.initializer.unwrap())
+            .unwrap()
+            .data
+        else {
+            panic!("expected outer new expression");
+        };
+        assert!(matches!(
+            result.arena.get(outer.expression).map(|node| &node.data),
+            Some(NodeData::NewExpression(_))
+        ));
     }
 
     #[test]
