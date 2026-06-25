@@ -81,6 +81,25 @@ pub struct FunctionType {
     pub parameters_optional: bool,
 }
 
+fn unique_parameter_name(
+    requested: String,
+    used: &mut HashSet<String>,
+    next_suffix: &mut HashMap<String, usize>,
+) -> String {
+    if used.insert(requested.clone()) {
+        next_suffix.entry(requested.clone()).or_insert(1);
+        return requested;
+    }
+    let suffix = next_suffix.entry(requested.clone()).or_insert(1);
+    loop {
+        let candidate = format!("{requested}_{suffix}");
+        *suffix += 1;
+        if used.insert(candidate.clone()) {
+            return candidate;
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ImportTypeReference {
     pub module_specifier: String,
@@ -10011,31 +10030,21 @@ impl<'a> Checker<'a> {
                 (!returns.is_empty()).then(|| self.result.types.union(returns))
             })
             .unwrap_or_else(|| {
-                if self.options.is_javascript_file && !self.function_body_has_return(data.body) {
-                    self.result.types.void()
-                } else {
+                if self.function_body_has_return(data.body) {
                     self.result.types.any()
+                } else {
+                    self.result.types.void()
                 }
             });
         let mut saw_return = false;
         self.check_node(data.body, Some(return_type), &mut saw_return);
         self.local_scopes.pop();
+        let (parameters, parameter_names, rest_parameter) =
+            self.callable_signature_parameters(&data.parameters.nodes, parameters);
         let function = self.result.types.alloc(TypeKind::Function(FunctionType {
             parameters,
-            parameter_names: data
-                .parameters
-                .nodes
-                .iter()
-                .filter_map(|parameter| {
-                    let NodeData::ParameterDeclaration(parameter) =
-                        &self.arena.get(*parameter)?.data
-                    else {
-                        return None;
-                    };
-                    self.property_name(parameter.name)
-                })
-                .collect(),
-            rest_parameter: None,
+            parameter_names,
+            rest_parameter,
             return_type,
             parameters_optional: self.options.is_javascript_file
                 || (!data.parameters.nodes.is_empty()
@@ -14177,12 +14186,27 @@ impl<'a> Checker<'a> {
             }
             NodeData::MappedTypeNode(data) => self.mapped_type(data),
             NodeData::TupleTypeNode(data) => {
-                let elements = data
-                    .elements
-                    .nodes
-                    .iter()
-                    .map(|node| self.type_from_type_node(*node))
-                    .collect::<Vec<_>>();
+                let mut elements = Vec::with_capacity(data.elements.nodes.len());
+                for element in &data.elements.nodes {
+                    let type_id = self.type_from_type_node(*element);
+                    let is_spread = match self.arena.get(*element).map(|node| &node.data) {
+                        Some(NodeData::RestTypeNode(_)) => true,
+                        Some(NodeData::NamedTupleMember(member)) => {
+                            member.dot_dot_dot_token.is_some()
+                        }
+                        _ => false,
+                    };
+                    if is_spread {
+                        match self.result.types.get(type_id).map(|type_| &type_.kind) {
+                            Some(TypeKind::Tuple(spread) | TypeKind::ReadonlyTuple(spread)) => {
+                                elements.extend(spread.iter().copied());
+                            }
+                            _ => elements.push(type_id),
+                        }
+                    } else {
+                        elements.push(type_id);
+                    }
+                }
                 self.result.types.alloc(TypeKind::Tuple(elements))
             }
             NodeData::TypeLiteralNode(data) => self.object_type_from_members(&data.members.nodes),
@@ -14583,6 +14607,133 @@ impl<'a> Checker<'a> {
             return None;
         };
         self.property_name(reference.type_name)
+    }
+
+    fn callable_signature_parameters(
+        &self,
+        parameter_nodes: &[NodeId],
+        parameter_types: Vec<TypeId>,
+    ) -> (Vec<TypeId>, Vec<String>, Option<TypeId>) {
+        let mut signature_parameters = Vec::with_capacity(parameter_types.len());
+        let mut parameter_names = Vec::with_capacity(parameter_types.len());
+        let mut rest_parameter = None;
+        let mut used_names = HashSet::new();
+        let mut next_suffix = HashMap::<String, usize>::new();
+
+        for (index, (parameter_node, parameter_type)) in parameter_nodes
+            .iter()
+            .zip(parameter_types)
+            .enumerate()
+        {
+            let Some(NodeData::ParameterDeclaration(parameter)) =
+                self.arena.get(*parameter_node).map(|node| &node.data)
+            else {
+                signature_parameters.push(parameter_type);
+                parameter_names.push(format!("arg{index}"));
+                continue;
+            };
+            let base_name = self
+                .property_name(parameter.name)
+                .unwrap_or_else(|| format!("arg{index}"));
+            if parameter.dot_dot_dot_token.is_some()
+                && let Some(TypeKind::Tuple(elements) | TypeKind::ReadonlyTuple(elements)) =
+                    self.result.types.get(parameter_type).map(|type_| &type_.kind)
+            {
+                let labels = parameter
+                    .type_
+                    .map(|type_node| {
+                        self.tuple_element_names(type_node, &mut HashSet::new())
+                    })
+                    .unwrap_or_default();
+                for (element_index, element) in elements.iter().enumerate() {
+                    signature_parameters.push(*element);
+                    let requested = labels
+                        .get(element_index)
+                        .and_then(Clone::clone)
+                        .unwrap_or_else(|| format!("{base_name}{element_index}"));
+                    parameter_names.push(unique_parameter_name(
+                        requested,
+                        &mut used_names,
+                        &mut next_suffix,
+                    ));
+                }
+            } else if parameter.dot_dot_dot_token.is_some() {
+                rest_parameter = Some(parameter_type);
+                parameter_names.push(unique_parameter_name(
+                    base_name,
+                    &mut used_names,
+                    &mut next_suffix,
+                ));
+            } else {
+                signature_parameters.push(parameter_type);
+                parameter_names.push(unique_parameter_name(
+                    base_name,
+                    &mut used_names,
+                    &mut next_suffix,
+                ));
+            }
+        }
+        (signature_parameters, parameter_names, rest_parameter)
+    }
+
+    fn tuple_element_names(
+        &self,
+        node: NodeId,
+        alias_stack: &mut HashSet<SymbolId>,
+    ) -> Vec<Option<String>> {
+        let Some(node_data) = self.arena.get(node).map(|node| &node.data) else {
+            return Vec::new();
+        };
+        match node_data {
+            NodeData::TupleTypeNode(tuple) => tuple
+                .elements
+                .nodes
+                .iter()
+                .flat_map(|element| self.tuple_element_names(*element, alias_stack))
+                .collect(),
+            NodeData::NamedTupleMember(member) => {
+                vec![self.property_name(member.name)]
+            }
+            NodeData::RestTypeNode(rest) => self.tuple_element_names(rest.type_, alias_stack),
+            NodeData::OptionalTypeNode(optional) => {
+                self.tuple_element_names(optional.type_, alias_stack)
+            }
+            NodeData::ParenthesizedTypeNode(parenthesized) => {
+                self.tuple_element_names(parenthesized.type_, alias_stack)
+            }
+            NodeData::TypeOperatorNode(operator) => {
+                self.tuple_element_names(operator.type_, alias_stack)
+            }
+            NodeData::TypeReferenceNode(reference) => {
+                let Some(name) = self.property_name(reference.type_name) else {
+                    return Vec::new();
+                };
+                let Some(symbol) = self.resolve_identifier(reference.type_name, &name) else {
+                    return Vec::new();
+                };
+                if !alias_stack.insert(symbol) {
+                    return Vec::new();
+                }
+                let result = self
+                    .bindings
+                    .symbols
+                    .get(symbol)
+                    .into_iter()
+                    .flat_map(|symbol| &symbol.declarations)
+                    .find_map(|declaration| {
+                        let NodeData::TypeAliasDeclaration(alias) =
+                            &self.arena.get(*declaration)?.data
+                        else {
+                            return None;
+                        };
+                        Some(self.tuple_element_names(alias.type_, alias_stack))
+                    })
+                    .unwrap_or_default();
+                alias_stack.remove(&symbol);
+                result
+            }
+            _ => vec![None],
+        }
     }
 
     fn type_keys(&self, type_id: TypeId) -> Vec<String> {
@@ -22960,6 +23111,40 @@ mod tests {
                 .collect::<Vec<_>>(),
             source.statements.nodes[..2]
         );
+    }
+
+    #[test]
+    fn expands_labeled_tuple_spreads_in_function_expression_rest_parameters() {
+        let parsed = parse_source_file(
+            r"
+                function f() {
+                    type A = [s: string];
+                    type C = [...A, ...A];
+                    return function (...args: C) {};
+                }
+            ",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+
+        let f = bindings.root_scope().unwrap().symbols.get("f").unwrap();
+        let TypeKind::Function(f) = &result
+            .types
+            .get(result.type_of_symbol(f).unwrap())
+            .unwrap()
+            .kind
+        else {
+            panic!("expected outer function type");
+        };
+        let TypeKind::Function(returned) = &result.types.get(f.return_type).unwrap().kind else {
+            panic!("expected returned function type");
+        };
+        assert_eq!(returned.parameters, [result.types.string(); 2]);
+        assert_eq!(returned.parameter_names, ["s", "s_1"]);
+        assert_eq!(returned.rest_parameter, None);
+        assert_eq!(returned.return_type, result.types.void());
     }
 
     #[test]
