@@ -380,6 +380,7 @@ pub fn emit_source_file_with_context(
         active_anonymous_private_class: None,
         private_destructuring_rewrites: HashMap::new(),
         preemitted_source_prologues: HashSet::new(),
+        preemitted_captured_while_loops: HashMap::new(),
         captured_loop_body: None,
         downlevel_super_context: None,
         downlevel_constructor_super_capture: None,
@@ -860,10 +861,18 @@ pub fn emit_source_file_with_context(
         )
     })
         && !settings.no_emit_helpers;
+    let defer_captured_while_leading_comments = settings.target < ScriptTarget::Es2015
+        && data.statements.nodes.first().is_some_and(|statement| {
+            matches!(
+                arena.get(*statement).map(|node| &node.data),
+                Some(NodeData::WhileStatement(while_statement))
+                    if printer.es5_while_loop_needs_capture(while_statement)
+            )
+        });
     if let Some(start) = first_statement_start {
         let defer_commonjs_leading_comments = settings.module == ModuleKind::CommonJs
             && (printer.import_helpers_namespace.is_some() || printer.automatic_jsx.any());
-        if !defer_commonjs_leading_comments {
+        if !defer_commonjs_leading_comments && !defer_captured_while_leading_comments {
             printer.emit_leading_detached_source_comments(start);
         }
         if settings.module == ModuleKind::CommonJs
@@ -896,6 +905,7 @@ pub fn emit_source_file_with_context(
             }
         }
         if !defer_commonjs_leading_comments
+            && !defer_captured_while_leading_comments
             && data.statements.nodes.first().is_some_and(|statement| {
             arena
                 .get(*statement)
@@ -933,9 +943,20 @@ pub fn emit_source_file_with_context(
         && !settings.no_emit_helpers
         && printer.import_helpers_namespace.is_none()
         && printer.source_needs_import_star_helper(&data.statements);
+    let preemit_commonjs_import_star = settings.module == ModuleKind::CommonJs
+        && is_external_module
+        && !preemit_isolated_metadata_import_star
+        && !needs_dynamic_import_helpers
+        && !settings.no_emit_helpers
+        && printer.import_helpers_namespace.is_none()
+        && printer.source_needs_import_star_helper(&data.statements);
     if preemit_isolated_metadata_import_star {
         printer.emit_create_binding_helper();
         printer.emit_set_module_default_helper();
+    }
+    if preemit_commonjs_import_star {
+        printer.emit_create_binding_helper();
+        printer.emit_import_star_helper();
     }
     if needs_dynamic_import_helpers
         && !settings.no_emit_helpers
@@ -1158,7 +1179,8 @@ pub fn emit_source_file_with_context(
         printer.writer.write(";");
         printer.writer.newline();
     }
-    if !(settings.module == ModuleKind::CommonJs && is_external_module)
+    if !(defer_captured_while_leading_comments
+        || settings.module == ModuleKind::CommonJs && is_external_module)
         && data.statements.nodes.first().is_some_and(|statement| {
             arena
                 .get(*statement)
@@ -1186,10 +1208,12 @@ pub fn emit_source_file_with_context(
         let defer_import_star_body = needs_import_star_helper
             && needs_export_star_helper
             && !needs_dynamic_import_helpers
-            && !preemit_isolated_metadata_import_star;
+            && !preemit_isolated_metadata_import_star
+            && !preemit_commonjs_import_star;
         if (needs_import_star_helper || needs_export_star_helper)
             && !needs_dynamic_import_helpers
             && !preemit_isolated_metadata_import_star
+            && !preemit_commonjs_import_star
             && !settings.no_emit_helpers
             && printer.import_helpers_namespace.is_none()
         {
@@ -1197,6 +1221,7 @@ pub fn emit_source_file_with_context(
         }
         if needs_import_star_helper
             && !needs_dynamic_import_helpers
+            && !preemit_commonjs_import_star
             && !settings.no_emit_helpers
             && printer.import_helpers_namespace.is_none()
         {
@@ -1263,6 +1288,13 @@ pub fn emit_source_file_with_context(
         printer.writer.write(" = this;");
         printer.writer.newline();
         printer.capture_arrow_this = Some(alias);
+    }
+    for statement in &data.statements.nodes {
+        if let Some(NodeData::WhileStatement(while_statement)) =
+            arena.get(*statement).map(|node| &node.data)
+        {
+            printer.preemit_es5_captured_while_loop(*statement, while_statement)?;
+        }
     }
     if settings.module == ModuleKind::CommonJs
         && is_external_module
@@ -18402,7 +18434,11 @@ impl DeclarationPrinter<'_> {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn semantic_parameter_is_optional(&self, signature: &FunctionType, index: usize) -> bool {
+        if self.semantic_parameter_is_explicitly_required(signature, index) {
+            return false;
+        }
         if signature.parameters_optional {
             return true;
         }
@@ -18502,6 +18538,51 @@ impl DeclarationPrinter<'_> {
                         _ => None,
                     })
                     .is_some()
+        })
+    }
+
+    fn semantic_parameter_is_explicitly_required(
+        &self,
+        signature: &FunctionType,
+        index: usize,
+    ) -> bool {
+        self.arena.iter().any(|(node_id, node)| {
+            let parameters = match &node.data {
+                NodeData::ArrowFunction(function) => &function.parameters,
+                NodeData::FunctionExpression(function) => &function.parameters,
+                NodeData::FunctionDeclaration(function) => &function.parameters,
+                NodeData::MethodDeclaration(method) => &method.parameters,
+                _ => return false,
+            };
+            if parameters.nodes.len() != signature.parameters.len()
+                || !self
+                    .node_types
+                    .and_then(|types| types.get(&node_id))
+                    .and_then(|type_id| self.semantic_types.and_then(|types| types.get(*type_id)))
+                    .is_some_and(|type_| {
+                        matches!(&type_.kind, TypeKind::Function(source) if source == signature)
+                    })
+            {
+                return false;
+            }
+            let Some(NodeData::ParameterDeclaration(parameter)) = parameters
+                .nodes
+                .get(index)
+                .and_then(|parameter| self.arena.get(*parameter))
+                .map(|parameter| &parameter.data)
+            else {
+                return false;
+            };
+            let name_matches = signature
+                .parameter_names
+                .get(index)
+                .is_none_or(|name| {
+                    declaration_name_text(self.arena, parameter.name) == Some(name)
+                });
+            name_matches
+                && parameter.type_.is_some()
+                && parameter.question_token.is_none()
+                && parameter.initializer.is_none()
         })
     }
 
@@ -25914,6 +25995,7 @@ struct Printer<'a> {
     active_anonymous_private_class: Option<NodeId>,
     private_destructuring_rewrites: HashMap<NodeId, PrivateDestructuringRewrite>,
     preemitted_source_prologues: HashSet<NodeId>,
+    preemitted_captured_while_loops: HashMap<NodeId, String>,
     captured_loop_body: Option<NodeId>,
     downlevel_super_context: Option<(String, bool)>,
     downlevel_constructor_super_capture: Option<String>,
@@ -31175,6 +31257,20 @@ impl Printer<'_> {
                 self.emit_if_statement(id, data)?;
             }
             NodeData::WhileStatement(data) => {
+                if let Some(loop_name) = self.preemitted_captured_while_loops.get(&id).cloned() {
+                    self.writer.write("while (");
+                    self.emit_expression(data.expression, 0)?;
+                    self.writer.write(") {");
+                    self.writer.newline();
+                    self.writer.indent += 1;
+                    self.writer.write(&loop_name);
+                    self.writer.write("();");
+                    self.writer.newline();
+                    self.writer.indent -= 1;
+                    self.writer.write("}");
+                    self.record_mapping_at(node.range.end.get());
+                    return Ok(());
+                }
                 self.writer.write("while (");
                 self.emit_expression(data.expression, 0)?;
                 self.writer.write(") ");
@@ -32329,6 +32425,134 @@ impl Printer<'_> {
             }
         }
         Ok(())
+    }
+
+    fn preemit_es5_captured_while_loop(
+        &mut self,
+        id: NodeId,
+        data: &ts_ast::WhileStatementData,
+    ) -> Result<bool, EmitError> {
+        if !self.es5_while_loop_needs_capture(data) {
+            return Ok(false);
+        }
+        let body_node = self.node(data.statement)?.clone();
+        let NodeData::Block(block) = &body_node.data else {
+            return Ok(false);
+        };
+        let loop_name = self.generated_names.generate("_loop");
+        let mut hoisted = Vec::new();
+        self.writer.write("var ");
+        self.writer.write(&loop_name);
+        self.writer.write(" = function () {");
+        self.writer.newline();
+        self.writer.indent += 1;
+        let mut previous_end = body_node.range.start.get().saturating_add(1);
+        let mut previous_emitted = false;
+        for statement in &block.statements.nodes {
+            let statement_node = self.node(*statement)?.clone();
+            let current_emitted = self.statement_emits_in_place(*statement, &statement_node);
+            self.emit_source_comments_between_with_ownership(
+                previous_end,
+                statement_node.range.start.get(),
+                previous_emitted,
+                current_emitted,
+            );
+            if let NodeData::VariableStatement(variable) = &statement_node.data
+                && let Some(list_node) = self.arena.get(variable.declaration_list)
+                && !variable_list_is_block_scoped(list_node)
+                && let NodeData::VariableDeclarationList(list) = &list_node.data
+            {
+                let mut emitted_initializer = false;
+                for declaration_id in &list.declarations.nodes {
+                    let Some(NodeData::VariableDeclaration(declaration)) =
+                        self.arena.get(*declaration_id).map(|node| &node.data)
+                    else {
+                        continue;
+                    };
+                    if let Some(name) = declaration_name_text(self.arena, declaration.name) {
+                        hoisted.push(name.to_owned());
+                    }
+                    if let Some(initializer) = declaration.initializer {
+                        if emitted_initializer {
+                            self.writer.write(", ");
+                        }
+                        self.emit_expression(declaration.name, 1)?;
+                        self.writer.write(" = ");
+                        self.emit_expression(initializer, 1)?;
+                        emitted_initializer = true;
+                    }
+                }
+                if emitted_initializer {
+                    self.writer.write(";");
+                    self.writer.newline();
+                }
+            } else {
+                self.emit_statement(*statement)?;
+            }
+            previous_end = statement_node.range.end.get();
+            previous_emitted = current_emitted;
+        }
+        self.emit_source_comments_between_with_trailing(
+            previous_end,
+            body_node.range.end.get().saturating_sub(1),
+            previous_emitted,
+        );
+        self.writer.indent -= 1;
+        self.writer.write("};");
+        self.writer.newline();
+        if !hoisted.is_empty() {
+            self.writer.write("var ");
+            self.writer.write(&hoisted.join(", "));
+            self.writer.write(";");
+            self.writer.newline();
+        }
+        self.preemitted_captured_while_loops.insert(id, loop_name);
+        Ok(true)
+    }
+
+    fn es5_while_loop_needs_capture(&self, data: &ts_ast::WhileStatementData) -> bool {
+        if self.settings.target >= ScriptTarget::Es2015 {
+            return false;
+        }
+        let Some(NodeData::Block(block)) = self.arena.get(data.statement).map(|node| &node.data)
+        else {
+            return false;
+        };
+        let structurally_captured = block.statements.nodes.iter().any(|statement| {
+            let Some(NodeData::VariableStatement(statement)) =
+                self.arena.get(*statement).map(|node| &node.data)
+            else {
+                return false;
+            };
+            let Some(list_node) = self.arena.get(statement.declaration_list) else {
+                return false;
+            };
+            let NodeData::VariableDeclarationList(list) = &list_node.data else {
+                return false;
+            };
+            variable_list_is_block_scoped(list_node)
+                && list.declarations.nodes.iter().any(|declaration| {
+                    let Some(NodeData::VariableDeclaration(declaration)) =
+                        self.arena.get(*declaration).map(|node| &node.data)
+                    else {
+                        return false;
+                    };
+                    let Some(name) = declaration_name_text(self.arena, declaration.name) else {
+                        return false;
+                    };
+                    self.arena.iter().any(|(reference, node)| {
+                        reference != declaration.name
+                            && matches!(
+                                &node.data,
+                                NodeData::Identifier(identifier) if identifier.text == name
+                            )
+                            && node_is_in_nested_function(self.arena, reference, data.statement)
+                            && identifier_is_unqualified_value_reference(self.arena, reference)
+                    })
+                })
+        });
+        self.loop_body_has_captured_block_scoped_declaration(data.statement)
+            || structurally_captured
     }
 
     #[allow(clippy::too_many_lines)]
@@ -41947,9 +42171,27 @@ impl Printer<'_> {
     ) -> Result<(), EmitError> {
         match self.arena.get(statement).map(|node| &node.data) {
             Some(NodeData::Block(block)) => {
+                let block_node = self.node(statement)?.clone();
+                let mut previous_end = block_node.range.start.get().saturating_add(1);
+                let mut previous_emitted = false;
                 for statement in &block.statements.nodes {
+                    let statement_node = self.node(*statement)?.clone();
+                    let current_emitted = self.statement_emits_in_place(*statement, &statement_node);
+                    self.emit_source_comments_between_with_ownership(
+                        previous_end,
+                        statement_node.range.start.get(),
+                        previous_emitted,
+                        current_emitted,
+                    );
                     self.emit_es5_async_planned_statement(*statement, state, case, false)?;
+                    previous_end = statement_node.range.end.get();
+                    previous_emitted = current_emitted;
                 }
+                self.emit_source_comments_between_with_trailing(
+                    previous_end,
+                    block_node.range.end.get().saturating_sub(1),
+                    previous_emitted,
+                );
                 Ok(())
             }
             _ => self.emit_es5_async_planned_statement(statement, state, case, false),
@@ -55116,7 +55358,7 @@ impl Printer<'_> {
                 if self.settings.target < ScriptTarget::Es2015
                     && let Some(temp) = self.computed_property_temps.get(&id).cloned()
                 {
-                    self.emit_es5_computed_object_literal(data, &temp)?;
+                    self.emit_es5_computed_object_literal(id, data, &temp)?;
                     return Ok(());
                 }
                 if self.settings.target < ScriptTarget::Es2018
@@ -58510,16 +58752,24 @@ impl Printer<'_> {
 
     fn emit_es5_computed_object_literal(
         &mut self,
+        object: NodeId,
         data: &ts_ast::ObjectLiteralExpressionData,
         temp: &str,
     ) -> Result<(), EmitError> {
+        let multiline = self.node_source_is_multiline(object);
         self.writer.write("(");
         self.writer.write(temp);
         self.writer.write(" = {},");
-        self.writer.indent += 1;
+        if multiline {
+            self.writer.indent += 1;
+        }
         for property_id in &data.properties.nodes {
             let property_node = self.node(*property_id)?.clone();
-            self.writer.newline();
+            if multiline {
+                self.writer.newline();
+            } else {
+                self.writer.write(" ");
+            }
             match &property_node.data {
                 NodeData::PropertyAssignment(property) => {
                     self.writer.write(temp);
@@ -58563,9 +58813,15 @@ impl Printer<'_> {
             }
             self.writer.write(",");
         }
-        self.writer.newline();
+        if multiline {
+            self.writer.newline();
+        } else {
+            self.writer.write(" ");
+        }
         self.writer.write(temp);
-        self.writer.indent -= 1;
+        if multiline {
+            self.writer.indent -= 1;
+        }
         self.writer.write(")");
         Ok(())
     }

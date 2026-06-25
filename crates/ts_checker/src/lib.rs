@@ -14258,14 +14258,18 @@ impl<'a> Checker<'a> {
                                 .collect::<Vec<_>>()
                         })
                         .unwrap_or_default();
-                    let Some(symbol) = self.resolve_type_entity_symbol(data.type_name) else {
+                    let type_id = if let Some(symbol) =
+                        self.resolve_type_entity_symbol(data.type_name)
+                    {
+                        self.instantiate_alias(symbol, &arguments)
+                            .or_else(|| self.instantiate_declared_object(symbol, &arguments))
+                            .or_else(|| self.result.symbol_types.get(&symbol).copied())
+                            .unwrap_or_else(|| self.result.types.unknown())
+                    } else if let Some(type_id) = self.entity_name_type(data.type_name) {
+                        type_id
+                    } else {
                         return self.unresolved_type_name(data.type_name, name);
                     };
-                    let type_id = self
-                        .instantiate_alias(symbol, &arguments)
-                        .or_else(|| self.instantiate_declared_object(symbol, &arguments))
-                        .or_else(|| self.result.symbol_types.get(&symbol).copied())
-                        .unwrap_or_else(|| self.result.types.unknown());
                     let Some(kind) = self
                         .result
                         .types
@@ -14510,7 +14514,19 @@ impl<'a> Checker<'a> {
                     .iter()
                     .map(|node| self.type_from_type_node(*node))
                     .collect::<Vec<_>>();
-                self.result.types.union(members)
+                if members
+                    .iter()
+                    .any(|member| {
+                        self.result
+                            .named_type_references
+                            .get(member)
+                            .is_some_and(|reference| reference.name.contains('.'))
+                    })
+                {
+                    self.result.types.alloc(TypeKind::Union(members))
+                } else {
+                    self.result.types.union(members)
+                }
             }
             NodeData::IntersectionTypeNode(data) => {
                 let members = data
