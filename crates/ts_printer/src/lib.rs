@@ -597,6 +597,9 @@ pub fn emit_source_file_with_context(
         {
             helpers.insert("__assign");
         }
+        if settings.target < ScriptTarget::Es2015 && source_needs_spread_array_helper(arena) {
+            helpers.insert("__spreadArray");
+        }
         if settings.target < ScriptTarget::Es2018 && source_needs_object_rest_helper(arena) {
             helpers.insert("__rest");
         }
@@ -693,6 +696,7 @@ pub fn emit_source_file_with_context(
             const HELPER_ORDER: &[&str] = &[
                 "__extends",
                 "__assign",
+                "__spreadArray",
                 "__rest",
                 "__awaiter",
                 "__generator",
@@ -854,6 +858,9 @@ pub fn emit_source_file_with_context(
     let needs_assign_helper = settings.target < ScriptTarget::Es2015
         && source_needs_assign_helper(arena)
         && !settings.no_emit_helpers;
+    let needs_spread_array_helper = settings.target < ScriptTarget::Es2015
+        && source_needs_spread_array_helper(arena)
+        && !settings.no_emit_helpers;
     let needs_make_template_object_helper = arena.iter().any(|(_, node)| {
         matches!(
             &node.data,
@@ -983,6 +990,12 @@ pub fn emit_source_file_with_context(
         && !printer.imported_helpers.contains("__assign")
     {
         printer.emit_assign_helper();
+    }
+    if needs_spread_array_helper
+        && !matches!(settings.module, ModuleKind::Amd | ModuleKind::Umd | ModuleKind::System)
+        && !printer.imported_helpers.contains("__spreadArray")
+    {
+        printer.emit_spread_array_helper();
     }
     if settings.experimental_decorators
         && source_needs_legacy_decorate_helper(arena)
@@ -1770,6 +1783,16 @@ fn source_needs_assign_helper(arena: &NodeArena) -> bool {
                 arena.get(*property).map(|node| &node.data),
                 Some(NodeData::SpreadAssignment(_))
             ))) || matches!(node.data, NodeData::JsxSpreadAttribute(_))
+    })
+}
+
+fn source_needs_spread_array_helper(arena: &NodeArena) -> bool {
+    arena.iter().any(|(_, node)| {
+        matches!(&node.data, NodeData::ArrayLiteralExpression(array)
+            if array.elements.nodes.iter().any(|element| matches!(
+                arena.get(*element).map(|node| &node.data),
+                Some(NodeData::SpreadElement(_))
+            )))
     })
 }
 
@@ -26943,16 +26966,22 @@ impl Printer<'_> {
                     else {
                         continue;
                     };
+                    let dependency_path = amd_import_dependency_path(
+                        context
+                            .amd_module_specifier_rewrites
+                            .get(path)
+                            .map_or(path, String::as_str),
+                        context.amd_bundle,
+                    );
+                    let parameter = self.identifier_text(import.name)?.to_owned();
                     dependencies.push(AmdRuntimeDependency {
-                        path: amd_import_dependency_path(
-                            context
-                                .amd_module_specifier_rewrites
-                                .get(path)
-                                .map_or(path, String::as_str),
-                            context.amd_bundle,
-                        ),
-                        parameter: Some(self.identifier_text(import.name)?.to_owned()),
+                        path: dependency_path,
+                        parameter: (self.settings.module != ModuleKind::Umd)
+                            .then(|| parameter.clone()),
                     });
+                    if self.settings.module == ModuleKind::Umd {
+                        aliased_import_requires.push((parameter, path.to_owned()));
+                    }
                     if self.has_modifier(import.modifiers.as_ref(), SyntaxKind::ExportKeyword)
                         && let Some(symbol) = self
                             .bindings
@@ -27161,43 +27190,67 @@ impl Printer<'_> {
                 _ => {}
             }
         }
-        let mut leading_named_dependencies = Vec::new();
-        let mut trailing_named_dependencies = Vec::new();
-        for dependency in context
-            .amd_dependencies
-            .iter()
-            .filter(|dependency| dependency.name.is_some())
-        {
-            let name = dependency.name.expect("named dependency checked");
-            let runtime = AmdRuntimeDependency {
-                path: dependency.path.to_owned(),
-                parameter: Some(name.to_owned()),
-            };
-            if dependencies
-                .iter()
-                .any(|runtime| runtime.path == dependency.path)
-            {
-                trailing_named_dependencies.push(AmdRuntimeDependency {
-                    path: name.to_owned(),
-                    parameter: runtime.parameter,
-                });
-            } else {
-                leading_named_dependencies.push(runtime);
-            }
-        }
-        leading_named_dependencies.append(&mut dependencies);
-        leading_named_dependencies.append(&mut trailing_named_dependencies);
-        dependencies = leading_named_dependencies;
-        dependencies.extend(
-            context
+        if self.settings.module == ModuleKind::Umd {
+            let mut pragma_dependencies = context
                 .amd_dependencies
                 .iter()
-                .filter(|dependency| dependency.name.is_none())
+                .filter(|dependency| dependency.name.is_some())
                 .map(|dependency| AmdRuntimeDependency {
                     path: dependency.path.to_owned(),
-                    parameter: None,
-                }),
-        );
+                    parameter: dependency.name.map(str::to_owned),
+                })
+                .collect::<Vec<_>>();
+            pragma_dependencies.extend(
+                context
+                    .amd_dependencies
+                    .iter()
+                    .filter(|dependency| dependency.name.is_none())
+                    .map(|dependency| AmdRuntimeDependency {
+                        path: dependency.path.to_owned(),
+                        parameter: None,
+                    }),
+            );
+            pragma_dependencies.append(&mut dependencies);
+            dependencies = pragma_dependencies;
+        } else {
+            let mut leading_named_dependencies = Vec::new();
+            let mut trailing_named_dependencies = Vec::new();
+            for dependency in context
+                .amd_dependencies
+                .iter()
+                .filter(|dependency| dependency.name.is_some())
+            {
+                let name = dependency.name.expect("named dependency checked");
+                let runtime = AmdRuntimeDependency {
+                    path: dependency.path.to_owned(),
+                    parameter: Some(name.to_owned()),
+                };
+                if dependencies
+                    .iter()
+                    .any(|runtime| runtime.path == dependency.path)
+                {
+                    trailing_named_dependencies.push(AmdRuntimeDependency {
+                        path: name.to_owned(),
+                        parameter: runtime.parameter,
+                    });
+                } else {
+                    leading_named_dependencies.push(runtime);
+                }
+            }
+            leading_named_dependencies.append(&mut dependencies);
+            leading_named_dependencies.append(&mut trailing_named_dependencies);
+            dependencies = leading_named_dependencies;
+            dependencies.extend(
+                context
+                    .amd_dependencies
+                    .iter()
+                    .filter(|dependency| dependency.name.is_none())
+                    .map(|dependency| AmdRuntimeDependency {
+                        path: dependency.path.to_owned(),
+                        parameter: None,
+                    }),
+            );
+        }
         dependencies.extend(side_effect_dependencies);
 
         if data.statements.nodes.iter().all(|statement| {
@@ -27210,7 +27263,7 @@ impl Printer<'_> {
             self.emit_detached_reference_directives_between(0, node.range.start.get());
         }
 
-        if self.settings.module == ModuleKind::Amd {
+        if matches!(self.settings.module, ModuleKind::Amd | ModuleKind::Umd) {
             for dependency in context.amd_dependencies {
                 let start = usize::try_from(dependency.comment_start).unwrap_or(usize::MAX);
                 let end = usize::try_from(dependency.comment_end).unwrap_or(usize::MAX);
@@ -27256,6 +27309,13 @@ impl Printer<'_> {
             if source_needs_legacy_param_helper(self.arena) {
                 self.emit_param_helper();
             }
+        }
+        if self.settings.target < ScriptTarget::Es2015
+            && source_needs_spread_array_helper(self.arena)
+            && self.import_helpers_namespace.is_none()
+            && !self.settings.no_emit_helpers
+        {
+            self.emit_spread_array_helper();
         }
         if self.settings.module == ModuleKind::Umd {
             self.writer.write("(function (factory) {");
@@ -27418,20 +27478,6 @@ impl Printer<'_> {
             self.writer.write(&initializer.parameter);
             self.writer.write(");");
             self.writer.newline();
-        }
-        if self.settings.module == ModuleKind::Umd && !aliased_import_requires.is_empty() {
-            for dependency in context
-                .amd_dependencies
-                .iter()
-                .filter(|dependency| dependency.name.is_some())
-            {
-                let start = usize::try_from(dependency.comment_start).unwrap_or(usize::MAX);
-                let end = usize::try_from(dependency.comment_end).unwrap_or(usize::MAX);
-                if let Some(comment) = self.source_text.get(start..end) {
-                    self.writer.write(comment);
-                    self.writer.newline();
-                }
-            }
         }
         for (parameter, alias) in &aliased_import_requires {
             self.writer.write("const ");
@@ -27709,6 +27755,13 @@ impl Printer<'_> {
             if source_needs_legacy_param_helper(self.arena) {
                 self.emit_param_helper();
             }
+        }
+        if self.settings.target < ScriptTarget::Es2015
+            && source_needs_spread_array_helper(self.arena)
+            && self.import_helpers_namespace.is_none()
+            && !self.settings.no_emit_helpers
+        {
+            self.emit_spread_array_helper();
         }
         if !plan.hoisted_names.is_empty() {
             self.writer.write("var ");
@@ -29271,6 +29324,23 @@ impl Printer<'_> {
         }
     }
 
+    fn emit_spread_array_helper(&mut self) {
+        for line in [
+            "var __spreadArray = (this && this.__spreadArray) || function (to, from, pack) {",
+            "    if (pack || arguments.length === 2) for (var i = 0, l = from.length, ar; i < l; i++) {",
+            "        if (ar || !(i in from)) {",
+            "            if (!ar) ar = Array.prototype.slice.call(from, 0, i);",
+            "            ar[i] = from[i];",
+            "        }",
+            "    }",
+            "    return to.concat(ar || Array.prototype.slice.call(from));",
+            "};",
+        ] {
+            self.writer.write(line);
+            self.writer.newline();
+        }
+    }
+
     fn emit_make_template_object_helper(&mut self) {
         for line in [
             "var __makeTemplateObject = (this && this.__makeTemplateObject) || function (cooked, raw) {",
@@ -30156,6 +30226,9 @@ impl Printer<'_> {
         }
         if self.verbatim_module_syntax {
             return true;
+        }
+        if !self.import_semantically_has_runtime_value(declaration) {
+            return false;
         }
         let has_runtime_reference = self.import_binding_has_emitted_runtime_use(import.name)
             || self.identifier_text(import.name).is_ok_and(|name| {
@@ -59370,35 +59443,39 @@ impl Printer<'_> {
         &mut self,
         data: &ts_ast::ArrayLiteralExpressionData,
     ) -> Result<(), EmitError> {
-        self.writer.write("[].concat([]");
-        let mut array_open = false;
-        let mut elements_in_array = 0_usize;
+        let mut chunks = vec![(false, Vec::new())];
         for element in &data.elements.nodes {
             let node = self.node(*element)?.clone();
-            if let NodeData::SpreadElement(spread) = &node.data {
-                if array_open {
-                    self.writer.write("]");
-                    array_open = false;
-                }
-                self.writer.write(", ");
+            if matches!(node.data, NodeData::SpreadElement(_)) {
+                chunks.push((true, vec![*element]));
+            } else if chunks.last().is_some_and(|chunk| chunk.0) {
+                chunks.push((false, vec![*element]));
+            } else if let Some((_, elements)) = chunks.last_mut() {
+                elements.push(*element);
+            }
+        }
+        for _ in 1..chunks.len() {
+            self.emit_helper_reference("__spreadArray");
+            self.writer.write("(");
+        }
+        self.emit_es5_spread_ordinary_array(
+            &chunks[0].1.iter().copied().map(Some).collect::<Vec<_>>(),
+        )?;
+        for (spread, elements) in &chunks[1..] {
+            self.writer.write(", ");
+            if *spread {
+                let NodeData::SpreadElement(spread) = &self.node(elements[0])?.data else {
+                    unreachable!("spread chunk identified above")
+                };
                 self.emit_expression(spread.expression, 1)?;
-                continue;
+                self.writer.write(", true)");
+            } else {
+                self.emit_es5_spread_ordinary_array(
+                    &elements.iter().copied().map(Some).collect::<Vec<_>>(),
+                )?;
+                self.writer.write(", false)");
             }
-            if !array_open {
-                self.writer.write(", [");
-                array_open = true;
-                elements_in_array = 0;
-            }
-            if elements_in_array != 0 {
-                self.writer.write(", ");
-            }
-            self.emit_expression(*element, 0)?;
-            elements_in_array += 1;
         }
-        if array_open {
-            self.writer.write("]");
-        }
-        self.writer.write(")");
         Ok(())
     }
 
@@ -65258,6 +65335,26 @@ mod tests {
     }
 
     #[test]
+    fn preserves_amd_dependency_pragmas_before_umd_wrapper() {
+        let source = concat!(
+            "///<amd-dependency path='bar' name='b'/>\n",
+            "///<amd-dependency path='foo'/>\n",
+            "import m1 = require(\"m2\");\n",
+            "m1.f();",
+        );
+        let output = emit_umd(source).code;
+        assert!(
+            output.starts_with(concat!(
+                "///<amd-dependency path='bar' name='b'/>\n",
+                "///<amd-dependency path='foo'/>\n",
+                "(function (factory) {\n",
+            )),
+            "{output}"
+        );
+        assert_eq!(output.matches("<amd-dependency").count(), 2, "{output}");
+    }
+
+    #[test]
     fn emits_amd_live_binding_for_reexported_named_import() {
         let output =
             emit_amd("import { Foo } from './a'; const c = new Foo(); export { c, Foo };").code;
@@ -65944,6 +66041,24 @@ mod tests {
             "{output}"
         );
         assert!(!output.contains("__spreadArray"), "{output}");
+    }
+
+    #[test]
+    fn downlevels_array_spreads_with_the_spread_array_helper() {
+        let output = emit_with(
+            "const values = [...typed];",
+            ScriptTarget::Es5,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(
+            output.contains("var __spreadArray = (this && this.__spreadArray)"),
+            "{output}"
+        );
+        assert!(
+            output.contains("var values = __spreadArray([], typed, true);"),
+            "{output}"
+        );
     }
 
     #[test]
