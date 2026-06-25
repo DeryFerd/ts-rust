@@ -25103,6 +25103,7 @@ enum CommonJsDestructuringValue {
     Temp(String),
     Property(Box<Self>, NodeId),
     Element(Box<Self>, usize),
+    Slice(Box<Self>, usize),
     Default(Box<Self>, NodeId),
 }
 
@@ -32700,7 +32701,20 @@ impl Printer<'_> {
                                 || self
                                     .commonjs_destructuring_pattern_updates_export(binary.left)) =>
                     {
-                        Some((node.range.start.get(), Some(id), binary.left))
+                        let reusable_root = matches!(
+                            self.arena.get(binary.right).map(|node| &node.data),
+                            Some(NodeData::Identifier(identifier))
+                                if !self.commonjs_destructuring_pattern_contains_identifier(
+                                    binary.left,
+                                    &identifier.text,
+                                )
+                        );
+                        Some((
+                            node.range.start.get(),
+                            Some(id),
+                            binary.left,
+                            reusable_root,
+                        ))
                     }
                     NodeData::ForInOrOfStatement(data)
                         if node.kind == SyntaxKind::ForOfStatement
@@ -32713,15 +32727,15 @@ impl Printer<'_> {
                                 )
                             ) =>
                     {
-                        Some((node.range.start.get(), None, data.initializer))
+                        Some((node.range.start.get(), None, data.initializer, false))
                     }
                     _ => None,
                 }
             })
             .collect::<Vec<_>>();
-        assignments.sort_by_key(|(start, _, _)| *start);
+        assignments.sort_by_key(|(start, ..)| *start);
         let mut claimed_by_container = HashMap::<NodeId, HashSet<String>>::new();
-        for (_, expression, pattern) in assignments {
+        for (_, expression, pattern, reusable_root) in assignments {
             if let Some(expression) = expression {
                 self.commonjs_destructuring_assignment_roots
                     .insert(expression);
@@ -32734,6 +32748,7 @@ impl Printer<'_> {
                 pattern,
                 container,
                 &mut claimed,
+                reusable_root,
             );
             claimed_by_container.insert(container, claimed);
         }
@@ -32744,6 +32759,7 @@ impl Printer<'_> {
         pattern: NodeId,
         container: NodeId,
         claimed: &mut HashSet<String>,
+        reusable_value: bool,
     ) {
         let is_default = matches!(
             self.arena.get(pattern).map(|node| &node.data),
@@ -32751,7 +32767,9 @@ impl Printer<'_> {
                 if self.arena.get(binary.operator_token)
                     .is_some_and(|operator| operator.kind == SyntaxKind::EqualsToken)
         );
-        if self.commonjs_destructuring_pattern_value_use_count(pattern) > 1 || is_default {
+        if (!reusable_value && self.commonjs_destructuring_pattern_value_needs_temp(pattern))
+            || is_default
+        {
             self.prepare_commonjs_destructuring_pattern_temp(pattern, container, claimed);
         }
         match self.arena.get(pattern).map(|node| &node.data) {
@@ -32760,6 +32778,7 @@ impl Printer<'_> {
                     binary.left,
                     container,
                     claimed,
+                    false,
                 );
             }
             Some(NodeData::ObjectLiteralExpression(object)) => {
@@ -32771,6 +32790,7 @@ impl Printer<'_> {
                                 property.initializer,
                                 container,
                                 claimed,
+                                false,
                             );
                         }
                         Some(NodeData::ShorthandPropertyAssignment(property)) => {
@@ -32783,6 +32803,7 @@ impl Printer<'_> {
                             }
                             self.prepare_commonjs_destructuring_pattern_temps(
                                 name, container, claimed,
+                                false,
                             );
                         }
                         Some(NodeData::SpreadAssignment(spread)) => {
@@ -32790,6 +32811,7 @@ impl Printer<'_> {
                                 spread.expression,
                                 container,
                                 claimed,
+                                false,
                             );
                         }
                         _ => {}
@@ -32806,10 +32828,12 @@ impl Printer<'_> {
                             spread.expression,
                             container,
                             claimed,
+                            false,
                         );
                     } else {
                         self.prepare_commonjs_destructuring_pattern_temps(
                             element, container, claimed,
+                            false,
                         );
                     }
                 }
@@ -32879,6 +32903,57 @@ impl Printer<'_> {
         }
     }
 
+    fn commonjs_destructuring_pattern_value_needs_temp(&self, pattern: NodeId) -> bool {
+        if self.commonjs_destructuring_pattern_value_use_count(pattern) > 1 {
+            return true;
+        }
+        match self.arena.get(pattern).map(|node| &node.data) {
+            Some(NodeData::ObjectLiteralExpression(object)) => object.properties.nodes.iter().any(
+                |property| match self.arena.get(*property).map(|node| &node.data) {
+                    Some(NodeData::PropertyAssignment(property)) => matches!(
+                        self.arena.get(property.initializer).map(|node| node.kind),
+                        Some(
+                            SyntaxKind::ObjectLiteralExpression
+                                | SyntaxKind::ArrayLiteralExpression
+                        )
+                    ),
+                    _ => false,
+                },
+            ),
+            Some(NodeData::ArrayLiteralExpression(array)) => {
+                let mut saw_omission = false;
+                for element in &array.elements.nodes {
+                    match self.arena.get(*element).map(|node| &node.data) {
+                        Some(NodeData::OmittedExpression(_)) => saw_omission = true,
+                        Some(NodeData::SpreadElement(spread)) => {
+                            return saw_omission
+                                || matches!(
+                                    self.arena.get(spread.expression).map(|node| node.kind),
+                                    Some(
+                                        SyntaxKind::ObjectLiteralExpression
+                                            | SyntaxKind::ArrayLiteralExpression
+                                    )
+                                );
+                        }
+                        Some(_) => {
+                            return saw_omission
+                                || matches!(
+                                    self.arena.get(*element).map(|node| node.kind),
+                                    Some(
+                                        SyntaxKind::ObjectLiteralExpression
+                                            | SyntaxKind::ArrayLiteralExpression
+                                    )
+                                );
+                        }
+                        None => {}
+                    }
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
     fn commonjs_destructuring_pattern_leaf_count(&self, pattern: NodeId) -> usize {
         match self.arena.get(pattern).map(|node| &node.data) {
             Some(
@@ -32928,6 +33003,61 @@ impl Printer<'_> {
                 self.commonjs_destructuring_pattern_leaf_count(binary.left)
             }
             _ => 0,
+        }
+    }
+
+    fn commonjs_destructuring_pattern_contains_identifier(
+        &self,
+        pattern: NodeId,
+        name: &str,
+    ) -> bool {
+        match self.arena.get(pattern).map(|node| &node.data) {
+            Some(NodeData::Identifier(identifier)) => identifier.text == name,
+            Some(NodeData::BinaryExpression(binary))
+                if self
+                    .arena
+                    .get(binary.operator_token)
+                    .is_some_and(|operator| operator.kind == SyntaxKind::EqualsToken) =>
+            {
+                self.commonjs_destructuring_pattern_contains_identifier(binary.left, name)
+            }
+            Some(NodeData::ObjectLiteralExpression(object)) => {
+                object.properties.nodes.iter().any(|property| {
+                    match self.arena.get(*property).map(|node| &node.data) {
+                        Some(NodeData::PropertyAssignment(property)) => self
+                            .commonjs_destructuring_pattern_contains_identifier(
+                                property.initializer,
+                                name,
+                            ),
+                        Some(NodeData::ShorthandPropertyAssignment(property)) => self
+                            .commonjs_destructuring_pattern_contains_identifier(
+                                property.name,
+                                name,
+                            ),
+                        Some(NodeData::SpreadAssignment(spread)) => self
+                            .commonjs_destructuring_pattern_contains_identifier(
+                                spread.expression,
+                                name,
+                            ),
+                        _ => false,
+                    }
+                })
+            }
+            Some(NodeData::ArrayLiteralExpression(array)) => {
+                array.elements.nodes.iter().any(|element| {
+                    match self.arena.get(*element).map(|node| &node.data) {
+                        Some(NodeData::SpreadElement(spread)) => self
+                            .commonjs_destructuring_pattern_contains_identifier(
+                                spread.expression,
+                                name,
+                            ),
+                        Some(NodeData::OmittedExpression(_)) | None => false,
+                        Some(_) => self
+                            .commonjs_destructuring_pattern_contains_identifier(*element, name),
+                    }
+                })
+            }
+            _ => false,
         }
     }
 
@@ -55253,7 +55383,10 @@ impl Printer<'_> {
                     let is_inlined_constant = self.const_enum_emit_mode.inlines_accesses()
                         && (self.enum_access_values.contains_key(&id)
                             || self.enum_access_fallbacks.contains_key(&id));
-                    if is_binary && !is_inlined_constant {
+                    if is_binary
+                        && !is_inlined_constant
+                        && !self.commonjs_destructuring_assignment_roots.contains(&id)
+                    {
                         actions.push(Action::Binary(id, precedence));
                     } else {
                         self.emit_expression(id, precedence)?;
@@ -55460,7 +55593,7 @@ impl Printer<'_> {
         let NodeData::BinaryExpression(binary) = &node.data else {
             return Err(Self::unsupported(expression, node.kind));
         };
-        let wrap = parent_precedence > 0;
+        let wrap = parent_precedence > 1;
         if wrap {
             self.writer.write("(");
         }
@@ -55573,7 +55706,10 @@ impl Printer<'_> {
                         NodeData::SpreadElement(spread) => {
                             self.emit_commonjs_destructuring_pattern(
                                 spread.expression,
-                                value.clone(),
+                                CommonJsDestructuringValue::Slice(
+                                    Box::new(value.clone()),
+                                    index,
+                                ),
                                 first,
                             )?;
                         }
@@ -55664,6 +55800,12 @@ impl Printer<'_> {
                 self.writer.write("[");
                 self.writer.write(&index.to_string());
                 self.writer.write("]");
+            }
+            CommonJsDestructuringValue::Slice(value, index) => {
+                self.emit_commonjs_destructuring_value(value)?;
+                self.writer.write(".slice(");
+                self.writer.write(&index.to_string());
+                self.writer.write(")");
             }
             CommonJsDestructuringValue::Default(value, default) => {
                 self.emit_commonjs_destructuring_value(value)?;
@@ -59925,6 +60067,15 @@ mod tests {
             )
             .code,
             "for (var all = make().slice(0), i = 0; i < 1; i++)\n    use(all);\n"
+        );
+        assert_eq!(
+            emit_with(
+                "let first, second, i; for (([first, second] = values), i = 0; i < 1; i++) use(second);",
+                ScriptTarget::Es5,
+                ModuleKind::EsNext,
+            )
+            .code,
+            "var first, second, i;\nfor ((first = values[0], second = values[1]), i = 0; i < 1; i++)\n    use(second);\n"
         );
     }
 

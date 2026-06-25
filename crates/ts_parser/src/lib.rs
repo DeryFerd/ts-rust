@@ -6061,6 +6061,18 @@ impl<'a> Parser<'a> {
         while self.current.kind != SyntaxKind::CloseBracketToken
             && self.current.kind != SyntaxKind::EndOfFile
         {
+            if self.current.kind == SyntaxKind::CommaToken {
+                let position = self.current.range.start;
+                elements.push(self.alloc_node(
+                    SyntaxKind::OmittedExpression,
+                    TextRange::new(position, position),
+                    NodeData::OmittedExpression(Box::new(OmittedExpressionData)),
+                    &[],
+                ));
+                self.bump();
+                trailing = self.current.kind == SyntaxKind::CloseBracketToken;
+                continue;
+            }
             elements.push(self.parse_spread_element_or_expression());
             if self.current.kind == SyntaxKind::ColonToken {
                 // Recover an object/type-like `name: value` fragment inside an array as two
@@ -13171,6 +13183,39 @@ mod tests {
             4
         );
         assert!(pattern.elements.has_trailing_comma);
+    }
+
+    #[test]
+    fn preserves_omitted_array_literal_elements() {
+        let result = parse_source_file("const values = [, second, ,];");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let (list, _) = variable_list(&result, source_statements(&result)[0]);
+        let declaration = declaration_nodes(&result, list)[0];
+        let NodeData::VariableDeclaration(declaration) =
+            &result.arena.get(declaration).unwrap().data
+        else {
+            panic!("expected variable declaration");
+        };
+        let initializer = declaration.initializer.expect("initializer");
+        let NodeData::ArrayLiteralExpression(array) =
+            &result.arena.get(initializer).unwrap().data
+        else {
+            panic!("expected array literal");
+        };
+        assert_eq!(
+            array
+                .elements
+                .nodes
+                .iter()
+                .map(|element| result.arena.get(*element).unwrap().kind)
+                .collect::<Vec<_>>(),
+            [
+                SyntaxKind::OmittedExpression,
+                SyntaxKind::Identifier,
+                SyntaxKind::OmittedExpression,
+            ]
+        );
+        assert!(array.elements.has_trailing_comma);
     }
 
     #[test]
