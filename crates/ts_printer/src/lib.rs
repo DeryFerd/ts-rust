@@ -842,7 +842,16 @@ pub fn emit_source_file_with_context(
         if !defer_commonjs_leading_comments {
             printer.emit_leading_detached_source_comments(start);
         }
-        if settings.module == ModuleKind::CommonJs && is_external_module {
+        if settings.module == ModuleKind::CommonJs
+            && is_external_module
+            && !(printer.automatic_jsx.any()
+                && data.statements.nodes.first().is_some_and(|statement| {
+                    arena.get(*statement).is_some_and(|node| {
+                        matches!(node.data, NodeData::ImportDeclaration(_))
+                            && !printer.statement_emits_runtime(*statement, node)
+                    })
+                }))
+        {
             printer.emit_detached_reference_directives_between(0, start);
         }
         if needs_extends_helper || (settings.module == ModuleKind::CommonJs && is_external_module) {
@@ -1303,7 +1312,10 @@ pub fn emit_source_file_with_context(
                         node.range.start.get(),
                     );
                 }
-            } else if settings.module != ModuleKind::None && has_runtime_statement {
+            } else if settings.module != ModuleKind::None
+                && has_runtime_statement
+                && !(printer.automatic_jsx.any() && erased_import)
+            {
                 printer.emit_detached_reference_directives_between(
                     reference_owner_start,
                     node.range.start.get(),
@@ -8322,6 +8334,15 @@ impl DeclarationPrinter<'_> {
                 Some(NodeData::MappedTypeNode(_))
             ) {
                 self.emit_compact_local_alias_type(body, annotation, &mut HashSet::new())?;
+            } else if matches!(
+                self.arena.get(annotation).map(|node| &node.data),
+                Some(NodeData::TypeLiteralNode(literal))
+                    if literal.members.nodes.iter().any(|member| matches!(
+                        self.arena.get(*member).map(|node| &node.data),
+                        Some(NodeData::IndexSignatureDeclaration(_))
+                    ))
+            ) {
+                self.emit_semantic_type(return_type)?;
             } else {
                 self.emit_type(annotation)?;
             }
@@ -15669,6 +15690,7 @@ impl DeclarationPrinter<'_> {
                 self.writer.write(";");
             }
             NodeData::IndexSignatureDeclaration(data) => {
+                self.emit_declaration_member_modifiers(data.modifiers.as_ref());
                 self.writer.write("[");
                 let mut previous_end = data.parameters.range.start.get().saturating_add(1);
                 for (index, parameter) in data.parameters.nodes.iter().enumerate() {
@@ -18397,6 +18419,9 @@ impl DeclarationPrinter<'_> {
             let (number_index_name, string_index_name) =
                 self.semantic_object_index_parameter_names(object);
             if let Some(type_id) = object.number_index_type {
+                if self.semantic_object_index_is_readonly(object, SyntaxKind::NumberKeyword) {
+                    self.writer.write("readonly ");
+                }
                 self.writer.write("[");
                 self.writer.write(&number_index_name);
                 self.writer.write(": number]: ");
@@ -18405,6 +18430,9 @@ impl DeclarationPrinter<'_> {
                 self.writer.newline();
             }
             if let Some(type_id) = object.string_index_type {
+                if self.semantic_object_index_is_readonly(object, SyntaxKind::StringKeyword) {
+                    self.writer.write("readonly ");
+                }
                 self.writer.write("[");
                 self.writer.write(&string_index_name);
                 self.writer.write(": string]: ");
@@ -19244,6 +19272,44 @@ impl DeclarationPrinter<'_> {
             }
         }
         (number_name, string_name)
+    }
+
+    fn semantic_object_index_is_readonly(
+        &self,
+        object: &ObjectType,
+        key_kind: SyntaxKind,
+    ) -> bool {
+        self.matching_source_type_literal(object)
+            .and_then(|id| self.arena.get(id))
+            .and_then(|node| match &node.data {
+                NodeData::TypeLiteralNode(literal) => Some(literal),
+                _ => None,
+            })
+            .is_some_and(|literal| {
+                literal.members.nodes.iter().any(|member| {
+                    let Some(NodeData::IndexSignatureDeclaration(index)) =
+                        self.arena.get(*member).map(|node| &node.data)
+                    else {
+                        return false;
+                    };
+                    let matches_key = index
+                        .parameters
+                        .nodes
+                        .first()
+                        .and_then(|parameter| self.arena.get(*parameter))
+                        .and_then(|parameter| match &parameter.data {
+                            NodeData::ParameterDeclaration(parameter) => parameter.type_,
+                            _ => None,
+                        })
+                        .and_then(|type_| self.arena.get(type_))
+                        .is_some_and(|type_| type_.kind == key_kind);
+                    matches_key
+                        && self.member_has_modifier(
+                            index.modifiers.as_ref(),
+                            SyntaxKind::ReadonlyKeyword,
+                        )
+                })
+            })
     }
 
     #[allow(clippy::too_many_lines)]
@@ -33791,7 +33857,13 @@ impl Printer<'_> {
             if parameter.initializer.is_some() || parameter.dot_dot_dot_token.is_some() {
                 break;
             }
-            let temp = self.generate_block_temp(function, &claimed);
+            let temp = self
+                .identifier_text(parameter.name)
+                .ok()
+                .map_or_else(
+                    || self.generate_block_temp(function, &claimed),
+                    |name| self.generate_named_parameter_temp(function, name, &claimed),
+                );
             claimed.insert(temp.clone());
             outer.nodes.push(*parameter_id);
             overrides.push((*parameter_id, parameter.name, temp));
@@ -33937,6 +34009,31 @@ impl Printer<'_> {
                 }
             }
             count += 1;
+        }
+    }
+
+    fn generate_named_parameter_temp(
+        &self,
+        function: NodeId,
+        name: &str,
+        claimed: &HashSet<String>,
+    ) -> String {
+        let function_range = self.arena.get(function).map(|node| node.range);
+        let mut suffix = 1_u32;
+        loop {
+            let candidate = format!("{name}_{suffix}");
+            let used = claimed.contains(&candidate)
+                || self.arena.iter().any(|(_, node)| {
+                    matches!(&node.data, NodeData::Identifier(identifier)
+                        if identifier.text == candidate)
+                        && function_range.is_some_and(|range| {
+                            range.start <= node.range.start && node.range.end <= range.end
+                        })
+                });
+            if !used {
+                return candidate;
+            }
+            suffix += 1;
         }
     }
 
@@ -46711,6 +46808,10 @@ impl Printer<'_> {
         self.writer.write("function ");
         self.writer.write(name);
         if let Some((_, _, constructor)) = constructor {
+            let captures_constructor_body_this = base.is_none()
+                && constructor
+                    .body
+                    .is_some_and(|body| self.body_has_downlevel_arrow_this(body));
             let constructor_returns_on_all_paths = constructor
                 .body
                 .is_some_and(|body| self.statement_is_covered_by_returns(body));
@@ -46720,8 +46821,12 @@ impl Printer<'_> {
             self.writer.indent += 1;
             self.emit_es5_class_field_prelude(
                 &field_object_temps,
-                captures_field_this && base.is_none(),
+                (captures_field_this || captures_constructor_body_this) && base.is_none(),
             );
+            let previous_arrow_this_capture = self.capture_arrow_this.clone();
+            if captures_constructor_body_this {
+                self.capture_arrow_this = Some("_this".to_owned());
+            }
             let emitted_defaults =
                 self.emit_parameter_default_prologues(&constructor.parameters)?;
             let emitted_rest =
@@ -46852,6 +46957,7 @@ impl Printer<'_> {
                 self.writer.newline();
             }
             self.this_alias = previous_this_alias;
+            self.capture_arrow_this = previous_arrow_this_capture;
             self.writer.indent -= 1;
             self.writer.write("}");
             self.writer.newline();
@@ -57793,6 +57899,22 @@ mod tests {
     }
 
     #[test]
+    fn declaration_emit_preserves_readonly_index_signatures() {
+        let output = emit_declarations_with_semantics(concat!(
+            "interface Values { readonly [key: string]: object; }\n",
+            "declare const values: { readonly [key: number]: string };",
+        ));
+        assert!(
+            output.contains("readonly [key: string]: object;"),
+            "{output}"
+        );
+        assert!(
+            output.contains("readonly [key: number]: string;"),
+            "{output}"
+        );
+    }
+
+    #[test]
     fn preserves_comments_inside_property_access_chains() {
         let output = emit_with(
             concat!(
@@ -58545,6 +58667,10 @@ mod tests {
     }
 
     fn emit_jsx(source: &str, jsx: JsxEmit) -> String {
+        emit_jsx_module(source, jsx, ModuleKind::EsNext)
+    }
+
+    fn emit_jsx_module(source: &str, jsx: JsxEmit, module: ModuleKind) -> String {
         let parsed = parse_jsx_source_file(source);
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         emit_source_file_with_settings(
@@ -58555,7 +58681,7 @@ mod tests {
             PrinterSettings {
                 always_strict: false,
                 target: ScriptTarget::EsNext,
-                module: ModuleKind::EsNext,
+                module,
                 jsx,
                 emit_javascript: true,
                 emit_declarations: false,
@@ -59364,6 +59490,21 @@ mod tests {
     }
 
     #[test]
+    fn drops_reference_directives_owned_by_erased_automatic_jsx_imports() {
+        let output = emit_jsx_module(
+            concat!(
+                "/// <reference path=\"types.d.ts\" />\n\n",
+                "import React from 'react';\n",
+                "export const view = <div />;",
+            ),
+            JsxEmit::ReactJsx,
+            ModuleKind::CommonJs,
+        );
+        assert!(!output.contains("<reference"), "{output}");
+        assert!(output.contains("require(\"react/jsx-runtime\")"), "{output}");
+    }
+
+    #[test]
     fn automatic_jsx_extracts_key_and_uses_single_child_props() {
         let source = "const item = <Component key='item' value={count}>text</Component>;";
         assert_eq!(
@@ -59471,6 +59612,24 @@ mod tests {
             output.contains(
                 "const next = (value) => __awaiter(void 0, void 0, void 0, function* () { return yield value; });"
             ),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn names_simple_outer_parameters_in_downleveled_async_arrows() {
+        let output = emit_with(
+            "const run = async (dispatch, { value }) => value;",
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(
+            output.contains(concat!(
+                "const run = (dispatch_1, _a) => ",
+                "__awaiter(void 0, [dispatch_1, _a], void 0, ",
+                "function* (dispatch, { value })",
+            )),
             "{output}"
         );
     }
@@ -62282,6 +62441,21 @@ mod tests {
         );
         assert!(!output.contains("erased header"), "{output}");
         assert!(!output.contains("erased arrow"), "{output}");
+    }
+
+    #[test]
+    fn captures_lexical_this_in_es5_constructor_arrows() {
+        let output = emit_with(
+            "class C { constructor() { const read = () => this.value; } }",
+            ScriptTarget::Es5,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(output.contains("var _this = this;"), "{output}");
+        assert!(
+            output.contains("var read = function () { return _this.value; };"),
+            "{output}"
+        );
     }
 
     #[test]
