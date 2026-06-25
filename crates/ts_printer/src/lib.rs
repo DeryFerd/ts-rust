@@ -8971,12 +8971,6 @@ impl DeclarationPrinter<'_> {
                 self.emit_semantic_parameters(&inner, None)?;
                 self.writer.write(") => ");
                 self.emit_widened_semantic_type(inner.return_type)?;
-            } else if declaration.initializer.is_some_and(|initializer| {
-                self.arena
-                    .get(initializer)
-                    .is_some_and(|node| node.kind == SyntaxKind::NullKeyword)
-            }) {
-                self.writer.write(": any");
             } else if self.variable_declaration_has_redeclarations(declaration_id)
                 && let Some(type_id) = declaration
                     .initializer
@@ -8984,6 +8978,21 @@ impl DeclarationPrinter<'_> {
             {
                 self.writer.write(": ");
                 self.emit_widened_semantic_type(type_id)?;
+            } else if declaration.initializer.is_some_and(|initializer| {
+                self.arena
+                    .get(initializer)
+                    .is_some_and(|node| node.kind == SyntaxKind::NullKeyword)
+            }) {
+                self.writer.write(": ");
+                if keyword == "let"
+                    && let Some(type_id) = declaration
+                        .initializer
+                        .and_then(|initializer| self.node_types?.get(&initializer).copied())
+                {
+                    self.emit_semantic_type(type_id)?;
+                } else {
+                    self.writer.write("any");
+                }
             } else if let Some(type_id) = self
                 .node_types
                 .and_then(|types| types.get(&declaration_id).copied())
@@ -40197,8 +40206,6 @@ impl Printer<'_> {
                     .or_default()
                     .insert(generated.clone());
                 self.identifier_rewrites.insert(symbol, generated);
-            } else {
-                claimed.entry(var_scope).or_default().insert(name);
             }
         }
     }
@@ -54646,6 +54653,23 @@ mod tests {
     }
 
     #[test]
+    fn reuses_downleveled_binding_names_across_disjoint_loop_scopes() {
+        let output = emit_with(
+            concat!(
+                "for (let let of [1]) {}\n",
+                "for (const let of [2]) {}\n",
+                "for (let let in [3]) {}\n",
+                "for (const let in [4]) {}\n",
+            ),
+            ScriptTarget::Es5,
+            ModuleKind::EsNext,
+        )
+        .code;
+        assert_eq!(output.matches("var let").count(), 4, "{output}");
+        assert!(!output.contains("let_1"), "{output}");
+    }
+
+    #[test]
     fn evaluates_downleveled_destructuring_assignment_sources_once() {
         let output = emit_with(
             "var a, b; ({ a, b } = getValue());",
@@ -59440,6 +59464,14 @@ class Board {
                 "declare var a: number;\n",
                 "declare let a: any;\n",
             )
+        );
+    }
+
+    #[test]
+    fn declaration_emit_preserves_null_for_let_initializer() {
+        assert_eq!(
+            emit_declarations_with_semantics("let value = null;"),
+            "declare let value: null;\n"
         );
     }
 
