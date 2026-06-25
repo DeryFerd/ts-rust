@@ -20417,6 +20417,52 @@ impl DeclarationPrinter<'_> {
                     self.emit_type_arguments(data.type_arguments.as_ref())?;
                 }
             }
+            NodeData::ImportTypeNode(data) => {
+                if data.is_type_of {
+                    self.writer.write("typeof ");
+                }
+                self.writer.write("import(");
+                self.emit_type(data.argument)?;
+                if let Some(attributes) = data.attributes {
+                    let bag_node = self.node(attributes)?.clone();
+                    let NodeData::ImportAttributes(bag) = &bag_node.data else {
+                        return Err(Self::unsupported(attributes, bag_node.kind));
+                    };
+                    self.writer.write(", { ");
+                    self.writer
+                        .write(if bag.token == SyntaxKind::AssertKeyword {
+                            "assert"
+                        } else {
+                            "with"
+                        });
+                    self.writer.write(": {");
+                    if !bag.attributes.nodes.is_empty() {
+                        self.writer.write(" ");
+                    }
+                    for (index, attribute) in bag.attributes.nodes.iter().enumerate() {
+                        if index != 0 {
+                            self.writer.write(", ");
+                        }
+                        let entry_node = self.node(*attribute)?.clone();
+                        let NodeData::ImportAttribute(entry) = &entry_node.data else {
+                            return Err(Self::unsupported(*attribute, entry_node.kind));
+                        };
+                        self.emit_name(entry.name)?;
+                        self.writer.write(": ");
+                        self.emit_literal_expression(entry.value)?;
+                    }
+                    if !bag.attributes.nodes.is_empty() {
+                        self.writer.write(" ");
+                    }
+                    self.writer.write("} }");
+                }
+                self.writer.write(")");
+                if let Some(qualifier) = data.qualifier {
+                    self.writer.write(".");
+                    self.emit_name(qualifier)?;
+                }
+                self.emit_type_arguments(data.type_arguments.as_ref())?;
+            }
             NodeData::TypePredicateNode(data) => {
                 if data.asserts_modifier.is_some() {
                     self.writer.write("asserts ");
@@ -59033,6 +59079,19 @@ mod tests {
                 .unwrap()
                 .code,
             "declare enum Keys {\n    \"string\",\n    1,\n    [\"computed\"],\n    [3]\n}\n"
+        );
+    }
+
+    #[test]
+    fn emits_import_type_attributes_in_declarations() {
+        let source = "export type T = import(\"pkg\", { with: { type: \"json\" } }).Value;";
+        let parsed = parse_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        assert_eq!(
+            emit_declaration_file(&parsed.arena, parsed.source_file, "input.ts", source, false)
+                .unwrap()
+                .code,
+            "export type T = import(\"pkg\", { with: { type: \"json\" } }).Value;\n"
         );
     }
 

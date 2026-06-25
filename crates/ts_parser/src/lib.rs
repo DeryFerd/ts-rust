@@ -6090,6 +6090,10 @@ impl<'a> Parser<'a> {
                 ));
             } else if self.current.kind == SyntaxKind::ColonToken
                 || self.current_token_starts_recovered_object_property_initializer()
+                || !matches!(
+                    self.arena.get(name).map(|node| &node.data),
+                    Some(NodeData::Identifier(_))
+                )
             {
                 if self.current.kind == SyntaxKind::ColonToken {
                     self.bump();
@@ -7525,6 +7529,12 @@ impl<'a> Parser<'a> {
         let start = self.consume().range.start;
         self.expect_and_bump(SyntaxKind::OpenParenToken, "Expected '('.");
         let argument = self.parse_literal_type();
+        let attributes = if self.current.kind == SyntaxKind::CommaToken {
+            self.bump();
+            self.parse_import_type_attributes()
+        } else {
+            None
+        };
         self.expect_and_bump(SyntaxKind::CloseParenToken, "Expected ')'.");
         let qualifier = if self.current.kind == SyntaxKind::DotToken {
             self.bump();
@@ -7538,6 +7548,7 @@ impl<'a> Parser<'a> {
             |arguments| arguments.range.end,
         );
         let mut children = vec![argument];
+        children.extend(attributes);
         children.extend(qualifier);
         extend_list_children(&mut children, type_arguments.as_ref());
         self.alloc_node(
@@ -7545,13 +7556,121 @@ impl<'a> Parser<'a> {
             TextRange::new(start, end),
             NodeData::ImportTypeNode(Box::new(ImportTypeNodeData {
                 argument,
-                attributes: None,
+                attributes,
                 is_type_of: false,
                 qualifier,
                 type_arguments,
             })),
             &children,
         )
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn parse_import_type_attributes(&mut self) -> Option<NodeId> {
+        if self.current.kind != SyntaxKind::OpenBraceToken {
+            self.error_current("Expected '{'.");
+            return None;
+        }
+        self.bump();
+        let keyword = if matches!(
+            self.current.kind,
+            SyntaxKind::WithKeyword | SyntaxKind::AssertKeyword
+        ) {
+            self.consume()
+        } else {
+            self.error_current("Expected 'with'.");
+            return None;
+        };
+        self.expect_and_bump(SyntaxKind::ColonToken, "Expected ':'.");
+        self.expect_and_bump(SyntaxKind::OpenBraceToken, "Expected '{'.");
+        let list_start = self.current.range.start;
+        let mut attributes = Vec::new();
+        while !matches!(
+            self.current.kind,
+            SyntaxKind::CloseBraceToken | SyntaxKind::EndOfFile
+        ) {
+            if !matches!(
+                self.current.kind,
+                SyntaxKind::Identifier | SyntaxKind::StringLiteral
+            ) && !self.current.kind.is_keyword()
+            {
+                self.error_current("Expected an import attribute name.");
+                return Some(self.alloc_node(
+                    SyntaxKind::ImportAttributes,
+                    TextRange::new(keyword.range.start, list_start),
+                    NodeData::ImportAttributes(Box::new(ImportAttributesData {
+                        attributes: NodeList {
+                            range: TextRange::new(list_start, list_start),
+                            nodes: Vec::new(),
+                            has_trailing_comma: false,
+                        },
+                        multi_line: false,
+                        token: keyword.kind,
+                        facts: 0,
+                    })),
+                    &[],
+                ));
+            }
+            let attribute_start = self.current.range.start;
+            let name = self.parse_property_name("Expected an import attribute name.");
+            self.expect_and_bump(SyntaxKind::ColonToken, "Expected ':'.");
+            let value = if self.current.kind == SyntaxKind::StringLiteral {
+                self.parse_string_literal()
+            } else {
+                let value = self.parse_binary_expression(2);
+                let range = self
+                    .arena
+                    .get(value)
+                    .map_or(TextRange::new(attribute_start, attribute_start), |node| {
+                        node.range
+                    });
+                self.error_code_at(range, 2858, []);
+                value
+            };
+            attributes.push(self.alloc_node(
+                SyntaxKind::ImportAttribute,
+                TextRange::new(attribute_start, self.node_end(value)),
+                NodeData::ImportAttribute(Box::new(ImportAttributeData {
+                    value,
+                    facts: 0,
+                    name,
+                })),
+                &[name, value],
+            ));
+            if self.current.kind != SyntaxKind::CommaToken {
+                break;
+            }
+            self.bump();
+        }
+        let inner_end = if self.current.kind == SyntaxKind::CloseBraceToken {
+            self.consume().range.end
+        } else {
+            self.error_current("Expected '}'.");
+            attributes
+                .last()
+                .map_or(list_start, |attribute| self.node_end(*attribute))
+        };
+        let end = if self.current.kind == SyntaxKind::CloseBraceToken {
+            self.consume().range.end
+        } else {
+            self.error_current("Expected '}'.");
+            inner_end
+        };
+        Some(self.alloc_node(
+            SyntaxKind::ImportAttributes,
+            TextRange::new(keyword.range.start, end),
+            NodeData::ImportAttributes(Box::new(ImportAttributesData {
+                attributes: NodeList {
+                    range: TextRange::new(list_start, inner_end),
+                    nodes: attributes.clone(),
+                    has_trailing_comma: false,
+                },
+                multi_line: false,
+                token: keyword.kind,
+                facts: 0,
+            })),
+            &attributes,
+        ))
     }
 
     fn parse_literal_type(&mut self) -> NodeId {
@@ -9239,6 +9358,28 @@ mod tests {
         let object = object.expect("expected object literal");
         assert_eq!(object.properties.nodes.len(), 1);
         assert!(object.properties.has_trailing_comma);
+    }
+
+    #[test]
+    fn recovers_non_identifier_object_names_as_missing_property_assignments() {
+        let result = parse_source_file("use({ 1234, next: \"value\" });");
+        let object = result.arena.iter().find_map(|(_, node)| {
+            let NodeData::ObjectLiteralExpression(object) = &node.data else {
+                return None;
+            };
+            Some(object)
+        });
+        let object = object.expect("expected object literal");
+        assert_eq!(object.properties.nodes.len(), 2);
+        let NodeData::PropertyAssignment(property) =
+            &result.arena.get(object.properties.nodes[0]).unwrap().data
+        else {
+            panic!("expected recovered property assignment");
+        };
+        assert!(matches!(
+            &result.arena.get(property.initializer).unwrap().data,
+            NodeData::Identifier(identifier) if identifier.text.is_empty()
+        ));
     }
 
     #[test]
@@ -11281,6 +11422,49 @@ mod tests {
             .collect();
         assert!(declaration_flags.contains(&NODE_FLAG_USING));
         assert!(declaration_flags.contains(&NODE_FLAG_AWAIT_USING));
+    }
+
+    #[test]
+    fn parses_and_recovers_import_type_attributes() {
+        let valid = parse_source_file(
+            "type T = import(\"pkg\", { with: { type: \"json\" } }).Value;",
+        );
+        assert!(valid.diagnostics.is_empty(), "{:?}", valid.diagnostics);
+        let valid_import = valid.arena.iter().find_map(|(_, node)| {
+            let NodeData::ImportTypeNode(import) = &node.data else {
+                return None;
+            };
+            Some(import)
+        });
+        let attributes = valid_import
+            .expect("expected import type")
+            .attributes
+            .expect("expected import attributes");
+        let NodeData::ImportAttributes(attributes) = &valid.arena.get(attributes).unwrap().data
+        else {
+            panic!("expected import attributes");
+        };
+        assert_eq!(attributes.attributes.nodes.len(), 1);
+
+        let invalid = parse_source_file(
+            "type T = import(\"pkg\", { with: { 1234, type: \"json\" } }).Value;",
+        );
+        assert!(!invalid.diagnostics.is_empty());
+        let invalid_import = invalid.arena.iter().find_map(|(_, node)| {
+            let NodeData::ImportTypeNode(import) = &node.data else {
+                return None;
+            };
+            Some(import)
+        });
+        let attributes = invalid_import
+            .expect("expected recovered import type")
+            .attributes
+            .expect("expected recovered import attributes");
+        let NodeData::ImportAttributes(attributes) = &invalid.arena.get(attributes).unwrap().data
+        else {
+            panic!("expected recovered import attributes");
+        };
+        assert!(attributes.attributes.nodes.is_empty());
     }
 
     #[test]
