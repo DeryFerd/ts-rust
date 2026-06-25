@@ -5961,6 +5961,12 @@ impl<'a> Parser<'a> {
         while self.current.kind != SyntaxKind::CloseBraceToken
             && self.current.kind != SyntaxKind::EndOfFile
         {
+            if self.current.kind == SyntaxKind::CommaToken {
+                self.error_current("Property assignment expected.");
+                self.bump();
+                trailing = self.current.kind == SyntaxKind::CloseBraceToken;
+                continue;
+            }
             let property_start = self.current.range.start;
             if self.current.kind == SyntaxKind::DotDotDotToken {
                 self.bump();
@@ -9215,6 +9221,20 @@ mod tests {
             &result.arena.get(body.statements.nodes[3]).unwrap().data,
             NodeData::Block(_)
         ));
+    }
+
+    #[test]
+    fn skips_recovery_only_entries_for_doubled_object_literal_commas() {
+        let result = parse_source_file("Boolean({ x: 0,, });");
+        let object = result.arena.iter().find_map(|(_, node)| {
+            let NodeData::ObjectLiteralExpression(object) = &node.data else {
+                return None;
+            };
+            Some(object)
+        });
+        let object = object.expect("expected object literal");
+        assert_eq!(object.properties.nodes.len(), 1);
+        assert!(object.properties.has_trailing_comma);
     }
 
     #[test]
