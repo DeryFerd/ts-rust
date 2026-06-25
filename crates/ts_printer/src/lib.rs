@@ -26367,10 +26367,12 @@ impl Printer<'_> {
                     let until_next = next_comment.map_or(remainder, |next| &remainder[..next]);
                     let inline_with_next =
                         next_comment.is_some() && !until_next.contains(['\n', '\r']);
+                    let touches_parenthesized_node = comment_range.1 == end
+                        && self.source_text.as_bytes().get(end) == Some(&b'(');
                     let inline_with_node = next_comment.is_none()
                         && !immediate_trailing
                         && preserve_leading
-                        && comment_range.1 < end
+                        && (comment_range.1 < end || touches_parenthesized_node)
                         && !remainder.contains(['\n', '\r'])
                         && remainder.trim().is_empty();
                     let inline_after = inline_with_next || inline_with_node;
@@ -26559,8 +26561,10 @@ impl Printer<'_> {
                         .min();
                     let inline_with_next =
                         next_comment.is_some_and(|next| !remainder[..next].contains(['\n', '\r']));
+                    let touches_parenthesized_node = comment_end == end
+                        && self.source_text.as_bytes().get(end) == Some(&b'(');
                     let inline_with_node = next_comment.is_none()
-                        && comment_end < end
+                        && (comment_end < end || touches_parenthesized_node)
                         && !remainder.contains(['\n', '\r'])
                         && remainder.trim().is_empty();
                     let inline_after = inline_with_next || inline_with_node;
@@ -29317,10 +29321,30 @@ impl Printer<'_> {
                     node.range.end.get(),
                     b';',
                 ) {
-                    self.emit_binary_comment_trivia(
-                        self.node(data.expression)?.range.end.get(),
-                        semicolon,
+                    let expression_end = self.node(data.expression)?.range.end.get();
+                    let same_line_block_comment = usize::try_from(expression_end)
+                        .ok()
+                        .zip(usize::try_from(semicolon).ok())
+                        .and_then(|(start, end)| self.source_text.get(start..end))
+                        .and_then(|trivia| {
+                            trivia
+                                .find("/*")
+                                .map(|comment| !trivia[..comment].contains(['\n', '\r']))
+                        })
+                        .unwrap_or(false);
+                    let parenthesized = matches!(
+                        self.arena.get(data.expression).map(|node| &node.data),
+                        Some(NodeData::ParenthesizedExpression(_))
                     );
+                    if same_line_block_comment && parenthesized {
+                        self.writer.write(" ");
+                    }
+                    self.emit_binary_comment_trivia(
+                        expression_end, semicolon,
+                    );
+                    if same_line_block_comment && parenthesized {
+                        self.writer.remove_trailing_newline();
+                    }
                     self.writer.remove_trailing_spaces();
                 }
                 let recovered_jsx_trailing_greater = matches!(
@@ -50481,19 +50505,20 @@ impl Printer<'_> {
                         .and_then(|(start, end)| self.source_text.get(start..end))
                         .is_some_and(|trivia| trivia.contains("//"));
                     if has_leading_line_comment {
-                        self.writer.indent += 1;
                         self.emit_source_comments_between_with_trailing(
                             comment_start,
                             expression_start,
                             false,
                         );
+                        if self.block_comment_touches_range_end(comment_start, expression_start) {
+                            self.writer.remove_trailing_newline();
+                            self.writer.write(" ");
+                        }
                     } else if self.trivia_has_block_comment(comment_start, expression_start) {
+                        self.writer.write(" ");
                         self.emit_block_comment_trivia(comment_start, expression_start, false);
                     }
                     self.emit_expression(data.expression, 0)?;
-                    if has_leading_line_comment {
-                        self.writer.indent -= 1;
-                    }
                     self.emit_binary_comment_trivia(
                         self.node(data.expression)?.range.end.get(),
                         node.range.end.get().saturating_sub(1),
@@ -50503,6 +50528,9 @@ impl Printer<'_> {
                     }
                     let indent_closing = !has_leading_line_comment && self.writer.line_start;
                     self.writer.indent += usize::from(indent_closing);
+                    if has_leading_line_comment && !self.writer.line_start {
+                        self.writer.write(" ");
+                    }
                     self.writer.write(")");
                     self.writer.indent -= usize::from(indent_closing);
                 }
@@ -56110,6 +56138,28 @@ mod tests {
         assert_eq!(
             output,
             "const a = /*comm*/ 10;\nconst b = /*comm*/ 10;\n"
+        );
+    }
+
+    #[test]
+    fn preserves_parenthesized_expression_internal_comments() {
+        let output = emit_with(
+            concat!(
+                "/*1*/(/*2*/ \"foo\" /*3*/)/*4*/\n;\n",
+                "// open\n/*1*/(\n    // next\n    /*2*/\"foo\"\n",
+                "    //close\n    /*3*/)/*4*/\n;",
+            ),
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert_eq!(
+            output,
+            concat!(
+                "/*1*/ ( /*2*/\"foo\" /*3*/) /*4*/;\n",
+                "// open\n/*1*/ (\n// next\n/*2*/ \"foo\"\n",
+                "//close\n/*3*/ ) /*4*/;\n",
+            )
         );
     }
 
