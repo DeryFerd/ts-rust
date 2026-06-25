@@ -44526,17 +44526,96 @@ impl Printer<'_> {
         let Some(class_name) = class.name else {
             return Ok(());
         };
-        for member_id in &class.members.nodes {
-            if !class_member_has_legacy_decorators(self.arena, *member_id) {
+        let mut member_ids = class.members.nodes.clone();
+        member_ids.sort_by_key(|member| {
+            self.arena
+                .get(*member)
+                .and_then(declaration_modifiers)
+                .is_some_and(|modifiers| {
+                    self.has_modifier(Some(modifiers), SyntaxKind::StaticKeyword)
+                })
+        });
+        let mut emitted_accessors = BTreeSet::new();
+        for member_id in &member_ids {
+            let member = self.node(*member_id)?.clone();
+            let accessor_pair = match &member.data {
+                NodeData::GetAccessorDeclaration(accessor) => {
+                    let name = type_member_name_text(self.arena, *member_id);
+                    let is_static = self.has_modifier(
+                        accessor.modifiers.as_ref(),
+                        SyntaxKind::StaticKeyword,
+                    );
+                    class.members.nodes.iter().copied().find(|candidate| {
+                        if *candidate == *member_id
+                            || type_member_name_text(self.arena, *candidate) != name
+                        {
+                            return false;
+                        }
+                        matches!(
+                            self.arena.get(*candidate).map(|node| &node.data),
+                            Some(NodeData::SetAccessorDeclaration(candidate))
+                                if self.has_modifier(
+                                    candidate.modifiers.as_ref(),
+                                    SyntaxKind::StaticKeyword,
+                                ) == is_static
+                        )
+                    })
+                }
+                NodeData::SetAccessorDeclaration(accessor) => {
+                    let name = type_member_name_text(self.arena, *member_id);
+                    let is_static = self.has_modifier(
+                        accessor.modifiers.as_ref(),
+                        SyntaxKind::StaticKeyword,
+                    );
+                    class.members.nodes.iter().copied().find(|candidate| {
+                        if *candidate == *member_id
+                            || type_member_name_text(self.arena, *candidate) != name
+                        {
+                            return false;
+                        }
+                        matches!(
+                            self.arena.get(*candidate).map(|node| &node.data),
+                            Some(NodeData::GetAccessorDeclaration(candidate))
+                                if self.has_modifier(
+                                    candidate.modifiers.as_ref(),
+                                    SyntaxKind::StaticKeyword,
+                                ) == is_static
+                        )
+                    })
+                }
+                _ => None,
+            };
+            if !class_member_has_legacy_decorators(self.arena, *member_id)
+                && !accessor_pair.is_some_and(|pair| {
+                    class_member_has_legacy_decorators(self.arena, pair)
+                })
+            {
                 continue;
             }
-            let member = self.node(*member_id)?.clone();
+            if matches!(
+                member.data,
+                NodeData::GetAccessorDeclaration(_) | NodeData::SetAccessorDeclaration(_)
+            ) {
+                let name = type_member_name_text(self.arena, *member_id).unwrap_or_default();
+                let is_static = declaration_modifiers(&member).is_some_and(|modifiers| {
+                    self.has_modifier(Some(modifiers), SyntaxKind::StaticKeyword)
+                });
+                if !emitted_accessors.insert((is_static, name.to_owned())) {
+                    continue;
+                }
+            }
             if matches!(
                 &member.data,
                 NodeData::MethodDeclaration(method) if self.is_constructor_name(method.name)
             ) {
                 continue;
             }
+            let paired_setter_parameters = accessor_pair
+                .and_then(|pair| self.arena.get(pair))
+                .and_then(|pair| match &pair.data {
+                    NodeData::SetAccessorDeclaration(setter) => Some(setter.parameters.clone()),
+                    _ => None,
+                });
             let (
                 name,
                 modifiers,
@@ -44570,7 +44649,11 @@ impl Printer<'_> {
                 NodeData::GetAccessorDeclaration(data) => (
                     data.name,
                     data.modifiers.as_ref(),
-                    Some(&data.parameters),
+                    Some(
+                        paired_setter_parameters
+                            .as_ref()
+                            .unwrap_or(&data.parameters),
+                    ),
                     None,
                     data.type_,
                     "null",
@@ -66497,6 +66580,19 @@ class Board {
                 "__decorate([\n    method,\n    __param(0, parameter)\n], C.prototype, \"run\", null);"
             ),
             "{output}"
+        );
+
+        let grouped = emit_with_decorator_mode(
+            "class D { @staticDecorator static value: number; run(@parameter input: number) {} }",
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+            true,
+        )
+        .code;
+        assert!(
+            grouped.find("D.prototype, \"run\"").unwrap()
+                < grouped.find("D, \"value\"").unwrap(),
+            "{grouped}"
         );
     }
 
