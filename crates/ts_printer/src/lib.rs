@@ -29786,7 +29786,84 @@ impl Printer<'_> {
         })
     }
 
+    fn recovered_type_alias_declare_break(
+        &self,
+        alias: &ts_ast::TypeAliasDeclarationData,
+    ) -> Option<(u32, u32, u32, bool)> {
+        let declare_end = alias
+            .modifiers
+            .as_ref()?
+            .list
+            .nodes
+            .iter()
+            .find_map(|modifier| {
+                let node = self.arena.get(*modifier)?;
+                (node.kind == SyntaxKind::DeclareKeyword).then_some(node.range.end.get())
+            })?;
+        let name_start = self.arena.get(alias.name)?.range.start.get();
+        let type_start = self.source_keyword_between(declare_end, name_start, "type")?;
+        let declare_break = usize::try_from(declare_end)
+            .ok()
+            .zip(usize::try_from(type_start).ok())
+            .and_then(|(start, end)| self.source_text.get(start..end))
+            .is_some_and(|trivia| trivia.contains(['\n', '\r']));
+        if !declare_break {
+            return None;
+        }
+        let type_end = type_start.saturating_add(4);
+        let type_break = usize::try_from(type_end)
+            .ok()
+            .zip(usize::try_from(name_start).ok())
+            .and_then(|(start, end)| self.source_text.get(start..end))
+            .is_some_and(|trivia| trivia.contains(['\n', '\r']));
+        Some((declare_end, type_start, name_start, type_break))
+    }
+
+    fn emit_recovered_type_alias_declare_break(
+        &mut self,
+        alias: &ts_ast::TypeAliasDeclarationData,
+    ) -> Result<bool, EmitError> {
+        let Some((declare_end, type_start, name_start, type_break)) =
+            self.recovered_type_alias_declare_break(alias)
+        else {
+            return Ok(false);
+        };
+        self.writer.write("declare;");
+        self.emit_source_comments_between_with_trailing(declare_end, type_start, true);
+        if !self.writer.line_start {
+            self.writer.newline();
+        }
+        if type_break {
+            self.writer.write("type;");
+            self.emit_source_comments_between_with_trailing(
+                type_start.saturating_add(4),
+                name_start,
+                true,
+            );
+            if !self.writer.line_start {
+                self.writer.newline();
+            }
+            self.emit_expression(alias.name, 0)?;
+            self.writer.write(" = ");
+            let type_node = self.node(alias.type_)?;
+            let type_source = usize::try_from(type_node.range.start.get())
+                .ok()
+                .zip(usize::try_from(type_node.range.end.get()).ok())
+                .and_then(|(start, end)| self.source_text.get(start..end))
+                .unwrap_or("undefined")
+                .trim();
+            self.writer.write(type_source);
+            self.writer.write(";");
+        }
+        Ok(true)
+    }
+
     fn statement_emits_runtime(&self, id: NodeId, node: &Node) -> bool {
+        if let NodeData::TypeAliasDeclaration(alias) = &node.data
+            && self.recovered_type_alias_declare_break(alias).is_some()
+        {
+            return true;
+        }
         if !self.namespace_containers.is_empty()
             && self.namespace_erases_external_module_statement(node)
         {
@@ -30749,6 +30826,15 @@ impl Printer<'_> {
     #[allow(clippy::too_many_lines)]
     fn emit_statement(&mut self, id: NodeId) -> Result<(), EmitError> {
         let node = self.node(id)?.clone();
+        if let NodeData::TypeAliasDeclaration(alias) = &node.data
+            && self.emit_recovered_type_alias_declare_break(alias)?
+        {
+            self.record_mapping_at(node.range.end.get());
+            if !self.writer.line_start {
+                self.writer.newline();
+            }
+            return Ok(());
+        }
         let misplaced_module_statement = node.parent.is_some_and(|parent| {
             !matches!(
                 self.arena.get(parent).map(|node| &node.data),
