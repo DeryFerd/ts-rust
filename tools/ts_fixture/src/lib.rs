@@ -1086,6 +1086,7 @@ const SCALAR_OPTION_NAMES: &[&str] = &[
     "skipLibCheck",
     "sourceMap",
     "sourceRoot",
+    "stripInternal",
     "strict",
     "strictBuiltinIteratorReturn",
     "strictNullChecks",

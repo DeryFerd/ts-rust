@@ -117,6 +117,7 @@ pub struct CompilerOptions {
     pub no_unused_parameters: bool,
     pub preserve_const_enums: bool,
     pub skip_lib_check: bool,
+    pub strip_internal: bool,
     pub strict: bool,
     pub strict_null_checks: bool,
     pub use_define_for_class_fields: Option<bool>,
@@ -191,6 +192,7 @@ impl Default for CompilerOptions {
             no_unused_parameters: false,
             preserve_const_enums: false,
             skip_lib_check: false,
+            strip_internal: false,
             strict: false,
             strict_null_checks: false,
             use_define_for_class_fields: None,
@@ -359,6 +361,7 @@ impl CompilerOptions {
                 }
                 "rootdir" => self.root_dir.clone_from(&overrides.root_dir),
                 "skiplibcheck" => self.skip_lib_check = overrides.skip_lib_check,
+                "stripinternal" => self.strip_internal = overrides.strip_internal,
                 "sourcemap" => self.source_map = overrides.source_map,
                 "inlinesourcemap" => self.inline_source_map = overrides.inline_source_map,
                 "inlinesources" => self.inline_sources = overrides.inline_sources,
@@ -606,6 +609,9 @@ pub fn parse_compiler_options_map(options: &BTreeMap<String, JsonValue>) -> Pars
             "skiplibcheck" => {
                 parsed.skip_lib_check = boolean(original_name, value, &mut diagnostics);
             }
+            "stripinternal" => {
+                parsed.strip_internal = boolean(original_name, value, &mut diagnostics);
+            }
             "strict" => parsed.strict = boolean(original_name, value, &mut diagnostics),
             "strictnullchecks" => {
                 parsed.strict_null_checks = boolean(original_name, value, &mut diagnostics);
@@ -716,6 +722,7 @@ struct PartialOptions {
     no_unused_parameters: Option<bool>,
     preserve_const_enums: Option<bool>,
     skip_lib_check: Option<bool>,
+    strip_internal: Option<bool>,
     strict: Option<bool>,
     strict_null_checks: Option<bool>,
     use_define_for_class_fields: Option<bool>,
@@ -812,6 +819,7 @@ impl PartialOptions {
             no_unused_parameters: self.no_unused_parameters.unwrap_or(false),
             preserve_const_enums: self.preserve_const_enums.unwrap_or(false),
             skip_lib_check: self.skip_lib_check.unwrap_or(false),
+            strip_internal: self.strip_internal.unwrap_or(false),
             strict,
             strict_null_checks: self.strict_null_checks.unwrap_or(strict),
             use_define_for_class_fields: self.use_define_for_class_fields,
@@ -1262,6 +1270,13 @@ mod tests {
         assert!(result.is_ok(), "{:?}", result.diagnostics);
         assert!(result.options.remove_comments);
         assert!(result.options.printer_settings().remove_comments);
+    }
+
+    #[test]
+    fn parses_strip_internal() {
+        let result = parse_compiler_options(&object([("stripInternal", JsonValue::Bool(true))]));
+        assert!(result.is_ok(), "{:?}", result.diagnostics);
+        assert!(result.options.strip_internal);
     }
 
     #[test]

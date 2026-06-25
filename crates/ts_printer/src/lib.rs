@@ -2937,6 +2937,50 @@ pub fn emit_declaration_file_with_semantics(
     remove_comments: bool,
     rewrite_relative_import_extensions: bool,
 ) -> Result<EmitResult, EmitError> {
+    emit_declaration_file_with_semantics_and_options(
+        arena,
+        source_file,
+        source_name,
+        source_text,
+        declaration_map,
+        declaration_reachability,
+        enum_member_values,
+        semantic_types,
+        node_types,
+        import_type_references,
+        named_type_references,
+        remove_comments,
+        rewrite_relative_import_extensions,
+        false,
+    )
+}
+
+/// Emits declarations with checker-owned inferred type metadata and declaration-only options.
+///
+/// # Errors
+///
+/// Returns an error when a declaration contains an unsupported or missing node.
+#[allow(
+    clippy::fn_params_excessive_bools,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
+)]
+pub fn emit_declaration_file_with_semantics_and_options(
+    arena: &NodeArena,
+    source_file: NodeId,
+    source_name: &str,
+    source_text: &str,
+    declaration_map: bool,
+    declaration_reachability: Option<&BTreeMap<NodeId, BTreeSet<NodeId>>>,
+    enum_member_values: Option<&BTreeMap<NodeId, EmitConstantValue>>,
+    semantic_types: Option<&TypeArena>,
+    node_types: Option<&BTreeMap<NodeId, TypeId>>,
+    import_type_references: Option<&BTreeMap<TypeId, ImportTypeReference>>,
+    named_type_references: Option<&BTreeMap<TypeId, NamedTypeReference>>,
+    remove_comments: bool,
+    rewrite_relative_import_extensions: bool,
+    strip_internal: bool,
+) -> Result<EmitResult, EmitError> {
     // Declaration transforms occasionally need to distinguish same-spelled names in
     // different lexical scopes. Keep binding information beside checker types instead
     // of rediscovering declarations with arena-wide textual searches.
@@ -2968,6 +3012,7 @@ pub fn emit_declaration_file_with_semantics(
         emitted_javascript_class_properties: HashSet::new(),
         canonical_literal_quotes: false,
         remove_comments,
+        strip_internal,
         rewrite_relative_import_extensions,
         semantic_infer_count: 0,
         jsdoc_typedefs_emitted: false,
@@ -3175,6 +3220,7 @@ struct DeclarationPrinter<'a> {
     emitted_javascript_class_properties: HashSet<(NodeId, String)>,
     canonical_literal_quotes: bool,
     remove_comments: bool,
+    strip_internal: bool,
     rewrite_relative_import_extensions: bool,
     semantic_infer_count: usize,
     jsdoc_typedefs_emitted: bool,
@@ -4277,6 +4323,9 @@ impl DeclarationPrinter<'_> {
         scope: NodeId,
     ) -> Result<(), EmitError> {
         let node = self.node(id)?.clone();
+        if self.has_internal_annotation(id) {
+            return Ok(());
+        }
         if self.javascript_source
             && !self.jsdoc_typedef_names().is_empty()
             && export_declaration_is_empty(self.arena, &node)
@@ -14510,6 +14559,50 @@ impl DeclarationPrinter<'_> {
         comments
     }
 
+    fn has_internal_annotation(&self, node: NodeId) -> bool {
+        if !self.strip_internal {
+            return false;
+        }
+        let Some(mut position) = self
+            .arena
+            .get(node)
+            .and_then(|node| usize::try_from(node.range.start.get()).ok())
+        else {
+            return false;
+        };
+        loop {
+            while position > 0
+                && self.source_text.as_bytes()[position - 1].is_ascii_whitespace()
+            {
+                position -= 1;
+            }
+            if position >= 2
+                && self.source_text.as_bytes().get(position - 2..position) == Some(b"*/")
+            {
+                let Some(start) = self.source_text[..position - 2].rfind("/*") else {
+                    break;
+                };
+                if self.source_text[start..position].contains("@internal") {
+                    return true;
+                }
+                position = start;
+                continue;
+            }
+            let line_start = self.source_text[..position]
+                .rfind(['\n', '\r'])
+                .map_or(0, |line_break| line_break + 1);
+            let line = self.source_text[line_start..position].trim_start();
+            if !line.starts_with("//") {
+                break;
+            }
+            if line.contains("@internal") {
+                return true;
+            }
+            position = line_start;
+        }
+        false
+    }
+
     fn emit_immediate_trailing_member_comment(&mut self, member: NodeId, end: u32) {
         let Some(member) = self.arena.get(member) else {
             return;
@@ -15118,6 +15211,9 @@ impl DeclarationPrinter<'_> {
     #[allow(clippy::too_many_lines)]
     fn emit_member(&mut self, id: NodeId) -> Result<(), EmitError> {
         let node = self.node(id)?.clone();
+        if self.has_internal_annotation(id) {
+            return Ok(());
+        }
         if self.javascript_source
             && let NodeData::MethodDeclaration(method) = &node.data
             && self.emit_javascript_method_overloads(id, method)?
@@ -43469,11 +43565,22 @@ impl Printer<'_> {
                 };
                 self.emit_downlevel_binding_declarators(
                     declaration.name,
-                    value,
+                    value.clone(),
                     None,
                     &mut emitted,
                     false,
                 )?;
+                if !emitted {
+                    let temp = self.generated_names.generate_temp();
+                    self.emit_downlevel_declarator_start(&mut emitted);
+                    self.writer.write(&temp);
+                    self.writer.write(" = ");
+                    if let DownlevelBindingValue::Node(initializer) = &value {
+                        self.emit_expression(*initializer, 1)?;
+                    } else {
+                        self.emit_downlevel_binding_value(&value)?;
+                    }
+                }
                 continue;
             }
             self.emit_downlevel_declarator_start(&mut emitted);
@@ -43573,9 +43680,30 @@ impl Printer<'_> {
             })
             .and_then(|(start, end)| self.source_text.get(start..end))
             .is_some_and(|source| source.trim_start().starts_with("<:"));
+        let preserves_unterminated_string_space = data
+            .declarations
+            .nodes
+            .last()
+            .and_then(|declaration| self.arena.get(*declaration))
+            .and_then(|node| match &node.data {
+                NodeData::VariableDeclaration(declaration) => declaration.initializer,
+                _ => None,
+            })
+            .and_then(|initializer| self.arena.get(initializer))
+            .is_some_and(|initializer| {
+                matches!(
+                    &initializer.data,
+                    NodeData::StringLiteral(literal) if literal.token_flags.0 & (1 << 2) != 0
+                ) && usize::try_from(initializer.range.start.get())
+                    .ok()
+                    .and_then(|start| self.source_text.get(start..))
+                    .map(|source| &source[..source.find(['\n', '\r']).unwrap_or(source.len())])
+                    .is_some_and(|source| source.ends_with(' '))
+            });
         if keyword != "const"
             && !ends_with_missing_initializer
             && !preserves_recovered_jsx_space
+            && !preserves_unterminated_string_space
         {
             self.writer.remove_trailing_spaces();
         }
@@ -52643,8 +52771,11 @@ impl Printer<'_> {
             NodeData::StringLiteral(data) => {
                 if data.token_flags.0 & (1 << 2) != 0 {
                     let start = usize::try_from(node.range.start.get()).unwrap_or(usize::MAX);
-                    let end = usize::try_from(node.range.end.get()).unwrap_or(usize::MAX);
-                    if let Some(raw) = self.source_text.get(start..end) {
+                    let raw = self.source_text.get(start..).map(|source| {
+                        let end = source.find(['\n', '\r']).unwrap_or(source.len());
+                        &source[..end]
+                    });
+                    if let Some(raw) = raw {
                         self.writer.write(raw);
                     } else {
                         self.write_source_quoted_string(id, &data.text);
@@ -53743,7 +53874,7 @@ impl Printer<'_> {
                             .is_some_and(|trivia| trivia.contains(['\n', '\r']))
                     })
                 } else {
-                    self.node_source_is_multiline(id)
+                    self.node_source_is_multiline_ignoring_string_literals(id)
                 };
                 if emitted_properties.is_empty() {
                     self.writer.write("{}");
@@ -56155,6 +56286,9 @@ impl Printer<'_> {
             CommonJsDestructuringValue::Expression(binary.right),
             &mut first,
         )?;
+        if first {
+            self.emit_expression(binary.right, 1)?;
+        }
         if wrap {
             self.writer.write(")");
         }
@@ -58124,6 +58258,50 @@ impl Printer<'_> {
         self.source_text
             .get(start..end)
             .is_some_and(|text| text.contains('\n') || text.contains('\r'))
+    }
+
+    fn node_source_is_multiline_ignoring_string_literals(&self, id: NodeId) -> bool {
+        let Some(node) = self.arena.get(id) else {
+            return false;
+        };
+        let start = usize::try_from(node.range.start.get()).unwrap_or(usize::MAX);
+        let end = usize::try_from(node.range.end.get()).unwrap_or(usize::MAX);
+        let Some(source) = self.source_text.get(start..end) else {
+            return false;
+        };
+        let bytes = source.as_bytes();
+        let mut quote = None;
+        let mut index = 0;
+        while index < bytes.len() {
+            let byte = bytes[index];
+            if let Some(delimiter) = quote {
+                if byte == b'\\' {
+                    index += 1;
+                    if bytes.get(index) == Some(&b'\r') {
+                        index += 1;
+                        if bytes.get(index) == Some(&b'\n') {
+                            index += 1;
+                        }
+                    } else if bytes.get(index) == Some(&b'\n') {
+                        index += 1;
+                    } else {
+                        index += usize::from(index < bytes.len());
+                    }
+                    continue;
+                }
+                if byte == delimiter {
+                    quote = None;
+                } else if matches!(byte, b'\n' | b'\r') {
+                    return true;
+                }
+            } else if matches!(byte, b'\'' | b'"') {
+                quote = Some(byte);
+            } else if matches!(byte, b'\n' | b'\r') {
+                return true;
+            }
+            index += 1;
+        }
+        false
     }
 
     fn source_has_line_break_between(&self, left: NodeId, right: NodeId) -> bool {
@@ -60629,6 +60807,19 @@ mod tests {
         assert!(output.contains(".a"), "{output}");
         assert!(output.contains(".b"), "{output}");
         assert!(!output.contains("{ a, b } ="), "{output}");
+    }
+
+    #[test]
+    fn retains_empty_destructuring_initializer_evaluation_when_downleveling() {
+        assert_eq!(
+            emit_with(
+                "let [] = null; let {} = undefined; ({} = null);",
+                ScriptTarget::Es5,
+                ModuleKind::None,
+            )
+            .code,
+            "var _a = null;\nvar _b = undefined;\n(null);\n"
+        );
     }
 
     #[test]
@@ -68230,6 +68421,28 @@ class Board {
             "const emoji = \"🤷‍♂️\";\n\nexport function decl() {}\n",
         );
         assert!(output.contains("export declare function decl(): void;"));
+    }
+
+    #[test]
+    fn preserves_string_line_continuations_without_forcing_multiline_containers() {
+        assert_eq!(
+            emit_with_parse_errors(
+                "var x = {'text\\\r\n':'hello'};",
+                ScriptTarget::Es2015,
+                ModuleKind::None,
+            )
+            .code,
+            "var x = { 'text\\\r\n': 'hello' };\n"
+        );
+        assert_eq!(
+            emit_with_parse_errors(
+                "var es3 = 'line 1\\ \r\n';",
+                ScriptTarget::Es2015,
+                ModuleKind::None,
+            )
+            .code,
+            "var es3 = 'line 1\\ ;\n';;\n"
+        );
     }
 
     #[test]

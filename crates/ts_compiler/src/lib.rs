@@ -26,8 +26,8 @@ use ts_path::{
 };
 use ts_printer::{
     AmdDependency as PrinterAmdDependency, BUNDLE_EXTENDS_HELPER, EmitConstantValue, EmitContext,
-    emit_declaration_file_with_semantics, emit_source_file_with_context, runtime_identifier_uses,
-    source_needs_extends_helper,
+    emit_declaration_file_with_semantics_and_options, emit_source_file_with_context,
+    runtime_identifier_uses, source_needs_extends_helper,
 };
 use ts_sourcemap::{SourceMap, SourceMapBuilder};
 use ts_vfs::FileSystem;
@@ -872,7 +872,7 @@ impl Program {
                 }
                 let declaration_node_types =
                     declaration_node_types_for_emit(source_file, self.options.strict_null_checks);
-                match emit_declaration_file_with_semantics(
+                match emit_declaration_file_with_semantics_and_options(
                     &source_file.parse.arena,
                     source_file.parse.source_file,
                     &source_file.file_name,
@@ -886,6 +886,7 @@ impl Program {
                     Some(&source_file.checking.named_type_references),
                     settings.remove_comments,
                     self.options.rewrite_relative_import_extensions,
+                    self.options.strip_internal,
                 ) {
                     Ok(mut emitted) => {
                         let file_name = declaration_file_name.to_owned();
@@ -1358,7 +1359,7 @@ impl Program {
                 let enum_member_values = enum_values_for_emit(&source.checking.enum_member_values);
                 let declaration_node_types =
                     declaration_node_types_for_emit(source, self.options.strict_null_checks);
-                match emit_declaration_file_with_semantics(
+                match emit_declaration_file_with_semantics_and_options(
                     &source.parse.arena,
                     source.parse.source_file,
                     &source.file_name,
@@ -1372,6 +1373,7 @@ impl Program {
                     Some(&source.checking.named_type_references),
                     settings.remove_comments,
                     self.options.rewrite_relative_import_extensions,
+                    self.options.strip_internal,
                 ) {
                     Ok(mut emitted) => {
                         if !emitted.code.is_empty() {
@@ -5416,6 +5418,52 @@ mod tests {
                 .any(|file| file.file_name.ends_with("b.d.ts")),
             "{:?}",
             emitted.files
+        );
+    }
+
+    #[test]
+    fn strip_internal_omits_annotated_declarations_only_from_declaration_emit() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/main.ts",
+            concat!(
+                "/** @internal */ class Hidden {}\n",
+                "class Visible {\n",
+                "  foo(): void {}\n",
+                "  // @internal\n",
+                "  bar(): void {}\n",
+                "}\n",
+            ),
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["main.ts".to_owned()],
+            CompilerOptions {
+                declaration: true,
+                no_lib: true,
+                strip_internal: true,
+                target: ScriptTarget::Es2015,
+                ..CompilerOptions::default()
+            },
+        );
+        let emitted = program.emit();
+        let javascript = emitted
+            .files
+            .iter()
+            .find(|file| file.file_name == "/project/main.js")
+            .unwrap();
+        assert!(javascript.text.contains("class Hidden"), "{}", javascript.text);
+        assert!(javascript.text.contains("bar()"), "{}", javascript.text);
+        let declaration = emitted
+            .files
+            .iter()
+            .find(|file| file.file_name == "/project/main.d.ts")
+            .unwrap();
+        assert_eq!(
+            declaration.text,
+            "declare class Visible {\n    foo(): void;\n}\n"
         );
     }
 
