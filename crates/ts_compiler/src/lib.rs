@@ -577,24 +577,6 @@ impl Program {
         if !settings.emit_javascript && !settings.emit_declarations {
             return output;
         }
-        if self.options.out_file.is_some()
-            && settings.emit_javascript
-            && !matches!(
-                self.options.module,
-                ModuleKind::None | ModuleKind::Amd | ModuleKind::System
-            )
-        {
-            return output;
-        }
-        if self.options.out_file.is_some()
-            && self.options.module == ModuleKind::None
-            && self
-                .source_files
-                .iter()
-                .any(source_is_external_module)
-        {
-            return output;
-        }
         if self.options.out_file.is_some() {
             return self.emit_bundle(settings);
         }
@@ -949,6 +931,21 @@ impl Program {
         let paths = ts_outputpaths::bundle_output_paths(&self.options, &self.current_directory)
             .expect("outFile was checked before bundle emission");
         let sources = self.bundle_sources();
+        let javascript_sources = sources
+            .iter()
+            .copied()
+            .filter(|source| {
+                matches!(settings.module, ModuleKind::Amd | ModuleKind::System)
+                    || !source_is_external_module(source)
+            })
+            .collect::<Vec<_>>();
+        let declaration_sources = if settings.emit_javascript
+            && !matches!(settings.module, ModuleKind::Amd | ModuleKind::System)
+        {
+            &javascript_sources
+        } else {
+            &sources
+        };
         let bundle_source_names = sources
             .iter()
             .map(|source| source.file_name.clone())
@@ -970,22 +967,28 @@ impl Program {
                 .diagnostics
                 .push(output_overwrites_input_diagnostic(file_name));
         }
-        if settings.emit_javascript && !javascript_output_overwrites_input {
+        if settings.emit_javascript
+            && !javascript_output_overwrites_input
+            && !javascript_sources.is_empty()
+        {
             let mut code = String::new();
             let mut map_builder = settings.source_map.then(SourceMapBuilder::new);
             let mut map_sources = Vec::new();
             let mut map_sources_content = Vec::new();
             let mut amd_generated_name_offsets = BTreeMap::new();
-            if let Some(shebang) = sources.iter().find_map(|source| source_shebang(source)) {
+            if let Some(shebang) = javascript_sources
+                .iter()
+                .find_map(|source| source_shebang(source))
+            {
                 code.push_str(shebang);
                 code.push('\n');
             }
             let mut prologues = Vec::new();
             let mut seen_prologues = HashSet::new();
-            let has_script_sources = sources
+            let has_script_sources = javascript_sources
                 .iter()
                 .any(|source| !source_is_external_module(source));
-            for source in sources
+            for source in javascript_sources
                 .iter()
                 .filter(|source| !source_is_external_module(source))
             {
@@ -1006,7 +1009,7 @@ impl Program {
             }
             let bundle_needs_extends_helper = settings.target < ts_options::ScriptTarget::Es2015
                 && !settings.no_emit_helpers
-                && sources
+                && javascript_sources
                     .iter()
                     .any(|source| {
                         (!settings.import_helpers || !source_is_external_module(source))
@@ -1015,7 +1018,7 @@ impl Program {
             if bundle_needs_extends_helper {
                 code.push_str(BUNDLE_EXTENDS_HELPER);
             }
-            for (source_index, source) in sources.iter().enumerate() {
+            for (source_index, source) in javascript_sources.iter().enumerate() {
                 let map_source_offset = map_builder.as_ref().map(|_| {
                     let offset = u32::try_from(map_sources.len()).unwrap_or(u32::MAX);
                     map_sources.push(
@@ -1092,7 +1095,7 @@ impl Program {
                     preserve_const_enums,
                     settings.module == ModuleKind::Amd,
                     &later_top_level_script_variable_names(
-                        sources.iter().skip(source_index + 1).copied(),
+                        javascript_sources.iter().skip(source_index + 1).copied(),
                     ),
                 );
                 if matches!(
@@ -1189,6 +1192,14 @@ impl Program {
                 for base in amd_generated_dependency_bases(source) {
                     *amd_generated_name_offsets.entry(base).or_default() += 1;
                 }
+                if settings.module == ModuleKind::System && source_is_external_module(source) {
+                    *amd_generated_name_offsets
+                        .entry("exports".to_owned())
+                        .or_default() += 1;
+                    *amd_generated_name_offsets
+                        .entry("context".to_owned())
+                        .or_default() += 1;
+                }
                 if emitted_uses_tslib_dependency {
                     *amd_generated_name_offsets
                         .entry("tslib".to_owned())
@@ -1241,7 +1252,7 @@ impl Program {
             let mut code = String::new();
             let mut preserved_references = BTreeSet::new();
             if let Some(declaration_file) = paths.declaration.as_deref() {
-                for source in &sources {
+                for source in declaration_sources {
                     let lower = source.file_name.to_ascii_lowercase();
                     if lower.ends_with(".d.ts")
                         || lower.ends_with(".d.mts")
@@ -1261,7 +1272,7 @@ impl Program {
             }
             let mut map_builder = self.options.declaration_map.then(SourceMapBuilder::new);
             let mut map_sources = Vec::new();
-            for source in &sources {
+            for source in declaration_sources {
                 let lower = source.file_name.to_ascii_lowercase();
                 if lower.ends_with(".d.ts")
                     || lower.ends_with(".d.mts")
@@ -7170,6 +7181,43 @@ mod tests {
     }
 
     #[test]
+    fn system_out_file_rewrites_dependencies_and_uniquifies_wrapper_names() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/ref/a.ts", "export class A {}")
+            .unwrap();
+        fs.write_file(
+            "/project/b.ts",
+            "import { A } from './ref/a'; export class B extends A {}",
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["ref/a.ts".to_owned(), "b.ts".to_owned()],
+            CompilerOptions {
+                out_file: Some("all.js".into()),
+                module: ModuleKind::System,
+                target: ScriptTarget::Es2015,
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        let emitted = program.emit();
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        let javascript = emitted
+            .files
+            .iter()
+            .find(|file| file.file_name == "/project/all.js")
+            .unwrap();
+        assert!(javascript.text.contains(
+            "System.register(\"ref/a\", [], function (exports_1, context_1) {"
+        ));
+        assert!(javascript.text.contains(
+            "System.register(\"b\", [\"ref/a\"], function (exports_2, context_2) {"
+        ));
+    }
+
+    #[test]
     fn amd_out_file_preserves_each_module_pragma_once_in_declarations() {
         let fs = MemoryFileSystem::new(true);
         fs.write_file(
@@ -9606,6 +9654,8 @@ mod tests {
         let fs = MemoryFileSystem::new(true);
         fs.write_file("/project/main.ts", "export const value = 1;")
             .unwrap();
+        fs.write_file("/project/global.ts", "const globalValue = 2;")
+            .unwrap();
         let program = Program::new_with_options(
             &fs,
             "/project",
@@ -9630,6 +9680,38 @@ mod tests {
             },
         );
         assert!(unspecified_module.emit().files.is_empty());
+
+        let mixed_unspecified_module = Program::new_with_options(
+            &fs,
+            "/project",
+            &["main.ts".to_owned(), "global.ts".to_owned()],
+            CompilerOptions {
+                out_file: Some("/project/bundle.js".into()),
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        let emitted = mixed_unspecified_module.emit();
+        assert_eq!(emitted.files.len(), 1);
+        assert_eq!(
+            emitted.files[0].text,
+            "\"use strict\";\nvar globalValue = 2;\n"
+        );
+
+        let commonjs_scripts = Program::new_with_options(
+            &fs,
+            "/project",
+            &["global.ts".to_owned()],
+            CompilerOptions {
+                module: ModuleKind::CommonJs,
+                out_file: Some("/project/bundle.js".into()),
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        let emitted = commonjs_scripts.emit();
+        assert_eq!(emitted.files.len(), 1);
+        assert_eq!(emitted.files[0].text, "\"use strict\";\nvar globalValue = 2;\n");
     }
 
     #[test]

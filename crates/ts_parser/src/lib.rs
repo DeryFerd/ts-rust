@@ -1123,6 +1123,26 @@ impl<'a> Parser<'a> {
         let return_type = self.parse_optional_type_annotation();
         let body = if self.current.kind == SyntaxKind::OpenBraceToken {
             Some(self.parse_block())
+        } else if self.current.kind == SyntaxKind::CommaToken {
+            self.error_current("Expected '{'.");
+            let position = self.current.full_start;
+            Some(self.alloc_node(
+                SyntaxKind::Block,
+                TextRange::new(position, position),
+                NodeData::Block(Box::new(BlockData {
+                    flow_node: None,
+                    locals: SymbolTable,
+                    multi_line: false,
+                    next_container: None,
+                    statements: NodeList {
+                        range: TextRange::new(position, position),
+                        nodes: Vec::new(),
+                        has_trailing_comma: false,
+                    },
+                    facts: 0,
+                })),
+                &[],
+            ))
         } else {
             self.parse_semicolon(self.current.range.start);
             None
@@ -1926,9 +1946,10 @@ impl<'a> Parser<'a> {
                 break;
             }
             let before = (self.current.kind, self.current.range);
-            if self.current.kind == SyntaxKind::SemicolonToken
-                || (signature_only && self.current.kind == SyntaxKind::CommaToken)
-            {
+            if matches!(
+                self.current.kind,
+                SyntaxKind::SemicolonToken | SyntaxKind::CommaToken
+            ) {
                 self.bump();
                 continue;
             }
@@ -2117,8 +2138,9 @@ impl<'a> Parser<'a> {
                 && !self.current_token_can_start_class_member()
             {
                 self.error_current("Expected '{'.");
+                let recovered_comma = self.current.kind == SyntaxKind::CommaToken;
                 let position = self.current.full_start;
-                Some(self.alloc_node(
+                let body = self.alloc_node(
                     SyntaxKind::Block,
                     TextRange::new(position, position),
                     NodeData::Block(Box::new(BlockData {
@@ -2134,7 +2156,11 @@ impl<'a> Parser<'a> {
                         facts: 0,
                     })),
                     &[],
-                ))
+                );
+                if recovered_comma {
+                    self.bump();
+                }
+                Some(body)
             } else {
                 self.parse_semicolon(parameters.range.end);
                 None
@@ -9039,6 +9065,48 @@ mod tests {
             &result.arena.get(call.expression).unwrap().data,
             NodeData::Identifier(identifier) if identifier.text == "value"
         ));
+    }
+
+    #[test]
+    fn recovers_comma_separated_function_declarations_with_missing_bodies() {
+        let result = parse_source_file(concat!(
+            "function f1(), function f1();\n",
+            "function f2(), function f2() {}\n",
+            "function f3() {}, function f3();\n",
+            "class C { m1(), m1(); m2(), m2() {} m3() {}, m3(); }\n",
+        ));
+        let statements = source_statements(&result);
+        let bodies = statements
+            .iter()
+            .filter_map(|statement| {
+                let NodeData::FunctionDeclaration(function) =
+                    &result.arena.get(*statement)?.data
+                else {
+                    return None;
+                };
+                Some(function.body.is_some())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(bodies, [true, false, true, true, true, false]);
+        let NodeData::ClassDeclaration(class) =
+            &result.arena.get(*statements.last().unwrap()).unwrap().data
+        else {
+            panic!("expected class declaration");
+        };
+        let method_bodies = class
+            .members
+            .nodes
+            .iter()
+            .map(|member| {
+                let NodeData::MethodDeclaration(method) =
+                    &result.arena.get(*member).unwrap().data
+                else {
+                    panic!("expected method declaration");
+                };
+                method.body.is_some()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(method_bodies, [true, false, true, true, true, false]);
     }
 
     #[test]

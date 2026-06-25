@@ -23211,6 +23211,14 @@ impl GeneratedNames {
             .then(|| preferred.to_owned())
     }
 
+    fn reserve_generated_offsets(&mut self, offsets: &BTreeMap<String, u32>) {
+        for (base, count) in offsets {
+            for index in 1..=*count {
+                self.used.insert(format!("{base}_{index}"));
+            }
+        }
+    }
+
     fn generate_temp(&mut self) -> String {
         let mut count = 0_u32;
         loop {
@@ -23288,8 +23296,10 @@ impl SystemModulePlan {
         jsx: JsxEmit,
         runtime_modules: &HashSet<NodeId>,
         runtime_identifier_uses: &HashSet<String>,
+        generated_name_offsets: &BTreeMap<String, u32>,
     ) -> Self {
         let mut names = GeneratedNames::new(arena);
+        names.reserve_generated_offsets(generated_name_offsets);
         let export_function = names.generate("exports");
         let context_object = names.generate("context");
         let mut dependencies = Vec::new();
@@ -25516,7 +25526,16 @@ impl Printer<'_> {
             self.settings.jsx,
             &runtime_modules,
             &self.runtime_identifier_uses,
+            context.amd_generated_name_offsets,
         );
+        for dependency in &mut plan.dependencies {
+            if let Some(rewrite) = context
+                .amd_module_specifier_rewrites
+                .get(&dependency.specifier)
+            {
+                dependency.specifier.clone_from(rewrite);
+            }
+        }
         for statement in &data.statements.nodes {
             let Some(node) = self.arena.get(*statement) else {
                 continue;

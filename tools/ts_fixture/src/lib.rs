@@ -360,7 +360,7 @@ fn parse_baseline_section_list(baseline: &str) -> Vec<(String, String)> {
 pub fn expand_option_matrix(case: &Case) -> Vec<OptionVariant> {
     let mut option_values = BTreeMap::<String, Vec<String>>::new();
     for &name in SCALAR_OPTION_NAMES {
-        let Some(value) = case.directive_values(name).next() else {
+        let Some(value) = case.directive_values(name).last() else {
             continue;
         };
         let values = if value.trim() == "*" {
@@ -393,7 +393,7 @@ pub fn expand_option_matrix(case: &Case) -> Vec<OptionVariant> {
         );
     }
     for &name in LIST_OPTION_NAMES {
-        if let Some(value) = case.directive_values(name).next() {
+        if let Some(value) = case.directive_values(name).last() {
             option_values.insert(name.to_owned(), vec![value.to_owned()]);
         }
     }
@@ -1936,6 +1936,25 @@ mod tests {
             ]
         );
         assert_eq!(compile_case_matrix(&case).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn repeated_scalar_option_directives_use_the_last_value() {
+        let case = Case::parse(
+            "repeated.ts",
+            concat!(
+                "// @outFile: first.js\n",
+                "// @outFile: second.js\n",
+                "const value = 1;\n",
+            ),
+        )
+        .unwrap();
+        let variants = expand_option_matrix(&case);
+        assert_eq!(variants.len(), 1);
+        assert_eq!(
+            variants[0].values.get("outFile").map(String::as_str),
+            Some("second.js")
+        );
     }
 
     #[test]
