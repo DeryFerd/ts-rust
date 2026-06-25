@@ -560,6 +560,7 @@ impl<'a> Parser<'a> {
             && !self.next_token_preceded_by_line_break()
             && self.next_token_kind() == SyntaxKind::FunctionKeyword;
         let let_starts_declaration = self.is_let_declaration();
+        let static_starts_recovered_call = self.static_starts_recovered_call_statement();
         let (import_starts_expression, invalid_import_declaration) =
             self.classify_import_statement_start();
         let recovered_bigint_module_clause = match self.current.kind {
@@ -612,6 +613,10 @@ impl<'a> Parser<'a> {
                 self.parse_expression_statement()
             }
             SyntaxKind::AsyncKeyword if !async_starts_function => self.parse_expression_statement(),
+            SyntaxKind::StaticKeyword if static_starts_recovered_call => {
+                self.bump();
+                self.parse_expression_statement()
+            }
             SyntaxKind::DeclareKeyword | SyntaxKind::AbstractKeyword | SyntaxKind::AsyncKeyword => {
                 self.parse_modified_statement()
             }
@@ -634,6 +639,21 @@ impl<'a> Parser<'a> {
             SyntaxKind::Identifier if is_labeled_statement => self.parse_labeled_statement(),
             _ => self.parse_expression_statement(),
         }
+    }
+
+    fn static_starts_recovered_call_statement(&mut self) -> bool {
+        if self.current.kind != SyntaxKind::StaticKeyword {
+            return false;
+        }
+        let checkpoint = self.scanner.mark();
+        let name = self.scanner.scan();
+        let next = self.scanner.scan().kind;
+        self.scanner.rewind(checkpoint);
+        !name
+            .flags
+            .contains(ScannerTokenFlags::PRECEDING_LINE_BREAK)
+            && (name.kind == SyntaxKind::Identifier || name.kind.is_keyword())
+            && next == SyntaxKind::OpenParenToken
     }
 
     fn current_token_starts_module_declaration(&mut self) -> bool {
@@ -7164,7 +7184,7 @@ impl<'a> Parser<'a> {
                 .current
                 .flags
                 .contains(ScannerTokenFlags::PRECEDING_LINE_BREAK)
-                && self.is_index_signature()
+                && (self.is_index_signature() || self.line_broken_bracket_starts_method())
             {
                 break;
             }
@@ -7199,6 +7219,28 @@ impl<'a> Parser<'a> {
             );
         }
         type_node
+    }
+
+    fn line_broken_bracket_starts_method(&mut self) -> bool {
+        if self.current.kind != SyntaxKind::OpenBracketToken {
+            return false;
+        }
+        let checkpoint = self.scanner.mark();
+        let name = self.scanner.scan().kind;
+        let close = self.scanner.scan().kind;
+        let mut next = self.scanner.scan().kind;
+        if matches!(next, SyntaxKind::QuestionToken | SyntaxKind::ExclamationToken) {
+            next = self.scanner.scan().kind;
+        }
+        self.scanner.rewind(checkpoint);
+        matches!(
+            name,
+            SyntaxKind::Identifier
+                | SyntaxKind::StringLiteral
+                | SyntaxKind::NumericLiteral
+                | SyntaxKind::BigIntLiteral
+        ) && close == SyntaxKind::CloseBracketToken
+            && matches!(next, SyntaxKind::OpenParenToken | SyntaxKind::LessThanToken)
     }
 
     fn next_token_starts_type(&mut self) -> bool {
@@ -9107,6 +9149,72 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(method_bodies, [true, false, true, true, true, false]);
+    }
+
+    #[test]
+    fn preserves_computed_name_overload_implementation_bodies() {
+        let result = parse_source_file(concat!(
+            "class C {\n",
+            "  [\"foo\"](): void\n",
+            "  [\"bar\"](): void;\n",
+            "  [\"foo\"]() { return 0; }\n",
+            "}\n",
+        ));
+        let statements = source_statements(&result);
+        let NodeData::ClassDeclaration(class) =
+            &result.arena.get(statements[0]).unwrap().data
+        else {
+            panic!("expected class declaration");
+        };
+        let bodies = class
+            .members
+            .nodes
+            .iter()
+            .map(|member| {
+                let NodeData::MethodDeclaration(method) =
+                    &result.arena.get(*member).unwrap().data
+                else {
+                    panic!("expected method declaration");
+                };
+                method.body.is_some()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(bodies, [false, false, true]);
+    }
+
+    #[test]
+    fn recovers_static_prefixed_calls_in_a_malformed_function_body() {
+        let result = parse_source_file(concat!(
+            "function boo {\n",
+            "  static test()\n",
+            "  static test(name: string)\n",
+            "  static test(name?: any) { }\n",
+            "}\n",
+        ));
+        let NodeData::FunctionDeclaration(function) =
+            &result.arena.get(source_statements(&result)[0]).unwrap().data
+        else {
+            panic!("expected function declaration");
+        };
+        let NodeData::Block(body) = &result.arena.get(function.body.unwrap()).unwrap().data else {
+            panic!("expected function body");
+        };
+        assert_eq!(body.statements.nodes.len(), 4);
+        for statement in &body.statements.nodes[..3] {
+            let NodeData::ExpressionStatement(statement) =
+                &result.arena.get(*statement).unwrap().data
+            else {
+                panic!("expected recovered call statement");
+            };
+            assert!(matches!(
+                &result.arena.get(statement.expression).unwrap().data,
+                NodeData::CallExpression(_)
+            ));
+        }
+        assert!(matches!(
+            &result.arena.get(body.statements.nodes[3]).unwrap().data,
+            NodeData::Block(_)
+        ));
     }
 
     #[test]
