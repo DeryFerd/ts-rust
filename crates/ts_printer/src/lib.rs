@@ -18293,7 +18293,9 @@ impl DeclarationPrinter<'_> {
                     self.writer.write(")");
                 }
                 self.writer.write(": ");
-                if !self.emit_computed_object_method_return(type_id)? {
+                if let Some(type_) = source_method.and_then(|method| method.type_) {
+                    self.emit_type(type_)?;
+                } else if !self.emit_computed_object_method_return(type_id)? {
                     if matches!(
                         self.semantic_types
                             .and_then(|types| types.get(signature.return_type))
@@ -21342,7 +21344,15 @@ impl DeclarationPrinter<'_> {
             };
             let property_node = element.property_name.unwrap_or(name);
             let property = declaration_name_text(self.arena, property_node).unwrap_or("property");
-            self.emit_name(property_node)?;
+            if is_identifier_text(property) {
+                self.writer.write(property);
+            } else if let Some(NodeData::ComputedPropertyName(computed)) =
+                self.arena.get(property_node).map(|node| &node.data)
+            {
+                self.emit_name(computed.expression)?;
+            } else {
+                self.emit_name(property_node)?;
+            }
             if element.initializer.is_some() {
                 self.writer.write("?");
             }
@@ -57732,6 +57742,31 @@ mod tests {
             "{output}"
         );
         assert!(!output.contains("once = false"), "{output}");
+    }
+
+    #[test]
+    fn declaration_emit_canonicalizes_inferred_binding_property_names() {
+        let output = emit_declarations_with_semantics(
+            concat!(
+                "type O = { a: string };\n",
+                "type F = ({ \"a\": renamed, 2: two, [3]: three }) => void;\n",
+                "const obj = { method({ a: value }: O): typeof value { return value; } };\n",
+            ),
+        );
+        assert!(
+            output.contains(concat!(
+                ": {\n",
+                "    a: any;\n",
+                "    2: any;\n",
+                "    3: any;\n",
+                "}) => void;",
+            )),
+            "{output}"
+        );
+        assert!(
+            output.contains("method({ a: value }: O): typeof value;"),
+            "{output}"
+        );
     }
 
     #[test]

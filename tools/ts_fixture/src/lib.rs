@@ -719,6 +719,10 @@ fn compile_case_variant(case: &Case, variant: &OptionVariant) -> std::io::Result
         path.rsplit_once('/')
             .map(|(directory, _)| directory.to_owned())
     });
+    let include_node_modules_roots = project_directory.is_none()
+        && case
+            .directive_values("fullEmitPaths")
+            .any(|value| value.eq_ignore_ascii_case("true"));
     let links = case
         .directive_values("link")
         .filter_map(|value| value.split_once("->"))
@@ -775,9 +779,10 @@ fn compile_case_variant(case: &Case, variant: &OptionVariant) -> std::io::Result
             )?;
         }
         if is_compilation_unit(&path)
-            && !path
-                .split('/')
-                .any(|component| component.eq_ignore_ascii_case("node_modules"))
+            && (include_node_modules_roots
+                || !path
+                    .split('/')
+                    .any(|component| component.eq_ignore_ascii_case("node_modules")))
         {
             roots.push(path);
         }
@@ -817,7 +822,7 @@ fn compile_case_variant(case: &Case, variant: &OptionVariant) -> std::io::Result
     let current_directory = project_directory
         .as_deref()
         .or_else(|| case.directive_values("currentDirectory").next())
-        .unwrap_or("/case");
+        .unwrap_or_else(|| virtual_unit_root(case));
     let program = ts_compiler::Program::new_with_options(
         &file_system,
         current_directory,
@@ -882,12 +887,24 @@ fn virtual_unit_path(case: &Case, unit: &Unit, index: usize) -> String {
             .file_name()
             .and_then(|name| name.to_str())
             .map_or_else(|| format!("unit{index}.ts"), str::to_owned);
-        return ts_path::resolve_path("/case", &[&base]);
+        return ts_path::resolve_path(virtual_unit_root(case), &[&base]);
     }
     if path.starts_with('/') {
         return ts_path::normalize_path(&path);
     }
-    ts_path::resolve_path("/case", &[&path])
+    ts_path::resolve_path(virtual_unit_root(case), &[&path])
+}
+
+fn virtual_unit_root(case: &Case) -> &'static str {
+    if case
+        .units
+        .iter()
+        .any(|unit| unit.path.to_string_lossy().replace('\\', "/").starts_with("/.src/"))
+    {
+        "/.src"
+    } else {
+        "/case"
+    }
 }
 
 fn is_compilation_unit(path: &str) -> bool {
@@ -1505,7 +1522,7 @@ mod tests {
         compare_case_emitted_output_sections, compare_emitted_output_sections, compile_case,
         compile_case_matrix, expand_option_matrix, first_different_line, fixture_compiler_options,
         matrix_axes, parse_baseline_sections, run_case_against_baseline,
-        select_variant_baselines,
+        select_variant_baselines, virtual_unit_path,
     };
 
     #[test]
@@ -1543,6 +1560,29 @@ mod tests {
             .outputs
             .keys()
             .all(|path| !path.contains("node_modules")));
+    }
+
+    #[test]
+    fn full_emit_paths_promotes_explicit_node_modules_units() {
+        let case = Case::parse(
+            "dependencyUnit.ts",
+            concat!(
+                "// @target: es2015\n",
+                "// @fullEmitPaths: true\n",
+                "// @filename: /src/main.ts\nexport const main = 1;\n",
+                "// @filename: /src/node_modules/pkg/index.ts\nexport const dependency = 1;\n",
+            ),
+        )
+        .unwrap();
+        let compilation = compile_case(&case).unwrap();
+        assert!(
+            compilation
+                .outputs
+                .keys()
+                .any(|path| path.ends_with("node_modules/pkg/index.js")),
+            "{:?}",
+            compilation.outputs.keys().collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -1590,6 +1630,24 @@ mod tests {
         assert_eq!(case.units[1].start_line, 7);
         assert_eq!(case.directives.len(), 4);
         assert!(case.directives[2].is_filename());
+    }
+
+    #[test]
+    fn relative_units_share_an_explicit_upstream_src_root() {
+        let case = Case::parse(
+            "srcRoot.ts",
+            concat!(
+                "// @filename: /.src/node_modules/@types/pkg/index.d.ts\n",
+                "declare module 'pkg' {}\n",
+                "// @filename: usage.ts\n",
+                "import 'pkg';\n",
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            virtual_unit_path(&case, &case.units[1], 1),
+            "/.src/usage.ts"
+        );
     }
 
     #[test]

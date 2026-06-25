@@ -155,6 +155,13 @@ fn source_shebang(source: &SourceFile) -> Option<&str> {
         .map(|line| line.trim_end_matches('\r'))
 }
 
+fn source_is_json(source: &SourceFile) -> bool {
+    Path::new(&source.file_name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+}
+
 fn source_prologue_directives(source: &SourceFile) -> Vec<&str> {
     let Some(NodeData::SourceFile(file)) = source
         .parse
@@ -814,7 +821,7 @@ impl Program {
                         .push(emit_diagnostic(source_file, &error)),
                 }
             }
-            if settings.emit_declarations {
+            if settings.emit_declarations && !source_is_json(source_file) {
                 let Some(declaration_file_name) = paths.declaration.as_deref() else {
                     continue;
                 };
@@ -9862,6 +9869,43 @@ export function create() { return new M.Value(); }"#,
                 .files
                 .iter()
                 .all(|file| !file.file_name.contains("node_modules"))
+        );
+    }
+
+    #[test]
+    fn json_modules_are_copied_without_declaration_files() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/main.ts",
+            "import data = require('./data.json'); export const value = data.value;",
+        )
+        .unwrap();
+        fs.write_file("/project/data.json", "{ \"value\": 1 }")
+            .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["main.ts".to_owned()],
+            CompilerOptions {
+                declaration: true,
+                resolve_json_module: true,
+                out_dir: Some("/project/out".into()),
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        let emitted = program.emit();
+        assert!(
+            emitted
+                .files
+                .iter()
+                .any(|file| file.file_name == "/project/out/data.json")
+        );
+        assert!(
+            emitted
+                .files
+                .iter()
+                .all(|file| file.file_name != "/project/out/data.d.ts")
         );
     }
 
