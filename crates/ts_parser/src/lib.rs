@@ -548,6 +548,8 @@ impl<'a> Parser<'a> {
         let is_const_enum = self.current.kind == SyntaxKind::ConstKeyword
             && self.next_token_kind() == SyntaxKind::EnumKeyword;
         let is_module_declaration = self.current_token_starts_module_declaration();
+        let contextual_type_starts_declaration =
+            self.current_token_starts_contextual_type_declaration();
         let abstract_starts_expression = self.current.kind == SyntaxKind::AbstractKeyword
             && self.next_token_preceded_by_line_break();
         let declare_starts_expression = self.current.kind == SyntaxKind::DeclareKeyword
@@ -579,8 +581,8 @@ impl<'a> Parser<'a> {
             SyntaxKind::AwaitKeyword => self.parse_await_statement(),
             SyntaxKind::FunctionKeyword => self.parse_function_declaration(),
             SyntaxKind::ClassKeyword => self.parse_class_declaration(),
-            SyntaxKind::InterfaceKeyword => self.parse_interface_declaration(),
-            SyntaxKind::TypeKeyword => self.parse_type_alias_declaration(),
+            SyntaxKind::InterfaceKeyword | SyntaxKind::TypeKeyword
+                if contextual_type_starts_declaration => self.parse_contextual_type_declaration(),
             SyntaxKind::EnumKeyword => self.parse_enum_declaration(),
             SyntaxKind::ReturnKeyword => self.parse_return_statement(),
             SyntaxKind::IfKeyword => self.parse_if_statement(),
@@ -668,6 +670,21 @@ impl<'a> Parser<'a> {
                 next == SyntaxKind::StringLiteral || is_module_name_token(next)
             }
             _ => false,
+        }
+    }
+
+    fn current_token_starts_contextual_type_declaration(&mut self) -> bool {
+        matches!(
+            self.current.kind,
+            SyntaxKind::InterfaceKeyword | SyntaxKind::TypeKeyword
+        ) && is_module_name_token(self.next_token_kind())
+    }
+
+    fn parse_contextual_type_declaration(&mut self) -> NodeId {
+        match self.current.kind {
+            SyntaxKind::InterfaceKeyword => self.parse_interface_declaration(),
+            SyntaxKind::TypeKeyword => self.parse_type_alias_declaration(),
+            _ => unreachable!("expected a contextual type declaration"),
         }
     }
 
@@ -3970,6 +3987,31 @@ impl<'a> Parser<'a> {
             NodeData::Token(Box::new(TokenData)),
             &[],
         );
+        let next = self.next_token_kind();
+        let invalid_contextual_declaration_name = match self.current.kind {
+            SyntaxKind::InterfaceKeyword | SyntaxKind::NamespaceKeyword => {
+                !is_module_name_token(next)
+            }
+            SyntaxKind::TypeKeyword => !matches!(
+                next,
+                SyntaxKind::OpenBraceToken | SyntaxKind::AsteriskToken
+            ) && !is_module_name_token(next),
+            SyntaxKind::ModuleKeyword => {
+                next != SyntaxKind::StringLiteral && !is_module_name_token(next)
+            }
+            _ => false,
+        };
+        if invalid_contextual_declaration_name {
+            return self.alloc_node_with_flags(
+                SyntaxKind::NotEmittedStatement,
+                NODE_FLAG_HAS_ERROR,
+                export_token.range,
+                NodeData::NotEmittedStatement(Box::new(NotEmittedStatementData {
+                    flow_node: None,
+                })),
+                &[export_modifier],
+            );
+        }
         let class_modifier_before_import = if matches!(
             self.current.kind,
             SyntaxKind::PublicKeyword
@@ -12510,6 +12552,55 @@ mod tests {
         assert_eq!(
             result.arena.get(condition.operand).unwrap().kind,
             SyntaxKind::Identifier
+        );
+    }
+
+    #[test]
+    fn recovers_invalid_contextual_declaration_names_as_statements() {
+        let result = parse_source_file(concat!(
+            "namespace 100 {}\ninterface 100 {}\ntype 100 {}\n",
+            "export namespace 100 {}\nexport interface 100 {}\nexport type 100 {}\n",
+        ));
+        let statements = source_statements(&result);
+        assert_eq!(statements.len(), 21);
+        assert_eq!(
+            statements
+                .iter()
+                .filter(|statement| {
+                    matches!(
+                        result.arena.get(**statement).map(|node| &node.data),
+                        Some(NodeData::NotEmittedStatement(_))
+                    )
+                })
+                .count(),
+            3
+        );
+        let names = statements
+            .iter()
+            .filter_map(|statement| {
+                let NodeData::ExpressionStatement(expression) =
+                    &result.arena.get(*statement)?.data
+                else {
+                    return None;
+                };
+                let NodeData::Identifier(identifier) =
+                    &result.arena.get(expression.expression)?.data
+                else {
+                    return None;
+                };
+                (!identifier.text.is_empty()).then_some(identifier.text.as_str())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                "namespace",
+                "interface",
+                "type",
+                "namespace",
+                "interface",
+                "type"
+            ]
         );
     }
 
