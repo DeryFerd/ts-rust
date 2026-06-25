@@ -1061,18 +1061,21 @@ pub fn emit_source_file_with_context(
         let mut fields = printer
             .private_field_plans
             .values()
+            .filter(|plan| plan.scope == source_file)
             .flat_map(|plan| plan.fields.iter())
             .collect::<Vec<_>>();
-        fields.sort_by_key(|field| field.declaration_order);
-        printer.writer.write("var ");
-        for (index, field) in fields.iter().enumerate() {
-            if index != 0 {
-                printer.writer.write(", ");
+        if !fields.is_empty() {
+            fields.sort_by_key(|field| field.declaration_order);
+            printer.writer.write("var ");
+            for (index, field) in fields.iter().enumerate() {
+                if index != 0 {
+                    printer.writer.write(", ");
+                }
+                printer.writer.write(&field.storage);
             }
-            printer.writer.write(&field.storage);
+            printer.writer.write(";");
+            printer.writer.newline();
         }
-        printer.writer.write(";");
-        printer.writer.newline();
     }
     if !printer.imported_helper_aliases.is_empty() {
         printer.writer.write("import { ");
@@ -24741,6 +24744,7 @@ struct PrivateFieldInfo {
 
 #[derive(Clone)]
 struct PrivateFieldPlan {
+    scope: NodeId,
     fields: Vec<PrivateFieldInfo>,
 }
 
@@ -25227,10 +25231,45 @@ impl Printer<'_> {
                 declaration_order += 1;
             }
             if !fields.is_empty() {
+                let Some(scope) = self.private_field_storage_scope(class_id) else {
+                    continue;
+                };
                 self.private_field_plans
-                    .insert(class_name, PrivateFieldPlan { fields });
+                    .insert(class_name, PrivateFieldPlan { scope, fields });
             }
         }
+    }
+
+    fn private_field_storage_scope(&self, class: NodeId) -> Option<NodeId> {
+        let mut current = class;
+        while let Some(parent) = self.arena.get(current).and_then(|node| node.parent) {
+            match self.arena.get(parent).map(|node| &node.data) {
+                Some(NodeData::SourceFile(_) | NodeData::ModuleBlock(_)) => return Some(parent),
+                Some(NodeData::Block(_))
+                    if self
+                        .arena
+                        .get(parent)
+                        .and_then(|block| block.parent)
+                        .and_then(|function| self.arena.get(function))
+                        .is_some_and(|function| {
+                            matches!(
+                                function.data,
+                                NodeData::FunctionDeclaration(_)
+                                    | NodeData::FunctionExpression(_)
+                                    | NodeData::ArrowFunction(_)
+                                    | NodeData::MethodDeclaration(_)
+                                    | NodeData::ConstructorDeclaration(_)
+                                    | NodeData::GetAccessorDeclaration(_)
+                                    | NodeData::SetAccessorDeclaration(_)
+                            )
+                        }) =>
+                {
+                    return Some(parent);
+                }
+                _ => current = parent,
+            }
+        }
+        None
     }
 
     #[allow(clippy::too_many_lines)]
@@ -29536,6 +29575,11 @@ impl Printer<'_> {
                         self.emit_commonjs_declaration_exports(data.modifiers.as_ref(), &names);
                     }
                 }
+                if self.settings.target < ScriptTarget::Es2015
+                    && let Some(plan) = self.private_field_plan(data)
+                {
+                    self.emit_private_field_initializers(&plan);
+                }
                 if !emitted_stage3_class_decorators
                     && self.settings.target >= ScriptTarget::Es2015
                 {
@@ -32554,6 +32598,7 @@ impl Printer<'_> {
         self.writer.indent += 1;
         self.namespace_declarations.push(HashSet::new());
         self.prepare_class_expression_temps(id, data);
+        self.emit_private_field_declarations_for_scope(id);
         let mut previous_end = node.range.start.get().saturating_add(1);
         if self.body_opening_line_comment_is_unowned(id) {
             let comment_end = data
@@ -44347,7 +44392,11 @@ impl Printer<'_> {
         emitted_name: Option<&str>,
     ) -> Result<(), EmitError> {
         if self.settings.target < ScriptTarget::Es2015 {
-            return self.emit_downlevel_class(data, emitted_name);
+            let previous = self.active_private_field_plan.clone();
+            self.active_private_field_plan = self.private_field_plan(data);
+            let result = self.emit_downlevel_class(data, emitted_name);
+            self.active_private_field_plan = previous;
+            return result;
         }
         let private_plan = self.private_method_plan(data);
         let previous_private_plan = self.active_private_method_plan.clone();
@@ -45910,6 +45959,28 @@ impl Printer<'_> {
             self.writer.write(" = new WeakMap()");
         }
         self.writer.write(";");
+    }
+
+    fn emit_private_field_declarations_for_scope(&mut self, scope: NodeId) {
+        let mut fields = self
+            .private_field_plans
+            .values()
+            .filter(|plan| plan.scope == scope)
+            .flat_map(|plan| plan.fields.iter())
+            .collect::<Vec<_>>();
+        fields.sort_by_key(|field| field.declaration_order);
+        if fields.is_empty() {
+            return;
+        }
+        self.writer.write("var ");
+        for (index, field) in fields.iter().enumerate() {
+            if index != 0 {
+                self.writer.write(", ");
+            }
+            self.writer.write(&field.storage);
+        }
+        self.writer.write(";");
+        self.writer.newline();
     }
 
     fn emit_private_method_initializers(
@@ -59591,6 +59662,34 @@ mod tests {
             "{output}"
         );
         assert!(output.ends_with("_A_value = new WeakMap();\n"), "{output}");
+    }
+
+    #[test]
+    fn lowers_uninitialized_private_fields_for_es5() {
+        let output = emit_with(
+            "class C { #value: unknown; }",
+            ScriptTarget::Es5,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(output.contains("_C_value.set(this, void 0);"), "{output}");
+        assert!(output.ends_with("_C_value = new WeakMap();\n"), "{output}");
+    }
+
+    #[test]
+    fn scopes_nested_class_private_field_storage_to_the_function() {
+        let output = emit_with(
+            "function test() { let WeakMap; class C { #value; } }",
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(
+            output.contains("function test() {\n    var _C_value;"),
+            "{output}"
+        );
+        assert!(!output.starts_with("var _C_value;"), "{output}");
+        assert!(output.contains("_C_value = new WeakMap();"), "{output}");
     }
 
     #[test]
