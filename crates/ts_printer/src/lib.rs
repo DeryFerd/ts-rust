@@ -30460,9 +30460,24 @@ impl Printer<'_> {
                     return Ok(());
                 }
                 self.writer.write("break");
+                let keyword_end = node.range.start.get().saturating_add(5);
                 if let Some(label) = data.label {
-                    self.writer.write(" ");
+                    let label_start = self.node(label)?.range.start.get();
+                    self.emit_for_block_comment_gap(keyword_end, label_start, true, true);
                     self.emit_expression(label, 0)?;
+                    let semicolon = self
+                        .source_punctuation_between(
+                            self.node(label)?.range.end.get(),
+                            node.range.end.get(),
+                            b';',
+                        )
+                        .unwrap_or(node.range.end.get());
+                    self.emit_for_block_comment_gap(
+                        self.node(label)?.range.end.get(),
+                        semicolon,
+                        false,
+                        false,
+                    );
                 }
                 self.writer.write(";");
             }
@@ -30507,7 +30522,19 @@ impl Printer<'_> {
             NodeData::DebuggerStatement(_) => self.writer.write("debugger;"),
             NodeData::LabeledStatement(data) => {
                 self.emit_expression(data.label, 0)?;
-                self.writer.write(": ");
+                let label_end = self.node(data.label)?.range.end.get();
+                let statement_start = self.node(data.statement)?.range.start.get();
+                let colon = self
+                    .source_punctuation_between(label_end, statement_start, b':')
+                    .unwrap_or(label_end);
+                self.emit_for_block_comment_gap(label_end, colon, false, false);
+                self.writer.write(":");
+                self.emit_for_block_comment_gap(
+                    colon.saturating_add(1),
+                    statement_start,
+                    true,
+                    true,
+                );
                 self.emit_statement(data.statement)?;
                 return Ok(());
             }
@@ -31205,12 +31232,52 @@ impl Printer<'_> {
         false
     }
 
+    #[allow(clippy::too_many_lines)]
     fn emit_switch(&mut self, data: &ts_ast::SwitchStatementData) -> Result<(), EmitError> {
-        self.writer.write("switch (");
+        let switch_node = self.node(data.case_block)?.clone();
+        let expression = self.node(data.expression)?.clone();
+        let statement = self
+            .arena
+            .get(data.case_block)
+            .and_then(|block| block.parent)
+            .and_then(|switch| self.arena.get(switch))
+            .cloned();
+        let keyword_end = statement
+            .as_ref()
+            .map_or(expression.range.start.get(), |node| {
+                node.range.start.get().saturating_add(6)
+            });
+        let open = self
+            .source_punctuation_between(keyword_end, expression.range.start.get(), b'(')
+            .unwrap_or(keyword_end);
+        let close = self
+            .source_punctuation_between(
+                expression.range.end.get(),
+                switch_node.range.start.get(),
+                b')',
+            )
+            .unwrap_or(expression.range.end.get());
+        self.writer.write("switch");
+        self.emit_for_block_comment_gap(keyword_end, open, true, true);
+        self.writer.write("(");
+        self.emit_for_block_comment_gap(
+            open.saturating_add(1),
+            expression.range.start.get(),
+            false,
+            false,
+        );
         self.emit_expression(data.expression, 0)?;
-        self.writer.write(") {");
+        self.emit_for_block_comment_gap(expression.range.end.get(), close, false, false);
+        self.writer.write(")");
+        self.emit_for_block_comment_gap(
+            close.saturating_add(1),
+            switch_node.range.start.get(),
+            true,
+            true,
+        );
+        self.writer.write("{");
         self.writer.newline();
-        let block_node = self.node(data.case_block)?.clone();
+        let block_node = switch_node;
         let NodeData::CaseBlock(block) = &block_node.data else {
             return Err(Self::unsupported(data.case_block, block_node.kind));
         };
@@ -31227,13 +31294,6 @@ impl Printer<'_> {
                 clause_node.range.start.get(),
                 previous_emitted,
             );
-            if clause_node.kind == SyntaxKind::DefaultClause {
-                self.writer.write("default:");
-            } else {
-                self.writer.write("case ");
-                self.emit_expression(clause.expression, 0)?;
-                self.writer.write(":");
-            }
             let comment_end = clause
                 .statements
                 .nodes
@@ -31249,6 +31309,43 @@ impl Printer<'_> {
                         .map(|node| node.range.start.get())
                 })
                 .unwrap_or_else(|| block_node.range.end.get().saturating_sub(1));
+            if clause_node.kind == SyntaxKind::DefaultClause {
+                self.writer.write("default");
+                let colon = self
+                    .switch_clause_colon_end(&clause_node, clause, comment_end)
+                    .map_or(clause_node.range.start.get().saturating_add(7), |end| {
+                        end.saturating_sub(1)
+                    });
+                self.emit_for_block_comment_gap(
+                    clause_node.range.start.get().saturating_add(7),
+                    colon,
+                    false,
+                    false,
+                );
+                self.writer.write(":");
+            } else {
+                self.writer.write("case");
+                let keyword_end = clause_node.range.start.get().saturating_add(4);
+                self.emit_for_block_comment_gap(
+                    keyword_end,
+                    self.node(clause.expression)?.range.start.get(),
+                    true,
+                    true,
+                );
+                self.emit_expression(clause.expression, 0)?;
+                let colon = self
+                    .switch_clause_colon_end(&clause_node, clause, comment_end)
+                    .map_or(self.node(clause.expression)?.range.end.get(), |end| {
+                        end.saturating_sub(1)
+                    });
+                self.emit_for_block_comment_gap(
+                    self.node(clause.expression)?.range.end.get(),
+                    colon,
+                    false,
+                    false,
+                );
+                self.writer.write(":");
+            }
             if let Some(comment_start) =
                 self.switch_clause_colon_end(&clause_node, clause, comment_end)
             {
@@ -31258,6 +31355,14 @@ impl Printer<'_> {
                     true,
                     false,
                 );
+                let comment_is_inline = usize::try_from(comment_start)
+                    .ok()
+                    .zip(usize::try_from(comment_end).ok())
+                    .and_then(|(start, end)| self.source_text.get(start..end))
+                    .is_some_and(|trivia| !trivia.contains(['\n', '\r']));
+                if comment_is_inline {
+                    self.writer.remove_trailing_newline();
+                }
             }
             if let [statement] = clause.statements.nodes.as_slice()
                 && matches!(
@@ -60883,6 +60988,33 @@ mod tests {
                 "        return value;\n",
                 "}\n",
             )
+        );
+    }
+
+    #[test]
+    fn preserves_internal_comments_across_labeled_switch_tokens() {
+        let output = emit_with(
+            concat!(
+                "/*-1*/ foo /*0*/ : /*1*/ switch /*2*/ ( /*3*/ false /*4*/ ) /*5*/ {\n",
+                "/*6*/ case /*7*/ false /*8*/ : /*9*/\n",
+                "/*10*/ break /*11*/ foo /*12*/;\n",
+                "/*13*/ default /*14*/ : /*15*/\n",
+                "/*16*/ case /*17*/ false /*18*/ : /*19*/ { /*20*/\n",
+                "/*21*/ } /*22*/\n}",
+            ),
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(
+            output.contains("foo /*0*/: /*1*/ switch /*2*/ ( /*3*/false /*4*/) /*5*/ {"),
+            "{output}"
+        );
+        assert!(output.contains("case /*7*/ false /*8*/: /*9*/"), "{output}");
+        assert!(output.contains("break /*11*/ foo /*12*/;"), "{output}");
+        assert!(
+            output.contains("case /*17*/ false /*18*/: /*19*/ { /*20*/"),
+            "{output}"
         );
     }
 
