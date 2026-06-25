@@ -686,6 +686,28 @@ impl<'a> ProgramChecker<'a> {
         let mut files = preliminary.clone();
         for file_index in order {
             let source = &self.sources[file_index];
+            let established_global_variables = global_variables
+                .iter()
+                .filter(|name| {
+                    self.sources
+                        .iter()
+                        .enumerate()
+                        .any(|(other_index, other)| {
+                            other_index != file_index
+                                && other
+                                    .bindings
+                                    .root_scope()
+                                    .and_then(|scope| scope.symbols.get(name))
+                                    .and_then(|symbol| other.bindings.symbols.get(symbol))
+                                    .is_some_and(|symbol| {
+                                        symbol.flags.contains(
+                                            ts_binder::SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+                                        )
+                                    })
+                        })
+                })
+                .cloned()
+                .collect();
             let (
                 external_symbols,
                 external_imports,
@@ -727,7 +749,7 @@ impl<'a> ProgramChecker<'a> {
                         .with_environment(external_symbols, external_imports, external_names)
                         .with_global_environment(
                             is_external_module(source),
-                            global_variables.clone(),
+                            established_global_variables,
                         )
                         .check(source.source_file)
                 };
@@ -24301,6 +24323,38 @@ mod tests {
             .type_of_symbol(root.symbols.get("result").unwrap())
             .unwrap();
         assert_eq!(checked.files[1].types.display(result_type), "{ b: number }");
+    }
+
+    #[test]
+    fn infers_new_global_variables_from_prior_files() {
+        let declarations = parse_source_file("var x = { a: 10, b: 20 };");
+        let client = parse_source_file("var y = x;");
+        let declaration_bindings = bind_source_file(&declarations.arena, declarations.source_file);
+        let client_bindings = bind_source_file(&client.arena, client.source_file);
+        let no_modules = BTreeMap::new();
+        let checked = check_program(&[
+            ProgramSource {
+                arena: &declarations.arena,
+                source_file: declarations.source_file,
+                bindings: &declaration_bindings,
+                resolved_modules: &no_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+            ProgramSource {
+                arena: &client.arena,
+                source_file: client.source_file,
+                bindings: &client_bindings,
+                resolved_modules: &no_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+        ]);
+        let y = client_bindings.root_scope().unwrap().symbols.get("y").unwrap();
+        let y_type = checked.files[1].type_of_symbol(y).unwrap();
+        assert_eq!(checked.files[1].types.display(y_type), "{ a: number; b: number }");
     }
 
     #[test]

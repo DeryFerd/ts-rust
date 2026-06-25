@@ -35159,6 +35159,35 @@ impl Printer<'_> {
         self.writer.write("{");
         self.writer.newline();
         self.writer.indent += 1;
+        let mut hoisted_names = Vec::new();
+        for statement in &block.statements.nodes {
+            let Some(NodeData::VariableStatement(variable)) =
+                self.arena.get(*statement).map(|node| &node.data)
+            else {
+                continue;
+            };
+            let names = self.variable_declaration_names(variable.declaration_list)?;
+            let simple = names.len()
+                == self
+                    .arena
+                    .get(variable.declaration_list)
+                    .and_then(|node| match &node.data {
+                        NodeData::VariableDeclarationList(list) => {
+                            Some(list.declarations.nodes.len())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or(0);
+            if simple {
+                hoisted_names.extend(names);
+            }
+        }
+        if !hoisted_names.is_empty() {
+            self.writer.write("var ");
+            self.writer.write(&hoisted_names.join(", "));
+            self.writer.write(";");
+            self.writer.newline();
+        }
         self.writer.write("return ");
         self.emit_generator_reference();
         self.writer.write("(this, function (_a) {");
@@ -35567,6 +35596,7 @@ impl Printer<'_> {
                     self.arena.get(*statement).map(|node| &node.data)
                 {
                     self.emit_es5_generator_return(return_statement.expression)?;
+                } else if self.emit_es5_generator_variable_initializers(*statement)? {
                 } else {
                     self.emit_statement(*statement)?;
                 }
@@ -35610,6 +35640,7 @@ impl Printer<'_> {
                 self.arena.get(*statement).map(|node| &node.data)
             {
                 self.emit_es5_generator_return(return_statement.expression)?;
+            } else if self.emit_es5_generator_variable_initializers(*statement)? {
             } else {
                 self.emit_statement(*statement)?;
             }
@@ -35627,6 +35658,47 @@ impl Printer<'_> {
         self.writer.write("}");
         self.writer.newline();
         Ok(())
+    }
+
+    fn emit_es5_generator_variable_initializers(
+        &mut self,
+        statement: NodeId,
+    ) -> Result<bool, EmitError> {
+        let statement_node = self.node(statement)?.clone();
+        let NodeData::VariableStatement(variable) = &statement_node.data else {
+            return Ok(false);
+        };
+        let list_node = self.node(variable.declaration_list)?.clone();
+        let NodeData::VariableDeclarationList(list) = &list_node.data else {
+            return Ok(false);
+        };
+        if !list.declarations.nodes.iter().all(|declaration| {
+            matches!(
+                self.arena.get(*declaration).map(|node| &node.data),
+                Some(NodeData::VariableDeclaration(declaration))
+                    if matches!(
+                        self.arena.get(declaration.name).map(|node| &node.data),
+                        Some(NodeData::Identifier(_))
+                    )
+            )
+        }) {
+            return Ok(false);
+        }
+        self.record_mapping(&statement_node);
+        for declaration in &list.declarations.nodes {
+            let NodeData::VariableDeclaration(declaration) = &self.node(*declaration)?.data else {
+                continue;
+            };
+            let Some(initializer) = declaration.initializer else {
+                continue;
+            };
+            self.emit_expression(declaration.name, 1)?;
+            self.writer.write(" = ");
+            self.emit_expression(initializer, 1)?;
+            self.writer.write(";");
+            self.writer.newline();
+        }
+        Ok(true)
     }
 
     fn emit_es5_generator_yield_opcode(
@@ -59879,6 +59951,16 @@ mod tests {
         assert!(es2015.contains("function* declared()"), "{es2015}");
         assert!(es2015.contains("function* named()"), "{es2015}");
         assert!(!es2015.contains("__generator"), "{es2015}");
+
+        let vars = emit_with(
+            "function* f() { var x = 1, y; }",
+            ScriptTarget::Es5,
+            ModuleKind::EsNext,
+        )
+        .code;
+        assert!(vars.contains("function f() {\n    var x, y;\n"), "{vars}");
+        assert!(vars.contains("        x = 1;\n"), "{vars}");
+        assert!(!vars.contains("        var x"), "{vars}");
     }
 
     #[test]
