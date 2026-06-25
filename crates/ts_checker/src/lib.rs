@@ -8449,6 +8449,7 @@ impl<'a> Checker<'a> {
                             self.result.types.never()
                         } else {
                             let element_types = self.complete_object_union_members(element_types);
+                            let element_types = self.reduce_subtype_union_members(&element_types);
                             self.result.types.union(element_types)
                         }
                     });
@@ -8911,6 +8912,29 @@ impl<'a> Checker<'a> {
                     }
                 }
                 self.result.types.alloc(TypeKind::Object(object.clone()))
+            })
+            .collect()
+    }
+
+    fn reduce_subtype_union_members(&self, members: &[TypeId]) -> Vec<TypeId> {
+        if let Some(any) = members.iter().find(|member| {
+            self.result
+                .types
+                .get(**member)
+                .is_some_and(|type_| matches!(type_.kind, TypeKind::Any))
+        }) {
+            return vec![*any];
+        }
+        members
+            .iter()
+            .enumerate()
+            .filter_map(|(index, member)| {
+                let redundant = members.iter().enumerate().any(|(other_index, other)| {
+                    index != other_index
+                        && self.is_assignable(*member, *other)
+                        && (!self.is_assignable(*other, *member) || other_index < index)
+                });
+                (!redundant).then_some(*member)
             })
             .collect()
     }
@@ -22218,6 +22242,47 @@ mod tests {
             panic!("expected widened array type");
         };
         assert_eq!(element, result.types.number());
+    }
+
+    #[test]
+    fn array_inference_reduces_redundant_optional_function_subtypes() {
+        let parsed = parse_source_file(concat!(
+            "declare const anyValue: any;",
+            "const mixed = [1, anyValue];",
+            "const cases = [",
+            "(value: string) => {}, (value?: string) => {},",
+            "(value: number) => {}, (value?: number) => {},",
+            "(value: string[]) => {}, (value?: string[]) => {},",
+            "];",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let cases = bindings.root_scope().unwrap().symbols.get("cases").unwrap();
+        let cases_type = result.type_of_symbol(cases).unwrap();
+        let TypeKind::Array(element) = result.types.get(cases_type).unwrap().kind else {
+            panic!("expected array");
+        };
+        let TypeKind::Union(members) = &result.types.get(element).unwrap().kind else {
+            panic!("expected function union");
+        };
+        assert_eq!(members.len(), 3);
+        assert!(members.iter().all(|member| matches!(
+            result.types.get(*member).map(|type_| &type_.kind),
+            Some(TypeKind::Function(signature)) if !signature.parameters_optional
+        )));
+
+        let mixed = bindings.root_scope().unwrap().symbols.get("mixed").unwrap();
+        let mixed_type = result.type_of_symbol(mixed).unwrap();
+        assert!(matches!(
+            result.types.get(mixed_type).map(|type_| &type_.kind),
+            Some(TypeKind::Array(element))
+                if matches!(
+                    result.types.get(*element).map(|type_| &type_.kind),
+                    Some(TypeKind::Any)
+                )
+        ));
     }
 
     #[test]

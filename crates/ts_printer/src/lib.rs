@@ -10790,7 +10790,15 @@ impl DeclarationPrinter<'_> {
                 )?;
             }
         } else {
-            self.emit_semantic_type_list(&members, " | ")?;
+            for (index, member) in members.into_iter().enumerate() {
+                if index != 0 {
+                    self.writer.write(" | ");
+                }
+                self.emit_semantic_type_with_precedence(
+                    member,
+                    SemanticTypePrecedence::Union,
+                )?;
+            }
         }
         self.writer.write(")[]");
         Ok(true)
@@ -17486,7 +17494,7 @@ impl DeclarationPrinter<'_> {
         {
             return true;
         }
-        self.arena.iter().any(|(_, node)| {
+        self.arena.iter().any(|(node_id, node)| {
             let parameters = match &node.data {
                 NodeData::ArrowFunction(function) => &function.parameters,
                 NodeData::FunctionExpression(function) => &function.parameters,
@@ -17494,6 +17502,16 @@ impl DeclarationPrinter<'_> {
                 NodeData::MethodDeclaration(method) => &method.parameters,
                 _ => return false,
             };
+            if self
+                .node_types
+                .and_then(|types| types.get(&node_id))
+                .and_then(|type_id| self.semantic_types.and_then(|types| types.get(*type_id)))
+                .is_some_and(|type_| {
+                    !matches!(&type_.kind, TypeKind::Function(source) if source == signature)
+                })
+            {
+                return false;
+            }
             if parameters.nodes.len() != signature.parameters.len() {
                 return false;
             }
@@ -22981,9 +22999,6 @@ impl GeneratedNames {
         }
     }
 
-    fn generate_loop_variable(&mut self) -> String {
-        self.claim("_i").unwrap_or_else(|| self.generate_temp())
-    }
 }
 
 #[derive(Clone)]
@@ -27652,7 +27667,8 @@ impl Printer<'_> {
         visited: &mut HashSet<SymbolId>,
     ) -> bool {
         let Some(body) = module.body else {
-            return false;
+            return module.keyword == SyntaxKind::GlobalKeyword
+                && !self.has_modifier(module.modifiers.as_ref(), SyntaxKind::DeclareKeyword);
         };
         let Some(body) = self.arena.get(body) else {
             return false;
@@ -28668,7 +28684,7 @@ impl Printer<'_> {
             }
             NodeData::ForInOrOfStatement(data) => {
                 if node.kind == SyntaxKind::ForOfStatement
-                    && self.emit_es5_captured_for_of_loop(data)?
+                    && self.emit_es5_captured_for_of_loop(id, data)?
                 {
                     self.writer.newline();
                     return Ok(());
@@ -29106,9 +29122,9 @@ impl Printer<'_> {
             .incrementor
             .and_then(|part| self.arena.get(part))
             .map_or(close, |part| part.range.start.get());
-        let second_semicolon = self
-            .source_punctuation_between(second_semicolon_start, second_semicolon_end, b';')
-            .unwrap_or(second_semicolon_start);
+        let source_second_semicolon =
+            self.source_punctuation_between(second_semicolon_start, second_semicolon_end, b';');
+        let second_semicolon = source_second_semicolon.unwrap_or(second_semicolon_start);
         let recovery_comment = self
             .source_punctuation_between(open.saturating_add(1), close, b';')
             .is_none()
@@ -29172,7 +29188,7 @@ impl Printer<'_> {
                 .is_some_and(|incrementor| !self.expression_emits_nothing(incrementor))
                 || (data.incrementor.is_none()
                     && data.condition.is_some()
-                    && second_semicolon == second_semicolon_start
+                    && source_second_semicolon.is_none()
                 ),
         );
         if let Some(incrementor) = data.incrementor {
@@ -30048,6 +30064,7 @@ impl Printer<'_> {
 
     fn emit_es5_captured_for_of_loop(
         &mut self,
+        id: NodeId,
         data: &ts_ast::ForInOrOfStatementData,
     ) -> Result<bool, EmitError> {
         if self.settings.target >= ScriptTarget::Es2015 || data.await_modifier.is_some() {
@@ -30074,11 +30091,14 @@ impl Printer<'_> {
         if !self.block_scoped_declaration_is_captured(declaration.name, data.statement) {
             return Ok(false);
         }
-        let body_node = self.node(data.statement)?.clone();
-        let NodeData::Block(block) = &body_node.data else {
-            return Ok(false);
-        };
         let loop_name = self.generated_names.generate("_loop");
+        let previous_this_alias = self.this_alias.clone();
+        let local_this_alias = (previous_this_alias.is_none()
+            && self.synthetic_loop_body_uses_this(data.statement))
+        .then(|| self.generated_names.generate("this"));
+        if let Some(alias) = local_this_alias.as_ref() {
+            self.this_alias = Some(alias.clone());
+        }
         self.writer.write("var ");
         self.writer.write(&loop_name);
         self.writer.write(" = function (");
@@ -30087,38 +30107,21 @@ impl Printer<'_> {
         self.writer.newline();
         self.writer.indent += 1;
         let previous_captured_loop_body = self.captured_loop_body.replace(data.statement);
-        let result = (|| {
-            let mut previous_end = body_node.range.start.get().saturating_add(1);
-            let mut previous_emitted = false;
-            for statement in &block.statements.nodes {
-                let statement_node = self.node(*statement)?.clone();
-                self.emit_source_comments_between_with_trailing(
-                    previous_end,
-                    statement_node.range.start.get(),
-                    previous_emitted,
-                );
-                self.emit_statement(*statement)?;
-                previous_end = statement_node.range.end.get();
-                previous_emitted = statement_emits_javascript(self.arena, &statement_node);
-            }
-            self.emit_source_comments_between_with_trailing(
-                previous_end,
-                body_node.range.end.get().saturating_sub(1),
-                previous_emitted,
-            );
-            Ok::<(), EmitError>(())
-        })();
+        let result = self.emit_synthetic_loop_helper_body(data.statement);
         self.captured_loop_body = previous_captured_loop_body;
+        self.this_alias = previous_this_alias;
         result?;
         self.writer.indent -= 1;
         self.writer.write("};");
         self.writer.newline();
+        if let Some(alias) = local_this_alias {
+            self.writer.write("var ");
+            self.writer.write(&alias);
+            self.writer.write(" = this;");
+            self.writer.newline();
+        }
 
-        let counter = self.generated_names.generate_loop_variable();
-        let rhs = match self.node(data.expression)?.data.clone() {
-            NodeData::Identifier(identifier) => self.generated_names.generate(&identifier.text),
-            _ => self.generated_names.generate_temp(),
-        };
+        let (counter, rhs, _) = self.scoped_downlevel_for_of_names(id, data.expression);
         self.writer.write("for (var ");
         self.writer.write(&counter);
         self.writer.write(" = 0, ");
@@ -30150,6 +30153,61 @@ impl Printer<'_> {
         self.writer.indent -= 1;
         self.writer.write("}");
         Ok(true)
+    }
+
+    fn emit_synthetic_loop_helper_body(&mut self, body: NodeId) -> Result<(), EmitError> {
+        let body_node = self.node(body)?.clone();
+        let NodeData::Block(block) = &body_node.data else {
+            return self.emit_statement(body);
+        };
+        let mut previous_end = body_node.range.start.get().saturating_add(1);
+        let mut previous_emitted = false;
+        for statement in &block.statements.nodes {
+            let statement_node = self.node(*statement)?.clone();
+            self.emit_source_comments_between_with_trailing(
+                previous_end,
+                statement_node.range.start.get(),
+                previous_emitted,
+            );
+            self.emit_statement(*statement)?;
+            previous_end = statement_node.range.end.get();
+            previous_emitted = statement_emits_javascript(self.arena, &statement_node);
+        }
+        self.emit_source_comments_between_with_trailing(
+            previous_end,
+            body_node.range.end.get().saturating_sub(1),
+            previous_emitted,
+        );
+        Ok(())
+    }
+
+    fn synthetic_loop_body_uses_this(&self, body: NodeId) -> bool {
+        self.arena.iter().any(|(id, node)| {
+            if node.kind != SyntaxKind::ThisKeyword || !self.node_is_within(id, body) {
+                return false;
+            }
+            let mut current = id;
+            while let Some(parent) = self.arena.get(current).and_then(|node| node.parent) {
+                if parent == body {
+                    return true;
+                }
+                if matches!(
+                    self.arena.get(parent).map(|node| &node.data),
+                    Some(
+                        NodeData::FunctionDeclaration(_)
+                            | NodeData::FunctionExpression(_)
+                            | NodeData::MethodDeclaration(_)
+                            | NodeData::ConstructorDeclaration(_)
+                            | NodeData::GetAccessorDeclaration(_)
+                            | NodeData::SetAccessorDeclaration(_)
+                    )
+                ) {
+                    return false;
+                }
+                current = parent;
+            }
+            false
+        })
     }
 
     fn emit_try(&mut self, data: &ts_ast::TryStatementData) -> Result<(), EmitError> {
@@ -56188,6 +56246,58 @@ mod tests {
     }
 
     #[test]
+    fn preserves_for_semicolon_spacing_without_an_incrementor() {
+        let output = emit_with(
+            "for (; false;) { let value; () => value; }",
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(output.contains("for (; false;)"), "{output}");
+        assert!(!output.contains("for (; false; )"), "{output}");
+    }
+
+    #[test]
+    fn downlevels_captured_nested_non_block_for_of_loops() {
+        let output = emit_with(
+            "for (let outer of []) for (let inner of outer.items) use(() => inner);",
+            ScriptTarget::Es5,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(output.contains("var _loop_1 = function (inner)"), "{output}");
+        assert!(
+            output.contains("for (var _i = 0, _a = []; _i < _a.length; _i++)"),
+            "{output}"
+        );
+        assert!(
+            output.contains(
+                "for (var _b = 0, _c = outer.items; _b < _c.length; _b++)"
+            ),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn captures_lexical_this_for_nested_synthetic_loop_helpers() {
+        let output = emit_with(
+            concat!(
+                "class C { method() { ",
+                "for (let outer of xs) for (let inner of ys) ",
+                "this.use(() => outer + inner);",
+                " } }",
+            ),
+            ScriptTarget::Es5,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(output.contains("var this_1 = this;"), "{output}");
+        assert!(output.contains("this_1.use(function ()"), "{output}");
+        assert!(output.contains("var _loop_1 = function (outer)"), "{output}");
+        assert!(output.contains("var _loop_2 = function (inner)"), "{output}");
+    }
+
+    #[test]
     fn preserves_continue_statement_internal_comments() {
         let output = emit_with(
             "label: for (;;) { /*1*/ continue /*2*/ label /*3*/; }",
@@ -62795,6 +62905,28 @@ class Board {
         );
         assert!(
             output.contains("declare function returningUnion(): () => string | C;"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn declaration_emit_reduces_and_parenthesizes_array_function_unions() {
+        let output = emit_declarations_with_semantics(concat!(
+            "const cases = [",
+            "(value: string) => {}, (value?: string) => {},",
+            "(value: number) => {}, (value?: number) => {},",
+            "(value: string[]) => {}, (value?: string[]) => {},",
+            "];",
+        ));
+
+        assert!(
+            output.contains(concat!(
+                "declare const cases: (",
+                "((value: string) => void) | ",
+                "((value: number) => void) | ",
+                "((value: string[]) => void)",
+                ")[];",
+            )),
             "{output}"
         );
     }

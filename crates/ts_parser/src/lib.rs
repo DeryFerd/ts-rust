@@ -547,15 +547,7 @@ impl<'a> Parser<'a> {
             && self.next_token_kind() == SyntaxKind::ColonToken;
         let is_const_enum = self.current.kind == SyntaxKind::ConstKeyword
             && self.next_token_kind() == SyntaxKind::EnumKeyword;
-        let is_module_declaration = match self.current.kind {
-            SyntaxKind::GlobalKeyword => self.next_token_kind() == SyntaxKind::OpenBraceToken,
-            SyntaxKind::NamespaceKeyword => is_module_name_token(self.next_token_kind()),
-            SyntaxKind::ModuleKeyword => {
-                let next = self.next_token_kind();
-                next == SyntaxKind::StringLiteral || is_module_name_token(next)
-            }
-            _ => false,
-        };
+        let is_module_declaration = self.current_token_starts_module_declaration();
         let abstract_starts_expression = self.current.kind == SyntaxKind::AbstractKeyword
             && self.next_token_preceded_by_line_break();
         let declare_starts_expression = self.current.kind == SyntaxKind::DeclareKeyword
@@ -641,6 +633,21 @@ impl<'a> Parser<'a> {
             SyntaxKind::SemicolonToken => self.parse_empty_statement(),
             SyntaxKind::Identifier if is_labeled_statement => self.parse_labeled_statement(),
             _ => self.parse_expression_statement(),
+        }
+    }
+
+    fn current_token_starts_module_declaration(&mut self) -> bool {
+        match self.current.kind {
+            SyntaxKind::GlobalKeyword => matches!(
+                self.next_token_kind(),
+                SyntaxKind::OpenBraceToken | SyntaxKind::Identifier | SyntaxKind::ExportKeyword
+            ),
+            SyntaxKind::NamespaceKeyword => is_module_name_token(self.next_token_kind()),
+            SyntaxKind::ModuleKeyword => {
+                let next = self.next_token_kind();
+                next == SyntaxKind::StringLiteral || is_module_name_token(next)
+            }
+            _ => false,
         }
     }
 
@@ -1956,7 +1963,16 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn current_token_can_start_class_member(&self) -> bool {
+    fn current_token_can_start_class_member(&mut self) -> bool {
+        let recovered_global = self.current.kind == SyntaxKind::GlobalKeyword
+            && matches!(
+                self.next_token_kind(),
+                SyntaxKind::OpenBraceToken | SyntaxKind::Identifier | SyntaxKind::ExportKeyword
+            )
+            && !self.next_token_preceded_by_line_break();
+        if recovered_global {
+            return false;
+        }
         self.current.kind == SyntaxKind::Identifier
             || self.current.kind.is_keyword()
             || matches!(
@@ -11650,6 +11666,38 @@ mod tests {
             result.arena.get(statements[2]).unwrap().data,
             NodeData::EmptyStatement(_)
         ));
+    }
+
+    #[test]
+    fn recovers_global_namespace_from_inside_a_class() {
+        let result = parse_source_file("class C { global x }");
+        let statements = source_statements(&result);
+        assert_eq!(statements.len(), 3, "{:?}", result.diagnostics);
+
+        let NodeData::ClassDeclaration(class) = &result.arena.get(statements[0]).unwrap().data
+        else {
+            panic!("expected class declaration");
+        };
+        assert!(class.members.nodes.is_empty());
+
+        let NodeData::ModuleDeclaration(global) = &result.arena.get(statements[1]).unwrap().data
+        else {
+            panic!("expected recovered global namespace");
+        };
+        assert_eq!(global.keyword, SyntaxKind::GlobalKeyword);
+        assert!(global.body.is_none());
+
+        let NodeData::ExpressionStatement(expression) =
+            &result.arena.get(statements[2]).unwrap().data
+        else {
+            panic!("expected recovered expression");
+        };
+        let NodeData::Identifier(identifier) =
+            &result.arena.get(expression.expression).unwrap().data
+        else {
+            panic!("expected identifier expression");
+        };
+        assert_eq!(identifier.text, "x");
     }
 
     #[test]
