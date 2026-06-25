@@ -29157,7 +29157,8 @@ impl Printer<'_> {
             )
         });
         if let NodeData::ExpressionStatement(statement) = &node.data
-            && self.expression_statement_is_recovered_jsx_closing(id, statement.expression)
+            && (self.expression_statement_is_recovered_jsx_closing(id, statement.expression)
+                || self.expression_statement_is_recovered_private_jsx_tail(id))
         {
             return Ok(());
         }
@@ -53141,6 +53142,34 @@ impl Printer<'_> {
             .is_some_and(|source| source.contains(&format!("</{name}>")))
     }
 
+    fn expression_statement_is_recovered_private_jsx_tail(&self, statement: NodeId) -> bool {
+        if !matches!(self.settings.jsx, JsxEmit::React | JsxEmit::Preserve) {
+            return false;
+        }
+        let Some(node) = self.arena.get(statement) else {
+            return false;
+        };
+        let start = usize::try_from(node.range.start.get()).unwrap_or(usize::MAX);
+        let end = usize::try_from(node.range.end.get()).unwrap_or(usize::MAX);
+        let line_start = self.source_text[..start.min(self.source_text.len())]
+            .rfind(['\n', '\r'])
+            .map_or(0, |line_break| line_break + 1);
+        let line_end = self.source_text[end.min(self.source_text.len())..]
+            .find(['\n', '\r'])
+            .map_or(self.source_text.len(), |offset| end + offset);
+        let Some(prefix) = self.source_text.get(line_start..start) else {
+            return false;
+        };
+        let Some(tail) = self.source_text.get(start..line_end) else {
+            return false;
+        };
+        tail.trim_start().starts_with('#')
+            && tail.contains("/>")
+            && prefix.rsplit_once('<').is_some_and(|(_, tag)| {
+                tag.trim_end().ends_with('.')
+            })
+    }
+
     fn emit_recovered_namespaced_jsx_statements(
         &mut self,
         statement: NodeId,
@@ -58735,6 +58764,41 @@ mod tests {
         )
         .unwrap();
         assert_eq!(emitted.code, "const x = <div></>;\n");
+    }
+
+    #[test]
+    fn drops_recovered_private_name_tail_after_jsx_member_tag() {
+        let source = concat!(
+            "class Test {\n",
+            "    #prop = () => <div />;\n",
+            "    render() { return <this.#prop />; }\n",
+            "}\n",
+        );
+        let parsed = parse_jsx_source_file(source);
+        let emitted = emit_source_file_with_settings(
+            &parsed.arena,
+            parsed.source_file,
+            "input.tsx",
+            source,
+            PrinterSettings {
+                always_strict: false,
+                target: ScriptTarget::Es2015,
+                module: ModuleKind::EsNext,
+                jsx: JsxEmit::Preserve,
+                emit_javascript: true,
+                emit_declarations: false,
+                source_map: false,
+                inline_source_map: false,
+                import_helpers: false,
+                no_emit_helpers: false,
+                experimental_decorators: false,
+                remove_comments: false,
+                use_define_for_class_fields: None,
+            },
+        )
+        .unwrap();
+        assert!(emitted.code.contains("return <this. />;"), "{}", emitted.code);
+        assert!(!emitted.code.contains("#prop /"), "{}", emitted.code);
     }
 
     #[test]
