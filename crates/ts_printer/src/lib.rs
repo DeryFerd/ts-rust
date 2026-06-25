@@ -48566,6 +48566,9 @@ impl Printer<'_> {
     }
 
     fn import_binding_is_used(&self, name: NodeId) -> bool {
+        if self.import_binding_is_merged_with_runtime_namespace(name) {
+            return false;
+        }
         binding_has_runtime_identifier_use(
             self.arena,
             self.bindings,
@@ -48577,6 +48580,9 @@ impl Printer<'_> {
     }
 
     fn import_binding_has_emitted_runtime_use(&self, binding: NodeId) -> bool {
+        if self.import_binding_is_merged_with_runtime_namespace(binding) {
+            return false;
+        }
         let Some(name) = declaration_name_text(self.arena, binding) else {
             return false;
         };
@@ -48661,6 +48667,27 @@ impl Printer<'_> {
             }
             false
         })
+    }
+
+    fn import_binding_is_merged_with_runtime_namespace(&self, binding: NodeId) -> bool {
+        let Some(name) = declaration_name_text(self.arena, binding) else {
+            return false;
+        };
+        self.bindings
+            .node_symbols
+            .get(&binding)
+            .copied()
+            .or_else(|| self.bindings.resolve_name_at(binding, name))
+            .and_then(|symbol| self.bindings.symbols.get(symbol))
+            .is_some_and(|symbol| {
+                symbol.declarations.iter().any(|declaration| {
+                    matches!(
+                        self.arena.get(*declaration).map(|node| &node.data),
+                        Some(NodeData::ModuleDeclaration(module))
+                            if self.namespace_has_runtime_contents(module, &mut HashSet::new())
+                    )
+                })
+            })
     }
 
     fn identifier_resolves_to_default_import(&self, identifier: NodeId, name: &str) -> bool {
@@ -49144,7 +49171,18 @@ impl Printer<'_> {
                     if let Some(NodeData::ExportDeclaration(export)) =
                         self.arena.get(parent).map(|node| &node.data)
                     {
-                        runtime_local_export = export.module_specifier.is_none()
+                        let top_level = self
+                            .arena
+                            .get(parent)
+                            .and_then(|node| node.parent)
+                            .is_some_and(|parent| {
+                                matches!(
+                                    self.arena.get(parent).map(|node| &node.data),
+                                    Some(NodeData::SourceFile(_))
+                                )
+                            });
+                        runtime_local_export = top_level
+                            && export.module_specifier.is_none()
                             && self.export_specifier_emits_runtime(export, specifier_id);
                         break;
                     }
@@ -60412,6 +60450,53 @@ class Board {
         assert_eq!(
             result.code,
             "\"use strict\";\nObject.defineProperty(exports, \"__esModule\", { value: true });\nexports.m = void 0;\nvar m;\n(function (m) {\n    function foo() { }\n    m.foo = foo;\n})(m || (exports.m = m = {}));\n"
+        );
+    }
+
+    #[test]
+    fn ignores_namespace_local_export_clauses_for_commonjs_bindings() {
+        let result = emit_with(
+            "export namespace M { export var v = 0; } const x = 0; export namespace M { v; export { x }; }",
+            ScriptTarget::Es2015,
+            ModuleKind::CommonJs,
+        );
+        assert_eq!(
+            result.code,
+            concat!(
+                "\"use strict\";\n",
+                "Object.defineProperty(exports, \"__esModule\", { value: true });\n",
+                "exports.M = void 0;\n",
+                "var M;\n",
+                "(function (M) {\n",
+                "    M.v = 0;\n",
+                "})(M || (exports.M = M = {}));\n",
+                "const x = 0;\n",
+                "(function (M) {\n",
+                "    M.v;\n",
+                "})(M || (exports.M = M = {}));\n",
+            )
+        );
+    }
+
+    #[test]
+    fn runtime_namespace_wins_over_a_merged_namespace_import() {
+        let result = emit_commonjs_with_false_runtime_meaning(
+            "import * as Lib from './file1'; namespace Lib { export const foo = \"\"; } Lib.foo; var x: Lib.Bar; export { Lib };",
+            0,
+        );
+        assert_eq!(
+            result.code,
+            concat!(
+                "\"use strict\";\n",
+                "Object.defineProperty(exports, \"__esModule\", { value: true });\n",
+                "exports.Lib = void 0;\n",
+                "var Lib;\n",
+                "(function (Lib) {\n",
+                "    Lib.foo = \"\";\n",
+                "})(Lib || (exports.Lib = Lib = {}));\n",
+                "Lib.foo;\n",
+                "var x;\n",
+            )
         );
     }
 
