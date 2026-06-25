@@ -332,7 +332,16 @@ impl Program {
                 file_index += 1;
                 continue;
             }
+            let source_count_before_references = self.source_files.len();
             self.load_reference_directives_for_file(file_system, &resolver, file_index);
+            for source_file in &self.source_files[source_count_before_references..] {
+                register_ambient_external_modules(
+                    source_file,
+                    &self.current_directory,
+                    self.case_sensitivity,
+                    &mut ambient_modules,
+                );
+            }
             register_ambient_external_modules(
                 &self.source_files[file_index],
                 &self.current_directory,
@@ -6124,6 +6133,45 @@ mod tests {
     }
 
     #[test]
+    fn resolves_import_equals_against_referenced_ambient_modules() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/ambient.ts",
+            r#"declare module "M" { export class Value {} }"#,
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/main.ts",
+            r#"/// <reference path="ambient.ts" />
+import M = require("M");
+export function create() { return new M.Value(); }"#,
+        )
+        .unwrap();
+
+        let program = Program::new_with_module_resolution(
+            &fs,
+            "/project",
+            &["main.ts".to_owned()],
+            ts_module::ResolutionOptions::default(),
+        );
+        assert!(
+            !program
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code == Some(2307)),
+            "{:?}",
+            program.diagnostics()
+        );
+        assert_eq!(
+            program
+                .resolved_modules
+                .get(&("/project/main.ts".to_owned(), "M".to_owned()))
+                .map(String::as_str),
+            Some("/project/ambient.ts")
+        );
+    }
+
+    #[test]
     fn resolves_es_imports_against_top_level_ambient_modules() {
         let fs = MemoryFileSystem::new(true);
         fs.write_file(
@@ -7830,7 +7878,8 @@ mod tests {
                     "declare namespace M {\n",
                     "    class C {\n",
                     "    }\n",
-                    "    var value: C;\n",
+                    "    export var value: C;\n",
+                    "    export {};\n",
                     "}\n",
                 ),
             ),

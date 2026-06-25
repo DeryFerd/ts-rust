@@ -2286,6 +2286,15 @@ impl<'a> ProgramChecker<'a> {
                         &qualifier,
                         &exported_names,
                     );
+                    rewrite_nested_exported_named_descriptor_qualifiers(
+                        &mut descriptor,
+                        &qualifier,
+                    );
+                    paint_local_import_equals_descriptor_references(
+                        &mut descriptor,
+                        specifier,
+                        &qualifier,
+                    );
                 }
                 if is_relative_module_specifier(specifier)
                     && let Some((source_path, target_path)) =
@@ -2421,11 +2430,15 @@ impl<'a> ProgramChecker<'a> {
                 }
                 if let Some(local_name) = identifier_text(source.arena, namespace.name) {
                     let exported_names = qualified_exports.keys().cloned().collect::<BTreeSet<_>>();
-                    for descriptor in qualified_exports.values_mut() {
+                    for (exported_name, descriptor) in &mut qualified_exports {
                         rewrite_exported_named_descriptor_qualifier(
                             descriptor,
                             local_name,
                             &exported_names,
+                        );
+                        rewrite_nested_exported_named_descriptor_qualifiers(
+                            descriptor,
+                            &format!("{local_name}.{exported_name}"),
                         );
                     }
                 }
@@ -3095,6 +3108,60 @@ fn rewrite_exported_named_descriptor_qualifier(
     exported_names: &BTreeSet<String>,
 ) {
     rewrite_named_descriptor_qualifier_matching(descriptor, qualifier, exported_names);
+}
+
+fn rewrite_nested_exported_named_descriptor_qualifiers(
+    descriptor: &mut TypeDescriptor,
+    qualifier: &str,
+) {
+    let TypeDescriptor::Object { properties, .. } = descriptor else {
+        return;
+    };
+    let exported_names = properties.keys().cloned().collect::<BTreeSet<_>>();
+    for property in properties.values_mut() {
+        rewrite_named_descriptor_qualifier_matching(property, qualifier, &exported_names);
+    }
+    for (name, property) in properties {
+        rewrite_nested_exported_named_descriptor_qualifiers(
+            property,
+            &format!("{qualifier}.{name}"),
+        );
+    }
+}
+
+fn paint_local_import_equals_descriptor_references(
+    descriptor: &mut TypeDescriptor,
+    module_specifier: &str,
+    local_name: &str,
+) {
+    let reference = if let TypeDescriptor::Named { name, .. } = &*descriptor {
+        let (is_typeof, reference) = name
+            .strip_prefix("typeof ")
+            .map_or((false, name.as_str()), |name| (true, name));
+        reference.strip_prefix(local_name).and_then(|suffix| {
+            suffix
+                .strip_prefix('.')
+                .or_else(|| suffix.is_empty().then_some("export="))
+        })
+        .map(|qualifier| (qualifier.to_owned(), is_typeof))
+    } else {
+        None
+    };
+    if let Some((qualifier, is_typeof)) = reference {
+        let target = descriptor.clone();
+        *descriptor = TypeDescriptor::Import {
+            reference: ImportTypeReference {
+                module_specifier: module_specifier.to_owned(),
+                qualifier,
+                is_typeof,
+            },
+            target: Box::new(target),
+        };
+        return;
+    }
+    visit_descriptor_children(descriptor, |child| {
+        paint_local_import_equals_descriptor_references(child, module_specifier, local_name);
+    });
 }
 
 fn rewrite_named_descriptor_qualifier_matching(

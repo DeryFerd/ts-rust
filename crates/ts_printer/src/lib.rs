@@ -4260,6 +4260,15 @@ impl DeclarationPrinter<'_> {
             return Ok(());
         }
         if self.module_file
+            && matches!(
+                &node.data,
+                NodeData::ImportEqualsDeclaration(import)
+                    if self.import_equals_is_only_used_by_portable_inference(id, import)
+            )
+        {
+            return Ok(());
+        }
+        if self.module_file
             && (self.statement_is_portable_inferred_alias_dependency(id)
                 || self.import_is_only_used_by_portable_inferred_aliases(id))
         {
@@ -17075,7 +17084,46 @@ impl DeclarationPrinter<'_> {
             })
     }
 
+    fn local_import_equals_for(&self, reference: &ImportTypeReference) -> Option<String> {
+        self.arena.iter().find_map(|(import_id, node)| {
+            let NodeData::ImportEqualsDeclaration(import) = &node.data else {
+                return None;
+            };
+            if self.import_equals_is_only_used_by_portable_inference(import_id, import) {
+                return None;
+            }
+            let retained = self.declaration_reachability.is_none_or(|reachability| {
+                reachability
+                    .values()
+                    .any(|statements| statements.contains(&import_id))
+            });
+            if !retained {
+                return None;
+            }
+            let NodeData::ExternalModuleReference(external) = &self
+                .arena
+                .get(import.module_reference)?
+                .data
+            else {
+                return None;
+            };
+            let module = string_literal_text(self.arena, external.expression)?;
+            if module != reference.module_specifier {
+                return None;
+            }
+            let local = declaration_name_text(self.arena, import.name)?;
+            Some(if reference.qualifier == "export=" || reference.qualifier.is_empty() {
+                local.to_owned()
+            } else {
+                format!("{local}.{}", reference.qualifier)
+            })
+        })
+    }
+
     fn local_named_import_for(&self, reference: &ImportTypeReference) -> Option<String> {
+        if let Some(local) = self.local_import_equals_for(reference) {
+            return Some(local);
+        }
         self.arena.iter().find_map(|(import_id, node)| {
             let NodeData::ImportDeclaration(import) = &node.data else {
                 return None;
@@ -21987,6 +22035,222 @@ impl DeclarationPrinter<'_> {
                     self.bindings.resolve_name_at(identifier, text) == Some(symbol)
                 })
         })
+    }
+
+    fn import_equals_is_only_used_by_portable_inference(
+        &self,
+        declaration: NodeId,
+        import: &ts_ast::ImportEqualsDeclarationData,
+    ) -> bool {
+        let Some(NodeData::ExternalModuleReference(external)) = self
+            .arena
+            .get(import.module_reference)
+            .map(|node| &node.data)
+        else {
+            return false;
+        };
+        let Some(module_specifier) = string_literal_text(self.arena, external.expression) else {
+            return false;
+        };
+        let Some(name) = declaration_name_text(self.arena, import.name) else {
+            return false;
+        };
+        let symbol = self
+            .bindings
+            .node_symbols
+            .get(&import.name)
+            .copied()
+            .or_else(|| self.bindings.resolve_name_at(import.name, name));
+        let references = self
+            .arena
+            .iter()
+            .filter_map(|(identifier, node)| {
+                (identifier != import.name
+                    && !self.node_is_within(identifier, declaration)
+                    && matches!(
+                        &node.data,
+                        NodeData::Identifier(identifier) if identifier.text == name
+                    )
+                    && symbol.is_none_or(|symbol| {
+                        self.bindings.resolve_name_at(identifier, name) == Some(symbol)
+                    }))
+                .then_some(identifier)
+            })
+            .collect::<Vec<_>>();
+        !references.is_empty()
+            && references.iter().all(|identifier| {
+                self.portable_inference_type_for_reference(*identifier)
+                    .is_some_and(|type_id| {
+                        self.semantic_type_imports_only_other_modules(
+                            type_id,
+                            module_specifier,
+                            &mut HashSet::new(),
+                        )
+                    })
+            })
+    }
+
+    fn portable_inference_type_for_reference(&self, reference: NodeId) -> Option<TypeId> {
+        let mut current = reference;
+        let mut expression = None;
+        while let Some(parent) = self.arena.get(current).and_then(|node| node.parent) {
+            let node = self.arena.get(parent)?;
+            match &node.data {
+                NodeData::PropertyAccessExpression(_)
+                | NodeData::ElementAccessExpression(_)
+                | NodeData::CallExpression(_)
+                | NodeData::NewExpression(_) => expression = Some(parent),
+                NodeData::ParameterDeclaration(parameter) => {
+                    if parameter.type_.is_some()
+                        || !parameter
+                            .initializer
+                            .is_some_and(|initializer| self.node_is_within(reference, initializer))
+                    {
+                        return None;
+                    }
+                    return expression
+                        .and_then(|expression| self.node_types?.get(&expression).copied());
+                }
+                NodeData::PropertyDeclaration(property) => {
+                    if property.type_.is_some()
+                        || !property
+                            .initializer
+                            .is_some_and(|initializer| self.node_is_within(reference, initializer))
+                    {
+                        return None;
+                    }
+                    return expression
+                        .and_then(|expression| self.node_types?.get(&expression).copied());
+                }
+                NodeData::VariableDeclaration(variable) => {
+                    if variable.type_.is_some()
+                        || !variable
+                            .initializer
+                            .is_some_and(|initializer| self.node_is_within(reference, initializer))
+                    {
+                        return None;
+                    }
+                    return expression
+                        .and_then(|expression| self.node_types?.get(&expression).copied());
+                }
+                NodeData::ReturnStatement(_) => {
+                    let mut declaration = node.parent;
+                    while let Some(id) = declaration {
+                        let declaration_node = self.arena.get(id)?;
+                        let inferred = match &declaration_node.data {
+                            NodeData::FunctionDeclaration(function) => function.type_.is_none(),
+                            NodeData::MethodDeclaration(method) => method.type_.is_none(),
+                            NodeData::GetAccessorDeclaration(getter) => getter.type_.is_none(),
+                            NodeData::ArrowFunction(function) => function.type_.is_none(),
+                            NodeData::FunctionExpression(function) => function.type_.is_none(),
+                            NodeData::SourceFile(_) => return None,
+                            _ => {
+                                declaration = declaration_node.parent;
+                                continue;
+                            }
+                        };
+                        return inferred
+                            .then(|| {
+                                expression.and_then(|expression| {
+                                    self.node_types?.get(&expression).copied()
+                                })
+                            })
+                            .flatten();
+                    }
+                    return None;
+                }
+                NodeData::SourceFile(_) => return None,
+                _ => {}
+            }
+            current = parent;
+        }
+        None
+    }
+
+    fn semantic_type_imports_only_other_modules(
+        &self,
+        type_id: TypeId,
+        excluded_module: &str,
+        visiting: &mut HashSet<TypeId>,
+    ) -> bool {
+        fn visit(
+            printer: &DeclarationPrinter<'_>,
+            type_id: TypeId,
+            excluded_module: &str,
+            visiting: &mut HashSet<TypeId>,
+            found: &mut bool,
+        ) -> bool {
+            if !visiting.insert(type_id) {
+                return true;
+            }
+            if let Some(reference) = printer
+                .import_type_references
+                .and_then(|references| references.get(&type_id))
+            {
+                if reference.module_specifier == excluded_module {
+                    return false;
+                }
+                *found = true;
+            }
+            if let Some(reference) = printer
+                .named_type_references
+                .and_then(|references| references.get(&type_id))
+                && !reference.type_arguments.iter().all(|argument| {
+                    visit(printer, *argument, excluded_module, visiting, found)
+                })
+            {
+                return false;
+            }
+            let children = match printer
+                .semantic_types
+                .and_then(|types| types.get(type_id))
+                .map(|type_| &type_.kind)
+            {
+                Some(TypeKind::Array(element)) => vec![*element],
+                Some(
+                    TypeKind::Tuple(elements)
+                    | TypeKind::ReadonlyTuple(elements)
+                    | TypeKind::Union(elements)
+                    | TypeKind::Intersection(elements),
+                ) => elements.clone(),
+                Some(TypeKind::Object(object)) => object
+                    .properties
+                    .values()
+                    .copied()
+                    .chain(object.string_index_type)
+                    .chain(object.number_index_type)
+                    .collect(),
+                Some(TypeKind::Function(signature) | TypeKind::Constructor(signature)) => signature
+                    .parameters
+                    .iter()
+                    .copied()
+                    .chain(signature.rest_parameter)
+                    .chain([signature.return_type])
+                    .collect(),
+                Some(TypeKind::Overload(signatures)) => signatures
+                    .iter()
+                    .flat_map(|signature| {
+                        signature
+                            .parameters
+                            .iter()
+                            .copied()
+                            .chain(signature.rest_parameter)
+                            .chain([signature.return_type])
+                    })
+                    .collect(),
+                Some(TypeKind::TypeParameter {
+                    constraint: Some(constraint),
+                    ..
+                }) => vec![*constraint],
+                _ => Vec::new(),
+            };
+            children
+                .into_iter()
+                .all(|child| visit(printer, child, excluded_module, visiting, found))
+        }
+
+        let mut found = false;
+        visit(self, type_id, excluded_module, visiting, &mut found) && found
     }
 
     fn same_name_named_import_module(&self, import_id: NodeId, name: &str) -> Option<&str> {
