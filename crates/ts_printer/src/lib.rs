@@ -285,6 +285,7 @@ pub fn emit_source_file_with_context(
         this_alias: None,
         class_static_this_capture: None,
         class_binding_terminator_before_lowering: false,
+        defer_static_fields: false,
         capture_arrow_this: None,
         namespace_containers: Vec::new(),
         namespace_declarations: vec![HashSet::new()],
@@ -25232,6 +25233,7 @@ struct Printer<'a> {
     this_alias: Option<String>,
     class_static_this_capture: Option<String>,
     class_binding_terminator_before_lowering: bool,
+    defer_static_fields: bool,
     capture_arrow_this: Option<String>,
     namespace_containers: Vec<String>,
     namespace_declarations: Vec<HashSet<String>>,
@@ -25344,6 +25346,7 @@ struct Printer<'a> {
 struct StaticBlockDeclarationPlan {
     capture: String,
     base_capture: Option<String>,
+    lower_static_fields: bool,
 }
 
 impl Printer<'_> {
@@ -34028,18 +34031,29 @@ impl Printer<'_> {
                 self.class_expression_temps.insert(*class_id, temp.clone());
                 field_temps.push(temp);
             }
-            if !*is_expression
+            let has_static_block = members.iter().any(|member| {
+                matches!(
+                    self.arena.get(*member).map(|node| &node.data),
+                    Some(NodeData::ClassStaticBlockDeclaration(_))
+                )
+            });
+            let lowered_static_field_uses_super = self.settings.target < ScriptTarget::Es2022
                 && members.iter().any(|member| {
                     matches!(
                         self.arena.get(*member).map(|node| &node.data),
-                        Some(NodeData::ClassStaticBlockDeclaration(_))
-                    )
-                })
-            {
+                        Some(NodeData::PropertyDeclaration(property))
+                            if self.property_is_static(property)
+                                && property.initializer.is_some()
+                    ) && self.arena.iter().any(|(candidate, node)| {
+                        self.node_is_within(candidate, *member)
+                            && node.kind == SyntaxKind::SuperKeyword
+                    })
+                });
+            if !*is_expression && (has_static_block || lowered_static_field_uses_super) {
                 let capture = self.generate_block_temp(source_file, &claimed);
                 claimed.insert(capture.clone());
                 field_temps.push(capture.clone());
-                let uses_super = members.iter().any(|member| {
+                let uses_super = lowered_static_field_uses_super || members.iter().any(|member| {
                     matches!(
                         self.arena.get(*member).map(|node| &node.data),
                         Some(NodeData::ClassStaticBlockDeclaration(_))
@@ -34069,6 +34083,7 @@ impl Printer<'_> {
                     StaticBlockDeclarationPlan {
                         capture,
                         base_capture,
+                        lower_static_fields: lowered_static_field_uses_super,
                     },
                 );
             }
@@ -45830,7 +45845,11 @@ impl Printer<'_> {
             let rewrite = format!("({base_capture} = {name})");
             Some((base, self.class_heritage_base_rewrites.insert(base, rewrite)))
         });
-        self.emit_class_with_name(&core, emitted_name)?;
+        let previous_defer_static_fields = self.defer_static_fields;
+        self.defer_static_fields = plan.lower_static_fields;
+        let class_result = self.emit_class_with_name(&core, emitted_name);
+        self.defer_static_fields = previous_defer_static_fields;
+        class_result?;
         if let Some((base, previous)) = base_rewrite {
             if let Some(previous) = previous {
                 self.class_heritage_base_rewrites.insert(base, previous);
@@ -45854,6 +45873,9 @@ impl Printer<'_> {
             .base_capture
             .as_ref()
             .and_then(|base| self.downlevel_super_context.replace((base.clone(), true)));
+        if plan.lower_static_fields {
+            self.emit_native_static_fields(data)?;
+        }
         for member in &data.members.nodes {
             let Some(NodeData::ClassStaticBlockDeclaration(block)) =
                 self.arena.get(*member).map(|node| &node.data)
@@ -46274,8 +46296,10 @@ impl Printer<'_> {
             if self.active_anonymous_private_class.is_none() {
                 if let Some(plan) = &private_plan {
                     self.emit_private_method_initializers(data, plan)?;
-                    self.emit_private_lowered_static_elements(data, plan)?;
-                } else {
+                    if !self.defer_static_fields {
+                        self.emit_private_lowered_static_elements(data, plan)?;
+                    }
+                } else if !self.defer_static_fields {
                     self.emit_native_static_fields(data)?;
                 }
                 if let Some(plan) = &private_field_plan {
@@ -52807,7 +52831,37 @@ impl Printer<'_> {
                         SyntaxKind::FalseKeyword => "false",
                         SyntaxKind::UndefinedKeyword => "undefined",
                         SyntaxKind::ThisKeyword => "this",
-                        SyntaxKind::SuperKeyword => "super",
+                        SyntaxKind::SuperKeyword => {
+                            if let Some((base, true)) = self.downlevel_super_context.clone()
+                                && let Some(receiver) = self.class_static_this_capture.clone()
+                            {
+                                self.writer.write("Reflect.get(");
+                                self.writer.write(&base);
+                                self.writer.write(", \"\", ");
+                                self.writer.write(&receiver);
+                                self.writer.write(")");
+                            } else {
+                                self.writer.write("super");
+                                let is_access_or_call_target = node.parent.is_some_and(|parent| {
+                                    match self.arena.get(parent).map(|node| &node.data) {
+                                        Some(NodeData::PropertyAccessExpression(access)) => {
+                                            access.expression == id
+                                        }
+                                        Some(NodeData::ElementAccessExpression(access)) => {
+                                            access.expression == id
+                                        }
+                                        Some(NodeData::CallExpression(call)) => {
+                                            call.expression == id
+                                        }
+                                        _ => false,
+                                    }
+                                });
+                                if !is_access_or_call_target {
+                                    self.writer.write(".");
+                                }
+                            }
+                            return Ok(());
+                        }
                         _ => return Err(Self::unsupported(id, node.kind)),
                     });
                 }
@@ -53083,6 +53137,15 @@ impl Printer<'_> {
                     self.writer.write(", ");
                     self.writer.write(&receiver);
                     self.writer.write(")");
+                } else if self.arena.get(data.expression).is_some_and(|node| {
+                    node.kind == SyntaxKind::SuperKeyword
+                }) && let Some((base, is_static)) = self.downlevel_super_context.clone()
+                {
+                    self.writer.write(&base);
+                    if !is_static {
+                        self.writer.write(".prototype");
+                    }
+                    self.emit_downlevel_member_access(data.name)?;
                 } else if self.settings.target < ScriptTarget::Es2020
                     && self.property_access_chain_has_optional(id)
                 {
@@ -64089,6 +64152,41 @@ mod tests {
                 && output.contains("return _super_1.call(this) || this;"),
             "{output}"
         );
+    }
+
+    #[test]
+    fn lowers_super_property_reads_and_recovered_bare_static_super() {
+        let es5 = emit_with(
+            "class Base {} class Derived extends Base { value() { return super.answer; } }",
+            ScriptTarget::Es5,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(es5.contains("return _super.prototype.answer;"), "{es5}");
+
+        let recovered = emit_with_parse_errors(
+            concat!(
+                "class Base {} class Derived extends Base {",
+                "field = super; static staticField = super; // static field\n",
+                "constructor(value = super) { super(); } }",
+            ),
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(recovered.contains("var _a, _b;"), "{recovered}");
+        assert!(
+            recovered.contains("class Derived extends (_b = Base)"),
+            "{recovered}"
+        );
+        assert!(recovered.contains("value = super."), "{recovered}");
+        assert!(recovered.contains("this.field = super.;"), "{recovered}");
+        assert!(recovered.contains("_a = Derived;"), "{recovered}");
+        let static_initializer = recovered
+            .find("Derived.staticField = Reflect.get(_b, \"\", _a);")
+            .expect("lowered static super initializer");
+        let comment = recovered.find("// static field").expect("static field comment");
+        assert!(static_initializer < comment, "{recovered}");
     }
 
     #[test]
