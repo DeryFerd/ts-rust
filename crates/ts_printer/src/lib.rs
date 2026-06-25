@@ -18134,6 +18134,8 @@ impl DeclarationPrinter<'_> {
                         }
                         _ => None,
                     });
+                let recursive_this_method =
+                    self.source_object_method_returns_this(object, &name);
                 let overload = self
                     .semantic_types
                     .and_then(|types| types.get(*type_id))
@@ -18187,6 +18189,13 @@ impl DeclarationPrinter<'_> {
                             } else {
                                 self.writer.write("/*elided*/ any");
                             }
+                        } else if recursive_this_method
+                            && self
+                                .semantic_types
+                                .and_then(|types| types.get(signature.return_type))
+                                .is_some_and(|type_| matches!(type_.kind, TypeKind::Unknown))
+                        {
+                            self.writer.write("/*elided*/ any");
                         } else {
                             self.emit_semantic_type(signature.return_type)?;
                         }
@@ -18544,6 +18553,27 @@ impl DeclarationPrinter<'_> {
                 .then_some(literal.as_ref())
             })
         })
+    }
+
+    fn source_object_method_returns_this(&self, object: &ObjectType, name: &str) -> bool {
+        self.matching_source_object_literal(object)
+            .is_some_and(|literal| {
+                literal.properties.nodes.iter().any(|property| {
+                    let Some(NodeData::MethodDeclaration(method)) =
+                        self.arena.get(*property).map(|node| &node.data)
+                    else {
+                        return false;
+                    };
+                    type_member_name_text(self.arena, *property) == Some(name)
+                        && method.body.is_some_and(|body| {
+                            self.declaration_single_return_expression(body)
+                                .and_then(|expression| self.arena.get(expression))
+                                .is_some_and(|expression| {
+                                    expression.kind == SyntaxKind::ThisKeyword
+                                })
+                        })
+                })
+            })
     }
 
     fn source_object_accessors(&self, object: &ObjectType, name: &str) -> Option<(NodeId, NodeId)> {
@@ -54208,6 +54238,15 @@ impl Printer<'_> {
             self.writer.write("[]");
             return Ok(());
         }
+        if !leading_void
+            && !self.downlevel_iteration
+            && let [argument] = arguments
+            && let Some(NodeData::SpreadElement(spread)) =
+                self.arena.get(*argument).map(|node| &node.data)
+        {
+            self.emit_expression(spread.expression, 1)?;
+            return Ok(());
+        }
         let Some(spread_index) = arguments.iter().position(|argument| {
             matches!(
                 self.arena.get(*argument).map(|node| &node.data),
@@ -59703,6 +59742,21 @@ mod tests {
     }
 
     #[test]
+    fn passes_a_sole_spread_argument_directly_to_apply() {
+        let output = emit_with(
+            "let result = fn(...values);",
+            ScriptTarget::Es5,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(
+            output.contains("fn.apply(void 0, values)"),
+            "{output}"
+        );
+        assert!(!output.contains("__spreadArray"), "{output}");
+    }
+
+    #[test]
     fn downlevel_nullish_coalescing_preserves_parenthesized_left_temps() {
         let output = emit_with(
             "const first = (\"literal\") ?? fallback; const second = ((\"nested\")) ?? fallback;",
@@ -63645,6 +63699,20 @@ class Board {
             output.contains("declare var nested: () => () => number;"),
             "{output}"
         );
+    }
+
+    #[test]
+    fn declaration_emit_elides_recursive_object_method_this_returns() {
+        let output = emit_declarations_with_semantics(concat!(
+            "function create() { return { ",
+            "first() { return this; }, ",
+            "second() { return this; } ",
+            "}; }",
+        ));
+
+        assert!(output.contains("first(): /*elided*/ any;"), "{output}");
+        assert!(output.contains("second(): /*elided*/ any;"), "{output}");
+        assert!(!output.contains("unknown"), "{output}");
     }
 
     #[test]
