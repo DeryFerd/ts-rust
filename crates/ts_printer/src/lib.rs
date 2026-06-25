@@ -637,10 +637,12 @@ pub fn emit_source_file_with_context(
         {
             helpers.insert("__values");
         }
-        if !printer.private_field_plans.is_empty() || !printer.private_method_plans.is_empty() {
+        if !printer.private_field_plans.is_empty() {
             helpers.insert("__classPrivateFieldGet");
             helpers.insert("__classPrivateFieldIn");
             helpers.insert("__classPrivateFieldSet");
+        } else if !printer.private_method_plans.is_empty() {
+            helpers.insert("__classPrivateFieldGet");
         }
         if printer.es_module_interop
             && (matches!(
@@ -25807,6 +25809,7 @@ struct PrivateMethodInfo {
     method: NodeId,
     private_name: String,
     function_name: String,
+    is_static: bool,
 }
 
 #[derive(Clone)]
@@ -25815,6 +25818,7 @@ struct PrivateMethodPlan {
     capture: Option<String>,
     declarations: Vec<PrivateMethodDeclaration>,
     methods: Vec<PrivateMethodInfo>,
+    has_instance_methods: bool,
     class_name: NodeId,
     class_symbol: Option<SymbolId>,
 }
@@ -26549,6 +26553,7 @@ impl Printer<'_> {
                         method,
                         private_name,
                         function_name,
+                        is_static: false,
                     }
                 })
                 .collect();
@@ -26627,53 +26632,61 @@ impl Printer<'_> {
                     let NodeData::MethodDeclaration(method) = &self.arena.get(*member)?.data else {
                         return None;
                     };
-                    if method.body.is_none()
-                        || declaration_has_modifier_in_list(
-                            self.arena,
-                            method.modifiers.as_ref(),
-                            SyntaxKind::StaticKeyword,
-                        )
-                    {
-                        return None;
-                    }
+                    method.body?;
                     let NodeData::PrivateIdentifier(name) = &self.arena.get(method.name)?.data
                     else {
                         return None;
                     };
-                    Some((*member, name.text.trim_start_matches('#').to_owned()))
+                    let is_static = declaration_has_modifier_in_list(
+                        self.arena,
+                        method.modifiers.as_ref(),
+                        SyntaxKind::StaticKeyword,
+                    );
+                    Some((
+                        *member,
+                        name.text.trim_start_matches('#').to_owned(),
+                        is_static,
+                    ))
                 })
                 .collect::<Vec<_>>();
             if private_methods.is_empty() {
                 continue;
             }
 
-            let preferred_brand = format!("_{class_text}_instances");
-            let brand = self
-                .generated_names
-                .claim(&preferred_brand)
-                .unwrap_or_else(|| self.generated_names.generate(&preferred_brand));
-            let mut declarations = vec![PrivateMethodDeclaration {
-                name: brand.clone(),
-                order: declaration_order,
-            }];
-            declaration_order += 1;
+            let has_instance_methods = private_methods.iter().any(|(_, _, is_static)| !is_static);
+            let mut declarations = Vec::new();
+            let mut brand = None;
+            if has_instance_methods {
+                let preferred_brand = format!("_{class_text}_instances");
+                let generated_brand = self
+                    .generated_names
+                    .claim(&preferred_brand)
+                    .unwrap_or_else(|| self.generated_names.generate(&preferred_brand));
+                declarations.push(PrivateMethodDeclaration {
+                    name: generated_brand.clone(),
+                    order: declaration_order,
+                });
+                declaration_order += 1;
+                brand = Some(generated_brand);
+            }
 
-            let needs_capture = class.members.nodes.iter().any(|member| {
-                self.arena
-                    .get(*member)
-                    .is_some_and(|member| match &member.data {
-                        NodeData::ClassStaticBlockDeclaration(_) => true,
-                        NodeData::PropertyDeclaration(property) => {
-                            property.initializer.is_some()
-                                && declaration_has_modifier_in_list(
-                                    self.arena,
-                                    property.modifiers.as_ref(),
-                                    SyntaxKind::StaticKeyword,
-                                )
-                        }
-                        _ => false,
-                    })
-            });
+            let needs_capture = private_methods.iter().any(|(_, _, is_static)| *is_static)
+                || class.members.nodes.iter().any(|member| {
+                    self.arena
+                        .get(*member)
+                        .is_some_and(|member| match &member.data {
+                            NodeData::ClassStaticBlockDeclaration(_) => true,
+                            NodeData::PropertyDeclaration(property) => {
+                                property.initializer.is_some()
+                                    && declaration_has_modifier_in_list(
+                                        self.arena,
+                                        property.modifiers.as_ref(),
+                                        SyntaxKind::StaticKeyword,
+                                    )
+                            }
+                            _ => false,
+                        })
+                });
             let capture = needs_capture.then(|| self.generated_names.generate_temp());
             if let Some(capture) = &capture {
                 declarations.push(PrivateMethodDeclaration {
@@ -26684,7 +26697,7 @@ impl Printer<'_> {
             }
 
             let mut methods = Vec::new();
-            for (method, private_name) in private_methods {
+            for (method, private_name, is_static) in private_methods {
                 let preferred = format!("_{class_text}_{private_name}");
                 let function_name = self
                     .generated_names
@@ -26699,6 +26712,7 @@ impl Printer<'_> {
                     method,
                     private_name,
                     function_name,
+                    is_static,
                 });
             }
             let class_symbol = class
@@ -26709,10 +26723,11 @@ impl Printer<'_> {
             self.private_method_plans.insert(
                 class_name,
                 PrivateMethodPlan {
-                    brand,
+                    brand: brand.or_else(|| capture.clone()).expect("private method state"),
                     capture,
                     declarations,
                     methods,
+                    has_instance_methods,
                     class_name,
                     class_symbol,
                 },
@@ -26736,6 +26751,7 @@ impl Printer<'_> {
                     capture: None,
                     declarations: Vec::new(),
                     methods: plan.methods.clone(),
+                    has_instance_methods: true,
                     class_name: class_id,
                     class_symbol: None,
                 })
@@ -28569,7 +28585,7 @@ impl Printer<'_> {
                         &trivia[index..comment_end],
                         comment_range.0,
                         !inline_after,
-                        terminal_comment,
+                        terminal_comment && !immediate_trailing,
                     );
                     if inline_after {
                         self.writer.write(" ");
@@ -31329,7 +31345,7 @@ impl Printer<'_> {
             NodeData::SwitchStatement(data) => self.emit_switch(data)?,
             NodeData::TryStatement(data) => self.emit_try(data)?,
             NodeData::ThrowStatement(data) => {
-                self.writer.write("throw ");
+                self.writer.write("throw");
                 let keyword_end = node.range.start.get().saturating_add(5);
                 let expression_start = self.node(data.expression)?.range.start.get();
                 let has_line_break = usize::try_from(keyword_end)
@@ -31338,12 +31354,18 @@ impl Printer<'_> {
                     .and_then(|(start, end)| self.source_text.get(start..end))
                     .is_some_and(|trivia| trivia.contains(['\n', '\r']));
                 if has_line_break {
-                    self.writer.write(";");
+                    self.writer.write(" ;");
                     self.writer.newline();
                     self.emit_expression(data.expression, 0)?;
                     self.writer.write(";");
                 } else {
+                    self.emit_keyword_operand_gap(keyword_end, data.expression);
                     self.emit_expression(data.expression, 0)?;
+                    let expression_end = self.node(data.expression)?.range.end.get();
+                    let semicolon = self
+                        .source_punctuation_between(expression_end, node.range.end.get(), b';')
+                        .unwrap_or(node.range.end.get());
+                    self.emit_for_block_comment_gap(expression_end, semicolon, false, false);
                     self.writer.write(";");
                 }
             }
@@ -33242,40 +33264,131 @@ impl Printer<'_> {
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     fn emit_try(&mut self, data: &ts_ast::TryStatementData) -> Result<(), EmitError> {
-        self.writer.write("try ");
+        let try_start = self
+            .arena
+            .get(data.try_block)
+            .and_then(|block| block.parent)
+            .and_then(|statement| self.arena.get(statement))
+            .map_or_else(
+                || {
+                    self.arena
+                        .get(data.try_block)
+                        .map_or(0, |node| node.range.start.get())
+                },
+                |node| node.range.start.get(),
+            );
+        self.writer.write("try");
+        self.emit_for_block_comment_gap(
+            try_start.saturating_add(3),
+            self.node(data.try_block)?.range.start.get(),
+            true,
+            true,
+        );
         self.emit_block(data.try_block)?;
+        let mut previous_block = data.try_block;
         if let Some(catch_id) = data.catch_clause {
             let catch_node = self.node(catch_id)?.clone();
             let NodeData::CatchClause(catch) = &catch_node.data else {
                 return Err(Self::unsupported(catch_id, catch_node.kind));
             };
-            self.writer.newline();
+            self.emit_source_comments_between_with_ownership(
+                self.node(data.try_block)?.range.end.get(),
+                catch_node.range.start.get(),
+                true,
+                true,
+            );
+            if !self.writer.line_start {
+                self.writer.newline();
+            }
             self.writer.write("catch");
             if let Some(variable_id) = catch.variable_declaration {
                 let variable_node = self.node(variable_id)?.clone();
                 let NodeData::VariableDeclaration(variable) = &variable_node.data else {
                     return Err(Self::unsupported(variable_id, variable_node.kind));
                 };
-                self.writer.write(" (");
+                let open = self
+                    .source_punctuation_between(
+                        catch_node.range.start.get().saturating_add(5),
+                        variable_node.range.start.get(),
+                        b'(',
+                    )
+                    .unwrap_or(catch_node.range.start.get().saturating_add(5));
+                let close = self
+                    .source_punctuation_between(
+                        variable_node.range.end.get(),
+                        self.node(catch.block)?.range.start.get(),
+                        b')',
+                    )
+                    .unwrap_or(variable_node.range.end.get());
+                self.emit_for_block_comment_gap(
+                    catch_node.range.start.get().saturating_add(5),
+                    open,
+                    true,
+                    true,
+                );
+                self.writer.write("(");
+                self.emit_for_block_comment_gap(
+                    open.saturating_add(1),
+                    variable_node.range.start.get(),
+                    false,
+                    false,
+                );
                 self.emit_expression(variable.name, 0)?;
                 if let Some(initializer) = variable.initializer {
                     self.writer.write(" = ");
                     self.emit_expression(initializer, 1)?;
                 }
+                self.emit_for_block_comment_gap(variable_node.range.end.get(), close, false, false);
                 self.writer.write(")");
+                self.emit_for_block_comment_gap(
+                    close.saturating_add(1),
+                    self.node(catch.block)?.range.start.get(),
+                    true,
+                    true,
+                );
             } else if self.settings.target < ScriptTarget::Es2019 {
                 let variable = self.generated_names.generate_temp();
                 self.writer.write(" (");
                 self.writer.write(&variable);
                 self.writer.write(")");
+                self.writer.write(" ");
+            } else {
+                self.emit_for_block_comment_gap(
+                    catch_node.range.start.get().saturating_add(5),
+                    self.node(catch.block)?.range.start.get(),
+                    true,
+                    true,
+                );
             }
-            self.writer.write(" ");
             self.emit_block(catch.block)?;
+            previous_block = catch.block;
         }
         if let Some(finally_block) = data.finally_block {
-            self.writer.newline();
-            self.writer.write("finally ");
+            let finally_start = self
+                .source_keyword_between(
+                    self.node(previous_block)?.range.end.get(),
+                    self.node(finally_block)?.range.start.get(),
+                    "finally",
+                )
+                .unwrap_or(self.node(previous_block)?.range.end.get());
+            self.emit_source_comments_between_with_ownership(
+                self.node(previous_block)?.range.end.get(),
+                finally_start,
+                true,
+                true,
+            );
+            if !self.writer.line_start {
+                self.writer.newline();
+            }
+            self.writer.write("finally");
+            self.emit_for_block_comment_gap(
+                finally_start.saturating_add(7),
+                self.node(finally_block)?.range.start.get(),
+                true,
+                true,
+            );
             self.emit_block(finally_block)?;
         }
         Ok(())
@@ -34807,6 +34920,7 @@ impl Printer<'_> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     fn emit_block(&mut self, id: NodeId) -> Result<(), EmitError> {
         let node = self.node(id)?.clone();
         let NodeData::Block(data) = &node.data else {
@@ -34899,11 +35013,18 @@ impl Printer<'_> {
             previous_end = statement_node.range.end.get();
             previous_emitted = current_owns_source_comments;
         }
+        let close = node.range.end.get().saturating_sub(1);
+        let trailing_block_comment_touches_close =
+            self.block_comment_touches_range_end(previous_end, close);
         self.emit_source_comments_between_with_trailing(
             previous_end,
-            node.range.end.get().saturating_sub(1),
+            close,
             previous_emitted || previous_end == node.range.start.get().saturating_add(1),
         );
+        if trailing_block_comment_touches_close && self.writer.line_start {
+            self.writer.remove_trailing_newline();
+            self.writer.write(" ");
+        }
         self.namespace_declarations.pop();
         self.writer.indent -= 1;
         self.writer.write("}");
@@ -47324,7 +47445,10 @@ impl Printer<'_> {
                 && self.is_constructor_name(method.name)
         });
         if lower_fields
-            && (self.has_instance_field_initializers(data) || private_plan.is_some())
+            && (self.has_instance_field_initializers(data)
+                || private_plan
+                    .as_ref()
+                    .is_some_and(|plan| plan.has_instance_methods))
             && !has_constructor
         {
             self.emit_synthesized_native_constructor(data, has_base)?;
@@ -48960,6 +49084,9 @@ impl Printer<'_> {
         let Some(plan) = &self.active_private_method_plan else {
             return;
         };
+        if !plan.has_instance_methods {
+            return;
+        }
         self.writer.write(&plan.brand);
         self.writer.write(".add(");
         self.writer.write(receiver);
@@ -49011,20 +49138,29 @@ impl Printer<'_> {
             .and_then(|name| declaration_name_text(self.arena, name))
             .unwrap_or("_class");
         self.writer.newline();
+        let mut wrote_initializer = false;
         if let Some(capture) = &plan.capture {
             self.writer.write(capture);
             self.writer.write(" = ");
             self.writer.write(class_name);
-            self.writer.write(", ");
+            wrote_initializer = true;
         }
-        self.writer.write(&plan.brand);
-        self.writer.write(" = new WeakSet()");
+        if plan.has_instance_methods {
+            if wrote_initializer {
+                self.writer.write(", ");
+            }
+            self.writer.write(&plan.brand);
+            self.writer.write(" = new WeakSet()");
+            wrote_initializer = true;
+        }
         for private_method in &plan.methods {
             let node = self.node(private_method.method)?.clone();
             let NodeData::MethodDeclaration(method) = &node.data else {
                 return Err(Self::unsupported(private_method.method, node.kind));
             };
-            self.writer.write(", ");
+            if wrote_initializer {
+                self.writer.write(", ");
+            }
             self.writer.write(&private_method.function_name);
             self.writer.write(" = ");
             if self.has_modifier(method.modifiers.as_ref(), SyntaxKind::AsyncKeyword) {
@@ -49039,6 +49175,7 @@ impl Printer<'_> {
             self.emit_parameters(&method.parameters)?;
             self.writer.write(" ");
             self.emit_function_body(method.body.expect("private method has a body"))?;
+            wrote_initializer = true;
         }
         self.writer.write(";");
         Ok(())
@@ -54880,6 +55017,13 @@ impl Printer<'_> {
                 } else {
                     let unbound_receiver = self.commonjs_module_transform
                         && self.commonjs_call_requires_unbound_receiver(data.expression);
+                    let preserve_await_gap = matches!(
+                        self.arena.get(data.expression).map(|node| &node.data),
+                        Some(NodeData::Identifier(identifier)) if identifier.text == "await"
+                    ) && usize::try_from(self.node(data.expression)?.range.end.get())
+                        .ok()
+                        .and_then(|end| self.source_text.as_bytes().get(end))
+                        .is_some_and(u8::is_ascii_whitespace);
                     if unbound_receiver {
                         self.writer.write("(0, ");
                     }
@@ -54894,6 +55038,9 @@ impl Printer<'_> {
                         && let Some(type_arguments) = &data.type_arguments
                     {
                         self.emit_javascript_type_arguments_as_operators(type_arguments)?;
+                        self.writer.write(" ");
+                    }
+                    if preserve_await_gap {
                         self.writer.write(" ");
                     }
                     self.writer.write("(");
@@ -54958,18 +55105,7 @@ impl Printer<'_> {
                         true,
                     );
                     if self.emitted_source_comments.len() == comment_count {
-                        let keyword_end = usize::try_from(node.range.start.get().saturating_add(5))
-                            .unwrap_or(usize::MAX);
-                        let expression_start =
-                            usize::try_from(self.node(data.expression)?.range.start.get())
-                                .unwrap_or(usize::MAX);
-                        if self
-                            .source_text
-                            .get(keyword_end..expression_start)
-                            .is_none_or(|trivia| !trivia.is_empty())
-                        {
-                            self.writer.write(" ");
-                        }
+                        self.writer.write(" ");
                     }
                     self.emit_expression(data.expression, 2)?;
                 }
@@ -56273,7 +56409,11 @@ impl Printer<'_> {
         self.writer.write("(");
         self.emit_expression(receiver, 1)?;
         self.writer.write(", ");
-        self.writer.write(&plan.brand);
+        self.writer.write(if method.is_static {
+            plan.capture.as_deref().unwrap_or(&plan.brand)
+        } else {
+            &plan.brand
+        });
         self.writer.write(", \"m\", ");
         self.writer.write(&method.function_name);
         self.writer.write(")");
@@ -57033,14 +57173,17 @@ impl Printer<'_> {
     }
 
     fn emit_jsx_attribute_expression(&mut self, expression: NodeId) -> Result<(), EmitError> {
-        let multiline_arrow = matches!(
+        let multiline_expression = matches!(
             self.arena.get(expression).map(|node| &node.data),
             Some(NodeData::ArrowFunction(arrow))
                 if matches!(self.arena.get(arrow.body).map(|node| &node.data), Some(NodeData::Block(_)))
+        ) || matches!(
+            self.arena.get(expression).map(|node| &node.data),
+            Some(NodeData::ObjectLiteralExpression(_)) if self.node_source_is_multiline(expression)
         );
-        self.writer.indent += usize::from(multiline_arrow);
+        self.writer.indent += usize::from(multiline_expression);
         let result = self.emit_expression(expression, 0);
-        self.writer.indent -= usize::from(multiline_arrow);
+        self.writer.indent -= usize::from(multiline_expression);
         result
     }
 
@@ -63874,6 +64017,30 @@ mod tests {
             ),
             "{output}"
         );
+    }
+
+    #[test]
+    fn lowers_static_private_methods_with_the_class_as_the_brand() {
+        let output = emit_with(
+            "export class Foo { constructor() { Foo.#test(); } static #test() { return 'success'; } }",
+            ScriptTarget::Es2021,
+            ModuleKind::EsNext,
+        )
+        .code;
+        assert!(output.contains("var _a, _Foo_test;"), "{output}");
+        assert!(
+            output.contains(
+                "__classPrivateFieldGet(_a, _a, \"m\", _Foo_test).call(_a);"
+            ),
+            "{output}"
+        );
+        assert!(
+            output.contains(
+                "_a = Foo, _Foo_test = function _Foo_test() { return 'success'; };"
+            ),
+            "{output}"
+        );
+        assert!(!output.contains("WeakSet"), "{output}");
     }
 
     #[test]
