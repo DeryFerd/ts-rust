@@ -49253,26 +49253,28 @@ impl Printer<'_> {
     }
 
     fn erased_constructor_modifier_precedes_property_assignment(&self, statement: NodeId) -> bool {
+        self.erased_constructor_modifier(statement).is_some()
+    }
+
+    fn erased_constructor_modifier(&self, statement: NodeId) -> Option<&'static str> {
         if !self.is_recovered_constructor_property_assignment(statement) {
-            return false;
+            return None;
         }
-        let Some(start) = self
+        let start = self
             .arena
             .get(statement)
             .and_then(|node| usize::try_from(node.range.start.get()).ok())
-        else {
-            return false;
-        };
-        let Some(prefix) = self.source_text.get(..start) else {
-            return false;
-        };
+            ?;
+        let prefix = self.source_text.get(..start)?;
         let line_start = prefix
             .rfind(['\n', '\r', ';', '{'])
             .map_or(0, |position| position + 1);
-        matches!(
-            prefix[line_start..].trim(),
-            "public" | "private" | "protected"
-        )
+        match prefix[line_start..].trim() {
+            "public" => Some("public"),
+            "private" => Some("private"),
+            "protected" => Some("protected"),
+            _ => None,
+        }
     }
 
     fn emit_recovered_constructor_property_assignment(
@@ -49290,10 +49292,17 @@ impl Printer<'_> {
         if self.node(binary.operator_token)?.kind != SyntaxKind::EqualsToken {
             return Ok(false);
         }
-        if matches!(self.node(binary.left)?.data, NodeData::Identifier(_)) {
-            self.writer.write("this.");
+        if let NodeData::Identifier(identifier) = &self.node(binary.left)?.data
+            && identifier.text.is_empty()
+            && let Some(modifier) = self.erased_constructor_modifier(statement)
+        {
+            self.writer.write(modifier);
+        } else {
+            if matches!(self.node(binary.left)?.data, NodeData::Identifier(_)) {
+                self.writer.write("this.");
+            }
+            self.emit_expression(binary.left, 1)?;
         }
-        self.emit_expression(binary.left, 1)?;
         self.writer.write(" = ");
         self.emit_expression(binary.right, 1)?;
         self.writer.write(";");
@@ -64726,6 +64735,21 @@ class Board {
 
     #[test]
     fn recovers_static_members_and_initializes_missing_super_fields_first() {
+        let reserved_word_recovery = emit_with_parse_errors(
+            "class Foo { constructor(private, public, static) { private = public = static; } }",
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(
+            reserved_word_recovery.contains("private = public = static;"),
+            "{reserved_word_recovery}"
+        );
+        assert!(
+            !reserved_word_recovery.contains("this.private"),
+            "{reserved_word_recovery}"
+        );
+
         assert_eq!(
             emit_with_parse_errors(
                 "class C { static static foo = 1; public static static bar() {} }",

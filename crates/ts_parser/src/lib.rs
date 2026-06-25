@@ -3697,11 +3697,10 @@ impl<'a> Parser<'a> {
             } else {
                 None
             };
-            let name = if matches!(
-                self.current.kind,
-                SyntaxKind::Identifier | SyntaxKind::RequireKeyword
-            ) {
-                Some(self.parse_identifier("Expected an import binding."))
+            let name = if is_import_binding_identifier_kind(self.current.kind)
+                || self.current.kind.is_keyword()
+            {
+                Some(self.parse_import_binding_identifier("Expected an import binding."))
             } else {
                 None
             };
@@ -3925,18 +3924,14 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_entity_name(&mut self) -> NodeId {
-        let mut entity = if matches!(
-            self.current.kind,
-            SyntaxKind::DefaultKeyword | SyntaxKind::UndefinedKeyword | SyntaxKind::ThisKeyword
-        ) || is_contextual_keyword(self.current.kind)
-        {
+        let mut entity = if self.current.kind.is_keyword() {
             self.parse_identifier_name("Expected a module reference.")
         } else {
             self.parse_identifier("Expected a module reference.")
         };
         while self.current.kind == SyntaxKind::DotToken {
             self.bump();
-            let right = self.parse_identifier("Expected an identifier after '.'.");
+            let right = self.parse_identifier_name("Expected an identifier after '.'.");
             entity = self.alloc_node(
                 SyntaxKind::QualifiedName,
                 TextRange::new(self.node_start(entity), self.node_end(right)),
@@ -13865,6 +13860,49 @@ mod tests {
                     NodeData::Identifier(identifier) if identifier.text == "package"
                 )
         ));
+    }
+
+    #[test]
+    fn recovers_reserved_words_in_imports_and_heritage_names() {
+        let result = parse_source_file(
+            r#"
+                import public = require("1");
+                import * as package from "./1";
+                import { foo as private } from "./1";
+                import public from "./1";
+                class F implements public.private.implements {}
+            "#,
+        );
+        let statements = source_statements(&result);
+        assert_eq!(statements.len(), 5, "{:?}", result.diagnostics);
+        assert_eq!(
+            result.arena.get(statements[0]).unwrap().kind,
+            SyntaxKind::ImportEqualsDeclaration
+        );
+        for statement in &statements[1..4] {
+            assert_eq!(
+                result.arena.get(*statement).unwrap().kind,
+                SyntaxKind::ImportDeclaration
+            );
+        }
+
+        let NodeData::ClassDeclaration(class) = &result.arena.get(statements[4]).unwrap().data
+        else {
+            panic!("expected class declaration");
+        };
+        let clause = class.heritage_clauses.as_ref().unwrap().nodes[0];
+        let NodeData::HeritageClause(clause) = &result.arena.get(clause).unwrap().data else {
+            panic!("expected heritage clause");
+        };
+        let NodeData::ExpressionWithTypeArguments(heritage) =
+            &result.arena.get(clause.types.nodes[0]).unwrap().data
+        else {
+            panic!("expected heritage expression");
+        };
+        assert_eq!(
+            result.arena.get(heritage.expression).unwrap().kind,
+            SyntaxKind::QualifiedName
+        );
     }
 
     fn find_descendant_kind(
