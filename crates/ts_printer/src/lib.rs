@@ -4704,6 +4704,11 @@ impl DeclarationPrinter<'_> {
                         self.heritage_call_returned_local_class(*expression)
                     {
                         self.emit_local_class_constructor_type(local_class)?;
+                    } else if matches!(
+                        self.arena.get(*expression).map(|node| &node.data),
+                        Some(NodeData::ClassExpression(_))
+                    ) {
+                        self.emit_local_class_constructor_type(*expression)?;
                     } else if let Some(type_id) = type_id {
                         self.emit_synthetic_base_type(*type_id, argument.as_deref())?;
                     } else {
@@ -6915,10 +6920,11 @@ impl DeclarationPrinter<'_> {
 
     fn emit_local_class_constructor_type(&mut self, class: NodeId) -> Result<(), EmitError> {
         let class_node = self.node(class)?.clone();
-        let NodeData::ClassDeclaration(class) = &class_node.data else {
-            return Err(Self::unsupported(class, class_node.kind));
+        let members = match &class_node.data {
+            NodeData::ClassDeclaration(class) => class.members.nodes.clone(),
+            NodeData::ClassExpression(class) => class.members.nodes.clone(),
+            _ => return Err(Self::unsupported(class, class_node.kind)),
         };
-        let members = class.members.nodes.clone();
         self.writer.write("{");
         self.writer.newline();
         self.writer.indent += 1;
@@ -6926,27 +6932,62 @@ impl DeclarationPrinter<'_> {
         self.writer.newline();
         self.writer.indent += 1;
         for member in members {
-            let Some(NodeData::PropertyDeclaration(property)) =
-                self.arena.get(member).map(|node| &node.data)
-            else {
+            let Some(member_node) = self.arena.get(member) else {
                 continue;
             };
-            if self.member_has_modifier(property.modifiers.as_ref(), SyntaxKind::StaticKeyword)
-                || self.member_has_modifier(property.modifiers.as_ref(), SyntaxKind::PrivateKeyword)
-            {
-                continue;
-            }
-            self.emit_name(property.name)?;
-            self.writer.write(": ");
-            if let Some(type_) = property.type_ {
-                self.emit_type(type_)?;
-            } else if let Some(type_id) = self
-                .node_types
-                .and_then(|types| types.get(&member).copied())
-            {
-                self.emit_widened_semantic_type(type_id)?;
-            } else {
-                self.writer.write("any");
+            match &member_node.data {
+                NodeData::MethodDeclaration(method)
+                    if !self.member_has_modifier(
+                        method.modifiers.as_ref(),
+                        SyntaxKind::StaticKeyword,
+                    ) && !self.member_has_modifier(
+                        method.modifiers.as_ref(),
+                        SyntaxKind::PrivateKeyword,
+                    ) && !self.member_has_modifier(
+                        method.modifiers.as_ref(),
+                        SyntaxKind::ProtectedKeyword,
+                    ) =>
+                {
+                    self.emit_name(method.name)?;
+                    self.emit_parameters(&method.parameters)?;
+                    if let Some(type_) = method.type_ {
+                        self.writer.write(": ");
+                        self.emit_type(type_)?;
+                    } else if method
+                        .body
+                        .is_some_and(|body| !self.block_has_value_return(body))
+                    {
+                        self.writer.write(": void");
+                    } else {
+                        self.writer.write(": any");
+                    }
+                }
+                NodeData::PropertyDeclaration(property)
+                    if !self.member_has_modifier(
+                        property.modifiers.as_ref(),
+                        SyntaxKind::StaticKeyword,
+                    ) && !self.member_has_modifier(
+                        property.modifiers.as_ref(),
+                        SyntaxKind::PrivateKeyword,
+                    ) && !self.member_has_modifier(
+                        property.modifiers.as_ref(),
+                        SyntaxKind::ProtectedKeyword,
+                    ) =>
+                {
+                    self.emit_name(property.name)?;
+                    self.writer.write(": ");
+                    if let Some(type_) = property.type_ {
+                        self.emit_type(type_)?;
+                    } else if let Some(type_id) = self
+                        .node_types
+                        .and_then(|types| types.get(&member).copied())
+                    {
+                        self.emit_widened_semantic_type(type_id)?;
+                    } else {
+                        self.writer.write("any");
+                    }
+                }
+                _ => continue,
             }
             self.writer.write(";");
             self.writer.newline();
@@ -20616,9 +20657,39 @@ impl DeclarationPrinter<'_> {
                 self.emit_type(data.false_type)?;
             }
             NodeData::TupleTypeNode(data) => {
-                self.writer.write("[");
-                self.emit_type_list(&data.elements, ", ")?;
-                self.writer.write("]");
+                let multiline = data.elements.nodes.len() > 1
+                    && data.elements.nodes.iter().all(|element| {
+                        matches!(
+                            self.arena.get(*element).map(|node| &node.data),
+                            Some(NodeData::RestTypeNode(_))
+                        )
+                    })
+                    && usize::try_from(node.range.start.get())
+                        .ok()
+                        .and_then(|start| self.source_text.get(..start))
+                        .and_then(|prefix| {
+                            let equals = prefix.rfind('=')?;
+                            Some(prefix[equals + 1..].contains(['\n', '\r']))
+                        })
+                        .unwrap_or(false);
+                if multiline {
+                    self.writer.write("[");
+                    self.writer.newline();
+                    self.writer.indent += 1;
+                    for (index, element) in data.elements.nodes.iter().enumerate() {
+                        self.emit_type(*element)?;
+                        if index + 1 != data.elements.nodes.len() {
+                            self.writer.write(",");
+                        }
+                        self.writer.newline();
+                    }
+                    self.writer.indent -= 1;
+                    self.writer.write("]");
+                } else {
+                    self.writer.write("[");
+                    self.emit_type_list(&data.elements, ", ")?;
+                    self.writer.write("]");
+                }
             }
             NodeData::ParenthesizedTypeNode(data) => {
                 self.writer.write("(");
@@ -46302,15 +46373,6 @@ impl Printer<'_> {
         let mut emitted_temps = false;
         let mut emitted_binding_parameters = false;
         if prologue_count == 0 {
-            if let Some(first_statement) = body.statements.nodes.first()
-                && let Some(first_statement) = self.arena.get(*first_statement)
-            {
-                self.emit_source_comments_between_with_trailing(
-                    body_node.range.start.get().saturating_add(1),
-                    first_statement.range.start.get(),
-                    false,
-                );
-            }
             self.emit_constructor_generated_temps(&generated_temps);
             emitted_temps = true;
             self.emit_downlevel_binding_parameter_prologues(&downlevel_binding_parameters)?;
@@ -46320,6 +46382,15 @@ impl Printer<'_> {
                 self.emit_parameter_properties(&method.parameters, "this")?;
                 self.emit_instance_fields(data, "this")?;
                 emitted_fields = true;
+            }
+            if let Some(first_statement) = body.statements.nodes.first()
+                && let Some(first_statement) = self.arena.get(*first_statement)
+            {
+                self.emit_source_comments_between_with_trailing(
+                    body_node.range.start.get().saturating_add(1),
+                    first_statement.range.start.get(),
+                    false,
+                );
             }
         }
         let mut previous_end = body_node.range.start.get().saturating_add(1);
@@ -57915,6 +57986,23 @@ mod tests {
     }
 
     #[test]
+    fn declaration_emit_expands_multiline_rest_tuples() {
+        let output = emit_declarations_with_semantics(concat!(
+            "type Left = [string]; type Right = [number];\n",
+            "type Both =\n    [...Left, ...Right]['length'];",
+        ));
+        assert!(
+            output.contains(concat!(
+                "type Both = [\n",
+                "    ...Left,\n",
+                "    ...Right\n",
+                "]",
+            )),
+            "{output}"
+        );
+    }
+
+    #[test]
     fn preserves_comments_inside_property_access_chains() {
         let output = emit_with(
             concat!(
@@ -63169,6 +63257,23 @@ class Board {
     }
 
     #[test]
+    fn emits_generated_constructor_fields_before_leading_body_comments() {
+        let output = emit_with(
+            concat!(
+                "class C { field = 1; constructor(public value: number) {\n",
+                "// source statement\nuse(value); } }",
+            ),
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        let parameter_property = output.find("this.value = value;").unwrap();
+        let field = output.find("this.field = 1;").unwrap();
+        let comment = output.find("// source statement").unwrap();
+        assert!(parameter_property < comment && field < comment, "{output}");
+    }
+
+    #[test]
     fn preserves_trailing_comments_across_erased_abstract_type_statements() {
         let source = concat!(
             "class ConcreteA {}\n",
@@ -65139,6 +65244,26 @@ class Board {
                 "    new (...args: any[]): {\n",
                 "        [x: string]: any;\n",
                 "        get(value: string): void;\n",
+                "    };\n",
+                "};",
+            )),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn declaration_emit_preserves_methods_from_recursive_anonymous_class_bases() {
+        let output = emit_declarations_with_semantics(concat!(
+            "abstract class Base { abstract root(): Derived; }\n",
+            "class Derived extends class extends Base {\n",
+            "    root() { return undefined as any; }\n",
+            "} {}\n",
+        ));
+        assert!(
+            output.contains(concat!(
+                "declare const Derived_base: {\n",
+                "    new (): {\n",
+                "        root(): any;\n",
                 "    };\n",
                 "};",
             )),
