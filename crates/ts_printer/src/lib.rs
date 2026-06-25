@@ -8977,6 +8977,13 @@ impl DeclarationPrinter<'_> {
                     .is_some_and(|node| node.kind == SyntaxKind::NullKeyword)
             }) {
                 self.writer.write(": any");
+            } else if self.variable_declaration_has_redeclarations(declaration_id)
+                && let Some(type_id) = declaration
+                    .initializer
+                    .and_then(|initializer| self.node_types?.get(&initializer).copied())
+            {
+                self.writer.write(": ");
+                self.emit_widened_semantic_type(type_id)?;
             } else if let Some(type_id) = self
                 .node_types
                 .and_then(|types| types.get(&declaration_id).copied())
@@ -9257,6 +9264,26 @@ impl DeclarationPrinter<'_> {
                 })
             })
         })
+    }
+
+    fn variable_declaration_has_redeclarations(&self, declaration: NodeId) -> bool {
+        self.bindings
+            .node_symbols
+            .get(&declaration)
+            .and_then(|symbol| self.bindings.symbols.get(*symbol))
+            .is_some_and(|symbol| {
+                symbol
+                    .declarations
+                    .iter()
+                    .filter(|candidate| {
+                        matches!(
+                            self.arena.get(**candidate).map(|node| &node.data),
+                            Some(NodeData::VariableDeclaration(_))
+                        )
+                    })
+                    .nth(1)
+                    .is_some()
+            })
     }
 
     fn variable_static_assignments(&self, variable_name: &str) -> Vec<(NodeId, NodeId)> {
@@ -59398,6 +59425,21 @@ class Board {
                 "};",
             )),
             "{output}"
+        );
+    }
+
+    #[test]
+    fn declaration_emit_preserves_initialized_type_across_let_redeclaration() {
+        let output = emit_declarations_with_semantics(
+            "var let = 10;\nvar a = 10;\nlet = 30;\nlet\na;",
+        );
+        assert_eq!(
+            output,
+            concat!(
+                "declare var let: number;\n",
+                "declare var a: number;\n",
+                "declare let a: any;\n",
+            )
         );
     }
 

@@ -560,6 +560,7 @@ impl<'a> Parser<'a> {
         let async_starts_function = self.current.kind == SyntaxKind::AsyncKeyword
             && !self.next_token_preceded_by_line_break()
             && self.next_token_kind() == SyntaxKind::FunctionKeyword;
+        let let_starts_declaration = self.is_let_declaration();
         let (import_starts_expression, invalid_import_declaration) =
             self.classify_import_statement_start();
         let recovered_bigint_module_clause = match self.current.kind {
@@ -570,9 +571,10 @@ impl<'a> Parser<'a> {
         match self.current.kind {
             SyntaxKind::OpenBraceToken => self.parse_block(),
             SyntaxKind::ConstKeyword if is_const_enum => self.parse_const_enum_declaration(),
-            SyntaxKind::VarKeyword | SyntaxKind::LetKeyword | SyntaxKind::ConstKeyword => {
+            SyntaxKind::VarKeyword | SyntaxKind::ConstKeyword => {
                 self.parse_variable_statement()
             }
+            SyntaxKind::LetKeyword if let_starts_declaration => self.parse_variable_statement(),
             SyntaxKind::UsingKeyword => self.parse_using_statement(),
             SyntaxKind::AwaitKeyword => self.parse_await_statement(),
             SyntaxKind::FunctionKeyword => self.parse_function_declaration(),
@@ -907,6 +909,18 @@ impl<'a> Parser<'a> {
             .contains(ScannerTokenFlags::PRECEDING_LINE_BREAK);
         self.scanner.rewind(checkpoint);
         has_line_break
+    }
+
+    fn is_let_declaration(&mut self) -> bool {
+        if self.current.kind != SyntaxKind::LetKeyword {
+            return false;
+        }
+        let next = self.next_token_kind();
+        is_import_binding_identifier_kind(next)
+            || matches!(
+                next,
+                SyntaxKind::OpenBraceToken | SyntaxKind::OpenBracketToken
+            )
     }
 
     fn parse_variable_statement_tail(
