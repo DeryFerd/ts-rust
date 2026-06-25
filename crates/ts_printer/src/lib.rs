@@ -4295,6 +4295,7 @@ impl DeclarationPrinter<'_> {
             && !matches!(&node.data, NodeData::ImportDeclaration(import) if self.import_is_used_by_synthetic_class_base(id, import))
             && !matches!(&node.data, NodeData::ImportDeclaration(import) if self.import_has_retained_declaration_binding_use(id, import))
             && !matches!(&node.data, NodeData::ImportEqualsDeclaration(import) if self.import_equals_is_used_by_inferred_variable_type(id, import))
+            && !matches!(&node.data, NodeData::ImportEqualsDeclaration(import) if self.import_equals_is_used_by_inferred_alias_type(import))
             && !matches!(
                 &node.data,
                 NodeData::ImportEqualsDeclaration(import)
@@ -7748,6 +7749,42 @@ impl DeclarationPrinter<'_> {
         })
     }
 
+    fn import_equals_is_used_by_inferred_alias_type(
+        &self,
+        import: &ts_ast::ImportEqualsDeclarationData,
+    ) -> bool {
+        let Some(name) = declaration_name_text(self.arena, import.name) else {
+            return false;
+        };
+        self.arena.iter().any(|(declaration_id, node)| {
+            let NodeData::VariableDeclaration(variable) = &node.data else {
+                return false;
+            };
+            if variable.type_.is_some()
+                || variable.initializer.and_then(|initializer| {
+                    self.internal_import_equals_type_alias_name(declaration_id, initializer)
+                }) != Some(name)
+            {
+                return false;
+            }
+            let mut current = declaration_id;
+            while let Some(parent) = self.arena.get(current).and_then(|node| node.parent) {
+                match self.arena.get(parent).map(|node| &node.data) {
+                    Some(NodeData::VariableStatement(_)) => {
+                        return self.declaration_reachability.is_none_or(|reachability| {
+                            reachability
+                                .values()
+                                .any(|retained| retained.contains(&parent))
+                        });
+                    }
+                    Some(NodeData::SourceFile(_)) => return false,
+                    _ => current = parent,
+                }
+            }
+            false
+        })
+    }
+
     fn entity_expression_root_identifier(&self, expression: NodeId) -> Option<NodeId> {
         match &self.arena.get(expression)?.data {
             NodeData::Identifier(_) => Some(expression),
@@ -9220,6 +9257,12 @@ impl DeclarationPrinter<'_> {
             {
                 self.writer.write(": ");
                 self.writer.write(type_name);
+            } else if let Some(type_name) = declaration.initializer.and_then(|initializer| {
+                self.internal_import_equals_type_alias_name(declaration_id, initializer)
+                    .map(str::to_owned)
+            }) {
+                self.writer.write(": ");
+                self.writer.write(&type_name);
             } else if let Some(type_query) =
                 self.variable_entity_value_type_query_name(declaration_id, declaration)
             {
@@ -10396,6 +10439,88 @@ impl DeclarationPrinter<'_> {
         let reference = self.named_type_references?.get(type_id)?;
         let name = reference.name.strip_prefix("typeof ").unwrap_or(&reference.name);
         (!name.starts_with("__") && !name.contains('.')).then(|| format!("{alias}.{name}"))
+    }
+
+    fn internal_import_equals_type_alias_name(
+        &self,
+        declaration: NodeId,
+        expression: NodeId,
+    ) -> Option<&str> {
+        if self.enum_member_type_expression(expression).is_some()
+            && let Some(alias) = self.private_internal_import_equals_root_name(expression)
+        {
+            return Some(alias);
+        }
+        self.node_types
+            .and_then(|types| types.get(&expression))
+            .and_then(|type_id| {
+                self.internal_import_equals_type_alias_for_type(declaration, *type_id)
+            })
+            .or_else(|| {
+                let type_id = self.internal_import_equals_target_value_type(expression)?;
+                self.internal_import_equals_type_alias_for_type(declaration, type_id)
+            })
+    }
+
+    fn internal_import_equals_target_value_type(&self, expression: NodeId) -> Option<TypeId> {
+        let root = self.entity_expression_root_identifier(expression)?;
+        let name = declaration_name_text(self.arena, root)?;
+        let symbol = self.bindings.resolve_name_at(root, name)?;
+        let target = self.declaration_alias_target_symbol(symbol, &mut HashSet::new())?;
+        self.bindings
+            .symbols
+            .get(target)?
+            .declarations
+            .iter()
+            .find_map(|declaration| {
+                let NodeData::VariableDeclaration(variable) =
+                    &self.arena.get(*declaration)?.data
+                else {
+                    return None;
+                };
+                variable
+                    .initializer
+                    .and_then(|initializer| self.node_types?.get(&initializer).copied())
+                    .or_else(|| self.node_types?.get(declaration).copied())
+            })
+    }
+
+    fn internal_import_equals_type_alias_for_type(
+        &self,
+        declaration: NodeId,
+        type_id: TypeId,
+    ) -> Option<&str> {
+        let reference = self.named_type_references?.get(&type_id)?;
+        let target_name = reference
+            .name
+            .strip_prefix("typeof ")
+            .unwrap_or(&reference.name)
+            .rsplit('.')
+            .next()?;
+        if target_name.starts_with("__") {
+            return None;
+        }
+        let namespace = self.containing_namespace_names(declaration);
+        self.arena.iter().find_map(|(candidate, node)| {
+            let NodeData::ImportEqualsDeclaration(import) = &node.data else {
+                return None;
+            };
+            if self.containing_namespace_names(candidate) != namespace
+                || matches!(
+                    self.arena
+                        .get(import.module_reference)
+                        .map(|node| &node.data),
+                    Some(NodeData::ExternalModuleReference(_))
+                )
+            {
+                return None;
+            }
+            let target = self.resolve_entity_expression_symbol(import.module_reference)?;
+            let path = self.runtime_symbol_declaration_path(target)?;
+            (path.last().map(String::as_str) == Some(target_name))
+                .then(|| declaration_name_text(self.arena, import.name))
+                .flatten()
+        })
     }
 
     fn entity_value_type_query_name(
@@ -21696,9 +21821,7 @@ impl DeclarationPrinter<'_> {
                     )
             )
         });
-        if !(self.source_scope_has_explicit_module_syntax(scope)
-            && has_privacy_boundary
-            && has_string_module_augmentation)
+        if !has_privacy_boundary
             && can_use_existing_module_marker
             && retained.iter().any(|statement| {
                 self.arena.get(*statement).is_some_and(|node| {
@@ -22129,15 +22252,24 @@ impl DeclarationPrinter<'_> {
         declaration: NodeId,
         import: &ts_ast::ImportEqualsDeclarationData,
     ) -> bool {
-        let Some(NodeData::ExternalModuleReference(external)) = self
+        if self.arena.get(declaration).is_some_and(|node| {
+            declaration_has_modifier(self.arena, node, SyntaxKind::ExportKeyword)
+        }) {
+            return false;
+        }
+        let module_specifier = match self
             .arena
             .get(import.module_reference)
             .map(|node| &node.data)
-        else {
-            return false;
-        };
-        let Some(module_specifier) = string_literal_text(self.arena, external.expression) else {
-            return false;
+        {
+            Some(NodeData::ExternalModuleReference(external)) => {
+                let Some(module_specifier) = string_literal_text(self.arena, external.expression)
+                else {
+                    return false;
+                };
+                Some(module_specifier)
+            }
+            _ => None,
         };
         let Some(name) = declaration_name_text(self.arena, import.name) else {
             return false;
@@ -22166,19 +22298,76 @@ impl DeclarationPrinter<'_> {
             .collect::<Vec<_>>();
         !references.is_empty()
             && references.iter().all(|identifier| {
+                if module_specifier.is_none() {
+                    return self.internal_import_reference_is_erased(*identifier, name);
+                }
                 self.portable_inference_type_for_reference(*identifier)
                     .is_some_and(|type_id| {
-                        self.semantic_type_imports_only_other_modules(
-                            type_id,
-                            module_specifier,
-                            &mut HashSet::new(),
-                        ) || (self.nested_string_module_declaration_exists(module_specifier)
-                            && self
-                                .semantic_types
-                                .and_then(|types| types.get(type_id))
-                                .is_some_and(|type_| matches!(type_.kind, TypeKind::Any)))
+                        module_specifier.is_some_and(|module_specifier| {
+                            self.semantic_type_imports_only_other_modules(
+                                type_id,
+                                module_specifier,
+                                &mut HashSet::new(),
+                            ) || (self
+                                .nested_string_module_declaration_exists(module_specifier)
+                                && self
+                                    .semantic_types
+                                    .and_then(|types| types.get(type_id))
+                                    .is_some_and(|type_| matches!(type_.kind, TypeKind::Any)))
+                        })
                     })
             })
+    }
+
+    fn internal_import_reference_is_erased(&self, reference: NodeId, name: &str) -> bool {
+        let mut current = reference;
+        while let Some(parent) = self.arena.get(current).and_then(|node| node.parent) {
+            let Some(node) = self.arena.get(parent) else {
+                return false;
+            };
+            match &node.data {
+                NodeData::VariableDeclaration(variable) => {
+                    let Some(initializer) = variable.initializer else {
+                        return false;
+                    };
+                    if variable.type_.is_some() || !self.node_is_within(reference, initializer) {
+                        return false;
+                    }
+                    if let Some(alias) =
+                        self.internal_import_equals_type_alias_name(parent, initializer)
+                    {
+                        return alias != name;
+                    }
+                    let type_id = self
+                        .node_types
+                        .and_then(|types| types.get(&initializer).copied())
+                        .filter(|type_id| {
+                            self.semantic_types
+                                .and_then(|types| types.get(*type_id))
+                                .is_none_or(|type_| !matches!(type_.kind, TypeKind::Any))
+                        })
+                        .or_else(|| self.internal_import_equals_target_value_type(initializer));
+                    return type_id
+                        .and_then(|type_id| self.semantic_types?.get(type_id))
+                        .is_some_and(|type_| {
+                            matches!(
+                                type_.kind,
+                                TypeKind::Boolean
+                                    | TypeKind::Number
+                                    | TypeKind::String
+                                    | TypeKind::BigInt
+                                    | TypeKind::BooleanLiteral(_)
+                                    | TypeKind::NumberLiteral(_)
+                                    | TypeKind::StringLiteral(_)
+                                    | TypeKind::BigIntLiteral(_)
+                            )
+                        });
+                }
+                NodeData::SourceFile(_) | NodeData::ModuleBlock(_) => return false,
+                _ => current = parent,
+            }
+        }
+        false
     }
 
     fn nested_string_module_declaration_exists(&self, module_specifier: &str) -> bool {
@@ -64605,6 +64794,33 @@ class Board {
             ),
             "{output}"
         );
+    }
+
+    #[test]
+    fn declaration_emit_reuses_internal_aliases_for_inferred_types() {
+        let output = emit_declarations_with_semantics(concat!(
+            "namespace M {\n",
+            "    export class C {}\n",
+            "    export enum E { A }\n",
+            "    export function make() { return new C(); }\n",
+            "    export var value = new C();\n",
+            "}\n",
+            "import C = M.C;\n",
+            "import E = M.E;\n",
+            "import make = M.make;\n",
+            "import value = M.value;\n",
+            "export var made = make();\n",
+            "export var copied = value;\n",
+            "export var member = E.A;\n",
+        ));
+        assert!(output.contains("import C = M.C;"), "{output}");
+        assert!(output.contains("import E = M.E;"), "{output}");
+        assert!(!output.contains("import make = M.make;"), "{output}");
+        assert!(!output.contains("import value = M.value;"), "{output}");
+        assert!(output.contains("export declare var made: C;"), "{output}");
+        assert!(output.contains("export declare var copied: C;"), "{output}");
+        assert!(output.contains("export declare var member: E;"), "{output}");
+        assert!(output.ends_with("export {};\n"), "{output}");
     }
 
     #[test]
