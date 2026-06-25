@@ -47,6 +47,6 @@ export CARGO_PROFILE_TEST_DEBUG=0
 export CARGO_PROFILE_DEV_CODEGEN_UNITS="${CARGO_PROFILE_DEV_CODEGEN_UNITS:-256}"
 export CARGO_PROFILE_TEST_CODEGEN_UNITS="${CARGO_PROFILE_TEST_CODEGEN_UNITS:-256}"
 unset CARGO_ENCODED_RUSTFLAGS
-export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C debuginfo=0 -C link-arg=-Wl,--threads=1"
+export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C debuginfo=0 -C llvm-args=--threads=1 -C link-arg=-Wl,--threads=1"
 
 exec cargo "$@"
