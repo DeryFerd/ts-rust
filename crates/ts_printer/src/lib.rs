@@ -26170,6 +26170,26 @@ impl Printer<'_> {
         }
     }
 
+    fn erased_assertion_expression(&self, mut expression: NodeId) -> Option<(NodeId, NodeId)> {
+        loop {
+            match &self.arena.get(expression)?.data {
+                NodeData::ParenthesizedExpression(parenthesized) => {
+                    expression = parenthesized.expression;
+                }
+                NodeData::AsExpression(assertion) => {
+                    return Some((expression, assertion.expression));
+                }
+                NodeData::SatisfiesExpression(assertion) => {
+                    return Some((expression, assertion.expression));
+                }
+                NodeData::TypeAssertion(assertion) => {
+                    return Some((expression, assertion.expression));
+                }
+                _ => return None,
+            }
+        }
+    }
+
     fn emit_inline_block_comments_between(
         &mut self,
         start: u32,
@@ -26559,6 +26579,13 @@ impl Printer<'_> {
             .zip(usize::try_from(end).ok())
             .and_then(|(start, end)| self.source_text.get(start..end))
             .is_some_and(|trivia| trivia.contains("/*"))
+    }
+
+    fn first_block_comment_start(&self, start: u32, end: u32) -> Option<u32> {
+        let start_index = usize::try_from(start).ok()?;
+        let end_index = usize::try_from(end).ok()?;
+        let offset = self.source_text.get(start_index..end_index)?.find("/*")?;
+        start.checked_add(u32::try_from(offset).ok()?)
     }
 
     fn block_comment_starts_on_new_line(&self, start: u32, end: u32) -> bool {
@@ -50307,20 +50334,10 @@ impl Printer<'_> {
                 }
             }
             NodeData::ParenthesizedExpression(data) => {
-                let erases_to_inner_expression = matches!(
-                    self.node(data.expression)?.data,
-                    NodeData::AsExpression(_)
-                        | NodeData::SatisfiesExpression(_)
-                        | NodeData::TypeAssertion(_)
-                );
-                if erases_to_inner_expression {
-                    let assertion = &self.node(data.expression)?.data;
-                    let asserted_expression = match assertion {
-                        NodeData::AsExpression(assertion) => assertion.expression,
-                        NodeData::SatisfiesExpression(assertion) => assertion.expression,
-                        NodeData::TypeAssertion(assertion) => assertion.expression,
-                        _ => unreachable!("checked erased assertion kind"),
-                    };
+                if let Some((assertion_id, asserted_expression)) =
+                    self.erased_assertion_expression(data.expression)
+                {
+                    let assertion = &self.node(assertion_id)?.data;
                     let keep_for_object_statement =
                         matches!(
                             self.node(asserted_expression)?.data,
@@ -50351,8 +50368,10 @@ impl Printer<'_> {
                         );
                     let comment_start = node.range.start.get().saturating_add(1);
                     let asserted_start = self.node(asserted_expression)?.range.start.get();
-                    let keep_for_leading_comment =
+                    let has_leading_comment =
                         self.trivia_has_block_comment(comment_start, asserted_start);
+                    let keep_for_leading_comment = has_leading_comment
+                        && !matches!(assertion, NodeData::SatisfiesExpression(_));
                     let keep_for_export_default_class = matches!(
                         self.node(asserted_expression)?.data,
                         NodeData::ClassExpression(_)
@@ -50374,7 +50393,7 @@ impl Printer<'_> {
                         if keep_for_leading_comment {
                             self.emit_block_comment_trivia(comment_start, asserted_start, true);
                         }
-                        self.emit_expression(data.expression, 0)?;
+                        self.emit_expression(assertion_id, 0)?;
                         self.writer.write(")");
                     } else {
                         let precedence = if matches!(assertion, NodeData::AsExpression(_))
@@ -50386,7 +50405,13 @@ impl Printer<'_> {
                         } else {
                             parent_precedence
                         };
-                        self.emit_expression(data.expression, precedence)?;
+                        if has_leading_comment {
+                            let comment_start = self
+                                .first_block_comment_start(comment_start, asserted_start)
+                                .unwrap_or(comment_start);
+                            self.emit_block_comment_trivia(comment_start, asserted_start, true);
+                        }
+                        self.emit_expression(assertion_id, precedence)?;
                     }
                 } else {
                     self.writer.write("(");
@@ -56011,6 +56036,23 @@ mod tests {
             .unwrap()
             .code;
         assert_eq!(output, "(a, new );\n");
+    }
+
+    #[test]
+    fn erases_nested_satisfies_parentheses_without_losing_comments() {
+        let output = emit_with(
+            concat!(
+                "const a = (/*comm*/ 10 satisfies number); ",
+                "const b = ((/*comm*/ 10 satisfies number));",
+            ),
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert_eq!(
+            output,
+            "const a = /*comm*/ 10;\nconst b = /*comm*/ 10;\n"
+        );
     }
 
     fn emit_declarations_with_semantics(source: &str) -> String {
