@@ -55868,6 +55868,9 @@ impl Printer<'_> {
         if self.statement_contains_class_expression(*statement)? {
             return Ok(None);
         }
+        if self.body_needs_downlevel_nullish_temp(block) {
+            return Ok(None);
+        }
         if source_has_braces
             && self.source_range_contains_comment(
                 node.range.start.get().saturating_add(1),
@@ -55880,12 +55883,37 @@ impl Printer<'_> {
             NodeData::ExpressionStatement(_)
             | NodeData::DebuggerStatement(_)
             | NodeData::ReturnStatement(_)
-            | NodeData::ThrowStatement(_) => true,
+            | NodeData::ThrowStatement(_)
+            | NodeData::VariableStatement(_) => true,
             NodeData::IfStatement(_) => source_has_braces,
-            NodeData::VariableStatement(_) => !source_has_braces,
             _ => false,
         };
         Ok(compact.then_some(*statement))
+    }
+
+    fn body_needs_downlevel_nullish_temp(&self, body: NodeId) -> bool {
+        self.settings.target < ScriptTarget::Es2020
+            && self.arena.iter().any(|(id, node)| {
+                let receiver = match &node.data {
+                    NodeData::BinaryExpression(binary)
+                        if self
+                            .arena
+                            .get(binary.operator_token)
+                            .is_some_and(|operator| {
+                                operator.kind == SyntaxKind::QuestionQuestionToken
+                            }) => binary.left,
+                    NodeData::PropertyAccessExpression(access)
+                        if access.question_dot_token.is_some() => access.expression,
+                    NodeData::ElementAccessExpression(access)
+                        if access.question_dot_token.is_some() => access.expression,
+                    NodeData::CallExpression(call) if call.question_dot_token.is_some() => {
+                        call.expression
+                    }
+                    _ => return false,
+                };
+                self.node_belongs_to_temp_scope(id, body)
+                    && self.downlevel_nullish_left_needs_temp(receiver)
+            })
     }
 
     fn source_range_contains_comment(&self, start: u32, end: u32) -> bool {
@@ -59346,6 +59374,20 @@ mod tests {
         assert_eq!(
             emit_with(source, ScriptTarget::Es2015, ModuleKind::CommonJs).code,
             "function compact() { return 1; }\nfunction multiline() {\n}\nclass Box {\n    constructor(value) {\n        this.value = value;\n    }\n    set item(next) { next = 1; }\n}\n"
+        );
+    }
+
+    #[test]
+    fn preserves_compact_variable_statement_method_bodies() {
+        let output = emit_with(
+            "class Box { method() { var value = this.item; } }",
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(
+            output.contains("    method() { var value = this.item; }"),
+            "{output}"
         );
     }
 
