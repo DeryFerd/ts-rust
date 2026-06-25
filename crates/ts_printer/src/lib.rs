@@ -35481,6 +35481,39 @@ impl Printer<'_> {
         object_rest: Option<(NodeId, &str, Option<&str>)>,
         compact_outer: bool,
     ) -> Result<(), EmitError> {
+        if !compact_outer
+            && expression_body.is_none()
+            && object_rest.is_none()
+            && matches!(
+                self.arena.get(body).map(|node| &node.data),
+                Some(NodeData::Block(block)) if block.statements.nodes.is_empty()
+            )
+        {
+            self.writer.write("{");
+            self.writer.newline();
+            self.writer.indent += 1;
+            self.writer.write("return ");
+            self.emit_awaiter_reference();
+            self.writer.write("(");
+            self.writer.write(this_argument);
+            self.writer.write(", void 0, void 0, function () { return ");
+            self.emit_generator_reference();
+            self.writer.write("(");
+            self.writer.write(generator_this);
+            self.writer.write(", function (");
+            self.writer.write(requested_state_parameter);
+            self.writer.write(") {");
+            self.writer.newline();
+            self.writer.indent += 1;
+            self.writer.write("return [2 /*return*/];");
+            self.writer.newline();
+            self.writer.indent -= 1;
+            self.writer.write("}); });");
+            self.writer.newline();
+            self.writer.indent -= 1;
+            self.writer.write("}");
+            return Ok(());
+        }
         let previous_await_captures = std::mem::take(&mut self.es5_async_await_captures);
         let previous_conditional_temps = std::mem::take(&mut self.es5_async_conditional_temps);
         let previous_array_temps = std::mem::take(&mut self.es5_async_array_temps);
@@ -58922,6 +58955,25 @@ mod tests {
             output.contains(
                 "const next = (value) => __awaiter(void 0, void 0, void 0, function* () { return yield value; });"
             ),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn compacts_empty_async_function_state_machines_for_es5() {
+        let output = emit_with(
+            "async function run() {}",
+            ScriptTarget::Es5,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(
+            output.contains(concat!(
+                "return __awaiter(this, void 0, void 0, function () { ",
+                "return __generator(this, function (_a) {\n",
+                "        return [2 /*return*/];\n",
+                "    }); });",
+            )),
             "{output}"
         );
     }
