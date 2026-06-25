@@ -2471,6 +2471,25 @@ fn binding_has_runtime_identifier_use(
     let Some(name) = declaration_name_text(arena, binding) else {
         return false;
     };
+    if name == "undefined"
+        && arena
+            .get(binding)
+            .and_then(|node| node.parent)
+            .and_then(|parent| arena.get(parent))
+            .is_some_and(|parent| matches!(parent.data, NodeData::ImportSpecifier(_)))
+    {
+        let mut source_file = binding;
+        while let Some(parent) = arena.get(source_file).and_then(|node| node.parent) {
+            source_file = parent;
+        }
+        if arena.iter().any(|(id, node)| {
+            node.kind == SyntaxKind::UndefinedKeyword
+                && id != binding
+                && identifier_is_runtime_use(arena, id, source_file)
+        }) {
+            return true;
+        }
+    }
     if !runtime_identifier_uses.contains(name) {
         return false;
     }
@@ -28265,6 +28284,26 @@ impl Printer<'_> {
             .is_some_and(|symbol| self.export_specifier_is_orphan_global(local, symbol))
     }
 
+    fn export_specifier_references_orphan_global(&self, specifier: NodeId) -> bool {
+        let Some(NodeData::ExportSpecifier(specifier)) =
+            self.arena.get(specifier).map(|node| &node.data)
+        else {
+            return false;
+        };
+        let local = specifier.property_name.unwrap_or(specifier.name);
+        let Some(name) = declaration_name_text(self.arena, local) else {
+            return false;
+        };
+        self.arena.iter().any(|(candidate, node)| {
+            matches!(&node.data, NodeData::ExportSpecifier(candidate_specifier)
+                if declaration_name_text(
+                    self.arena,
+                    candidate_specifier.property_name.unwrap_or(candidate_specifier.name),
+                ) == Some(name))
+                && self.export_specifier_id_is_orphan_global(candidate)
+        })
+    }
+
     fn export_specifier_emits_runtime(
         &self,
         export: &ts_ast::ExportDeclarationData,
@@ -49193,6 +49232,7 @@ impl Printer<'_> {
                 && (self
                     .commonjs_export_import_declaration(*specifier_id)
                     .is_some()
+                    || self.export_specifier_references_orphan_global(*specifier_id)
                     || self
                         .commonjs_export_function_declaration(*specifier_id)
                         .is_some()
@@ -49438,7 +49478,7 @@ impl Printer<'_> {
             && exports.elements.nodes.iter().all(|specifier| {
                 self.commonjs_export_import_declaration(*specifier)
                     .is_some()
-                    || self.export_specifier_id_is_orphan_global(*specifier)
+                    || self.export_specifier_references_orphan_global(*specifier)
                     || self
                         .commonjs_export_function_declaration(*specifier)
                         .is_some()
@@ -51338,7 +51378,13 @@ impl Printer<'_> {
             }
             NodeData::RegularExpressionLiteral(data) => self.writer.write(&data.text),
             NodeData::KeywordExpression(_) => {
-                if node.kind == SyntaxKind::ThisKeyword
+                if node.kind == SyntaxKind::UndefinedKeyword
+                    && let Some(rewrite) = self
+                        .commonjs_named_import_text_rewrites
+                        .get("undefined")
+                {
+                    self.writer.write(rewrite);
+                } else if node.kind == SyntaxKind::ThisKeyword
                     && let Some(alias) = &self.class_static_this_capture
                 {
                     self.writer.write(alias);
@@ -56452,7 +56498,8 @@ impl Printer<'_> {
             | NodeData::DebuggerStatement(_)
             | NodeData::ReturnStatement(_)
             | NodeData::ThrowStatement(_)
-            | NodeData::VariableStatement(_) => true,
+            | NodeData::VariableStatement(_)
+            | NodeData::LabeledStatement(_) => true,
             NodeData::IfStatement(_) => source_has_braces,
             _ => false,
         };
@@ -60048,6 +60095,19 @@ mod tests {
     }
 
     #[test]
+    fn preserves_compact_labeled_arrow_bodies() {
+        assert_eq!(
+            emit_with(
+                "var callback = () => { label: 1 }",
+                ScriptTarget::Es2015,
+                ModuleKind::None,
+            )
+            .code,
+            "var callback = () => { label: 1; };\n"
+        );
+    }
+
+    #[test]
     fn emits_source_compact_function_and_method_bodies_for_es_modules() {
         let source = "function declared(value: number) { return value; }\nconst expression = function () { value; };\nclass Box { method(value: number) { return value; } }\nconst object = { method() { value; } };";
         assert_eq!(
@@ -63470,6 +63530,31 @@ class Board {
         .code;
         assert!(output.contains("const x = require(\"something\");"), "{output}");
         assert!(output.contains("exports.x = x;"), "{output}");
+    }
+
+    #[test]
+    fn preinitializes_orphan_global_exports_without_runtime_assignments() {
+        let output = emit_with(
+            "export { missing, missing as alias };",
+            ScriptTarget::Es2015,
+            ModuleKind::CommonJs,
+        )
+        .code;
+        assert!(output.contains("exports.missing = void 0;"), "{output}");
+        assert!(!output.contains("exports.missing = missing;"), "{output}");
+        assert!(!output.contains("exports.alias = missing;"), "{output}");
+    }
+
+    #[test]
+    fn retains_commonjs_imports_named_undefined_when_used() {
+        let output = emit_with(
+            "import { undefined } from './values'; use(undefined);",
+            ScriptTarget::Es2015,
+            ModuleKind::CommonJs,
+        )
+        .code;
+        assert!(output.contains("require(\"./values\")"), "{output}");
+        assert!(output.contains("use(values_1.undefined);"), "{output}");
     }
 
     #[test]
