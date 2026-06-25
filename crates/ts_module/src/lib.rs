@@ -128,14 +128,15 @@ impl<'a, F: FileSystem + ?Sized> Resolver<'a, F> {
             failed_lookups: Vec::new(),
         };
         let containing_directory = directory_path(containing_file);
-        let resolved = if is_relative(specifier) || is_absolute(specifier) {
+        let resolved = if is_relative(specifier) {
             let candidate = resolve_path(&containing_directory, &[specifier]);
             state.resolve_candidate(&candidate, false).or_else(|| {
-                if is_relative(specifier) {
-                    state.resolve_root_dirs(specifier, &containing_directory)
-                } else {
-                    None
-                }
+                state.resolve_root_dirs(specifier, &containing_directory)
+            })
+        } else if is_absolute(specifier) {
+            state.resolve_paths_or_base_url(specifier).or_else(|| {
+                let candidate = resolve_path(&containing_directory, &[specifier]);
+                state.resolve_candidate(&candidate, false)
             })
         } else if self.options.mode == ResolutionMode::Classic {
             state.resolve_paths_or_base_url(specifier).or_else(|| {
@@ -1097,6 +1098,35 @@ mod tests {
                 .unwrap()
                 .resolved_file_name,
             "/repo/src/plain.ts"
+        );
+    }
+
+    #[test]
+    fn resolves_rooted_specifiers_through_paths_with_real_root_fallback() {
+        let fs = fs(&[("/repo/src/foo.ts", ""), ("/bar.ts", "")]);
+        let resolver = Resolver::new(
+            &fs,
+            ResolutionOptions {
+                base_url: Some("/repo".into()),
+                paths: BTreeMap::from([("/*".into(), vec!["./src/*".into()])]),
+                ..ResolutionOptions::default()
+            },
+        );
+        assert_eq!(
+            resolver
+                .resolve("/foo", "/repo/app/main.ts")
+                .resolved
+                .unwrap()
+                .resolved_file_name,
+            "/repo/src/foo.ts"
+        );
+        assert_eq!(
+            resolver
+                .resolve("/bar", "/repo/app/main.ts")
+                .resolved
+                .unwrap()
+                .resolved_file_name,
+            "/bar.ts"
         );
     }
 
