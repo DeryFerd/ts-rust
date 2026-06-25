@@ -4826,6 +4826,15 @@ impl<'a> Parser<'a> {
             self.parse_primary_expression()
         };
         loop {
+            if self.current.kind == SyntaxKind::LessThanLessThanToken {
+                let checkpoint = self.scanner.mark();
+                let shift_token = self.current.clone();
+                self.current = self.scanner.rescan_less_than_token();
+                if !self.is_type_argument_expression_suffix() {
+                    self.scanner.rewind(checkpoint);
+                    self.current = shift_token;
+                }
+            }
             match self.current.kind {
                 SyntaxKind::DotToken => {
                     self.bump();
@@ -9118,6 +9127,29 @@ mod tests {
             result.arena.get(assertion.expression).unwrap().kind,
             SyntaxKind::Identifier
         );
+    }
+
+    #[test]
+    fn splits_shift_token_for_nested_generic_function_call_type_arguments() {
+        let result = parse_source_file(
+            "const value = foo<<T>(x: T) => number>(() => 1); const shifted = a << b;",
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert!(result.arena.iter().any(|(_, node)| {
+            matches!(
+                &node.data,
+                NodeData::CallExpression(call) if call.type_arguments.is_some()
+            )
+        }));
+        assert!(result.arena.iter().any(|(_, node)| {
+            let NodeData::BinaryExpression(binary) = &node.data else {
+                return false;
+            };
+            result
+                .arena
+                .get(binary.operator_token)
+                .is_some_and(|operator| operator.kind == SyntaxKind::LessThanLessThanToken)
+        }));
     }
 
     #[test]
