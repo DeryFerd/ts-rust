@@ -83,6 +83,7 @@ pub struct EmitContext<'a> {
     pub emit_decorator_metadata: bool,
     pub es_module_interop: bool,
     pub preserve_dynamic_import: bool,
+    pub verbatim_module_syntax: bool,
     pub isolated_modules: bool,
     pub strict_null_checks: bool,
     pub force_use_strict: bool,
@@ -227,6 +228,7 @@ pub fn emit_source_file_with_settings_and_bindings(
             emit_decorator_metadata: false,
             es_module_interop: false,
             preserve_dynamic_import: false,
+            verbatim_module_syntax: false,
             isolated_modules: false,
             strict_null_checks: false,
             force_use_strict: false,
@@ -288,6 +290,7 @@ pub fn emit_source_file_with_context(
         commonjs_export_text_rewrites: HashMap::new(),
         commonjs_reexport_temps: HashMap::new(),
         commonjs_anonymous_default_names: HashMap::new(),
+        node_esm_require_name: None,
         decorator_metadata_guard_temps: HashMap::new(),
         import_helpers_namespace: None,
         imported_helpers: BTreeSet::new(),
@@ -316,6 +319,7 @@ pub fn emit_source_file_with_context(
         amd_dynamic_import_temps: HashMap::new(),
         amd_dynamic_import_counter: 0,
         amd_export_star_temps: HashMap::new(),
+        bundle_emit: context.amd_bundle,
         class_expression_name_exclusions: HashSet::new(),
         computed_property_temps: HashMap::new(),
         class_expression_computed_properties: HashSet::new(),
@@ -364,7 +368,11 @@ pub fn emit_source_file_with_context(
         is_external_module: false,
         emit_decorator_metadata: context.emit_decorator_metadata,
         es_module_interop: context.es_module_interop,
-        preserve_dynamic_import: context.preserve_dynamic_import,
+        lower_dynamic_import_to_commonjs: !context.preserve_dynamic_import
+            && (settings.module == ModuleKind::CommonJs
+                || (settings.module == ModuleKind::None
+                    && settings.target < ScriptTarget::Es2020)),
+        verbatim_module_syntax: context.verbatim_module_syntax,
         isolated_modules: context.isolated_modules,
         strict_null_checks: context.strict_null_checks,
         jsx_factory: context.jsx_factory.map(str::to_owned),
@@ -562,6 +570,13 @@ pub fn emit_source_file_with_context(
                 helpers.insert("__metadata");
             }
         }
+        if !settings.experimental_decorators && source_needs_standard_decorator_helpers(arena) {
+            helpers.insert("__esDecorate");
+            helpers.insert("__runInitializers");
+            if source_needs_standard_decorator_set_function_name_helper(arena) {
+                helpers.insert("__setFunctionName");
+            }
+        }
         if settings.target < ScriptTarget::Es2017 && source_needs_awaiter_helper(arena) {
             helpers.insert("__awaiter");
         }
@@ -651,6 +666,9 @@ pub fn emit_source_file_with_context(
                 "__decorate",
                 "__param",
                 "__metadata",
+                "__esDecorate",
+                "__runInitializers",
+                "__setFunctionName",
                 "__exportStar",
                 "__importStar",
                 "__importDefault",
@@ -699,6 +717,41 @@ pub fn emit_source_file_with_context(
     {
         return printer.emit_amd_source_file(data, context);
     }
+    if settings.module == ModuleKind::EsNext
+        && context.preserve_dynamic_import
+        && data.statements.nodes.iter().any(|statement| {
+            matches!(
+                arena.get(*statement).map(|node| &node.data),
+                Some(NodeData::ImportEqualsDeclaration(import))
+                    if printer.is_external_import_equals(import)
+                        && printer.import_equals_has_runtime_use(*statement, import)
+            )
+        })
+    {
+        let create_require = printer
+            .generated_names
+            .claim("_createRequire")
+            .unwrap_or_else(|| printer.generated_names.generate("_createRequire"));
+        let require = printer
+            .generated_names
+            .claim("__require")
+            .unwrap_or_else(|| printer.generated_names.generate("__require"));
+        printer.writer.write("import { createRequire as ");
+        printer.writer.write(&create_require);
+        printer.writer.write(" } from \"module\";");
+        printer.writer.newline();
+        printer.writer.write(if settings.target < ScriptTarget::Es2015 {
+            "var "
+        } else {
+            "const "
+        });
+        printer.writer.write(&require);
+        printer.writer.write(" = ");
+        printer.writer.write(&create_require);
+        printer.writer.write("(import.meta.url);");
+        printer.writer.newline();
+        printer.node_esm_require_name = Some(require);
+    }
     let has_use_strict = data.statements.nodes.first().is_some_and(|statement| {
         let Some(NodeData::ExpressionStatement(statement)) =
             arena.get(*statement).map(|node| &node.data)
@@ -733,9 +786,8 @@ pub fn emit_source_file_with_context(
     });
     let needs_async_generator_helper =
         settings.target < ScriptTarget::Es2018 && source_needs_async_generator_helper(arena);
-    let needs_dynamic_import_helpers = settings.module == ModuleKind::CommonJs
-        && !context.preserve_dynamic_import
-        && source_has_dynamic_import(arena);
+    let needs_dynamic_import_helpers =
+        printer.lower_dynamic_import_to_commonjs && source_has_dynamic_import(arena);
     if !has_use_strict
         && (context.force_use_strict
             || has_invalid_import_recovery
@@ -872,8 +924,12 @@ pub fn emit_source_file_with_context(
     let needs_standard_decorator_helpers = !settings.experimental_decorators
         && source_needs_standard_decorator_helpers(arena);
     if needs_standard_decorator_helpers && !settings.no_emit_helpers {
-        printer.emit_es_decorate_helper();
-        printer.emit_run_initializers_helper();
+        if !printer.imported_helpers.contains("__esDecorate") {
+            printer.emit_es_decorate_helper();
+        }
+        if !printer.imported_helpers.contains("__runInitializers") {
+            printer.emit_run_initializers_helper();
+        }
     }
     if settings.target < ScriptTarget::Es2017
         && source_needs_awaiter_helper(arena)
@@ -893,13 +949,15 @@ pub fn emit_source_file_with_context(
     {
         printer.emit_generator_helper();
     }
-    if (needs_standard_decorator_helpers
+    if ((!settings.experimental_decorators
+        && source_needs_standard_decorator_set_function_name_helper(arena))
         || (settings.target < ScriptTarget::Es2022
             && source_needs_set_function_name_helper(
                 arena,
                 settings.use_define_for_class_fields == Some(true),
             )))
         && !settings.no_emit_helpers
+        && !printer.imported_helpers.contains("__setFunctionName")
     {
         printer.emit_set_function_name_helper();
     }
@@ -1711,6 +1769,38 @@ pub fn source_needs_extends_helper(arena: &NodeArena) -> bool {
                 )
             })
         })
+    })
+}
+
+fn source_needs_standard_decorator_set_function_name_helper(arena: &NodeArena) -> bool {
+    arena.iter().any(|(id, node)| {
+        let NodeData::ClassExpression(class) = &node.data else {
+            return false;
+        };
+        if class.name.is_some() || node_is_in_ambient_context(arena, id) {
+            return false;
+        }
+        let decorated = declaration_has_modifier_in_list(
+            arena,
+            class.modifiers.as_ref(),
+            SyntaxKind::Decorator,
+        ) || class.members.nodes.iter().any(|member| {
+            arena.get(*member).is_some_and(|member| {
+                declaration_has_modifier(arena, member, SyntaxKind::Decorator)
+            })
+        });
+        if !decorated {
+            return false;
+        }
+        node.parent
+            .and_then(|parent| arena.get(parent))
+            .is_some_and(|parent| match &parent.data {
+                NodeData::VariableDeclaration(declaration) => declaration.initializer == Some(id),
+                NodeData::ParameterDeclaration(declaration) => declaration.initializer == Some(id),
+                NodeData::BinaryExpression(expression) => expression.right == id,
+                NodeData::PropertyAssignment(property) => property.initializer == id,
+                _ => false,
+            })
     })
 }
 
@@ -4874,6 +4964,11 @@ impl DeclarationPrinter<'_> {
                             )
                         {
                             self.emit_semantic_object_literal_type(&object, data.expression, true)?;
+                        } else if matches!(
+                            self.arena.get(data.expression).map(|node| &node.data),
+                            Some(NodeData::ArrowFunction(_) | NodeData::FunctionExpression(_))
+                        ) {
+                            self.emit_initializer_function_type(data.expression)?;
                         } else if let Some(TypeKind::Constructor(signature)) = self
                             .semantic_types
                             .and_then(|types| types.get(type_id))
@@ -5299,6 +5394,18 @@ impl DeclarationPrinter<'_> {
             .flatten()
     }
 
+    fn require_call_module_specifier(&self, expression: NodeId) -> Option<&str> {
+        let NodeData::CallExpression(call) = &self.arena.get(expression)?.data else {
+            return None;
+        };
+        if declaration_name_text(self.arena, call.expression) != Some("require")
+            || call.arguments.nodes.len() != 1
+        {
+            return None;
+        }
+        string_literal_text(self.arena, call.arguments.nodes[0])
+    }
+
     #[allow(clippy::too_many_lines)]
     fn emit_javascript_commonjs_declaration_assignment(
         &mut self,
@@ -5317,10 +5424,43 @@ impl DeclarationPrinter<'_> {
         let left = binary.left;
         let right = binary.right;
         if let Some(name) = self.javascript_commonjs_named_export(left) {
+            if name == "default" {
+                let default_name = self.generate_declaration_name_avoiding_source("_default");
+                self.writer.write("declare const ");
+                self.writer.write(&default_name);
+                self.writer.write(": ");
+                if self.is_const_declaration_literal_initializer(right) {
+                    self.emit_literal_expression(right)?;
+                } else if matches!(
+                    self.arena.get(right).map(|node| &node.data),
+                    Some(NodeData::ArrowFunction(_) | NodeData::FunctionExpression(_))
+                ) {
+                    self.emit_initializer_function_type(right)?;
+                } else if let Some(type_query) = self.entity_value_type_query(right) {
+                    self.writer.write("typeof ");
+                    self.emit_name(type_query)?;
+                } else if let Some(type_id) =
+                    self.node_types.and_then(|types| types.get(&right).copied())
+                {
+                    self.emit_semantic_type(type_id)?;
+                } else {
+                    self.writer.write("any");
+                }
+                self.writer.write(";");
+                self.writer.newline();
+                self.writer.write("export default ");
+                self.writer.write(&default_name);
+                self.writer.write(";");
+                return Ok(true);
+            }
             self.writer.write("export const ");
             self.emit_semantic_property_name(&name);
             self.writer.write(": ");
-            if self.is_symbol_factory_call(right) {
+            if let Some(module) = self.require_call_module_specifier(right).map(str::to_owned) {
+                self.writer.write("typeof import(");
+                write_quoted(&mut self.writer, &module);
+                self.writer.write(")");
+            } else if self.is_symbol_factory_call(right) {
                 self.writer.write("unique symbol");
             } else if let Some(type_id) = self.node_types.and_then(|types| types.get(&right).copied())
             {
@@ -8814,7 +8954,11 @@ impl DeclarationPrinter<'_> {
                                 .contains("as const")
                         })
                 });
-                self.writer.write(if const_asserted { ": " } else { " = " });
+                self.writer.write(if self.javascript_source || const_asserted {
+                    ": "
+                } else {
+                    " = "
+                });
                 let previous = self.canonical_literal_quotes;
                 self.canonical_literal_quotes = true;
                 let result = self.emit_literal_expression(declaration.initializer.unwrap());
@@ -17514,6 +17658,13 @@ impl DeclarationPrinter<'_> {
                 initializer.and_then(|value| self.enum_member_type_expression(value))
             {
                 self.emit_name(enum_type)?;
+            } else if let Some(initializer) = initializer.filter(|initializer| {
+                matches!(
+                    self.arena.get(*initializer).map(|node| &node.data),
+                    Some(NodeData::ArrowFunction(_) | NodeData::FunctionExpression(_))
+                )
+            }) {
+                self.emit_initializer_function_type(initializer)?;
             } else if let Some(initializer) = initializer
                 && let Some(TypeKind::Object(nested)) = self
                     .semantic_types
@@ -20667,6 +20818,10 @@ impl DeclarationPrinter<'_> {
                                     .map(|node| &node.data),
                                 Some(NodeData::ExternalModuleReference(_))
                             ),
+                            NodeData::ExpressionStatement(statement) => self
+                                .is_javascript_commonjs_declaration_assignment(
+                                    statement.expression,
+                                ),
                             _ => false,
                         }
                     })
@@ -20815,6 +20970,18 @@ impl DeclarationPrinter<'_> {
         if self.namespace_scope_has_synthetic_class_base(scope) {
             return true;
         }
+        if matches!(
+            self.arena.get(scope).map(|node| &node.data),
+            Some(NodeData::SourceFile(file)) if file.statements.nodes.iter().any(|statement| {
+                matches!(
+                    self.arena.get(*statement).map(|node| &node.data),
+                    Some(NodeData::ExpressionStatement(statement))
+                        if self.is_javascript_commonjs_declaration_assignment(statement.expression)
+                )
+            })
+        ) {
+            return false;
+        }
         if self.module_file
             && matches!(
                 self.arena.get(scope).map(|node| &node.data),
@@ -20834,6 +21001,8 @@ impl DeclarationPrinter<'_> {
                     NodeData::ImportEqualsDeclaration(_)
                         | NodeData::ExportDeclaration(_)
                         | NodeData::ExportAssignment(_) => true,
+                    NodeData::ExpressionStatement(statement) => self
+                        .is_javascript_commonjs_declaration_assignment(statement.expression),
                     _ => false,
                 }
             })
@@ -20883,6 +21052,10 @@ impl DeclarationPrinter<'_> {
                             NodeData::ImportEqualsDeclaration(_)
                             | NodeData::ExportDeclaration(_)
                             | NodeData::ExportAssignment(_) => true,
+                            NodeData::ExpressionStatement(statement) => self
+                                .is_javascript_commonjs_declaration_assignment(
+                                    statement.expression,
+                                ),
                             _ => false,
                         }
                 })
@@ -23514,6 +23687,7 @@ struct Printer<'a> {
     commonjs_export_text_rewrites: HashMap<String, String>,
     commonjs_reexport_temps: HashMap<NodeId, String>,
     commonjs_anonymous_default_names: HashMap<NodeId, String>,
+    node_esm_require_name: Option<String>,
     decorator_metadata_guard_temps: HashMap<NodeId, DecoratorMetadataGuardPlan>,
     import_helpers_namespace: Option<String>,
     imported_helpers: BTreeSet<&'static str>,
@@ -23539,6 +23713,7 @@ struct Printer<'a> {
     amd_dynamic_import_temps: HashMap<NodeId, String>,
     amd_dynamic_import_counter: u32,
     amd_export_star_temps: HashMap<NodeId, String>,
+    bundle_emit: bool,
     class_expression_name_exclusions: HashSet<NodeId>,
     computed_property_temps: HashMap<NodeId, String>,
     class_expression_computed_properties: HashSet<NodeId>,
@@ -23587,7 +23762,8 @@ struct Printer<'a> {
     is_external_module: bool,
     emit_decorator_metadata: bool,
     es_module_interop: bool,
-    preserve_dynamic_import: bool,
+    lower_dynamic_import_to_commonjs: bool,
+    verbatim_module_syntax: bool,
     isolated_modules: bool,
     strict_null_checks: bool,
     jsx_factory: Option<String>,
@@ -24776,7 +24952,7 @@ impl Printer<'_> {
                 }
                 _ => false,
             };
-            if skip_import {
+            if skip_import || self.statement_is_use_strict_prologue(*statement) {
                 continue;
             }
             self.emit_statement(*statement)?;
@@ -25144,6 +25320,9 @@ impl Printer<'_> {
         statement: NodeId,
         export_function: &str,
     ) -> Result<(), EmitError> {
+        if self.statement_is_use_strict_prologue(statement) {
+            return Ok(());
+        }
         let node = self.node(statement)?.clone();
         match &node.data {
             NodeData::ExportAssignment(assignment) if !assignment.is_export_equals => {
@@ -26619,6 +26798,9 @@ impl Printer<'_> {
         if export.is_type_only || specifier.is_type_only {
             return false;
         }
+        if self.verbatim_module_syntax {
+            return true;
+        }
         if export.module_specifier.is_some() {
             return self
                 .import_runtime_meanings
@@ -26775,6 +26957,7 @@ impl Printer<'_> {
             && self.import_runtime_meanings.get(&id) == Some(&false)
             && self.named_export_clause_has_runtime_specifier(export) != Some(true)
             && !self.const_enum_emit_mode.preserves_declarations()
+            && (!self.verbatim_module_syntax || export.is_type_only)
         {
             return false;
         }
@@ -26791,7 +26974,10 @@ impl Printer<'_> {
             {
                 false
             }
-            NodeData::ExportDeclaration(_) if export_declaration_is_empty(self.arena, node) => {
+            NodeData::ExportDeclaration(_)
+                if !self.verbatim_module_syntax
+                    && export_declaration_is_empty(self.arena, node) =>
+            {
                 false
             }
             NodeData::ExportAssignment(assignment)
@@ -26887,6 +27073,9 @@ impl Printer<'_> {
     ) -> bool {
         if import.is_type_only {
             return false;
+        }
+        if self.verbatim_module_syntax {
+            return true;
         }
         let has_runtime_reference = self.import_binding_has_emitted_runtime_use(import.name)
             || self.identifier_text(import.name).is_ok_and(|name| {
@@ -27759,6 +27948,7 @@ impl Printer<'_> {
             && self.import_runtime_meanings.get(&id) == Some(&false)
             && self.named_export_clause_has_runtime_specifier(export) != Some(true)
             && !self.const_enum_emit_mode.preserves_declarations()
+            && (!self.verbatim_module_syntax || export.is_type_only)
         {
             return Ok(());
         }
@@ -27831,7 +28021,10 @@ impl Printer<'_> {
         match &node.data {
             NodeData::InterfaceDeclaration(_) | NodeData::TypeAliasDeclaration(_) => return Ok(()),
             NodeData::FunctionDeclaration(data) if data.body.is_none() => return Ok(()),
-            NodeData::ExportDeclaration(_) if export_declaration_is_empty(self.arena, &node) => {
+            NodeData::ExportDeclaration(_)
+                if !self.verbatim_module_syntax
+                    && export_declaration_is_empty(self.arena, &node) =>
+            {
                 return Ok(());
             }
             _ => {}
@@ -28033,6 +28226,9 @@ impl Printer<'_> {
             }
             NodeData::ClassDeclaration(data) => {
                 let decorators = self.class_decorator_expressions(data.modifiers.as_ref());
+                let emitted_stage3_class_decorators = !self.settings.experimental_decorators
+                    && !decorators.is_empty()
+                    && self.emit_stage3_empty_class_decorator_binding(data, &decorators)?;
                 let recovered_default_name = (!decorators.is_empty()
                     && data.name.is_none()
                     && self.has_modifier(data.modifiers.as_ref(), SyntaxKind::DefaultKeyword))
@@ -28049,7 +28245,7 @@ impl Printer<'_> {
                     && self.namespace_containers.is_empty()
                     && self.has_modifier(data.modifiers.as_ref(), SyntaxKind::ExportKeyword)
                     && self.has_modifier(data.modifiers.as_ref(), SyntaxKind::DefaultKeyword);
-                if decorators.is_empty() {
+                if !emitted_stage3_class_decorators && decorators.is_empty() {
                     if !lower_preserved_default {
                         self.emit_runtime_declaration_modifiers(id, data.modifiers.as_ref());
                     }
@@ -28060,13 +28256,15 @@ impl Printer<'_> {
                     )? {
                         self.emit_class_with_name(data, commonjs_default_name.as_deref())?;
                     }
-                } else if let Some(name) = recovered_default_name.as_deref() {
+                } else if !emitted_stage3_class_decorators
+                    && let Some(name) = recovered_default_name.as_deref()
+                {
                     self.writer.write("let ");
                     self.writer.write(name);
                     self.writer.write(" = ");
                     self.emit_class(data)?;
                     self.writer.write(";");
-                } else {
+                } else if !emitted_stage3_class_decorators {
                     self.emit_decorated_class_binding(data)?;
                 }
                 self.emit_auto_accessor_storage_initializers(data);
@@ -28111,10 +28309,15 @@ impl Printer<'_> {
                         self.emit_commonjs_declaration_exports(data.modifiers.as_ref(), &names);
                     }
                 }
-                if self.settings.target >= ScriptTarget::Es2015 {
+                if !emitted_stage3_class_decorators
+                    && self.settings.target >= ScriptTarget::Es2015
+                {
                     self.emit_class_member_decorators(data)?;
                 }
-                if !decorators.is_empty() && self.settings.target >= ScriptTarget::Es2015 {
+                if !emitted_stage3_class_decorators
+                    && !decorators.is_empty()
+                    && self.settings.target >= ScriptTarget::Es2015
+                {
                     self.emit_class_decorator_assignment(
                         data,
                         &decorators,
@@ -41433,6 +41636,139 @@ impl Printer<'_> {
     }
 
     #[allow(clippy::too_many_lines)]
+    fn emit_stage3_empty_class_decorator_binding(
+        &mut self,
+        data: &ts_ast::ClassDeclarationData,
+        decorators: &[NodeId],
+    ) -> Result<bool, EmitError> {
+        if self.settings.target < ScriptTarget::Es2015 || !data.members.nodes.is_empty() {
+            return Ok(false);
+        }
+        let Some(name_id) = data.name else {
+            return Ok(false);
+        };
+        let name = self.identifier_text(name_id)?.to_owned();
+        let class_decorators = self.unique_stage3_name("_classDecorators");
+        let class_descriptor = self.unique_stage3_name("_classDescriptor");
+        let class_extra_initializers = self.unique_stage3_name("_classExtraInitializers");
+        let class_this = self.unique_stage3_name("_classThis");
+
+        self.writer.write("let ");
+        self.writer.write(&name);
+        self.writer.write(" = (() => {");
+        self.writer.newline();
+        self.writer.indent += 1;
+        self.writer.write("let ");
+        self.writer.write(&class_decorators);
+        self.writer.write(" = [");
+        for (index, decorator) in decorators.iter().enumerate() {
+            if index != 0 {
+                self.writer.write(", ");
+            }
+            self.emit_expression(*decorator, 1)?;
+        }
+        self.writer.write("];");
+        self.writer.newline();
+        self.writer.write("let ");
+        self.writer.write(&class_descriptor);
+        self.writer.write(";");
+        self.writer.newline();
+        self.writer.write("let ");
+        self.writer.write(&class_extra_initializers);
+        self.writer.write(" = [];");
+        self.writer.newline();
+        self.writer.write("let ");
+        self.writer.write(&class_this);
+        self.writer.write(";");
+        self.writer.newline();
+        self.writer.write("var ");
+        self.writer.write(&name);
+        self.writer.write(" = class {");
+        self.writer.newline();
+        self.writer.indent += 1;
+        self.writer.write("static { ");
+        self.writer.write(&class_this);
+        self.writer.write(" = this; }");
+        self.writer.newline();
+        self.writer.write("static {");
+        self.writer.newline();
+        self.writer.indent += 1;
+        self.writer.write("const _metadata = typeof Symbol === \"function\" && Symbol.metadata ? Object.create(null) : void 0;");
+        self.writer.newline();
+        self.emit_helper_reference("__esDecorate");
+        self.writer.write("(null, ");
+        self.writer.write(&class_descriptor);
+        self.writer.write(" = { value: ");
+        self.writer.write(&class_this);
+        self.writer.write(" }, ");
+        self.writer.write(&class_decorators);
+        self.writer.write(", { kind: \"class\", name: ");
+        self.writer.write(&class_this);
+        self.writer.write(".name, metadata: _metadata }, null, ");
+        self.writer.write(&class_extra_initializers);
+        self.writer.write(");");
+        self.writer.newline();
+        self.writer.write(&name);
+        self.writer.write(" = ");
+        self.writer.write(&class_this);
+        self.writer.write(" = ");
+        self.writer.write(&class_descriptor);
+        self.writer.write(".value;");
+        self.writer.newline();
+        self.writer.write("if (_metadata) Object.defineProperty(");
+        self.writer.write(&class_this);
+        self.writer.write(", Symbol.metadata, { enumerable: true, configurable: true, writable: true, value: _metadata });");
+        self.writer.newline();
+        self.emit_helper_reference("__runInitializers");
+        self.writer.write("(");
+        self.writer.write(&class_this);
+        self.writer.write(", ");
+        self.writer.write(&class_extra_initializers);
+        self.writer.write(");");
+        self.writer.newline();
+        self.writer.indent -= 1;
+        self.writer.write("}");
+        self.writer.newline();
+        self.writer.indent -= 1;
+        self.writer.write("};");
+        self.writer.newline();
+        self.writer.write("return ");
+        self.writer.write(&name);
+        self.writer.write(" = ");
+        self.writer.write(&class_this);
+        self.writer.write(";");
+        self.writer.newline();
+        self.writer.indent -= 1;
+        self.writer.write("})();");
+
+        let preserves_module_modifier = self.namespace_containers.is_empty()
+            && matches!(
+                self.settings.module,
+                ModuleKind::None
+                    | ModuleKind::Es2015
+                    | ModuleKind::Es2020
+                    | ModuleKind::Es2022
+                    | ModuleKind::EsNext
+                    | ModuleKind::Preserve
+            );
+        if preserves_module_modifier
+            && self.has_modifier(data.modifiers.as_ref(), SyntaxKind::ExportKeyword)
+        {
+            self.writer.newline();
+            if self.has_modifier(data.modifiers.as_ref(), SyntaxKind::DefaultKeyword) {
+                self.writer.write("export default ");
+                self.writer.write(&name);
+                self.writer.write(";");
+            } else {
+                self.writer.write("export { ");
+                self.writer.write(&name);
+                self.writer.write(" };");
+            }
+        }
+        Ok(true)
+    }
+
+    #[allow(clippy::too_many_lines)]
     fn emit_class_decorator_assignment(
         &mut self,
         data: &ts_ast::ClassDeclarationData,
@@ -42981,7 +43317,9 @@ impl Printer<'_> {
         self.writer.newline();
         self.writer.indent += 1;
         if let Some(name) = &plan.inferred_name {
-            self.writer.write("static { __setFunctionName(this, ");
+            self.writer.write("static { ");
+            self.emit_helper_reference("__setFunctionName");
+            self.writer.write("(this, ");
             write_quoted(&mut self.writer, name);
             self.writer.write("); }");
             self.writer.newline();
@@ -43009,7 +43347,9 @@ impl Printer<'_> {
             } else {
                 self.writer.write("static { this.");
                 self.writer.write(&member.name);
-                self.writer.write(" = __runInitializers(this, ");
+                self.writer.write(" = ");
+                self.emit_helper_reference("__runInitializers");
+                self.writer.write("(this, ");
                 self.writer.write(&member.initializers_name);
                 self.writer.write(", ");
                 self.emit_stage3_initializer(property.initializer)?;
@@ -43027,7 +43367,8 @@ impl Printer<'_> {
             self.writer.write("static {");
             self.writer.newline();
             self.writer.indent += 1;
-            self.writer.write("__runInitializers(this, ");
+            self.emit_helper_reference("__runInitializers");
+            self.writer.write("(this, ");
             self.writer.write(extra);
             self.writer.write(");");
             self.writer.newline();
@@ -43069,7 +43410,8 @@ impl Printer<'_> {
             for member in plan.members.iter().filter(|member| {
                 member.is_accessor == is_accessor && member.is_static == is_static
             }) {
-                self.writer.write("__esDecorate(");
+                self.emit_helper_reference("__esDecorate");
+                self.writer.write("(");
                 self.writer.write(if member.is_accessor { "this" } else { "null" });
                 self.writer.write(", null, ");
                 self.writer.write(&member.decorators_name);
@@ -43132,15 +43474,20 @@ impl Printer<'_> {
             self.writer.write(backing);
             self.writer.write(" = ");
             if let Some(extra) = preceding_extra {
-                self.writer.write("(__runInitializers(this, ");
+                self.writer.write("(");
+                self.emit_helper_reference("__runInitializers");
+                self.writer.write("(this, ");
                 self.writer.write(extra);
-                self.writer.write("), __runInitializers(this, ");
+                self.writer.write("), ");
+                self.emit_helper_reference("__runInitializers");
+                self.writer.write("(this, ");
                 self.writer.write(&member.initializers_name);
                 self.writer.write(", ");
                 self.emit_stage3_initializer(property.initializer)?;
                 self.writer.write("))");
             } else {
-                self.writer.write("__runInitializers(this, ");
+                self.emit_helper_reference("__runInitializers");
+                self.writer.write("(this, ");
                 self.writer.write(&member.initializers_name);
                 self.writer.write(", ");
                 self.emit_stage3_initializer(property.initializer)?;
@@ -43194,15 +43541,20 @@ impl Printer<'_> {
                     .write(member.backing_name.as_deref().expect("accessor backing name"));
                 self.writer.write(" = ");
                 if let Some(extra) = preceding_extra {
-                    self.writer.write("(__runInitializers(this, ");
+                    self.writer.write("(");
+                    self.emit_helper_reference("__runInitializers");
+                    self.writer.write("(this, ");
                     self.writer.write(extra);
-                    self.writer.write("), __runInitializers(this, ");
+                    self.writer.write("), ");
+                    self.emit_helper_reference("__runInitializers");
+                    self.writer.write("(this, ");
                     self.writer.write(&member.initializers_name);
                     self.writer.write(", ");
                     self.emit_stage3_initializer(property.initializer)?;
                     self.writer.write("))");
                 } else {
-                    self.writer.write("__runInitializers(this, ");
+                    self.emit_helper_reference("__runInitializers");
+                    self.writer.write("(this, ");
                     self.writer.write(&member.initializers_name);
                     self.writer.write(", ");
                     self.emit_stage3_initializer(property.initializer)?;
@@ -43210,14 +43562,17 @@ impl Printer<'_> {
                 }
             } else {
                 if let Some(extra) = preceding_extra {
-                    self.writer.write("__runInitializers(this, ");
+                    self.emit_helper_reference("__runInitializers");
+                    self.writer.write("(this, ");
                     self.writer.write(extra);
                     self.writer.write(");");
                     self.writer.newline();
                 }
                 self.writer.write("this.");
                 self.writer.write(&member.name);
-                self.writer.write(" = __runInitializers(this, ");
+                self.writer.write(" = ");
+                self.emit_helper_reference("__runInitializers");
+                self.writer.write("(this, ");
                 self.writer.write(&member.initializers_name);
                 self.writer.write(", ");
                 self.emit_stage3_initializer(property.initializer)?;
@@ -43228,7 +43583,8 @@ impl Printer<'_> {
             preceding_extra = Some(&member.extra_initializers_name);
         }
         if let Some(extra) = preceding_extra {
-            self.writer.write("__runInitializers(this, ");
+            self.emit_helper_reference("__runInitializers");
+            self.writer.write("(this, ");
             self.writer.write(extra);
             self.writer.write(");");
             self.writer.newline();
@@ -43373,7 +43729,8 @@ impl Printer<'_> {
             && let Some(name) = self.class_expression_inferred_name(id)
         {
             self.writer.newline();
-            self.writer.write("__setFunctionName(");
+            self.emit_helper_reference("__setFunctionName");
+            self.writer.write("(");
             self.writer.write(temp);
             self.writer.write(", ");
             write_quoted(&mut self.writer, &name);
@@ -43775,6 +44132,18 @@ impl Printer<'_> {
         matches!(
             self.arena.get(expression.expression).map(|node| &node.data),
             Some(NodeData::StringLiteral(_))
+        )
+    }
+
+    fn statement_is_use_strict_prologue(&self, statement: NodeId) -> bool {
+        let Some(NodeData::ExpressionStatement(expression)) =
+            self.arena.get(statement).map(|node| &node.data)
+        else {
+            return false;
+        };
+        matches!(
+            self.arena.get(expression.expression).map(|node| &node.data),
+            Some(NodeData::StringLiteral(literal)) if literal.text == "use strict"
         )
     }
 
@@ -46036,11 +46405,18 @@ impl Printer<'_> {
             let NodeData::ImportClause(clause) = &clause_node.data else {
                 return Err(Self::unsupported(clause, clause_node.kind));
             };
+            let retain_unused = self.verbatim_module_syntax;
             let runtime_default = clause
                 .name
-                .filter(|name| recovered_module_specifier || self.import_binding_is_used(*name));
+                .filter(|name| {
+                    retain_unused
+                        || recovered_module_specifier
+                        || self.import_binding_is_used(*name)
+                });
             let runtime_bindings = clause.named_bindings.filter(|bindings| {
-                recovered_module_specifier || self.import_bindings_have_runtime_use(*bindings)
+                recovered_module_specifier
+                    || retain_unused && self.import_bindings_have_syntactic_value(*bindings)
+                    || self.import_bindings_have_runtime_use(*bindings)
             });
             if runtime_default.is_none() && runtime_bindings.is_none() {
                 return Ok(());
@@ -46053,7 +46429,7 @@ impl Printer<'_> {
                 }
             }
             if let Some(bindings) = runtime_bindings {
-                self.emit_named_imports(bindings, recovered_module_specifier)?;
+                self.emit_named_imports(bindings, recovered_module_specifier || retain_unused)?;
             }
             self.writer.write(" from ");
         } else {
@@ -46107,7 +46483,12 @@ impl Printer<'_> {
         let reference = self.node(data.module_reference)?.clone();
         match &reference.data {
             NodeData::ExternalModuleReference(reference) => {
-                self.writer.write("require(");
+                self.writer.write(
+                    self.node_esm_require_name
+                        .as_deref()
+                        .unwrap_or("require"),
+                );
+                self.writer.write("(");
                 if let Some(NodeData::StringLiteral(literal)) =
                     self.arena.get(reference.expression).map(|node| &node.data)
                 {
@@ -46389,17 +46770,19 @@ impl Printer<'_> {
         };
         self.writer.write("{ ");
         let mut emitted = false;
-        for specifier in &data.elements.nodes {
-            if !retain_all && !self.import_specifier_has_runtime_use(*specifier) {
+        for specifier_id in &data.elements.nodes {
+            let node = self.node(*specifier_id)?.clone();
+            let NodeData::ImportSpecifier(specifier) = &node.data else {
+                return Err(Self::unsupported(*specifier_id, node.kind));
+            };
+            if specifier.is_type_only
+                || !retain_all && !self.import_specifier_has_runtime_use(*specifier_id)
+            {
                 continue;
             }
             if emitted {
                 self.writer.write(", ");
             }
-            let node = self.node(*specifier)?.clone();
-            let NodeData::ImportSpecifier(specifier) = &node.data else {
-                return Err(Self::unsupported(*specifier, node.kind));
-            };
             if let Some(property) = specifier.property_name {
                 self.emit_expression(property, 0)?;
                 self.writer.write(" as ");
@@ -46409,6 +46792,18 @@ impl Printer<'_> {
         }
         self.writer.write(" }");
         Ok(())
+    }
+
+    fn import_bindings_have_syntactic_value(&self, bindings: NodeId) -> bool {
+        match self.arena.get(bindings).map(|node| &node.data) {
+            Some(NodeData::NamedImports(imports)) => imports.elements.nodes.iter().any(|specifier| {
+                !matches!(
+                    self.arena.get(*specifier).map(|node| &node.data),
+                    Some(NodeData::ImportSpecifier(specifier)) if specifier.is_type_only
+                )
+            }),
+            _ => true,
+        }
     }
 
     fn import_bindings_have_runtime_use(&self, bindings: NodeId) -> bool {
@@ -47785,7 +48180,17 @@ impl Printer<'_> {
         if inlineable {
             self.writer.write("() => __importStar(require(");
             if let Some(argument) = argument {
-                self.emit_expression(argument, 0)?;
+                if self.bundle_emit
+                    && let Some(NodeData::StringLiteral(literal)) =
+                        self.arena.get(argument).map(|node| &node.data)
+                {
+                    write_quoted(
+                        &mut self.writer,
+                        literal.text.strip_prefix("./").unwrap_or(&literal.text),
+                    );
+                } else {
+                    self.emit_expression(argument, 0)?;
+                }
             }
         } else {
             self.writer.write("s => __importStar(require(s");
@@ -48060,6 +48465,7 @@ impl Printer<'_> {
             .unwrap_or(true)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn import_has_runtime_use(
         &self,
         declaration: NodeId,
@@ -48096,6 +48502,12 @@ impl Printer<'_> {
         }
         if clause.phase_modifier == Some(SyntaxKind::TypeKeyword) {
             return false;
+        }
+        if self.verbatim_module_syntax {
+            return clause.name.is_some()
+                || clause
+                    .named_bindings
+                    .is_some_and(|bindings| self.import_bindings_have_syntactic_value(bindings));
         }
         if matches!(
             clause
@@ -49104,8 +49516,7 @@ impl Printer<'_> {
                     && self.is_dynamic_import_call(data)
                 {
                     self.emit_amd_dynamic_import(id, data, parent_precedence)?;
-                } else if self.commonjs_module_transform
-                    && !self.preserve_dynamic_import
+                } else if self.lower_dynamic_import_to_commonjs
                     && self.is_dynamic_import_call(data)
                 {
                     self.emit_commonjs_dynamic_import(data)?;
@@ -54879,6 +55290,15 @@ mod tests {
     }
 
     fn emit_with(source: &str, target: ScriptTarget, module: ModuleKind) -> super::EmitResult {
+        emit_with_decorator_mode(source, target, module, false)
+    }
+
+    fn emit_with_decorator_mode(
+        source: &str,
+        target: ScriptTarget,
+        module: ModuleKind,
+        experimental_decorators: bool,
+    ) -> super::EmitResult {
         let parsed = parse_source_file(source);
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         emit_source_file_with_settings(
@@ -54897,7 +55317,7 @@ mod tests {
                 inline_source_map: false,
                 import_helpers: false,
                 no_emit_helpers: false,
-                experimental_decorators: false,
+                experimental_decorators,
                 remove_comments: false,
                 use_define_for_class_fields: None,
             },
@@ -54951,6 +55371,7 @@ mod tests {
                 emit_decorator_metadata: true,
                 es_module_interop: false,
                 preserve_dynamic_import: false,
+                verbatim_module_syntax: false,
                 isolated_modules: false,
                 strict_null_checks,
                 force_use_strict: false,
@@ -55017,6 +55438,7 @@ mod tests {
                 emit_decorator_metadata: false,
                 es_module_interop: false,
                 preserve_dynamic_import: false,
+                verbatim_module_syntax: false,
                 isolated_modules: false,
                 strict_null_checks: false,
                 force_use_strict: false,
@@ -55151,6 +55573,7 @@ mod tests {
                 emit_decorator_metadata: false,
                 es_module_interop: false,
                 preserve_dynamic_import: false,
+                verbatim_module_syntax: false,
                 isolated_modules: false,
                 strict_null_checks: false,
                 force_use_strict: false,
@@ -56957,6 +57380,7 @@ mod tests {
                 emit_decorator_metadata: false,
                 es_module_interop: false,
                 preserve_dynamic_import: false,
+                verbatim_module_syntax: false,
                 isolated_modules: false,
                 strict_null_checks: false,
                 force_use_strict: false,
@@ -57599,6 +58023,7 @@ mod tests {
                     emit_decorator_metadata: false,
                     es_module_interop: false,
                     preserve_dynamic_import: false,
+                    verbatim_module_syntax: false,
                     isolated_modules: false,
                     strict_null_checks: false,
                     force_use_strict: false,
@@ -59964,6 +60389,7 @@ class Board {
                 emit_decorator_metadata: false,
                 es_module_interop: false,
                 preserve_dynamic_import: false,
+                verbatim_module_syntax: false,
                 isolated_modules: false,
                 strict_null_checks: false,
                 force_use_strict: false,
@@ -61484,7 +61910,8 @@ class Board {
             "@decorator(\"hi\")\n",
             "class Other { constructor() {} }\n",
         );
-        let output = emit_with(source, ScriptTarget::Es2015, ModuleKind::None).code;
+        let output =
+            emit_with_decorator_mode(source, ScriptTarget::Es2015, ModuleKind::None, true).code;
         assert!(output.starts_with("var __decorate = "), "{output}");
         assert!(
             output.contains(
@@ -61500,10 +61927,11 @@ class Board {
 
     #[test]
     fn lowers_legacy_member_and_parameter_decorators() {
-        let output = emit_with(
+        let output = emit_with_decorator_mode(
             "class C { @field value: string; @method run(@parameter input: number) {} }",
             ScriptTarget::Es2015,
             ModuleKind::None,
+            true,
         )
         .code;
 
@@ -61523,10 +61951,11 @@ class Board {
 
     #[test]
     fn preserves_multiple_class_decorator_evaluation_order() {
-        let output = emit_with(
+        let output = emit_with_decorator_mode(
             "@first\n@second(1)\nclass C {}",
             ScriptTarget::Es2015,
             ModuleKind::None,
+            true,
         )
         .code;
         assert!(

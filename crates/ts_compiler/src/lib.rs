@@ -639,7 +639,12 @@ impl Program {
                 let fixed_commonjs_module = [".cts", ".cjs"]
                     .iter()
                     .any(|extension| lower_file_name.ends_with(extension));
-                if matches!(
+                if self.options.module_specified
+                    && source_settings.module == ModuleKind::None
+                    && source_is_external_module(source_file)
+                {
+                    source_settings.module = ModuleKind::CommonJs;
+                } else if matches!(
                     source_settings.module,
                     ModuleKind::Node16
                         | ModuleKind::Node18
@@ -733,6 +738,7 @@ impl Program {
                             | ModuleKind::Node20
                             | ModuleKind::NodeNext
                     ),
+                    verbatim_module_syntax: self.options.verbatim_module_syntax,
                     isolated_modules: self.options.isolated_modules,
                     strict_null_checks: self.options.strict_null_checks,
                     force_use_strict: fixed_es_module && settings.module == ModuleKind::CommonJs,
@@ -1116,6 +1122,7 @@ impl Program {
                             | ModuleKind::Node20
                             | ModuleKind::NodeNext
                     ),
+                    verbatim_module_syntax: self.options.verbatim_module_syntax,
                     isolated_modules: self.options.isolated_modules,
                     strict_null_checks: self.options.strict_null_checks,
                     force_use_strict: false,
@@ -1413,6 +1420,9 @@ impl Program {
             if !source.is_default_library
                 && !ts_path::is_declaration_file(&source.file_name)
                 && program.source_should_emit(source)
+                && (!program.options.module_specified
+                    || program.options.module != ModuleKind::None
+                    || !source_is_external_module(source))
             {
                 ordered.push(index);
             }

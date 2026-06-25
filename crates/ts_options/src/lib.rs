@@ -123,6 +123,8 @@ pub struct CompilerOptions {
     pub verbatim_module_syntax: bool,
     pub lib: Option<Vec<String>>,
     pub module: ModuleKind,
+    /// Whether `module` was explicitly supplied rather than selected as the default.
+    pub module_specified: bool,
     pub module_resolution: ModuleResolutionKind,
     pub target: ScriptTarget,
     pub jsx: JsxEmit,
@@ -194,6 +196,7 @@ impl Default for CompilerOptions {
             verbatim_module_syntax: false,
             lib: None,
             module: ModuleKind::default(),
+            module_specified: false,
             module_resolution: ModuleResolutionKind::Node10,
             target: ScriptTarget::Es5,
             jsx: JsxEmit::None,
@@ -319,6 +322,7 @@ impl CompilerOptions {
                 "reactnamespace" => self.react_namespace.clone_from(&overrides.react_namespace),
                 "module" => {
                     self.module = overrides.module;
+                    self.module_specified = true;
                     if !names.contains("moduleresolution") {
                         self.module_resolution = overrides.module_resolution;
                     }
@@ -740,6 +744,7 @@ impl PartialOptions {
         let strict = self.strict.unwrap_or(false);
         let emit_declaration_only = self.emit_declaration_only.unwrap_or(false);
         let composite = self.composite.unwrap_or(false);
+        let module_specified = self.module.is_some();
         let module = self.module.unwrap_or(if self.out_file.is_some() {
             ModuleKind::None
         } else {
@@ -800,6 +805,7 @@ impl PartialOptions {
             verbatim_module_syntax: self.verbatim_module_syntax.unwrap_or(false),
             lib: self.lib,
             module,
+            module_specified,
             module_resolution,
             target: self.target.unwrap_or_default(),
             jsx: self.jsx.unwrap_or_default(),
@@ -1135,15 +1141,24 @@ mod tests {
         let direct = CompilerOptions::default();
         assert_eq!(ModuleKind::default(), ModuleKind::None);
         assert_eq!(direct.module, ModuleKind::None);
+        assert!(!direct.module_specified);
         assert_eq!(direct.module_resolution, ModuleResolutionKind::Node10);
 
         let parsed = parse_compiler_options(&object([]));
         assert!(parsed.is_ok(), "{:?}", parsed.diagnostics);
         assert_eq!(parsed.options.module, ModuleKind::None);
+        assert!(!parsed.options.module_specified);
         assert_eq!(
             parsed.options.module_resolution,
             ModuleResolutionKind::Node10
         );
+
+        let mut overridden = CompilerOptions::default();
+        overridden.apply_overrides(
+            &CompilerOptions::default(),
+            &BTreeSet::from(["module".to_owned()]),
+        );
+        assert!(overridden.module_specified);
     }
 
     #[test]
@@ -1156,6 +1171,7 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(result.options.target, ScriptTarget::Es2025);
         assert_eq!(result.options.module, ModuleKind::NodeNext);
+        assert!(result.options.module_specified);
         assert_eq!(result.options.jsx, JsxEmit::ReactJsx);
         assert_eq!(
             result.options.module_resolution,
