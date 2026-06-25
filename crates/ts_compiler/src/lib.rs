@@ -1005,10 +1005,10 @@ impl Program {
             let mut seen_prologues = HashSet::new();
             let has_script_sources = javascript_sources
                 .iter()
-                .any(|source| !source_is_external_module(source));
+                .any(|source| !source_is_json(source) && !source_is_external_module(source));
             for source in javascript_sources
                 .iter()
-                .filter(|source| !source_is_external_module(source))
+                .filter(|source| !source_is_json(source) && !source_is_external_module(source))
             {
                 for directive in source_prologue_directives(source) {
                     if seen_prologues.insert(directive.to_owned()) {
@@ -1071,6 +1071,22 @@ impl Program {
                 let generated_line =
                     u32::try_from(code.bytes().filter(|byte| *byte == b'\n').count())
                         .unwrap_or(u32::MAX);
+                if settings.module == ModuleKind::Amd && source_is_json(source) {
+                    if let (Some(builder), Some(source_offset)) =
+                        (&mut map_builder, map_source_offset)
+                    {
+                        let _ = builder.add_mapping(generated_line, 0, source_offset, 0, 0);
+                    }
+                    code.push_str("define(");
+                    code.push_str(
+                        &serde_json::to_string(&amd_bundle_module_name(source, &bundle_root))
+                            .expect("AMD JSON module names are serializable"),
+                    );
+                    code.push_str(", [], ");
+                    code.push_str(source.source_text.trim_end_matches(['\n', '\r']));
+                    code.push_str(");\n");
+                    continue;
+                }
                 let mut source_settings = source_printer_settings(settings, &source.source_text);
                 source_settings.source_map = settings.source_map;
                 source_settings.inline_source_map = false;
@@ -9906,6 +9922,35 @@ export function create() { return new M.Value(); }"#,
                 .files
                 .iter()
                 .all(|file| file.file_name != "/project/out/data.d.ts")
+        );
+    }
+
+    #[test]
+    fn amd_out_file_emits_json_as_a_named_value_module() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/main.ts",
+            "import * as data from './data.json'; export { data };",
+        )
+        .unwrap();
+        fs.write_file("/project/data.json", "{\n    \"value\": 1\n}\n")
+            .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["main.ts".to_owned()],
+            CompilerOptions {
+                module: ModuleKind::Amd,
+                out_file: Some("/project/out.js".into()),
+                resolve_json_module: true,
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        let output = &program.emit().files[0].text;
+        assert!(
+            output.starts_with("define(\"data\", [], {\n    \"value\": 1\n});\n"),
+            "{output}"
         );
     }
 
