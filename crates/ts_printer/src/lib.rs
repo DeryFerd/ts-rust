@@ -21135,6 +21135,16 @@ impl DeclarationPrinter<'_> {
         true
     }
 
+    fn namespace_scope_is_separately_nested(&self, scope: NodeId) -> bool {
+        self.arena
+            .get(scope)
+            .and_then(|scope| scope.parent)
+            .and_then(|module| self.arena.get(module))
+            .and_then(|module| module.parent)
+            .and_then(|parent| self.arena.get(parent))
+            .is_some_and(|parent| matches!(parent.data, NodeData::ModuleBlock(_)))
+    }
+
     fn namespace_scope_has_privacy_boundary(&self, scope: NodeId) -> bool {
         let Some(retained) = self
             .declaration_reachability
@@ -21232,7 +21242,9 @@ impl DeclarationPrinter<'_> {
             },
             _ => false,
         };
-        !sole_annotated_namespace_variable || has_local_private
+        has_local_private
+            || (!sole_annotated_namespace_variable
+                && !self.namespace_scope_is_separately_nested(scope))
     }
 
     fn private_declaration_is_only_referenced_from_private_members(
@@ -21343,8 +21355,10 @@ impl DeclarationPrinter<'_> {
         {
             return false;
         }
-        (self.namespace_scope_allows_explicit_exports(scope)
-            && (self.namespace_scope_has_privacy_boundary(scope)
+        let has_privacy_boundary = self.namespace_scope_has_privacy_boundary(scope);
+        ((self.namespace_scope_allows_explicit_exports(scope)
+            || (has_privacy_boundary && self.namespace_scope_is_separately_nested(scope)))
+            && (has_privacy_boundary
                 || self.namespace_scope_has_synthetic_class_base(scope)
                 || matches!(
                     self.arena.get(scope).map(|node| &node.data),
@@ -63085,6 +63099,19 @@ class Board {
         );
         assert!(output.contains("namespace Inner"), "{output}");
         assert!(!output.contains("export namespace Inner"), "{output}");
+        assert!(output.contains("export {};"), "{output}");
+    }
+
+    #[test]
+    fn declaration_emit_preserves_exports_for_nested_local_privacy_boundaries() {
+        let output = emit_declarations_with_semantics(concat!(
+            "namespace Outer { namespace Inner { class Private {} ",
+            "export class Public { value: Private; } } ",
+            "export class Use { value: Inner.Public; } }",
+        ));
+        assert!(output.contains("namespace Inner"), "{output}");
+        assert!(output.contains("class Private"), "{output}");
+        assert!(output.contains("export class Public"), "{output}");
         assert!(output.contains("export {};"), "{output}");
     }
 
