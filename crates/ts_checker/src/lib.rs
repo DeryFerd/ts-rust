@@ -11764,6 +11764,50 @@ impl<'a> Checker<'a> {
         self.instantiate_synthetic_mapped_type(name.strip_prefix("__mapped:")?, arguments)
     }
 
+    fn instantiate_core_utility_type(
+        &mut self,
+        name: &str,
+        arguments: &[TypeId],
+    ) -> Option<TypeId> {
+        if name != "Omit" {
+            return None;
+        }
+        let [source, excluded] = arguments else {
+            return None;
+        };
+        let excluded = self
+            .literal_keys(*excluded)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<BTreeSet<_>>();
+        let mut object = self.contextual_object_type(*source)?;
+        object
+            .properties
+            .retain(|property, _| !excluded.contains(property));
+        object
+            .property_order
+            .retain(|property| !excluded.contains(property));
+        object
+            .numeric_properties
+            .retain(|property| !excluded.contains(property));
+        object
+            .optional_properties
+            .retain(|property| !excluded.contains(property));
+        object
+            .readonly_properties
+            .retain(|property| !excluded.contains(property));
+        object
+            .getter_properties
+            .retain(|property| !excluded.contains(property));
+        object
+            .setter_properties
+            .retain(|property| !excluded.contains(property));
+        object
+            .setter_property_types
+            .retain(|property, _| !excluded.contains(property));
+        Some(self.result.types.alloc(TypeKind::Object(object)))
+    }
+
     fn instantiate_synthetic_indexed_access(&mut self, arguments: &[TypeId]) -> Option<TypeId> {
         let [object, index] = arguments else {
             return None;
@@ -13279,6 +13323,11 @@ impl<'a> Checker<'a> {
                     return return_type;
                 }
                 let symbol = self.resolve_identifier(data.type_name, &name);
+                let semantic_core_utility = name == "Omit"
+                    && symbol.map_or_else(
+                        || self.external_names.contains_key(&name),
+                        |symbol| self.external_aliases.contains_key(&symbol),
+                    );
                 let conditional_alias = symbol.is_some_and(|symbol| {
                     self.bindings.symbols.get(symbol).is_some_and(|symbol| {
                         symbol.declarations.iter().any(|declaration| {
@@ -13324,6 +13373,11 @@ impl<'a> Checker<'a> {
                             },
                         );
                         placeholder
+                    } else if self.external_aliases.contains_key(&symbol)
+                        && let Some(instantiated) =
+                            self.instantiate_core_utility_type(&name, &arguments)
+                    {
+                        instantiated
                     } else if let Some(descriptor) = self.external_aliases.get(&symbol).cloned() {
                         self.import_alias(&descriptor, &arguments)
                     } else {
@@ -13350,6 +13404,11 @@ impl<'a> Checker<'a> {
                             .or_insert(reference);
                     }
                     type_id
+                } else if self.external_names.contains_key(&name)
+                    && let Some(instantiated) =
+                        self.instantiate_core_utility_type(&name, &arguments)
+                {
+                    instantiated
                 } else if let Some(descriptor) = self.external_names.get(&name).cloned() {
                     let imported = self.import_alias(&descriptor, &arguments);
                     self.constructor_instance_type(imported).unwrap_or(imported)
@@ -13359,6 +13418,7 @@ impl<'a> Checker<'a> {
                 if !conditional_alias
                     && !indexed_mapped_alias
                     && !structurally_serialized_alias
+                    && !semantic_core_utility
                     && self.named_type_arguments_are_resolved_or_in_scope(&arguments)
                     && let Some(kind) = self
                         .result
@@ -14054,6 +14114,21 @@ impl<'a> Checker<'a> {
                 .iter()
                 .flat_map(|member| self.literal_keys(*member))
                 .collect(),
+            TypeKind::Intersection(members) => {
+                let Some((first, remaining)) = members.split_first() else {
+                    return Vec::new();
+                };
+                let mut common = self.literal_keys(*first);
+                for member in remaining {
+                    let names = self
+                        .literal_keys(*member)
+                        .into_iter()
+                        .map(|(name, _)| name)
+                        .collect::<BTreeSet<_>>();
+                    common.retain(|(name, _)| names.contains(name));
+                }
+                common
+            }
             TypeKind::TypeParameter {
                 constraint: Some(constraint),
                 ..
@@ -21949,6 +22024,58 @@ mod tests {
 
         assert!(
             result.types.len() < 200_000,
+            "type count: {}",
+            result.types.len()
+        );
+    }
+
+    #[test]
+    fn bounds_external_omit_instantiation_chains() {
+        let mut source = String::from(concat!(
+            "export type merge<base, props> = ",
+            "Omit<base, keyof props & keyof base> & props;\n",
+            "declare const merge: <l, r>(l: l, r: r) => merge<l, r>;\n",
+        ));
+        for index in 1..=12 {
+            if index == 1 {
+                writeln!(source, "const o1 = merge({{ p1: 1 }}, {{ p2: 2 }});").unwrap();
+            } else {
+                writeln!(
+                    source,
+                    "const o{index} = merge(o{}, {{ p{}: {} }});",
+                    index - 1,
+                    index + 1,
+                    index + 1,
+                )
+                .unwrap();
+            }
+        }
+        let parsed = parse_source_file(&source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let parameter = TypeDescriptor::TypeParameter("base".into());
+        let omit = TypeDescriptor::Alias {
+            parameters: vec!["base".into(), "keys".into()],
+            body: Box::new(TypeDescriptor::Intersection(vec![
+                parameter.clone(),
+                parameter,
+            ])),
+        };
+        let result = Checker::new(&parsed.arena, &bindings)
+            .with_environment(
+                Default::default(),
+                Default::default(),
+                BTreeMap::from([("Omit".into(), omit)]),
+            )
+            .with_options(CheckerOptions {
+                strict_null_checks: true,
+                ..CheckerOptions::default()
+            })
+            .check(parsed.source_file);
+
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert!(
+            result.types.len() < 5_000,
             "type count: {}",
             result.types.len()
         );
