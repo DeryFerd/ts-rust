@@ -4259,11 +4259,11 @@ impl DeclarationPrinter<'_> {
         if self.module_file && self.statement_is_structurally_consumed_local_mixin(id) {
             return Ok(());
         }
-        if self.module_file
+        if (self.module_file || in_namespace)
             && matches!(
                 &node.data,
                 NodeData::ImportEqualsDeclaration(import)
-                    if self.import_equals_is_only_used_by_portable_inference(id, import)
+                    if self.import_equals_is_only_used_by_erased_inference(id, import)
             )
         {
             return Ok(());
@@ -9231,6 +9231,11 @@ impl DeclarationPrinter<'_> {
             {
                 self.writer.write(": typeof ");
                 self.emit_name(type_query)?;
+            } else if let Some(type_name) = declaration.initializer.and_then(|initializer| {
+                self.private_internal_import_equals_call_return_name(initializer)
+            }) {
+                self.writer.write(": ");
+                self.writer.write(&type_name);
             } else if let Some((class_name, static_, members)) = declaration
                 .initializer
                 .and_then(|initializer| self.dynamic_class_member_access(initializer))
@@ -10348,12 +10353,63 @@ impl DeclarationPrinter<'_> {
         self.entity_value_type_query_name(declaration_id, initializer)
     }
 
+    fn private_internal_import_equals_root_name(&self, expression: NodeId) -> Option<&str> {
+        let root = self.entity_expression_root_identifier(expression)?;
+        let name = declaration_name_text(self.arena, root)?;
+        let symbol = self.bindings.resolve_name_at(root, name)?;
+        self.bindings
+            .symbols
+            .get(symbol)?
+            .declarations
+            .iter()
+            .any(|declaration| {
+                let Some(node) = self.arena.get(*declaration) else {
+                    return false;
+                };
+                matches!(
+                    &node.data,
+                    NodeData::ImportEqualsDeclaration(import)
+                        if !declaration_has_modifier(
+                            self.arena,
+                            node,
+                            SyntaxKind::ExportKeyword,
+                        ) && !matches!(
+                            self.arena
+                                .get(import.module_reference)
+                                .map(|node| &node.data),
+                            Some(NodeData::ExternalModuleReference(_))
+                        )
+                )
+            })
+            .then_some(name)
+    }
+
+    fn private_internal_import_equals_call_return_name(
+        &self,
+        initializer: NodeId,
+    ) -> Option<String> {
+        let NodeData::CallExpression(call) = &self.arena.get(initializer)?.data else {
+            return None;
+        };
+        let alias = self.private_internal_import_equals_root_name(call.expression)?;
+        let type_id = self.node_types?.get(&initializer)?;
+        let reference = self.named_type_references?.get(type_id)?;
+        let name = reference.name.strip_prefix("typeof ").unwrap_or(&reference.name);
+        (!name.starts_with("__") && !name.contains('.')).then(|| format!("{alias}.{name}"))
+    }
+
     fn entity_value_type_query_name(
         &self,
         declaration: NodeId,
         initializer: NodeId,
     ) -> Option<String> {
         let syntactic_path = self.entity_expression_path(initializer)?;
+        if self
+            .private_internal_import_equals_root_name(initializer)
+            .is_some()
+        {
+            return Some(syntactic_path.join("."));
+        }
         let resolved = self.resolve_entity_expression_symbol_following_aliases(initializer);
         let canonical_path = resolved
             .and_then(|symbol| self.runtime_symbol_declaration_path(symbol))
@@ -10390,7 +10446,9 @@ impl DeclarationPrinter<'_> {
             .zip(&canonical_path)
             .take_while(|(left, right)| left == right)
             .count();
-        let start = if common >= 2 && common < canonical_path.len() {
+        let start = if common == namespace_path.len() && common < canonical_path.len() {
+            common
+        } else if common >= 2 && common < canonical_path.len() {
             common - 1
         } else {
             0
@@ -10793,6 +10851,25 @@ impl DeclarationPrinter<'_> {
                 },
             );
         let root_is_import = root_kind == Some(true);
+        let root_external_module = self
+            .bindings
+            .symbols
+            .get(root_symbol)
+            .and_then(|symbol| {
+                symbol.declarations.iter().find_map(|declaration| {
+                    let NodeData::ImportEqualsDeclaration(import) =
+                        &self.arena.get(*declaration)?.data
+                    else {
+                        return None;
+                    };
+                    let NodeData::ExternalModuleReference(external) =
+                        &self.arena.get(import.module_reference)?.data
+                    else {
+                        return None;
+                    };
+                    string_literal_text(self.arena, external.expression)
+                })
+            });
         let root_is_namespace = root_kind == Some(false)
             && matches!(
                 self.arena
@@ -10811,7 +10888,17 @@ impl DeclarationPrinter<'_> {
                     )
                 })
             });
-        let has_nominal_type = root_is_import || root_is_namespace || expression_is_class;
+        let inferred_any = self
+            .node_types
+            .and_then(|types| types.get(&initializer))
+            .and_then(|type_id| self.semantic_types?.get(*type_id))
+            .is_some_and(|type_| matches!(type_.kind, TypeKind::Any));
+        let malformed_external_import = inferred_any
+            && root_external_module
+                .is_some_and(|module| self.nested_string_module_declaration_exists(module));
+        let has_nominal_type = (root_is_import && !malformed_external_import)
+            || root_is_namespace
+            || expression_is_class;
         has_nominal_type.then(|| {
             let canonical_name = root_is_namespace
                 .then(|| {
@@ -17089,7 +17176,7 @@ impl DeclarationPrinter<'_> {
             let NodeData::ImportEqualsDeclaration(import) = &node.data else {
                 return None;
             };
-            if self.import_equals_is_only_used_by_portable_inference(import_id, import) {
+            if self.import_equals_is_only_used_by_erased_inference(import_id, import) {
                 return None;
             }
             let retained = self.declaration_reachability.is_none_or(|reachability| {
@@ -22037,7 +22124,7 @@ impl DeclarationPrinter<'_> {
         })
     }
 
-    fn import_equals_is_only_used_by_portable_inference(
+    fn import_equals_is_only_used_by_erased_inference(
         &self,
         declaration: NodeId,
         import: &ts_ast::ImportEqualsDeclarationData,
@@ -22085,9 +22172,26 @@ impl DeclarationPrinter<'_> {
                             type_id,
                             module_specifier,
                             &mut HashSet::new(),
-                        )
+                        ) || (self.nested_string_module_declaration_exists(module_specifier)
+                            && self
+                                .semantic_types
+                                .and_then(|types| types.get(type_id))
+                                .is_some_and(|type_| matches!(type_.kind, TypeKind::Any)))
                     })
             })
+    }
+
+    fn nested_string_module_declaration_exists(&self, module_specifier: &str) -> bool {
+        self.arena.iter().any(|(_, node)| {
+            let NodeData::ModuleDeclaration(module) = &node.data else {
+                return false;
+            };
+            string_literal_text(self.arena, module.name) == Some(module_specifier)
+                && node
+                    .parent
+                    .and_then(|parent| self.arena.get(parent))
+                    .is_some_and(|parent| !matches!(parent.data, NodeData::SourceFile(_)))
+        })
     }
 
     fn portable_inference_type_for_reference(&self, reference: NodeId) -> Option<TypeId> {

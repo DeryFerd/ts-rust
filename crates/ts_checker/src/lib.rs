@@ -16270,19 +16270,18 @@ impl<'a> DeclarationReachability<'a> {
         else {
             return BTreeMap::new();
         };
-        let external = !bindings.exports.is_empty()
-            || source.statements.nodes.iter().any(|statement| {
-                arena.get(*statement).is_some_and(|node| {
-                    analyzer.node_has_modifier(*statement, SyntaxKind::ExportKeyword)
-                        || matches!(
-                            node.data,
-                            NodeData::ImportDeclaration(_)
-                                | NodeData::ImportEqualsDeclaration(_)
-                                | NodeData::ExportDeclaration(_)
-                                | NodeData::ExportAssignment(_)
-                        )
-                })
-            });
+        let external = source.statements.nodes.iter().any(|statement| {
+            arena.get(*statement).is_some_and(|node| {
+                analyzer.node_has_modifier(*statement, SyntaxKind::ExportKeyword)
+                    || matches!(
+                        node.data,
+                        NodeData::ImportDeclaration(_)
+                            | NodeData::ImportEqualsDeclaration(_)
+                            | NodeData::ExportDeclaration(_)
+                            | NodeData::ExportAssignment(_)
+                    )
+            })
+        });
         analyzer.collect_scope(
             source_file,
             &source.statements.nodes,
@@ -16369,6 +16368,10 @@ impl<'a> DeclarationReachability<'a> {
 
     fn seed_scope_roots(&mut self, scope: NodeId) {
         let statements = self.scopes.get(&scope).cloned().unwrap_or_default();
+        let source_scope = matches!(
+            self.arena.get(scope).map(|node| &node.data),
+            Some(NodeData::SourceFile(_))
+        );
         for statement in statements {
             let exported_declaration = self
                 .arena
@@ -16388,7 +16391,7 @@ impl<'a> DeclarationReachability<'a> {
                 || matches!(
                     self.arena.get(statement).map(|node| &node.data),
                     Some(NodeData::ModuleDeclaration(module))
-                        if matches!(
+                        if source_scope && matches!(
                             self.arena.get(module.name).map(|node| &node.data),
                             Some(NodeData::StringLiteral(_))
                         )
