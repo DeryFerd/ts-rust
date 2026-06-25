@@ -235,6 +235,16 @@ impl TypeArena {
         });
         flattened.sort_unstable();
         flattened.dedup();
+        let mut structurally_unique: Vec<TypeId> = Vec::with_capacity(flattened.len());
+        for member in flattened {
+            if structurally_unique.iter().any(|existing| {
+                self.types[existing.index()].kind == self.types[member.index()].kind
+            }) {
+                continue;
+            }
+            structurally_unique.push(member);
+        }
+        let flattened = structurally_unique;
         match flattened.as_slice() {
             [] => self.never(),
             [single] => *single,
@@ -256,8 +266,8 @@ impl TypeArena {
                 _ => flattened.push(member),
             }
         }
-        flattened.sort_unstable();
-        flattened.dedup();
+        let mut seen = HashSet::new();
+        flattened.retain(|member| seen.insert(*member));
         match flattened.as_slice() {
             [] => self.unknown(),
             [single] => *single,
@@ -6695,7 +6705,11 @@ impl<'a> Checker<'a> {
     ) -> TypeId {
         let mut type_id = self.type_of_expression(expression);
         let Some(name) = self.this_property_name(expression) else {
-            return self.widen_literal(type_id);
+            return if self.preserve_literal_inference {
+                type_id
+            } else {
+                self.widen_literal(type_id)
+            };
         };
         let mut child = expression;
         while let Some(parent) = self.arena.get(child).and_then(|node| node.parent) {
@@ -6711,7 +6725,11 @@ impl<'a> Checker<'a> {
             }
             child = parent;
         }
-        self.widen_literal(type_id)
+        if self.preserve_literal_inference {
+            type_id
+        } else {
+            self.widen_literal(type_id)
+        }
     }
 
     fn check_object_literal_getter(
@@ -8814,7 +8832,8 @@ impl<'a> Checker<'a> {
                     self.result.types.any()
                 } else {
                     let previous = self.preserve_literal_inference;
-                    self.preserve_literal_inference = contextual_type.is_none();
+                    self.preserve_literal_inference =
+                        self.preserve_literal_inference || contextual_type.is_none();
                     let result =
                         self.call_expression_type(node_id, callee, &data.arguments.nodes, false);
                     let result = if self
@@ -23370,6 +23389,37 @@ mod tests {
             });
         assert_eq!(reference.name, "Box");
         assert_eq!(reference.type_arguments, [result.types.number()]);
+    }
+
+    #[test]
+    fn retains_named_aliases_across_nested_generic_intersection_inference() {
+        let parsed = parse_source_file(concat!(
+            "type ModuleWithState<T> = { state: T };",
+            "type MoreState = { z: string };",
+            "declare function create<T, A>(state: T, actions: A): ModuleWithState<T> & A;",
+            "declare function convert<T, A>(value: ModuleWithState<T> & A): ModuleWithState<T & MoreState> & A;",
+            "const value = convert(create({ a: 12 }, { foo() { return true } }));",
+        ));
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        let value = bindings.root_scope().unwrap().symbols.get("value").unwrap();
+        let declaration = bindings.symbols.get(value).unwrap().declarations[0];
+        let type_id = result.node_types[&declaration];
+        let TypeKind::Intersection(members) = &result.types.get(type_id).unwrap().kind else {
+            panic!("expected intersection: {}", result.types.display(type_id));
+        };
+        let references = members
+            .iter()
+            .filter_map(|member| result.named_type_references.get(member))
+            .filter(|reference| reference.name == "ModuleWithState")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            references.len(),
+            2,
+            "type: {}; members: {members:?}; named: {:?}",
+            result.types.display(type_id),
+            result.named_type_references
+        );
     }
 
     #[test]

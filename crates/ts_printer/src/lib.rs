@@ -58446,6 +58446,29 @@ mod tests {
     }
 
     #[test]
+    fn declaration_emit_preserves_generic_intersection_alias_order() {
+        let output = emit_declarations_with_semantics(concat!(
+            "type ModuleWithState<T> = { state: T };",
+            "type MoreState = { z: string };",
+            "declare function create<T, A>(state: T, actions: A): ModuleWithState<T> & A;",
+            "declare function convert<T, A>(value: ModuleWithState<T> & A): ModuleWithState<T & MoreState> & A;",
+            "const value = convert(create({ a: 12 }, { foo() { return true } }));",
+        ));
+        assert!(
+            output.contains(concat!(
+                "declare const value: ModuleWithState<{\n",
+                "    a: number;\n",
+                "} & MoreState> & ModuleWithState<{\n",
+                "    a: number;\n",
+                "}> & {\n",
+                "    foo(): true;\n",
+                "};",
+            )),
+            "{output}"
+        );
+    }
+
+    #[test]
     fn declaration_emit_orders_inferred_object_signatures_indexes_and_properties() {
         let source = concat!(
             "var source: {\n",
