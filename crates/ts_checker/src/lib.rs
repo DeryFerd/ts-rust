@@ -588,6 +588,20 @@ struct ProgramChecker<'a> {
     source_paths: Option<&'a [String]>,
 }
 
+fn source_exceeds_class_graph_budget(source: &ProgramSource<'_>) -> bool {
+    source
+        .arena
+        .source_text()
+        .is_some_and(|text| text.len() >= 100_000)
+        && source
+            .arena
+            .iter()
+            .filter(|(_, node)| matches!(node.data, NodeData::ClassDeclaration(_)))
+            .take(100)
+            .count()
+            == 100
+}
+
 type DuplicateGlobal = (usize, NodeId, u32, String);
 type GlobalCollection = (
     BTreeMap<String, TypeDescriptor>,
@@ -641,7 +655,7 @@ impl<'a> ProgramChecker<'a> {
             .sources
             .iter()
             .map(|source| {
-                if source.is_default_library {
+                if source.is_default_library || source_exceeds_class_graph_budget(source) {
                     empty_check_result()
                 } else {
                     check_source_file_with_options(
@@ -669,7 +683,7 @@ impl<'a> ProgramChecker<'a> {
                 import_runtime_meanings,
             ) = self.imports(file_index, source, &preliminary, &files);
             let mut result =
-                if source.is_default_library {
+                if source.is_default_library || source_exceeds_class_graph_budget(source) {
                     preliminary[file_index].clone()
                 } else {
                     let mut external_names = globals.clone();
@@ -1924,6 +1938,8 @@ impl<'a> ProgramChecker<'a> {
 
     #[allow(clippy::too_many_lines)]
     fn globals(&self, results: &[CheckResult]) -> GlobalCollection {
+        const MAX_DEEPLY_DESCRIBED_GLOBAL_SOURCE_NODES: usize = 25_000;
+
         let mut globals = BTreeMap::new();
         let mut declarations = BTreeMap::<String, (usize, ts_binder::SymbolFlags)>::new();
         let mut duplicates = Vec::new();
@@ -1934,6 +1950,9 @@ impl<'a> ProgramChecker<'a> {
             if is_external_module(source) {
                 continue;
             }
+            let shallow_globals = !source.is_default_library
+                && (source.arena.len() > MAX_DEEPLY_DESCRIBED_GLOBAL_SOURCE_NODES
+                    || source_exceeds_class_graph_budget(source));
             let Some(root) = source.bindings.root_scope() else {
                 continue;
             };
@@ -1989,6 +2008,8 @@ impl<'a> ProgramChecker<'a> {
                                 symbol_id,
                                 referenced_names.contains(name),
                             )
+                        } else if shallow_globals {
+                            Some(TypeDescriptor::Any)
                         } else {
                             Self::describe_global_symbol(source, result, symbol_id)
                         }
@@ -2012,6 +2033,8 @@ impl<'a> ProgramChecker<'a> {
                         symbol_id,
                         referenced_names.contains(name),
                     )
+                } else if shallow_globals {
+                    Some(TypeDescriptor::Any)
                 } else {
                     Self::describe_global_symbol(source, result, symbol_id)
                 };
@@ -19732,6 +19755,15 @@ fn describe_type_with_imports_inner(
     if !imports.contains_key(&type_id)
         && let Some(reference) = named_references.and_then(|references| references.get(&type_id))
     {
+        if *remaining == 0 || depth >= max_depth {
+            visiting.remove(&type_id);
+            return TypeDescriptor::Named {
+                name: reference.name.clone(),
+                type_arguments: vec![TypeDescriptor::Any; reference.type_arguments.len()],
+                target: Box::new(TypeDescriptor::Any),
+            };
+        }
+        *remaining -= 1;
         visiting.remove(&type_id);
         let target = describe_type_with_imports_inner(
             types,
@@ -23588,6 +23620,23 @@ mod tests {
                 target: Box::new(TypeDescriptor::Any),
             })
         );
+    }
+
+    #[test]
+    fn bounded_descriptors_stop_recursive_named_type_arguments() {
+        let mut types = TypeArena::new();
+        let root = types.alloc(TypeKind::Any);
+        let names = BTreeMap::from([(
+            root,
+            NamedTypeReference {
+                name: "Recursive".into(),
+                type_arguments: vec![root],
+            },
+        )]);
+
+        let descriptor =
+            describe_type_with_imports_bounded(&types, &BTreeMap::new(), Some(&names), root, 8);
+        assert!(format!("{descriptor:?}").len() < 1_000, "{descriptor:?}");
     }
 
     #[test]

@@ -34340,15 +34340,19 @@ impl Printer<'_> {
             return Ok(None);
         }
         for statement in &block.statements.nodes {
-            if !matches!(
-                self.node(*statement)?.data,
+            let statement_node = self.node(*statement)?;
+            let compact = match &statement_node.data {
+                NodeData::VariableStatement(variable) => self
+                    .node(variable.declaration_list)
+                    .is_ok_and(|list| list.flags.0.trailing_zeros() >= 2),
                 NodeData::ExpressionStatement(_)
                     | NodeData::DebuggerStatement(_)
                     | NodeData::ReturnStatement(_)
                     | NodeData::ThrowStatement(_)
-                    | NodeData::EmptyStatement(_)
-            ) || self.statement_contains_class_expression(*statement)?
-            {
+                    | NodeData::EmptyStatement(_) => true,
+                _ => false,
+            };
+            if !compact || self.statement_contains_class_expression(*statement)? {
                 return Ok(None);
             }
         }
@@ -60360,6 +60364,19 @@ mod tests {
         .code;
         assert!(
             output.contains("    method() { var value = this.item; }"),
+            "{output}"
+        );
+
+        let output = emit_with(
+            "class Box { method(): Box { var value: Box; () => { var self = this; }; return value; } }",
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(
+            output.contains(
+                "    method() { var value; () => { var self = this; }; return value; }"
+            ),
             "{output}"
         );
     }
