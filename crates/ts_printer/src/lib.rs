@@ -29940,6 +29940,7 @@ impl Printer<'_> {
                 } else if let Some(name) = commonjs_default_name.as_deref() {
                     self.writer.write(name);
                 }
+                let outer_generated_names = self.generated_names.used.clone();
                 let parameter_class_temps = data.body.map_or_else(Vec::new, |body| {
                     self.prepare_parameter_class_expression_temps(&data.parameters, body)
                 });
@@ -30042,6 +30043,7 @@ impl Printer<'_> {
                     self.writer.write(&name);
                     self.writer.write(";");
                 }
+                self.generated_names.used = outer_generated_names;
             }
             NodeData::ClassDeclaration(data) => {
                 let decorators = self.class_decorator_expressions(data.modifiers.as_ref());
@@ -32928,6 +32930,7 @@ impl Printer<'_> {
         {
             let temp = self.generate_block_temp(container, claimed);
             claimed.insert(temp.clone());
+            self.generated_names.used.insert(temp.clone());
             self.commonjs_destructuring_assignment_hoists
                 .entry(container)
                 .or_default()
@@ -32981,51 +32984,39 @@ impl Printer<'_> {
         if self.commonjs_destructuring_pattern_value_use_count(pattern) > 1 {
             return true;
         }
-        match self.arena.get(pattern).map(|node| &node.data) {
-            Some(NodeData::ObjectLiteralExpression(object)) => object.properties.nodes.iter().any(
-                |property| match self.arena.get(*property).map(|node| &node.data) {
-                    Some(NodeData::PropertyAssignment(property)) => matches!(
-                        self.arena.get(property.initializer).map(|node| node.kind),
-                        Some(
-                            SyntaxKind::ObjectLiteralExpression
-                                | SyntaxKind::ArrayLiteralExpression
-                        )
-                    ),
-                    _ => false,
-                },
-            ),
-            Some(NodeData::ArrayLiteralExpression(array)) => {
-                let mut saw_omission = false;
-                for element in &array.elements.nodes {
-                    match self.arena.get(*element).map(|node| &node.data) {
-                        Some(NodeData::OmittedExpression(_)) => saw_omission = true,
-                        Some(NodeData::SpreadElement(spread)) => {
-                            return saw_omission
-                                || matches!(
-                                    self.arena.get(spread.expression).map(|node| node.kind),
-                                    Some(
-                                        SyntaxKind::ObjectLiteralExpression
-                                            | SyntaxKind::ArrayLiteralExpression
-                                    )
-                                );
-                        }
-                        Some(_) => {
-                            return saw_omission
-                                || matches!(
-                                    self.arena.get(*element).map(|node| node.kind),
-                                    Some(
-                                        SyntaxKind::ObjectLiteralExpression
-                                            | SyntaxKind::ArrayLiteralExpression
-                                    )
-                                );
-                        }
-                        None => {}
-                    }
+        let Some(NodeData::ArrayLiteralExpression(array)) =
+            self.arena.get(pattern).map(|node| &node.data)
+        else {
+            return false;
+        };
+        let mut saw_omission = false;
+        for element in &array.elements.nodes {
+            match self.arena.get(*element).map(|node| &node.data) {
+                Some(NodeData::OmittedExpression(_)) => saw_omission = true,
+                Some(NodeData::SpreadElement(spread)) => {
+                    return saw_omission
+                        || matches!(
+                            self.arena.get(spread.expression).map(|node| node.kind),
+                            Some(
+                                SyntaxKind::ObjectLiteralExpression
+                                    | SyntaxKind::ArrayLiteralExpression
+                            )
+                        );
                 }
-                false
+                Some(_) => {
+                    return saw_omission
+                        || matches!(
+                            self.arena.get(*element).map(|node| node.kind),
+                            Some(
+                                SyntaxKind::ObjectLiteralExpression
+                                    | SyntaxKind::ArrayLiteralExpression
+                            )
+                        );
+                }
+                None => {}
             }
-            _ => false,
         }
+        false
     }
 
     fn commonjs_destructuring_pattern_leaf_count(&self, pattern: NodeId) -> usize {
@@ -53330,7 +53321,30 @@ impl Printer<'_> {
                         )
                     })
                     .collect::<Vec<_>>();
-                let multiline = self.node_source_is_multiline(id);
+                let for_of_destructuring = node.parent.is_some_and(|parent| {
+                    matches!(
+                        self.arena.get(parent).map(|node| &node.data),
+                        Some(NodeData::ForInOrOfStatement(statement))
+                            if statement.initializer == id
+                    )
+                });
+                let multiline = if for_of_destructuring {
+                    emitted_properties.first().is_some_and(|property| {
+                        usize::try_from(node.range.start.get().saturating_add(1))
+                            .ok()
+                            .zip(
+                                self.arena
+                                    .get(*property)
+                                    .and_then(|property| {
+                                        usize::try_from(property.range.start.get()).ok()
+                                    }),
+                            )
+                            .and_then(|(start, end)| self.source_text.get(start..end))
+                            .is_some_and(|trivia| trivia.contains(['\n', '\r']))
+                    })
+                } else {
+                    self.node_source_is_multiline(id)
+                };
                 if emitted_properties.is_empty() {
                     self.writer.write("{}");
                     return Ok(());
@@ -53381,7 +53395,14 @@ impl Printer<'_> {
                             } else {
                                 self.writer.write(": ");
                             }
-                            self.emit_expression(property.initializer, 1)?;
+                            if for_of_destructuring && !multiline {
+                                self.writer.indent += 1;
+                                let result = self.emit_expression(property.initializer, 1);
+                                self.writer.indent -= 1;
+                                result?;
+                            } else {
+                                self.emit_expression(property.initializer, 1)?;
+                            }
                         }
                         NodeData::ShorthandPropertyAssignment(property) => {
                             self.emit_shorthand_property(property.name)?;
