@@ -33109,7 +33109,8 @@ impl Printer<'_> {
                 NodeData::Identifier(_)
                 | NodeData::NumericLiteral(_)
                 | NodeData::BigIntLiteral(_)
-                | NodeData::StringLiteral(_),
+                | NodeData::StringLiteral(_)
+                | NodeData::NoSubstitutionTemplateLiteral(_),
             )
             | None => false,
             Some(NodeData::ParenthesizedExpression(_)) => true,
@@ -45134,7 +45135,13 @@ impl Printer<'_> {
         self.writer.write(" {");
         self.writer.newline();
         self.writer.indent += 1;
-        let generated_temps = self.prepare_private_destructuring_rewrites(body_id);
+        let mut generated_temps = self.prepare_private_destructuring_rewrites(body_id);
+        let mut claimed_temps = generated_temps.iter().cloned().collect::<HashSet<_>>();
+        self.prepare_downlevel_nullish_temps(
+            body_id,
+            &mut claimed_temps,
+            &mut generated_temps,
+        );
         let prologue_count = body
             .statements
             .nodes
@@ -60443,6 +60450,36 @@ mod tests {
         assert!(
             output.contains(
                 "const second = (_b = ((\"nested\"))) !== null && _b !== void 0 ? _b : fallback;"
+            ),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn downlevel_nullish_coalescing_duplicates_constant_templates_without_a_temp() {
+        let output = emit_with(
+            "const value = `foo` ?? fallback;",
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert_eq!(
+            output,
+            "const value = `foo` !== null && `foo` !== void 0 ? `foo` : fallback;\n"
+        );
+    }
+
+    #[test]
+    fn downlevel_nullish_coalescing_declares_constructor_local_temps() {
+        let output = emit_with(
+            "class X { constructor() { const value = new.target ?? fallback; } }",
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(
+            output.contains(
+                "constructor() {\n        var _a;\n        const value = (_a = new.target) !== null && _a !== void 0 ? _a : fallback;\n"
             ),
             "{output}"
         );
