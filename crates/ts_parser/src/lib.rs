@@ -6452,8 +6452,8 @@ impl<'a> Parser<'a> {
         let mut element_children = vec![tag_name];
         extend_list_children(&mut element_children, type_arguments.as_ref());
         element_children.push(attributes);
-        if self.current.kind == SyntaxKind::SlashToken {
-            self.bump();
+        if self.current.kind != SyntaxKind::GreaterThanToken {
+            self.expect_and_bump(SyntaxKind::SlashToken, "Expected '/'.");
             let end = self.finish_jsx_tag(resume_jsx);
             return self.alloc_node(
                 SyntaxKind::JsxSelfClosingElement,
@@ -6531,12 +6531,16 @@ impl<'a> Parser<'a> {
 
     fn parse_jsx_children(&mut self) -> Vec<NodeId> {
         let mut children = Vec::new();
-        while !matches!(
-            self.current.kind,
-            SyntaxKind::LessThanSlashToken
-                | SyntaxKind::ConflictMarkerTrivia
-                | SyntaxKind::EndOfFile
-        ) {
+        loop {
+            self.current = self.scanner.rescan_jsx_token(true);
+            if matches!(
+                self.current.kind,
+                SyntaxKind::LessThanSlashToken
+                    | SyntaxKind::ConflictMarkerTrivia
+                    | SyntaxKind::EndOfFile
+            ) {
+                break;
+            }
             match self.current.kind {
                 SyntaxKind::JsxText | SyntaxKind::JsxTextAllWhiteSpaces => {
                     let token = self.current.clone();
@@ -12838,6 +12842,21 @@ mod tests {
 
         let custom = parse_jsx_source_file("const view = <my-widget data-id='x' />;");
         assert!(custom.diagnostics.is_empty(), "{:?}", custom.diagnostics);
+    }
+
+    #[test]
+    fn rescans_invalid_numeric_jsx_tag_as_child_text() {
+        let result = parse_jsx_source_file(concat!(
+            "const a = + <number> x;\n",
+            "const b = + <> x;\n",
+            "const c = + <1234> x;\n",
+        ));
+        assert!(result.arena.iter().any(|(_, node)| {
+            matches!(
+                &node.data,
+                NodeData::JsxText(text) if text.text.contains("1234> x;")
+            )
+        }));
     }
 
     #[test]
