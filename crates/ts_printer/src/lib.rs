@@ -14294,6 +14294,11 @@ impl DeclarationPrinter<'_> {
                 let result = self.emit_type(type_);
                 self.canonical_literal_quotes = previous;
                 result?;
+            } else if matches!(
+                self.arena.get(data.name).map(|node| &node.data),
+                Some(NodeData::BindingPattern(_))
+            ) {
+                self.emit_binding_pattern_structural_type(data.name, data.initializer, None)?;
             } else if data.dot_dot_dot_token.is_some() {
                 self.writer.write("any[]");
             } else {
@@ -59142,6 +59147,29 @@ mod tests {
                 .unwrap()
                 .code,
             "export type T = import(\"pkg\", { with: { type: \"json\" } }).Value;\n"
+        );
+    }
+
+    #[test]
+    fn emits_structural_types_for_destructured_signature_parameters() {
+        let source = concat!(
+            "interface C {\n",
+            "    ({p: name}): any;\n",
+            "    new ({p: boolean}): any;\n",
+            "}\n",
+        );
+        let parsed = parse_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        assert_eq!(
+            emit_declaration_file(&parsed.arena, parsed.source_file, "input.ts", source, false)
+                .unwrap()
+                .code,
+            concat!(
+                "interface C {\n",
+                "    ({ p: name }: {\n        p: any;\n    }): any;\n",
+                "    new ({ p: boolean }: {\n        p: any;\n    }): any;\n",
+                "}\n",
+            )
         );
     }
 
