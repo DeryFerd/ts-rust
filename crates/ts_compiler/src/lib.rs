@@ -17,7 +17,9 @@ use ts_diagnostics::{Diagnostic, message_by_code};
 use ts_glob::{DiscoveryOptions, discover_files};
 use ts_module::{ResolutionOptions, Resolver, automatic_type_directive_names, parse_package_json};
 use ts_options::{CompilerOptions, ModuleKind, PrinterSettings, parse_project_options};
-use ts_parser::{ParseResult, parse_jsx_source_file, parse_source_file};
+use ts_parser::{
+    ParseResult, parse_javascript_source_file, parse_jsx_source_file, parse_source_file,
+};
 use ts_path::{
     CaseSensitivity, canonicalize, change_extension, declaration_emit_extension, directory_path,
     is_absolute, resolve_path,
@@ -2183,15 +2185,17 @@ impl Program {
             }
             return;
         };
-        let is_jsx = Path::new(file_name).extension().is_some_and(|extension| {
-            extension.eq_ignore_ascii_case("tsx")
-                || extension.eq_ignore_ascii_case("jsx")
-                || (self.options.jsx != ts_options::JsxEmit::None
-                    && ["js", "mjs", "cjs"]
-                        .iter()
-                        .any(|candidate| extension.eq_ignore_ascii_case(candidate)))
+        let extension = Path::new(file_name)
+            .extension()
+            .and_then(|extension| extension.to_str());
+        let is_javascript = extension.is_some_and(|extension| {
+            ["js", "jsx", "mjs", "cjs"]
+                .iter()
+                .any(|candidate| extension.eq_ignore_ascii_case(candidate))
         });
-        let parse = if is_jsx {
+        let parse = if is_javascript {
+            parse_javascript_source_file(&source_text)
+        } else if extension.is_some_and(|extension| extension.eq_ignore_ascii_case("tsx")) {
             parse_jsx_source_file(&source_text)
         } else {
             parse_source_file(&source_text)
@@ -6653,6 +6657,28 @@ mod tests {
         assert_eq!(
             emitted.files[0].text,
             "\"use strict\";\nvar view = <Box label=\"ok\" />;\n"
+        );
+    }
+
+    #[test]
+    fn javascript_sources_use_jsx_language_variant_without_jsx_option() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/a.js", "~< <\n").unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["a.js".to_owned()],
+            CompilerOptions {
+                allow_js: true,
+                target: ScriptTarget::Es2015,
+                no_lib: true,
+                out_dir: Some("/project/out".to_owned()),
+                ..CompilerOptions::default()
+            },
+        );
+        assert_eq!(
+            program.emit().files[0].text,
+            "\"use strict\";\n~< /> <\n;\n"
         );
     }
 

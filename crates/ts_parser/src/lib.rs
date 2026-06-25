@@ -103,6 +103,12 @@ pub fn parse_jsx_source_file(source: &str) -> ParseResult {
     Parser::new_with_variant(source, LanguageVariant::Jsx).parse_source_file()
 }
 
+/// Parse a JavaScript source file using JSX lexical rules.
+#[must_use]
+pub fn parse_javascript_source_file(source: &str) -> ParseResult {
+    Parser::new_with_variant_and_javascript(source, LanguageVariant::Jsx, true).parse_source_file()
+}
+
 fn parse_amd_pragmas(source: &str) -> (Vec<AmdDependency>, Vec<AmdModuleName>, Vec<Diagnostic>) {
     let mut dependencies = Vec::new();
     let mut module_names = Vec::new();
@@ -336,6 +342,7 @@ struct Parser<'a> {
     scanner: Scanner<'a>,
     current: Token<'a>,
     language_variant: LanguageVariant,
+    javascript_file: bool,
     arena: NodeArena,
     diagnostics: Vec<Diagnostic>,
     invalid_token_recovery_ranges: Vec<TextRange>,
@@ -351,6 +358,14 @@ impl<'a> Parser<'a> {
     }
 
     fn new_with_variant(source: &'a str, variant: LanguageVariant) -> Self {
+        Self::new_with_variant_and_javascript(source, variant, false)
+    }
+
+    fn new_with_variant_and_javascript(
+        source: &'a str,
+        variant: LanguageVariant,
+        javascript_file: bool,
+    ) -> Self {
         let (amd_dependencies, amd_module_names, diagnostics) = parse_amd_pragmas(source);
         let mut scanner = Scanner::new(source);
         scanner.set_language_variant(variant);
@@ -361,6 +376,7 @@ impl<'a> Parser<'a> {
             scanner,
             current,
             language_variant: variant,
+            javascript_file,
             arena,
             diagnostics,
             invalid_token_recovery_ranges: Vec::new(),
@@ -6424,7 +6440,11 @@ impl<'a> Parser<'a> {
         if self.current.kind == SyntaxKind::ColonToken {
             self.bump();
         }
-        let type_arguments = self.parse_type_arguments();
+        let type_arguments = if self.javascript_file {
+            None
+        } else {
+            self.parse_type_arguments()
+        };
         let recovered_attribute = if self.current.kind == SyntaxKind::EqualsToken {
             let attribute_start = self.current.range.start;
             self.current = self.scanner.scan_jsx_attribute_value();
@@ -6717,6 +6737,10 @@ impl<'a> Parser<'a> {
                 })),
                 &attribute_children,
             ));
+        }
+        if self.current.kind == SyntaxKind::ColonToken {
+            self.error_current("Expected a JSX attribute name.");
+            self.bump();
         }
         let end = attributes.last().map_or(start, |id| self.node_end(*id));
         self.alloc_node(
@@ -8422,6 +8446,7 @@ fn is_expression_terminator(kind: SyntaxKind) -> bool {
         kind,
         SyntaxKind::SemicolonToken
             | SyntaxKind::CommaToken
+            | SyntaxKind::ColonToken
             | SyntaxKind::CloseParenToken
             | SyntaxKind::CloseBracketToken
             | SyntaxKind::CloseBraceToken
@@ -8633,7 +8658,8 @@ mod tests {
 
     use super::{
         NODE_FLAG_AWAIT_USING, NODE_FLAG_HAS_ERROR, NODE_FLAG_USING, ParseResult,
-        parse_jsdoc_comment, parse_jsx_source_file, parse_source_file, text_range,
+        parse_javascript_source_file, parse_jsdoc_comment, parse_jsx_source_file,
+        parse_source_file, text_range,
     };
 
     #[test]
@@ -12857,6 +12883,48 @@ mod tests {
                 NodeData::JsxText(text) if text.text.contains("1234> x;")
             )
         }));
+    }
+
+    #[test]
+    fn javascript_jsx_recovers_unary_elements_without_type_arguments() {
+        let less_than = parse_javascript_source_file("~< <");
+        let NodeData::ExpressionStatement(statement) =
+            &less_than.arena.get(source_statements(&less_than)[0]).unwrap().data
+        else {
+            panic!("expected expression statement");
+        };
+        let NodeData::BinaryExpression(binary) =
+            &less_than.arena.get(statement.expression).unwrap().data
+        else {
+            panic!("expected binary expression");
+        };
+        let NodeData::PrefixUnaryExpression(prefix) =
+            &less_than.arena.get(binary.left).unwrap().data
+        else {
+            panic!("expected prefix expression");
+        };
+        let NodeData::JsxSelfClosingElement(element) =
+            &less_than.arena.get(prefix.operand).unwrap().data
+        else {
+            panic!("expected self-closing JSX element");
+        };
+        assert!(element.type_arguments.is_none());
+
+        let spread = parse_javascript_source_file("!< {:>");
+        let NodeData::ExpressionStatement(statement) =
+            &spread.arena.get(source_statements(&spread)[0]).unwrap().data
+        else {
+            panic!("expected expression statement");
+        };
+        let NodeData::PrefixUnaryExpression(prefix) =
+            &spread.arena.get(statement.expression).unwrap().data
+        else {
+            panic!("expected prefix expression");
+        };
+        assert!(matches!(
+            spread.arena.get(prefix.operand).map(|node| &node.data),
+            Some(NodeData::JsxElement(_))
+        ));
     }
 
     #[test]
