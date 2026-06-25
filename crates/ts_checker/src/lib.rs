@@ -16279,6 +16279,20 @@ impl<'a> DeclarationReachability<'a> {
                         }
                         continue;
                     }
+                    NodeData::MethodDeclaration(method)
+                        if self.modifiers_have(
+                            method.modifiers.as_ref(),
+                            SyntaxKind::PrivateKeyword,
+                        ) =>
+                    {
+                        if matches!(
+                            self.arena.get(method.name).map(|node| &node.data),
+                            Some(NodeData::ComputedPropertyName(_))
+                        ) {
+                            stack.push(method.name);
+                        }
+                        continue;
+                    }
                     NodeData::PropertyDeclaration(property)
                         if property.type_.is_none() && property.initializer.is_some() =>
                     {
@@ -26078,6 +26092,29 @@ mod tests {
         assert!(retained.contains(&source.statements.nodes[0]));
         assert!(!retained.contains(&source.statements.nodes[1]));
         assert!(retained.contains(&source.statements.nodes[2]));
+    }
+
+    #[test]
+    fn private_method_signatures_do_not_retain_erased_type_dependencies() {
+        let parsed = parse_source_file(
+            r"
+                type Arg = { value: number };
+                export class C {
+                    private method({ value }: Arg): number { return value; }
+                }
+            ",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        let NodeData::SourceFile(source) = &parsed.arena.get(parsed.source_file).unwrap().data
+        else {
+            panic!("expected source file");
+        };
+        let retained = result.declarations_to_emit(parsed.source_file).unwrap();
+
+        assert!(!retained.contains(&source.statements.nodes[0]));
+        assert!(retained.contains(&source.statements.nodes[1]));
     }
 
     #[test]

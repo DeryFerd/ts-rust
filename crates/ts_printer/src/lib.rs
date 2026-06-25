@@ -487,6 +487,7 @@ pub fn emit_source_file_with_context(
             context.bindings,
             &printer.runtime_identifier_uses,
             &printer.synthetic_runtime_identifier_uses,
+            context.verbatim_module_syntax,
         );
         printer
             .generated_names
@@ -500,6 +501,7 @@ pub fn emit_source_file_with_context(
             &printer.runtime_identifier_uses,
             &printer.synthetic_runtime_identifier_uses,
             &printer.commonjs_star_import_temps,
+            context.verbatim_module_syntax,
         );
         printer
             .generated_names
@@ -513,6 +515,7 @@ pub fn emit_source_file_with_context(
             &printer.synthetic_runtime_identifier_uses,
             &printer.commonjs_default_imports,
             &printer.commonjs_star_import_temps,
+            context.verbatim_module_syntax,
         );
         printer
             .generated_names
@@ -2059,6 +2062,7 @@ fn commonjs_star_imports(
     bindings: &BindResult,
     runtime_identifier_uses: &HashSet<String>,
     synthetic_runtime_identifier_uses: &HashSet<String>,
+    retain_unused: bool,
 ) -> (
     HashMap<NodeId, String>,
     HashMap<SymbolId, String>,
@@ -2087,13 +2091,14 @@ fn commonjs_star_imports(
         let mut defaults = Vec::new();
         let mut named = Vec::new();
         if let Some(name) = clause.name
-            && binding_has_runtime_identifier_use(
+            && (retain_unused
+                || binding_has_runtime_identifier_use(
                 arena,
                 bindings,
                 name,
                 runtime_identifier_uses,
                 synthetic_runtime_identifier_uses,
-            )
+            ))
         {
             defaults.push(name);
         }
@@ -2111,7 +2116,8 @@ fn commonjs_star_imports(
                 let local_is_reexported = declaration_name_text(arena, specifier.name)
                     .is_some_and(|name| import_name_is_reexported(arena, name));
                 if specifier.is_type_only
-                    || (!local_is_reexported
+                    || (!retain_unused
+                        && !local_is_reexported
                         && !binding_has_runtime_identifier_use(
                             arena,
                             bindings,
@@ -2190,6 +2196,7 @@ fn commonjs_default_imports(
     runtime_identifier_uses: &HashSet<String>,
     synthetic_runtime_identifier_uses: &HashSet<String>,
     star_imports: &HashMap<NodeId, String>,
+    retain_unused: bool,
 ) -> HashMap<String, String> {
     let mut imports = HashMap::new();
     let mut module_name_counts = HashMap::<String, usize>::new();
@@ -2211,13 +2218,14 @@ fn commonjs_default_imports(
         }
         let mut local_names = Vec::new();
         if let Some(name) = clause.name
-            && binding_has_runtime_identifier_use(
+            && (retain_unused
+                || binding_has_runtime_identifier_use(
                 arena,
                 bindings,
                 name,
                 runtime_identifier_uses,
                 synthetic_runtime_identifier_uses,
-            )
+            ))
             && let Some(name) = declaration_name_text(arena, name)
         {
             local_names.push(name.to_owned());
@@ -2240,7 +2248,8 @@ fn commonjs_default_imports(
                 let is_default = specifier.property_name.is_some_and(|property| {
                     declaration_name_text(arena, property) == Some("default")
                 });
-                if (binding_has_runtime_identifier_use(
+                if (retain_unused
+                    || binding_has_runtime_identifier_use(
                     arena,
                     bindings,
                     specifier.name,
@@ -2320,6 +2329,7 @@ fn amd_import_dependency_path(path: &str, bundle: bool) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn commonjs_named_imports(
     arena: &NodeArena,
     statements: &NodeList,
@@ -2328,6 +2338,7 @@ fn commonjs_named_imports(
     synthetic_runtime_identifier_uses: &HashSet<String>,
     default_imports: &HashMap<String, String>,
     star_imports: &HashMap<NodeId, String>,
+    retain_unused: bool,
 ) -> (
     HashMap<NodeId, String>,
     HashMap<SymbolId, String>,
@@ -2390,13 +2401,15 @@ fn commonjs_named_imports(
             let Some(local) = declaration_name_text(arena, specifier.name) else {
                 continue;
             };
-            if !binding_has_runtime_identifier_use(
+            if !retain_unused
+                && !binding_has_runtime_identifier_use(
                 arena,
                 bindings,
                 specifier.name,
                 runtime_identifier_uses,
                 synthetic_runtime_identifier_uses,
-            ) && !import_name_is_reexported(arena, local)
+            )
+                && !import_name_is_reexported(arena, local)
             {
                 continue;
             }
@@ -42561,24 +42574,51 @@ impl Printer<'_> {
         self.writer.write("([");
         self.writer.newline();
         self.writer.indent += 1;
-        let metadata_parameters = self.emit_decorator_metadata.then(|| {
-            data.members.nodes.iter().find_map(|member| {
-                let NodeData::MethodDeclaration(method) = &self.arena.get(*member)?.data else {
-                    return None;
-                };
-                self.is_constructor_name(method.name)
-                    .then_some(&method.parameters)
+        let constructor_parameters = data.members.nodes.iter().find_map(|member| {
+            let NodeData::MethodDeclaration(method) = &self.arena.get(*member)?.data else {
+                return None;
+            };
+            self.is_constructor_name(method.name)
+                .then_some(&method.parameters)
+        });
+        let parameter_decorators = constructor_parameters
+            .into_iter()
+            .flat_map(|parameters| parameters.nodes.iter().enumerate())
+            .flat_map(|(index, parameter)| {
+                let modifiers = self.arena.get(*parameter).and_then(declaration_modifiers);
+                self.class_decorator_expressions(modifiers)
+                    .into_iter()
+                    .map(move |decorator| (index, decorator))
             })
-        }).flatten();
+            .collect::<Vec<_>>();
+        let metadata_parameters = self
+            .emit_decorator_metadata
+            .then_some(constructor_parameters)
+            .flatten();
         for (index, decorator) in decorators.iter().enumerate() {
             self.emit_expression(*decorator, 1)?;
             self.emit_decorator_trailing_line_comment(*decorator, data.modifiers.as_ref());
-            if metadata_parameters.is_some() || index + 1 != decorators.len() {
+            if !parameter_decorators.is_empty()
+                || metadata_parameters.is_some()
+                || index + 1 != decorators.len()
+            {
                 self.writer.write(",");
             }
             if !self.writer.line_start {
                 self.writer.newline();
             }
+        }
+        for (index, (parameter_index, decorator)) in parameter_decorators.iter().enumerate() {
+            self.emit_helper_reference("__param");
+            self.writer.write("(");
+            self.writer.write(&parameter_index.to_string());
+            self.writer.write(", ");
+            self.emit_expression(*decorator, 1)?;
+            self.writer.write(")");
+            if metadata_parameters.is_some() || index + 1 != parameter_decorators.len() {
+                self.writer.write(",");
+            }
+            self.writer.newline();
         }
         if let Some(parameters) = metadata_parameters {
             self.emit_helper_reference("__metadata");
@@ -42640,6 +42680,12 @@ impl Printer<'_> {
                 continue;
             }
             let member = self.node(*member_id)?.clone();
+            if matches!(
+                &member.data,
+                NodeData::MethodDeclaration(method) if self.is_constructor_name(method.name)
+            ) {
+                continue;
+            }
             let (
                 name,
                 modifiers,
@@ -47342,9 +47388,7 @@ impl Printer<'_> {
         let NodeData::ImportClause(clause) = &clause_node.data else {
             return Err(Self::unsupported(clause_id, clause_node.kind));
         };
-        let runtime_bindings = clause
-            .named_bindings
-            .filter(|bindings| self.import_bindings_have_runtime_use(*bindings));
+        let runtime_bindings = self.commonjs_runtime_import_bindings(clause);
         if let Some(temp) = self.commonjs_star_import_temps.get(&clause_id).cloned() {
             self.writer.write(self.variable_keyword());
             self.writer.write(" ");
@@ -47405,7 +47449,7 @@ impl Printer<'_> {
         if let Some(bindings) = runtime_bindings {
             let bindings_node = self.node(bindings)?.clone();
             let is_namespace_import = matches!(bindings_node.data, NodeData::NamespaceImport(_));
-            if matches!(&bindings_node.data, NodeData::NamedImports(imports) if imports.elements.nodes.iter().filter(|element| self.import_specifier_has_runtime_use(**element)).all(|element| self.commonjs_import_specifier_is_default(*element)))
+            if matches!(&bindings_node.data, NodeData::NamedImports(imports) if imports.elements.nodes.iter().filter(|element| self.commonjs_import_specifier_is_retained(**element)).all(|element| self.commonjs_import_specifier_is_default(*element)))
             {
                 return Ok(());
             }
@@ -47471,14 +47515,37 @@ impl Printer<'_> {
             .is_some_and(|property| declaration_name_text(self.arena, property) == Some("default"))
     }
 
+    fn commonjs_runtime_import_bindings(
+        &self,
+        clause: &ts_ast::ImportClauseData,
+    ) -> Option<NodeId> {
+        clause.named_bindings.filter(|bindings| {
+            (self.verbatim_module_syntax
+                && self.import_bindings_have_syntactic_value(*bindings))
+                || self.import_bindings_have_runtime_use(*bindings)
+        })
+    }
+
+    fn commonjs_import_specifier_is_retained(&self, specifier: NodeId) -> bool {
+        let Some(NodeData::ImportSpecifier(data)) =
+            self.arena.get(specifier).map(|node| &node.data)
+        else {
+            return false;
+        };
+        !data.is_type_only
+            && (self.verbatim_module_syntax || self.import_specifier_has_runtime_use(specifier))
+    }
+
     fn commonjs_has_non_default_bindings(&self, bindings: Option<NodeId>) -> bool {
         let Some(bindings) = bindings.and_then(|bindings| self.arena.get(bindings)) else {
             return false;
         };
         match &bindings.data {
-            NodeData::NamespaceImport(namespace) => self.import_binding_is_used(namespace.name),
+            NodeData::NamespaceImport(namespace) => {
+                self.verbatim_module_syntax || self.import_binding_is_used(namespace.name)
+            }
             NodeData::NamedImports(imports) => imports.elements.nodes.iter().any(|element| {
-                self.import_specifier_has_runtime_use(*element)
+                self.commonjs_import_specifier_is_retained(*element)
                     && !self.commonjs_import_specifier_is_default(*element)
             }),
             _ => false,
@@ -47493,7 +47560,7 @@ impl Printer<'_> {
         let mut emitted = false;
         for specifier in &data.elements.nodes {
             if self.commonjs_import_specifier_is_default(*specifier)
-                || !self.import_specifier_has_runtime_use(*specifier)
+                || !self.commonjs_import_specifier_is_retained(*specifier)
             {
                 continue;
             }
@@ -56358,6 +56425,7 @@ mod tests {
     fn emit_commonjs_with_false_runtime_meaning(
         source: &str,
         statement_index: usize,
+        verbatim_module_syntax: bool,
     ) -> super::EmitResult {
         let parsed = parse_source_file(source);
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
@@ -56408,7 +56476,7 @@ mod tests {
                 emit_decorator_metadata: false,
                 es_module_interop: false,
                 preserve_dynamic_import: false,
-                verbatim_module_syntax: false,
+                verbatim_module_syntax,
                 isolated_modules: false,
                 strict_null_checks: false,
                 force_use_strict: false,
@@ -61339,6 +61407,7 @@ class Board {
         let result = emit_commonjs_with_false_runtime_meaning(
             "import * as Lib from './file1'; namespace Lib { export const foo = \"\"; } Lib.foo; var x: Lib.Bar; export { Lib };",
             0,
+            false,
         );
         assert_eq!(
             result.code,
@@ -61674,9 +61743,37 @@ class Board {
 
     #[test]
     fn commonjs_keeps_syntactic_export_star_with_type_only_semantics() {
-        let output = emit_commonjs_with_false_runtime_meaning("export * from './types';", 0).code;
+        let output =
+            emit_commonjs_with_false_runtime_meaning("export * from './types';", 0, false).code;
         assert!(
             output.contains("__exportStar(require(\"./types\"), exports);"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn commonjs_verbatim_modules_retain_unused_value_imports() {
+        let output = emit_commonjs_with_false_runtime_meaning(
+            concat!(
+                "import Default from './default'; ",
+                "import { Named } from './named'; ",
+                "import * as Namespace from './namespace'; ",
+                "type Uses = [Default, Named, Namespace.Value];",
+            ),
+            0,
+            true,
+        )
+        .code;
+        assert!(
+            output.contains("const default_1 = require(\"./default\");"),
+            "{output}"
+        );
+        assert!(
+            output.contains("const named_1 = require(\"./named\");"),
+            "{output}"
+        );
+        assert!(
+            output.contains("const Namespace = require(\"./namespace\");"),
             "{output}"
         );
     }
@@ -61687,7 +61784,7 @@ class Board {
             "import key from './key';\n",
             "export default { [key.value]: {} };"
         );
-        let output = emit_commonjs_with_false_runtime_meaning(source, 0).code;
+        let output = emit_commonjs_with_false_runtime_meaning(source, 0, false).code;
         assert!(
             output.contains("const key_1 = __importDefault(require(\"./key\"));"),
             "{output}"
@@ -63166,6 +63263,27 @@ class Board {
             ),
             "{output}"
         );
+    }
+
+    #[test]
+    fn folds_constructor_parameter_decorators_into_the_class_assignment() {
+        let output = emit_with_decorator_mode(
+            "@classDecorator class C { constructor(@parameter value: number) {} }",
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+            true,
+        )
+        .code;
+        assert!(
+            output.contains(concat!(
+                "C = __decorate([\n",
+                "    classDecorator,\n",
+                "    __param(0, parameter)\n",
+                "], C);",
+            )),
+            "{output}"
+        );
+        assert!(!output.contains("C.prototype, \"constructor\""), "{output}");
     }
 
     #[test]
