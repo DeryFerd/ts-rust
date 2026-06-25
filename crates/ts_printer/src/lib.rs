@@ -24176,7 +24176,7 @@ struct SystemModulePlan {
     dependencies: Vec<SystemDependency>,
     hoisted_names: Vec<String>,
     identifier_rewrites: HashMap<ts_ast::SymbolId, String>,
-    exported_bindings: HashMap<ts_ast::SymbolId, String>,
+    exported_bindings: HashMap<ts_ast::SymbolId, Vec<String>>,
     hoisted_functions: Vec<NodeId>,
     export_star_function: Option<String>,
     export_star_names: Vec<String>,
@@ -24434,6 +24434,7 @@ impl SystemModulePlan {
         jsx: JsxEmit,
         runtime_modules: &HashSet<NodeId>,
         runtime_identifier_uses: &HashSet<String>,
+        preserve_const_enums: bool,
         generated_name_offsets: &BTreeMap<String, u32>,
     ) -> Self {
         let mut names = GeneratedNames::new(arena);
@@ -24477,13 +24478,27 @@ impl SystemModulePlan {
                 let exported_name = declaration_name_text(arena, specifier.name)
                     .unwrap_or(local_name)
                     .to_owned();
-                push_unique(&mut hoisted_names, local_name);
                 if let Some(symbol) = bindings
                     .root_scope()
                     .and_then(|scope| scope.symbols.get(local_name))
                     .or_else(|| bindings.resolve_name_at(local, local_name))
                 {
-                    exported_bindings.insert(symbol, exported_name);
+                    let runtime_flags = SymbolFlags::VARIABLE
+                        | SymbolFlags::CLASS
+                        | SymbolFlags::REGULAR_ENUM
+                        | SymbolFlags::VALUE_MODULE
+                        | SymbolFlags::NAMESPACE_MODULE;
+                    if let Some(symbol_data) = bindings.symbols.get(symbol)
+                        && symbol_data
+                            .flags
+                            .intersects(runtime_flags | SymbolFlags::FUNCTION)
+                    {
+                        push_system_export_name(
+                            &mut exported_bindings,
+                            symbol,
+                            exported_name,
+                        );
+                    }
                 }
             }
         }
@@ -24623,8 +24638,10 @@ impl SystemModulePlan {
             {
                 continue;
             }
-            if matches!(node.data, NodeData::ImportDeclaration(_))
-                && !runtime_imports.contains(statement)
+            if matches!(
+                node.data,
+                NodeData::ImportDeclaration(ref import) if import.import_clause.is_some()
+            ) && !runtime_imports.contains(statement)
             {
                 continue;
             }
@@ -24646,16 +24663,39 @@ impl SystemModulePlan {
                             .find(|dependency| dependency.specifier == specifier)
                         {
                             existing.storages.push(local.to_owned());
+                            if declaration_has_modifier(
+                                arena,
+                                node,
+                                SyntaxKind::ExportKeyword,
+                            ) {
+                                existing
+                                    .storage_exports
+                                    .push((existing.parameter.clone(), local.to_owned()));
+                            }
                             push_unique(&mut hoisted_names, local);
                             if let Some(symbol) = bindings.node_symbols.get(&import.name) {
-                                identifier_rewrites.insert(*symbol, local.to_owned());
+                                insert_system_identifier_rewrite(
+                                    bindings,
+                                    *symbol,
+                                    local,
+                                    &mut identifier_rewrites,
+                                );
                             }
                         } else {
                             let parameter = names.generate(local);
+                            let storage_exports = if declaration_has_modifier(
+                                arena,
+                                node,
+                                SyntaxKind::ExportKeyword,
+                            ) {
+                                vec![(parameter.clone(), local.to_owned())]
+                            } else {
+                                Vec::new()
+                            };
                             dependencies.push(SystemDependency {
                                 specifier: specifier.to_owned(),
                                 storages: vec![local.to_owned()],
-                                storage_exports: Vec::new(),
+                                storage_exports,
                                 namespace_exports: Vec::new(),
                                 named_exports: Vec::new(),
                                 parameter,
@@ -24669,6 +24709,25 @@ impl SystemModulePlan {
                 }
                 NodeData::ImportDeclaration(import) => {
                     let Some(clause) = import.import_clause else {
+                        let Some(specifier) =
+                            string_literal_text(arena, import.module_specifier)
+                        else {
+                            continue;
+                        };
+                        if !dependencies
+                            .iter()
+                            .any(|dependency| dependency.specifier == specifier)
+                        {
+                            dependencies.push(SystemDependency {
+                                specifier: specifier.to_owned(),
+                                storages: Vec::new(),
+                                storage_exports: Vec::new(),
+                                namespace_exports: Vec::new(),
+                                named_exports: Vec::new(),
+                                parameter: names.generate(""),
+                                export_star: false,
+                            });
+                        }
                         continue;
                     };
                     let Some(NodeData::ImportClause(clause)) =
@@ -24681,7 +24740,8 @@ impl SystemModulePlan {
                         continue;
                     };
                     let base = module_identifier_base(specifier);
-                    let storage = if let Some(bindings_id) = clause.named_bindings
+                    let storage = if clause.name.is_none()
+                        && let Some(bindings_id) = clause.named_bindings
                         && let Some(NodeData::NamespaceImport(namespace)) =
                             arena.get(bindings_id).map(|node| &node.data)
                     {
@@ -24712,7 +24772,12 @@ impl SystemModulePlan {
                     if let Some(name) = clause.name
                         && let Some(symbol) = bindings.node_symbols.get(&name)
                     {
-                        identifier_rewrites.insert(*symbol, format!("{storage}.default"));
+                        insert_system_identifier_rewrite(
+                            bindings,
+                            *symbol,
+                            &format!("{storage}.default"),
+                            &mut identifier_rewrites,
+                        );
                     }
                     if let Some(bindings_id) = clause.named_bindings {
                         match arena.get(bindings_id).map(|node| &node.data) {
@@ -24729,14 +24794,26 @@ impl SystemModulePlan {
                                         continue;
                                     };
                                     if let Some(symbol) = bindings.node_symbols.get(&import.name) {
-                                        identifier_rewrites
-                                            .insert(*symbol, format!("{storage}.{imported}"));
+                                        insert_system_identifier_rewrite(
+                                            bindings,
+                                            *symbol,
+                                            &format!("{storage}.{imported}"),
+                                            &mut identifier_rewrites,
+                                        );
                                     }
                                 }
                             }
                             Some(NodeData::NamespaceImport(namespace)) => {
-                                if let Some(symbol) = bindings.node_symbols.get(&namespace.name) {
-                                    identifier_rewrites.insert(*symbol, storage.clone());
+                                if clause.name.is_none()
+                                    && let Some(symbol) =
+                                        bindings.node_symbols.get(&namespace.name)
+                                {
+                                    insert_system_identifier_rewrite(
+                                        bindings,
+                                        *symbol,
+                                        &storage,
+                                        &mut identifier_rewrites,
+                                    );
                                 }
                             }
                             _ => {}
@@ -24746,25 +24823,65 @@ impl SystemModulePlan {
                 NodeData::VariableStatement(statement)
                     if !declaration_has_modifier(arena, node, SyntaxKind::DeclareKeyword) =>
                 {
-                    for name in simple_variable_names(arena, statement.declaration_list) {
-                        push_unique(&mut hoisted_names, &name);
-                    }
-                    if declaration_has_modifier(arena, node, SyntaxKind::ExportKeyword)
+                    let exported = declaration_has_modifier(
+                        arena,
+                        node,
+                        SyntaxKind::ExportKeyword,
+                    );
+                    if exported
                         && let Some(NodeData::VariableDeclarationList(list)) =
                             arena.get(statement.declaration_list).map(|node| &node.data)
                     {
                         for declaration in &list.declarations.nodes {
-                            let declaration_id = *declaration;
                             let Some(NodeData::VariableDeclaration(declaration)) =
-                                arena.get(declaration_id).map(|node| &node.data)
+                                arena.get(*declaration).map(|node| &node.data)
                             else {
                                 continue;
                             };
-                            let Some(name) = declaration_name_text(arena, declaration.name) else {
+                            if binding_pattern_has_multiple_leaves(arena, declaration.name) {
+                                let temp = names.generate_temp();
+                                push_unique(&mut hoisted_names, &temp);
+                            }
+                            let mut declaration_names = Vec::new();
+                            collect_binding_names(
+                                arena,
+                                declaration.name,
+                                &mut declaration_names,
+                            );
+                            for name in declaration_names {
+                                push_unique(&mut hoisted_names, &name);
+                            }
+                        }
+                    } else {
+                        for name in simple_variable_names(arena, statement.declaration_list) {
+                            push_unique(&mut hoisted_names, &name);
+                        }
+                    }
+                    if exported
+                        && let Some(NodeData::VariableDeclarationList(list)) =
+                            arena.get(statement.declaration_list).map(|node| &node.data)
+                    {
+                        for declaration in &list.declarations.nodes {
+                            let Some(NodeData::VariableDeclaration(declaration)) =
+                                arena.get(*declaration).map(|node| &node.data)
+                            else {
                                 continue;
                             };
-                            if let Some(symbol) = bindings.node_symbols.get(&declaration_id) {
-                                exported_bindings.insert(*symbol, name.to_owned());
+                            let mut names = Vec::new();
+                            collect_binding_name_nodes(arena, declaration.name, &mut names);
+                            for (name_id, name) in names {
+                                if let Some(symbol) = bindings
+                                    .node_symbols
+                                    .get(&name_id)
+                                    .copied()
+                                    .or_else(|| bindings.resolve_name_at(name_id, &name))
+                                {
+                                    push_system_export_name(
+                                        &mut exported_bindings,
+                                        symbol,
+                                        name,
+                                    );
+                                }
                             }
                         }
                     }
@@ -24782,7 +24899,11 @@ impl SystemModulePlan {
                         if declaration_has_modifier(arena, node, SyntaxKind::ExportKeyword)
                             && let Some(symbol) = bindings.node_symbols.get(&name_id)
                         {
-                            exported_bindings.insert(*symbol, name.to_owned());
+                            push_system_export_name(
+                                &mut exported_bindings,
+                                *symbol,
+                                name.to_owned(),
+                            );
                         }
                     }
                 }
@@ -24791,7 +24912,16 @@ impl SystemModulePlan {
                         && runtime_modules.contains(statement) =>
                 {
                     if let Some(name) = declaration_name_text(arena, module.name) {
-                        push_unique(&mut hoisted_names, name);
+                        let merged_with_function = bindings
+                            .node_symbols
+                            .get(&module.name)
+                            .copied()
+                            .or_else(|| bindings.resolve_name_at(module.name, name))
+                            .and_then(|symbol| bindings.symbols.get(symbol))
+                            .is_some_and(|symbol| symbol.flags.intersects(SymbolFlags::FUNCTION));
+                        if !merged_with_function {
+                            push_unique(&mut hoisted_names, name);
+                        }
                         collect_namespace_alias_rewrites(
                             arena,
                             bindings,
@@ -24802,7 +24932,8 @@ impl SystemModulePlan {
                     }
                 }
                 NodeData::EnumDeclaration(enumeration)
-                    if !declaration_has_modifier(arena, node, SyntaxKind::DeclareKeyword) =>
+                    if !declaration_has_modifier(arena, node, SyntaxKind::DeclareKeyword)
+                        && (!is_const_enum_declaration(arena, node) || preserve_const_enums) =>
                 {
                     if let Some(name) = declaration_name_text(arena, enumeration.name) {
                         push_unique(&mut hoisted_names, name);
@@ -24814,20 +24945,13 @@ impl SystemModulePlan {
         let mut nested_var_names = arena
             .iter()
             .filter_map(|(id, node)| {
-                let NodeData::VariableStatement(statement) = &node.data else {
+                let NodeData::VariableDeclarationList(_) = &node.data else {
                     return None;
                 };
-                if declaration_has_modifier(arena, node, SyntaxKind::DeclareKeyword) {
+                if node.flags.0 & 3 != 0 || !is_source_file_var_declaration(arena, id) {
                     return None;
                 }
-                let list = arena.get(statement.declaration_list)?;
-                if list.flags.0 & 3 != 0 || !is_source_file_var_declaration(arena, id) {
-                    return None;
-                }
-                Some((
-                    node.range.start,
-                    simple_variable_names(arena, statement.declaration_list),
-                ))
+                Some((node.range.start, simple_variable_names(arena, id)))
             })
             .collect::<Vec<_>>();
         nested_var_names.sort_by_key(|(start, _)| *start);
@@ -24851,7 +24975,11 @@ impl SystemModulePlan {
                             }
                         }
                         NodeData::FunctionDeclaration(declaration) => {
-                            if let Some(name) = declaration
+                            if !declaration_has_modifier(
+                                arena,
+                                node,
+                                SyntaxKind::DefaultKeyword,
+                            ) && let Some(name) = declaration
                                 .name
                                 .and_then(|name| declaration_name_text(arena, name))
                             {
@@ -24859,7 +24987,11 @@ impl SystemModulePlan {
                             }
                         }
                         NodeData::ClassDeclaration(declaration) => {
-                            if let Some(name) = declaration
+                            if !declaration_has_modifier(
+                                arena,
+                                node,
+                                SyntaxKind::DefaultKeyword,
+                            ) && let Some(name) = declaration
                                 .name
                                 .and_then(|name| declaration_name_text(arena, name))
                             {
@@ -24877,6 +25009,23 @@ impl SystemModulePlan {
                             }
                         }
                         _ => {}
+                    }
+                }
+                if let NodeData::ExportDeclaration(export) = &node.data
+                    && !export.is_type_only
+                    && let Some(NodeData::NamedExports(exports)) = export
+                        .export_clause
+                        .and_then(|clause| arena.get(clause))
+                        .map(|node| &node.data)
+                {
+                    for specifier in &exports.elements.nodes {
+                        if let Some(NodeData::ExportSpecifier(specifier)) =
+                            arena.get(*specifier).map(|node| &node.data)
+                            && !specifier.is_type_only
+                            && let Some(name) = declaration_name_text(arena, specifier.name)
+                        {
+                            push_unique(&mut export_star_names, name);
+                        }
                     }
                 }
             }
@@ -24914,6 +25063,7 @@ fn is_source_file_var_declaration(arena: &NodeArena, mut node: NodeId) -> bool {
                 | NodeData::GetAccessorDeclaration(_)
                 | NodeData::SetAccessorDeclaration(_)
                 | NodeData::ClassExpression(_)
+                | NodeData::ModuleDeclaration(_)
         ) {
             return false;
         }
@@ -24997,6 +25147,46 @@ fn push_unique(names: &mut Vec<String>, name: &str) {
     }
 }
 
+fn push_system_export_name(
+    bindings: &mut HashMap<ts_ast::SymbolId, Vec<String>>,
+    symbol: ts_ast::SymbolId,
+    name: String,
+) {
+    let names = bindings.entry(symbol).or_default();
+    if !names.contains(&name) {
+        names.push(name);
+    }
+}
+
+fn insert_system_identifier_rewrite(
+    bindings: &BindResult,
+    symbol: SymbolId,
+    rewrite: &str,
+    rewrites: &mut HashMap<SymbolId, String>,
+) {
+    let mut targets = HashSet::from([symbol]);
+    loop {
+        let aliases = bindings
+            .symbols
+            .iter()
+            .filter(|candidate| {
+                candidate
+                    .target
+                    .is_some_and(|target| targets.contains(&target))
+                    && !targets.contains(&candidate.id)
+            })
+            .map(|candidate| candidate.id)
+            .collect::<Vec<_>>();
+        if aliases.is_empty() {
+            break;
+        }
+        targets.extend(aliases);
+    }
+    for target in targets {
+        rewrites.insert(target, rewrite.to_owned());
+    }
+}
+
 fn string_literal_text(arena: &NodeArena, node: NodeId) -> Option<&str> {
     match &arena.get(node)?.data {
         NodeData::StringLiteral(literal) => Some(&literal.text),
@@ -25061,6 +25251,51 @@ fn collect_binding_names(arena: &NodeArena, name: NodeId, names: &mut Vec<String
         }
         _ => {}
     }
+}
+
+fn collect_binding_name_nodes(
+    arena: &NodeArena,
+    name: NodeId,
+    names: &mut Vec<(NodeId, String)>,
+) {
+    match arena.get(name).map(|node| &node.data) {
+        Some(NodeData::Identifier(identifier)) => names.push((name, identifier.text.clone())),
+        Some(NodeData::BindingPattern(pattern)) => {
+            for element in &pattern.elements.nodes {
+                if let Some(NodeData::BindingElement(element)) =
+                    arena.get(*element).map(|node| &node.data)
+                    && let Some(name) = element.name
+                {
+                    collect_binding_name_nodes(arena, name, names);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn binding_pattern_has_multiple_leaves(arena: &NodeArena, name: NodeId) -> bool {
+    fn leaf_count(arena: &NodeArena, name: NodeId) -> usize {
+        match arena.get(name).map(|node| &node.data) {
+            Some(NodeData::Identifier(_)) => 1,
+            Some(NodeData::BindingPattern(pattern)) => pattern
+                .elements
+                .nodes
+                .iter()
+                .filter_map(|element| match arena.get(*element).map(|node| &node.data) {
+                    Some(NodeData::BindingElement(element)) => element.name,
+                    _ => None,
+                })
+                .map(|name| leaf_count(arena, name))
+                .sum(),
+            _ => 0,
+        }
+    }
+
+    matches!(
+        arena.get(name).map(|node| &node.data),
+        Some(NodeData::BindingPattern(_))
+    ) && leaf_count(arena, name) > 1
 }
 
 fn collect_namespace_alias_rewrites(
@@ -25333,7 +25568,7 @@ struct Printer<'a> {
     enum_member_identifier_rewrites: HashMap<String, String>,
     system_predeclared_names: HashSet<String>,
     system_export_function: Option<String>,
-    system_exported_bindings: HashMap<ts_ast::SymbolId, String>,
+    system_exported_bindings: HashMap<ts_ast::SymbolId, Vec<String>>,
     commonjs_module_transform: bool,
     enum_member_values: &'a BTreeMap<NodeId, EmitConstantValue>,
     enum_access_values: &'a BTreeMap<NodeId, EmitConstantValue>,
@@ -26952,6 +27187,7 @@ impl Printer<'_> {
             self.settings.jsx,
             &runtime_modules,
             &self.runtime_identifier_uses,
+            self.const_enum_emit_mode.preserves_declarations(),
             context.amd_generated_name_offsets,
         );
         for dependency in &mut plan.dependencies {
@@ -26966,18 +27202,19 @@ impl Printer<'_> {
             let Some(node) = self.arena.get(*statement) else {
                 continue;
             };
-            let NodeData::ClassDeclaration(class) = &node.data else {
-                continue;
-            };
-            if class.name.is_some()
-                || !declaration_has_modifier(self.arena, node, SyntaxKind::DefaultKeyword)
-            {
-                continue;
+            let anonymous_default = match &node.data {
+                NodeData::ClassDeclaration(class) => class.name.is_none(),
+                NodeData::FunctionDeclaration(function) => function.name.is_none(),
+                _ => false,
+            } && declaration_has_modifier(self.arena, node, SyntaxKind::DefaultKeyword);
+            if anonymous_default {
+                let name = self.generated_names.generate("default");
+                self.commonjs_anonymous_default_names
+                    .insert(*statement, name.clone());
+                if matches!(node.data, NodeData::ClassDeclaration(_)) {
+                    push_unique(&mut plan.hoisted_names, &name);
+                }
             }
-            let name = self.generated_names.generate("default");
-            self.commonjs_anonymous_default_names
-                .insert(*statement, name.clone());
-            push_unique(&mut plan.hoisted_names, &name);
         }
         if !self.imported_helpers.is_empty() {
             let namespace = self.generated_names.generate("tslib");
@@ -27027,9 +27264,7 @@ impl Printer<'_> {
             self.emit_leading_pinned_source_comments(start);
         }
         self.writer.write("System.register(");
-        if context.amd_bundle
-            && let Some(name) = context.amd_module_name
-        {
+        if let Some(name) = context.amd_module_name {
             write_quoted(&mut self.writer, name);
             self.writer.write(", ");
         }
@@ -27073,6 +27308,62 @@ impl Printer<'_> {
         self.writer.write(&plan.context_object);
         self.writer.write(".id;");
         self.writer.newline();
+        let mut previous_function_end = 0;
+        for function_id in &plan.hoisted_functions {
+            let function_node = self.node(*function_id)?.clone();
+            self.emit_source_comments_between_with_trailing(
+                previous_function_end,
+                function_node.range.start.get(),
+                previous_function_end != 0,
+            );
+            self.emit_statement(*function_id)?;
+            if let NodeData::FunctionDeclaration(function) = &function_node.data {
+                let name_id = function.name;
+                let name = name_id
+                    .and_then(|name| declaration_name_text(self.arena, name))
+                    .map(str::to_owned)
+                    .or_else(|| self.commonjs_anonymous_default_names.get(function_id).cloned());
+                if let Some(name) = name {
+                    let symbol_exports = name_id
+                        .and_then(|name_id| {
+                            self.bindings
+                                .node_symbols
+                                .get(&name_id)
+                                .copied()
+                                .or_else(|| self.bindings.resolve_name_at(name_id, &name))
+                        })
+                        .and_then(|symbol| plan.exported_bindings.get(&symbol))
+                        .cloned();
+                    let exported_names = symbol_exports.unwrap_or_else(|| {
+                        if self.has_modifier(
+                            function.modifiers.as_ref(),
+                            SyntaxKind::ExportKeyword,
+                        ) {
+                            vec![if self.has_modifier(
+                                function.modifiers.as_ref(),
+                                SyntaxKind::DefaultKeyword,
+                            ) {
+                                "default".to_owned()
+                            } else {
+                                name.clone()
+                            }]
+                        } else {
+                            Vec::new()
+                        }
+                    });
+                    for exported_name in exported_names {
+                        self.writer.write(&plan.export_function);
+                        self.writer.write("(");
+                        write_quoted(&mut self.writer, &exported_name);
+                        self.writer.write(", ");
+                        self.writer.write(&name);
+                        self.writer.write(");");
+                        self.writer.newline();
+                    }
+                }
+            }
+            previous_function_end = function_node.range.end.get();
+        }
         if let Some(export_star) = plan.export_star_function.as_deref() {
             if let Some(exported_names) = plan.exported_names_object.as_deref() {
                 self.writer.write("var ");
@@ -27120,31 +27411,6 @@ impl Printer<'_> {
             self.writer.write("}");
             self.writer.newline();
         }
-        let mut previous_function_end = 0;
-        for function_id in &plan.hoisted_functions {
-            let function_node = self.node(*function_id)?.clone();
-            self.emit_source_comments_between_with_trailing(
-                previous_function_end,
-                function_node.range.start.get(),
-                previous_function_end != 0,
-            );
-            self.emit_statement(*function_id)?;
-            if let NodeData::FunctionDeclaration(function) = &function_node.data
-                && self.has_modifier(function.modifiers.as_ref(), SyntaxKind::ExportKeyword)
-                && let Some(name) = function
-                    .name
-                    .and_then(|name| declaration_name_text(self.arena, name))
-            {
-                self.writer.write(&plan.export_function);
-                self.writer.write("(");
-                write_quoted(&mut self.writer, name);
-                self.writer.write(", ");
-                self.writer.write(name);
-                self.writer.write(");");
-                self.writer.newline();
-            }
-            previous_function_end = function_node.range.end.get();
-        }
         self.writer.write("return {");
         self.writer.newline();
         self.writer.indent += 1;
@@ -27170,28 +27436,22 @@ impl Printer<'_> {
                     self.writer.write(");");
                     self.writer.newline();
                 }
-                for (exported_name, imported_name) in &dependency.named_exports {
-                    self.writer.write(&plan.export_function);
-                    self.writer.write("({");
-                    self.writer.newline();
-                    self.writer.indent += 1;
-                    write_quoted(&mut self.writer, exported_name);
-                    self.writer.write(": ");
-                    self.writer.write(&dependency.parameter);
-                    self.writer.write("[");
-                    write_quoted(&mut self.writer, imported_name);
-                    self.writer.write("]");
-                    self.writer.newline();
-                    self.writer.indent -= 1;
-                    self.writer.write("});");
-                    self.writer.newline();
-                }
-                for storage in &dependency.storages {
+                for (index, storage) in dependency.storages.iter().enumerate() {
                     self.writer.write(storage);
                     self.writer.write(" = ");
                     self.writer.write(&dependency.parameter);
                     self.writer.write(";");
                     self.writer.newline();
+                    if index == 0
+                        && dependency.export_star
+                        && let Some(export_star) = plan.export_star_function.as_deref()
+                    {
+                        self.writer.write(export_star);
+                        self.writer.write("(");
+                        self.writer.write(&dependency.parameter);
+                        self.writer.write(");");
+                        self.writer.newline();
+                    }
                 }
                 for (storage, exported_name) in &dependency.storage_exports {
                     self.writer.write(&plan.export_function);
@@ -27203,12 +27463,36 @@ impl Printer<'_> {
                     self.writer.newline();
                 }
                 if dependency.export_star
+                    && dependency.storages.is_empty()
                     && let Some(export_star) = plan.export_star_function.as_deref()
                 {
                     self.writer.write(export_star);
                     self.writer.write("(");
                     self.writer.write(&dependency.parameter);
                     self.writer.write(");");
+                    self.writer.newline();
+                }
+                if !dependency.named_exports.is_empty() {
+                    self.writer.write(&plan.export_function);
+                    self.writer.write("({");
+                    self.writer.newline();
+                    self.writer.indent += 1;
+                    for (index, (exported_name, imported_name)) in
+                        dependency.named_exports.iter().enumerate()
+                    {
+                        write_quoted(&mut self.writer, exported_name);
+                        self.writer.write(": ");
+                        self.writer.write(&dependency.parameter);
+                        self.writer.write("[");
+                        write_quoted(&mut self.writer, imported_name);
+                        self.writer.write("]");
+                        if index + 1 != dependency.named_exports.len() {
+                            self.writer.write(",");
+                        }
+                        self.writer.newline();
+                    }
+                    self.writer.indent -= 1;
+                    self.writer.write("});");
                     self.writer.newline();
                 }
                 self.writer.indent -= 1;
@@ -27289,6 +27573,44 @@ impl Printer<'_> {
                     if specifier.is_type_only {
                         continue;
                     }
+                    let local = specifier.property_name.unwrap_or(specifier.name);
+                    let local_name = declaration_name_text(self.arena, local).unwrap_or_default();
+                    let initialized_with_export = self
+                        .bindings
+                        .root_scope()
+                        .and_then(|scope| scope.symbols.get(local_name))
+                        .or_else(|| self.bindings.resolve_name_at(local, local_name))
+                        .and_then(|symbol| self.bindings.symbols.get(symbol))
+                        .is_some_and(|symbol| {
+                            symbol.flags.intersects(
+                                SymbolFlags::FUNCTION
+                                    | SymbolFlags::REGULAR_ENUM
+                                    | SymbolFlags::VALUE_MODULE
+                                    | SymbolFlags::NAMESPACE_MODULE,
+                            )
+                        });
+                    if initialized_with_export {
+                        continue;
+                    }
+                    let uninitialized_variable = self
+                        .bindings
+                        .root_scope()
+                        .and_then(|scope| scope.symbols.get(local_name))
+                        .or_else(|| self.bindings.resolve_name_at(local, local_name))
+                        .and_then(|symbol| self.bindings.symbols.get(symbol))
+                        .is_some_and(|symbol| {
+                            symbol.flags.intersects(SymbolFlags::VARIABLE)
+                                && symbol.declarations.iter().any(|declaration| {
+                                    matches!(
+                                        self.arena.get(*declaration).map(|node| &node.data),
+                                        Some(NodeData::VariableDeclaration(declaration))
+                                            if declaration.initializer.is_none()
+                                    )
+                                })
+                        });
+                    if uninitialized_variable {
+                        continue;
+                    }
                     self.writer.write(export_function);
                     self.writer.write("(");
                     write_quoted(
@@ -27296,7 +27618,7 @@ impl Printer<'_> {
                         declaration_name_text(self.arena, specifier.name).unwrap_or_default(),
                     );
                     self.writer.write(", ");
-                    self.emit_expression(specifier.property_name.unwrap_or(specifier.name), 0)?;
+                    self.emit_expression(local, 0)?;
                     self.writer.write(");");
                     self.writer.newline();
                 }
@@ -27339,6 +27661,12 @@ impl Printer<'_> {
                 if self.commonjs_empty_binding_temps.contains_key(&statement) {
                     self.emit_commonjs_empty_binding_initializer(statement, variable)?;
                     self.writer.newline();
+                    return Ok(());
+                }
+                if self.emit_system_predeclared_variable_assignment(variable)? {
+                    if !self.variable_list_is_uninitialized(variable.declaration_list) {
+                        self.writer.newline();
+                    }
                     return Ok(());
                 }
                 let exported =
@@ -31170,6 +31498,17 @@ impl Printer<'_> {
                 .contains(&initializer)
             {
                 self.emit_es5_async_hoisted_loop_binding(initializer)
+            } else if self.system_export_function.is_some()
+                && let Some(NodeData::VariableDeclarationList(list)) =
+                    self.arena.get(initializer).map(|node| &node.data)
+                && let [declaration] = list.declarations.nodes.as_slice()
+                && let Some(NodeData::VariableDeclaration(declaration)) =
+                    self.arena.get(*declaration).map(|node| &node.data)
+                && declaration.initializer.is_none()
+                && declaration_name_text(self.arena, declaration.name)
+                    .is_some_and(|name| self.system_predeclared_names.contains(name))
+            {
+                self.emit_expression(declaration.name, 0)
             } else {
                 self.emit_variable_list(initializer, false)
             }
@@ -32804,9 +33143,16 @@ impl Printer<'_> {
         match &name_node.data {
             NodeData::Identifier(_) => {
                 self.emit_downlevel_declarator_start(emitted);
+                let system_export = self.system_exported_name(name);
+                if let Some(exported) = system_export.as_deref() {
+                    self.emit_system_export_call_start(exported);
+                }
                 self.emit_expression(name, 0)?;
                 self.writer.write(" = ");
                 self.emit_downlevel_binding_value(&value)?;
+                if system_export.is_some() {
+                    self.writer.write(")");
+                }
             }
             NodeData::BindingPattern(pattern)
                 if name_node.kind == SyntaxKind::ArrayBindingPattern =>
@@ -49754,7 +50100,7 @@ impl Printer<'_> {
             .is_some_and(|parent| matches!(parent.data, NodeData::ModuleDeclaration(_)));
         let exported = dotted_namespace_child
             || self.has_modifier(data.modifiers.as_ref(), SyntaxKind::ExportKeyword);
-        let system_exported_name = self
+        let system_exported_names = self
             .bindings
             .node_symbols
             .get(&data.name)
@@ -49912,20 +50258,25 @@ impl Printer<'_> {
                 self.writer.write(&name);
                 self.writer.write(" = {})");
             }
-        } else if (exported || system_exported_name.is_some())
+        } else if (exported || system_exported_names.is_some())
             && let Some(export_function) = self.system_export_function.clone()
         {
+            let exported_names = system_exported_names
+                .unwrap_or_else(|| vec![name.clone()]);
             self.writer.write(&name);
             self.writer.write(" || (");
-            self.writer.write(&export_function);
-            self.writer.write("(");
-            write_quoted(
-                &mut self.writer,
-                system_exported_name.as_deref().unwrap_or(&name),
-            );
-            self.writer.write(", ");
+            for exported_name in exported_names.iter().rev() {
+                self.writer.write(&export_function);
+                self.writer.write("(");
+                write_quoted(&mut self.writer, exported_name);
+                self.writer.write(", ");
+            }
             self.writer.write(&name);
-            self.writer.write(" = {}))");
+            self.writer.write(" = {}");
+            for _ in &exported_names {
+                self.writer.write(")");
+            }
+            self.writer.write(")");
         } else if self.commonjs_module_transform && (exported || !commonjs_aliases.is_empty()) {
             self.writer.write(&name);
             self.writer.write(" || (");
@@ -50152,7 +50503,7 @@ impl Printer<'_> {
         self.writer.indent -= 1;
         self.writer.write("})(");
         let exported = self.has_modifier(data.modifiers.as_ref(), SyntaxKind::ExportKeyword);
-        let system_exported_name = self
+        let system_exported_names = self
             .bindings
             .node_symbols
             .get(&data.name)
@@ -50178,20 +50529,28 @@ impl Printer<'_> {
             return Ok(());
         }
         if let Some(export_function) = self.system_export_function.clone()
-            && (exported || system_exported_name.is_some() || !standalone_exports.is_empty())
+            && (exported || system_exported_names.is_some() || !standalone_exports.is_empty())
         {
-            let exported_name = system_exported_name
-                .as_ref()
-                .or_else(|| standalone_exports.first())
-                .unwrap_or(&name);
+            let exported_names = system_exported_names.unwrap_or_else(|| {
+                standalone_exports
+                    .first()
+                    .cloned()
+                    .map_or_else(|| vec![name.clone()], |name| vec![name])
+            });
             self.writer.write(&name);
             self.writer.write(" || (");
-            self.writer.write(&export_function);
-            self.writer.write("(");
-            write_quoted(&mut self.writer, exported_name);
-            self.writer.write(", ");
+            for exported_name in exported_names.iter().rev() {
+                self.writer.write(&export_function);
+                self.writer.write("(");
+                write_quoted(&mut self.writer, exported_name);
+                self.writer.write(", ");
+            }
             self.writer.write(&name);
-            self.writer.write(" = {})));");
+            self.writer.write(" = {}");
+            for _ in &exported_names {
+                self.writer.write(")");
+            }
+            self.writer.write("));");
             self.identifier_rewrites = saved_identifier_rewrites;
             self.enum_member_identifier_rewrites = saved_enum_member_rewrites;
             return Ok(());
@@ -51546,6 +51905,7 @@ impl Printer<'_> {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn emit_system_predeclared_variable_assignment(
         &mut self,
         statement: &ts_ast::VariableStatementData,
@@ -51557,7 +51917,15 @@ impl Printer<'_> {
         let NodeData::VariableDeclarationList(list) = &list_node.data else {
             return Ok(false);
         };
-        if list_node.flags.0 & 3 != 0 {
+        let is_direct_source_file_statement = list_node
+            .parent
+            .and_then(|statement| self.arena.get(statement))
+            .and_then(|statement| statement.parent)
+            .and_then(|parent| self.arena.get(parent))
+            .is_some_and(|parent| matches!(parent.data, NodeData::SourceFile(_)));
+        let is_hoisted_source_file_var = list_node.flags.0.trailing_zeros() >= 2
+            && is_source_file_var_declaration(self.arena, statement.declaration_list);
+        if !is_direct_source_file_statement && !is_hoisted_source_file_var {
             return Ok(false);
         }
         let declarations = list
@@ -51570,27 +51938,84 @@ impl Printer<'_> {
                 else {
                     return None;
                 };
-                let name = declaration_name_text(self.arena, declaration.name)?;
-                self.system_predeclared_names
-                    .contains(name)
-                    .then_some((declaration.name, declaration.initializer))
+                let mut names = Vec::new();
+                collect_binding_names(self.arena, declaration.name, &mut names);
+                (!names.is_empty()
+                    && names
+                        .iter()
+                        .all(|name| self.system_predeclared_names.contains(name)))
+                .then_some((declaration.name, declaration.initializer))
             })
             .collect::<Vec<_>>();
         if declarations.len() != list.declarations.nodes.len() {
             return Ok(false);
         }
         let mut emitted = false;
+        let direct_export = self.has_modifier(
+            statement.modifiers.as_ref(),
+            SyntaxKind::ExportKeyword,
+        );
         for (name, initializer) in declarations {
             let Some(initializer) = initializer else {
                 continue;
             };
-            if emitted {
-                self.writer.write(", ");
+            if matches!(
+                self.arena.get(name).map(|node| &node.data),
+                Some(NodeData::BindingPattern(_))
+            ) {
+                let reusable_identifier = matches!(
+                    &self.node(initializer)?.data,
+                    NodeData::Identifier(identifier)
+                        if !self.binding_name_contains_identifier(name, &identifier.text)?
+                );
+                let value = if reusable_identifier
+                    || (!self.binding_pattern_value_needs_temp(name)
+                        && !self.binding_pattern_has_omission(name))
+                {
+                    DownlevelBindingValue::Node(initializer)
+                } else {
+                    let temp = self.generated_names.generate_temp();
+                    self.emit_downlevel_declarator_start(&mut emitted);
+                    self.writer.write(&temp);
+                    self.writer.write(" = ");
+                    self.emit_expression(initializer, 1)?;
+                    DownlevelBindingValue::Name(temp)
+                };
+                if direct_export {
+                    self.emit_downlevel_binding_declarators(
+                        name,
+                        value,
+                        None,
+                        &mut emitted,
+                        false,
+                    )?;
+                } else {
+                    let exported_bindings = std::mem::take(&mut self.system_exported_bindings);
+                    let result = self.emit_downlevel_binding_declarators(
+                        name,
+                        value,
+                        None,
+                        &mut emitted,
+                        false,
+                    );
+                    self.system_exported_bindings = exported_bindings;
+                    result?;
+                }
+            } else {
+                self.emit_downlevel_declarator_start(&mut emitted);
+                let system_export = direct_export
+                    .then(|| self.system_exported_name(name))
+                    .flatten();
+                if let Some(exported) = system_export.as_deref() {
+                    self.emit_system_export_call_start(exported);
+                }
+                self.emit_expression(name, 1)?;
+                self.writer.write(" = ");
+                self.emit_expression(initializer, 1)?;
+                if system_export.is_some() {
+                    self.writer.write(")");
+                }
             }
-            self.emit_expression(name, 1)?;
-            self.writer.write(" = ");
-            self.emit_expression(initializer, 1)?;
-            emitted = true;
         }
         if emitted {
             self.writer.write(";");
@@ -52422,7 +52847,10 @@ impl Printer<'_> {
         let symbol = self
             .bindings
             .resolve_name_at(expression, &identifier.text)?;
-        self.system_exported_bindings.get(&symbol).cloned()
+        self.system_exported_bindings
+            .get(&symbol)
+            .and_then(|names| names.last())
+            .cloned()
     }
 
     fn emit_system_export_call_start(&mut self, name: &str) {
