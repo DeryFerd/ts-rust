@@ -1497,7 +1497,7 @@ impl<'a> ProgramChecker<'a> {
         match &source.arena.get(declaration)?.data {
             NodeData::ImportDeclaration(import) => {
                 let specifier = string_literal_text(source.arena, import.module_specifier)?;
-                let target = source.resolved_modules.get(specifier).copied()?;
+                let target = self.local_import_target(source, specifier)?;
                 let exports = self.resolved_module_export_symbols(target, specifier);
                 let Some(clause) = import.import_clause else {
                     return Some(true);

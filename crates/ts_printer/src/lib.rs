@@ -439,6 +439,21 @@ pub fn emit_source_file_with_context(
     }
     let source_end = node.range.end.get();
     printer.runtime_identifier_uses = runtime_identifier_uses(arena, source_file);
+    let decorator_runtime_names = arena
+        .iter()
+        .filter_map(|(_, node)| {
+            let NodeData::Decorator(decorator) = &node.data else {
+                return None;
+            };
+            decorator_expression_root_name(arena, decorator.expression).map(str::to_owned)
+        })
+        .collect::<Vec<_>>();
+    printer
+        .runtime_identifier_uses
+        .extend(decorator_runtime_names.iter().cloned());
+    printer
+        .synthetic_runtime_identifier_uses
+        .extend(decorator_runtime_names);
     if context.emit_decorator_metadata {
         let metadata_names = printer
             .decorator_metadata_runtime_names()
@@ -836,10 +851,14 @@ pub fn emit_source_file_with_context(
     let needs_assign_helper = settings.target < ScriptTarget::Es2015
         && source_needs_assign_helper(arena)
         && !settings.no_emit_helpers;
-    let needs_make_template_object_helper = settings.target < ScriptTarget::Es2015
-        && arena
-            .iter()
-            .any(|(_, node)| matches!(node.data, NodeData::TaggedTemplateExpression(_)))
+    let needs_make_template_object_helper = arena.iter().any(|(_, node)| {
+        matches!(
+            &node.data,
+            NodeData::TaggedTemplateExpression(tagged)
+                if settings.target < ScriptTarget::Es2015
+                    || template_has_invalid_escape(arena, tagged.template)
+        )
+    })
         && !settings.no_emit_helpers;
     if let Some(start) = first_statement_start {
         let defer_commonjs_leading_comments = settings.module == ModuleKind::CommonJs
@@ -931,16 +950,16 @@ pub fn emit_source_file_with_context(
     {
         printer.emit_extends_helper();
     }
+    if needs_make_template_object_helper
+        && !printer.imported_helpers.contains("__makeTemplateObject")
+    {
+        printer.emit_make_template_object_helper();
+    }
     if needs_assign_helper
         && !matches!(settings.module, ModuleKind::Amd | ModuleKind::Umd | ModuleKind::System)
         && !printer.imported_helpers.contains("__assign")
     {
         printer.emit_assign_helper();
-    }
-    if needs_make_template_object_helper
-        && !printer.imported_helpers.contains("__makeTemplateObject")
-    {
-        printer.emit_make_template_object_helper();
     }
     if settings.experimental_decorators
         && source_needs_legacy_decorate_helper(arena)
@@ -1589,6 +1608,104 @@ fn source_has_dynamic_import(arena: &NodeArena) -> bool {
             Some(NodeData::Identifier(identifier)) if identifier.text == "import"
         )
     })
+}
+
+fn template_has_invalid_escape(arena: &NodeArena, template: NodeId) -> bool {
+    const CONTAINS_INVALID_ESCAPE: u32 = 1 << 11;
+    let invalid = |template: ts_ast::TokenFlags, token: ts_ast::TokenFlags| {
+        (template.0 | token.0) & CONTAINS_INVALID_ESCAPE != 0
+    };
+    match arena.get(template).map(|node| &node.data) {
+        Some(NodeData::NoSubstitutionTemplateLiteral(literal)) => {
+            invalid(literal.template_flags, literal.token_flags)
+                || template_raw_has_invalid_escape(&literal.raw_text)
+        }
+        Some(NodeData::TemplateExpression(template)) => {
+            let head_invalid = matches!(
+                arena.get(template.head).map(|node| &node.data),
+                Some(NodeData::TemplateHead(head))
+                    if invalid(head.template_flags, head.token_flags)
+                        || template_raw_has_invalid_escape(&head.raw_text)
+            );
+            head_invalid
+                || template.template_spans.nodes.iter().any(|span| {
+                    let Some(NodeData::TemplateSpan(span)) =
+                        arena.get(*span).map(|node| &node.data)
+                    else {
+                        return false;
+                    };
+                    match arena.get(span.literal).map(|node| &node.data) {
+                        Some(NodeData::TemplateMiddle(literal)) => {
+                            invalid(literal.template_flags, literal.token_flags)
+                                || template_raw_has_invalid_escape(&literal.raw_text)
+                        }
+                        Some(NodeData::TemplateTail(literal)) => {
+                            invalid(literal.template_flags, literal.token_flags)
+                                || template_raw_has_invalid_escape(&literal.raw_text)
+                        }
+                        _ => false,
+                    }
+                })
+        }
+        _ => false,
+    }
+}
+
+fn template_raw_has_invalid_escape(raw: &str) -> bool {
+    let bytes = raw.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'\\' {
+            index += 1;
+            continue;
+        }
+        index += 1;
+        let Some(escape) = bytes.get(index).copied() else {
+            return true;
+        };
+        match escape {
+            b'u' if bytes.get(index + 1) == Some(&b'{') => {
+                let start = index + 2;
+                let Some(end) = bytes[start..].iter().position(|byte| *byte == b'}') else {
+                    return true;
+                };
+                let digits = &bytes[start..start + end];
+                if digits.is_empty()
+                    || digits.len() > 6
+                    || !digits.iter().all(u8::is_ascii_hexdigit)
+                    || std::str::from_utf8(digits)
+                        .ok()
+                        .and_then(|digits| u32::from_str_radix(digits, 16).ok())
+                        .is_none_or(|value| value > 0x10_ffff)
+                {
+                    return true;
+                }
+                index = start + end + 1;
+            }
+            b'u' => {
+                let end = index + 5;
+                if end > bytes.len()
+                    || !bytes[index + 1..end].iter().all(u8::is_ascii_hexdigit)
+                {
+                    return true;
+                }
+                index = end;
+            }
+            b'x' => {
+                let end = index + 3;
+                if end > bytes.len()
+                    || !bytes[index + 1..end].iter().all(u8::is_ascii_hexdigit)
+                {
+                    return true;
+                }
+                index = end;
+            }
+            b'1'..=b'9' => return true,
+            b'0' if bytes.get(index + 1).is_some_and(u8::is_ascii_digit) => return true,
+            _ => index += 1,
+        }
+    }
+    false
 }
 
 fn source_uses_commonjs_extension(source_name: &str) -> bool {
@@ -2645,6 +2762,20 @@ fn entity_root_identifier_text(arena: &NodeArena, entity: NodeId) -> Option<&str
     }
 }
 
+fn decorator_expression_root_name(arena: &NodeArena, expression: NodeId) -> Option<&str> {
+    match &arena.get(expression)?.data {
+        NodeData::Identifier(identifier) => Some(&identifier.text),
+        NodeData::CallExpression(call) => decorator_expression_root_name(arena, call.expression),
+        NodeData::PropertyAccessExpression(access) => {
+            decorator_expression_root_name(arena, access.expression)
+        }
+        NodeData::ParenthesizedExpression(parenthesized) => {
+            decorator_expression_root_name(arena, parenthesized.expression)
+        }
+        _ => None,
+    }
+}
+
 fn entity_root_identifier(arena: &NodeArena, entity: NodeId) -> Option<NodeId> {
     match &arena.get(entity)?.data {
         NodeData::Identifier(_) => Some(entity),
@@ -2676,7 +2807,7 @@ fn decorator_metadata_type_references(arena: &NodeArena) -> Vec<NodeId> {
         })
         .map(|(id, _)| id)
         .collect::<HashSet<_>>();
-    let decorated_members = arena
+    let mut decorated_members = arena
         .iter()
         .filter_map(|(_, node)| {
             let NodeData::ClassDeclaration(class) = &node.data else {
@@ -2687,6 +2818,40 @@ fn decorator_metadata_type_references(arena: &NodeArena) -> Vec<NodeId> {
         .flatten()
         .filter(|member| class_member_has_legacy_decorators(arena, *member))
         .collect::<HashSet<_>>();
+    for (_, node) in arena.iter() {
+        let NodeData::ClassDeclaration(class) = &node.data else {
+            continue;
+        };
+        let decorated_accessor_names = class
+            .members
+            .nodes
+            .iter()
+            .filter(|member| decorated_members.contains(member))
+            .filter_map(|member| match &arena.get(*member)?.data {
+                NodeData::GetAccessorDeclaration(accessor) => {
+                    declaration_name_text(arena, accessor.name)
+                }
+                NodeData::SetAccessorDeclaration(accessor) => {
+                    declaration_name_text(arena, accessor.name)
+                }
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        for member in &class.members.nodes {
+            let name = match &arena.get(*member).map(|node| &node.data) {
+                Some(NodeData::GetAccessorDeclaration(accessor)) => {
+                    declaration_name_text(arena, accessor.name)
+                }
+                Some(NodeData::SetAccessorDeclaration(accessor)) => {
+                    declaration_name_text(arena, accessor.name)
+                }
+                _ => None,
+            };
+            if name.is_some_and(|name| decorated_accessor_names.contains(name)) {
+                decorated_members.insert(*member);
+            }
+        }
+    }
 
     arena
         .iter()
@@ -24033,6 +24198,15 @@ impl Writer {
         }
     }
 
+    fn remove_trailing_char(&mut self, character: char) -> bool {
+        if !self.output.ends_with(character) {
+            return false;
+        }
+        self.output.pop();
+        self.column = self.column.saturating_sub(1);
+        true
+    }
+
     fn newline_preserving_trailing_spaces(&mut self) {
         self.output.push('\n');
         self.line_start = true;
@@ -30841,8 +31015,14 @@ impl Printer<'_> {
                     && self.namespace_containers.is_empty()
                     && self.has_modifier(data.modifiers.as_ref(), SyntaxKind::ExportKeyword)
                     && self.has_modifier(data.modifiers.as_ref(), SyntaxKind::DefaultKeyword);
+                let lower_preserved_named = self.settings.target < ScriptTarget::Es2015
+                    && !self.commonjs_module_transform
+                    && self.system_export_function.is_none()
+                    && self.namespace_containers.is_empty()
+                    && self.has_modifier(data.modifiers.as_ref(), SyntaxKind::ExportKeyword)
+                    && !self.has_modifier(data.modifiers.as_ref(), SyntaxKind::DefaultKeyword);
                 if !emitted_stage3_class_decorators && decorators.is_empty() {
-                    if !lower_preserved_default {
+                    if !lower_preserved_default && !lower_preserved_named {
                         self.emit_runtime_declaration_modifiers(id, data.modifiers.as_ref());
                     }
                     if !self.emit_class_declaration_static_blocks(
@@ -30869,6 +31049,11 @@ impl Printer<'_> {
                     self.writer.write("export default ");
                     self.emit_expression(name, 0)?;
                     self.writer.write(";");
+                } else if lower_preserved_named && let Some(name) = data.name {
+                    self.writer.newline();
+                    self.writer.write("export { ");
+                    self.emit_expression(name, 0)?;
+                    self.writer.write(" };");
                 }
                 if data.name.is_some() || commonjs_default_name.is_some() {
                     let names = data.name.map_or_else(
@@ -43948,10 +44133,14 @@ impl Printer<'_> {
         &mut self,
         body: NodeId,
         bindings: &[(NodeId, String)],
+        rest_parameters: Option<&NodeList>,
     ) -> Result<(), EmitError> {
         self.writer.write("{");
         self.writer.newline();
         self.writer.indent += 1;
+        if let Some(parameters) = rest_parameters {
+            self.emit_downlevel_rest_parameter_prologue(parameters)?;
+        }
         for (pattern, temp) in bindings {
             self.writer.write("var ");
             let mut emitted = false;
@@ -46064,7 +46253,16 @@ impl Printer<'_> {
                             .unwrap_or(&data.parameters),
                     ),
                     None,
-                    data.type_,
+                    data.type_.or_else(|| {
+                        paired_setter_parameters
+                            .as_ref()
+                            .and_then(|parameters| parameters.nodes.first())
+                            .and_then(|parameter| self.arena.get(*parameter))
+                            .and_then(|parameter| match &parameter.data {
+                                NodeData::ParameterDeclaration(parameter) => parameter.type_,
+                                _ => None,
+                            })
+                    }),
                     "null",
                     false,
                     true,
@@ -54930,10 +55128,28 @@ impl Printer<'_> {
                     self.writer.write("{}");
                     return Ok(());
                 }
+                let first_property_on_opening_line = multiline
+                    && emitted_properties.first().is_some_and(|property| {
+                        usize::try_from(node.range.start.get().saturating_add(1))
+                            .ok()
+                            .zip(
+                                self.arena
+                                    .get(*property)
+                                    .and_then(|property| {
+                                        usize::try_from(property.range.start.get()).ok()
+                                    }),
+                            )
+                            .and_then(|(start, end)| self.source_text.get(start..end))
+                            .is_some_and(|trivia| !trivia.contains(['\n', '\r']))
+                    });
                 self.writer.write("{");
                 if multiline {
-                    self.writer.newline();
                     self.writer.indent += 1;
+                    if first_property_on_opening_line {
+                        self.writer.write(" ");
+                    } else {
+                        self.writer.newline();
+                    }
                 } else {
                     self.writer.write(" ");
                 }
@@ -55223,7 +55439,18 @@ impl Printer<'_> {
                         self.this_alias = Some(alias);
                     }
                     let body_result = if !downlevel_bindings.is_empty() {
-                        self.emit_es5_arrow_binding_body(data.body, &downlevel_bindings)
+                        self.emit_es5_arrow_binding_body(
+                            data.body,
+                            &downlevel_bindings,
+                            self.parameters_have_rest_parameter(&data.parameters)
+                                .then_some(&data.parameters),
+                        )
+                    } else if self.parameters_have_rest_parameter(&data.parameters) {
+                        self.emit_es5_arrow_binding_body(
+                            data.body,
+                            &downlevel_bindings,
+                            Some(&data.parameters),
+                        )
                     } else if matches!(&self.node(data.body)?.data, NodeData::Block(_)) {
                         self.emit_function_body(data.body)
                     } else {
@@ -55495,29 +55722,29 @@ impl Printer<'_> {
                 }
             }
             NodeData::TaggedTemplateExpression(data) => {
-                if self.settings.target < ScriptTarget::Es2015 {
+                if self.settings.target < ScriptTarget::Es2015
+                    || template_has_invalid_escape(self.arena, data.template)
+                {
                     self.emit_downlevel_tagged_template(id, data)?;
+                } else if let Some(source) = self
+                    .node(id)
+                    .ok()
+                    .and_then(|node| {
+                        usize::try_from(node.range.start.get())
+                            .ok()
+                            .zip(usize::try_from(node.range.end.get()).ok())
+                    })
+                    .and_then(|(start, end)| self.source_text.get(start..end))
+                    .map(str::trim_end)
+                    .filter(|source| source.contains('`') && !source.ends_with('`'))
+                {
+                    self.emit_native_tagged_template(data)?;
+                    self.writer.remove_trailing_char('`');
+                    if source.ends_with("${") {
+                        self.writer.write("${");
+                    }
                 } else {
-                    let unbound_receiver = self.commonjs_module_transform
-                        && self.commonjs_call_requires_unbound_receiver(data.tag);
-                    if unbound_receiver {
-                        self.writer.write("(0, ");
-                    }
-                    self.emit_expression(data.tag, 18)?;
-                    if unbound_receiver {
-                        self.writer.write(")");
-                    }
-                    if self.source_is_javascript_input()
-                        && let Some(type_arguments) = &data.type_arguments
-                    {
-                        self.emit_javascript_type_arguments_as_operators(type_arguments)?;
-                    }
-                    if data.question_dot_token.is_some() {
-                        self.writer.write("?.");
-                    } else {
-                        self.writer.write(" ");
-                    }
-                    self.emit_expression(data.template, 18)?;
+                    self.emit_native_tagged_template(data)?;
                 }
             }
             NodeData::JsxElement(data) => self.emit_jsx_element(data)?,
@@ -55559,17 +55786,58 @@ impl Printer<'_> {
         Ok(())
     }
 
+    fn emit_native_tagged_template(
+        &mut self,
+        data: &ts_ast::TaggedTemplateExpressionData,
+    ) -> Result<(), EmitError> {
+        let unbound_receiver = self.commonjs_module_transform
+            && self.commonjs_call_requires_unbound_receiver(data.tag);
+        if unbound_receiver {
+            self.writer.write("(0, ");
+        }
+        self.emit_expression(data.tag, 18)?;
+        if unbound_receiver {
+            self.writer.write(")");
+        }
+        if self.source_is_javascript_input()
+            && let Some(type_arguments) = &data.type_arguments
+        {
+            self.emit_javascript_type_arguments_as_operators(type_arguments)?;
+        }
+        if data.question_dot_token.is_some() {
+            self.writer.write("?.");
+        } else {
+            self.writer.write(" ");
+        }
+        self.emit_expression(data.template, 18)
+    }
+
+    #[allow(clippy::too_many_lines)]
     fn emit_downlevel_tagged_template(
         &mut self,
         id: NodeId,
         data: &ts_ast::TaggedTemplateExpressionData,
     ) -> Result<(), EmitError> {
-        let mut cooked = Vec::new();
+        const CONTAINS_INVALID_ESCAPE: u32 = 1 << 11;
+        let cooked_text = |text: &str,
+                           raw: &str,
+                           template: ts_ast::TokenFlags,
+                           token: ts_ast::TokenFlags| {
+                ((template.0 | token.0) & CONTAINS_INVALID_ESCAPE == 0
+                    && !template_raw_has_invalid_escape(raw))
+                    .then(|| text.to_owned())
+        };
+        let mut cooked: Vec<Option<String>> = Vec::new();
         let mut raw = Vec::new();
         let mut substitutions = Vec::new();
         match self.arena.get(data.template).map(|node| &node.data) {
             Some(NodeData::NoSubstitutionTemplateLiteral(literal)) => {
-                cooked.push(literal.text.clone());
+                cooked.push(cooked_text(
+                    &literal.text,
+                    &literal.raw_text,
+                    literal.template_flags,
+                    literal.token_flags,
+                ));
                 raw.push(
                     literal
                         .raw_text
@@ -55585,8 +55853,19 @@ impl Printer<'_> {
                 else {
                     return Err(Self::unsupported(data.template, SyntaxKind::TemplateExpression));
                 };
-                cooked.push(head.text.clone());
-                raw.push(head.raw_text.clone());
+                cooked.push(cooked_text(
+                    &head.text,
+                    &head.raw_text,
+                    head.template_flags,
+                    head.token_flags,
+                ));
+                raw.push(
+                    head.raw_text
+                        .strip_prefix('`')
+                        .and_then(|text| text.strip_suffix("${"))
+                        .unwrap_or(&head.raw_text)
+                        .to_owned(),
+                );
                 for span in &template.template_spans.nodes {
                     let Some(NodeData::TemplateSpan(span)) =
                         self.arena.get(*span).map(|node| &node.data)
@@ -55596,12 +55875,36 @@ impl Printer<'_> {
                     substitutions.push(span.expression);
                     match self.arena.get(span.literal).map(|node| &node.data) {
                         Some(NodeData::TemplateMiddle(literal)) => {
-                            cooked.push(literal.text.clone());
-                            raw.push(literal.raw_text.clone());
+                            cooked.push(cooked_text(
+                                &literal.text,
+                                &literal.raw_text,
+                                literal.template_flags,
+                                literal.token_flags,
+                            ));
+                            raw.push(
+                                literal
+                                    .raw_text
+                                    .strip_prefix('}')
+                                    .and_then(|text| text.strip_suffix("${"))
+                                    .unwrap_or(&literal.raw_text)
+                                    .to_owned(),
+                            );
                         }
                         Some(NodeData::TemplateTail(literal)) => {
-                            cooked.push(literal.text.clone());
-                            raw.push(literal.raw_text.clone());
+                            cooked.push(cooked_text(
+                                &literal.text,
+                                &literal.raw_text,
+                                literal.template_flags,
+                                literal.token_flags,
+                            ));
+                            raw.push(
+                                literal
+                                    .raw_text
+                                    .strip_prefix('}')
+                                    .and_then(|text| text.strip_suffix('`'))
+                                    .unwrap_or(&literal.raw_text)
+                                    .to_owned(),
+                            );
                         }
                         _ => {}
                     }
@@ -55611,7 +55914,7 @@ impl Printer<'_> {
         }
         self.emit_expression(data.tag, 18)?;
         self.writer.write("(");
-        let cached = self.imported_helpers.contains("__makeTemplateObject");
+        let cached = self.is_external_module;
         if cached {
             let temp = self
                 .tagged_template_temps
@@ -55633,7 +55936,11 @@ impl Printer<'_> {
             if index != 0 {
                 self.writer.write(", ");
             }
-            write_quoted(&mut self.writer, text);
+            if let Some(text) = text {
+                write_quoted(&mut self.writer, text);
+            } else {
+                self.writer.write("void 0");
+            }
         }
         self.writer.write("], [");
         for (index, text) in raw.iter().enumerate() {
