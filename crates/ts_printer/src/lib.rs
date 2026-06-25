@@ -50370,6 +50370,8 @@ impl Printer<'_> {
                     let asserted_start = self.node(asserted_expression)?.range.start.get();
                     let has_leading_comment =
                         self.trivia_has_block_comment(comment_start, asserted_start);
+                    let has_leading_line_comment =
+                        self.source_range_contains_line_comment(comment_start, asserted_start);
                     let keep_for_leading_comment = has_leading_comment
                         && !matches!(assertion, NodeData::SatisfiesExpression(_));
                     let keep_for_export_default_class = matches!(
@@ -50405,6 +50407,16 @@ impl Printer<'_> {
                         } else {
                             parent_precedence
                         };
+                        if has_leading_line_comment {
+                            if !self.writer.line_start {
+                                self.writer.newline_preserving_trailing_spaces();
+                            }
+                            self.emit_source_comments_between_with_trailing(
+                                comment_start,
+                                asserted_start,
+                                false,
+                            );
+                        }
                         if has_leading_comment {
                             let comment_start = self
                                 .first_block_comment_start(comment_start, asserted_start)
@@ -56053,6 +56065,22 @@ mod tests {
             output,
             "const a = /*comm*/ 10;\nconst b = /*comm*/ 10;\n"
         );
+    }
+
+    #[test]
+    fn preserves_line_comments_inside_erased_arrow_body_parentheses() {
+        let output = emit_with(
+            concat!(
+                "const x = (a: any[]) => (\n",
+                "    // comment\n",
+                "    undefined as number\n",
+                ");",
+            ),
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert_eq!(output, "const x = (a) => \n// comment\nundefined;\n");
     }
 
     fn emit_declarations_with_semantics(source: &str) -> String {
