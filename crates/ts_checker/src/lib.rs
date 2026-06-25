@@ -1227,16 +1227,24 @@ impl<'a> ProgramChecker<'a> {
             else {
                 continue;
             };
-            for (name, descriptor) in self.resolved_module_exports_inner(
+            let star_exports = self.resolved_module_exports_inner(
                 star_target,
                 star_specifier,
                 star_result,
                 preliminary,
                 completed,
                 visited,
-            ) {
+            );
+            for (name, descriptor) in &star_exports {
                 if name != "default" {
-                    exports.entry(name).or_insert(descriptor);
+                    let mut descriptor = descriptor.clone();
+                    paint_exported_named_descriptor_dependencies(
+                        &mut descriptor,
+                        star_specifier,
+                        &star_exports,
+                        name,
+                    );
+                    exports.entry(name.clone()).or_insert(descriptor);
                 }
             }
         }
@@ -1247,6 +1255,7 @@ impl<'a> ProgramChecker<'a> {
         exports
     }
 
+    #[allow(clippy::too_many_lines)]
     fn describe_value_symbol(
         source: &ProgramSource<'_>,
         symbol_id: SymbolId,
@@ -1276,12 +1285,36 @@ impl<'a> ProgramChecker<'a> {
         let mut checker =
             Checker::new(source.arena, source.bindings).with_options(source.checker_options);
         checker.seed_symbol_types();
-        let instance = checker.result.symbol_types.get(&symbol_id).copied()?;
-        let constructor = checker.class_constructor_signature(&class.members.nodes, instance);
-        let constructor = checker
-            .result
-            .types
-            .alloc(TypeKind::Constructor(constructor));
+        if class.type_parameters.is_none() {
+            let instance = checker.result.symbol_types.get(&symbol_id).copied()?;
+            let constructor = checker.class_constructor_signature(&class.members.nodes, instance);
+            let constructor = checker
+                .result
+                .types
+                .alloc(TypeKind::Constructor(constructor));
+            let static_members = class
+                .members
+                .nodes
+                .iter()
+                .filter(|member| {
+                    checker
+                        .member_modifier(**member, SyntaxKind::StaticKeyword)
+                        .is_some()
+                })
+                .copied()
+                .collect::<Vec<_>>();
+            let value_type = if static_members.is_empty() {
+                constructor
+            } else {
+                let static_type = checker.object_type_from_members(&static_members);
+                checker
+                    .result
+                    .types
+                    .intersection([constructor, static_type])
+            };
+            return Some(describe_checked_type(&checker.result, value_type));
+        }
+        let constructor = checker.instantiate_declared_class_value(symbol_id, &[])?;
         let static_members = class
             .members
             .nodes
@@ -1302,7 +1335,56 @@ impl<'a> ProgramChecker<'a> {
                 .types
                 .intersection([constructor, static_type])
         };
-        Some(describe_checked_type(&checker.result, value_type))
+        let mut descriptor = describe_checked_type(&checker.result, value_type);
+        let mut scope = HashMap::new();
+        let mut defaults = Vec::new();
+        if let Some(type_parameters) = &class.type_parameters {
+            for parameter in &type_parameters.nodes {
+                let NodeData::TypeParameterDeclaration(parameter) =
+                    &source.arena.get(*parameter)?.data
+                else {
+                    continue;
+                };
+                let name = checker.property_name(parameter.name)?;
+                let type_id = checker.result.types.alloc(TypeKind::TypeParameter {
+                    name: name.clone(),
+                    constraint: None,
+                });
+                scope.insert(name.clone(), type_id);
+                let Some(default_node) = parameter.default_type else {
+                    continue;
+                };
+                checker.type_parameter_scopes.push(scope.clone());
+                let default_id = checker.type_from_type_node(default_node);
+                let default_target = describe_source_type(source, &checker.result, default_id);
+                let default = describe_type_node_syntax(
+                    source,
+                    &mut checker,
+                    default_node,
+                    default_target,
+                    &declaration_reference_names(source, symbol_id),
+                );
+                checker.type_parameter_scopes.pop();
+                defaults.push((name, default));
+            }
+        }
+        for (parameter, default) in defaults {
+            descriptor = substitute_descriptor(
+                &descriptor,
+                &BTreeMap::from([(
+                    parameter.clone(),
+                    TypeDescriptor::Named {
+                        name: "__default_type_parameter".into(),
+                        type_arguments: vec![default],
+                        target: Box::new(TypeDescriptor::TypeParameter {
+                            name: parameter,
+                            constraint: None,
+                        }),
+                    },
+                )]),
+            );
+        }
+        Some(descriptor)
     }
 
     fn describe_namespace_member_value(
@@ -1323,7 +1405,17 @@ impl<'a> ProgramChecker<'a> {
         }
         names.reverse();
         let name = names.join(".");
-        let descriptor = name_constructor_return(descriptor, &name);
+        let generic_class = symbol.declarations.iter().any(|declaration| {
+            matches!(
+                source.arena.get(*declaration).map(|node| &node.data),
+                Some(NodeData::ClassDeclaration(class)) if class.type_parameters.is_some()
+            )
+        });
+        let descriptor = if generic_class {
+            descriptor
+        } else {
+            name_constructor_return(descriptor, &name)
+        };
         Some(TypeDescriptor::Named {
             name: format!("typeof {name}"),
             type_arguments: Vec::new(),
@@ -2195,7 +2287,7 @@ impl<'a> ProgramChecker<'a> {
                         &exported_names,
                     );
                 }
-                if specifier.starts_with('.')
+                if is_relative_module_specifier(specifier)
                     && let Some((source_path, target_path)) =
                         self.import_rebase_paths(source_index, target)
                 {
@@ -2303,7 +2395,7 @@ impl<'a> ProgramChecker<'a> {
                 for descriptor in qualified_exports.values_mut() {
                     paint_exported_named_descriptor_imports(descriptor, specifier, &export_context);
                     if let Some((source_path, target_path)) = rebase_paths
-                        && !specifier.starts_with('.')
+                        && !is_relative_module_specifier(specifier)
                         && target_path.contains("/node_modules/")
                     {
                         rebase_package_import_references(
@@ -2313,7 +2405,7 @@ impl<'a> ProgramChecker<'a> {
                             target_path,
                         );
                     } else if let Some((source_path, target_path)) = rebase_paths
-                        && specifier.starts_with('.')
+                        && is_relative_module_specifier(specifier)
                     {
                         rebase_relative_import_references_between_files(
                             descriptor,
@@ -2481,7 +2573,8 @@ impl<'a> ProgramChecker<'a> {
         if let Some(descriptor) = exports.get(imported_name) {
             let mut descriptor = descriptor.clone();
             if let Some((source_path, target_path)) = rebase_paths
-                && (module_name.starts_with('.') || target_path.contains("/node_modules/"))
+                && (is_relative_module_specifier(module_name)
+                    || target_path.contains("/node_modules/"))
             {
                 rebase_relative_import_references_between_files(
                     &mut descriptor,
@@ -10325,6 +10418,20 @@ impl<'a> Checker<'a> {
         }
     }
 
+    fn constructed_import_reference(&self, type_id: TypeId) -> Option<ImportTypeReference> {
+        if let Some(reference) = self.result.import_type_references.get(&type_id) {
+            let mut reference = reference.clone();
+            reference.is_typeof = false;
+            return Some(reference);
+        }
+        let TypeKind::Intersection(members) = &self.result.types.get(type_id)?.kind else {
+            return None;
+        };
+        members
+            .iter()
+            .find_map(|member| self.constructed_import_reference(*member))
+    }
+
     fn instantiate_explicit_call_signature(
         &mut self,
         expression: NodeId,
@@ -10599,6 +10706,9 @@ impl<'a> Checker<'a> {
         arguments: &[NodeId],
         construct: bool,
     ) -> TypeId {
+        let constructed_import_reference = construct
+            .then(|| self.constructed_import_reference(callee))
+            .flatten();
         let callee_kind = self.result.types.get(callee).unwrap().kind.clone();
         if construct
             && matches!(callee_kind, TypeKind::Object(_))
@@ -10683,6 +10793,12 @@ impl<'a> Checker<'a> {
                 self.apply_type_parameter_defaults(signature, &mut inference);
                 self.apply_uninferred_overload_type_parameters(signature, &mut inference);
                 let result = self.substitute_type(signature.return_type, &inference);
+                if let Some(reference) = constructed_import_reference.clone() {
+                    self.result
+                        .import_type_references
+                        .entry(result)
+                        .or_insert(reference);
+                }
                 self.active_defaulted_type_parameters.clear();
                 return result;
             }
@@ -10760,6 +10876,12 @@ impl<'a> Checker<'a> {
         }
         self.apply_type_parameter_defaults(signature, &mut inference);
         let result = self.substitute_type(signature.return_type, &inference);
+        if let Some(reference) = constructed_import_reference {
+            self.result
+                .import_type_references
+                .entry(result)
+                .or_insert(reference);
+        }
         self.active_defaulted_type_parameters.clear();
         result
     }
@@ -16788,6 +16910,22 @@ fn paint_exported_named_descriptor_imports(
         module_name,
         exports,
         &mut HashSet::new(),
+        None,
+    );
+}
+
+fn paint_exported_named_descriptor_dependencies(
+    descriptor: &mut TypeDescriptor,
+    module_name: &str,
+    exports: &BTreeMap<String, TypeDescriptor>,
+    exported_name: &str,
+) {
+    paint_exported_named_descriptor_imports_with_visited(
+        descriptor,
+        module_name,
+        exports,
+        &mut HashSet::new(),
+        Some(exported_name),
     );
 }
 
@@ -16796,8 +16934,15 @@ fn paint_exported_named_descriptor_imports_with_visited(
     module_name: &str,
     exports: &BTreeMap<String, TypeDescriptor>,
     visiting_names: &mut HashSet<String>,
+    excluded_export: Option<&str>,
 ) {
-    if paint_exported_named_descriptor_import(descriptor, module_name, exports, visiting_names) {
+    if paint_exported_named_descriptor_import(
+        descriptor,
+        module_name,
+        exports,
+        visiting_names,
+        excluded_export,
+    ) {
         return;
     }
     if matches!(descriptor, TypeDescriptor::Alias { .. }) {
@@ -16809,6 +16954,7 @@ fn paint_exported_named_descriptor_imports_with_visited(
             module_name,
             exports,
             visiting_names,
+            excluded_export,
         );
     });
 }
@@ -16818,19 +16964,26 @@ fn paint_exported_named_descriptor_import(
     module_name: &str,
     exports: &BTreeMap<String, TypeDescriptor>,
     visiting_names: &mut HashSet<String>,
+    excluded_export: Option<&str>,
 ) -> bool {
     if let TypeDescriptor::Import { reference, target } = descriptor {
         let exported_root = reference
             .qualifier
             .split_once('.')
             .map_or(reference.qualifier.as_str(), |(root, _)| root);
-        if exports.contains_key(exported_root) {
+        let dotted_package = reference.module_specifier.starts_with('.')
+            && !is_relative_module_specifier(&reference.module_specifier);
+        if exports.contains_key(exported_root)
+            && Some(exported_root) != excluded_export
+            && !dotted_package
+        {
             module_name.clone_into(&mut reference.module_specifier);
             paint_exported_named_descriptor_imports_with_visited(
                 target,
                 module_name,
                 exports,
                 visiting_names,
+                excluded_export,
             );
             return true;
         }
@@ -16843,11 +16996,14 @@ fn paint_exported_named_descriptor_import(
             .split_once('.')
             .map_or(referenced_name, |(root, _)| root)
             .to_owned();
-        let exported_root = exports
-            .contains_key(&referenced_root)
+        let exported_root = (Some(referenced_root.as_str()) != excluded_export
+            && exports.contains_key(&referenced_root))
             .then(|| referenced_root.clone())
             .or_else(|| {
                 exports.iter().find_map(|(exported, descriptor)| {
+                    if Some(exported.as_str()) == excluded_export {
+                        return None;
+                    }
                     let TypeDescriptor::Named { name, .. } = descriptor else {
                         return None;
                     };
@@ -16885,6 +17041,7 @@ fn paint_exported_named_descriptor_import(
                         module_name,
                         exports,
                         visiting_names,
+                        excluded_export,
                     );
                 }
                 paint_exported_named_descriptor_imports_with_visited(
@@ -16892,6 +17049,7 @@ fn paint_exported_named_descriptor_import(
                     module_name,
                     exports,
                     visiting_names,
+                    excluded_export,
                 );
             }
             visiting_names.remove(&visiting_name);
@@ -17060,7 +17218,7 @@ fn rename_descriptor_reference_roots(
 
 fn rebase_relative_import_references(descriptor: &mut TypeDescriptor, imported_module: &str) {
     if let TypeDescriptor::Import { reference, .. } = descriptor
-        && reference.module_specifier.starts_with('.')
+        && is_relative_module_specifier(&reference.module_specifier)
     {
         reference.module_specifier =
             rebase_module_specifier(imported_module, &reference.module_specifier);
@@ -17092,7 +17250,7 @@ fn rebase_package_import_references(
     target_file: &str,
 ) {
     if let TypeDescriptor::Import { reference, .. } = descriptor
-        && reference.module_specifier.starts_with('.')
+        && is_relative_module_specifier(&reference.module_specifier)
     {
         let public_entry =
             public_module_specifier_for_target(imported_module, "", source_file, target_file);
@@ -17110,7 +17268,7 @@ fn rebase_relative_import_references_between_files(
     imported_file: &str,
 ) {
     if let TypeDescriptor::Import { reference, .. } = descriptor
-        && reference.module_specifier.starts_with('.')
+        && is_relative_module_specifier(&reference.module_specifier)
     {
         reference.module_specifier = rebase_module_specifier_between_files(
             source_file,
@@ -17208,7 +17366,9 @@ fn rebase_module_specifier(imported_module: &str, nested: &str) -> String {
         1
     };
     let module_parts = imported_module.split('/').count();
-    let directory = if !imported_module.starts_with('.') && module_parts <= package_root_parts {
+    let directory = if !is_relative_module_specifier(imported_module)
+        && module_parts <= package_root_parts
+    {
         imported_module
     } else {
         imported_module
@@ -17239,13 +17399,19 @@ fn rebase_module_specifier(imported_module: &str, nested: &str) -> String {
     }
 }
 
+fn is_relative_module_specifier(specifier: &str) -> bool {
+    matches!(specifier, "." | "..")
+        || specifier.starts_with("./")
+        || specifier.starts_with("../")
+}
+
 fn public_module_specifier_for_target(
     imported_module: &str,
     nested: &str,
     source_path: &str,
     target_path: &str,
 ) -> String {
-    if imported_module.starts_with('.') {
+    if is_relative_module_specifier(imported_module) {
         return rebase_module_specifier(imported_module, nested);
     }
     let mut components = imported_module.split('/');
@@ -25934,6 +26100,115 @@ mod tests {
             result.types.get(type_id),
             result.named_type_references,
             result.import_type_references,
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn preserves_reexported_constructor_reference_through_generic_intersection() {
+        let generated = parse_source_file(
+            r#"
+                export interface PrismaClientOptions { rejectOnNotFound?: any; }
+                export class PrismaClient<T extends PrismaClientOptions = PrismaClientOptions> {
+                    private fetcher;
+                }
+            "#,
+        );
+        let package = parse_source_file(r#"export * from ".prisma/client";"#);
+        let consumer = parse_source_file(
+            r#"
+                import { PrismaClient } from "@prisma/client";
+                declare const enhancePrisma: <TPrismaClientCtor>(client: TPrismaClientCtor) =>
+                    TPrismaClientCtor & { enhanced: unknown };
+                const EnhancedPrisma = enhancePrisma(PrismaClient);
+                export default new EnhancedPrisma();
+            "#,
+        );
+        for parsed in [&generated, &package, &consumer] {
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        }
+        let generated_bindings = bind_source_file(&generated.arena, generated.source_file);
+        let package_bindings = bind_source_file(&package.arena, package.source_file);
+        let consumer_bindings = bind_source_file(&consumer.arena, consumer.source_file);
+        let no_modules = BTreeMap::new();
+        let package_modules = BTreeMap::from([(".prisma/client".into(), 0)]);
+        let consumer_modules = BTreeMap::from([("@prisma/client".into(), 1)]);
+        let checked = check_program_with_paths(
+            &[
+                ProgramSource {
+                    arena: &generated.arena,
+                    source_file: generated.source_file,
+                    bindings: &generated_bindings,
+                    resolved_modules: &no_modules,
+                    is_default_library: false,
+                    skip_diagnostics: false,
+                    checker_options: CheckerOptions {
+                        is_declaration_file: true,
+                        ..CheckerOptions::default()
+                    },
+                },
+                ProgramSource {
+                    arena: &package.arena,
+                    source_file: package.source_file,
+                    bindings: &package_bindings,
+                    resolved_modules: &package_modules,
+                    is_default_library: false,
+                    skip_diagnostics: false,
+                    checker_options: CheckerOptions {
+                        is_declaration_file: true,
+                        ..CheckerOptions::default()
+                    },
+                },
+                ProgramSource {
+                    arena: &consumer.arena,
+                    source_file: consumer.source_file,
+                    bindings: &consumer_bindings,
+                    resolved_modules: &consumer_modules,
+                    is_default_library: false,
+                    skip_diagnostics: false,
+                    checker_options: CheckerOptions::default(),
+                },
+            ],
+            &[
+                "/node_modules/.prisma/client/index.d.ts".into(),
+                "/node_modules/@prisma/client/index.d.ts".into(),
+                "/index.ts".into(),
+            ],
+        );
+        assert!(checked.files[2].diagnostics.is_empty());
+        let expression = consumer
+            .arena
+            .iter()
+            .find_map(|(id, node)| matches!(node.data, NodeData::NewExpression(_)).then_some(id))
+            .expect("new expression");
+        let result = &checked.files[2];
+        let type_id = result.type_of_node(expression).expect("new expression type");
+        assert_eq!(
+            result.import_type_references.get(&type_id),
+            Some(&ImportTypeReference {
+                module_specifier: "@prisma/client".into(),
+                qualifier: "PrismaClient".into(),
+                is_typeof: false,
+            }),
+            "type={:?}, named={:?}, imports={:?}",
+            result.types.get(type_id),
+            result.named_type_references,
+            result.import_type_references,
+        );
+        let reference = result
+            .named_type_references
+            .get(&type_id)
+            .expect("named PrismaClient instance");
+        let [options] = reference.type_arguments.as_slice() else {
+            panic!("expected default PrismaClientOptions argument: {reference:?}");
+        };
+        assert_eq!(
+            result.import_type_references.get(options),
+            Some(&ImportTypeReference {
+                module_specifier: ".prisma/client".into(),
+                qualifier: "PrismaClientOptions".into(),
+                is_typeof: false,
+            })
         );
     }
 

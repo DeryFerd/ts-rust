@@ -4281,6 +4281,7 @@ impl DeclarationPrinter<'_> {
             )
             && !matches!(&node.data, NodeData::ImportDeclaration(import) if self.import_is_used_by_inferred_return(id, import))
             && !matches!(&node.data, NodeData::ImportDeclaration(import) if self.import_is_used_by_inferred_semantic_variable_type(id, import))
+            && !matches!(&node.data, NodeData::ImportDeclaration(import) if self.import_is_used_by_synthesized_export_type(import))
             && !matches!(&node.data, NodeData::ImportDeclaration(import) if self.import_is_used_by_retained_binding_pattern(id, import))
             && !matches!(&node.data, NodeData::ImportDeclaration(import) if self.import_is_used_by_synthetic_class_base(id, import))
             && !matches!(&node.data, NodeData::ImportDeclaration(import) if self.import_has_retained_declaration_binding_use(id, import))
@@ -4959,6 +4960,7 @@ impl DeclarationPrinter<'_> {
                     && !self.statement_is_inferred_class_property_dependency(id)
                     && !self.import_has_non_assertion_type_reference(data)
                     && !self.import_is_used_by_inferred_semantic_variable_type(id, data)
+                    && !self.import_is_used_by_synthesized_export_type(data)
                     && !self.import_is_used_by_inferred_return(id, data)
                     && !self.import_is_used_by_synthetic_class_base(id, data)
                     && !self.import_is_used_by_javascript_prop_types_namespace(data)
@@ -4967,6 +4969,7 @@ impl DeclarationPrinter<'_> {
                 }
                 if data.import_clause.is_some()
                     && !self.import_has_retained_declaration_binding_use(id, data)
+                    && !self.import_is_used_by_synthesized_export_type(data)
                     && !self.statement_is_inferred_class_property_dependency(id)
                     && !self.import_is_used_by_javascript_prop_types_namespace(data)
                 {
@@ -7457,6 +7460,28 @@ impl DeclarationPrinter<'_> {
         })
     }
 
+    fn import_is_used_by_synthesized_export_type(
+        &self,
+        import: &ts_ast::ImportDeclarationData,
+    ) -> bool {
+        self.arena.iter().any(|(_, node)| {
+            let NodeData::ExportAssignment(export) = &node.data else {
+                return false;
+            };
+            if export.is_export_equals {
+                return false;
+            }
+            let Some(type_id) = self.synthesized_expression_type(export.expression) else {
+                return false;
+            };
+            self.semantic_type_references_import(
+                type_id,
+                import,
+                &mut HashSet::new(),
+            )
+        })
+    }
+
     fn semantic_type_references_names(
         &self,
         type_id: TypeId,
@@ -7722,6 +7747,9 @@ impl DeclarationPrinter<'_> {
             }
             NodeData::ParenthesizedExpression(parenthesized) => {
                 self.entity_expression_root_identifier(parenthesized.expression)
+            }
+            NodeData::NewExpression(new_expression) => {
+                self.entity_expression_root_identifier(new_expression.expression)
             }
             _ => None,
         }
@@ -16980,6 +17008,7 @@ impl DeclarationPrinter<'_> {
                     .any(|statements| statements.contains(&import_id))
                     || self.import_is_used_by_inferred_return(import_id, import)
                     || self.import_is_used_by_inferred_semantic_variable_type(import_id, import)
+                    || self.import_is_used_by_synthesized_export_type(import)
             });
             if !retained {
                 return None;
