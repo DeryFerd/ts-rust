@@ -330,6 +330,7 @@ impl Program {
                 file_index += 1;
                 continue;
             }
+            self.load_reference_directives_for_file(file_system, &resolver, file_index);
             register_ambient_external_modules(
                 &self.source_files[file_index],
                 &self.current_directory,
@@ -407,7 +408,6 @@ impl Program {
         }
         program.load_default_libraries();
         let resolution_options = program.options.module_resolution_options();
-        program.load_reference_directives(file_system, &resolution_options);
         program.load_automatic_type_directives(file_system, &resolution_options);
         program.load_module_graph(file_system, resolution_options);
         program.check_program();
@@ -2247,55 +2247,47 @@ impl Program {
         }
     }
 
-    fn load_reference_directives(
+    fn load_reference_directives_for_file(
         &mut self,
         file_system: &dyn FileSystem,
-        resolution_options: &ResolutionOptions,
+        resolver: &Resolver<'_, dyn FileSystem + '_>,
+        file_index: usize,
     ) {
-        let resolver = Resolver::new(file_system, resolution_options.clone());
-        let mut file_index = 0;
-        while file_index < self.source_files.len() {
-            if self.source_files[file_index].is_default_library {
-                file_index += 1;
-                continue;
-            }
-            let containing_file = self.source_files[file_index].file_name.clone();
-            let directives = reference_directives(&self.source_files[file_index].source_text);
-            for directive in directives {
-                match directive.kind {
-                    ReferenceKind::Path => {
-                        let unresolved_file_name = resolve_path(
-                            &directory_path(&containing_file),
-                            &[directive.value.as_str()],
-                        );
-                        let file_name = resolve_reference_path(
-                            file_system,
-                            &unresolved_file_name,
-                            self.options.allow_js,
-                        )
-                        .unwrap_or(unresolved_file_name);
-                        self.load_file(file_system, &file_name, true);
+        let containing_file = self.source_files[file_index].file_name.clone();
+        let directives = reference_directives(&self.source_files[file_index].source_text);
+        for directive in directives {
+            match directive.kind {
+                ReferenceKind::Path => {
+                    let unresolved_file_name = resolve_path(
+                        &directory_path(&containing_file),
+                        &[directive.value.as_str()],
+                    );
+                    let file_name = resolve_reference_path(
+                        file_system,
+                        &unresolved_file_name,
+                        self.options.allow_js,
+                    )
+                    .unwrap_or(unresolved_file_name);
+                    self.load_file(file_system, &file_name, true);
+                }
+                ReferenceKind::Types => {
+                    if let Some(resolved) = resolver
+                        .resolve_type_reference(&directive.value, &containing_file)
+                        .resolved
+                    {
+                        self.load_file(file_system, &resolved.resolved_file_name, false);
+                    } else {
+                        self.diagnostics
+                            .push(type_definition_not_found(&directive.value));
                     }
-                    ReferenceKind::Types => {
-                        if let Some(resolved) = resolver
-                            .resolve_type_reference(&directive.value, &containing_file)
-                            .resolved
-                        {
-                            self.load_file(file_system, &resolved.resolved_file_name, false);
-                        } else {
-                            self.diagnostics
-                                .push(type_definition_not_found(&directive.value));
-                        }
-                    }
-                    ReferenceKind::Lib => {
-                        let library_name = bundled_library_name(&directive.value);
-                        for dependency in ts_bundled::library_closure(&library_name) {
-                            self.load_bundled_library(dependency);
-                        }
+                }
+                ReferenceKind::Lib => {
+                    let library_name = bundled_library_name(&directive.value);
+                    for dependency in ts_bundled::library_closure(&library_name) {
+                        self.load_bundled_library(dependency);
                     }
                 }
             }
-            file_index += 1;
         }
     }
 
@@ -5413,6 +5405,76 @@ mod tests {
                 .diagnostics()
                 .iter()
                 .any(|diagnostic| diagnostic.code == Some(2304))
+        );
+    }
+
+    #[test]
+    fn emits_path_references_discovered_through_imported_modules() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/ref.ts", "var x = 1;").unwrap();
+        fs.write_file(
+            "/project/a.ts",
+            "/// <reference path=\"ref.ts\"/>\nexport var y;",
+        )
+        .unwrap();
+        fs.write_file("/project/b.ts", "import y = require(\"./a\");")
+            .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["b.ts".to_owned()],
+            CompilerOptions {
+                module: ModuleKind::CommonJs,
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        assert!(program.diagnostics().is_empty(), "{:?}", program.diagnostics());
+        let emitted = program.emit();
+        assert!(
+            emitted
+                .files
+                .iter()
+                .any(|file| file.file_name == "/project/ref.js"),
+            "{:?}",
+            emitted.files
+        );
+    }
+
+    #[test]
+    fn declaration_emit_preserves_non_nullable_generic_logical_or_return() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/main.ts",
+            concat!(
+                "function fail(): never { throw new Error(); }\n",
+                "function value<T>(input: T) { return input || fail(); }",
+            ),
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["main.ts".to_owned()],
+            CompilerOptions {
+                declaration: true,
+                strict: true,
+                ..CompilerOptions::default()
+            },
+        );
+        assert!(program.diagnostics().is_empty(), "{:?}", program.diagnostics());
+        let emitted = program.emit();
+        let declaration = emitted
+            .files
+            .iter()
+            .find(|file| file.file_name == "/project/main.d.ts")
+            .expect("declaration output");
+        assert!(
+            declaration
+                .text
+                .contains("function value<T>(input: T): NonNullable<T>;"),
+            "{}",
+            declaration.text
         );
     }
 

@@ -8156,6 +8156,22 @@ impl<'a> Checker<'a> {
                         Some(TypeKind::Boolean)
                     ) {
                         members.push(self.result.types.alloc(TypeKind::BooleanLiteral(true)));
+                    } else if self.options.strict_null_checks
+                        && matches!(
+                        self.result.types.get(member).map(|type_| &type_.kind),
+                        Some(TypeKind::TypeParameter { .. })
+                    )
+                    {
+                        let kind = self.result.types.get(member).unwrap().kind.clone();
+                        let non_nullable = self.result.types.alloc(kind);
+                        self.result.named_type_references.insert(
+                            non_nullable,
+                            NamedTypeReference {
+                                name: "NonNullable".into(),
+                                type_arguments: vec![member],
+                            },
+                        );
+                        members.push(non_nullable);
                     } else {
                         members.push(member);
                     }
@@ -24081,6 +24097,40 @@ mod tests {
             result.types.get(*member).map(|type_| &type_.kind),
             Some(TypeKind::Function(_))
         )));
+    }
+
+    #[test]
+    fn preserves_non_nullable_generic_logical_or_returns() {
+        let parsed = parse_source_file(
+            r"
+                function error(): never { throw new Error(); }
+                function value<T>(input: T) { return input || error(); }
+            ",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file_with_options(
+            &parsed.arena,
+            parsed.source_file,
+            &bindings,
+            CheckerOptions {
+                strict_null_checks: true,
+                ..CheckerOptions::default()
+            },
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let symbol = bindings.root_scope().unwrap().symbols.get("value").unwrap();
+        let type_id = result.type_of_symbol(symbol).unwrap();
+        let TypeKind::Function(signature) = &result.types.get(type_id).unwrap().kind else {
+            panic!("expected generic function");
+        };
+        assert_eq!(
+            result.named_type_references.get(&signature.return_type),
+            Some(&NamedTypeReference {
+                name: "NonNullable".into(),
+                type_arguments: vec![signature.parameters[0]],
+            })
+        );
     }
 
     #[test]

@@ -16687,13 +16687,14 @@ impl DeclarationPrinter<'_> {
             .and_then(|references| references.get(&id))
             && reference.name != "__private_pick_mapped"
             && self.named_type_reference_is_declaration_visible(&reference.name)
-            && !matches!(
-                self.semantic_types
-                    .and_then(|types| types.get(id))
-                    .map(|type_| &type_.kind),
-                Some(TypeKind::TypeParameter { name, .. })
-                    if !name.starts_with("__cyclic_alias__")
-            )
+            && (reference.name == "NonNullable"
+                || !matches!(
+                    self.semantic_types
+                        .and_then(|types| types.get(id))
+                        .map(|type_| &type_.kind),
+                    Some(TypeKind::TypeParameter { name, .. })
+                        if !name.starts_with("__cyclic_alias__")
+                ))
         {
             let display_name = self
                 .self_import_namespace_for_type_arguments(&reference.type_arguments)
@@ -16965,7 +16966,7 @@ impl DeclarationPrinter<'_> {
     }
 
     fn named_type_reference_is_declaration_visible(&self, name: &str) -> bool {
-        if name.contains('.') {
+        if name == "NonNullable" || name.contains('.') {
             return true;
         }
         let matching = self
