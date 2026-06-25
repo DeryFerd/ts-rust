@@ -5935,12 +5935,35 @@ impl<'a> Parser<'a> {
                 },
                 flags: ts_ast::ModifierFlags::default(),
             });
+            if matches!(
+                self.current.kind,
+                SyntaxKind::GetKeyword | SyntaxKind::SetKeyword
+            ) && self.is_accessor_signature()
+            {
+                properties.push(self.parse_class_accessor(
+                    property_start,
+                    modifiers,
+                    modifier_nodes,
+                    true,
+                ));
+                if self.current.kind != SyntaxKind::CommaToken {
+                    break;
+                }
+                self.bump();
+                trailing = self.current.kind == SyntaxKind::CloseBraceToken;
+                continue;
+            }
             let asterisk_token = if self.current.kind == SyntaxKind::AsteriskToken {
                 Some(self.consume_token_node())
             } else {
                 None
             };
             let name = self.parse_property_name("Expected a property name.");
+            let postfix_token = if self.current.kind == SyntaxKind::QuestionToken {
+                Some(self.consume_token_node())
+            } else {
+                None
+            };
             if matches!(
                 self.current.kind,
                 SyntaxKind::LessThanToken | SyntaxKind::OpenParenToken
@@ -5958,6 +5981,7 @@ impl<'a> Parser<'a> {
                 let mut children = modifier_nodes;
                 children.extend(asterisk_token);
                 children.push(name);
+                children.extend(postfix_token);
                 extend_list_children(&mut children, type_parameters.as_ref());
                 children.extend(parameters.nodes.iter().copied());
                 children.extend(return_type);
@@ -5974,7 +5998,7 @@ impl<'a> Parser<'a> {
                         locals: SymbolTable,
                         next_container: None,
                         parameters,
-                        postfix_token: None,
+                        postfix_token,
                         symbol: None,
                         type_: return_type,
                         type_parameters,
@@ -5995,13 +6019,15 @@ impl<'a> Parser<'a> {
                 }
                 let initializer = self.parse_binary_expression(2);
                 let mut children = modifier_nodes.clone();
-                children.extend([name, initializer]);
+                children.push(name);
+                children.extend(postfix_token);
+                children.push(initializer);
                 properties.push(self.alloc_node(
                     SyntaxKind::PropertyAssignment,
                     TextRange::new(property_start, self.node_end(initializer)),
                     NodeData::PropertyAssignment(Box::new(PropertyAssignmentData {
                         initializer,
-                        postfix_token: None,
+                        postfix_token,
                         symbol: None,
                         type_: initializer,
                         facts: 0,
@@ -6025,10 +6051,25 @@ impl<'a> Parser<'a> {
                             Some(equals_token),
                             Some(initializer),
                             self.node_end(initializer),
-                            vec![name, equals_token, initializer],
+                            {
+                                let mut children = vec![name];
+                                children.extend(postfix_token);
+                                children.extend([equals_token, initializer]);
+                                children
+                            },
                         )
                     } else {
-                        (None, None, self.node_end(name), vec![name])
+                        let mut children = vec![name];
+                        children.extend(postfix_token);
+                        (
+                            None,
+                            None,
+                            postfix_token.map_or_else(
+                                || self.node_end(name),
+                                |token| self.node_end(token),
+                            ),
+                            children,
+                        )
                     };
                 children.splice(0..0, modifier_nodes.iter().copied());
                 properties.push(self.alloc_node(
@@ -6038,7 +6079,7 @@ impl<'a> Parser<'a> {
                         ShorthandPropertyAssignmentData {
                             equals_token,
                             object_assignment_initializer,
-                            postfix_token: None,
+                            postfix_token,
                             symbol: None,
                             type_: name,
                             facts: 0,
@@ -9269,6 +9310,36 @@ mod tests {
             panic!("expected setter");
         };
         assert!(setter.body.is_none());
+    }
+
+    #[test]
+    fn recovers_object_member_modifiers_and_question_marks() {
+        let result = parse_source_file(
+            "const value = { public get foo() {}, bar?() {}, baz?: 1 };",
+        );
+        let object = find_descendant_kind(
+            &result,
+            result.source_file,
+            SyntaxKind::ObjectLiteralExpression,
+        )
+        .expect("object literal");
+        let NodeData::ObjectLiteralExpression(object) = &result.arena.get(object).unwrap().data
+        else {
+            panic!("expected object literal");
+        };
+        assert_eq!(object.properties.nodes.len(), 3);
+        assert!(matches!(
+            &result.arena.get(object.properties.nodes[0]).unwrap().data,
+            NodeData::GetAccessorDeclaration(accessor) if accessor.modifiers.is_some()
+        ));
+        assert!(matches!(
+            &result.arena.get(object.properties.nodes[1]).unwrap().data,
+            NodeData::MethodDeclaration(method) if method.postfix_token.is_some()
+        ));
+        assert!(matches!(
+            &result.arena.get(object.properties.nodes[2]).unwrap().data,
+            NodeData::PropertyAssignment(property) if property.postfix_token.is_some()
+        ));
     }
 
     #[test]

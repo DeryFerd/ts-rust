@@ -10082,6 +10082,9 @@ impl DeclarationPrinter<'_> {
     }
 
     fn const_literal_declaration_initializer(&self, expression: NodeId) -> Option<NodeId> {
+        if let Some(literal) = self.object_literal_asserted_property_literal(expression) {
+            return Some(literal);
+        }
         let symbol = self.resolve_entity_expression_symbol(expression)?;
         self.bindings
             .symbols
@@ -10089,15 +10092,33 @@ impl DeclarationPrinter<'_> {
             .declarations
             .iter()
             .find_map(|declaration| {
-                let NodeData::VariableDeclaration(variable) = &self.arena.get(*declaration)?.data
-                else {
-                    return None;
+                let initializer = match &self.arena.get(*declaration)?.data {
+                    NodeData::VariableDeclaration(variable) => {
+                        let list = self.arena.get(self.arena.get(*declaration)?.parent?)?;
+                        (list.flags.0 & (1 << 1) != 0).then_some(variable.initializer?)?
+                    }
+                    NodeData::PropertyAssignment(property) => {
+                        let type_ = match &self.arena.get(property.initializer)?.data {
+                            NodeData::AsExpression(assertion) => assertion.type_,
+                            NodeData::TypeAssertion(assertion) => assertion.type_,
+                            _ => return None,
+                        };
+                        let NodeData::LiteralTypeNode(literal) = &self.arena.get(type_)?.data else {
+                            return None;
+                        };
+                        return matches!(
+                            self.arena.get(literal.literal).map(|node| &node.data),
+                            Some(
+                                NodeData::StringLiteral(_)
+                                    | NodeData::NumericLiteral(_)
+                                    | NodeData::BigIntLiteral(_)
+                                    | NodeData::NoSubstitutionTemplateLiteral(_)
+                            )
+                        )
+                        .then_some(literal.literal);
+                    }
+                    _ => return None,
                 };
-                let list = self.arena.get(self.arena.get(*declaration)?.parent?)?;
-                if list.flags.0 & (1 << 1) == 0 {
-                    return None;
-                }
-                let initializer = variable.initializer?;
                 matches!(
                     self.arena.get(initializer).map(|node| &node.data),
                     Some(
@@ -10119,6 +10140,57 @@ impl DeclarationPrinter<'_> {
                                 )
                     )
                     .then_some(initializer)
+                })
+            })
+    }
+
+    fn object_literal_asserted_property_literal(&self, expression: NodeId) -> Option<NodeId> {
+        let NodeData::PropertyAccessExpression(access) = &self.arena.get(expression)?.data else {
+            return None;
+        };
+        let member_name = declaration_name_text(self.arena, access.name)?;
+        let receiver = self.resolve_entity_expression_symbol(access.expression)?;
+        self.bindings
+            .symbols
+            .get(receiver)?
+            .declarations
+            .iter()
+            .find_map(|declaration| {
+                let NodeData::VariableDeclaration(variable) = &self.arena.get(*declaration)?.data
+                else {
+                    return None;
+                };
+                let NodeData::ObjectLiteralExpression(object) =
+                    &self.arena.get(variable.initializer?)?.data
+                else {
+                    return None;
+                };
+                object.properties.nodes.iter().find_map(|property| {
+                    let NodeData::PropertyAssignment(property) = &self.arena.get(*property)?.data
+                    else {
+                        return None;
+                    };
+                    if declaration_name_text(self.arena, property.name) != Some(member_name) {
+                        return None;
+                    }
+                    let type_ = match &self.arena.get(property.initializer)?.data {
+                        NodeData::AsExpression(assertion) => assertion.type_,
+                        NodeData::TypeAssertion(assertion) => assertion.type_,
+                        _ => return None,
+                    };
+                    let NodeData::LiteralTypeNode(literal) = &self.arena.get(type_)?.data else {
+                        return None;
+                    };
+                    matches!(
+                        self.arena.get(literal.literal).map(|node| &node.data),
+                        Some(
+                            NodeData::StringLiteral(_)
+                                | NodeData::NumericLiteral(_)
+                                | NodeData::BigIntLiteral(_)
+                                | NodeData::NoSubstitutionTemplateLiteral(_)
+                        )
+                    )
+                    .then_some(literal.literal)
                 })
             })
     }
@@ -19387,6 +19459,23 @@ impl DeclarationPrinter<'_> {
         else {
             return Ok(false);
         };
+        let semantic_literal = self
+            .node_types
+            .and_then(|types| types.get(&computed.expression))
+            .and_then(|type_id| self.semantic_types?.get(*type_id))
+            .map(|type_| type_.kind.clone());
+        match semantic_literal {
+            Some(TypeKind::StringLiteral(value)) => {
+                self.emit_semantic_property_name(&value);
+                return Ok(true);
+            }
+            Some(TypeKind::NumberLiteral(value)) => {
+                self.writer
+                    .write(&ts_jsnum::Number::from_string(&value).to_string());
+                return Ok(true);
+            }
+            _ => {}
+        }
         let Some(literal) = self.const_literal_declaration_initializer(computed.expression) else {
             return Ok(false);
         };
@@ -20829,7 +20918,7 @@ impl DeclarationPrinter<'_> {
                 && is_identifier_text(&literal.text)
             {
                 self.writer.write(&literal.text);
-            } else {
+            } else if !self.emit_computed_literal_property_name(name)? {
                 self.emit_name(name)?;
             }
             self.writer.write(": ");
@@ -51008,25 +51097,35 @@ impl Printer<'_> {
                     self.emit_downlevel_object_spread(data)?;
                     return Ok(());
                 }
+                let emitted_properties = data
+                    .properties
+                    .nodes
+                    .iter()
+                    .copied()
+                    .filter(|property| {
+                        !matches!(
+                            self.arena.get(*property).map(|node| &node.data),
+                            Some(NodeData::MethodDeclaration(method)) if method.body.is_none()
+                        )
+                    })
+                    .collect::<Vec<_>>();
                 let multiline = self.node_source_is_multiline(id);
-                if data.properties.nodes.is_empty() {
+                if emitted_properties.is_empty() {
                     self.writer.write("{}");
                     return Ok(());
                 }
                 self.writer.write("{");
                 if multiline {
                     self.writer.newline();
-                    if !data.properties.nodes.is_empty() {
-                        self.writer.indent += 1;
-                    }
+                    self.writer.indent += 1;
                 } else {
                     self.writer.write(" ");
                 }
                 let mut previous_end = node.range.start.get().saturating_add(1);
-                for (index, property) in data.properties.nodes.iter().enumerate() {
+                for (index, property) in emitted_properties.iter().enumerate() {
                     if index != 0 {
                         if multiline {
-                            let previous = data.properties.nodes[index - 1];
+                            let previous = emitted_properties[index - 1];
                             if self.source_has_line_break_between(previous, *property) {
                                 self.writer.newline();
                             } else {
@@ -51189,12 +51288,10 @@ impl Printer<'_> {
                     }
                     previous_end = node.range.end.get();
                     if multiline
-                        && (index + 1 < data.properties.nodes.len()
+                        && (index + 1 < emitted_properties.len()
                             || data.properties.has_trailing_comma)
                     {
-                        let boundary = data
-                            .properties
-                            .nodes
+                        let boundary = emitted_properties
                             .get(index + 1)
                             .and_then(|next| self.arena.get(*next))
                             .map_or_else(
@@ -51232,9 +51329,7 @@ impl Printer<'_> {
                     if !self.writer.line_start {
                         self.writer.newline();
                     }
-                    if !data.properties.nodes.is_empty() {
-                        self.writer.indent -= 1;
-                    }
+                    self.writer.indent -= 1;
                     self.writer.write("}");
                 } else {
                     if data.properties.has_trailing_comma {
@@ -54162,6 +54257,7 @@ impl Printer<'_> {
         properties: &[NodeId],
     ) -> Result<(), EmitError> {
         self.writer.write("{ ");
+        self.writer.indent += 1;
         for (index, property) in properties.iter().enumerate() {
             if index != 0 {
                 self.writer.write(", ");
@@ -54169,6 +54265,7 @@ impl Printer<'_> {
             let node = self.node(*property)?.clone();
             self.emit_object_property(*property, &node)?;
         }
+        self.writer.indent -= 1;
         self.writer.write(" }");
         Ok(())
     }
@@ -58211,6 +58308,18 @@ mod tests {
     }
 
     #[test]
+    fn omits_bodyless_object_literal_methods() {
+        let parsed = parse_source_file("var value = { missing(); };");
+        assert_eq!(parsed.diagnostics.len(), 1, "{:?}", parsed.diagnostics);
+        assert_eq!(
+            emit_source_file(&parsed.arena, parsed.source_file)
+                .unwrap()
+                .code,
+            "var value = {};\n"
+        );
+    }
+
+    #[test]
     fn preserves_empty_element_access_recovery_after_new_expressions() {
         let source = "var one = new Z[]; var two = new Z[][]; var grouped = (<any>new Z).value;";
         let parsed = parse_source_file(source);
@@ -59984,6 +60093,20 @@ mod tests {
                 "const fresh = Object.assign({ a: 1 });\n",
                 "const shared = Object.assign({}, source);\n",
             )
+        );
+    }
+
+    #[test]
+    fn downlevel_object_spread_indents_method_bodies_inside_property_chunks() {
+        let output = emit_with(
+            "const value = { ...base, method() {\nreturn { ...base, x: 1 };\n} };",
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(
+            output.contains("method() {\n        return Object.assign"),
+            "{output}"
         );
     }
 
@@ -62411,6 +62534,16 @@ class Board {
             output.contains("export declare const number = 100;"),
             "{output}"
         );
+    }
+
+    #[test]
+    fn declaration_object_literal_uses_resolved_computed_string_name() {
+        let output = emit_declarations_with_semantics(concat!(
+            "const keys = { value: 'resolved' as 'resolved' }; ",
+            "export const object = { [keys.value]: 1 };",
+        ));
+        assert!(output.contains("resolved: number;"), "{output}");
+        assert!(!output.contains("[keys.value]"), "{output}");
     }
 
     #[test]
