@@ -151,7 +151,8 @@ fn source_shebang(source: &SourceFile) -> Option<&str> {
         .strip_prefix('\u{feff}')
         .unwrap_or(&source.source_text);
     text.lines()
-        .find(|line| line.starts_with("#!"))
+        .next()
+        .filter(|line| line.starts_with("#!"))
         .map(|line| line.trim_end_matches('\r'))
 }
 
@@ -357,7 +358,7 @@ impl Program {
             );
             let containing_file = self.source_files[file_index].file_name.clone();
             let specifiers = module_specifiers(&self.source_files[file_index].parse);
-            for (specifier, range, can_resolve_ambient) in specifiers {
+            for (specifier, range, can_resolve_ambient, side_effect_only) in specifiers {
                 let result = resolver.resolve(&specifier, &containing_file);
                 if let Some(resolved) = result.resolved {
                     let containing = canonicalize(
@@ -384,12 +385,18 @@ impl Program {
                     );
                     self.resolved_modules
                         .insert((containing, specifier.clone()), target.clone());
-                } else if !self.options.no_check {
-                    self.diagnostics.push(module_not_found_diagnostic(
-                        &containing_file,
-                        range,
-                        &specifier,
-                    ));
+                } else if !self.options.no_check
+                    && (!side_effect_only || self.options.no_unchecked_side_effect_imports)
+                {
+                    self.diagnostics.push(if side_effect_only {
+                        side_effect_import_not_found_diagnostic(
+                            &containing_file,
+                            range,
+                            &specifier,
+                        )
+                    } else {
+                        module_not_found_diagnostic(&containing_file, range, &specifier)
+                    });
                 }
             }
             file_index += 1;
@@ -725,7 +732,7 @@ impl Program {
                     amd_module_name: source_file.parse.amd_module_name.as_deref(),
                     amd_bundle: false,
                     preemitted_source_prologues: false,
-                    preemitted_shebang: false,
+                    preemitted_shebang: source_shebang(source_file).is_some(),
                     suppress_extends_helper: false,
                     preemitted_comment_end: None,
                     preserve_top_of_file_reference_directive,
@@ -769,7 +776,14 @@ impl Program {
                         let Some(file_name) = paths.javascript.clone() else {
                             continue;
                         };
+                        let shebang = source_shebang(source_file);
+                        if let Some(shebang) = shebang {
+                            emitted.code = format!("{shebang}\n{}", emitted.code);
+                        }
                         if let Some(mut source_map) = emitted.source_map {
+                            if shebang.is_some() {
+                                source_map.mappings.insert(0, ';');
+                            }
                             if self.options.inline_sources {
                                 source_map.sources_content =
                                     Some(vec![source_file.source_text.clone()]);
@@ -4841,14 +4855,16 @@ fn base64_encode(bytes: &[u8]) -> String {
     encoded
 }
 
-fn module_specifiers(parse: &ParseResult) -> Vec<(String, TextRange, bool)> {
+fn module_specifiers(parse: &ParseResult) -> Vec<(String, TextRange, bool, bool)> {
     let mut specifiers = parse
         .arena
         .iter()
         .filter_map(|(_, node)| match &node.data {
             NodeData::ImportDeclaration(data) => {
                 string_literal(&parse.arena, data.module_specifier)
-                    .map(|(specifier, range)| (specifier, range, true))
+                    .map(|(specifier, range)| {
+                        (specifier, range, true, data.import_clause.is_none())
+                    })
             }
             NodeData::ImportEqualsDeclaration(data) => parse
                 .arena
@@ -4859,18 +4875,18 @@ fn module_specifiers(parse: &ParseResult) -> Vec<(String, TextRange, bool)> {
                     }
                     _ => None,
                 })
-                .map(|(specifier, range)| (specifier, range, true)),
+                .map(|(specifier, range)| (specifier, range, true, false)),
             NodeData::ExportDeclaration(data) => data
                 .module_specifier
                 .and_then(|specifier| string_literal(&parse.arena, specifier))
-                .map(|(specifier, range)| (specifier, range, true)),
+                .map(|(specifier, range)| (specifier, range, true, false)),
             NodeData::ImportTypeNode(data) => {
                 let argument = match parse.arena.get(data.argument).map(|node| &node.data) {
                     Some(NodeData::LiteralTypeNode(literal)) => literal.literal,
                     _ => data.argument,
                 };
                 string_literal(&parse.arena, argument)
-                    .map(|(specifier, range)| (specifier, range, true))
+                    .map(|(specifier, range)| (specifier, range, true, false))
             }
             NodeData::CallExpression(data)
                 if matches!(
@@ -4882,7 +4898,7 @@ fn module_specifiers(parse: &ParseResult) -> Vec<(String, TextRange, bool)> {
                     .nodes
                     .first()
                     .and_then(|argument| string_literal(&parse.arena, *argument))
-                    .map(|(specifier, range)| (specifier, range, true))
+                    .map(|(specifier, range)| (specifier, range, true, false))
             }
             _ => None,
         })
@@ -4893,7 +4909,7 @@ fn module_specifiers(parse: &ParseResult) -> Vec<(String, TextRange, bool)> {
     specifiers
 }
 
-fn jsdoc_import_specifiers(source: &str) -> Vec<(String, TextRange, bool)> {
+fn jsdoc_import_specifiers(source: &str) -> Vec<(String, TextRange, bool, bool)> {
     let mut specifiers = Vec::new();
     let mut search_start = 0;
     while let Some(relative_start) = source[search_start..].find("/**") {
@@ -4933,6 +4949,7 @@ fn jsdoc_import_specifiers(source: &str) -> Vec<(String, TextRange, bool)> {
                     TextPos::new(u32::try_from(value_end).unwrap_or(u32::MAX)),
                 ),
                 true,
+                false,
             ));
             import_search = value_end.saturating_sub(body_start);
         }
@@ -5200,6 +5217,22 @@ fn module_not_found_diagnostic(
         message: message
             .format(&[specifier.to_owned()])
             .expect("TS2307 has one formatting argument"),
+    }
+}
+
+fn side_effect_import_not_found_diagnostic(
+    file_name: &str,
+    range: TextRange,
+    specifier: &str,
+) -> ProgramDiagnostic {
+    let message = message_by_code(2882).expect("TS2882 must be in the generated catalog");
+    ProgramDiagnostic {
+        file_name: Some(file_name.to_owned()),
+        range: Some(range),
+        code: Some(message.code()),
+        message: message
+            .format(&[specifier.to_owned()])
+            .expect("TS2882 has one formatting argument"),
     }
 }
 
@@ -5607,6 +5640,71 @@ mod tests {
         let reference = javascript.text.find("/// <reference path='dep.ts'/>").unwrap();
         let namespace = javascript.text.find("var bar;").unwrap();
         assert!(marker < reference && reference < namespace, "{}", javascript.text);
+    }
+
+    #[test]
+    fn emits_shebang_before_generated_prologues_and_references() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/types.d.ts",
+            "declare module 'pkg' { export const value: number; }",
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/main.ts",
+            concat!(
+                "#!/usr/bin/env node\n\n",
+                "/// <reference path=\"types.d.ts\"/>\n\n",
+                "import { value } from 'pkg';\n",
+                "use(value);\n",
+            ),
+        )
+        .unwrap();
+        let emitted = Program::new_with_options(
+            &fs,
+            "/project",
+            &["main.ts".to_owned()],
+            CompilerOptions {
+                module: ModuleKind::CommonJs,
+                no_lib: true,
+                target: ScriptTarget::Es2015,
+                ..CompilerOptions::default()
+            },
+        )
+        .emit();
+        let javascript = emitted
+            .files
+            .iter()
+            .find(|file| file.file_name == "/project/main.js")
+            .unwrap();
+        assert!(
+            javascript.text.starts_with(concat!(
+                "#!/usr/bin/env node\n",
+                "\"use strict\";\n",
+                "/// <reference path=\"types.d.ts\"/>\n",
+                "Object.defineProperty(exports, \"__esModule\", { value: true });\n",
+            )),
+            "{}",
+            javascript.text
+        );
+
+        fs.write_file(
+            "/project/invalid.ts",
+            "var value = 1;\n#!/usr/bin/env node",
+        )
+        .unwrap();
+        let invalid = Program::new_with_options(
+            &fs,
+            "/project",
+            &["invalid.ts".to_owned()],
+            CompilerOptions {
+                no_lib: true,
+                target: ScriptTarget::Es2015,
+                ..CompilerOptions::default()
+            },
+        )
+        .emit();
+        assert!(!invalid.files[0].text.starts_with("#!"));
     }
 
     #[test]
@@ -6159,7 +6257,7 @@ mod tests {
         let fs = MemoryFileSystem::new(true);
         fs.write_file(
             "/project/main.ts",
-            "import { value } from './dep.js'; import './missing'; value;",
+            "import { value } from './dep.js'; import { missing } from './missing'; value; missing;",
         )
         .unwrap();
         fs.write_file("/project/dep.ts", "export const value = 1;")
@@ -6177,6 +6275,52 @@ mod tests {
                 .diagnostics()
                 .iter()
                 .any(|diagnostic| diagnostic.code == Some(2307))
+        );
+    }
+
+    #[test]
+    fn checks_unresolved_side_effect_imports_only_when_requested() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/main.ts",
+            "import './side-effect'; import { value } from './binding'; value;",
+        )
+        .unwrap();
+        let unchecked = Program::new_with_options(
+            &fs,
+            "/project",
+            &["main.ts".to_owned()],
+            CompilerOptions {
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        assert_eq!(
+            unchecked
+                .diagnostics()
+                .iter()
+                .filter_map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [2307]
+        );
+
+        let checked = Program::new_with_options(
+            &fs,
+            "/project",
+            &["main.ts".to_owned()],
+            CompilerOptions {
+                no_lib: true,
+                no_unchecked_side_effect_imports: true,
+                ..CompilerOptions::default()
+            },
+        );
+        assert_eq!(
+            checked
+                .diagnostics()
+                .iter()
+                .filter_map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [2882, 2307]
         );
     }
 

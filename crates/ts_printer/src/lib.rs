@@ -360,7 +360,7 @@ pub fn emit_source_file_with_context(
         exported_object_rest_temps: HashMap::new(),
         commonjs_destructuring_assignment_roots: HashSet::new(),
         commonjs_destructuring_assignment_temps: HashMap::new(),
-        commonjs_destructuring_assignment_hoists: Vec::new(),
+        commonjs_destructuring_assignment_hoists: HashMap::new(),
         commonjs_postfix_export_temps: HashMap::new(),
         downlevel_nullish_temps: HashMap::new(),
         downlevel_optional_temps: HashMap::new(),
@@ -890,7 +890,9 @@ pub fn emit_source_file_with_context(
         temps.extend(
             printer
                 .commonjs_destructuring_assignment_hoists
-                .iter()
+                .get(&source_file)
+                .into_iter()
+                .flatten()
                 .cloned(),
         );
         if !temps.is_empty() {
@@ -25011,9 +25013,11 @@ struct DownlevelAsyncParameterPlan {
 #[derive(Clone)]
 enum CommonJsDestructuringValue {
     Expression(NodeId),
+    Binding(DownlevelBindingValue),
     Temp(String),
     Property(Box<Self>, NodeId),
     Element(Box<Self>, usize),
+    Default(Box<Self>, NodeId),
 }
 
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
@@ -25118,7 +25122,7 @@ struct Printer<'a> {
     exported_object_rest_temps: HashMap<NodeId, String>,
     commonjs_destructuring_assignment_roots: HashSet<NodeId>,
     commonjs_destructuring_assignment_temps: HashMap<NodeId, String>,
-    commonjs_destructuring_assignment_hoists: Vec<String>,
+    commonjs_destructuring_assignment_hoists: HashMap<NodeId, Vec<String>>,
     commonjs_postfix_export_temps: HashMap<NodeId, String>,
     downlevel_nullish_temps: HashMap<NodeId, String>,
     downlevel_optional_temps: HashMap<NodeId, String>,
@@ -31923,6 +31927,13 @@ impl Printer<'_> {
                     })
             })
             .collect::<HashSet<_>>();
+        if let Some(container) = container
+            && let Some(temps) = self
+                .commonjs_destructuring_assignment_hoists
+                .get(&container)
+        {
+            used.extend(temps.iter().cloned());
+        }
         let mut loops = self
             .arena
             .iter()
@@ -32204,9 +32215,23 @@ impl Printer<'_> {
             }
             self.writer.write(";");
         } else {
-            self.emit_expression(initializer, 1)?;
-            self.writer.write(" = ");
-            self.emit_downlevel_binding_value(value)?;
+            if self.settings.target < ScriptTarget::Es2015
+                && matches!(
+                    initializer_node.kind,
+                    SyntaxKind::ObjectLiteralExpression | SyntaxKind::ArrayLiteralExpression
+                )
+            {
+                let mut first = true;
+                self.emit_commonjs_destructuring_pattern(
+                    initializer,
+                    CommonJsDestructuringValue::Binding(value.clone()),
+                    &mut first,
+                )?;
+            } else {
+                self.emit_expression(initializer, 1)?;
+                self.writer.write(" = ");
+                self.emit_downlevel_binding_value(value)?;
+            }
             self.writer.write(";");
         }
         self.writer.newline();
@@ -32222,6 +32247,47 @@ impl Printer<'_> {
         emitted: &mut bool,
         inline_single_leaf_nested: bool,
     ) -> Result<(), EmitError> {
+        let name_node = self.node(name)?.clone();
+        let mut current = name_node.parent;
+        let mut parameter_binding = false;
+        while let Some(parent) = current {
+            let Some(parent_node) = self.arena.get(parent) else {
+                break;
+            };
+            if matches!(parent_node.data, NodeData::ParameterDeclaration(_)) {
+                parameter_binding = true;
+                break;
+            }
+            if matches!(
+                parent_node.data,
+                NodeData::VariableDeclaration(_)
+                    | NodeData::FunctionDeclaration(_)
+                    | NodeData::FunctionExpression(_)
+                    | NodeData::ArrowFunction(_)
+            ) {
+                break;
+            }
+            current = parent_node.parent;
+        }
+        if let Some(initializer) = initializer
+            && matches!(name_node.data, NodeData::Identifier(_))
+            && parameter_binding
+        {
+            let temp = self.generated_names.generate_temp();
+            self.emit_downlevel_declarator_start(emitted);
+            self.writer.write(&temp);
+            self.writer.write(" = ");
+            self.emit_downlevel_binding_value(&value)?;
+            self.emit_downlevel_declarator_start(emitted);
+            self.emit_expression(name, 0)?;
+            self.writer.write(" = ");
+            self.writer.write(&temp);
+            self.writer.write(" === void 0 ? ");
+            self.emit_expression(initializer, 2)?;
+            self.writer.write(" : ");
+            self.writer.write(&temp);
+            return Ok(());
+        }
         let value = if let Some(initializer) = initializer {
             let temp = self.generated_names.generate_temp();
             self.emit_downlevel_declarator_start(emitted);
@@ -32242,7 +32308,6 @@ impl Printer<'_> {
             value
         };
 
-        let name_node = self.node(name)?.clone();
         match &name_node.data {
             NodeData::Identifier(_) => {
                 self.emit_downlevel_declarator_start(emitted);
@@ -32532,77 +32597,159 @@ impl Printer<'_> {
             .arena
             .iter()
             .filter_map(|(id, node)| {
-                let NodeData::BinaryExpression(binary) = &node.data else {
-                    return None;
-                };
-                if self
-                    .arena
-                    .get(binary.operator_token)
-                    .is_none_or(|operator| operator.kind != SyntaxKind::EqualsToken)
-                    || !matches!(
-                        self.arena.get(binary.left).map(|left| left.kind),
-                        Some(
-                            SyntaxKind::ObjectLiteralExpression
-                                | SyntaxKind::ArrayLiteralExpression
-                        )
-                    )
-                    || (self.settings.target >= ScriptTarget::Es2015
-                        && !self.commonjs_destructuring_pattern_updates_export(binary.left))
-                {
-                    return None;
+                match &node.data {
+                    NodeData::BinaryExpression(binary)
+                        if self
+                            .arena
+                            .get(binary.operator_token)
+                            .is_some_and(|operator| operator.kind == SyntaxKind::EqualsToken)
+                            && matches!(
+                                self.arena.get(binary.left).map(|left| left.kind),
+                                Some(
+                                    SyntaxKind::ObjectLiteralExpression
+                                        | SyntaxKind::ArrayLiteralExpression
+                                )
+                            )
+                            && (self.settings.target < ScriptTarget::Es2015
+                                || self
+                                    .commonjs_destructuring_pattern_updates_export(binary.left)) =>
+                    {
+                        Some((node.range.start.get(), Some(id), binary.left))
+                    }
+                    NodeData::ForInOrOfStatement(data)
+                        if node.kind == SyntaxKind::ForOfStatement
+                            && self.settings.target < ScriptTarget::Es2015
+                            && matches!(
+                                self.arena.get(data.initializer).map(|node| node.kind),
+                                Some(
+                                    SyntaxKind::ObjectLiteralExpression
+                                        | SyntaxKind::ArrayLiteralExpression
+                                )
+                            ) =>
+                    {
+                        Some((node.range.start.get(), None, data.initializer))
+                    }
+                    _ => None,
                 }
-                Some((node.range.start.get(), id, binary.left))
             })
             .collect::<Vec<_>>();
         assignments.sort_by_key(|(start, _, _)| *start);
+        let mut claimed_by_container = HashMap::<NodeId, HashSet<String>>::new();
         for (_, expression, pattern) in assignments {
-            self.commonjs_destructuring_assignment_roots
-                .insert(expression);
-            self.prepare_commonjs_destructuring_pattern_temps(pattern);
+            if let Some(expression) = expression {
+                self.commonjs_destructuring_assignment_roots
+                    .insert(expression);
+            }
+            let Some(container) = self.nearest_function_like_container(pattern) else {
+                continue;
+            };
+            let mut claimed = claimed_by_container.remove(&container).unwrap_or_default();
+            self.prepare_commonjs_destructuring_pattern_temps(
+                pattern,
+                container,
+                &mut claimed,
+            );
+            claimed_by_container.insert(container, claimed);
         }
     }
 
-    fn prepare_commonjs_destructuring_pattern_temps(&mut self, pattern: NodeId) {
-        if self.commonjs_destructuring_pattern_value_use_count(pattern) > 1
-            && !self
-                .commonjs_destructuring_assignment_temps
-                .contains_key(&pattern)
-        {
-            let temp = self.generated_names.generate_temp();
-            self.commonjs_destructuring_assignment_hoists
-                .push(temp.clone());
-            self.commonjs_destructuring_assignment_temps
-                .insert(pattern, temp);
+    fn prepare_commonjs_destructuring_pattern_temps(
+        &mut self,
+        pattern: NodeId,
+        container: NodeId,
+        claimed: &mut HashSet<String>,
+    ) {
+        let is_default = matches!(
+            self.arena.get(pattern).map(|node| &node.data),
+            Some(NodeData::BinaryExpression(binary))
+                if self.arena.get(binary.operator_token)
+                    .is_some_and(|operator| operator.kind == SyntaxKind::EqualsToken)
+        );
+        if self.commonjs_destructuring_pattern_value_use_count(pattern) > 1 || is_default {
+            self.prepare_commonjs_destructuring_pattern_temp(pattern, container, claimed);
         }
         match self.arena.get(pattern).map(|node| &node.data) {
+            Some(NodeData::BinaryExpression(binary)) if is_default => {
+                self.prepare_commonjs_destructuring_pattern_temps(
+                    binary.left,
+                    container,
+                    claimed,
+                );
+            }
             Some(NodeData::ObjectLiteralExpression(object)) => {
-                for property in &object.properties.nodes {
-                    match self.arena.get(*property).map(|node| &node.data) {
+                let properties = object.properties.nodes.clone();
+                for property in properties {
+                    match self.arena.get(property).map(|node| &node.data) {
                         Some(NodeData::PropertyAssignment(property)) => {
-                            self.prepare_commonjs_destructuring_pattern_temps(property.initializer);
+                            self.prepare_commonjs_destructuring_pattern_temps(
+                                property.initializer,
+                                container,
+                                claimed,
+                            );
                         }
                         Some(NodeData::ShorthandPropertyAssignment(property)) => {
-                            self.prepare_commonjs_destructuring_pattern_temps(property.name);
+                            let name = property.name;
+                            let has_default = property.object_assignment_initializer.is_some();
+                            if has_default {
+                                self.prepare_commonjs_destructuring_pattern_temp(
+                                    name, container, claimed,
+                                );
+                            }
+                            self.prepare_commonjs_destructuring_pattern_temps(
+                                name, container, claimed,
+                            );
                         }
                         Some(NodeData::SpreadAssignment(spread)) => {
-                            self.prepare_commonjs_destructuring_pattern_temps(spread.expression);
+                            self.prepare_commonjs_destructuring_pattern_temps(
+                                spread.expression,
+                                container,
+                                claimed,
+                            );
                         }
                         _ => {}
                     }
                 }
             }
             Some(NodeData::ArrayLiteralExpression(array)) => {
-                for element in &array.elements.nodes {
+                let elements = array.elements.nodes.clone();
+                for element in elements {
                     if let Some(NodeData::SpreadElement(spread)) =
-                        self.arena.get(*element).map(|node| &node.data)
+                        self.arena.get(element).map(|node| &node.data)
                     {
-                        self.prepare_commonjs_destructuring_pattern_temps(spread.expression);
+                        self.prepare_commonjs_destructuring_pattern_temps(
+                            spread.expression,
+                            container,
+                            claimed,
+                        );
                     } else {
-                        self.prepare_commonjs_destructuring_pattern_temps(*element);
+                        self.prepare_commonjs_destructuring_pattern_temps(
+                            element, container, claimed,
+                        );
                     }
                 }
             }
             _ => {}
+        }
+    }
+
+    fn prepare_commonjs_destructuring_pattern_temp(
+        &mut self,
+        pattern: NodeId,
+        container: NodeId,
+        claimed: &mut HashSet<String>,
+    ) {
+        if !self
+            .commonjs_destructuring_assignment_temps
+            .contains_key(&pattern)
+        {
+            let temp = self.generate_block_temp(container, claimed);
+            claimed.insert(temp.clone());
+            self.commonjs_destructuring_assignment_hoists
+                .entry(container)
+                .or_default()
+                .push(temp.clone());
+            self.commonjs_destructuring_assignment_temps
+                .insert(pattern, temp);
         }
     }
 
@@ -32686,6 +32833,14 @@ impl Printer<'_> {
                     },
                 )
                 .sum(),
+            Some(NodeData::BinaryExpression(binary))
+                if self
+                    .arena
+                    .get(binary.operator_token)
+                    .is_some_and(|operator| operator.kind == SyntaxKind::EqualsToken) =>
+            {
+                self.commonjs_destructuring_pattern_leaf_count(binary.left)
+            }
             _ => 0,
         }
     }
@@ -32724,6 +32879,14 @@ impl Printer<'_> {
                         Some(_) => self.commonjs_destructuring_pattern_updates_export(*element),
                     }
                 })
+            }
+            Some(NodeData::BinaryExpression(binary))
+                if self
+                    .arena
+                    .get(binary.operator_token)
+                    .is_some_and(|operator| operator.kind == SyntaxKind::EqualsToken) =>
+            {
+                self.commonjs_destructuring_pattern_updates_export(binary.left)
             }
             _ => false,
         }
@@ -33054,6 +33217,7 @@ impl Printer<'_> {
         self.writer.indent += 1;
         self.namespace_declarations.push(HashSet::new());
         self.prepare_class_expression_temps(id, data);
+        self.emit_commonjs_destructuring_assignment_hoists_for_body(id);
         self.emit_private_field_declarations_for_scope(id);
         let mut previous_end = node.range.start.get().saturating_add(1);
         if self.body_opening_line_comment_is_unowned(id) {
@@ -33891,6 +34055,7 @@ impl Printer<'_> {
         self.writer.write("{");
         self.writer.newline();
         self.writer.indent += 1;
+        self.emit_commonjs_destructuring_assignment_hoists_for_body(body);
         if !temps.is_empty() {
             self.writer.write("var ");
             self.writer.write(&temps.join(", "));
@@ -34028,6 +34193,7 @@ impl Printer<'_> {
         for statement in &block.statements.nodes[..prologue_count] {
             self.emit_statement(*statement)?;
         }
+        self.emit_commonjs_destructuring_assignment_hoists_for_body(body);
         if !class_temps.is_empty() {
             self.writer.write("var ");
             self.writer.write(&class_temps.join(", "));
@@ -34056,6 +34222,7 @@ impl Printer<'_> {
         binding_parameters: &[(NodeId, NodeId, String)],
     ) -> Result<(), EmitError> {
         for (_, pattern, temp) in binding_parameters {
+            self.generated_names.used.insert(temp.clone());
             if self.node(*pattern)?.kind == SyntaxKind::ObjectBindingPattern
                 && self.object_binding_pattern_has_rest(*pattern)
             {
@@ -34376,11 +34543,28 @@ impl Printer<'_> {
             return Err(Self::unsupported(body, body_node.kind));
         };
         self.prepare_class_expression_temps(body, block);
+        self.emit_commonjs_destructuring_assignment_hoists_for_body(body);
         if self.writer.line_start {
             self.writer.remove_trailing_newline();
             self.writer.write(" ");
         }
         Ok(())
+    }
+
+    fn emit_commonjs_destructuring_assignment_hoists_for_body(&mut self, body: NodeId) {
+        let Some(container) = self.arena.get(body).and_then(|node| node.parent) else {
+            return;
+        };
+        let Some(temps) = self
+            .commonjs_destructuring_assignment_hoists
+            .get(&container)
+        else {
+            return;
+        };
+        self.writer.write("var ");
+        self.writer.write(&temps.join(", "));
+        self.writer.write(";");
+        self.writer.newline();
     }
 
     fn compact_function_body_statements(
@@ -52752,7 +52936,9 @@ impl Printer<'_> {
                         }
                         NodeData::ShorthandPropertyAssignment(property) => {
                             self.emit_shorthand_property(property.name)?;
-                            if let Some(initializer) = property.object_assignment_initializer {
+                            if self.settings.target >= ScriptTarget::Es2015
+                                && let Some(initializer) = property.object_assignment_initializer
+                            {
                                 self.writer.write(" = ");
                                 self.emit_expression(initializer, 2)?;
                             }
@@ -55102,6 +55288,7 @@ impl Printer<'_> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     fn emit_commonjs_destructuring_pattern(
         &mut self,
         pattern: NodeId,
@@ -55116,11 +55303,36 @@ impl Printer<'_> {
             self.emit_commonjs_destructuring_separator(first);
             self.writer.write(&temp);
             self.writer.write(" = ");
-            self.emit_commonjs_destructuring_value(&value)?;
-            value = CommonJsDestructuringValue::Temp(temp);
+            let default = if let CommonJsDestructuringValue::Default(inner, default) = &value {
+                self.emit_commonjs_destructuring_value(inner)?;
+                Some(*default)
+            } else {
+                self.emit_commonjs_destructuring_value(&value)?;
+                None
+            };
+            value = if let Some(default) = default {
+                CommonJsDestructuringValue::Default(
+                    Box::new(CommonJsDestructuringValue::Temp(temp)),
+                    default,
+                )
+            } else {
+                CommonJsDestructuringValue::Temp(temp)
+            };
         }
         let node = self.node(pattern)?.clone();
         match &node.data {
+            NodeData::BinaryExpression(binary)
+                if self
+                    .arena
+                    .get(binary.operator_token)
+                    .is_some_and(|operator| operator.kind == SyntaxKind::EqualsToken) =>
+            {
+                self.emit_commonjs_destructuring_pattern(
+                    binary.left,
+                    CommonJsDestructuringValue::Default(Box::new(value), binary.right),
+                    first,
+                )?;
+            }
             NodeData::ObjectLiteralExpression(object) => {
                 for property_id in &object.properties.nodes {
                     let property = self.node(*property_id)?.clone();
@@ -55136,11 +55348,20 @@ impl Printer<'_> {
                             )?;
                         }
                         NodeData::ShorthandPropertyAssignment(property) => {
+                            let value = CommonJsDestructuringValue::Property(
+                                Box::new(value.clone()),
+                                property.name,
+                            );
                             self.emit_commonjs_destructuring_pattern(
                                 property.name,
-                                CommonJsDestructuringValue::Property(
-                                    Box::new(value.clone()),
-                                    property.name,
+                                property.object_assignment_initializer.map_or(
+                                    value.clone(),
+                                    |default| {
+                                        CommonJsDestructuringValue::Default(
+                                            Box::new(value),
+                                            default,
+                                        )
+                                    },
                                 ),
                                 first,
                             )?;
@@ -55242,6 +55463,9 @@ impl Printer<'_> {
                     self.writer.write(".");
                 }
             }
+            CommonJsDestructuringValue::Binding(value) => {
+                self.emit_downlevel_binding_value(value)?;
+            }
             CommonJsDestructuringValue::Temp(temp) => self.writer.write(temp),
             CommonJsDestructuringValue::Property(value, name) => {
                 self.emit_commonjs_destructuring_value(value)?;
@@ -55252,6 +55476,13 @@ impl Printer<'_> {
                 self.writer.write("[");
                 self.writer.write(&index.to_string());
                 self.writer.write("]");
+            }
+            CommonJsDestructuringValue::Default(value, default) => {
+                self.emit_commonjs_destructuring_value(value)?;
+                self.writer.write(" === void 0 ? ");
+                self.emit_expression(*default, 2)?;
+                self.writer.write(" : ");
+                self.emit_commonjs_destructuring_value(value)?;
             }
         }
         Ok(())
@@ -56192,7 +56423,9 @@ impl Printer<'_> {
             }
             NodeData::ShorthandPropertyAssignment(property) => {
                 self.emit_shorthand_property(property.name)?;
-                if let Some(initializer) = property.object_assignment_initializer {
+                if self.settings.target >= ScriptTarget::Es2015
+                    && let Some(initializer) = property.object_assignment_initializer
+                {
                     self.writer.write(" = ");
                     self.emit_expression(initializer, 2)?;
                 }

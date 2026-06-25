@@ -112,6 +112,7 @@ pub struct CompilerOptions {
     pub no_implicit_returns: bool,
     pub no_lib: bool,
     pub no_fallthrough_cases_in_switch: bool,
+    pub no_unchecked_side_effect_imports: bool,
     pub no_unused_locals: bool,
     pub no_unused_parameters: bool,
     pub preserve_const_enums: bool,
@@ -185,6 +186,7 @@ impl Default for CompilerOptions {
             no_implicit_returns: false,
             no_lib: false,
             no_fallthrough_cases_in_switch: false,
+            no_unchecked_side_effect_imports: false,
             no_unused_locals: false,
             no_unused_parameters: false,
             preserve_const_enums: false,
@@ -343,6 +345,10 @@ impl CompilerOptions {
                 "nolib" => self.no_lib = overrides.no_lib,
                 "nofallthroughcasesinswitch" => {
                     self.no_fallthrough_cases_in_switch = overrides.no_fallthrough_cases_in_switch;
+                }
+                "nouncheckedsideeffectimports" => {
+                    self.no_unchecked_side_effect_imports =
+                        overrides.no_unchecked_side_effect_imports;
                 }
                 "nounusedlocals" => self.no_unused_locals = overrides.no_unused_locals,
                 "nounusedparameters" => self.no_unused_parameters = overrides.no_unused_parameters,
@@ -584,6 +590,10 @@ pub fn parse_compiler_options_map(options: &BTreeMap<String, JsonValue>) -> Pars
                 parsed.no_fallthrough_cases_in_switch =
                     boolean(original_name, value, &mut diagnostics);
             }
+            "nouncheckedsideeffectimports" => {
+                parsed.no_unchecked_side_effect_imports =
+                    boolean(original_name, value, &mut diagnostics);
+            }
             "nounusedlocals" => {
                 parsed.no_unused_locals = boolean(original_name, value, &mut diagnostics);
             }
@@ -701,6 +711,7 @@ struct PartialOptions {
     no_implicit_returns: Option<bool>,
     no_lib: Option<bool>,
     no_fallthrough_cases_in_switch: Option<bool>,
+    no_unchecked_side_effect_imports: Option<bool>,
     no_unused_locals: Option<bool>,
     no_unused_parameters: Option<bool>,
     preserve_const_enums: Option<bool>,
@@ -794,6 +805,9 @@ impl PartialOptions {
             no_implicit_returns: self.no_implicit_returns.unwrap_or(false),
             no_lib: self.no_lib.unwrap_or(false),
             no_fallthrough_cases_in_switch: self.no_fallthrough_cases_in_switch.unwrap_or(false),
+            no_unchecked_side_effect_imports: self
+                .no_unchecked_side_effect_imports
+                .unwrap_or(false),
             no_unused_locals: self.no_unused_locals.unwrap_or(false),
             no_unused_parameters: self.no_unused_parameters.unwrap_or(false),
             preserve_const_enums: self.preserve_const_enums.unwrap_or(false),
@@ -1261,6 +1275,7 @@ mod tests {
             ("esModuleInterop", JsonValue::Bool(true)),
             ("noUnusedLocals", JsonValue::Bool(true)),
             ("noUnusedParameters", JsonValue::Bool(true)),
+            ("noUncheckedSideEffectImports", JsonValue::Bool(true)),
             ("skipLibCheck", JsonValue::Bool(true)),
             ("verbatimModuleSyntax", JsonValue::Bool(true)),
             ("isolatedModules", JsonValue::Bool(true)),
@@ -1280,6 +1295,7 @@ mod tests {
         assert!(result.options.allow_synthetic_default_imports);
         assert!(result.options.no_unused_locals);
         assert!(result.options.no_unused_parameters);
+        assert!(result.options.no_unchecked_side_effect_imports);
         assert!(result.options.skip_lib_check);
         assert!(result.options.verbatim_module_syntax);
         assert!(result.options.isolated_modules);

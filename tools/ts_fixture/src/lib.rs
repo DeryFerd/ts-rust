@@ -1072,6 +1072,7 @@ const SCALAR_OPTION_NAMES: &[&str] = &[
     "noEmitOnError",
     "noImplicitAny",
     "noLib",
+    "noUncheckedSideEffectImports",
     "noUnusedLocals",
     "noUnusedParameters",
     "outFile",
