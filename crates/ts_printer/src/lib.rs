@@ -50120,19 +50120,7 @@ impl Printer<'_> {
                 }
                 self.emit_expression_list(&data.elements)?;
                 if data.elements.has_trailing_comma {
-                    if object {
-                        self.writer.write(",");
-                    } else {
-                        let last_is_omitted = data
-                            .elements
-                            .nodes
-                            .last()
-                            .and_then(|last| self.arena.get(*last))
-                            .is_some_and(|last| {
-                                matches!(last.data, NodeData::OmittedExpression(_))
-                            });
-                        self.writer.write(if last_is_omitted { " ," } else { "," });
-                    }
+                    self.writer.write(",");
                 }
                 if object && !data.elements.nodes.is_empty() {
                     self.writer.write(" ");
@@ -50183,10 +50171,28 @@ impl Printer<'_> {
                                 .get(binary.operator_token)
                                 .is_some_and(|operator| operator.kind == SyntaxKind::InstanceOfKeyword)
                         });
-                if preserve_binary_grouping {
+                let preserve_optional_chain_boundary = data.type_arguments.is_some()
+                    && self.property_access_chain_has_optional(data.expression)
+                    && node
+                        .parent
+                        .and_then(|parent| self.arena.get(parent))
+                        .is_some_and(|parent| {
+                            matches!(
+                                parent.data,
+                                NodeData::PropertyAccessExpression(_)
+                                    | NodeData::ElementAccessExpression(_)
+                                    | NodeData::CallExpression(_)
+                            )
+                        });
+                let preserve_grouping =
+                    preserve_binary_grouping || preserve_optional_chain_boundary;
+                if preserve_grouping {
                     self.writer.write("(");
                 }
-                self.emit_expression(data.expression, parent_precedence)?;
+                self.emit_expression(
+                    data.expression,
+                    if preserve_grouping { 0 } else { parent_precedence },
+                )?;
                 if let Some(arguments) = &data.type_arguments
                     && arguments.nodes.iter().any(|argument| {
                         matches!(
@@ -50204,7 +50210,7 @@ impl Printer<'_> {
                     }
                     self.writer.write(">");
                 }
-                if preserve_binary_grouping {
+                if preserve_grouping {
                     self.writer.write(")");
                 }
             }
@@ -50361,15 +50367,10 @@ impl Printer<'_> {
                     self.writer.write(", ");
                     self.writer.write(&receiver);
                     self.writer.write(")");
-                } else if data.question_dot_token.is_some()
-                    && self.settings.target < ScriptTarget::Es2020
+                } else if self.settings.target < ScriptTarget::Es2020
+                    && self.property_access_chain_has_optional(id)
                 {
-                    self.emit_downlevel_optional_property(
-                        id,
-                        data.expression,
-                        data.name,
-                        parent_precedence,
-                    )?;
+                    self.emit_downlevel_optional_property_chain(id, parent_precedence)?;
                 } else {
                     self.emit_expression(data.expression, 18)?;
                     let expression_end = self.node(data.expression)?.range.end.get();
@@ -51610,6 +51611,8 @@ impl Printer<'_> {
             NodeData::NoSubstitutionTemplateLiteral(data) => {
                 if self.settings.target < ScriptTarget::Es2015 {
                     write_quoted(&mut self.writer, &data.text);
+                } else if data.raw_text.starts_with('`') && data.raw_text.ends_with('`') {
+                    self.writer.write(&data.raw_text);
                 } else {
                     self.writer.write("`");
                     write_template_text(&mut self.writer, &data.text);
@@ -53887,6 +53890,19 @@ impl Printer<'_> {
         )
     }
 
+    fn property_access_chain_has_optional(&self, expression: NodeId) -> bool {
+        let mut current = expression;
+        while let Some(NodeData::PropertyAccessExpression(access)) =
+            self.arena.get(current).map(|node| &node.data)
+        {
+            if access.question_dot_token.is_some() {
+                return true;
+            }
+            current = access.expression;
+        }
+        false
+    }
+
     fn emit_downlevel_optional_access_call(
         &mut self,
         optional_access: NodeId,
@@ -53944,13 +53960,26 @@ impl Printer<'_> {
         Ok(())
     }
 
-    fn emit_downlevel_optional_property(
+    fn emit_downlevel_optional_property_chain(
         &mut self,
-        optional: NodeId,
         expression: NodeId,
-        name: NodeId,
         parent_precedence: u8,
     ) -> Result<(), EmitError> {
+        let mut optional = expression;
+        let receiver;
+        let mut names = Vec::new();
+        loop {
+            let NodeData::PropertyAccessExpression(access) = &self.node(optional)?.data else {
+                return Err(Self::unsupported(optional, self.node(optional)?.kind));
+            };
+            names.push(access.name);
+            if access.question_dot_token.is_some() {
+                receiver = access.expression;
+                break;
+            }
+            optional = access.expression;
+        }
+        names.reverse();
         let wrap = parent_precedence > 2;
         if wrap {
             self.writer.write("(");
@@ -53959,21 +53988,23 @@ impl Printer<'_> {
             self.writer.write("(");
             self.writer.write(&temp);
             self.writer.write(" = ");
-            self.emit_expression(expression, 1)?;
+            self.emit_expression(receiver, 1)?;
             self.writer.write(")");
             self.writer.write(" === null || ");
             self.writer.write(&temp);
             self.writer.write(" === void 0 ? void 0 : ");
             self.writer.write(&temp);
         } else {
-            self.emit_expression(expression, 10)?;
+            self.emit_expression(receiver, 10)?;
             self.writer.write(" === null || ");
-            self.emit_expression(expression, 10)?;
+            self.emit_expression(receiver, 10)?;
             self.writer.write(" === void 0 ? void 0 : ");
-            self.emit_expression(expression, 18)?;
+            self.emit_expression(receiver, 18)?;
         }
-        self.writer.write(".");
-        self.emit_expression(name, 18)?;
+        for name in names {
+            self.writer.write(".");
+            self.emit_expression(name, 18)?;
+        }
         if wrap {
             self.writer.write(")");
         }
@@ -53996,7 +54027,18 @@ impl Printer<'_> {
             self.writer.write("(");
             self.writer.write(temp);
             self.writer.write(" = ");
+            let erased_instantiation = matches!(
+                self.arena.get(expression).map(|node| &node.data),
+                Some(NodeData::ExpressionWithTypeArguments(data))
+                    if data.type_arguments.is_some()
+            );
+            if erased_instantiation {
+                self.writer.write("(");
+            }
             self.emit_expression(expression, 1)?;
+            if erased_instantiation {
+                self.writer.write(")");
+            }
             self.writer.write(")");
             self.writer.write(" === null || ");
             self.writer.write(temp);
@@ -54561,7 +54603,15 @@ impl Printer<'_> {
             return Err(Self::unsupported(data.head, head.kind));
         };
         self.writer.write("`");
-        write_template_text(&mut self.writer, &head.text);
+        if let Some(raw) = head
+            .raw_text
+            .strip_prefix('`')
+            .and_then(|raw| raw.strip_suffix("${"))
+        {
+            self.writer.write(raw);
+        } else {
+            write_template_text(&mut self.writer, &head.text);
+        }
         for span in &data.template_spans.nodes {
             let node = self.node(*span)?.clone();
             let NodeData::TemplateSpan(span) = &node.data else {
@@ -54572,8 +54622,28 @@ impl Printer<'_> {
             self.writer.write("}");
             let literal = self.node(span.literal)?.clone();
             match &literal.data {
-                NodeData::TemplateMiddle(data) => write_template_text(&mut self.writer, &data.text),
-                NodeData::TemplateTail(data) => write_template_text(&mut self.writer, &data.text),
+                NodeData::TemplateMiddle(data) => {
+                    if let Some(raw) = data
+                        .raw_text
+                        .strip_prefix('}')
+                        .and_then(|raw| raw.strip_suffix("${"))
+                    {
+                        self.writer.write(raw);
+                    } else {
+                        write_template_text(&mut self.writer, &data.text);
+                    }
+                }
+                NodeData::TemplateTail(data) => {
+                    if let Some(raw) = data
+                        .raw_text
+                        .strip_prefix('}')
+                        .and_then(|raw| raw.strip_suffix('`'))
+                    {
+                        self.writer.write(raw);
+                    } else {
+                        write_template_text(&mut self.writer, &data.text);
+                    }
+                }
                 _ => return Err(Self::unsupported(span.literal, literal.kind)),
             }
         }
@@ -57905,12 +57975,21 @@ mod tests {
     fn preserves_omitted_array_binding_slots() {
         assert_eq!(
             emit_with(
-                "let [, b, , a] = results;",
+                "let [, b, , a] = results; let [,] = results;",
                 ScriptTarget::Es2015,
                 ModuleKind::None,
             )
             .code,
-            "let [, b, , a] = results;\n"
+            "let [, b, , a] = results;\nlet [,] = results;\n"
+        );
+    }
+
+    #[test]
+    fn preserves_raw_template_escape_spellings() {
+        let source = r"`\0`; `${0}\05`; `\055${0}`; `${0}\005${0}`;";
+        assert_eq!(
+            emit_with(source, ScriptTarget::Es2015, ModuleKind::None).code,
+            "`\\0`;\n`${0}\\05`;\n`\\055${0}`;\n`${0}\\005${0}`;\n"
         );
     }
 
@@ -60026,6 +60105,30 @@ mod tests {
                 "(_a = new A) === null || _a === void 0 ? void 0 : _a.b();\n",
                 "(_b = new A()) === null || _b === void 0 ? void 0 : _b.b();\n",
             )
+        );
+    }
+
+    #[test]
+    fn preserves_optional_instantiation_boundaries() {
+        let source = "a?.b<T>.d; a?.b.d; a?.<T>(); a<T>?.();";
+        let es2020 = emit_with(source, ScriptTarget::Es2020, ModuleKind::None).code;
+        assert_eq!(es2020, "(a?.b).d;\na?.b.d;\na?.();\na?.();\n");
+        let es2019 = emit_with(source, ScriptTarget::Es2019, ModuleKind::None).code;
+        assert!(
+            es2019.contains("(a === null || a === void 0 ? void 0 : a.b).d;"),
+            "{es2019}"
+        );
+        assert!(
+            es2019.contains("a === null || a === void 0 ? void 0 : a.b.d;"),
+            "{es2019}"
+        );
+        assert!(
+            es2019.contains("a === null || a === void 0 ? void 0 : a();"),
+            "{es2019}"
+        );
+        assert!(
+            es2019.contains("(_a = (a)) === null || _a === void 0 ? void 0 : _a();"),
+            "{es2019}"
         );
     }
 

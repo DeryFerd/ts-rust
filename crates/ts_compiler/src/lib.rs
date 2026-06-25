@@ -586,6 +586,15 @@ impl Program {
         {
             return output;
         }
+        if self.options.out_file.is_some()
+            && self.options.module == ModuleKind::None
+            && self
+                .source_files
+                .iter()
+                .any(source_is_external_module)
+        {
+            return output;
+        }
         if self.options.out_file.is_some() {
             return self.emit_bundle(settings);
         }
@@ -766,9 +775,19 @@ impl Program {
                                     Some(vec![source_file.source_text.clone()]);
                             }
                             source_map.file = file_name.rsplit('/').next().map(str::to_owned);
+                            let source_map_file = paths
+                                .source_map
+                                .clone()
+                                .unwrap_or_else(|| format!("{file_name}.map"));
+                            let source_map_directory = self
+                                .logical_source_map_path(&source_map_file)
+                                .map_or_else(
+                                    || common_source_directory.clone(),
+                                    |path| directory_path(&path),
+                                );
                             make_source_map_sources_relative(
                                 &mut source_map,
-                                &common_source_directory,
+                                &source_map_directory,
                             );
                             let serialized = serialize_source_map(
                                 &source_map,
@@ -1543,9 +1562,14 @@ impl Program {
     }
 
     fn source_map_url(&self, generated_file: &str, map_file: &str) -> String {
-        let Some(map_root) = self.options.map_root.as_deref() else {
+        let Some(logical_map) = self.logical_source_map_path(map_file) else {
             return map_file.rsplit('/').next().unwrap_or(map_file).to_owned();
         };
+        relative_path(&directory_path(generated_file), &logical_map)
+    }
+
+    fn logical_source_map_path(&self, map_file: &str) -> Option<String> {
+        let map_root = self.options.map_root.as_deref()?;
         let map_root = if is_absolute(map_root) {
             ts_path::normalize_path(map_root)
         } else {
@@ -1557,8 +1581,7 @@ impl Program {
             .as_deref()
             .and_then(|out_dir| strip_directory_prefix(map_file, out_dir))
             .unwrap_or_else(|| map_file.rsplit('/').next().unwrap_or(map_file).to_owned());
-        let logical_map = resolve_path(&map_root, &[&relative_map]);
-        relative_path(&directory_path(generated_file), &logical_map)
+        Some(resolve_path(&map_root, &[&relative_map]))
     }
 
     fn rewrite_bundle_declaration_specifiers(
@@ -2484,8 +2507,9 @@ fn serialize_source_map(source_map: &SourceMap, source_root: Option<&str>) -> St
 
 fn make_source_map_sources_relative(source_map: &mut SourceMap, source_directory: &str) {
     for source in &mut source_map.sources {
-        *source =
-            strip_directory_prefix(source, source_directory).unwrap_or_else(|| source.clone());
+        if is_absolute(source) {
+            *source = relative_path(source_directory, source);
+        }
     }
 }
 
@@ -2505,10 +2529,15 @@ fn strip_directory_prefix(path: &str, directory: &str) -> Option<String> {
 fn relative_path(from_directory: &str, target: &str) -> String {
     let from = ts_path::normalize_path(from_directory);
     let target = ts_path::normalize_path(target);
-    let from_parts = from.trim_start_matches('/').split('/').collect::<Vec<_>>();
-    let target_parts = target
-        .trim_start_matches('/')
+    let from_parts = from
+        .trim_matches('/')
         .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    let target_parts = target
+        .trim_matches('/')
+        .split('/')
+        .filter(|part| !part.is_empty())
         .collect::<Vec<_>>();
     let common = from_parts
         .iter()
@@ -7568,13 +7597,24 @@ mod tests {
             "/project/tsconfig.json",
             r#"{
                 "files": ["src/main.ts"],
-                "compilerOptions": { "outDir": "build", "inlineSourceMap": true, "noLib": true }
+                "compilerOptions": {
+                    "outDir": "build",
+                    "mapRoot": "maps",
+                    "inlineSourceMap": true,
+                    "noLib": true
+                }
             }"#,
         )
         .unwrap();
         fs.write_file("/project/src/main.ts", "const main = 1;")
             .unwrap();
         let program = Program::from_config(&fs, "/project/tsconfig.json");
+        assert_eq!(
+            program
+                .logical_source_map_path("/project/build/main.js.map")
+                .as_deref(),
+            Some("/project/maps/main.js.map")
+        );
         let emitted = program.emit();
         assert_eq!(emitted.files.len(), 1);
         assert_eq!(emitted.files[0].file_name, "/project/build/main.js");
@@ -9578,6 +9618,18 @@ mod tests {
             },
         );
         assert!(program.emit().files.is_empty());
+
+        let unspecified_module = Program::new_with_options(
+            &fs,
+            "/project",
+            &["main.ts".to_owned()],
+            CompilerOptions {
+                out_file: Some("/project/bundle.js".into()),
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        assert!(unspecified_module.emit().files.is_empty());
     }
 
     #[test]

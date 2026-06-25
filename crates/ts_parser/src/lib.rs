@@ -4801,7 +4801,31 @@ impl<'a> Parser<'a> {
                 }
                 SyntaxKind::QuestionDotToken => {
                     let question_dot_token = self.consume_token_node();
-                    if self.current.kind == SyntaxKind::OpenParenToken {
+                    if self.current.kind == SyntaxKind::LessThanToken
+                        && self.is_type_argument_expression_suffix()
+                    {
+                        let type_arguments = self
+                            .parse_type_arguments()
+                            .expect("type argument suffix starts with '<'");
+                        let arguments = self.parse_argument_list();
+                        let end = arguments.range.end;
+                        let mut children = vec![expression, question_dot_token];
+                        children.extend(type_arguments.nodes.iter().copied());
+                        children.extend(arguments.nodes.iter().copied());
+                        expression = self.alloc_node(
+                            SyntaxKind::CallExpression,
+                            TextRange::new(self.node_start(expression), end),
+                            NodeData::CallExpression(Box::new(CallExpressionData {
+                                arguments,
+                                expression,
+                                question_dot_token: Some(question_dot_token),
+                                symbol: None,
+                                type_arguments: Some(type_arguments),
+                                facts: 0,
+                            })),
+                            &children,
+                        );
+                    } else if self.current.kind == SyntaxKind::OpenParenToken {
                         let arguments = self.parse_argument_list();
                         let end = arguments.range.end;
                         let mut children = vec![expression, question_dot_token];
@@ -8993,6 +9017,28 @@ mod tests {
             };
             assert_eq!(new_expression.arguments.is_some(), index == 1);
         }
+    }
+
+    #[test]
+    fn parses_optional_calls_with_type_arguments() {
+        let result = parse_source_file("value?.<T>();");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let NodeData::ExpressionStatement(statement) =
+            &result.arena.get(source_statements(&result)[0]).unwrap().data
+        else {
+            panic!("expected expression statement");
+        };
+        let NodeData::CallExpression(call) =
+            &result.arena.get(statement.expression).unwrap().data
+        else {
+            panic!("expected call expression");
+        };
+        assert!(call.question_dot_token.is_some());
+        assert_eq!(call.type_arguments.as_ref().unwrap().nodes.len(), 1);
+        assert!(matches!(
+            &result.arena.get(call.expression).unwrap().data,
+            NodeData::Identifier(identifier) if identifier.text == "value"
+        ));
     }
 
     #[test]
