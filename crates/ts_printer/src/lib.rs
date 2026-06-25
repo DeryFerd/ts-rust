@@ -31968,6 +31968,11 @@ impl Printer<'_> {
         } else {
             self.scoped_downlevel_for_of_names(statement, data.expression)
         };
+        self.generated_names.used.insert(counter.clone());
+        self.generated_names.used.insert(rhs.clone());
+        if let Some(binding_temp) = &binding_temp {
+            self.generated_names.used.insert(binding_temp.clone());
+        }
         self.writer.write("for (");
         if planned.is_none() {
             self.writer.write("var ");
@@ -32073,9 +32078,72 @@ impl Printer<'_> {
                 }
                 _ => None,
             };
+            if let Some(NodeData::ForInOrOfStatement(data)) =
+                self.arena.get(loop_id).map(|node| &node.data)
+            {
+                for _ in 0..self.downlevel_for_of_inner_temp_count(data.initializer) {
+                    Self::generate_scoped_temp(&mut used);
+                }
+            }
             current = (counter, rhs, binding_temp);
         }
         current
+    }
+
+    fn downlevel_for_of_inner_temp_count(&self, initializer: NodeId) -> usize {
+        fn pattern_count(printer: &Printer<'_>, pattern: NodeId) -> usize {
+            let Some(NodeData::BindingPattern(binding)) =
+                printer.arena.get(pattern).map(|node| &node.data)
+            else {
+                return 0;
+            };
+            binding
+                .elements
+                .nodes
+                .iter()
+                .map(|element| {
+                    let Some(NodeData::BindingElement(element)) =
+                        printer.arena.get(*element).map(|node| &node.data)
+                    else {
+                        return 0;
+                    };
+                    let Some(name) = element.name else {
+                        return 0;
+                    };
+                    let nested = matches!(
+                        printer.arena.get(name).map(|node| node.kind),
+                        Some(
+                            SyntaxKind::ArrayBindingPattern
+                                | SyntaxKind::ObjectBindingPattern
+                        )
+                    );
+                    if !nested {
+                        return usize::from(element.initializer.is_some());
+                    }
+                    let default_temps = if element.initializer.is_some() { 2 } else { 0 };
+                    let nested_temp = usize::from(
+                        element.initializer.is_none()
+                            && printer.binding_pattern_value_needs_temp(name),
+                    );
+                    default_temps + nested_temp + pattern_count(printer, name)
+                })
+                .sum()
+        }
+
+        let Some(NodeData::VariableDeclarationList(list)) =
+            self.arena.get(initializer).map(|node| &node.data)
+        else {
+            return 0;
+        };
+        list.declarations
+            .nodes
+            .first()
+            .and_then(|declaration| self.arena.get(*declaration))
+            .and_then(|node| match &node.data {
+                NodeData::VariableDeclaration(declaration) => Some(declaration.name),
+                _ => None,
+            })
+            .map_or(0, |pattern| pattern_count(self, pattern))
     }
 
     fn downlevel_for_of_initializer_needs_temp(&self, initializer: NodeId) -> bool {
@@ -32096,7 +32164,7 @@ impl Printer<'_> {
         matches!(
             self.arena.get(declaration.name).map(|node| node.kind),
             Some(SyntaxKind::ArrayBindingPattern | SyntaxKind::ObjectBindingPattern)
-        ) && !self.binding_pattern_has_single_simple_leaf(declaration.name)
+        ) && self.downlevel_for_of_pattern_needs_temp(declaration.name)
     }
 
     fn generate_scoped_temp(used: &mut HashSet<String>) -> String {
@@ -32272,8 +32340,7 @@ impl Printer<'_> {
                 let binding_value = if matches!(
                     self.node(declaration.name)?.kind,
                     SyntaxKind::ArrayBindingPattern | SyntaxKind::ObjectBindingPattern
-                ) && !self
-                    .binding_pattern_has_single_simple_leaf(declaration.name)
+                ) && self.downlevel_for_of_pattern_needs_temp(declaration.name)
                 {
                     let temp = binding_temp
                         .map_or_else(|| self.generated_names.generate_temp(), str::to_owned);
@@ -32335,30 +32402,8 @@ impl Printer<'_> {
         inline_single_leaf_nested: bool,
     ) -> Result<(), EmitError> {
         let name_node = self.node(name)?.clone();
-        let mut current = name_node.parent;
-        let mut parameter_binding = false;
-        while let Some(parent) = current {
-            let Some(parent_node) = self.arena.get(parent) else {
-                break;
-            };
-            if matches!(parent_node.data, NodeData::ParameterDeclaration(_)) {
-                parameter_binding = true;
-                break;
-            }
-            if matches!(
-                parent_node.data,
-                NodeData::VariableDeclaration(_)
-                    | NodeData::FunctionDeclaration(_)
-                    | NodeData::FunctionExpression(_)
-                    | NodeData::ArrowFunction(_)
-            ) {
-                break;
-            }
-            current = parent_node.parent;
-        }
         if let Some(initializer) = initializer
             && matches!(name_node.data, NodeData::Identifier(_))
-            && parameter_binding
         {
             let temp = self.generated_names.generate_temp();
             self.emit_downlevel_declarator_start(emitted);
@@ -32376,11 +32421,16 @@ impl Printer<'_> {
             return Ok(());
         }
         let value = if let Some(initializer) = initializer {
-            let temp = self.generated_names.generate_temp();
-            self.emit_downlevel_declarator_start(emitted);
-            self.writer.write(&temp);
-            self.writer.write(" = ");
-            self.emit_downlevel_binding_value(&value)?;
+            let temp = if let DownlevelBindingValue::Name(temp) = &value {
+                temp.clone()
+            } else {
+                let temp = self.generated_names.generate_temp();
+                self.emit_downlevel_declarator_start(emitted);
+                self.writer.write(&temp);
+                self.writer.write(" = ");
+                self.emit_downlevel_binding_value(&value)?;
+                temp
+            };
             let defaulted = self.generated_names.generate_temp();
             self.emit_downlevel_declarator_start(emitted);
             self.writer.write(&defaulted);
@@ -32430,13 +32480,12 @@ impl Printer<'_> {
                         )
                     };
                     let nested_kind = self.node(element_name)?.kind;
-                    let nested_single_leaf =
-                        self.binding_pattern_has_single_simple_leaf(element_name);
                     if element.initializer.is_none()
                         && ((nested_kind == SyntaxKind::ArrayBindingPattern
-                            && !(inline_single_leaf_nested && nested_single_leaf))
+                            && (!inline_single_leaf_nested
+                                || self.binding_pattern_value_needs_temp(element_name)))
                             || (nested_kind == SyntaxKind::ObjectBindingPattern
-                                && !nested_single_leaf))
+                                && self.binding_pattern_value_needs_temp(element_name)))
                     {
                         let temp = self.generated_names.generate_temp();
                         self.emit_downlevel_declarator_start(emitted);
@@ -32491,7 +32540,21 @@ impl Printer<'_> {
         }
         let property = element.property_name.unwrap_or(element_name);
         let index = self.downlevel_binding_property_index(property, emitted)?;
-        let element_value = DownlevelBindingValue::Element(Box::new(value.clone()), index);
+        let mut element_value = DownlevelBindingValue::Element(Box::new(value.clone()), index);
+        if element.initializer.is_none()
+            && matches!(
+                self.node(element_name)?.kind,
+                SyntaxKind::ArrayBindingPattern | SyntaxKind::ObjectBindingPattern
+            )
+            && self.binding_pattern_value_needs_temp(element_name)
+        {
+            let temp = self.generated_names.generate_temp();
+            self.emit_downlevel_declarator_start(emitted);
+            self.writer.write(&temp);
+            self.writer.write(" = ");
+            self.emit_downlevel_binding_value(&element_value)?;
+            element_value = DownlevelBindingValue::Name(temp);
+        }
         self.emit_downlevel_binding_declarators(
             element_name,
             element_value,
@@ -32774,11 +32837,22 @@ impl Printer<'_> {
         }
         match self.arena.get(pattern).map(|node| &node.data) {
             Some(NodeData::BinaryExpression(binary)) if is_default => {
+                let left_is_pattern = matches!(
+                    self.arena.get(binary.left).map(|node| node.kind),
+                    Some(SyntaxKind::ObjectLiteralExpression | SyntaxKind::ArrayLiteralExpression)
+                );
+                if left_is_pattern {
+                    self.prepare_commonjs_destructuring_pattern_temp(
+                        binary.left,
+                        container,
+                        claimed,
+                    );
+                }
                 self.prepare_commonjs_destructuring_pattern_temps(
                     binary.left,
                     container,
                     claimed,
-                    false,
+                    left_is_pattern,
                 );
             }
             Some(NodeData::ObjectLiteralExpression(object)) => {
@@ -34437,7 +34511,7 @@ impl Printer<'_> {
         &mut self,
         binding_parameters: &[(NodeId, NodeId, String)],
     ) -> Result<(), EmitError> {
-        for (_, pattern, temp) in binding_parameters {
+        for (parameter_id, pattern, temp) in binding_parameters {
             self.generated_names.used.insert(temp.clone());
             if self.node(*pattern)?.kind == SyntaxKind::ObjectBindingPattern
                 && self.object_binding_pattern_has_rest(*pattern)
@@ -34449,7 +34523,10 @@ impl Printer<'_> {
                 self.emit_downlevel_binding_declarators(
                     *pattern,
                     DownlevelBindingValue::Name(temp.clone()),
-                    None,
+                    match &self.node(*parameter_id)?.data {
+                        NodeData::ParameterDeclaration(parameter) => parameter.initializer,
+                        _ => None,
+                    },
                     &mut emitted,
                     true,
                 )?;
@@ -34474,6 +34551,12 @@ impl Printer<'_> {
     ) -> Result<bool, EmitError> {
         let mut emitted = false;
         for parameter_id in &parameters.nodes {
+            if overrides
+                .iter()
+                .any(|(candidate, _, _)| candidate == parameter_id)
+            {
+                continue;
+            }
             let node = self.node(*parameter_id)?.clone();
             let NodeData::ParameterDeclaration(parameter) = &node.data else {
                 return Err(Self::unsupported(*parameter_id, node.kind));
@@ -43172,8 +43255,7 @@ impl Printer<'_> {
                 )
             {
                 let value = if let Some(initializer) = declaration.initializer {
-                    if self.binding_pattern_has_single_simple_leaf(declaration.name)
-                        || matches!(
+                    let reusable_identifier = matches!(
                             &self.node(initializer)?.data,
                             NodeData::Identifier(identifier)
                                 if !self
@@ -43181,7 +43263,10 @@ impl Printer<'_> {
                                         declaration.name,
                                         &identifier.text,
                                     )?
-                        )
+                        );
+                    if reusable_identifier
+                        || (!self.binding_pattern_value_needs_temp(declaration.name)
+                            && !self.binding_pattern_has_omission(declaration.name))
                     {
                         DownlevelBindingValue::Node(initializer)
                     } else {
@@ -44100,28 +44185,75 @@ impl Printer<'_> {
         self.emit_block_comment_trivia(start, equals, true);
     }
 
-    fn binding_pattern_has_single_simple_leaf(&self, name: NodeId) -> bool {
-        fn leaf_count(arena: &NodeArena, name: NodeId) -> Option<usize> {
+    fn binding_pattern_value_needs_temp(&self, name: NodeId) -> bool {
+        fn has_leaf(arena: &NodeArena, name: NodeId) -> bool {
             match arena.get(name).map(|node| &node.data) {
-                Some(NodeData::Identifier(_)) => Some(1),
-                Some(NodeData::BindingPattern(pattern)) => {
-                    let mut count = 0;
-                    for element in &pattern.elements.nodes {
-                        match arena.get(*element).map(|node| &node.data) {
+                Some(NodeData::Identifier(_)) => true,
+                Some(NodeData::BindingPattern(pattern)) => pattern.elements.nodes.iter().any(
+                    |element| {
+                        matches!(
+                            arena.get(*element).map(|node| &node.data),
                             Some(NodeData::BindingElement(element))
-                                if element.initializer.is_none() =>
-                            {
-                                count += leaf_count(arena, element.name?)?;
-                            }
-                            _ => return None,
-                        }
-                    }
-                    Some(count)
-                }
-                _ => None,
+                                if element.name.is_some_and(|name| has_leaf(arena, name))
+                        )
+                    },
+                ),
+                _ => false,
             }
         }
-        leaf_count(self.arena, name) == Some(1)
+        let Some(NodeData::BindingPattern(pattern)) =
+            self.arena.get(name).map(|node| &node.data)
+        else {
+            return false;
+        };
+        pattern
+            .elements
+            .nodes
+            .iter()
+            .filter(|element| {
+                matches!(
+                    self.arena.get(**element).map(|node| &node.data),
+                    Some(NodeData::BindingElement(element))
+                        if element.name.is_some_and(|name| has_leaf(self.arena, name))
+                )
+            })
+            .count()
+            > 1
+    }
+
+    fn downlevel_for_of_pattern_needs_temp(&self, name: NodeId) -> bool {
+        if self.binding_pattern_value_needs_temp(name) {
+            return true;
+        }
+        matches!(
+            self.arena.get(name).map(|node| &node.data),
+            Some(NodeData::BindingPattern(pattern))
+                if self.arena.get(name).is_some_and(|node| {
+                    node.kind == SyntaxKind::ArrayBindingPattern
+                        && pattern.elements.nodes.iter().any(|element| {
+                            matches!(
+                                self.arena.get(*element).map(|node| &node.data),
+                                Some(NodeData::OmittedExpression(_))
+                            )
+                        })
+                })
+        )
+    }
+
+    fn binding_pattern_has_omission(&self, name: NodeId) -> bool {
+        self.arena.get(name).is_some_and(|node| {
+            node.kind == SyntaxKind::ArrayBindingPattern
+                && matches!(
+                    &node.data,
+                    NodeData::BindingPattern(pattern)
+                        if pattern.elements.nodes.iter().any(|element| {
+                            matches!(
+                                self.arena.get(*element).map(|node| &node.data),
+                                Some(NodeData::OmittedExpression(_))
+                            )
+                        })
+                )
+        })
     }
 
     fn binding_name_contains_identifier(
@@ -48962,7 +49094,7 @@ impl Printer<'_> {
                                     self.arena.get(declaration.name).map(|node| &node.data),
                                     Some(NodeData::BindingPattern(_))
                                 )
-                                && !self.binding_pattern_has_single_simple_leaf(declaration.name)
+                                && self.binding_pattern_value_needs_temp(declaration.name)
                         }) {
                             let temp = self.generated_names.generate_temp();
                             self.namespace_destructuring_temps
@@ -50738,8 +50870,7 @@ impl Printer<'_> {
             Some(NodeData::BindingPattern(_))
         ) {
             self.install_commonjs_binding_rewrites(declaration.name);
-            let reusable_initializer = self
-                .binding_pattern_has_single_simple_leaf(declaration.name)
+            let reusable_initializer = !self.binding_pattern_value_needs_temp(declaration.name)
                 || matches!(
                     &self.node(initializer)?.data,
                     NodeData::Identifier(identifier)
@@ -55616,6 +55747,7 @@ impl Printer<'_> {
         mut value: CommonJsDestructuringValue,
         first: &mut bool,
     ) -> Result<(), EmitError> {
+        let node = self.node(pattern)?.clone();
         if let Some(temp) = self
             .commonjs_destructuring_assignment_temps
             .get(&pattern)
@@ -55624,23 +55756,23 @@ impl Printer<'_> {
             self.emit_commonjs_destructuring_separator(first);
             self.writer.write(&temp);
             self.writer.write(" = ");
-            let default = if let CommonJsDestructuringValue::Default(inner, default) = &value {
-                self.emit_commonjs_destructuring_value(inner)?;
-                Some(*default)
-            } else {
+            if matches!(
+                node.kind,
+                SyntaxKind::ObjectLiteralExpression | SyntaxKind::ArrayLiteralExpression
+            ) {
                 self.emit_commonjs_destructuring_value(&value)?;
-                None
-            };
-            value = if let Some(default) = default {
-                CommonJsDestructuringValue::Default(
+                value = CommonJsDestructuringValue::Temp(temp);
+            } else if let CommonJsDestructuringValue::Default(inner, default) = value {
+                self.emit_commonjs_destructuring_value(&inner)?;
+                value = CommonJsDestructuringValue::Default(
                     Box::new(CommonJsDestructuringValue::Temp(temp)),
                     default,
-                )
+                );
             } else {
-                CommonJsDestructuringValue::Temp(temp)
-            };
+                self.emit_commonjs_destructuring_value(&value)?;
+                value = CommonJsDestructuringValue::Temp(temp);
+            }
         }
-        let node = self.node(pattern)?.clone();
         match &node.data {
             NodeData::BinaryExpression(binary)
                 if self
@@ -60062,7 +60194,7 @@ mod tests {
         assert_eq!(output.matches("fallback()").count(), 1, "{output}");
         assert_eq!(
             output,
-            "var _a = make(), _b = _a[0], _c = _b === void 0 ? fallback() : _b, head = _c, _d = _a[2], nested = _d[0], tail = _a.slice(3);\n"
+            "var _a = make(), _b = _a[0], head = _b === void 0 ? fallback() : _b, _c = _a[2], nested = _c[0], tail = _a.slice(3);\n"
         );
         assert_eq!(
             emit_with(
@@ -60099,6 +60231,15 @@ mod tests {
             )
             .code,
             "var first, second, i;\nfor ((first = values[0], second = values[1]), i = 0; i < 1; i++)\n    use(second);\n"
+        );
+        assert_eq!(
+            emit_with(
+                "let first, second; ([first, [second] = [fallback()]] = value);",
+                ScriptTarget::Es5,
+                ModuleKind::EsNext,
+            )
+            .code,
+            "var _a, _b;\nvar first, second;\n(first = value[0], _a = value[1], _b = _a === void 0 ? [fallback()] : _a, second = _b[0]);\n"
         );
     }
 
