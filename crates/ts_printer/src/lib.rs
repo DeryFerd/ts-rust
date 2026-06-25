@@ -300,6 +300,7 @@ pub fn emit_source_file_with_context(
         commonjs_anonymous_default_names: HashMap::new(),
         node_esm_require_name: None,
         decorator_metadata_guard_temps: HashMap::new(),
+        legacy_decorated_class_captures: HashMap::new(),
         import_helpers_namespace: None,
         imported_helpers: BTreeSet::new(),
         imported_helper_aliases: BTreeMap::new(),
@@ -449,6 +450,7 @@ pub fn emit_source_file_with_context(
             .extend(metadata_names);
         printer.prepare_decorator_metadata_guard_temps();
     }
+    printer.prepare_legacy_decorated_class_captures();
     // The classic JSX transform synthesizes factory calls, so the configured factory root is a
     // runtime dependency even when every source-level reference is confined to type positions.
     let preserves_classic_jsx = settings.jsx == JsxEmit::Preserve;
@@ -1011,6 +1013,26 @@ pub fn emit_source_file_with_context(
         && !printer.imported_helpers.contains("__rest")
     {
         printer.emit_object_rest_helper();
+    }
+    if !printer.legacy_decorated_class_captures.is_empty() {
+        let mut captures = printer
+            .legacy_decorated_class_captures
+            .iter()
+            .filter_map(|(class, capture)| {
+                Some((printer.arena.get(*class)?.range.start, capture.clone()))
+            })
+            .collect::<Vec<_>>();
+        captures.sort_by_key(|(start, _)| *start);
+        printer.writer.write("var ");
+        printer.writer.write(
+            &captures
+                .into_iter()
+                .map(|(_, capture)| capture)
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        printer.writer.write(";");
+        printer.writer.newline();
     }
     if settings.target >= ScriptTarget::Es2015 && !printer.decorator_metadata_guard_temps.is_empty()
     {
@@ -25110,6 +25132,7 @@ struct Printer<'a> {
     commonjs_anonymous_default_names: HashMap<NodeId, String>,
     node_esm_require_name: Option<String>,
     decorator_metadata_guard_temps: HashMap<NodeId, DecoratorMetadataGuardPlan>,
+    legacy_decorated_class_captures: HashMap<NodeId, String>,
     import_helpers_namespace: Option<String>,
     imported_helpers: BTreeSet<&'static str>,
     imported_helper_aliases: BTreeMap<&'static str, String>,
@@ -25431,6 +25454,71 @@ impl Printer<'_> {
                 );
             }
         }
+    }
+
+    fn prepare_legacy_decorated_class_captures(&mut self) {
+        if !self.settings.experimental_decorators
+            || self.settings.target < ScriptTarget::Es2022
+        {
+            return;
+        }
+        let mut classes = self
+            .arena
+            .iter()
+            .filter_map(|(class_id, node)| {
+                let NodeData::ClassDeclaration(class) = &node.data else {
+                    return None;
+                };
+                if self
+                    .class_decorator_expressions(class.modifiers.as_ref())
+                    .is_empty()
+                {
+                    return None;
+                }
+                let name_id = class.name?;
+                let name = declaration_name_text(self.arena, name_id)?.to_owned();
+                let symbol = self
+                    .bindings
+                    .node_symbols
+                    .get(&name_id)
+                    .copied()
+                    .or(class.local_symbol)
+                    .or(class.symbol)?;
+                let captures_self = class.members.nodes.iter().any(|member| {
+                    match self.arena.get(*member).map(|node| &node.data) {
+                        Some(NodeData::PropertyDeclaration(property))
+                            if self.property_is_static(property) =>
+                        {
+                            property.initializer.is_some_and(|initializer| {
+                                self.subtree_references_symbol(initializer, symbol)
+                            })
+                        }
+                        Some(NodeData::ClassStaticBlockDeclaration(block)) => {
+                            self.subtree_references_symbol(block.body, symbol)
+                        }
+                        _ => false,
+                    }
+                });
+                captures_self.then_some((node.range.start, class_id, name))
+            })
+            .collect::<Vec<_>>();
+        classes.sort_by_key(|(start, _, _)| *start);
+        for (_, class_id, name) in classes {
+            let capture = self.generated_names.generate(&name);
+            self.legacy_decorated_class_captures
+                .insert(class_id, capture);
+        }
+    }
+
+    fn subtree_references_symbol(&self, root: NodeId, symbol: SymbolId) -> bool {
+        self.arena.iter().any(|(id, node)| {
+            self.node_is_within(id, root)
+                && matches!(node.data, NodeData::Identifier(_))
+                && self.bindings.node_symbols.get(&id).copied().or_else(|| {
+                    declaration_name_text(self.arena, id)
+                        .and_then(|name| self.bindings.resolve_name_at(id, name))
+                }) == Some(symbol)
+        })
     }
 
     fn emit_downlevel_class_decorator_metadata_temps(
@@ -44560,6 +44648,25 @@ impl Printer<'_> {
             return self.emit_class(data);
         }
         let name = data.name.expect("decorated class name checked");
+        let capture = self
+            .arena
+            .get(name)
+            .and_then(|name| name.parent)
+            .and_then(|class| self.legacy_decorated_class_captures.get(&class))
+            .cloned();
+        let class_symbol = self
+            .bindings
+            .node_symbols
+            .get(&name)
+            .copied()
+            .or(data.local_symbol)
+            .or(data.symbol);
+        let previous_rewrite = capture.as_ref().and_then(|capture| {
+            class_symbol.and_then(|symbol| {
+                self.identifier_rewrites
+                    .insert(symbol, capture.clone())
+            })
+        });
         self.writer.write("let ");
         self.emit_expression(name, 0)?;
         self.writer.write(" = ");
@@ -44567,6 +44674,13 @@ impl Printer<'_> {
         let result = self.emit_class(data);
         self.class_binding_terminator_before_lowering = false;
         result?;
+        if let Some(symbol) = class_symbol {
+            if let Some(previous) = previous_rewrite {
+                self.identifier_rewrites.insert(symbol, previous);
+            } else if capture.is_some() {
+                self.identifier_rewrites.remove(&symbol);
+            }
+        }
         Ok(())
     }
 
@@ -44763,6 +44877,14 @@ impl Printer<'_> {
         }
         self.writer.write(local_name);
         self.writer.write(" = ");
+        if let Some(capture) = data
+            .name
+            .and_then(|name| self.arena.get(name)?.parent)
+            .and_then(|class| self.legacy_decorated_class_captures.get(&class))
+        {
+            self.writer.write(capture);
+            self.writer.write(" = ");
+        }
         self.emit_helper_reference("__decorate");
         self.writer.write("([");
         self.writer.newline();
@@ -45747,6 +45869,16 @@ impl Printer<'_> {
         self.writer.write(" {");
         self.writer.newline();
         self.writer.indent += 1;
+        if let Some(capture) = data
+            .name
+            .and_then(|name| self.arena.get(name)?.parent)
+            .and_then(|class| self.legacy_decorated_class_captures.get(&class))
+        {
+            self.writer.write("static { ");
+            self.writer.write(capture);
+            self.writer.write(" = this; }");
+            self.writer.newline();
+        }
         let has_constructor = data.members.nodes.iter().any(|member| {
             let Some(node) = self.arena.get(*member) else {
                 return false;
@@ -47207,6 +47339,7 @@ impl Printer<'_> {
         }
         if body.statements.nodes.is_empty()
             && !self.node_source_is_multiline(body_id)
+            && !self.block_precedes_recovered_class_member(body_id)
             && !self.has_instance_field_initializers(data)
             && !self.has_parameter_properties(&method.parameters)
             && self.active_private_method_plan.is_none()
@@ -47246,6 +47379,7 @@ impl Printer<'_> {
             .iter()
             .take_while(|statement| self.statement_is_string_prologue(**statement))
             .count();
+        let initialize_before_body = !has_base || !self.constructor_body_has_super_call(body_id);
         let mut emitted_fields = false;
         let mut emitted_temps = false;
         let mut emitted_binding_parameters = false;
@@ -47254,7 +47388,7 @@ impl Printer<'_> {
             emitted_temps = true;
             self.emit_downlevel_binding_parameter_prologues(&downlevel_binding_parameters)?;
             emitted_binding_parameters = true;
-            if !has_base {
+            if initialize_before_body {
                 self.emit_private_brand_initializer("this");
                 self.emit_parameter_properties(&method.parameters, "this")?;
                 self.emit_instance_fields(data, "this")?;
@@ -47285,7 +47419,7 @@ impl Printer<'_> {
                 emitted_temps = true;
                 self.emit_downlevel_binding_parameter_prologues(&downlevel_binding_parameters)?;
                 emitted_binding_parameters = true;
-                if !has_base {
+                if initialize_before_body {
                     self.emit_private_brand_initializer("this");
                     self.emit_parameter_properties(&method.parameters, "this")?;
                     self.emit_instance_fields(data, "this")?;
@@ -47614,7 +47748,7 @@ impl Printer<'_> {
             if self.has_modifier(property.modifiers.as_ref(), SyntaxKind::DeclareKeyword) {
                 continue;
             }
-            if !self.has_modifier(property.modifiers.as_ref(), SyntaxKind::StaticKeyword) {
+            if !self.property_is_static(property) {
                 continue;
             }
             if self.property_is_native_private_field(property) {
@@ -48557,7 +48691,7 @@ impl Printer<'_> {
                             ) || property.initializer.is_some()
                                 || self.property_is_auto_accessor(property)
                                 || self.settings.use_define_for_class_fields == Some(true))
-                            && !self.has_modifier(property.modifiers.as_ref(), SyntaxKind::StaticKeyword)
+                            && !self.property_is_static(property)
                 )
         })
     }
@@ -48576,7 +48710,7 @@ impl Printer<'_> {
             else {
                 continue;
             };
-            if self.has_modifier(property.modifiers.as_ref(), SyntaxKind::StaticKeyword) {
+            if self.property_is_static(property) {
                 continue;
             }
             let Some(initializer) = property.initializer else {
@@ -48705,7 +48839,7 @@ impl Printer<'_> {
             if self.has_modifier(property.modifiers.as_ref(), SyntaxKind::DeclareKeyword) {
                 continue;
             }
-            if self.has_modifier(property.modifiers.as_ref(), SyntaxKind::StaticKeyword) {
+            if self.property_is_static(property) {
                 continue;
             }
             if self.property_is_native_private_field(property) {
@@ -48796,6 +48930,10 @@ impl Printer<'_> {
 
     fn property_is_auto_accessor(&self, property: &ts_ast::PropertyDeclarationData) -> bool {
         self.has_modifier(property.modifiers.as_ref(), SyntaxKind::AccessorKeyword)
+    }
+
+    fn property_is_static(&self, property: &ts_ast::PropertyDeclarationData) -> bool {
+        self.modifier_count(property.modifiers.as_ref(), SyntaxKind::StaticKeyword) == 1
     }
 
     fn property_is_native_private_field(&self, property: &ts_ast::PropertyDeclarationData) -> bool {
@@ -48914,7 +49052,7 @@ impl Printer<'_> {
             if self.has_modifier(property.modifiers.as_ref(), SyntaxKind::DeclareKeyword) {
                 continue;
             }
-            if !self.has_modifier(property.modifiers.as_ref(), SyntaxKind::StaticKeyword) {
+            if !self.property_is_static(property) {
                 continue;
             }
             let initializer = property.initializer;
@@ -64568,6 +64706,37 @@ class Board {
     }
 
     #[test]
+    fn recovers_static_members_and_initializes_missing_super_fields_first() {
+        assert_eq!(
+            emit_with_parse_errors(
+                "class C { static static foo = 1; public static static bar() {} }",
+                ScriptTarget::Es2015,
+                ModuleKind::None,
+            )
+            .code,
+            "class C {\n    constructor() {\n        this.foo = 1;\n    }\n    bar() { }\n}\n"
+        );
+        assert_eq!(
+            emit_with(
+                "class C extends B { p = 1; constructor() { work(); } }",
+                ScriptTarget::Es2015,
+                ModuleKind::None,
+            )
+            .code,
+            "class C extends B {\n    constructor() {\n        this.p = 1;\n        work();\n    }\n}\n"
+        );
+        assert_eq!(
+            emit_with_parse_errors(
+                "class C { constructor() {\n static p = 1; static m() {}\n} }",
+                ScriptTarget::Es2015,
+                ModuleKind::None,
+            )
+            .code,
+            "class C {\n    constructor() {\n    }\n    static m() { }\n}\nC.p = 1;\n"
+        );
+    }
+
+    #[test]
     fn preserves_trailing_comments_across_erased_abstract_type_statements() {
         let source = concat!(
             "class ConcreteA {}\n",
@@ -67214,6 +67383,22 @@ class Board {
             output.ends_with("};\nOther = __decorate([\n    decorator(\"hi\")\n], Other);\n"),
             "{output}"
         );
+    }
+
+    #[test]
+    fn captures_legacy_decorated_class_static_self_references() {
+        let output = emit_with_decorator_mode(
+            "declare const dec: any; @dec class C { static instance = new C(); static { use(C); } }",
+            ScriptTarget::Es2022,
+            ModuleKind::None,
+            true,
+        )
+        .code;
+        assert!(output.contains("var C_1;\nlet C = class C {"), "{output}");
+        assert!(output.contains("static { C_1 = this; }"), "{output}");
+        assert!(output.contains("static instance = new C_1();"), "{output}");
+        assert!(output.contains("use(C_1);"), "{output}");
+        assert!(output.contains("C = C_1 = __decorate(["), "{output}");
     }
 
     #[test]
