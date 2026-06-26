@@ -286,6 +286,8 @@ pub fn emit_source_file_with_context(
         source_line_starts: settings.source_map.then(|| line_starts(source_text)),
         automatic_jsx,
         this_alias: None,
+        arguments_alias: None,
+        arguments_capture_counter: 0,
         class_static_this_capture: None,
         class_binding_terminator_before_lowering: false,
         defer_static_fields: false,
@@ -26231,6 +26233,7 @@ type ParameterNameOverride = (NodeId, NodeId, String);
 struct DownlevelAsyncParameterPlan {
     outer_parameters: NodeList,
     overrides: Vec<ParameterNameOverride>,
+    rest_parameter: Option<String>,
 }
 
 #[derive(Clone)]
@@ -26272,6 +26275,8 @@ struct Printer<'a> {
     source_line_starts: Option<Vec<usize>>,
     automatic_jsx: AutomaticJsxUsage,
     this_alias: Option<String>,
+    arguments_alias: Option<String>,
+    arguments_capture_counter: u32,
     class_static_this_capture: Option<String>,
     class_binding_terminator_before_lowering: bool,
     defer_static_fields: bool,
@@ -31575,6 +31580,7 @@ impl Printer<'_> {
                 }
             }
             NodeData::FunctionDeclaration(data) => {
+                let outer_arguments_alias = self.arguments_alias.take();
                 let commonjs_default_name = self.commonjs_anonymous_default_names.get(&id).cloned();
                 let namespace_default_name = (self.node_is_direct_namespace_member(id)
                     && data.name.is_none()
@@ -31735,6 +31741,7 @@ impl Printer<'_> {
                     self.writer.write(";");
                 }
                 self.generated_names.used = outer_generated_names;
+                self.arguments_alias = outer_arguments_alias;
             }
             NodeData::ClassDeclaration(data) => {
                 let decorators = self.class_decorator_expressions(data.modifiers.as_ref());
@@ -36744,10 +36751,93 @@ impl Printer<'_> {
             outer.nodes.push(*parameter_id);
             overrides.push((*parameter_id, parameter.name, temp));
         }
+        let parameter_count = parameters
+            .nodes
+            .iter()
+            .filter(|parameter_id| {
+                let Some(NodeData::ParameterDeclaration(parameter)) =
+                    self.arena.get(**parameter_id).map(|node| &node.data)
+                else {
+                    return true;
+                };
+                self.identifier_text(parameter.name).ok() != Some("this")
+            })
+            .count();
+        let rest_parameter = (overrides.len() < parameter_count)
+            .then(|| self.generate_named_parameter_temp(function, "args", &claimed));
         Some(DownlevelAsyncParameterPlan {
             outer_parameters: outer,
             overrides,
+            rest_parameter,
         })
+    }
+
+    fn function_body_uses_lexical_arguments_in_arrow(&self, body: NodeId) -> bool {
+        self.subtree_uses_lexical_arguments(body, false)
+    }
+
+    fn arrow_body_uses_lexical_arguments(&self, body: NodeId) -> bool {
+        if self.arena.get(body).is_some_and(|node| {
+            matches!(
+                node.data,
+                NodeData::FunctionDeclaration(_)
+                    | NodeData::FunctionExpression(_)
+                    | NodeData::MethodDeclaration(_)
+                    | NodeData::ConstructorDeclaration(_)
+                    | NodeData::GetAccessorDeclaration(_)
+                    | NodeData::SetAccessorDeclaration(_)
+            )
+        }) {
+            return false;
+        }
+        self.subtree_uses_lexical_arguments(body, true)
+    }
+
+    fn subtree_uses_lexical_arguments(&self, body: NodeId, root_is_arrow: bool) -> bool {
+        self.arena.iter().any(|(identifier_id, node)| {
+            if !matches!(
+                &node.data,
+                NodeData::Identifier(identifier) if identifier.text == "arguments"
+            ) || !self.node_is_within(identifier_id, body)
+            {
+                return false;
+            }
+            if identifier_id == body {
+                return root_is_arrow;
+            }
+            let mut current = node.parent;
+            let mut inside_arrow = false;
+            while let Some(id) = current {
+                if id == body {
+                    return inside_arrow || root_is_arrow;
+                }
+                let Some(ancestor) = self.arena.get(id) else {
+                    return false;
+                };
+                match &ancestor.data {
+                    NodeData::ArrowFunction(_) => inside_arrow = true,
+                    NodeData::FunctionDeclaration(_)
+                    | NodeData::FunctionExpression(_)
+                    | NodeData::MethodDeclaration(_)
+                    | NodeData::ConstructorDeclaration(_)
+                    | NodeData::GetAccessorDeclaration(_)
+                    | NodeData::SetAccessorDeclaration(_) => return false,
+                    _ => {}
+                }
+                current = ancestor.parent;
+            }
+            false
+        })
+    }
+
+    fn generate_arguments_capture_name(&mut self) -> String {
+        loop {
+            self.arguments_capture_counter += 1;
+            let candidate = format!("arguments_{}", self.arguments_capture_counter);
+            if self.generated_names.used.insert(candidate.clone()) {
+                return candidate;
+            }
+        }
     }
 
     fn emit_function_body_with_binding_parameters(
@@ -37349,8 +37439,23 @@ impl Printer<'_> {
         self.writer.write("{");
         self.writer.newline();
         self.writer.indent += 1;
+        let arguments_alias = self
+            .function_body_uses_lexical_arguments_in_arrow(body)
+            .then(|| self.generate_arguments_capture_name());
+        if let Some(alias) = arguments_alias.as_deref() {
+            self.writer.write("var ");
+            self.writer.write(alias);
+            self.writer.write(" = arguments;");
+            self.writer.newline();
+        }
+        let previous_arguments_alias = self.arguments_alias.clone();
+        if let Some(alias) = arguments_alias {
+            self.arguments_alias = Some(alias);
+        }
         self.writer.write("return ");
-        self.emit_awaiter_call_with_parameters(body, None, this_argument, parameters)?;
+        let result = self.emit_awaiter_call_with_parameters(body, None, this_argument, parameters);
+        self.arguments_alias = previous_arguments_alias;
+        result?;
         self.writer.write(";");
         self.writer.newline();
         self.writer.indent -= 1;
@@ -45505,6 +45610,13 @@ impl Printer<'_> {
                 self.writer.write(", ");
             }
             self.writer.write(temp);
+        }
+        if let Some(rest) = plan.rest_parameter.as_deref() {
+            if !plan.overrides.is_empty() {
+                self.writer.write(", ");
+            }
+            self.writer.write("...");
+            self.writer.write(rest);
         }
         self.writer.write("], void 0, function* ");
         let previous = self.async_expression_transform;
@@ -55526,6 +55638,11 @@ impl Printer<'_> {
                     self.writer.write(rewrite);
                 } else if let Some(rewrite) = self.enum_member_identifier_rewrites.get(&data.text) {
                     self.writer.write(rewrite);
+                } else if data.text == "arguments"
+                    && symbol.is_none()
+                    && let Some(alias) = self.arguments_alias.as_deref()
+                {
+                    self.writer.write(alias);
                 } else if let Some(temp) = self
                     .commonjs_default_imports
                     .get(&data.text)
@@ -57114,17 +57231,37 @@ impl Printer<'_> {
                     && object_rest_parameter.is_none())
                     .then(|| self.downlevel_async_parameter_plan(&data.parameters, id))
                     .flatten();
+                let local_arguments_alias = (downlevel_async
+                    && self.arguments_alias.is_none()
+                    && self.arrow_body_uses_lexical_arguments(data.body))
+                    .then(|| self.generate_arguments_capture_name());
                 if self.settings.target < ScriptTarget::Es2015 && downlevel_async {
                     self.writer.write("function ");
                 }
                 if object_rest_parameter.is_some() {
                     self.writer.write("(_a)");
                 } else if let Some(plan) = &downlevel_async_parameters {
-                    self.emit_parameters_with_name_overrides(
-                        &plan.outer_parameters,
-                        false,
-                        &plan.overrides,
-                    )?;
+                    if let Some(rest) = plan.rest_parameter.as_deref() {
+                        self.writer.write("(");
+                        for (index, (_, _, temp)) in plan.overrides.iter().enumerate() {
+                            if index != 0 {
+                                self.writer.write(", ");
+                            }
+                            self.writer.write(temp);
+                        }
+                        if !plan.overrides.is_empty() {
+                            self.writer.write(", ");
+                        }
+                        self.writer.write("...");
+                        self.writer.write(rest);
+                        self.writer.write(")");
+                    } else {
+                        self.emit_parameters_with_name_overrides(
+                            &plan.outer_parameters,
+                            false,
+                            &plan.overrides,
+                        )?;
+                    }
                 } else if !downlevel_async && self.arrow_uses_bare_parameter(id, data) {
                     let parameter_id = data.parameters.nodes[0];
                     let parameter_node = self.node(parameter_id)?.clone();
@@ -57141,6 +57278,18 @@ impl Printer<'_> {
                     self.writer.write(" => ");
                 }
                 if downlevel_async {
+                    let previous_arguments_alias = self.arguments_alias.clone();
+                    if let Some(alias) = local_arguments_alias.as_deref() {
+                        self.writer.write("{");
+                        self.writer.newline();
+                        self.writer.indent += 1;
+                        self.writer.write("var ");
+                        self.writer.write(alias);
+                        self.writer.write(" = arguments;");
+                        self.writer.newline();
+                        self.writer.write("return ");
+                        self.arguments_alias = Some(alias.to_owned());
+                    }
                     let this_argument = if self.settings.target < ScriptTarget::Es2015
                         && self.this_alias.as_deref() == Some("_a")
                     {
@@ -57213,6 +57362,15 @@ impl Printer<'_> {
                                 .then_some(data.body);
                         self.emit_awaiter_call(data.body, expression_body, &this_argument)?;
                     }
+                    if local_arguments_alias.is_some() {
+                        self.writer.write(";");
+                        self.writer.newline();
+                        self.writer.indent -= 1;
+                        self.writer.write("}");
+                    }
+                    if local_arguments_alias.is_none() {
+                        self.arguments_alias = previous_arguments_alias;
+                    }
                 } else if let Some(pattern) = object_rest_parameter {
                     self.emit_arrow_body_with_object_rest_parameter(data.body, pattern, "_a")?;
                 } else if matches!(&self.node(data.body)?.data, NodeData::Block(_)) {
@@ -57250,6 +57408,7 @@ impl Printer<'_> {
                 }
             }
             NodeData::FunctionExpression(data) => {
+                let outer_arguments_alias = self.arguments_alias.take();
                 let previous_static_capture = self.class_static_this_capture.take();
                 let wrap = parent_precedence > 18;
                 if wrap {
@@ -57313,6 +57472,7 @@ impl Printer<'_> {
                     self.writer.write(")");
                 }
                 self.class_static_this_capture = previous_static_capture;
+                self.arguments_alias = outer_arguments_alias;
             }
             NodeData::ClassExpression(data) => {
                 self.emit_class_expression(id, data, parent_precedence)?;
@@ -64529,6 +64689,29 @@ mod tests {
             ),
             "{output}"
         );
+    }
+
+    #[test]
+    fn reuses_async_arrow_arguments_capture_within_ordinary_function() {
+        let output = emit_with(
+            concat!(
+                "function f() { ",
+                "const first = async (x = z) => async () => arguments; ",
+                "const second = async (x = z) => async () => arguments; ",
+                "} ",
+                "function g() { return async (x = z) => arguments; }",
+            ),
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert_eq!(output.matches("var arguments_1 = arguments;").count(), 1, "{output}");
+        assert!(
+            output.matches("return arguments_1;").count() >= 2,
+            "{output}"
+        );
+        assert_eq!(output.matches("var arguments_2 = arguments;").count(), 1, "{output}");
+        assert!(output.contains("return arguments_2;"), "{output}");
     }
 
     #[test]
