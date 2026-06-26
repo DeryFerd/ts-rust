@@ -65,9 +65,7 @@ fn bundle_namespace_path(source: &SourceFile, declaration: NodeId) -> Option<Vec
     Some(path)
 }
 
-fn bundle_namespace_members(
-    sources: &[&SourceFile],
-) -> BTreeMap<Vec<String>, BTreeSet<String>> {
+fn bundle_namespace_members(sources: &[&SourceFile]) -> BTreeMap<Vec<String>, BTreeSet<String>> {
     let value_flags = SymbolFlags::FUNCTION
         | SymbolFlags::CLASS
         | SymbolFlags::FUNCTION_SCOPED_VARIABLE
@@ -156,14 +154,12 @@ fn is_valid_jsx_factory_expression(value: &str, allow_null: bool) -> bool {
     (allow_null && value == "null")
         || value.split('.').all(|part| {
             !part.is_empty()
-                && part
-                    .chars()
-                    .next()
-                    .is_some_and(|character| character == '_' || character == '$' || character.is_alphabetic())
-                && part
-                    .chars()
-                    .skip(1)
-                    .all(|character| character == '_' || character == '$' || character.is_alphanumeric())
+                && part.chars().next().is_some_and(|character| {
+                    character == '_' || character == '$' || character.is_alphabetic()
+                })
+                && part.chars().skip(1).all(|character| {
+                    character == '_' || character == '$' || character.is_alphanumeric()
+                })
         })
 }
 
@@ -459,11 +455,7 @@ impl Program {
                     && (!side_effect_only || self.options.no_unchecked_side_effect_imports)
                 {
                     self.diagnostics.push(if side_effect_only {
-                        side_effect_import_not_found_diagnostic(
-                            &containing_file,
-                            range,
-                            &specifier,
-                        )
+                        side_effect_import_not_found_diagnostic(&containing_file, range, &specifier)
                     } else {
                         module_not_found_diagnostic(&containing_file, range, &specifier)
                     });
@@ -522,12 +514,8 @@ impl Program {
         root_names: &[String],
         options: CompilerOptions,
     ) -> Self {
-        let mut program = Self::new_unchecked_with_options(
-            file_system,
-            current_directory,
-            root_names,
-            options,
-        );
+        let mut program =
+            Self::new_unchecked_with_options(file_system, current_directory, root_names, options);
         if program.options.emit_declaration_only
             && !program.options.declaration
             && !program.options.composite
@@ -699,11 +687,11 @@ impl Program {
             .filter(|factory| is_valid_jsx_factory_expression(factory, false))
             .cloned()
             .or_else(|| {
-            self.options
-                .react_namespace
-                .as_ref()
-                .map(|namespace| format!("{namespace}.createElement"))
-        });
+                self.options
+                    .react_namespace
+                    .as_ref()
+                    .map(|namespace| format!("{namespace}.createElement"))
+            });
         let jsx_fragment_factory = self
             .options
             .jsx_fragment_factory
@@ -811,11 +799,9 @@ impl Program {
                 let preserve_const_enums = self.options.preserve_const_enums
                     || self.options.isolated_modules
                     || self.options.verbatim_module_syntax;
-                let jsx_import_source = source_jsx_pragma_value(
-                    &source_file.source_text,
-                    "@jsxImportSource",
-                )
-                .or(self.options.jsx_import_source.as_deref());
+                let jsx_import_source =
+                    source_jsx_pragma_value(&source_file.source_text, "@jsxImportSource")
+                        .or(self.options.jsx_import_source.as_deref());
                 let mut import_runtime_meanings = import_runtime_meanings_for_emit(
                     source_file,
                     preserve_const_enums,
@@ -834,17 +820,16 @@ impl Program {
                             | NodeData::JsxSelfClosingElement(_)
                             | NodeData::JsxFragment(_)
                     )
-                })
-                {
+                }) {
                     preserve_classic_jsx_factory_import(
                         source_file,
                         &mut import_runtime_meanings,
                         jsx_factory.as_deref().unwrap_or("React.createElement"),
                     );
                 }
-                let preserve_top_of_file_reference_directive =
-                    self.source_has_resolved_path_reference(source_file)
-                        || has_preserved_reference_directive(&source_file.source_text);
+                let preserve_top_of_file_reference_directive = self
+                    .source_has_resolved_path_reference(source_file)
+                    || has_preserved_reference_directive(&source_file.source_text);
                 let emit_context = EmitContext {
                     bindings: &source_file.binding,
                     bundle_namespace_members: &BTreeMap::new(),
@@ -916,9 +901,8 @@ impl Program {
                                 .source_map
                                 .clone()
                                 .unwrap_or_else(|| format!("{file_name}.map"));
-                            let source_map_directory = self
-                                .logical_source_map_path(&source_map_file)
-                                .map_or_else(
+                            let source_map_directory =
+                                self.logical_source_map_path(&source_map_file).map_or_else(
                                     || common_source_directory.clone(),
                                     |path| directory_path(&path),
                                 );
@@ -977,8 +961,7 @@ impl Program {
                     || source_file.checking.diagnostics.iter().any(|diagnostic| {
                         matches!(
                             diagnostic.diagnostic.code(),
-                            2527
-                                | 2883
+                            2527 | 2883
                                 | 4023
                                 | 4025
                                 | 4032
@@ -1077,11 +1060,11 @@ impl Program {
             .filter(|factory| is_valid_jsx_factory_expression(factory, false))
             .cloned()
             .or_else(|| {
-            self.options
-                .react_namespace
-                .as_ref()
-                .map(|namespace| format!("{namespace}.createElement"))
-        });
+                self.options
+                    .react_namespace
+                    .as_ref()
+                    .map(|namespace| format!("{namespace}.createElement"))
+            });
         let jsx_fragment_factory = self
             .options
             .jsx_fragment_factory
@@ -1120,9 +1103,7 @@ impl Program {
             .javascript
             .as_deref()
             .is_some_and(|file_name| self.output_overwrites_input(file_name));
-        if javascript_output_overwrites_input
-            && let Some(file_name) = paths.javascript.as_deref()
-        {
+        if javascript_output_overwrites_input && let Some(file_name) = paths.javascript.as_deref() {
             output
                 .diagnostics
                 .push(output_overwrites_input_diagnostic(file_name));
@@ -1169,12 +1150,10 @@ impl Program {
             }
             let bundle_needs_extends_helper = settings.target < ts_options::ScriptTarget::Es2015
                 && !settings.no_emit_helpers
-                && javascript_sources
-                    .iter()
-                    .any(|source| {
-                        (!settings.import_helpers || !source_is_external_module(source))
-                            && source_needs_extends_helper(&source.parse.arena)
-                    });
+                && javascript_sources.iter().any(|source| {
+                    (!settings.import_helpers || !source_is_external_module(source))
+                        && source_needs_extends_helper(&source.parse.arena)
+                });
             if bundle_needs_extends_helper {
                 code.push_str(BUNDLE_EXTENDS_HELPER);
             }
@@ -1202,8 +1181,7 @@ impl Program {
                     let line = u32::try_from(code.bytes().filter(|byte| *byte == b'\n').count())
                         .unwrap_or(u32::MAX);
                     let comment = comment.trim_end_matches(['\n', '\r']);
-                    let column =
-                        u32::try_from(comment.encode_utf16().count()).unwrap_or(u32::MAX);
+                    let column = u32::try_from(comment.encode_utf16().count()).unwrap_or(u32::MAX);
                     let _ = builder.add_mapping(line, 0, source_offset, 0, 0);
                     let _ = builder.add_mapping(line, column, source_offset, 0, column);
                 }
@@ -1261,11 +1239,9 @@ impl Program {
                 let preserve_const_enums = self.options.preserve_const_enums
                     || self.options.isolated_modules
                     || self.options.verbatim_module_syntax;
-                let jsx_import_source = source_jsx_pragma_value(
-                    &source.source_text,
-                    "@jsxImportSource",
-                )
-                .or(self.options.jsx_import_source.as_deref());
+                let jsx_import_source =
+                    source_jsx_pragma_value(&source.source_text, "@jsxImportSource")
+                        .or(self.options.jsx_import_source.as_deref());
                 let mut import_runtime_meanings = import_runtime_meanings_for_emit(
                     source,
                     preserve_const_enums,
@@ -1284,8 +1260,7 @@ impl Program {
                             | NodeData::JsxSelfClosingElement(_)
                             | NodeData::JsxFragment(_)
                     )
-                })
-                {
+                }) {
                     preserve_classic_jsx_factory_import(
                         source,
                         &mut import_runtime_meanings,
@@ -1353,13 +1328,8 @@ impl Program {
                                         source_offset,
                                     );
                                 } else {
-                                    let _ = builder.add_mapping(
-                                        generated_line,
-                                        0,
-                                        source_offset,
-                                        0,
-                                        0,
-                                    );
+                                    let _ =
+                                        builder.add_mapping(generated_line, 0, source_offset, 0, 0);
                                 }
                             }
                             code.push_str(&emitted.code);
@@ -1467,16 +1437,7 @@ impl Program {
                     || source.checking.diagnostics.iter().any(|diagnostic| {
                         matches!(
                             diagnostic.diagnostic.code(),
-                            2527
-                                | 2883
-                                | 4023
-                                | 4025
-                                | 4032
-                                | 4081
-                                | 4094
-                                | 5088
-                                | 7056
-                                | 9010
+                            2527 | 2883 | 4023 | 4025 | 4032 | 4081 | 4094 | 5088 | 7056 | 9010
                         )
                     })
                 {
@@ -1673,8 +1634,7 @@ impl Program {
             .and_then(|extension| extension.to_str());
         if extension.is_some_and(|extension| {
             extension.eq_ignore_ascii_case("tsx") || extension.eq_ignore_ascii_case("jsx")
-        })
-            && self.options.jsx == ts_options::JsxEmit::None
+        }) && self.options.jsx == ts_options::JsxEmit::None
         {
             return false;
         }
@@ -1682,8 +1642,7 @@ impl Program {
             ["js", "jsx", "mjs", "cjs"]
                 .iter()
                 .any(|candidate| extension.eq_ignore_ascii_case(candidate))
-        })
-            && !self.options.allow_js
+        }) && !self.options.allow_js
         {
             return false;
         }
@@ -1733,11 +1692,8 @@ impl Program {
                     &directory_path(&source.file_name),
                     &[directive.value.as_str()],
                 );
-                let canonical = canonicalize(
-                    &referenced,
-                    &self.current_directory,
-                    self.case_sensitivity,
-                );
+                let canonical =
+                    canonicalize(&referenced, &self.current_directory, self.case_sensitivity);
                 self.file_index.contains_key(&canonical)
             })
     }
@@ -1792,9 +1748,7 @@ impl Program {
 
     fn source_map_url(&self, generated_file: &str, map_file: &str) -> String {
         let Some(logical_map) = self.logical_source_map_path(map_file) else {
-            return percent_encode_source_map_url(
-                map_file.rsplit('/').next().unwrap_or(map_file),
-            );
+            return percent_encode_source_map_url(map_file.rsplit('/').next().unwrap_or(map_file));
         };
         percent_encode_source_map_url(&relative_path(
             &directory_path(generated_file),
@@ -2691,8 +2645,7 @@ fn has_preserved_reference_directive(source: &str) -> bool {
         let trimmed = line.trim_start();
         trimmed.starts_with("///")
             && trimmed.contains("<reference")
-            && (trimmed.contains("preserve=\"true\"")
-                || trimmed.contains("preserve='true'"))
+            && (trimmed.contains("preserve=\"true\"") || trimmed.contains("preserve='true'"))
     })
 }
 
@@ -2937,9 +2890,8 @@ fn has_isolated_declaration_emit_error(source: &SourceFile) -> bool {
 #[allow(clippy::too_many_lines)]
 fn has_unsupported_isolated_declaration_shape(source: &SourceFile) -> bool {
     let arena = &source.parse.arena;
-    let Some(NodeData::SourceFile(file)) = arena
-        .get(source.parse.source_file)
-        .map(|node| &node.data)
+    let Some(NodeData::SourceFile(file)) =
+        arena.get(source.parse.source_file).map(|node| &node.data)
     else {
         return false;
     };
@@ -3009,9 +2961,8 @@ fn has_unsupported_isolated_declaration_shape(source: &SourceFile) -> bool {
                 }
             }
             NodeData::VariableStatement(variable) if is_public_statement(node) => {
-                let Some(NodeData::VariableDeclarationList(list)) = arena
-                    .get(variable.declaration_list)
-                    .map(|node| &node.data)
+                let Some(NodeData::VariableDeclarationList(list)) =
+                    arena.get(variable.declaration_list).map(|node| &node.data)
                 else {
                     continue;
                 };
@@ -3035,7 +2986,9 @@ fn has_unsupported_isolated_declaration_shape(source: &SourceFile) -> bool {
                         Some(NodeData::ArrowFunction(function)) if function.type_.is_none() => {
                             return true;
                         }
-                        Some(NodeData::FunctionExpression(function)) if function.type_.is_none() => {
+                        Some(NodeData::FunctionExpression(function))
+                            if function.type_.is_none() =>
+                        {
                             return true;
                         }
                         _ => {}
@@ -3059,10 +3012,7 @@ fn has_unsupported_isolated_declaration_shape(source: &SourceFile) -> bool {
                         && property.initializer.is_some_and(|initializer| {
                             matches!(
                                 arena.get(initializer).map(|node| &node.data),
-                                Some(
-                                    NodeData::ArrowFunction(_)
-                                        | NodeData::FunctionExpression(_)
-                                )
+                                Some(NodeData::ArrowFunction(_) | NodeData::FunctionExpression(_))
                             )
                         })
                     {
@@ -3121,8 +3071,7 @@ fn has_unsupported_isolated_declaration_shape(source: &SourceFile) -> bool {
         else {
             return false;
         };
-        identifier_text(arena, access.expression)
-            .is_some_and(|name| function_values.contains(name))
+        identifier_text(arena, access.expression).is_some_and(|name| function_values.contains(name))
     })
 }
 
@@ -3132,11 +3081,7 @@ fn source_has_external_module_augmentation(source: &SourceFile) -> bool {
             return false;
         };
         matches!(
-            source
-                .parse
-                .arena
-                .get(module.name)
-                .map(|node| &node.data),
+            source.parse.arena.get(module.name).map(|node| &node.data),
             Some(NodeData::StringLiteral(_))
         )
     })
@@ -3262,9 +3207,7 @@ fn anonymous_class_member_is_private(arena: &ts_ast::NodeArena, member: NodeId) 
         Some(NodeData::PropertyDeclaration(member)) => {
             (Some(member.name), member.modifiers.as_ref())
         }
-        Some(NodeData::MethodDeclaration(member)) => {
-            (Some(member.name), member.modifiers.as_ref())
-        }
+        Some(NodeData::MethodDeclaration(member)) => (Some(member.name), member.modifiers.as_ref()),
         Some(NodeData::GetAccessorDeclaration(member)) => {
             (Some(member.name), member.modifiers.as_ref())
         }
@@ -3483,7 +3426,8 @@ fn add_nonportable_inferred_type_diagnostics(source: &SourceFile, checking: &mut
             if declaration.initializer.is_some_and(|initializer| {
                 inferred_type_syntax_exceeds_serialization_limit(source, initializer)
             }) {
-                let message = message_by_code(7056).expect("TS7056 must be in the diagnostic catalog");
+                let message =
+                    message_by_code(7056).expect("TS7056 must be in the diagnostic catalog");
                 checking.diagnostics.push(CheckDiagnostic {
                     node: declaration.name,
                     diagnostic: Diagnostic::new(message),
@@ -3507,10 +3451,7 @@ fn add_nonportable_inferred_type_diagnostics(source: &SourceFile, checking: &mut
                     message_by_code(4025).expect("TS4025 must be in the diagnostic catalog");
                 checking.diagnostics.push(CheckDiagnostic {
                     node: declaration.name,
-                    diagnostic: Diagnostic::with_arguments(
-                        message,
-                        ["globalThis", "globalThis"],
-                    ),
+                    diagnostic: Diagnostic::with_arguments(message, ["globalThis", "globalThis"]),
                 });
                 continue;
             }
@@ -3818,8 +3759,7 @@ fn inferred_type_syntax_exceeds_serialization_limit(
         .nodes
         .iter()
         .filter_map(|statement| {
-            let NodeData::TypeAliasDeclaration(alias) =
-                &source.parse.arena.get(*statement)?.data
+            let NodeData::TypeAliasDeclaration(alias) = &source.parse.arena.get(*statement)?.data
             else {
                 return None;
             };
@@ -3873,12 +3813,14 @@ fn estimated_type_syntax_complexity(
     let add = |left: usize, right: usize| left.saturating_add(right).min(cap);
     let multiply = |left: usize, right: usize| left.saturating_mul(right).min(cap);
     let complexity = match arena.get(type_node).map(|node| &node.data) {
-        Some(NodeData::UnionTypeNode(union)) => union.types.nodes.iter().fold(0, |total, member| {
-            add(
-                total,
-                estimated_type_syntax_complexity(arena, *member, aliases, visiting),
-            )
-        }),
+        Some(NodeData::UnionTypeNode(union)) => {
+            union.types.nodes.iter().fold(0, |total, member| {
+                add(
+                    total,
+                    estimated_type_syntax_complexity(arena, *member, aliases, visiting),
+                )
+            })
+        }
         Some(NodeData::IntersectionTypeNode(intersection)) => {
             intersection.types.nodes.iter().fold(0, |total, member| {
                 add(
@@ -4639,16 +4581,16 @@ fn preserve_classic_jsx_factory_import(
                     Some(NodeData::NamespaceImport(namespace)) => {
                         identifier_text(&source.parse.arena, namespace.name) == Some(factory_root)
                     }
-                    Some(NodeData::NamedImports(imports)) => imports.elements.nodes.iter().any(
-                        |specifier| {
+                    Some(NodeData::NamedImports(imports)) => {
+                        imports.elements.nodes.iter().any(|specifier| {
                             matches!(
                                 source.parse.arena.get(*specifier).map(|node| &node.data),
                                 Some(NodeData::ImportSpecifier(specifier))
                                     if identifier_text(&source.parse.arena, specifier.name)
                                         == Some(factory_root)
                             )
-                        },
-                    ),
+                        })
+                    }
                     _ => false,
                 }
             });
@@ -5102,10 +5044,9 @@ fn module_specifiers(parse: &ParseResult) -> Vec<(String, TextRange, bool, bool)
         .iter()
         .filter_map(|(_, node)| match &node.data {
             NodeData::ImportDeclaration(data) => {
-                string_literal(&parse.arena, data.module_specifier)
-                    .map(|(specifier, range)| {
-                        (specifier, range, true, data.import_clause.is_none())
-                    })
+                string_literal(&parse.arena, data.module_specifier).map(|(specifier, range)| {
+                    (specifier, range, true, data.import_clause.is_none())
+                })
             }
             NodeData::ImportEqualsDeclaration(data) => parse
                 .arena
@@ -5648,7 +5589,11 @@ mod tests {
             .iter()
             .find(|file| file.file_name == "/project/main.js")
             .unwrap();
-        assert!(javascript.text.contains("class Hidden"), "{}", javascript.text);
+        assert!(
+            javascript.text.contains("class Hidden"),
+            "{}",
+            javascript.text
+        );
         assert!(javascript.text.contains("bar()"), "{}", javascript.text);
         let declaration = emitted
             .files
@@ -5839,7 +5784,11 @@ mod tests {
                 ..CompilerOptions::default()
             },
         );
-        assert!(program.diagnostics().is_empty(), "{:?}", program.diagnostics());
+        assert!(
+            program.diagnostics().is_empty(),
+            "{:?}",
+            program.diagnostics()
+        );
         let emitted = program.emit();
         assert!(
             emitted
@@ -5924,9 +5873,71 @@ mod tests {
             .find(|file| file.file_name == "/project/external.js")
             .unwrap();
         let marker = javascript.text.find("Object.defineProperty").unwrap();
-        let reference = javascript.text.find("/// <reference path='dep.ts'/>").unwrap();
+        let reference = javascript
+            .text
+            .find("/// <reference path='dep.ts'/>")
+            .unwrap();
         let namespace = javascript.text.find("var bar;").unwrap();
-        assert!(marker < reference && reference < namespace, "{}", javascript.text);
+        assert!(
+            marker < reference && reference < namespace,
+            "{}",
+            javascript.text
+        );
+    }
+
+    #[test]
+    fn drops_resolved_path_reference_owned_by_erased_import_equals() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/decls.ts",
+            concat!(
+                "declare module 'equ' { export class C {} }\n",
+                "declare module 'equ2' { export var x: number; }\n",
+            ),
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/consumer.ts",
+            concat!(
+                "/// <reference path=\"decls.ts\" />\n",
+                "import imp1 = require('equ');\n",
+                "\n",
+                "// Ambient external module members are always exported\n",
+                "import imp3 = require('equ2');\n",
+                "var n = imp3.x;\n",
+            ),
+        )
+        .unwrap();
+        let emitted = Program::new_with_options(
+            &fs,
+            "/project",
+            &["consumer.ts".to_owned()],
+            CompilerOptions {
+                module: ModuleKind::CommonJs,
+                target: ScriptTarget::Es2015,
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        )
+        .emit();
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        let javascript = emitted
+            .files
+            .iter()
+            .find(|file| file.file_name == "/project/consumer.js")
+            .unwrap();
+        assert!(
+            !javascript.text.contains("<reference"),
+            "{}",
+            javascript.text
+        );
+        assert!(
+            javascript
+                .text
+                .contains("// Ambient external module members are always exported\nconst imp3 = require(\"equ2\");"),
+            "{}",
+            javascript.text
+        );
     }
 
     #[test]
@@ -5975,11 +5986,8 @@ mod tests {
             javascript.text
         );
 
-        fs.write_file(
-            "/project/invalid.ts",
-            "var value = 1;\n#!/usr/bin/env node",
-        )
-        .unwrap();
+        fs.write_file("/project/invalid.ts", "var value = 1;\n#!/usr/bin/env node")
+            .unwrap();
         let invalid = Program::new_with_options(
             &fs,
             "/project",
@@ -6015,7 +6023,11 @@ mod tests {
                 ..CompilerOptions::default()
             },
         );
-        assert!(program.diagnostics().is_empty(), "{:?}", program.diagnostics());
+        assert!(
+            program.diagnostics().is_empty(),
+            "{:?}",
+            program.diagnostics()
+        );
         let emitted = program.emit();
         let declaration = emitted
             .files
@@ -7867,12 +7879,16 @@ export function create() { return new M.Value(); }"#,
             .iter()
             .find(|file| file.file_name == "/project/all.js")
             .unwrap();
-        assert!(javascript.text.contains(
-            "System.register(\"ref/a\", [], function (exports_1, context_1) {"
-        ));
-        assert!(javascript.text.contains(
-            "System.register(\"b\", [\"ref/a\"], function (exports_2, context_2) {"
-        ));
+        assert!(
+            javascript
+                .text
+                .contains("System.register(\"ref/a\", [], function (exports_1, context_1) {")
+        );
+        assert!(
+            javascript
+                .text
+                .contains("System.register(\"b\", [\"ref/a\"], function (exports_2, context_2) {")
+        );
     }
 
     #[test]
@@ -10486,7 +10502,10 @@ export function create() { return new M.Value(); }"#,
         );
         let emitted = commonjs_scripts.emit();
         assert_eq!(emitted.files.len(), 1);
-        assert_eq!(emitted.files[0].text, "\"use strict\";\nvar globalValue = 2;\n");
+        assert_eq!(
+            emitted.files[0].text,
+            "\"use strict\";\nvar globalValue = 2;\n"
+        );
     }
 
     #[test]

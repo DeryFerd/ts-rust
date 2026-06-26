@@ -1405,6 +1405,7 @@ pub fn emit_source_file_with_context(
                 node.range.end.get()
             };
             if current_emitted
+                || (erased_import && statement_index == 0)
                 || (settings.module != ModuleKind::None
                     && !printer.context_preserves_top_of_file_reference_directive)
             {
@@ -32070,10 +32071,7 @@ impl Printer<'_> {
                 return Ok(());
             }
             NodeData::WithStatement(data) => {
-                self.writer.write("with (");
-                self.emit_expression(data.expression, 0)?;
-                self.writer.write(") ");
-                self.emit_embedded(data.statement)?;
+                self.emit_with_statement(id, data)?;
             }
             NodeData::ImportDeclaration(data) if misplaced_module_statement => {
                 let source = usize::try_from(node.range.start.get())
@@ -33011,6 +33009,46 @@ impl Printer<'_> {
             )
             .unwrap_or(expression.range.end.get());
         self.writer.write("while");
+        self.emit_for_block_comment_gap(keyword_end, open, true, true);
+        self.writer.write("(");
+        self.emit_for_block_comment_gap(
+            open.saturating_add(1),
+            expression.range.start.get(),
+            false,
+            false,
+        );
+        self.emit_expression(data.expression, 0)?;
+        self.emit_for_block_comment_gap(expression.range.end.get(), close, false, false);
+        self.writer.write(")");
+        self.emit_for_block_comment_gap(
+            close.saturating_add(1),
+            statement.range.start.get(),
+            true,
+            true,
+        );
+        self.emit_embedded(data.statement)
+    }
+
+    fn emit_with_statement(
+        &mut self,
+        id: NodeId,
+        data: &ts_ast::WithStatementData,
+    ) -> Result<(), EmitError> {
+        let node = self.node(id)?.clone();
+        let expression = self.node(data.expression)?.clone();
+        let statement = self.node(data.statement)?.clone();
+        let keyword_end = node.range.start.get().saturating_add(4);
+        let open = self
+            .source_punctuation_between(keyword_end, expression.range.start.get(), b'(')
+            .unwrap_or(keyword_end);
+        let close = self
+            .source_punctuation_between(
+                expression.range.end.get(),
+                statement.range.start.get(),
+                b')',
+            )
+            .unwrap_or(expression.range.end.get());
+        self.writer.write("with");
         self.emit_for_block_comment_gap(keyword_end, open, true, true);
         self.writer.write("(");
         self.emit_for_block_comment_gap(
@@ -55981,11 +56019,32 @@ impl Printer<'_> {
                     }
                 } else {
                     self.writer.write("yield");
-                    if data.asterisk_token.is_some() {
+                    if let Some(asterisk) = data.asterisk_token {
+                        let keyword_end = node.range.start.get().saturating_add(5);
+                        let asterisk_node = self.node(asterisk)?.clone();
+                        if self.trivia_has_block_comment(
+                            keyword_end,
+                            asterisk_node.range.start.get(),
+                        ) {
+                            self.emit_block_comment_trivia(
+                                keyword_end,
+                                asterisk_node.range.start.get(),
+                                false,
+                            );
+                        }
                         self.writer.write("*");
-                    }
-                    if let Some(expression) = data.expression {
-                        self.writer.write(" ");
+                        if let Some(expression) = data.expression {
+                            self.emit_keyword_operand_gap(
+                                asterisk_node.range.end.get(),
+                                expression,
+                            );
+                            self.emit_expression(expression, 2)?;
+                        }
+                    } else if let Some(expression) = data.expression {
+                        self.emit_keyword_operand_gap(
+                            node.range.start.get().saturating_add(5),
+                            expression,
+                        );
                         self.emit_expression(expression, 2)?;
                     }
                 }
@@ -66844,6 +66903,41 @@ mod tests {
     }
 
     #[test]
+    fn preserves_comments_inside_with_statements() {
+        assert_eq!(
+            emit_with(
+                "/*1*/ with /*2*/ ( /*3*/ false /*4*/ ) /*5*/ {}",
+                ScriptTarget::Es2015,
+                ModuleKind::None,
+            )
+            .code,
+            "/*1*/ with /*2*/ ( /*3*/false /*4*/) /*5*/ { }\n"
+        );
+    }
+
+    #[test]
+    fn preserves_comments_around_yield_operands_and_asterisks() {
+        assert_eq!(
+            emit_with(
+                concat!(
+                    "function* f() { yield /*a*/ 1; ",
+                    "yield */*b*/ [2]; yield /*c*/* [3]; }",
+                ),
+                ScriptTarget::Es2015,
+                ModuleKind::None,
+            )
+            .code,
+            concat!(
+                "function* f() {\n",
+                "    yield /*a*/ 1;\n",
+                "    yield* /*b*/ [2];\n",
+                "    yield /*c*/* [3];\n",
+                "}\n",
+            )
+        );
+    }
+
+    #[test]
     fn downlevels_optional_element_and_spread_for_es5() {
         let result = emit_with(
             "const value = source?.[key]; const merged = { a: 1, ...extra, b: 2 }; const list = [0, ...items, 3];",
@@ -67866,8 +67960,7 @@ class Board {
                 "exports.value = void 0;\n",
                 "///<reference path='types.d.ts' />\n",
                 "const mod = require(\"./mod\");\n",
-                "const value = mod.value;\n",
-                "exports.value = value;\n",
+                "exports.value = mod.value;\n",
             )
         );
     }
