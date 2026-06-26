@@ -334,6 +334,9 @@ pub fn emit_source_file_with_context(
         emitted_source_comments: HashSet::new(),
         class_expression_temps: HashMap::new(),
         class_static_block_declaration_plans: HashMap::new(),
+        static_super_assignment_temps: HashMap::new(),
+        static_super_update_temps: HashMap::new(),
+        static_super_object_rest_temps: HashMap::new(),
         class_heritage_base_rewrites: HashMap::new(),
         amd_dynamic_import_temps: HashMap::new(),
         amd_dynamic_import_counter: 0,
@@ -1368,6 +1371,16 @@ pub fn emit_source_file_with_context(
             printer.emit_import_default_helper();
         }
         printer.prepare_source_class_expression_temps(source_file);
+        if settings.target < ScriptTarget::Es2015
+            && printer.body_has_downlevel_arrow_this(source_file)
+        {
+            let alias = printer.generate_this_capture_name(source_file);
+            printer.writer.write("var ");
+            printer.writer.write(&alias);
+            printer.writer.write(" = this;");
+            printer.writer.newline();
+            printer.capture_arrow_this = Some(alias);
+        }
         if export_equals_expression.is_none() {
             printer
                 .writer
@@ -1394,7 +1407,8 @@ pub fn emit_source_file_with_context(
         printer.writer.newline();
     }
     printer.emit_automatic_jsx_prelude();
-    if settings.target < ScriptTarget::Es2015
+    if !(settings.module == ModuleKind::CommonJs && is_external_module)
+        && settings.target < ScriptTarget::Es2015
         && printer.body_has_downlevel_arrow_this(source_file)
     {
         let alias = printer.generate_this_capture_name(source_file);
@@ -26502,6 +26516,9 @@ struct Printer<'a> {
     emitted_source_comments: HashSet<(usize, usize)>,
     class_expression_temps: HashMap<NodeId, String>,
     class_static_block_declaration_plans: HashMap<NodeId, StaticBlockDeclarationPlan>,
+    static_super_assignment_temps: HashMap<NodeId, String>,
+    static_super_update_temps: HashMap<NodeId, Vec<String>>,
+    static_super_object_rest_temps: HashMap<NodeId, String>,
     class_heritage_base_rewrites: HashMap<NodeId, String>,
     amd_dynamic_import_temps: HashMap<NodeId, String>,
     amd_dynamic_import_counter: u32,
@@ -26585,7 +26602,6 @@ struct Printer<'a> {
 struct StaticBlockDeclarationPlan {
     capture: Option<String>,
     base_capture: Option<String>,
-    interleave_static_fields: bool,
 }
 
 impl Printer<'_> {
@@ -36539,6 +36555,7 @@ impl Printer<'_> {
         else {
             return;
         };
+        claimed.extend(self.static_super_object_rest_temps.values().cloned());
         let members = &class.members.nodes;
         let has_static_block = members.iter().any(|member| {
             matches!(
@@ -36640,18 +36657,90 @@ impl Printer<'_> {
                 )
             })
         });
-        let base_capture = (uses_super && has_base).then(|| {
+        let base_capture = (self.settings.target >= ScriptTarget::Es2015
+            && uses_super
+            && has_base)
+            .then(|| {
             let temp = self.generate_block_temp(allocation_scope, claimed);
             claimed.insert(temp.clone());
             declarations.push(temp.clone());
             temp
         });
+        let static_members = members
+            .iter()
+            .copied()
+            .filter(|member| match self.arena.get(*member).map(|node| &node.data) {
+                Some(NodeData::ClassStaticBlockDeclaration(_)) => true,
+                Some(NodeData::PropertyDeclaration(property)) => {
+                    self.property_is_static(property)
+                }
+                _ => false,
+            })
+            .collect::<Vec<_>>();
+        let mut super_operations = self
+            .arena
+            .iter()
+            .filter_map(|(id, node)| {
+                let in_static_member = static_members
+                    .iter()
+                    .any(|member| self.node_is_within(id, *member));
+                if !in_static_member {
+                    return None;
+                }
+                let temp_count = match &node.data {
+                    NodeData::BinaryExpression(binary)
+                        if self.direct_super_access(binary.left).is_some()
+                            && !self.assignment_is_within_destructuring_target(id)
+                            && self
+                                .arena
+                                .get(binary.operator_token)
+                                .is_some_and(|operator| {
+                                    operator.kind.is_assignment_operator()
+                                }) => usize::from(!self.expression_value_is_discarded(id)),
+                    NodeData::PrefixUnaryExpression(unary)
+                        if matches!(
+                            unary.operator,
+                            SyntaxKind::PlusPlusToken | SyntaxKind::MinusMinusToken
+                        ) => self
+                            .direct_super_access(unary.operand)
+                            .map_or(0, |(_, element)| if element { 3 } else { 2 }),
+                    NodeData::PostfixUnaryExpression(unary)
+                        if matches!(
+                            unary.operator,
+                            SyntaxKind::PlusPlusToken | SyntaxKind::MinusMinusToken
+                        ) => self
+                            .direct_super_access(unary.operand)
+                            .map_or(0, |(_, element)| if element { 3 } else { 2 }),
+                    _ => 0,
+                };
+                (temp_count != 0).then_some((node.range.start, id, temp_count))
+            })
+            .collect::<Vec<_>>();
+        super_operations.sort_by_key(|(start, _, _)| *start);
+        for (_, operation, temp_count) in super_operations {
+            let temps = (0..temp_count)
+                .map(|_| {
+                    let temp = self.generate_block_temp(allocation_scope, claimed);
+                    claimed.insert(temp.clone());
+                    declarations.push(temp.clone());
+                    temp
+                })
+                .collect::<Vec<_>>();
+            if matches!(
+                self.arena.get(operation).map(|node| &node.data),
+                Some(NodeData::BinaryExpression(_))
+            ) {
+                self.static_super_assignment_temps
+                    .insert(operation, temps[0].clone());
+            } else {
+                self.static_super_update_temps.insert(operation, temps);
+            }
+        }
         self.class_static_block_declaration_plans.insert(
             class_id,
             StaticBlockDeclarationPlan {
                 capture,
                 base_capture,
-                interleave_static_fields: has_static_block,
             },
         );
     }
@@ -36663,6 +36752,146 @@ impl Printer<'_> {
                 Some(NodeData::CallExpression(call)) if call.expression == super_id
             )
         })
+    }
+
+    fn direct_super_access(&self, expression: NodeId) -> Option<(NodeId, bool)> {
+        match &self.arena.get(expression)?.data {
+            NodeData::PropertyAccessExpression(access)
+                if self
+                    .arena
+                    .get(access.expression)
+                    .is_some_and(|node| node.kind == SyntaxKind::SuperKeyword) =>
+            {
+                Some((access.name, false))
+            }
+            NodeData::ElementAccessExpression(access)
+                if self
+                    .arena
+                    .get(access.expression)
+                    .is_some_and(|node| node.kind == SyntaxKind::SuperKeyword) =>
+            {
+                Some((access.argument_expression, true))
+            }
+            _ => None,
+        }
+    }
+
+    fn assignment_is_within_destructuring_target(&self, assignment: NodeId) -> bool {
+        let mut current = assignment;
+        while let Some(parent) = self.arena.get(current).and_then(|node| node.parent) {
+            match self.arena.get(parent).map(|node| &node.data) {
+                Some(NodeData::ArrayLiteralExpression(_) | NodeData::ObjectLiteralExpression(_)) => {
+                    current = parent;
+                }
+                Some(NodeData::PropertyAssignment(property))
+                    if property.initializer == current =>
+                {
+                    current = parent;
+                }
+                Some(NodeData::SpreadAssignment(spread)) if spread.expression == current => {
+                    current = parent;
+                }
+                Some(NodeData::SpreadElement(spread)) if spread.expression == current => {
+                    current = parent;
+                }
+                Some(NodeData::BinaryExpression(binary)) => return binary.left == current,
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    fn expression_value_is_discarded(&self, expression: NodeId) -> bool {
+        let mut current = expression;
+        while let Some(parent) = self.arena.get(current).and_then(|node| node.parent) {
+            match self.arena.get(parent).map(|node| &node.data) {
+                Some(NodeData::ParenthesizedExpression(_)) => current = parent,
+                Some(NodeData::ExpressionStatement(statement)) => {
+                    return statement.expression == current;
+                }
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    fn super_access_is_within_destructuring_target(&self, access: NodeId) -> bool {
+        let mut current = access;
+        let mut saw_pattern = false;
+        while let Some(parent) = self.arena.get(current).and_then(|node| node.parent) {
+            match self.arena.get(parent).map(|node| &node.data) {
+                Some(NodeData::ArrayLiteralExpression(_) | NodeData::ObjectLiteralExpression(_)) => {
+                    saw_pattern = true;
+                    current = parent;
+                }
+                Some(NodeData::PropertyAssignment(property))
+                    if property.initializer == current =>
+                {
+                    saw_pattern = true;
+                    current = parent;
+                }
+                Some(NodeData::SpreadAssignment(spread)) if spread.expression == current => {
+                    saw_pattern = true;
+                    current = parent;
+                }
+                Some(NodeData::SpreadElement(spread)) if spread.expression == current => {
+                    saw_pattern = true;
+                    current = parent;
+                }
+                Some(NodeData::BinaryExpression(binary)) if binary.left == current => {
+                    if saw_pattern {
+                        return true;
+                    }
+                    current = parent;
+                }
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    fn emit_static_super_key(&mut self, property: NodeId, is_element: bool) -> Result<(), EmitError> {
+        if is_element {
+            self.emit_expression(property, 0)
+        } else {
+            let name = declaration_name_text(self.arena, property).unwrap_or("property");
+            write_quoted(&mut self.writer, name);
+            Ok(())
+        }
+    }
+
+    fn emit_static_super_get(
+        &mut self,
+        base: &str,
+        property: NodeId,
+        is_element: bool,
+        receiver: &str,
+    ) -> Result<(), EmitError> {
+        self.writer.write("Reflect.get(");
+        self.writer.write(base);
+        self.writer.write(", ");
+        self.emit_static_super_key(property, is_element)?;
+        self.writer.write(", ");
+        self.writer.write(receiver);
+        self.writer.write(")");
+        Ok(())
+    }
+
+    fn emit_static_super_setter_target(
+        &mut self,
+        base: &str,
+        property: NodeId,
+        is_element: bool,
+        receiver: &str,
+    ) -> Result<(), EmitError> {
+        self.writer.write("({ set value(_a) { Reflect.set(");
+        self.writer.write(base);
+        self.writer.write(", ");
+        self.emit_static_super_key(property, is_element)?;
+        self.writer.write(", _a, ");
+        self.writer.write(receiver);
+        self.writer.write("); } }).value");
+        Ok(())
     }
 
     fn prepare_source_class_static_block_declaration_plans(
@@ -36969,7 +37198,49 @@ impl Printer<'_> {
             }
             temps.extend(allocated);
         }
+        let mut static_super_rest_assignments = self
+            .arena
+            .iter()
+            .filter_map(|(id, node)| {
+                let NodeData::BinaryExpression(binary) = &node.data else {
+                    return None;
+                };
+                let equals = self
+                    .arena
+                    .get(binary.operator_token)
+                    .is_some_and(|operator| operator.kind == SyntaxKind::EqualsToken);
+                let target = equals
+                    .then(|| self.simple_object_rest_assignment_target(binary.left))
+                    .flatten()?;
+                (self.node_is_within(id, source_file)
+                    && self.node_is_within_static_class_element(id)
+                    && self.direct_super_access(target).is_some())
+                .then_some((node.range.start, id))
+            })
+            .collect::<Vec<_>>();
+        static_super_rest_assignments.sort_by_key(|(start, _)| *start);
+        for (_, assignment) in static_super_rest_assignments {
+            let temp = self.generated_names.generate_temp();
+            self.static_super_object_rest_temps
+                .insert(assignment, temp.clone());
+            temps.push(temp);
+        }
         temps
+    }
+
+    fn node_is_within_static_class_element(&self, node: NodeId) -> bool {
+        let mut current = node;
+        while let Some(parent) = self.arena.get(current).and_then(|node| node.parent) {
+            match self.arena.get(parent).map(|node| &node.data) {
+                Some(NodeData::PropertyDeclaration(property)) => {
+                    return self.property_is_static(property);
+                }
+                Some(NodeData::ClassStaticBlockDeclaration(_)) => return true,
+                Some(NodeData::ClassDeclaration(_) | NodeData::ClassExpression(_)) => return false,
+                _ => current = parent,
+            }
+        }
+        false
     }
 
     fn prepare_commonjs_postfix_export_temps(
@@ -38124,6 +38395,7 @@ impl Printer<'_> {
         let NodeData::Block(block) = &body_node.data else {
             return Err(Self::unsupported(body, body_node.kind));
         };
+        self.prepare_class_expression_temps(body, block);
         let mut previous_end = body_node.range.start.get().saturating_add(1);
         let mut skip_first_leading_comment = false;
         if self.body_opening_line_comment_is_unowned(body) {
@@ -48027,6 +48299,19 @@ impl Printer<'_> {
         Ok(())
     }
 
+    fn emit_native_static_block_body(&mut self, body: NodeId) -> Result<(), EmitError> {
+        if let Some(statement) = self.single_line_body_statement(body)? {
+            self.writer.write("{ ");
+            self.emit_compact_body_prelude(body)?;
+            self.emit_statement(statement)?;
+            self.writer.remove_trailing_newline();
+            self.writer.write(" }");
+        } else {
+            self.emit_block(body)?;
+        }
+        Ok(())
+    }
+
     fn emit_embedded(&mut self, id: NodeId) -> Result<(), EmitError> {
         if matches!(&self.node(id)?.data, NodeData::Block(_)) {
             return self.emit_block(id);
@@ -50480,7 +50765,7 @@ impl Printer<'_> {
             Some((base, self.class_heritage_base_rewrites.insert(base, rewrite)))
         });
         let previous_defer_static_fields = self.defer_static_fields;
-        self.defer_static_fields = plan.interleave_static_fields;
+        self.defer_static_fields = true;
         let previous_static_private_field_plan = self.active_static_private_field_plan.clone();
         self.active_static_private_field_plan = static_private_plan.clone();
         let class_name = data
@@ -50537,8 +50822,14 @@ impl Printer<'_> {
         }
         let previous_capture = self.class_static_this_capture.clone();
         self.class_static_this_capture.clone_from(&plan.capture);
-        let previous_super = plan
-            .base_capture
+        let static_super_base = if self.settings.target < ScriptTarget::Es2015
+            && self.class_base_expression(data)?.is_some()
+        {
+            Some("_super".to_owned())
+        } else {
+            plan.base_capture.clone()
+        };
+        let previous_super = static_super_base
             .as_ref()
             .and_then(|base| self.downlevel_super_context.replace((base.clone(), true)));
         let previous_private_field_plan = self.active_private_field_plan.clone();
@@ -50555,9 +50846,7 @@ impl Printer<'_> {
             let Some(member_node) = self.arena.get(*member) else {
                 continue;
             };
-            if plan.interleave_static_fields
-                && matches!(member_node.data, NodeData::PropertyDeclaration(_))
-            {
+            if matches!(member_node.data, NodeData::PropertyDeclaration(_)) {
                 self.emit_native_static_field(data, index, *member)?;
                 previous_static_end = member_node.range.end.get();
                 continue;
@@ -50601,7 +50890,7 @@ impl Printer<'_> {
         self.active_private_field_plan = previous_private_field_plan;
         self.active_static_private_field_plan = previous_static_private_field_plan;
         self.class_static_this_capture = previous_capture;
-        if plan.base_capture.is_some() {
+        if static_super_base.is_some() {
             self.downlevel_super_context = previous_super;
         }
         Ok(true)
@@ -51090,7 +51379,7 @@ impl Printer<'_> {
                         continue;
                     }
                     self.writer.write("static ");
-                    self.emit_block(block.body)?;
+                    self.emit_native_static_block_body(block.body)?;
                     self.writer.newline();
                 }
                 _ => return Err(Self::unsupported(*member, node.kind)),
@@ -53382,27 +53671,59 @@ impl Printer<'_> {
         }
         let captures_static_this = class_has_async_static_field(self.arena, data)
             || data.members.nodes.iter().any(|member| {
-                matches!(
-                    self.arena.get(*member).map(|node| &node.data),
-                    Some(NodeData::ClassStaticBlockDeclaration(_))
-                ) && self.arena.iter().any(|(candidate, node)| {
+                let static_context = match self.arena.get(*member).map(|node| &node.data) {
+                    Some(NodeData::ClassStaticBlockDeclaration(_)) => true,
+                    Some(NodeData::PropertyDeclaration(property)) => {
+                        self.property_is_static(property)
+                    }
+                    _ => false,
+                };
+                static_context && self.arena.iter().any(|(candidate, node)| {
                     self.node_is_within(candidate, *member)
-                        && node.kind == SyntaxKind::ThisKeyword
+                        && matches!(node.kind, SyntaxKind::ThisKeyword | SyntaxKind::SuperKeyword)
                 })
             });
-        if captures_static_this {
-            self.writer.write("var _a;");
+        let static_this_capture = captures_static_this.then(|| {
+            let class_id = data
+                .name
+                .and_then(|name| self.arena.get(name).and_then(|node| node.parent))
+                .or_else(|| {
+                    data.members
+                        .nodes
+                        .first()
+                        .and_then(|member| self.arena.get(*member))
+                        .and_then(|node| node.parent)
+                });
+            let claimed = class_id.map_or_else(HashSet::new, |class_id| {
+                self.class_expression_temps
+                    .iter()
+                    .filter(|(class_expression, _)| {
+                        self.node_is_within(class_id, **class_expression)
+                    })
+                    .map(|(_, temp)| temp.clone())
+                    .collect::<HashSet<_>>()
+            });
+            class_id.map_or_else(
+                || generated_temp_name(0).unwrap_or_else(|| "_a".to_owned()),
+                |class_id| self.generate_block_temp(class_id, &claimed),
+            )
+        });
+        if let Some(static_this_capture) = static_this_capture.as_deref() {
+            self.writer.write("var ");
+            self.writer.write(static_this_capture);
+            self.writer.write(";");
             self.writer.newline();
-            self.writer.write("_a = ");
+            self.writer.write(static_this_capture);
+            self.writer.write(" = ");
             self.writer.write(name);
             self.writer.write(";");
             self.writer.newline();
         }
         let previous_this_alias = self.this_alias.clone();
         let previous_static_this_capture = self.class_static_this_capture.clone();
-        if captures_static_this {
-            self.this_alias = Some("_a".to_owned());
-            self.class_static_this_capture = Some("_a".to_owned());
+        if let Some(static_this_capture) = static_this_capture.as_ref() {
+            self.this_alias = Some(static_this_capture.clone());
+            self.class_static_this_capture = Some(static_this_capture.clone());
         }
         let previous_static_super = super_capture
             .as_ref()
@@ -53870,12 +54191,24 @@ impl Printer<'_> {
             }
             let mut current = id;
             let mut inside_arrow = false;
+            let mut in_static_field_initializer = false;
             while let Some(parent) = self.arena.get(current).and_then(|node| node.parent) {
                 if parent == body {
                     return inside_arrow;
                 }
                 match self.arena.get(parent).map(|node| &node.data) {
                     Some(NodeData::ArrowFunction(_)) => inside_arrow = true,
+                    Some(NodeData::PropertyDeclaration(property))
+                        if self.property_is_static(property) =>
+                    {
+                        in_static_field_initializer = true;
+                    }
+                    Some(NodeData::ClassStaticBlockDeclaration(_)) => {
+                        inside_arrow = true;
+                        in_static_field_initializer = true;
+                    }
+                    Some(NodeData::ClassDeclaration(_) | NodeData::ClassExpression(_))
+                        if in_static_field_initializer => {}
                     Some(
                         NodeData::FunctionDeclaration(_)
                             | NodeData::FunctionExpression(_)
@@ -53883,7 +54216,6 @@ impl Printer<'_> {
                             | NodeData::ConstructorDeclaration(_)
                             | NodeData::GetAccessorDeclaration(_)
                             | NodeData::SetAccessorDeclaration(_)
-                            | NodeData::ClassStaticBlockDeclaration(_)
                             | NodeData::ClassDeclaration(_)
                             | NodeData::ClassExpression(_),
                     ) => return false,
@@ -54041,9 +54373,22 @@ impl Printer<'_> {
         capture_this: bool,
     ) -> Result<(), EmitError> {
         let previous = self.capture_arrow_this.clone();
+        let previous_this_alias = self.this_alias.clone();
+        let previous_this_alias_scope = self.this_alias_scope;
         self.capture_arrow_this = capture_this.then(|| "_this".to_owned());
+        if receiver != "this" {
+            self.this_alias = Some(receiver.to_owned());
+            self.this_alias_scope = data
+                .members
+                .nodes
+                .first()
+                .and_then(|member| self.arena.get(*member))
+                .and_then(|member| member.parent);
+        }
         let result = self.emit_instance_fields(data, receiver);
         self.capture_arrow_this = previous;
+        self.this_alias = previous_this_alias;
+        self.this_alias_scope = previous_this_alias_scope;
         result
     }
 
@@ -54216,7 +54561,19 @@ impl Printer<'_> {
             }
             _ => self.emit_expression(name, 0)?,
         }
-        self.writer.write(", {");
+        self.writer.write(", ");
+        if initializer.is_some_and(|initializer| {
+            self.static_super_object_rest_temps
+                .contains_key(&initializer)
+        }) {
+            self.writer.write(
+                "Object.assign({ enumerable: true, configurable: true, writable: true, value: ",
+            );
+            self.emit_expression(initializer.expect("initializer checked"), 1)?;
+            self.writer.write(" }))");
+            return Ok(());
+        }
+        self.writer.write("{");
         self.writer.newline();
         self.writer.indent += 1;
         self.writer.write("enumerable: true,");
@@ -58719,14 +59076,16 @@ impl Printer<'_> {
                     && let Some((base, true)) = self.downlevel_super_context.clone()
                     && let Some(receiver) = self.class_static_this_capture.clone()
                 {
-                    self.writer.write("Reflect.get(");
-                    self.writer.write(&base);
-                    self.writer.write(", ");
-                    let name = declaration_name_text(self.arena, data.name).unwrap_or("property");
-                    write_quoted(&mut self.writer, name);
-                    self.writer.write(", ");
-                    self.writer.write(&receiver);
-                    self.writer.write(")");
+                    if self.super_access_is_within_destructuring_target(id) {
+                        self.emit_static_super_setter_target(
+                            &base,
+                            data.name,
+                            false,
+                            &receiver,
+                        )?;
+                    } else {
+                        self.emit_static_super_get(&base, data.name, false, &receiver)?;
+                    }
                 } else if self.arena.get(data.expression).is_some_and(|node| {
                     node.kind == SyntaxKind::SuperKeyword
                 }) && let Some((base, is_static)) = self.downlevel_super_context.clone()
@@ -58860,13 +59219,34 @@ impl Printer<'_> {
                     node.kind == SyntaxKind::SuperKeyword
                 }) && let Some((base, is_static)) = self.downlevel_super_context.clone()
                 {
-                    self.writer.write(&base);
-                    if !is_static {
-                        self.writer.write(".prototype");
+                    if is_static
+                        && self.settings.target >= ScriptTarget::Es2015
+                        && let Some(receiver) = self.class_static_this_capture.clone()
+                    {
+                        if self.super_access_is_within_destructuring_target(id) {
+                            self.emit_static_super_setter_target(
+                                &base,
+                                data.argument_expression,
+                                true,
+                                &receiver,
+                            )?;
+                        } else {
+                            self.emit_static_super_get(
+                                &base,
+                                data.argument_expression,
+                                true,
+                                &receiver,
+                            )?;
+                        }
+                    } else {
+                        self.writer.write(&base);
+                        if !is_static {
+                            self.writer.write(".prototype");
+                        }
+                        self.writer.write("[");
+                        self.emit_expression(data.argument_expression, 0)?;
+                        self.writer.write("]");
                     }
-                    self.writer.write("[");
-                    self.emit_expression(data.argument_expression, 0)?;
-                    self.writer.write("]");
                 } else if data.question_dot_token.is_some() && self.settings.target < ScriptTarget::Es2020
                 {
                     self.emit_downlevel_optional_element(
@@ -58983,20 +59363,44 @@ impl Printer<'_> {
                 } else if let Some((capture, is_static, property, is_element)) =
                     downlevel_super_call
                 {
-                    self.writer.write(&capture);
-                    if !is_static {
-                        self.writer.write(".prototype");
-                    }
-                    if is_element {
-                        self.writer.write("[");
-                        self.emit_expression(property, 0)?;
-                        self.writer.write("]");
+                    let receiver = if is_static {
+                        self.class_static_this_capture
+                            .as_deref()
+                            .or(self.this_alias.as_deref())
+                            .unwrap_or("this")
                     } else {
-                        self.emit_downlevel_member_access(property)?;
+                        self.this_alias.as_deref().unwrap_or("this")
+                    }
+                    .to_owned();
+                    if is_static && self.settings.target >= ScriptTarget::Es2015 {
+                        self.writer.write("Reflect.get(");
+                        self.writer.write(&capture);
+                        self.writer.write(", ");
+                        if is_element {
+                            self.emit_expression(property, 0)?;
+                        } else {
+                            let name = declaration_name_text(self.arena, property)
+                                .unwrap_or("property");
+                            write_quoted(&mut self.writer, name);
+                        }
+                        self.writer.write(", ");
+                        self.writer.write(&receiver);
+                        self.writer.write(")");
+                    } else {
+                        self.writer.write(&capture);
+                        if !is_static {
+                            self.writer.write(".prototype");
+                        }
+                        if is_element {
+                            self.writer.write("[");
+                            self.emit_expression(property, 0)?;
+                            self.writer.write("]");
+                        } else {
+                            self.emit_downlevel_member_access(property)?;
+                        }
                     }
                     self.writer.write(".call(");
-                    self.writer
-                        .write(self.this_alias.as_deref().unwrap_or("this"));
+                    self.writer.write(&receiver);
                     if self.argument_list_has_expression(&data.arguments) {
                         self.writer.write(", ");
                         self.emit_argument_list(&data.arguments)?;
@@ -59455,6 +59859,9 @@ impl Printer<'_> {
                 }
             }
             NodeData::PrefixUnaryExpression(data) => {
+                if self.emit_static_super_update(id, data.operand, data.operator, false)? {
+                    return Ok(());
+                }
                 let commonjs_export = matches!(
                     data.operator,
                     SyntaxKind::PlusPlusToken | SyntaxKind::MinusMinusToken
@@ -59510,6 +59917,9 @@ impl Printer<'_> {
                 }
             }
             NodeData::PostfixUnaryExpression(data) => {
+                if self.emit_static_super_update(id, data.operand, data.operator, true)? {
+                    return Ok(());
+                }
                 if let Some(temp) = self.commonjs_postfix_export_temps.get(&id).cloned() {
                     self.writer.write("(");
                     self.emit_commonjs_export_assignment_prefixes(data.operand);
@@ -60355,6 +60765,10 @@ impl Printer<'_> {
                     }
                 } else if downlevel_generator {
                     self.emit_es5_generator_body(data.body)?;
+                } else if self.settings.target < ScriptTarget::Es2015
+                    && self.body_has_downlevel_arrow_this(data.body)
+                {
+                    self.emit_function_body_with_this_capture(data.body)?;
                 } else if self.source_text.is_empty()
                     && let Some(expression) = self.single_line_return_expression(data.body)?
                 {
@@ -60460,14 +60874,30 @@ impl Printer<'_> {
         &mut self,
         data: &ts_ast::TaggedTemplateExpressionData,
     ) -> Result<(), EmitError> {
-        let unbound_receiver = self.commonjs_module_transform
-            && self.commonjs_call_requires_unbound_receiver(data.tag);
-        if unbound_receiver {
-            self.writer.write("(0, ");
-        }
-        self.emit_expression(data.tag, 18)?;
-        if unbound_receiver {
+        let static_super = self
+            .direct_super_access(data.tag)
+            .zip(self.downlevel_super_context.clone())
+            .filter(|(_, (_, is_static))| *is_static)
+            .and_then(|((property, is_element), (base, _))| {
+                self.class_static_this_capture
+                    .clone()
+                    .map(|receiver| (base, property, is_element, receiver))
+            });
+        if let Some((base, property, is_element, receiver)) = static_super {
+            self.emit_static_super_get(&base, property, is_element, &receiver)?;
+            self.writer.write(".bind(");
+            self.writer.write(&receiver);
             self.writer.write(")");
+        } else {
+            let unbound_receiver = self.commonjs_module_transform
+                && self.commonjs_call_requires_unbound_receiver(data.tag);
+            if unbound_receiver {
+                self.writer.write("(0, ");
+            }
+            self.emit_expression(data.tag, 18)?;
+            if unbound_receiver {
+                self.writer.write(")");
+            }
         }
         if self.source_is_javascript_input()
             && let Some(type_arguments) = &data.type_arguments
@@ -61969,12 +62399,177 @@ impl Printer<'_> {
             .is_some_and(|trivia| trivia.contains(['\n', '\r']))
     }
 
+    fn emit_static_super_assignment(
+        &mut self,
+        expression: NodeId,
+        _parent_precedence: u8,
+    ) -> Result<bool, EmitError> {
+        if self.settings.target < ScriptTarget::Es2015 {
+            return Ok(false);
+        }
+        let Some((base, true)) = self.downlevel_super_context.clone() else {
+            return Ok(false);
+        };
+        let Some(receiver) = self.class_static_this_capture.clone() else {
+            return Ok(false);
+        };
+        let Some(NodeData::BinaryExpression(binary)) =
+            self.arena.get(expression).map(|node| &node.data)
+        else {
+            return Ok(false);
+        };
+        if let Some(temp) = self.static_super_object_rest_temps.get(&expression).cloned()
+            && let Some(target) = self.simple_object_rest_assignment_target(binary.left)
+            && let Some((property, is_element)) = self.direct_super_access(target)
+        {
+            self.writer.write("(");
+            self.writer.write(&temp);
+            self.writer.write(" = ");
+            self.emit_expression(binary.right, 1)?;
+            self.writer.write(", ");
+            self.emit_static_super_setter_target(&base, property, is_element, &receiver)?;
+            self.writer.write(" = ");
+            self.emit_helper_reference("__rest");
+            self.writer.write("(");
+            self.writer.write(&temp);
+            self.writer.write(", []), ");
+            self.writer.write(&temp);
+            self.writer.write(")");
+            return Ok(true);
+        }
+        let operator = self
+            .arena
+            .get(binary.operator_token)
+            .map(|operator| operator.kind)
+            .unwrap_or(SyntaxKind::EqualsToken);
+        if operator == SyntaxKind::EqualsToken
+            && self.expression_value_is_discarded(expression)
+            && let Some((property, is_element)) = self.direct_super_access(binary.left)
+        {
+            self.writer.write("Reflect.set(");
+            self.writer.write(&base);
+            self.writer.write(", ");
+            self.emit_static_super_key(property, is_element)?;
+            self.writer.write(", ");
+            self.emit_expression(binary.right, 1)?;
+            self.writer.write(", ");
+            self.writer.write(&receiver);
+            self.writer.write(")");
+            return Ok(true);
+        }
+        let Some(temp) = self.static_super_assignment_temps.get(&expression).cloned() else {
+            return Ok(false);
+        };
+        let Some((property, is_element)) = self.direct_super_access(binary.left) else {
+            return Ok(false);
+        };
+        self.writer.write("(Reflect.set(");
+        self.writer.write(&base);
+        self.writer.write(", ");
+        self.emit_static_super_key(property, is_element)?;
+        self.writer.write(", ");
+        self.writer.write(&temp);
+        self.writer.write(" = ");
+        if operator != SyntaxKind::EqualsToken {
+            self.emit_static_super_get(&base, property, is_element, &receiver)?;
+            self.writer.write(" ");
+            self.writer.write(
+                operator_text(operator)
+                    .unwrap_or("+=")
+                    .trim_end_matches('=')
+                    .trim_end(),
+            );
+            self.writer.write(" ");
+        }
+        self.emit_expression(binary.right, 1)?;
+        self.writer.write(", ");
+        self.writer.write(&receiver);
+        self.writer.write("), ");
+        self.writer.write(&temp);
+        self.writer.write(")");
+        Ok(true)
+    }
+
+    fn emit_static_super_update(
+        &mut self,
+        expression: NodeId,
+        operand: NodeId,
+        operator: SyntaxKind,
+        postfix: bool,
+    ) -> Result<bool, EmitError> {
+        if self.settings.target < ScriptTarget::Es2015 {
+            return Ok(false);
+        }
+        let Some((base, true)) = self.downlevel_super_context.clone() else {
+            return Ok(false);
+        };
+        let Some(receiver) = self.class_static_this_capture.clone() else {
+            return Ok(false);
+        };
+        let Some((property, is_element)) = self.direct_super_access(operand) else {
+            return Ok(false);
+        };
+        let Some(temps) = self.static_super_update_temps.get(&expression).cloned() else {
+            return Ok(false);
+        };
+        let (key_temp, result_temp, value_temp) = if is_element {
+            (Some(temps[0].as_str()), temps[1].as_str(), temps[2].as_str())
+        } else {
+            (None, temps[0].as_str(), temps[1].as_str())
+        };
+        self.writer.write("(Reflect.set(");
+        self.writer.write(&base);
+        self.writer.write(", ");
+        if let Some(key_temp) = key_temp {
+            self.writer.write(key_temp);
+            self.writer.write(" = ");
+            self.emit_expression(property, 0)?;
+        } else {
+            self.emit_static_super_key(property, false)?;
+        }
+        self.writer.write(", (");
+        self.writer.write(value_temp);
+        self.writer.write(" = ");
+        if let Some(key_temp) = key_temp {
+            self.writer.write("Reflect.get(");
+            self.writer.write(&base);
+            self.writer.write(", ");
+            self.writer.write(key_temp);
+            self.writer.write(", ");
+            self.writer.write(&receiver);
+            self.writer.write(")");
+        } else {
+            self.emit_static_super_get(&base, property, false, &receiver)?;
+        }
+        self.writer.write(", ");
+        self.writer.write(result_temp);
+        self.writer.write(" = ");
+        if !postfix {
+            self.writer.write(operator_text(operator).unwrap_or("++"));
+        }
+        self.writer.write(value_temp);
+        if postfix {
+            self.writer.write(operator_text(operator).unwrap_or("++"));
+            self.writer.write(", ");
+            self.writer.write(value_temp);
+        }
+        self.writer.write("), ");
+        self.writer.write(&receiver);
+        self.writer.write("), ");
+        self.writer.write(result_temp);
+        self.writer.write(")");
+        Ok(true)
+    }
+
     #[allow(clippy::items_after_statements, clippy::too_many_lines)]
     fn emit_binary_expression(
         &mut self,
         expression: NodeId,
         parent_precedence: u8,
     ) -> Result<(), EmitError> {
+        if self.emit_static_super_assignment(expression, parent_precedence)? {
+            return Ok(());
+        }
         if self
             .commonjs_destructuring_assignment_roots
             .contains(&expression)
@@ -71548,6 +72143,58 @@ mod tests {
             output.contains("_this.value = _super.prototype.foo;"),
             "{output}"
         );
+    }
+
+    #[test]
+    fn separates_static_super_captures_from_object_rest_temps() {
+        let output = emit_with_define(
+            concat!(
+                "declare class B { static value: any; } ",
+                "class C extends B { ",
+                "static copied = { ...super.value } = { value: 1 }; ",
+                "}",
+            ),
+            ScriptTarget::Es2015,
+        )
+        .code;
+        assert!(
+            output.contains("var _a;\nvar _b, _c;\nclass C extends (_c = B)"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn lowers_static_this_and_super_with_class_value_captures() {
+        let output = emit_with(
+            concat!(
+                "declare class B { static value: any; static read(): any; } ",
+                "class C extends B { ",
+                "static own = this.value; ",
+                "static inherited = super.read(); ",
+                "static updated = super.value += 1; ",
+                "}",
+            ),
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(output.contains("_a = C;"), "{output}");
+        assert!(
+            output.contains("Reflect.get(_b, \"read\", _a).call(_a)"),
+            "{output}"
+        );
+        assert!(output.contains("Reflect.set(_b, \"value\""), "{output}");
+    }
+
+    #[test]
+    fn preserves_compact_native_static_blocks() {
+        let output = emit_with(
+            "class B { static read() {} } class C extends B { static { super.read(); } }",
+            ScriptTarget::Es2022,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(output.contains("static { super.read(); }"), "{output}");
     }
 
     #[test]
