@@ -390,6 +390,8 @@ pub fn emit_source_file_with_context(
         active_private_method_plan: None,
         private_field_plans: HashMap::new(),
         active_private_field_plan: None,
+        enclosing_private_field_plans: Vec::new(),
+        private_field_computed_initializers: HashSet::new(),
         static_private_field_plans: HashMap::new(),
         active_static_private_field_plan: None,
         anonymous_private_class_plans: HashMap::new(),
@@ -26692,6 +26694,8 @@ struct Printer<'a> {
     active_private_method_plan: Option<PrivateMethodPlan>,
     private_field_plans: HashMap<NodeId, PrivateFieldPlan>,
     active_private_field_plan: Option<PrivateFieldPlan>,
+    enclosing_private_field_plans: Vec<PrivateFieldPlan>,
+    private_field_computed_initializers: HashSet<String>,
     static_private_field_plans: HashMap<NodeId, StaticPrivateFieldPlan>,
     active_static_private_field_plan: Option<StaticPrivateFieldPlan>,
     anonymous_private_class_plans: HashMap<NodeId, AnonymousPrivateClassPlan>,
@@ -27148,6 +27152,43 @@ impl Printer<'_> {
         None
     }
 
+    fn private_class_expression_storage_scope(&self, class: NodeId) -> Option<NodeId> {
+        let mut current = class;
+        while let Some(parent) = self.arena.get(current).and_then(|node| node.parent) {
+            match self.arena.get(parent).map(|node| &node.data) {
+                Some(NodeData::SourceFile(_) | NodeData::ModuleBlock(_)) => return Some(parent),
+                Some(NodeData::Block(_)) => {
+                    let container = self
+                        .arena
+                        .get(parent)
+                        .and_then(|block| block.parent)
+                        .and_then(|container| self.arena.get(container));
+                    if container.is_some_and(|container| {
+                        matches!(
+                            container.data,
+                            NodeData::FunctionDeclaration(_)
+                                | NodeData::FunctionExpression(_)
+                                | NodeData::ArrowFunction(_)
+                                | NodeData::MethodDeclaration(_)
+                                | NodeData::ConstructorDeclaration(_)
+                                | NodeData::GetAccessorDeclaration(_)
+                                | NodeData::SetAccessorDeclaration(_)
+                                | NodeData::ForStatement(_)
+                                | NodeData::ForInOrOfStatement(_)
+                                | NodeData::WhileStatement(_)
+                                | NodeData::DoStatement(_)
+                        )
+                    }) {
+                        return Some(parent);
+                    }
+                }
+                _ => {}
+            }
+            current = parent;
+        }
+        None
+    }
+
     #[allow(clippy::too_many_lines)]
     fn prepare_anonymous_private_class_lowerings(&mut self) {
         let classes = self
@@ -27157,8 +27198,7 @@ impl Printer<'_> {
                 let NodeData::ClassExpression(class) = &node.data else {
                     return None;
                 };
-                (class.name.is_none() && !node_is_in_ambient_context(self.arena, id))
-                    .then_some((id, class.clone()))
+                (!node_is_in_ambient_context(self.arena, id)).then_some((id, class.clone()))
             })
             .collect::<Vec<_>>();
         for (class_id, class) in classes {
@@ -27167,30 +27207,55 @@ impl Printer<'_> {
                 .nodes
                 .iter()
                 .filter_map(|member| {
-                    let NodeData::MethodDeclaration(method) = &self.arena.get(*member)?.data else {
+                    let (name, modifiers, body, kind) =
+                        match &self.arena.get(*member)?.data {
+                            NodeData::MethodDeclaration(method) => (
+                                method.name,
+                                method.modifiers.as_ref(),
+                                method.body,
+                                PrivateMemberKind::Method,
+                            ),
+                            NodeData::GetAccessorDeclaration(accessor) => (
+                                accessor.name,
+                                accessor.modifiers.as_ref(),
+                                accessor.body,
+                                PrivateMemberKind::Getter,
+                            ),
+                            NodeData::SetAccessorDeclaration(accessor) => (
+                                accessor.name,
+                                accessor.modifiers.as_ref(),
+                                accessor.body,
+                                PrivateMemberKind::Setter,
+                            ),
+                            _ => return None,
+                        };
+                    body?;
+                    if declaration_has_modifier_in_list(
+                        self.arena,
+                        modifiers,
+                        SyntaxKind::StaticKeyword,
+                    ) {
                         return None;
                     };
-                    if method.body.is_none()
-                        || declaration_has_modifier_in_list(
-                            self.arena,
-                            method.modifiers.as_ref(),
-                            SyntaxKind::StaticKeyword,
-                        )
-                    {
-                        return None;
-                    }
-                    let NodeData::PrivateIdentifier(name) = &self.arena.get(method.name)?.data
-                    else {
+                    let NodeData::PrivateIdentifier(name) = &self.arena.get(name)?.data else {
                         return None;
                     };
-                    Some((*member, name.text.trim_start_matches('#').to_owned()))
+                    Some((
+                        *member,
+                        name.text.trim_start_matches('#').to_owned(),
+                        kind,
+                    ))
                 })
                 .collect::<Vec<_>>();
             let has_private_methods = !private_methods.is_empty();
             let inferred_name = self
                 .class_expression_inferred_name(class_id)
                 .unwrap_or_else(|| "class".to_owned());
-            let prefix = (!has_private_methods).then_some(inferred_name.as_str());
+            let explicit_name = class
+                .name
+                .and_then(|name| declaration_name_text(self.arena, name));
+            let prefix = explicit_name
+                .or_else(|| (!has_private_methods).then_some(inferred_name.as_str()));
             let mut fields = Vec::new();
             let mut static_fields = Vec::new();
             for member in &class.members.nodes {
@@ -27234,14 +27299,24 @@ impl Printer<'_> {
                 continue;
             }
             let brand = has_private_methods.then(|| {
+                let preferred = explicit_name
+                    .map_or_else(|| "_instances".to_owned(), |name| format!("_{name}_instances"));
                 self.generated_names
-                    .claim("_instances")
-                    .unwrap_or_else(|| self.generated_names.generate("_instances"))
+                    .claim(&preferred)
+                    .unwrap_or_else(|| self.generated_names.generate(&preferred))
             });
             let methods = private_methods
                 .into_iter()
-                .map(|(method, private_name)| {
-                    let preferred = format!("_{private_name}");
+                .map(|(method, private_name, kind)| {
+                    let suffix = match kind {
+                        PrivateMemberKind::Method => "",
+                        PrivateMemberKind::Getter => "_get",
+                        PrivateMemberKind::Setter => "_set",
+                    };
+                    let preferred = explicit_name.map_or_else(
+                        || format!("_{private_name}{suffix}"),
+                        |name| format!("_{name}_{private_name}{suffix}"),
+                    );
                     let function_name = self
                         .generated_names
                         .claim(&preferred)
@@ -27251,11 +27326,11 @@ impl Printer<'_> {
                         private_name,
                         function_name,
                         is_static: false,
-                        kind: PrivateMemberKind::Method,
+                        kind,
                     }
                 })
                 .collect();
-            let Some(scope) = self.private_field_storage_scope(class_id) else {
+            let Some(scope) = self.private_class_expression_storage_scope(class_id) else {
                 continue;
             };
             self.anonymous_private_class_plans.insert(
@@ -27285,6 +27360,9 @@ impl Printer<'_> {
         else {
             return;
         };
+        if self.private_class_plan_is_block_scoped(plan) {
+            return;
+        }
         if let Some(brand) = &plan.brand {
             if !before_class_temp {
                 return;
@@ -27304,6 +27382,60 @@ impl Printer<'_> {
             );
             declarations.extend(plan.fields.iter().map(|field| field.storage.clone()));
         }
+    }
+
+    fn private_class_plan_is_block_scoped(&self, plan: &AnonymousPrivateClassPlan) -> bool {
+        matches!(
+            self.arena.get(plan.scope).map(|node| &node.data),
+            Some(NodeData::Block(_))
+        ) && !self
+            .arena
+            .get(plan.scope)
+            .and_then(|node| node.parent)
+            .and_then(|parent| self.arena.get(parent))
+            .is_some_and(|parent| {
+                matches!(
+                    parent.data,
+                    NodeData::FunctionDeclaration(_)
+                        | NodeData::FunctionExpression(_)
+                        | NodeData::ArrowFunction(_)
+                        | NodeData::MethodDeclaration(_)
+                        | NodeData::ConstructorDeclaration(_)
+                        | NodeData::GetAccessorDeclaration(_)
+                        | NodeData::SetAccessorDeclaration(_)
+                )
+            })
+    }
+
+    fn block_scoped_private_class_declarations(&self, scope: NodeId) -> Vec<String> {
+        let mut plans = self
+            .anonymous_private_class_plans
+            .iter()
+            .filter(|(_, plan)| {
+                plan.scope == scope && self.private_class_plan_is_block_scoped(plan)
+            })
+            .collect::<Vec<_>>();
+        plans.sort_by_key(|(class, _)| self.arena.get(**class).map(|node| node.range.start));
+        let mut declarations = Vec::new();
+        for (_, plan) in plans {
+            if let Some(brand) = &plan.brand {
+                declarations.push(brand.clone());
+                declarations.extend(plan.fields.iter().map(|field| field.storage.clone()));
+                declarations.extend(
+                    plan.methods
+                        .iter()
+                        .map(|method| method.function_name.clone()),
+                );
+            } else {
+                declarations.extend(
+                    plan.static_fields
+                        .iter()
+                        .map(|field| field.storage.clone()),
+                );
+                declarations.extend(plan.fields.iter().map(|field| field.storage.clone()));
+            }
+        }
+        declarations
     }
 
     #[allow(clippy::too_many_lines)]
@@ -27523,10 +27655,13 @@ impl Printer<'_> {
         };
         let private_name = name.text.trim_start_matches('#');
         self.active_private_field_plan
-            .as_ref()?
-            .fields
             .iter()
-            .find(|field| field.private_name == private_name)
+            .chain(self.enclosing_private_field_plans.iter().rev())
+            .find_map(|plan| {
+                plan.fields
+                    .iter()
+                    .find(|field| field.private_name == private_name)
+            })
     }
 
     fn prepare_private_destructuring_rewrites(&mut self, body: NodeId) -> Vec<String> {
@@ -36734,6 +36869,15 @@ impl Printer<'_> {
             );
         }
         self.generated_names.used.extend(temps.iter().cloned());
+        let block_scoped_private_declarations =
+            self.block_scoped_private_class_declarations(block_id);
+        if !block_scoped_private_declarations.is_empty() {
+            self.writer.write("let ");
+            self.writer
+                .write(&block_scoped_private_declarations.join(", "));
+            self.writer.write(";");
+            self.writer.newline();
+        }
         if !temps.is_empty() {
             self.writer.write("var ");
             self.writer.write(&temps.join(", "));
@@ -51488,6 +51632,9 @@ impl Printer<'_> {
         let previous_private_plan = self.active_private_method_plan.clone();
         let private_field_plan = self.private_field_plan(data);
         let previous_private_field_plan = self.active_private_field_plan.clone();
+        if let Some(previous) = &previous_private_field_plan {
+            self.enclosing_private_field_plans.push(previous.clone());
+        }
         self.active_private_field_plan
             .clone_from(&private_field_plan);
         let mut previous_class_rewrite = None;
@@ -52001,6 +52148,9 @@ impl Printer<'_> {
         }
         self.active_private_method_plan = previous_private_plan;
         self.active_private_field_plan = previous_private_field_plan;
+        if self.active_private_field_plan.is_some() {
+            self.enclosing_private_field_plans.pop();
+        }
         Ok(())
     }
 
@@ -52083,7 +52233,22 @@ impl Printer<'_> {
                     .any(|member| self.runtime_computed_class_member_name(*member).is_some())
             })
             .collect::<Vec<_>>();
-        if pending.is_empty() {
+        let private_storages = lower_fields
+            .then(|| self.private_field_plan(class))
+            .flatten()
+            .map(|plan| {
+                plan.fields
+                    .into_iter()
+                    .filter_map(|field| {
+                        (!self
+                            .private_field_computed_initializers
+                            .contains(&field.storage))
+                        .then_some(field.storage)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if pending.is_empty() && private_storages.is_empty() {
             if let Some(temp) = self.computed_property_temps.get(&name).cloned() {
                 self.writer.write("[");
                 self.writer.write(&temp);
@@ -52095,6 +52260,12 @@ impl Printer<'_> {
             return self.emit_expression(name, 0);
         }
         self.writer.write("[(");
+        for storage in private_storages {
+            self.private_field_computed_initializers
+                .insert(storage.clone());
+            self.writer.write(&storage);
+            self.writer.write(" = new WeakMap(), ");
+        }
         for (_, field_name) in pending {
             let NodeData::ComputedPropertyName(field) = &self.node(field_name)?.data else {
                 unreachable!();
@@ -52118,7 +52289,15 @@ impl Printer<'_> {
             self.writer.write(&temp);
             self.writer.write(" = ");
         }
-        self.emit_expression(computed.expression, 0)?;
+        let mut computed_expression = computed.expression;
+        while let Some(NodeData::ParenthesizedExpression(parenthesized)) = self
+            .arena
+            .get(computed_expression)
+            .map(|node| &node.data)
+        {
+            computed_expression = parenthesized.expression;
+        }
+        self.emit_expression(computed_expression, 0)?;
         self.writer.write(")]");
         Ok(())
     }
@@ -52922,16 +53101,36 @@ impl Printer<'_> {
             }
             for private_method in &plan.methods {
                 let node = self.node(private_method.method)?.clone();
-                let NodeData::MethodDeclaration(method) = &node.data else {
-                    return Err(Self::unsupported(private_method.method, node.kind));
+                let (parameters, body, is_async, generator) = match &node.data {
+                    NodeData::MethodDeclaration(method) => (
+                        &method.parameters,
+                        method.body,
+                        self.has_modifier(method.modifiers.as_ref(), SyntaxKind::AsyncKeyword),
+                        method.asterisk_token.is_some(),
+                    ),
+                    NodeData::GetAccessorDeclaration(accessor) => {
+                        (&accessor.parameters, accessor.body, false, false)
+                    }
+                    NodeData::SetAccessorDeclaration(accessor) => {
+                        (&accessor.parameters, accessor.body, false, false)
+                    }
+                    _ => return Err(Self::unsupported(private_method.method, node.kind)),
                 };
                 self.writer.newline();
                 self.writer.write(&private_method.function_name);
-                self.writer.write(" = function ");
-                self.writer.write(&private_method.function_name);
-                self.emit_parameters(&method.parameters)?;
+                self.writer.write(" = ");
+                if is_async {
+                    self.writer.write("async ");
+                }
+                self.writer.write("function");
+                if generator {
+                    self.writer.write("*");
+                }
                 self.writer.write(" ");
-                self.emit_function_body(method.body.expect("private method has a body"))?;
+                self.writer.write(&private_method.function_name);
+                self.emit_parameters(parameters)?;
+                self.writer.write(" ");
+                self.emit_function_body(body.expect("private member has a body"))?;
                 self.writer.write(",");
             }
         }
@@ -53134,6 +53333,14 @@ impl Printer<'_> {
                     }
                     NodeData::MethodDeclaration(method) => matches!(
                         self.arena.get(method.name).map(|node| &node.data),
+                        Some(NodeData::PrivateIdentifier(_))
+                    ),
+                    NodeData::GetAccessorDeclaration(accessor) => matches!(
+                        self.arena.get(accessor.name).map(|node| &node.data),
+                        Some(NodeData::PrivateIdentifier(_))
+                    ),
+                    NodeData::SetAccessorDeclaration(accessor) => matches!(
+                        self.arena.get(accessor.name).map(|node| &node.data),
                         Some(NodeData::PrivateIdentifier(_))
                     ),
                     NodeData::ClassStaticBlockDeclaration(_) => true,
@@ -53531,8 +53738,20 @@ impl Printer<'_> {
     }
 
     fn emit_private_field_initializers(&mut self, plan: &PrivateFieldPlan) {
+        let fields = plan
+            .fields
+            .iter()
+            .filter(|field| {
+                !self
+                    .private_field_computed_initializers
+                    .contains(&field.storage)
+            })
+            .collect::<Vec<_>>();
+        if fields.is_empty() {
+            return;
+        }
         self.writer.newline();
-        for (index, field) in plan.fields.iter().enumerate() {
+        for (index, field) in fields.iter().enumerate() {
             if index != 0 {
                 self.writer.write(", ");
             }
@@ -53601,6 +53820,9 @@ impl Printer<'_> {
                         field.private_name == name.text.trim_start_matches('#')
                     })
                 })
+                && !self
+                    .private_field_computed_initializers
+                    .contains(&field.storage)
             {
                 if wrote_initializer {
                     self.writer.write(", ");
@@ -70616,6 +70838,53 @@ mod tests {
                 && output.contains("_b);"),
             "{output}"
         );
+    }
+
+    #[test]
+    fn keeps_named_class_expression_private_state_loop_scoped() {
+        let output = emit_with(
+            concat!(
+                "for (let i = 0; i < 2; i++) { use(class C { #field = i; ",
+                "#method() {} get #value() { return i; } set #value(next) {} }); }",
+            ),
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(
+            output.contains(concat!(
+                "let _C_instances, _C_field, _C_method, ",
+                "_C_value_get, _C_value_set;",
+            )),
+            "{output}"
+        );
+        assert!(
+            output.contains("_C_field = new WeakMap(),")
+                && output.contains("_C_instances = new WeakSet(),")
+                && output.contains("_C_value_set = function _C_value_set(next) { },"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn initializes_private_storage_in_nested_computed_names() {
+        let output = emit_with(
+            concat!(
+                "class Outer { #name; method() { const obj = this; class Inner { ",
+                "#value = 1; [obj.#name]() { return this.#value; } } } }",
+            ),
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(
+            output.contains(concat!(
+                "[(_Inner_value = new WeakMap(), ",
+                "__classPrivateFieldGet(obj, _Outer_name, \"f\"))]()",
+            )),
+            "{output}"
+        );
+        assert_eq!(output.matches("_Inner_value = new WeakMap()").count(), 1);
     }
 
     #[test]
