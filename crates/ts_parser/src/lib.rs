@@ -9556,6 +9556,33 @@ mod tests {
     }
 
     #[test]
+    fn class_field_line_break_does_not_create_a_semicolon_member() {
+        let result = parse_source_file(
+            "class C { #x = 1\n constructor(x: number) { this.#x = x; } static { x(); } }",
+        );
+        let NodeData::ClassDeclaration(class) =
+            &result.arena.get(source_statements(&result)[0]).unwrap().data
+        else {
+            panic!("expected class declaration");
+        };
+        assert_eq!(
+            class
+                .members
+                .nodes
+                .iter()
+                .map(|member| result.arena.get(*member).unwrap().kind)
+                .collect::<Vec<_>>(),
+            [
+                SyntaxKind::PropertyDeclaration,
+                SyntaxKind::MethodDeclaration,
+                SyntaxKind::ClassStaticBlockDeclaration,
+            ],
+            "{:?}",
+            result.diagnostics,
+        );
+    }
+
+    #[test]
     fn parses_var_as_a_class_property_name() {
         let result = parse_source_file("class C { var; } class D { var\nvalue = 1; }");
         assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);

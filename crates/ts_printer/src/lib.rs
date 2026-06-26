@@ -384,6 +384,8 @@ pub fn emit_source_file_with_context(
         active_private_method_plan: None,
         private_field_plans: HashMap::new(),
         active_private_field_plan: None,
+        static_private_field_plans: HashMap::new(),
+        active_static_private_field_plan: None,
         anonymous_private_class_plans: HashMap::new(),
         active_anonymous_private_class: None,
         private_destructuring_rewrites: HashMap::new(),
@@ -1191,6 +1193,12 @@ pub fn emit_source_file_with_context(
         && !printer.imported_helpers.contains("__classPrivateFieldGet")
     {
         printer.emit_private_field_helpers(source_needs_private_field_get_helper(arena));
+    } else if !printer.static_private_field_plans.is_empty()
+        && source_needs_private_field_get_helper(arena)
+        && !settings.no_emit_helpers
+        && !printer.imported_helpers.contains("__classPrivateFieldGet")
+    {
+        printer.emit_class_private_field_get_helper();
     }
     if !auto_accessor_storages.is_empty() {
         printer.emit_auto_accessor_helpers();
@@ -1225,21 +1233,35 @@ pub fn emit_source_file_with_context(
             printer.writer.newline();
         }
     }
-    if !printer.private_field_plans.is_empty() {
+    if !printer.private_field_plans.is_empty() || !printer.static_private_field_plans.is_empty() {
         let mut fields = printer
             .private_field_plans
             .values()
             .filter(|plan| plan.scope == source_file)
             .flat_map(|plan| plan.fields.iter())
             .collect::<Vec<_>>();
-        if !fields.is_empty() {
-            fields.sort_by_key(|field| field.declaration_order);
+        fields.sort_by_key(|field| field.declaration_order);
+        let mut declarations = fields
+            .into_iter()
+            .map(|field| field.storage.clone())
+            .collect::<Vec<_>>();
+        let mut static_plans = printer
+            .static_private_field_plans
+            .values()
+            .filter(|plan| plan.scope == source_file)
+            .collect::<Vec<_>>();
+        static_plans.sort_by_key(|plan| plan.capture.clone());
+        for plan in static_plans {
+            declarations.push(plan.capture.clone());
+            declarations.extend(plan.fields.iter().map(|field| field.storage.clone()));
+        }
+        if !declarations.is_empty() {
             printer.writer.write("var ");
-            for (index, field) in fields.iter().enumerate() {
+            for (index, declaration) in declarations.iter().enumerate() {
                 if index != 0 {
                     printer.writer.write(", ");
                 }
-                printer.writer.write(&field.storage);
+                printer.writer.write(declaration);
             }
             printer.writer.write(";");
             printer.writer.newline();
@@ -26296,6 +26318,20 @@ struct PrivateFieldPlan {
 }
 
 #[derive(Clone)]
+struct StaticPrivateFieldInfo {
+    private_name: String,
+    storage: String,
+    initializer: Option<NodeId>,
+}
+
+#[derive(Clone)]
+struct StaticPrivateFieldPlan {
+    scope: NodeId,
+    capture: String,
+    fields: Vec<StaticPrivateFieldInfo>,
+}
+
+#[derive(Clone)]
 struct AnonymousPrivateStaticField {
     storage: String,
     initializer: Option<NodeId>,
@@ -26470,6 +26506,8 @@ struct Printer<'a> {
     active_private_method_plan: Option<PrivateMethodPlan>,
     private_field_plans: HashMap<NodeId, PrivateFieldPlan>,
     active_private_field_plan: Option<PrivateFieldPlan>,
+    static_private_field_plans: HashMap<NodeId, StaticPrivateFieldPlan>,
+    active_static_private_field_plan: Option<StaticPrivateFieldPlan>,
     anonymous_private_class_plans: HashMap<NodeId, AnonymousPrivateClassPlan>,
     active_anonymous_private_class: Option<NodeId>,
     private_destructuring_rewrites: HashMap<NodeId, PrivateDestructuringRewrite>,
@@ -26498,7 +26536,7 @@ struct Printer<'a> {
 
 #[derive(Clone)]
 struct StaticBlockDeclarationPlan {
-    capture: String,
+    capture: Option<String>,
     base_capture: Option<String>,
     lower_static_fields: bool,
 }
@@ -26835,19 +26873,13 @@ impl Printer<'_> {
                 continue;
             };
             let mut fields = Vec::new();
+            let mut static_fields = Vec::new();
             for member in &class.members.nodes {
                 let Some(NodeData::PropertyDeclaration(property)) =
                     self.arena.get(*member).map(|node| &node.data)
                 else {
                     continue;
                 };
-                if declaration_has_modifier_in_list(
-                    self.arena,
-                    property.modifiers.as_ref(),
-                    SyntaxKind::StaticKeyword,
-                ) {
-                    continue;
-                }
                 let Some(NodeData::PrivateIdentifier(name)) =
                     self.arena.get(property.name).map(|node| &node.data)
                 else {
@@ -26859,19 +26891,42 @@ impl Printer<'_> {
                     .generated_names
                     .claim(&preferred)
                     .unwrap_or_else(|| self.generated_names.generate(&preferred));
-                fields.push(PrivateFieldInfo {
-                    private_name,
-                    storage,
-                    declaration_order,
-                });
+                if declaration_has_modifier_in_list(
+                    self.arena,
+                    property.modifiers.as_ref(),
+                    SyntaxKind::StaticKeyword,
+                ) {
+                    static_fields.push(StaticPrivateFieldInfo {
+                        private_name,
+                        storage,
+                        initializer: property.initializer,
+                    });
+                } else {
+                    fields.push(PrivateFieldInfo {
+                        private_name,
+                        storage,
+                        declaration_order,
+                    });
+                }
                 declaration_order += 1;
             }
+            let Some(scope) = self.private_field_storage_scope(class_id) else {
+                continue;
+            };
             if !fields.is_empty() {
-                let Some(scope) = self.private_field_storage_scope(class_id) else {
-                    continue;
-                };
                 self.private_field_plans
                     .insert(class_name, PrivateFieldPlan { scope, fields });
+            }
+            if !static_fields.is_empty() {
+                let capture = self.generated_names.generate_temp();
+                self.static_private_field_plans.insert(
+                    class_name,
+                    StaticPrivateFieldPlan {
+                        scope,
+                        capture,
+                        fields: static_fields,
+                    },
+                );
             }
         }
     }
@@ -27228,6 +27283,28 @@ impl Printer<'_> {
                     fields: plan.fields.clone(),
                 })
             })
+    }
+
+    fn static_private_field_plan(
+        &self,
+        class: &ts_ast::ClassDeclarationData,
+    ) -> Option<StaticPrivateFieldPlan> {
+        class
+            .name
+            .and_then(|name| self.static_private_field_plans.get(&name))
+            .cloned()
+    }
+
+    fn active_static_private_field(&self, name: NodeId) -> Option<&StaticPrivateFieldInfo> {
+        let NodeData::PrivateIdentifier(name) = &self.arena.get(name)?.data else {
+            return None;
+        };
+        let private_name = name.text.trim_start_matches('#');
+        self.active_static_private_field_plan
+            .as_ref()?
+            .fields
+            .iter()
+            .find(|field| field.private_name == private_name)
     }
 
     fn active_private_field(&self, name: NodeId) -> Option<&PrivateFieldInfo> {
@@ -36071,7 +36148,7 @@ impl Printer<'_> {
                     let mut current = id;
                     while let Some(parent) = self.arena.get(current).and_then(|node| node.parent) {
                         if parent == block_id {
-                            return Some((node.range.start, class.members.nodes.clone()));
+                            return Some((node.range.start, id, class.members.nodes.clone()));
                         }
                         if matches!(
                             self.arena.get(parent).map(|node| &node.data),
@@ -36095,16 +36172,23 @@ impl Printer<'_> {
         } else {
             Vec::new()
         };
-        class_declarations.sort_by_key(|(start, _)| *start);
+        class_declarations.sort_by_key(|(start, _, _)| *start);
         let mut claimed = HashSet::new();
         let mut temps = Vec::new();
         let mut declaration_index = 0;
         for (class_start, class_expression) in class_expressions {
             while class_declarations
                 .get(declaration_index)
-                .is_some_and(|(start, _)| *start < class_start)
+                .is_some_and(|(start, _, _)| *start < class_start)
             {
-                let members = class_declarations[declaration_index].1.clone();
+                let class_id = class_declarations[declaration_index].1;
+                let members = class_declarations[declaration_index].2.clone();
+                self.prepare_class_static_block_declaration_plan(
+                    class_id,
+                    block_id,
+                    &mut claimed,
+                    &mut temps,
+                );
                 self.prepare_class_expression_computed_property_temps(
                     &members,
                     block_id,
@@ -36150,7 +36234,13 @@ impl Printer<'_> {
                 &mut temps,
             );
         }
-        for (_, members) in &class_declarations[declaration_index..] {
+        for (_, class_id, members) in &class_declarations[declaration_index..] {
+            self.prepare_class_static_block_declaration_plan(
+                *class_id,
+                block_id,
+                &mut claimed,
+                &mut temps,
+            );
             self.prepare_class_expression_computed_property_temps(
                 members,
                 block_id,
@@ -36222,6 +36312,121 @@ impl Printer<'_> {
             self.amd_dynamic_import_temps.insert(call, temp.clone());
             temps.push(temp);
         }
+    }
+
+    fn prepare_class_static_block_declaration_plan(
+        &mut self,
+        class_id: NodeId,
+        allocation_scope: NodeId,
+        claimed: &mut HashSet<String>,
+        declarations: &mut Vec<String>,
+    ) {
+        if self.settings.target >= ScriptTarget::Es2022 {
+            return;
+        }
+        let Some(NodeData::ClassDeclaration(class)) =
+            self.arena.get(class_id).map(|node| &node.data)
+        else {
+            return;
+        };
+        let members = &class.members.nodes;
+        let has_static_block = members.iter().any(|member| {
+            matches!(
+                self.arena.get(*member).map(|node| &node.data),
+                Some(NodeData::ClassStaticBlockDeclaration(_))
+            )
+        });
+        let has_private_method_plan = class
+            .name
+            .is_some_and(|name| self.private_method_plans.contains_key(&name));
+        let lowered_static_field_uses_super = members.iter().any(|member| {
+            matches!(
+                self.arena.get(*member).map(|node| &node.data),
+                Some(NodeData::PropertyDeclaration(property))
+                    if self.property_is_static(property) && property.initializer.is_some()
+            ) && self.arena.iter().any(|(candidate, node)| {
+                self.node_is_within(candidate, *member) && node.kind == SyntaxKind::SuperKeyword
+            })
+        });
+        let lowered_static_field_uses_this = !has_private_method_plan
+            && members.iter().any(|member| {
+                matches!(
+                    self.arena.get(*member).map(|node| &node.data),
+                    Some(NodeData::PropertyDeclaration(property))
+                        if self.property_is_static(property) && property.initializer.is_some()
+                ) && self.arena.iter().any(|(candidate, node)| {
+                    self.node_is_within(candidate, *member) && node.kind == SyntaxKind::ThisKeyword
+                })
+            });
+        let lower_static_fields =
+            lowered_static_field_uses_super || lowered_static_field_uses_this;
+        if !has_static_block && !lower_static_fields {
+            return;
+        }
+        let static_block_uses_this_or_super = members.iter().any(|member| {
+            matches!(
+                self.arena.get(*member).map(|node| &node.data),
+                Some(NodeData::ClassStaticBlockDeclaration(_))
+            ) && self.arena.iter().any(|(candidate, node)| {
+                self.node_is_within(candidate, *member)
+                    && matches!(node.kind, SyntaxKind::ThisKeyword | SyntaxKind::SuperKeyword)
+            })
+        });
+        let has_static_private_member = members.iter().any(|member| {
+            matches!(
+                self.arena.get(*member).map(|node| &node.data),
+                Some(NodeData::PropertyDeclaration(property))
+                    if self.property_is_static(property)
+                        && matches!(
+                            self.arena.get(property.name).map(|node| &node.data),
+                            Some(NodeData::PrivateIdentifier(_))
+                        )
+            )
+        });
+        let static_private_capture = class
+            .name
+            .and_then(|name| self.static_private_field_plans.get(&name))
+            .map(|plan| plan.capture.clone());
+        let capture = static_private_capture.or_else(|| (lower_static_fields
+            || static_block_uses_this_or_super
+            || has_static_private_member)
+            .then(|| {
+                let capture = self.generate_block_temp(allocation_scope, claimed);
+                claimed.insert(capture.clone());
+                declarations.push(capture.clone());
+                capture
+            }));
+        let uses_super = lowered_static_field_uses_super || members.iter().any(|member| {
+            matches!(
+                self.arena.get(*member).map(|node| &node.data),
+                Some(NodeData::ClassStaticBlockDeclaration(_))
+            ) && self.arena.iter().any(|(candidate, node)| {
+                self.node_is_within(candidate, *member) && node.kind == SyntaxKind::SuperKeyword
+            })
+        });
+        let has_base = class.heritage_clauses.as_ref().is_some_and(|clauses| {
+            clauses.nodes.iter().any(|clause| {
+                matches!(
+                    self.arena.get(*clause).map(|node| &node.data),
+                    Some(NodeData::HeritageClause(heritage))
+                        if heritage.token == SyntaxKind::ExtendsKeyword
+                )
+            })
+        });
+        let base_capture = (uses_super && has_base).then(|| {
+            let temp = self.generate_block_temp(allocation_scope, claimed);
+            claimed.insert(temp.clone());
+            declarations.push(temp.clone());
+            temp
+        });
+        self.class_static_block_declaration_plans.insert(
+            class_id,
+            StaticBlockDeclarationPlan {
+                capture,
+                base_capture,
+                lower_static_fields,
+            },
+        );
     }
 
     #[allow(clippy::too_many_lines)]
@@ -36300,84 +36505,12 @@ impl Printer<'_> {
                 self.class_expression_temps.insert(*class_id, temp.clone());
                 field_temps.push(temp);
             }
-            let has_static_block = members.iter().any(|member| {
-                matches!(
-                    self.arena.get(*member).map(|node| &node.data),
-                    Some(NodeData::ClassStaticBlockDeclaration(_))
-                )
-            });
-            let lowered_static_field_uses_super = self.settings.target < ScriptTarget::Es2022
-                && members.iter().any(|member| {
-                    matches!(
-                        self.arena.get(*member).map(|node| &node.data),
-                        Some(NodeData::PropertyDeclaration(property))
-                            if self.property_is_static(property)
-                                && property.initializer.is_some()
-                    ) && self.arena.iter().any(|(candidate, node)| {
-                        self.node_is_within(candidate, *member)
-                            && node.kind == SyntaxKind::SuperKeyword
-                    })
-                });
-            let has_private_method_plan = self
-                .arena
-                .get(*class_id)
-                .and_then(|node| match &node.data {
-                    NodeData::ClassDeclaration(class) => class.name,
-                    NodeData::ClassExpression(class) => class.name,
-                    _ => None,
-                })
-                .is_some_and(|name| self.private_method_plans.contains_key(&name));
-            let lowered_static_field_uses_this = !has_private_method_plan
-                && self.settings.target < ScriptTarget::Es2022
-                && members.iter().any(|member| {
-                    matches!(
-                        self.arena.get(*member).map(|node| &node.data),
-                        Some(NodeData::PropertyDeclaration(property))
-                            if self.property_is_static(property)
-                                && property.initializer.is_some()
-                    ) && self.arena.iter().any(|(candidate, node)| {
-                        self.node_is_within(candidate, *member)
-                            && node.kind == SyntaxKind::ThisKeyword
-                    })
-                });
-            let lower_static_fields =
-                lowered_static_field_uses_super || lowered_static_field_uses_this;
-            if !*is_expression && (has_static_block || lower_static_fields) {
-                let capture = self.generate_block_temp(source_file, &claimed);
-                claimed.insert(capture.clone());
-                field_temps.push(capture.clone());
-                let uses_super = lowered_static_field_uses_super || members.iter().any(|member| {
-                    matches!(
-                        self.arena.get(*member).map(|node| &node.data),
-                        Some(NodeData::ClassStaticBlockDeclaration(_))
-                    ) && self.arena.iter().any(|(candidate, node)| {
-                        self.node_is_within(candidate, *member)
-                            && node.kind == SyntaxKind::SuperKeyword
-                    })
-                });
-                let has_base = self.arena.get(*class_id).is_some_and(|node| {
-                    matches!(&node.data, NodeData::ClassDeclaration(class)
-                        if class.heritage_clauses.as_ref().is_some_and(|clauses| {
-                            clauses.nodes.iter().any(|clause| matches!(
-                                self.arena.get(*clause).map(|node| &node.data),
-                                Some(NodeData::HeritageClause(heritage))
-                                    if heritage.token == SyntaxKind::ExtendsKeyword
-                            ))
-                        }))
-                });
-                let base_capture = (uses_super && has_base).then(|| {
-                    let temp = self.generate_block_temp(source_file, &claimed);
-                    claimed.insert(temp.clone());
-                    field_temps.push(temp.clone());
-                    temp
-                });
-                self.class_static_block_declaration_plans.insert(
+            if !*is_expression {
+                self.prepare_class_static_block_declaration_plan(
                     *class_id,
-                    StaticBlockDeclarationPlan {
-                        capture,
-                        base_capture,
-                        lower_static_fields,
-                    },
+                    source_file,
+                    &mut claimed,
+                    &mut field_temps,
                 );
             }
             for member in members {
@@ -49965,13 +50098,31 @@ impl Printer<'_> {
         else {
             return Ok(false);
         };
+        let static_private_plan = self.static_private_field_plan(data);
         let mut core = data.clone();
         core.members.nodes.retain(|member| {
-            !matches!(
+            let is_static_block = matches!(
                 self.arena.get(*member).map(|node| &node.data),
                 Some(NodeData::ClassStaticBlockDeclaration(_))
-            )
+            );
+            let is_static_private_field = static_private_plan.is_some()
+                && matches!(
+                    self.arena.get(*member).map(|node| &node.data),
+                    Some(NodeData::PropertyDeclaration(property))
+                        if self.property_is_static(property)
+                            && matches!(
+                                self.arena.get(property.name).map(|node| &node.data),
+                                Some(NodeData::PrivateIdentifier(_))
+                            )
+                );
+            !is_static_block && !is_static_private_field
         });
+        core.members.range.end = core
+            .members
+            .nodes
+            .last()
+            .and_then(|member| self.arena.get(*member))
+            .map_or(core.members.range.start, |member| member.range.end);
         let base_rewrite = plan.base_capture.as_ref().and_then(|base_capture| {
             let base = self.class_base_expression(data).ok().flatten()?;
             let name = declaration_name_text(self.arena, base)?;
@@ -49980,6 +50131,8 @@ impl Printer<'_> {
         });
         let previous_defer_static_fields = self.defer_static_fields;
         self.defer_static_fields = plan.lower_static_fields;
+        let previous_static_private_field_plan = self.active_static_private_field_plan.clone();
+        self.active_static_private_field_plan = static_private_plan.clone();
         let class_result = self.emit_class_with_name(&core, emitted_name);
         self.defer_static_fields = previous_defer_static_fields;
         class_result?;
@@ -49996,12 +50149,28 @@ impl Printer<'_> {
             .or(emitted_name)
             .unwrap_or("_class")
             .to_owned();
-        self.writer.newline();
-        self.writer.write(&plan.capture);
-        self.writer.write(" = ");
-        self.writer.write(&class_name);
-        self.writer.write(";");
-        let previous_capture = self.class_static_this_capture.replace(plan.capture.clone());
+        if let Some(capture) = &plan.capture {
+            self.writer.newline();
+            self.writer.write(capture);
+            self.writer.write(" = ");
+            self.writer.write(&class_name);
+            self.writer.write(";");
+        }
+        if let Some(static_private_plan) = &static_private_plan {
+            for field in &static_private_plan.fields {
+                self.writer.newline();
+                self.writer.write(&field.storage);
+                self.writer.write(" = { value: ");
+                if let Some(initializer) = field.initializer {
+                    self.emit_expression(initializer, 1)?;
+                } else {
+                    self.writer.write("void 0");
+                }
+                self.writer.write(" };");
+            }
+        }
+        let previous_capture = self.class_static_this_capture.clone();
+        self.class_static_this_capture.clone_from(&plan.capture);
         let previous_super = plan
             .base_capture
             .as_ref()
@@ -50009,6 +50178,10 @@ impl Printer<'_> {
         if plan.lower_static_fields {
             self.emit_native_static_fields(data)?;
         }
+        let previous_private_field_plan = self.active_private_field_plan.clone();
+        self.active_private_field_plan = self.private_field_plan(data);
+        let previous_private_method_plan = self.active_private_method_plan.clone();
+        self.active_private_method_plan = self.private_method_plan(data);
         for member in &data.members.nodes {
             let Some(NodeData::ClassStaticBlockDeclaration(block)) =
                 self.arena.get(*member).map(|node| &node.data)
@@ -50016,10 +50189,53 @@ impl Printer<'_> {
                 continue;
             };
             self.writer.newline();
-            self.writer.write("(() => ");
-            self.emit_block(block.body)?;
+            self.writer.write(if self.settings.target < ScriptTarget::Es2015 {
+                "(function () "
+            } else {
+                "(() => "
+            });
+            let mut local_rewrites = Vec::new();
+            if self.settings.target < ScriptTarget::Es2015 {
+                let local_symbols = self
+                    .arena
+                    .iter()
+                    .filter_map(|(id, node)| {
+                        (self.node_is_within(id, block.body)
+                            && matches!(node.data, NodeData::Identifier(_))
+                            && node.parent.and_then(|parent| self.arena.get(parent)).is_some_and(
+                                |parent| identifier_is_declaration_name(id, parent),
+                            ))
+                        .then(|| self.bindings.node_symbols.get(&id).copied())
+                        .flatten()
+                    })
+                    .collect::<HashSet<_>>();
+                for symbol in local_symbols {
+                    if let Some(rewrite) = self.identifier_rewrites.remove(&symbol) {
+                        local_rewrites.push((symbol, rewrite));
+                    }
+                }
+            }
+            let block_result = if matches!(
+                self.arena.get(block.body).map(|node| &node.data),
+                Some(NodeData::Block(block)) if block.statements.nodes.is_empty()
+            ) && !self.node_source_is_multiline(block.body)
+            {
+                self.writer.write("{");
+                self.writer.newline();
+                self.writer.write("}");
+                Ok(())
+            } else {
+                self.emit_block(block.body)
+            };
+            for (symbol, rewrite) in local_rewrites {
+                self.identifier_rewrites.insert(symbol, rewrite);
+            }
+            block_result?;
             self.writer.write(")();");
         }
+        self.active_private_method_plan = previous_private_method_plan;
+        self.active_private_field_plan = previous_private_field_plan;
+        self.active_static_private_field_plan = previous_static_private_field_plan;
         self.class_static_this_capture = previous_capture;
         if plan.base_capture.is_some() {
             self.downlevel_super_context = previous_super;
@@ -57695,6 +57911,20 @@ impl Printer<'_> {
                     self.writer.write(", ");
                     self.writer.write(&rewrite.value_temp);
                     self.writer.write(", \"f\"); } }).value");
+                } else if let Some(private_field) =
+                    self.active_static_private_field(data.name).cloned()
+                {
+                    let Some(plan) = self.active_static_private_field_plan.clone() else {
+                        return Err(Self::unsupported(id, node.kind));
+                    };
+                    self.emit_helper_reference("__classPrivateFieldGet");
+                    self.writer.write("(");
+                    self.writer.write(&plan.capture);
+                    self.writer.write(", ");
+                    self.writer.write(&plan.capture);
+                    self.writer.write(", \"f\", ");
+                    self.writer.write(&private_field.storage);
+                    self.writer.write(")");
                 } else if let Some(private_field) = self.active_private_field(data.name).cloned() {
                     self.emit_helper_reference("__classPrivateFieldGet");
                     self.writer.write("(");
@@ -57705,6 +57935,13 @@ impl Printer<'_> {
                 } else if let Some(private_method) = self.active_private_method(data.name).cloned()
                 {
                     self.emit_private_method_get(data.expression, &private_method)?;
+                } else if self.settings.target < ScriptTarget::Es2022
+                    && matches!(
+                    self.arena.get(data.name).map(|node| &node.data),
+                    Some(NodeData::PrivateIdentifier(_))
+                ) {
+                    self.emit_expression(data.expression, 18)?;
+                    self.writer.write(".");
                 } else if self.arena.get(data.expression).is_some_and(|node| {
                     node.kind == SyntaxKind::SuperKeyword
                 }) && let Some((base, true)) = self.downlevel_super_context.clone()
@@ -65595,6 +65832,42 @@ mod tests {
         assert!(es5.contains("(function (b) {\n    var _a;"), "{es5}");
         assert!(es5.contains("if (b === void 0) { b = (_a ="), "{es5}");
         assert!(es5.contains("_a.x = 1,"), "{es5}");
+    }
+
+    #[test]
+    fn lowers_declaration_static_blocks_without_unneeded_class_captures() {
+        let simple = emit_with(
+            "const a = 2; class C { static { const a = 1; a; } }",
+            ScriptTarget::Es5,
+            ModuleKind::EsNext,
+        )
+        .code;
+        assert!(!simple.starts_with("var _a;"), "{simple}");
+        assert!(simple.contains("(function () {\n    var a = 1;"), "{simple}");
+
+        let private = emit_with(
+            "let getX; class C { #x = 1\n constructor(x: number) { this.#x = x; } static { getX = (obj: C) => obj.#x; } }",
+            ScriptTarget::Es2015,
+            ModuleKind::EsNext,
+        )
+        .code;
+        assert!(!private.contains("var _a;"), "{private}");
+        assert!(!private.contains("\n    ;\n"), "{private}");
+        assert!(private.contains("class C {"), "{private}");
+        assert!(private.contains("(() => {\n    getX = (obj) =>"), "{private}");
+
+        let static_private = emit_with(
+            "class C { static #x = 1; static { C.#x; } }",
+            ScriptTarget::Es2015,
+            ModuleKind::EsNext,
+        )
+        .code;
+        assert!(static_private.contains("var _a, _C_x;"), "{static_private}");
+        assert!(static_private.contains("_a = C;\n_C_x = { value: 1 };"), "{static_private}");
+        assert!(
+            static_private.contains("__classPrivateFieldGet(_a, _a, \"f\", _C_x);"),
+            "{static_private}",
+        );
     }
 
     #[test]
