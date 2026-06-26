@@ -31062,6 +31062,52 @@ impl Printer<'_> {
         }
     }
 
+    fn restore_source_comments_between(
+        &mut self,
+        start: u32,
+        end: u32,
+        restore_immediate: bool,
+    ) {
+        let start = usize::try_from(start).unwrap_or(usize::MAX);
+        let end = usize::try_from(end).unwrap_or(usize::MAX);
+        let Some(trivia) = self.source_text.get(start..end) else {
+            return;
+        };
+        let bytes = trivia.as_bytes();
+        let mut index = 0;
+        while index < bytes.len() {
+            let Some(offset) = [
+                trivia[index..].find("//"),
+                trivia[index..].find("/*"),
+            ]
+            .into_iter()
+            .flatten()
+            .min()
+            else {
+                break;
+            };
+            let comment_start = index + offset;
+            let line_comment = bytes[comment_start..].starts_with(b"//");
+            let comment_end = if line_comment {
+                bytes[comment_start..]
+                    .iter()
+                    .position(|byte| matches!(*byte, b'\n' | b'\r'))
+                    .map_or(bytes.len(), |offset| comment_start + offset)
+            } else {
+                bytes[comment_start + 2..]
+                    .windows(2)
+                    .position(|window| window == b"*/")
+                    .map_or(bytes.len(), |offset| comment_start + 2 + offset + 2)
+            };
+            let immediate = !trivia[..comment_start].contains(['\n', '\r']);
+            if immediate == restore_immediate {
+                self.emitted_source_comments
+                    .remove(&(start + comment_start, start + comment_end));
+            }
+            index = comment_end.max(comment_start + 2);
+        }
+    }
+
     fn emit_leading_source_comments(&mut self, end: u32) {
         self.emit_leading_source_comments_excluding_with_mode(end, &[], false);
     }
@@ -53260,6 +53306,7 @@ impl Printer<'_> {
                     self.writer.write("void 0");
                 }
                 self.writer.write(" };");
+                self.emit_private_static_field_trailing_comment(data, field.member);
             }
         }
         let previous_capture = self.class_static_this_capture.clone();
@@ -53924,7 +53971,38 @@ impl Printer<'_> {
                         self.emit_expression(initializer, 1)?;
                     }
                     self.writer.write(";");
-                    self.writer.newline();
+                    if self.class_private_name_is_duplicate(data, property.name) {
+                        let comment_end = data
+                            .members
+                            .nodes
+                            .get(member_index + 1)
+                            .and_then(|next| {
+                                self.arena.get(*next).map(|node| node.range.start.get())
+                            })
+                            .or_else(|| {
+                                node.parent
+                                    .and_then(|class| self.arena.get(class))
+                                    .map(|class| class.range.end.get().saturating_sub(1))
+                            })
+                            .unwrap_or(data.members.range.end.get());
+                        self.restore_source_comments_between(
+                            node.range.end.get(),
+                            comment_end,
+                            true,
+                        );
+                        let comment_count = self.emitted_source_comments.len();
+                        self.emit_source_comments_between_with_ownership(
+                            node.range.end.get(),
+                            comment_end,
+                            true,
+                            false,
+                        );
+                        if self.emitted_source_comments.len() == comment_count {
+                            self.writer.newline();
+                        }
+                    } else {
+                        self.writer.newline();
+                    }
                 }
                 NodeData::GetAccessorDeclaration(accessor) => {
                     if private_plan.is_some()
@@ -55834,6 +55912,38 @@ impl Printer<'_> {
         self.writer.write(";");
     }
 
+    fn emit_private_static_field_trailing_comment(
+        &mut self,
+        data: &ts_ast::ClassDeclarationData,
+        member: NodeId,
+    ) {
+        let Some(member_node) = self.arena.get(member) else {
+            return;
+        };
+        let member_end = member_node.range.end.get();
+        let member_index = data
+            .members
+            .nodes
+            .iter()
+            .position(|candidate| *candidate == member);
+        let comment_end = member_index
+            .and_then(|index| data.members.nodes.get(index + 1))
+            .and_then(|next| self.arena.get(*next).map(|node| node.range.start.get()))
+            .or_else(|| {
+                member_node
+                    .parent
+                    .and_then(|class| self.arena.get(class))
+                    .map(|class| class.range.end.get().saturating_sub(1))
+            })
+            .unwrap_or(data.members.range.end.get());
+        self.restore_source_comments_between(member_end, comment_end, true);
+        let comment_count = self.emitted_source_comments.len();
+        self.emit_source_comments_between_with_ownership(member_end, comment_end, true, false);
+        if self.emitted_source_comments.len() != comment_count {
+            self.writer.remove_trailing_newline();
+        }
+    }
+
     fn emit_private_field_declarations_for_scope(&mut self, scope: NodeId) {
         let mut class_names = self
             .private_method_plans
@@ -57700,7 +57810,44 @@ impl Printer<'_> {
                     self.writer.write("void 0");
                 }
                 self.writer.write(" };");
-                self.writer.newline();
+                let comment_member_index = data
+                    .members
+                    .nodes
+                    .iter()
+                    .position(|member| *member == field.member)
+                    .unwrap_or(index);
+                let comment_start = self
+                    .arena
+                    .get(field.member)
+                    .map_or(node.range.end.get(), |member| member.range.end.get());
+                let comment_end = data
+                    .members
+                    .nodes
+                    .get(comment_member_index + 1)
+                    .and_then(|next| self.arena.get(*next).map(|node| node.range.start.get()))
+                    .or_else(|| {
+                        self.arena
+                            .get(field.member)
+                            .and_then(|member| member.parent)
+                            .and_then(|class| self.arena.get(class))
+                            .map(|class| class.range.end.get().saturating_sub(1))
+                    })
+                    .unwrap_or(data.members.range.end.get());
+                self.restore_source_comments_between(
+                    comment_start,
+                    comment_end,
+                    false,
+                );
+                let comment_count = self.emitted_source_comments.len();
+                self.emit_source_comments_between_with_ownership(
+                    comment_start,
+                    comment_end,
+                    false,
+                    true,
+                );
+                if self.emitted_source_comments.len() == comment_count {
+                    self.writer.newline();
+                }
                 continue;
             }
             if let Some(field) = current_private_field {
@@ -73730,6 +73877,27 @@ mod tests {
                 && output.contains("_B_value_1.set(this, 2);"),
             "{output}"
         );
+
+        let comments = emit_with(
+            concat!(
+                "class C { #value = 1; static #value = 2; // duplicate\n",
+                "// continuation one\n",
+                "// continuation two\n",
+                "}",
+            ),
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(
+            comments.contains(concat!(
+                "_C_value_1 = { value: 1 };\n",
+                "        // continuation one\n",
+                "        // continuation two\n",
+            )),
+            "{comments}"
+        );
+        assert!(comments.contains("static #value = 2; // duplicate"), "{comments}");
     }
 
     #[test]
