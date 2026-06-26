@@ -52827,7 +52827,13 @@ impl Printer<'_> {
         let NodeData::VariableDeclarationList(data) = &node.data else {
             return Err(Self::unsupported(id, node.kind));
         };
-        let keyword = if self.settings.target < ScriptTarget::Es2015 {
+        let keyword = if node.flags.0 & (1 << 2) != 0 {
+            if node.flags.0 & (1 << 1) != 0 {
+                "await using"
+            } else {
+                "using"
+            }
+        } else if self.settings.target < ScriptTarget::Es2015 {
             "var"
         } else if node.flags.0 & (1 << 1) != 0 {
             "const"
@@ -53024,8 +53030,21 @@ impl Printer<'_> {
                     .map(|source| &source[..source.find(['\n', '\r']).unwrap_or(source.len())])
                     .is_some_and(|source| source.ends_with(' '))
             });
+        let ends_with_missing_binding = data
+            .declarations
+            .nodes
+            .last()
+            .and_then(|declaration| self.arena.get(*declaration))
+            .is_some_and(|node| {
+                matches!(
+                    &node.data,
+                    NodeData::VariableDeclaration(declaration)
+                        if node_is_missing_identifier(self.arena, declaration.name)
+                )
+            });
         if keyword != "const"
             && !ends_with_missing_initializer
+            && !ends_with_missing_binding
             && !preserves_recovered_jsx_space
             && !preserves_unterminated_string_space
         {
