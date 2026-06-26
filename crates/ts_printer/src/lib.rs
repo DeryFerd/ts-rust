@@ -50085,7 +50085,19 @@ impl Printer<'_> {
         }
         let lower_fields = self.settings.target < ScriptTarget::Es2022
             || self.settings.use_define_for_class_fields == Some(false);
-        let has_base = self.class_base_expression(data)?.is_some();
+        let base = self.class_base_expression(data)?;
+        let has_base = base.is_some();
+        let has_constructible_base = base.is_some_and(|base| {
+            let mut base = base;
+            while let Some(NodeData::ParenthesizedExpression(parenthesized)) =
+                self.arena.get(base).map(|base| &base.data)
+            {
+                base = parenthesized.expression;
+            }
+            self.arena
+                .get(base)
+                .is_none_or(|base| base.kind != SyntaxKind::NullKeyword)
+        });
         self.writer.write("class");
         if let Some(name) = data.name {
             self.writer.write(" ");
@@ -50164,7 +50176,7 @@ impl Printer<'_> {
                     .is_some_and(|plan| plan.has_instance_methods))
             && !has_constructor
         {
-            self.emit_synthesized_native_constructor(data, has_base)?;
+            self.emit_synthesized_native_constructor(data, has_constructible_base)?;
         }
         let mut previous_end = data.members.range.start.get();
         let mut previous_emitted = false;

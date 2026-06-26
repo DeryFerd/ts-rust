@@ -2148,6 +2148,11 @@ impl<'a> Parser<'a> {
         while self.current.kind != SyntaxKind::CloseBraceToken
             && self.current.kind != SyntaxKind::EndOfFile
         {
+            if !signature_only && self.current.kind == SyntaxKind::FunctionKeyword {
+                self.error_current("Declaration expected.");
+                recovered_at_statement = true;
+                break;
+            }
             if !signature_only && self.class_var_keyword_starts_recovered_statement() {
                 self.error_code_at(self.current.range, 1068, std::iter::empty::<String>());
                 recovered_at_statement = true;
