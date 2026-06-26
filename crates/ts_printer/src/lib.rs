@@ -35654,9 +35654,13 @@ impl Printer<'_> {
         let NodeData::ModuleDeclaration(module) = &node.data else {
             return None;
         };
-        self.namespace_has_runtime_contents(module, &mut HashSet::new())
-            .then(|| self.bindings.node_symbols.get(&module.name).copied())
-            .flatten()
+        if !self.namespace_has_runtime_contents(module, &mut HashSet::new()) {
+            return None;
+        }
+        self.bindings
+            .node_symbols
+            .get(&module.name)
+            .copied()
             .or_else(|| self.bindings.node_symbols.get(&id).copied())
     }
 
