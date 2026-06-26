@@ -397,6 +397,7 @@ pub fn emit_source_file_with_context(
         private_field_computed_initializers: HashSet::new(),
         static_private_field_plans: HashMap::new(),
         active_static_private_field_plan: None,
+        enclosing_static_private_field_plans: Vec::new(),
         anonymous_private_class_plans: HashMap::new(),
         active_anonymous_private_class: None,
         predeclared_anonymous_private_classes: HashSet::new(),
@@ -26772,6 +26773,8 @@ struct StaticPrivateFieldPlan {
 
 #[derive(Clone)]
 struct AnonymousPrivateStaticField {
+    member: NodeId,
+    private_name: String,
     storage: String,
     initializer: Option<NodeId>,
 }
@@ -26968,6 +26971,7 @@ struct Printer<'a> {
     private_field_computed_initializers: HashSet<String>,
     static_private_field_plans: HashMap<NodeId, StaticPrivateFieldPlan>,
     active_static_private_field_plan: Option<StaticPrivateFieldPlan>,
+    enclosing_static_private_field_plans: Vec<StaticPrivateFieldPlan>,
     anonymous_private_class_plans: HashMap<NodeId, AnonymousPrivateClassPlan>,
     active_anonymous_private_class: Option<NodeId>,
     predeclared_anonymous_private_classes: HashSet<NodeId>,
@@ -27632,6 +27636,8 @@ impl Printer<'_> {
                     SyntaxKind::StaticKeyword,
                 ) {
                     static_fields.push(AnonymousPrivateStaticField {
+                        member: *member,
+                        private_name,
                         storage,
                         initializer: property.initializer,
                     });
@@ -28339,6 +28345,27 @@ impl Printer<'_> {
             .name
             .and_then(|name| self.static_private_field_plans.get(&name))
             .cloned()
+            .or_else(|| {
+                let class_id = self.active_anonymous_private_class?;
+                let plan = self.anonymous_private_class_plans.get(&class_id)?;
+                if plan.static_fields.is_empty() {
+                    return None;
+                }
+                Some(StaticPrivateFieldPlan {
+                    scope: plan.scope,
+                    capture: self.class_expression_temps.get(&class_id)?.clone(),
+                    fields: plan
+                        .static_fields
+                        .iter()
+                        .map(|field| StaticPrivateFieldInfo {
+                            member: field.member,
+                            private_name: field.private_name.clone(),
+                            storage: field.storage.clone(),
+                            initializer: field.initializer,
+                        })
+                        .collect(),
+                })
+            })
     }
 
     fn active_static_private_field(&self, name: NodeId) -> Option<&StaticPrivateFieldInfo> {
@@ -28347,11 +28374,28 @@ impl Printer<'_> {
         };
         let private_name = name.text.trim_start_matches('#');
         self.active_static_private_field_plan
-            .as_ref()?
-            .fields
             .iter()
-            .rev()
-            .find(|field| field.private_name == private_name)
+            .chain(self.enclosing_static_private_field_plans.iter().rev())
+            .find_map(|plan| {
+                plan.fields
+                    .iter()
+                    .rev()
+                    .find(|field| field.private_name == private_name)
+            })
+    }
+
+    fn active_static_private_field_plan_for_member(
+        &self,
+        member: &StaticPrivateFieldInfo,
+    ) -> Option<&StaticPrivateFieldPlan> {
+        self.active_static_private_field_plan
+            .iter()
+            .chain(self.enclosing_static_private_field_plans.iter().rev())
+            .find(|plan| {
+                plan.fields
+                    .iter()
+                    .any(|candidate| candidate.member == member.member)
+            })
     }
 
     fn active_private_field(&self, name: NodeId) -> Option<&PrivateFieldInfo> {
@@ -28374,10 +28418,9 @@ impl Printer<'_> {
         if let Some(field) = self.active_private_field(name) {
             return Some(field.storage.clone());
         }
-        if self.active_static_private_field(name).is_some() {
+        if let Some(field) = self.active_static_private_field(name) {
             return self
-                .active_static_private_field_plan
-                .as_ref()
+                .active_static_private_field_plan_for_member(field)
                 .map(|plan| plan.capture.clone());
         }
         let method = self.active_private_method(name)?;
@@ -28409,7 +28452,7 @@ impl Printer<'_> {
             return Some((field.storage.clone(), "f", None, None));
         }
         if let Some(field) = self.active_static_private_field(name) {
-            let plan = self.active_static_private_field_plan.as_ref()?;
+            let plan = self.active_static_private_field_plan_for_member(field)?;
             return Some((
                 plan.capture.clone(),
                 "f",
@@ -38259,7 +38302,11 @@ impl Printer<'_> {
                 .filter(|name| is_identifier_text(name))
                 .cloned(),
         );
-        if let Some(plan) = &self.active_static_private_field_plan {
+        for plan in self
+            .active_static_private_field_plan
+            .iter()
+            .chain(self.enclosing_static_private_field_plans.iter().rev())
+        {
             local_claimed.insert(plan.capture.clone());
         }
         local_claimed.extend(temps.iter().cloned());
@@ -53228,6 +53275,10 @@ impl Printer<'_> {
             if let Some(previous) = &previous_method {
                 self.enclosing_private_method_plans.push(previous.clone());
             }
+            if let Some(previous) = &previous_static {
+                self.enclosing_static_private_field_plans
+                    .push(previous.clone());
+            }
             self.active_private_field_plan = self.private_field_plan(data);
             self.active_private_method_plan = self.private_method_plan(data);
             self.active_static_private_field_plan = self.static_private_field_plan(data);
@@ -53240,6 +53291,9 @@ impl Printer<'_> {
             }
             if self.active_private_method_plan.is_some() {
                 self.enclosing_private_method_plans.pop();
+            }
+            if self.active_static_private_field_plan.is_some() {
+                self.enclosing_static_private_field_plans.pop();
             }
             return result;
         }
@@ -53255,6 +53309,14 @@ impl Printer<'_> {
         }
         self.active_private_field_plan
             .clone_from(&private_field_plan);
+        let static_private_plan = self.static_private_field_plan(data);
+        let previous_static_private_plan = self.active_static_private_field_plan.clone();
+        if let Some(previous) = &previous_static_private_plan {
+            self.enclosing_static_private_field_plans
+                .push(previous.clone());
+        }
+        self.active_static_private_field_plan
+            .clone_from(&static_private_plan);
         let mut previous_class_rewrite = None;
         if let Some(plan) = &private_plan {
             self.active_private_method_plan = Some(plan.clone());
@@ -53782,11 +53844,15 @@ impl Printer<'_> {
         }
         self.active_private_method_plan = previous_private_plan;
         self.active_private_field_plan = previous_private_field_plan;
+        self.active_static_private_field_plan = previous_static_private_plan;
         if self.active_private_method_plan.is_some() {
             self.enclosing_private_method_plans.pop();
         }
         if self.active_private_field_plan.is_some() {
             self.enclosing_private_field_plans.pop();
+        }
+        if self.active_static_private_field_plan.is_some() {
+            self.enclosing_static_private_field_plans.pop();
         }
         Ok(())
     }
@@ -54764,7 +54830,26 @@ impl Printer<'_> {
         self.suppressed_class_empty_element_ranges
             .truncate(suppressed_range_count);
         class_result?;
-        self.active_anonymous_private_class = previous_anonymous_private_class;
+        let post_private_method_plan = self.private_method_plan(data);
+        let post_private_field_plan = self.private_field_plan(data);
+        let post_static_private_field_plan = self.static_private_field_plan(data);
+        let previous_post_private_method_plan = self.active_private_method_plan.clone();
+        let previous_post_private_field_plan = self.active_private_field_plan.clone();
+        let previous_post_static_private_field_plan =
+            self.active_static_private_field_plan.clone();
+        if let Some(previous) = &previous_post_private_method_plan {
+            self.enclosing_private_method_plans.push(previous.clone());
+        }
+        if let Some(previous) = &previous_post_private_field_plan {
+            self.enclosing_private_field_plans.push(previous.clone());
+        }
+        if let Some(previous) = &previous_post_static_private_field_plan {
+            self.enclosing_static_private_field_plans
+                .push(previous.clone());
+        }
+        self.active_private_method_plan = post_private_method_plan;
+        self.active_private_field_plan = post_private_field_plan;
+        self.active_static_private_field_plan = post_static_private_field_plan;
         let lowered_static_field_gaps = data
             .members
             .nodes
@@ -54953,6 +55038,19 @@ impl Printer<'_> {
         self.writer.newline();
         self.writer.write(temp);
         self.writer.indent -= lowering_indent;
+        self.active_private_method_plan = previous_post_private_method_plan;
+        self.active_private_field_plan = previous_post_private_field_plan;
+        self.active_static_private_field_plan = previous_post_static_private_field_plan;
+        if self.active_private_method_plan.is_some() {
+            self.enclosing_private_method_plans.pop();
+        }
+        if self.active_private_field_plan.is_some() {
+            self.enclosing_private_field_plans.pop();
+        }
+        if self.active_static_private_field_plan.is_some() {
+            self.enclosing_static_private_field_plans.pop();
+        }
+        self.active_anonymous_private_class = previous_anonymous_private_class;
         if wrap {
             self.writer.write(")");
         }
@@ -61988,7 +62086,10 @@ impl Printer<'_> {
                 } else if let Some(private_field) =
                     self.active_static_private_field(data.name).cloned()
                 {
-                    let Some(plan) = self.active_static_private_field_plan.clone() else {
+                    let Some(plan) = self
+                        .active_static_private_field_plan_for_member(&private_field)
+                        .cloned()
+                    else {
                         return Err(Self::unsupported(id, node.kind));
                     };
                     self.emit_helper_reference("__classPrivateFieldGet");
@@ -63937,7 +64038,10 @@ impl Printer<'_> {
                     .map(|receiver| (base, property, is_element, receiver))
             });
         if let Some((receiver, field)) = static_private_field {
-            let Some(plan) = self.active_static_private_field_plan.clone() else {
+            let Some(plan) = self
+                .active_static_private_field_plan_for_member(&field)
+                .cloned()
+            else {
                 return Err(Self::unsupported(data.tag, SyntaxKind::PropertyAccessExpression));
             };
             let receiver_temp = self
@@ -66095,7 +66199,9 @@ impl Printer<'_> {
             && let Some(NodeData::PropertyAccessExpression(access)) =
                 self.arena.get(private_target).map(|node| &node.data)
             && let Some(field) = self.active_static_private_field(access.name).cloned()
-            && let Some(plan) = self.active_static_private_field_plan.clone()
+            && let Some(plan) = self
+                .active_static_private_field_plan_for_member(&field)
+                .cloned()
         {
             let receiver_temp = self
                 .private_compound_assignment_receiver_temps
@@ -66284,7 +66390,9 @@ impl Printer<'_> {
             && let Some(NodeData::PropertyAccessExpression(access)) =
                 self.arena.get(private_target).map(|node| &node.data)
             && let Some(field) = self.active_static_private_field(access.name).cloned()
-            && let Some(plan) = self.active_static_private_field_plan.clone()
+            && let Some(plan) = self
+                .active_static_private_field_plan_for_member(&field)
+                .cloned()
             && !self.private_destructuring_rewrites.contains_key(&private_target)
         {
             self.emit_helper_reference("__classPrivateFieldSet");
@@ -73720,6 +73828,33 @@ mod tests {
         );
         assert!(
             output.contains("_C_bar = async function _C_bar()"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn keeps_anonymous_static_private_plans_active_through_initializers() {
+        let output = emit_with(
+            concat!(
+                "const C = class D { static #field = D.#method(); ",
+                "static #method() { return 42; } ",
+                "static getField() { return C.#field; } };",
+            ),
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(
+            output.contains(
+                "return __classPrivateFieldGet(C, _a, \"f\", _D_field);"
+            ),
+            "{output}"
+        );
+        assert!(
+            output.contains(concat!(
+                "_D_field = { value: ",
+                "__classPrivateFieldGet(_a, _a, \"m\", _D_method).call(_a) }",
+            )),
             "{output}"
         );
     }
