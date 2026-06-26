@@ -21674,7 +21674,17 @@ fn enum_constant_literal(arena: &NodeArena, expression: NodeId) -> Option<Value>
                 },
             )))
         }
-        _ => None,
+        _ => {
+            let evaluation = evaluate_with(arena, expression, &mut |reference| {
+                Evaluation::unknown(UnknownReason::UnresolvedEntity(reference))
+            });
+            match evaluation.outcome {
+                EvaluationOutcome::Value(value @ (Value::Number(_) | Value::String(_))) => {
+                    Some(value)
+                }
+                _ => None,
+            }
+        }
     }
 }
 
@@ -22600,7 +22610,9 @@ mod tests {
 
     #[test]
     fn evaluates_const_variable_enum_initializers() {
-        let parsed = parse_source_file("const value = 1; enum E { A = value }");
+        let parsed = parse_source_file(
+            "const value = 1; const computed = 9000 % 2; enum E { A = value, B = computed }",
+        );
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         let bindings = bind_source_file(&parsed.arena, parsed.source_file);
         let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
@@ -22610,7 +22622,10 @@ mod tests {
                 .values()
                 .cloned()
                 .collect::<Vec<_>>(),
-            [EnumConstantValue::Number(1.0)]
+            [
+                EnumConstantValue::Number(1.0),
+                EnumConstantValue::Number(0.0),
+            ]
         );
     }
 

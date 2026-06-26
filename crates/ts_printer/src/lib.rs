@@ -58485,7 +58485,13 @@ impl Printer<'_> {
             .nodes
             .get(index + 1)
             .and_then(|next| self.arena.get(*next).map(|node| node.range.start.get()))
+            .or_else(|| {
+                node.parent
+                    .and_then(|class| self.arena.get(class))
+                    .map(|class| class.range.end.get().saturating_sub(1))
+            })
             .unwrap_or(data.members.range.end.get());
+        self.restore_source_comments_between(node.range.end.get(), comment_end, true);
         let comment_count = self.emitted_source_comments.len();
         self.emit_source_comments_between_with_ownership(
             node.range.end.get(),
@@ -77708,6 +77714,17 @@ mod tests {
         )
         .code;
         assert!(commented.contains("this.value = local; // error"), "{commented}");
+
+        let static_commented = emit_with(
+            "class C { static value = 1; // static error\n}",
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(
+            static_commented.contains("C.value = 1; // static error"),
+            "{static_commented}"
+        );
 
         let computed = emit_with_define(
             "let key = 'x'; class C { [key] = 1; method() {} } class D {}",
