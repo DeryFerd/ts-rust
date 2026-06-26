@@ -5863,7 +5863,12 @@ impl DeclarationPrinter<'_> {
                         })
                     })
                     .collect::<HashSet<_>>();
-                let mut emitted_private_brand = false;
+                let mut emitted_private_brand = !self.javascript_source
+                    && !private_name_members.is_empty();
+                if emitted_private_brand {
+                    self.writer.write("#private;");
+                    self.writer.newline();
+                }
                 for member_index in member_order {
                     let member = &data.members.nodes[member_index];
                     if private_name_members.contains(member) {
@@ -24199,7 +24204,7 @@ impl DeclarationPrinter<'_> {
         }
         has_privacy_boundary
             || self.namespace_scope_has_synthetic_class_base(scope)
-            || self.arena.iter().any(|(statement, node)| {
+            || (self.module_file && self.arena.iter().any(|(statement, node)| {
                 node.parent == Some(scope)
                     && matches!(
                         node.data,
@@ -24207,7 +24212,7 @@ impl DeclarationPrinter<'_> {
                     )
                     && !declaration_has_modifier(self.arena, node, SyntaxKind::ExportKeyword)
                     && self.statement_is_inferred_class_property_dependency(statement)
-            })
+            }))
     }
 
     fn emit_import(
@@ -59470,9 +59475,9 @@ impl Printer<'_> {
                 continue;
             };
             if candidate_static == is_static && candidate_key == key {
-                if is_getter {
+                if is_getter && getter.is_none() {
                     getter = Some(*candidate);
-                } else {
+                } else if !is_getter && setter.is_none() {
                     setter = Some(*candidate);
                 }
             }
@@ -59491,8 +59496,13 @@ impl Printer<'_> {
             self.emit_downlevel_accessor_leading_comments(class, getter);
             self.writer.write("get: ");
             self.emit_downlevel_accessor_function(getter)?;
-            let boundary = setter
-                .and_then(|setter| self.arena.get(setter).map(|node| node.range.start.get()))
+            let boundary = class
+                .members
+                .nodes
+                .iter()
+                .position(|candidate| *candidate == getter)
+                .and_then(|index| class.members.nodes.get(index + 1))
+                .and_then(|next| self.arena.get(*next).map(|node| node.range.start.get()))
                 .unwrap_or(class.members.range.end.get());
             self.emit_downlevel_accessor_trailing_comments(getter, boundary);
             self.writer.write(",");
@@ -73352,15 +73362,20 @@ mod tests {
     }
 
     #[test]
-    fn declaration_private_names_collapse_at_their_source_position() {
+    fn declaration_private_names_collapse_before_public_members() {
         let declarations = emit_declarations_with_semantics(
-            "class Box { #value: string; visible: number; }",
+            "class Box { visible: number; #value: string; }",
         );
         assert!(
             declarations.contains("#private;\n    visible: number;"),
             "{declarations}"
         );
         assert!(!declarations.contains("#value"), "{declarations}");
+
+        let script = emit_declarations_with_semantics(
+            "const key = Symbol(); class C { #value: string; [key]: number; }",
+        );
+        assert!(!script.ends_with("export {};\n"), "{script}");
     }
 
     #[test]
@@ -76479,6 +76494,19 @@ mod tests {
             emit_with(source, ScriptTarget::Es5, ModuleKind::EsNext).code,
             "var C = /** @class */ (function () {\n    function C() {\n    }\n    Object.defineProperty(C.prototype, \"X\", {\n        get: function () { return 1; },\n        set: function (v) {\n            if (v === void 0) { v = 0; }\n        },\n        enumerable: false,\n        configurable: true\n    });\n    Object.defineProperty(C, \"Y\", {\n        get: function () { return 2; },\n        enumerable: false,\n        configurable: true\n    });\n    return C;\n}());\n"
         );
+    }
+
+    #[test]
+    fn downlevel_duplicate_accessors_keep_the_first_implementation() {
+        let output = emit_with(
+            "class C { get x() { return 1; } get x() { return 2; } // error\n}",
+            ScriptTarget::Es5,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(output.contains("get: function () { return 1; },"), "{output}");
+        assert!(!output.contains("return 2"), "{output}");
+        assert!(!output.contains("// error"), "{output}");
     }
 
     #[test]
