@@ -51261,6 +51261,12 @@ impl Printer<'_> {
                 }
             }
             self.writer.write(";");
+        } else if plan.capture.is_none()
+            && private_method_plan.is_none()
+            && self.settings.target >= ScriptTarget::Es2015
+            && let Some(private_field_plan) = self.private_field_plan(data)
+        {
+            self.emit_private_field_initializers(&private_field_plan);
         }
         if let Some(static_private_plan) = &static_private_plan {
             for field in &static_private_plan.fields {
@@ -51975,13 +51981,10 @@ impl Printer<'_> {
                         self.emit_private_lowered_static_elements(data, plan)?;
                     }
                 } else if !self.defer_static_fields {
+                    if let Some(plan) = &private_field_plan {
+                        self.emit_private_field_initializers(plan);
+                    }
                     self.emit_native_static_fields(data)?;
-                }
-                if private_plan.is_none()
-                    && !self.defer_static_fields
-                    && let Some(plan) = &private_field_plan
-                {
-                    self.emit_private_field_initializers(plan);
                 }
             }
         }
@@ -58381,10 +58384,12 @@ impl Printer<'_> {
 
     fn emit_object_literal_property_name(&mut self, name: NodeId) -> Result<(), EmitError> {
         let node = self.node(name)?.clone();
-        if let NodeData::Identifier(identifier) = &node.data {
-            self.write_source_identifier(name, &identifier.text);
-        } else {
-            self.emit_expression(name, 0)?;
+        match &node.data {
+            NodeData::Identifier(identifier) => {
+                self.write_source_identifier(name, &identifier.text);
+            }
+            NodeData::PrivateIdentifier(_) => {}
+            _ => self.emit_expression(name, 0)?,
         }
         Ok(())
     }
@@ -60962,7 +60967,7 @@ impl Printer<'_> {
                             if self.settings.target < ScriptTarget::Es2015
                                 && method.asterisk_token.is_none()
                             {
-                                self.emit_expression(method.name, 0)?;
+                                self.emit_object_literal_property_name(method.name)?;
                                 self.writer.write(": function ");
                                 self.emit_parameters(&method.parameters)?;
                                 self.writer.write(" ");
@@ -60988,7 +60993,7 @@ impl Printer<'_> {
                                 if method.asterisk_token.is_some() {
                                     self.writer.write("*");
                                 }
-                                self.emit_expression(method.name, 0)?;
+                                self.emit_object_literal_property_name(method.name)?;
                                 self.emit_parameters(&method.parameters)?;
                                 self.writer.write(" ");
                                 if downlevel_async {
@@ -61013,7 +61018,7 @@ impl Printer<'_> {
                                     .replace(("_super".to_owned(), true))
                             });
                             self.writer.write("get ");
-                            self.emit_expression(accessor.name, 0)?;
+                            self.emit_object_literal_property_name(accessor.name)?;
                             self.emit_parameters(&accessor.parameters)?;
                             self.writer.write(" ");
                             if self.settings.target < ScriptTarget::Es2015 {
@@ -61035,7 +61040,7 @@ impl Printer<'_> {
                                     .replace(("_super".to_owned(), true))
                             });
                             self.writer.write("set ");
-                            self.emit_expression(accessor.name, 0)?;
+                            self.emit_object_literal_property_name(accessor.name)?;
                             let binding_parameters = if self.settings.target < ScriptTarget::Es2015
                             {
                                 self.downlevel_binding_parameters(&accessor.parameters, *property)
@@ -70493,6 +70498,37 @@ mod tests {
             "{output}"
         );
         assert!(output.contains("_C_shared = { value: 2 };"), "{output}");
+    }
+
+    #[test]
+    fn initializes_private_field_storage_before_lowered_static_fields() {
+        let output = emit_with(
+            "class A { #first = 1; static instance = new A(); #second = 2; }",
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(
+            output.ends_with(concat!(
+                "_A_first = new WeakMap(), _A_second = new WeakMap();\n",
+                "A.instance = new A();\n",
+            )),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn erases_private_names_recovered_in_object_literals() {
+        let output = emit_with(
+            "const value = { #field: 1, #method() {}, get #accessor() { return 2; } };",
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert_eq!(
+            output,
+            "const value = { : 1, () { }, get () { return 2; } };\n"
+        );
     }
 
     #[test]
