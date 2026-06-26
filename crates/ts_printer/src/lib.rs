@@ -4470,12 +4470,32 @@ impl DeclarationPrinter<'_> {
     }
 
     fn statement_is_local_export_dependency(&self, statement: NodeId) -> bool {
-        if !matches!(
-            self.arena.get(statement).map(|node| &node.data),
-            Some(NodeData::VariableStatement(_))
-        ) {
-            return false;
-        }
+        let declares_name = |name: &str| match self.arena.get(statement).map(|node| &node.data) {
+            Some(NodeData::VariableStatement(_)) => {
+                self.variable_statement_declares(statement, name)
+            }
+            Some(NodeData::FunctionDeclaration(declaration)) => declaration
+                .name
+                .and_then(|name| declaration_name_text(self.arena, name))
+                == Some(name),
+            Some(NodeData::ClassDeclaration(declaration)) => declaration
+                .name
+                .and_then(|name| declaration_name_text(self.arena, name))
+                == Some(name),
+            Some(NodeData::InterfaceDeclaration(declaration)) => {
+                declaration_name_text(self.arena, declaration.name) == Some(name)
+            }
+            Some(NodeData::TypeAliasDeclaration(declaration)) => {
+                declaration_name_text(self.arena, declaration.name) == Some(name)
+            }
+            Some(NodeData::EnumDeclaration(declaration)) => {
+                declaration_name_text(self.arena, declaration.name) == Some(name)
+            }
+            Some(NodeData::ModuleDeclaration(declaration)) => {
+                declaration_name_text(self.arena, declaration.name) == Some(name)
+            }
+            _ => false,
+        };
         self.arena.iter().any(|(_, node)| {
             let NodeData::ExportDeclaration(export) = &node.data else {
                 return false;
@@ -4500,7 +4520,7 @@ impl DeclarationPrinter<'_> {
                     self.arena,
                     specifier.property_name.unwrap_or(specifier.name),
                 )
-                .is_some_and(|name| self.variable_statement_declares(statement, name))
+                .is_some_and(declares_name)
             })
         })
     }
@@ -24259,6 +24279,7 @@ impl DeclarationPrinter<'_> {
         let is_private_dependency = |statement| {
             self.arena.get(statement).is_some_and(|node| {
                 !declaration_has_modifier(self.arena, node, SyntaxKind::ExportKeyword)
+                    && !self.statement_is_local_export_dependency(statement)
                     && !self.private_declaration_is_only_referenced_from_private_members(statement)
                     && !self
                         .javascript_variable_is_only_literal_computed_property_dependency(statement)
@@ -24610,6 +24631,9 @@ impl DeclarationPrinter<'_> {
                         .is_javascript_commonjs_declaration_assignment(statement.expression),
                     _ => false,
                 }
+            })
+            && !self.arena.iter().any(|(_, node)| {
+                node.parent == Some(scope) && export_declaration_is_empty(self.arena, node)
             })
         {
             return true;

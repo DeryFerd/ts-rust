@@ -440,7 +440,16 @@ impl Program {
                     );
                     self.resolved_modules
                         .insert((containing, specifier.clone()), target);
+                    let source_count_before_import = self.source_files.len();
                     self.load_file(file_system, &resolved.resolved_file_name, false);
+                    for source_file in &self.source_files[source_count_before_import..] {
+                        register_ambient_external_modules(
+                            source_file,
+                            &self.current_directory,
+                            self.case_sensitivity,
+                            &mut ambient_modules,
+                        );
+                    }
                 } else if can_resolve_ambient
                     && !module_name_is_relative(&specifier)
                     && let Some(target) = ambient_modules.get(&specifier)

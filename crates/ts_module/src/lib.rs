@@ -473,6 +473,26 @@ impl<F: FileSystem + ?Sized> ResolutionState<'_, '_, F> {
         let package_json_path = join(directory, "package.json");
         let package = self.read_package_json(&package_json_path);
         if let Some(package) = package {
+            if self.resolver.options.prefer_types
+                && let Some(types_versions) = &package.types_versions
+            {
+                let types_entry = package
+                    .typings
+                    .as_deref()
+                    .or(package.types.as_deref())
+                    .unwrap_or("index");
+                if let Some(targets) = types_version_targets(types_versions, types_entry) {
+                    for target in targets {
+                        let candidate = resolve_path(directory, &[&target]);
+                        if let Some(mut resolved) =
+                            self.resolve_candidate_with_package(&candidate, &package_json_path)
+                        {
+                            resolved.package_json = Some(package_json_path.clone());
+                            return Some(resolved);
+                        }
+                    }
+                }
+            }
             let fields = if self.resolver.options.prefer_types {
                 [
                     package.typings.as_deref(),
@@ -1205,6 +1225,35 @@ mod tests {
         assert_eq!(
             resolved.package_json.as_deref(),
             Some("/app/node_modules/pkg/package.json")
+        );
+    }
+
+    #[test]
+    fn resolves_package_types_versions_root_entry() {
+        let fs = fs(&[
+            (
+                "/app/node_modules/pkg/package.json",
+                r#"{"types":"index","typesVersions":{">=7":{"*":["types/*"]}}}"#,
+            ),
+            ("/app/node_modules/pkg/index.d.ts", ""),
+            ("/app/node_modules/pkg/types/index.d.ts", ""),
+        ]);
+        let resolver = Resolver::new(&fs, ResolutionOptions::default());
+        let resolved = resolver
+            .resolve("pkg", "/app/src/main.ts")
+            .resolved
+            .unwrap();
+        assert_eq!(
+            resolved.resolved_file_name,
+            "/app/node_modules/pkg/types/index.d.ts"
+        );
+        assert_eq!(
+            resolver
+                .resolve("../", "/app/node_modules/pkg/types/index.d.ts")
+                .resolved
+                .unwrap()
+                .resolved_file_name,
+            "/app/node_modules/pkg/types/index.d.ts"
         );
     }
 

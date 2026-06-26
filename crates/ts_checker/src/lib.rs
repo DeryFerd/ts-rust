@@ -10236,7 +10236,16 @@ impl<'a> Checker<'a> {
                     self.result.types.intersection([constructor, static_type])
                 };
                 self.class_value_stack.pop();
-                return class_value;
+                let kind = self.result.types.get(class_value).unwrap().kind.clone();
+                let named_class_value = self.result.types.alloc(kind);
+                self.result.named_type_references.insert(
+                    named_class_value,
+                    NamedTypeReference {
+                        name: format!("typeof {name}"),
+                        type_arguments: Vec::new(),
+                    },
+                );
+                return named_class_value;
             }
             return type_id;
         }
