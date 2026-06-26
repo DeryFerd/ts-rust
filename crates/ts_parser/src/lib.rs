@@ -3177,10 +3177,27 @@ impl<'a> Parser<'a> {
                 })),
                 &children,
             ));
-            if self.current.kind != SyntaxKind::CommaToken {
-                break;
+            match self.current.kind {
+                SyntaxKind::CommaToken
+                | SyntaxKind::SemicolonToken
+                | SyntaxKind::ColonToken => {
+                    self.bump();
+                }
+                SyntaxKind::CloseBraceToken | SyntaxKind::EndOfFile => break,
+                kind
+                    if kind == SyntaxKind::Identifier
+                        || kind.is_keyword()
+                        || matches!(
+                            kind,
+                            SyntaxKind::StringLiteral
+                                | SyntaxKind::NumericLiteral
+                                | SyntaxKind::BigIntLiteral
+                                | SyntaxKind::OpenBracketToken
+                        ) => {}
+                _ => {
+                    self.bump();
+                }
             }
-            self.bump();
         }
         let end = if self.current.kind == SyntaxKind::CloseBraceToken {
             self.consume().range.end

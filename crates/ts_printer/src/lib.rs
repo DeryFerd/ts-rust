@@ -36000,7 +36000,6 @@ impl Printer<'_> {
                 }
             }
             NodeData::EnumDeclaration(data) => {
-                self.emit_runtime_declaration_modifiers(id, data.modifiers.as_ref());
                 self.emit_enum(data)?;
             }
             NodeData::ModuleDeclaration(data) => self.emit_namespace(data)?,
@@ -62957,6 +62956,11 @@ impl Printer<'_> {
             .last_mut()
             .expect("every enum has a lexical declaration scope")
             .insert(name.clone());
+        if first_declaration
+            && let Some(declaration) = self.arena.get(data.name).and_then(|name| name.parent)
+        {
+            self.emit_runtime_declaration_modifiers(declaration, data.modifiers.as_ref());
+        }
         if first_declaration
             && !self.namespace_has_prior_merged_value_declaration(data.name)
             && !self.system_predeclared_names.contains(&name)

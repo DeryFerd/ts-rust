@@ -4597,6 +4597,35 @@ impl<'a> Checker<'a> {
                 Some((self.property_name(member.name)?, node.range.start.get()))
             })
             .collect::<Vec<_>>();
+        for declaration in &declarations {
+            let Some(NodeData::EnumDeclaration(enumeration)) =
+                self.arena.get(*declaration).map(|node| &node.data)
+            else {
+                continue;
+            };
+            for member_id in &enumeration.members.nodes {
+                let Some(value) = self.result.enum_member_values.get(member_id) else {
+                    continue;
+                };
+                let Some(NodeData::EnumMember(member)) =
+                    self.arena.get(*member_id).map(|node| &node.data)
+                else {
+                    continue;
+                };
+                let Some(name) = self.property_name(member.name) else {
+                    continue;
+                };
+                resolved_values.insert(
+                    name,
+                    match value {
+                        EnumConstantValue::Number(value) => {
+                            Value::Number(Number::new(*value))
+                        }
+                        EnumConstantValue::String(value) => Value::String(value.clone()),
+                    },
+                );
+            }
+        }
         let is_const = self.has_ast_modifier(data.modifiers.as_ref(), SyntaxKind::ConstKeyword);
         let mut next_numeric_value = Some(0.0_f64);
         for member_id in &data.members.nodes {
@@ -4738,8 +4767,10 @@ impl<'a> Checker<'a> {
             EvaluationOutcome::Value(Value::Number(value)) if value.is_nan() => {
                 if is_const {
                     self.error(initializer, 2478, std::iter::empty());
+                    None
+                } else {
+                    Some(Value::Number(value))
                 }
-                None
             }
             EvaluationOutcome::Value(Value::Number(value)) if value.is_infinite() => {
                 if is_const {
