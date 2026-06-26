@@ -5330,6 +5330,7 @@ impl DeclarationPrinter<'_> {
                     return Ok(());
                 }
                 if self.import_is_only_used_by_synthesized_declarations(id, data)
+                    && !self.import_has_retained_declaration_binding_use(id, data)
                     && !self.statement_is_inferred_class_property_dependency(id)
                     && !self.import_has_non_assertion_type_reference(data)
                     && !self.import_is_used_by_inferred_semantic_variable_type(id, data)
@@ -21262,7 +21263,7 @@ impl DeclarationPrinter<'_> {
                 self.emit_type(data.element_type)?;
                 self.writer.write("[]");
             }
-            NodeData::UnionTypeNode(data) => self.emit_type_list(&data.types, " | ")?,
+            NodeData::UnionTypeNode(data) => self.emit_union_type(id, &data.types)?,
             NodeData::IntersectionTypeNode(data) => self.emit_type_list(&data.types, " & ")?,
             NodeData::ConditionalTypeNode(data) => {
                 self.emit_type(data.check_type)?;
@@ -21550,6 +21551,80 @@ impl DeclarationPrinter<'_> {
             self.emit_type(*type_)?;
         }
         Ok(())
+    }
+
+    fn emit_union_type(&mut self, union: NodeId, list: &NodeList) -> Result<(), EmitError> {
+        let mut gap_start = self.node(union)?.range.start.get();
+        for (index, member) in list.nodes.iter().enumerate() {
+            if index != 0 {
+                self.writer.write(" | ");
+            }
+            let member_node = self.node(*member)?.clone();
+            self.emit_union_member_leading_comments(gap_start, member_node.range.start.get());
+            self.emit_type(*member)?;
+            gap_start = member_node.range.end.get();
+        }
+        Ok(())
+    }
+
+    fn emit_union_member_leading_comments(&mut self, start: u32, end: u32) {
+        if self.remove_comments {
+            return;
+        }
+        let Some(trivia) = usize::try_from(start)
+            .ok()
+            .zip(usize::try_from(end).ok())
+            .and_then(|(start, end)| self.source_text.get(start..end))
+        else {
+            return;
+        };
+        let bytes = trivia.as_bytes();
+        let mut cursor = 0;
+        let mut operator = None;
+        while cursor < bytes.len() {
+            if bytes[cursor..].starts_with(b"/*") {
+                cursor += 2;
+                while cursor + 1 < bytes.len() && !bytes[cursor..].starts_with(b"*/") {
+                    cursor += 1;
+                }
+                cursor = (cursor + 2).min(bytes.len());
+            } else if bytes[cursor..].starts_with(b"//") {
+                cursor += 2;
+                while cursor < bytes.len() && !matches!(bytes[cursor], b'\n' | b'\r') {
+                    cursor += 1;
+                }
+            } else {
+                if bytes[cursor] == b'|' {
+                    operator = Some(cursor);
+                }
+                cursor += 1;
+            }
+        }
+        let Some(operator) = operator else {
+            return;
+        };
+        cursor = operator + 1;
+        while cursor < bytes.len() {
+            if bytes[cursor..].starts_with(b"/*") {
+                let comment_start = cursor;
+                cursor += 2;
+                while cursor + 1 < bytes.len() && !bytes[cursor..].starts_with(b"*/") {
+                    cursor += 1;
+                }
+                cursor = (cursor + 2).min(bytes.len());
+                self.writer.write(&trivia[comment_start..cursor]);
+                self.writer.write(" ");
+            } else if bytes[cursor..].starts_with(b"//") {
+                let comment_start = cursor;
+                while cursor < bytes.len() && !matches!(bytes[cursor], b'\n' | b'\r') {
+                    cursor += 1;
+                }
+                self.writer.write(&trivia[comment_start..cursor]);
+                self.writer.newline();
+            } else {
+                cursor += 1;
+            }
+        }
     }
 
     fn type_literal_member_is_declaration_safe(&self, member: NodeId) -> bool {
@@ -22939,6 +23014,9 @@ impl DeclarationPrinter<'_> {
         if self.import_binding_is_used_by_synthetic_class_base(import_id, name) {
             return true;
         }
+        if self.import_binding_is_used_by_inferred_return_computed_name(import_id, name) {
+            return true;
+        }
         if let Some(used) = self.import_binding_is_exported_new_dependency(import_id, name) {
             return used;
         }
@@ -23074,6 +23152,62 @@ impl DeclarationPrinter<'_> {
                 && symbol.is_none_or(|symbol| {
                     self.bindings.resolve_name_at(identifier, text) == Some(symbol)
                 })
+        })
+    }
+
+    fn import_binding_is_used_by_inferred_return_computed_name(
+        &self,
+        import_id: NodeId,
+        name: &str,
+    ) -> bool {
+        let binding_symbol = self
+            .arena
+            .get(import_id)
+            .and_then(|node| match &node.data {
+                NodeData::ImportDeclaration(import) => self.import_binding_node(import, name),
+                _ => None,
+            })
+            .and_then(|(binding, _)| {
+                self.bindings
+                    .node_symbols
+                    .get(&binding)
+                    .copied()
+                    .or_else(|| self.bindings.resolve_name_at(binding, name))
+            });
+        self.arena.iter().any(|(identifier, node)| {
+            if !matches!(
+                &node.data,
+                NodeData::Identifier(data) if data.text == name
+            ) || !identifier_is_within_computed_property_name(self.arena, identifier)
+                || binding_symbol.is_some_and(|symbol| {
+                    self.bindings.resolve_name_at(identifier, name) != Some(symbol)
+                })
+            {
+                return false;
+            }
+            let mut current = identifier;
+            let mut within_return = false;
+            while let Some(parent) = self.arena.get(current).and_then(|node| node.parent) {
+                let Some(parent_node) = self.arena.get(parent) else {
+                    return false;
+                };
+                match &parent_node.data {
+                    NodeData::ReturnStatement(_) => within_return = true,
+                    NodeData::FunctionDeclaration(function) => {
+                        return within_return
+                            && function.type_.is_none()
+                            && declaration_has_modifier(
+                                self.arena,
+                                parent_node,
+                                SyntaxKind::ExportKeyword,
+                            );
+                    }
+                    NodeData::SourceFile(_) => return false,
+                    _ => {}
+                }
+                current = parent;
+            }
+            false
         })
     }
 
@@ -51331,9 +51465,7 @@ impl Printer<'_> {
             {
                 self.writer.write("export ");
             }
-            if parent_container.is_some()
-                && self.namespace_local_declaration_is_block_scoped(data.name)
-            {
+            if self.namespace_local_declaration_is_block_scoped(data.name) {
                 self.writer.write("let ");
             } else {
                 self.writer.write("var ");
@@ -65271,6 +65403,16 @@ mod tests {
     }
 
     #[test]
+    fn emits_namespace_storage_in_function_blocks_as_let() {
+        let emitted = emit_with(
+            "function f() { namespace Local { export const value = 1; } }",
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        );
+        assert!(emitted.code.contains("    let Local;"), "{}", emitted.code);
+    }
+
+    #[test]
     fn omits_redundant_variable_for_function_namespace_merges() {
         assert_eq!(
             emit_with(
@@ -69802,6 +69944,30 @@ class Board {
         let output = emit_declarations_with_semantics(source);
         assert!(output.contains("[x: string]: number;"), "{output}");
         assert!(!output.contains("[x: number]"), "{output}");
+    }
+
+    #[test]
+    fn declaration_computed_object_return_retains_imported_unique_symbol_names() {
+        let source = concat!(
+            "import Op from './op';\n",
+            "import { Po } from './po';\n",
+            "export default function foo() {\n",
+            "  return { [Op.or]: 1, [Po.ro]: {} };\n",
+            "}\n",
+        );
+        let output = emit_declarations_with_semantics(source);
+        assert!(output.starts_with("import Op from './op';\nimport { Po } from './po';\n"), "{output}");
+        assert!(output.contains("[Op.or]: number;"), "{output}");
+        assert!(output.contains("[Po.ro]: {};"), "{output}");
+    }
+
+    #[test]
+    fn declaration_emit_preserves_comments_after_leading_union_operators() {
+        let output = emit_declarations_with_semantics(concat!(
+            "export type D = /*discarded*/ | /*one*/ 1 /*trailing*/ ",
+            "| /*two*/ 2;",
+        ));
+        assert_eq!(output, "export type D = /*one*/ 1 | /*two*/ 2;\n");
     }
 
     #[test]

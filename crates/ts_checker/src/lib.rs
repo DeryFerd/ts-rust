@@ -8952,7 +8952,11 @@ impl<'a> Checker<'a> {
                 } else {
                     let element = expected_element.unwrap_or_else(|| {
                         if element_types.is_empty() {
-                            self.result.types.never()
+                            if self.options.strict_null_checks {
+                                self.result.types.never()
+                            } else {
+                                self.result.types.any()
+                            }
                         } else {
                             let element_types = self.complete_object_union_members(element_types);
                             let element_types = self.reduce_subtype_union_members(&element_types);
@@ -28447,6 +28451,50 @@ mod tests {
             },
         );
         assert!(loose.diagnostics.is_empty(), "{:?}", loose.diagnostics);
+    }
+
+    #[test]
+    fn empty_array_literals_widen_to_any_without_strict_null_checks() {
+        let parsed = parse_source_file("export function make() { return []; }");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let array = parsed
+            .arena
+            .iter()
+            .find_map(|(id, node)| {
+                matches!(node.data, NodeData::ArrayLiteralExpression(_)).then_some(id)
+            })
+            .unwrap();
+
+        let loose = check_source_file_with_options(
+            &parsed.arena,
+            parsed.source_file,
+            &bindings,
+            CheckerOptions {
+                strict_null_checks: false,
+                ..CheckerOptions::default()
+            },
+        );
+        let TypeKind::Array(loose_element) = &loose
+            .types
+            .get(*loose.node_types.get(&array).unwrap())
+            .unwrap()
+            .kind
+        else {
+            panic!("expected array type");
+        };
+        assert_eq!(*loose_element, loose.types.any());
+
+        let strict = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        let TypeKind::Array(strict_element) = &strict
+            .types
+            .get(*strict.node_types.get(&array).unwrap())
+            .unwrap()
+            .kind
+        else {
+            panic!("expected array type");
+        };
+        assert_eq!(*strict_element, strict.types.never());
     }
 
     #[test]
