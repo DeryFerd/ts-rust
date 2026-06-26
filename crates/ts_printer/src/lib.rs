@@ -8237,6 +8237,93 @@ impl DeclarationPrinter<'_> {
         })
     }
 
+    fn returned_local_abstract_class_declaration(&self, body: NodeId) -> Option<NodeId> {
+        let NodeData::Block(body) = &self.arena.get(body)?.data else {
+            return None;
+        };
+        let returned = body.statements.nodes.iter().find_map(|statement| {
+            let NodeData::ReturnStatement(return_) = &self.arena.get(*statement)?.data else {
+                return None;
+            };
+            declaration_name_text(self.arena, return_.expression?)
+        })?;
+        body.statements.nodes.iter().find_map(|statement| {
+            let node = self.arena.get(*statement)?;
+            let NodeData::ClassDeclaration(class) = &node.data else {
+                return None;
+            };
+            (class
+                .name
+                .and_then(|name| declaration_name_text(self.arena, name))
+                == Some(returned)
+                && declaration_has_modifier(self.arena, node, SyntaxKind::AbstractKeyword))
+            .then_some(*statement)
+        })
+    }
+
+    fn abstract_local_class_default_base_instance_type(
+        &self,
+        function: &ts_ast::FunctionDeclarationData,
+        class: NodeId,
+    ) -> Option<TypeId> {
+        let NodeData::ClassDeclaration(class) = &self.arena.get(class)?.data else {
+            return None;
+        };
+        let base_name = class
+            .heritage_clauses
+            .as_ref()?
+            .nodes
+            .iter()
+            .find_map(|clause| {
+                let NodeData::HeritageClause(clause) = &self.arena.get(*clause)?.data else {
+                    return None;
+                };
+                if clause.token != SyntaxKind::ExtendsKeyword {
+                    return None;
+                }
+                clause.types.nodes.iter().find_map(|heritage| {
+                    let NodeData::ExpressionWithTypeArguments(heritage) =
+                        &self.arena.get(*heritage)?.data
+                    else {
+                        return None;
+                    };
+                    declaration_name_text(self.arena, heritage.expression)
+                })
+            })?;
+        let initializer = function.parameters.nodes.iter().find_map(|parameter| {
+            let NodeData::ParameterDeclaration(parameter) = &self.arena.get(*parameter)?.data
+            else {
+                return None;
+            };
+            (declaration_name_text(self.arena, parameter.name) == Some(base_name))
+                .then_some(parameter.initializer)
+                .flatten()
+        })?;
+        let constructor = self.node_types?.get(&initializer).copied()?;
+        self.semantic_constructor_instance_type(constructor, &mut HashSet::new())
+    }
+
+    fn semantic_constructor_instance_type(
+        &self,
+        type_id: TypeId,
+        visited: &mut HashSet<TypeId>,
+    ) -> Option<TypeId> {
+        if !visited.insert(type_id) {
+            return None;
+        }
+        match &self.semantic_types?.get(type_id)?.kind {
+            TypeKind::Constructor(signature) => Some(signature.return_type),
+            TypeKind::Object(object) => object
+                .construct_signatures
+                .first()
+                .map(|signature| signature.return_type),
+            TypeKind::Union(members) | TypeKind::Intersection(members) => members
+                .iter()
+                .find_map(|member| self.semantic_constructor_instance_type(*member, visited)),
+            _ => None,
+        }
+    }
+
     fn emit_inferred_local_class_mixin_type(
         &mut self,
         class_id: NodeId,
@@ -9832,6 +9919,27 @@ impl DeclarationPrinter<'_> {
         {
             return self.emit_widened_semantic_type(return_type);
         }
+        if let Some(class) = function
+            .body
+            .and_then(|body| self.returned_local_abstract_class_declaration(body))
+            && let Some(signature) = self
+                .semantic_types
+                .and_then(|types| types.get(return_type))
+                .and_then(|type_| match &type_.kind {
+                    TypeKind::Constructor(signature) => Some(signature.clone()),
+                    TypeKind::Object(object) => object.construct_signatures.first().cloned(),
+                    _ => None,
+                })
+        {
+            let instance_type = self
+                .abstract_local_class_default_base_instance_type(function, class)
+                .unwrap_or(signature.return_type);
+            self.writer.write("abstract new (");
+            self.emit_semantic_parameters(&signature, None)?;
+            self.writer.write(") => ");
+            self.emit_semantic_constructor_instance_type(instance_type)?;
+            return Ok(());
+        }
         if self.emit_returned_augmented_function_type(function)? {
             return Ok(());
         }
@@ -10150,7 +10258,7 @@ impl DeclarationPrinter<'_> {
             });
             let parameter_names = self.class_expression_constructor_parameter_names(class);
             let base_parameters = self.returned_class_base_constraint_parameters(function, class);
-            let property_order = class
+            let mut property_order = class
                 .members
                 .nodes
                 .iter()
@@ -10168,6 +10276,7 @@ impl DeclarationPrinter<'_> {
                         .flatten()
                 })
                 .collect::<Vec<_>>();
+            property_order.dedup();
             for (index, member) in members.into_iter().enumerate() {
                 if index != 0 {
                     self.writer.write(" & ");
@@ -15193,6 +15302,12 @@ impl DeclarationPrinter<'_> {
                 .and_then(|initializer| self.initializer_variable_type_annotation(initializer))
             {
                 self.emit_type(type_node)?;
+            } else if let Some(type_query) = parameter
+                .initializer
+                .and_then(|initializer| self.entity_value_type_query(initializer))
+            {
+                self.writer.write("typeof ");
+                self.emit_name(type_query)?;
             } else if let Some(type_id) = type_id {
                 let assignment_initializer = parameter.initializer.and_then(|initializer| {
                     let initializer = self.unwrap_parenthesized(initializer);
@@ -74057,6 +74172,33 @@ mod tests {
         ));
         assert!(declarations.contains("export interface Component<"), "{declarations}");
         assert!(!declarations.contains("declare const Component:"), "{declarations}");
+    }
+
+    #[test]
+    fn declaration_preserves_default_class_parameter_type_query() {
+        let declarations = emit_declarations_with_semantics(concat!(
+            "export abstract class Base { accessor value = 1; }",
+            "export function mixin(Super = Base) {",
+            " abstract class Mixed extends Super {} return Mixed;",
+            "}",
+        ));
+        assert!(
+            declarations.contains(
+                "export declare function mixin(Super?: typeof Base): abstract new () => {"
+            ),
+            "{declarations}"
+        );
+
+        let accessor_mixin = emit_declarations_with_semantics(concat!(
+            "class A { constructor(...args: any[]) {} }",
+            "export function Mixin<T extends typeof A>(Super: T) {",
+            " return class extends Super {",
+            "  get name(): string { return 'B'; } set name(value: string) {}",
+            " };",
+            "}",
+        ));
+        assert_eq!(accessor_mixin.matches("get name(): string;").count(), 1);
+        assert_eq!(accessor_mixin.matches("set name(value: string);").count(), 1);
     }
 
     #[test]
