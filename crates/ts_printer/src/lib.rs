@@ -2511,25 +2511,7 @@ fn source_needs_legacy_decorate_helper(arena: &NodeArena) -> bool {
                         Some(NodeData::PrivateIdentifier(_))
                     )
                 });
-                !private_member
-                    && ((!class_member_is_constructor(arena, *member)
-                        && arena.get(*member).is_some_and(|member| {
-                            member.kind != SyntaxKind::ClassStaticBlockDeclaration
-                            && declaration_has_modifier(arena, member, SyntaxKind::Decorator)
-                        }))
-                        || function_like_parameters(arena, *member).is_some_and(
-                        |parameters| {
-                            parameters.nodes.iter().any(|parameter| {
-                                arena.get(*parameter).is_some_and(|parameter| {
-                                    declaration_has_modifier(
-                                        arena,
-                                        parameter,
-                                        SyntaxKind::Decorator,
-                                    )
-                                })
-                            })
-                        },
-                    ))
+                !private_member && class_member_has_legacy_decorators(arena, *member)
             }))
     })
 }
@@ -2571,6 +2553,9 @@ fn source_needs_standard_decorator_helpers(arena: &NodeArena) -> bool {
 
 fn source_needs_legacy_param_helper(arena: &NodeArena) -> bool {
     arena.iter().any(|(_, node)| {
+        if matches!(&node.data, NodeData::MethodDeclaration(method) if method.body.is_none()) {
+            return false;
+        }
         function_like_parameters_from_node(node).is_some_and(|parameters| {
             parameters.nodes.iter().any(|parameter| {
                 arena.get(*parameter).is_some_and(|parameter| {
@@ -3736,6 +3721,12 @@ fn decorator_metadata_type_references(arena: &NodeArena) -> Vec<NodeId> {
 }
 
 fn class_member_has_legacy_decorators(arena: &NodeArena, member: NodeId) -> bool {
+    if matches!(
+        arena.get(member).map(|node| &node.data),
+        Some(NodeData::MethodDeclaration(method)) if method.body.is_none()
+    ) {
+        return false;
+    }
     (!class_member_is_constructor(arena, member)
         && arena
             .get(member)
