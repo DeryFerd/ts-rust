@@ -389,6 +389,7 @@ pub fn emit_source_file_with_context(
         namespace_destructuring_temps: HashMap::new(),
         private_method_plans: HashMap::new(),
         active_private_method_plan: None,
+        enclosing_private_method_plans: Vec::new(),
         private_field_plans: HashMap::new(),
         active_private_field_plan: None,
         enclosing_private_field_plans: Vec::new(),
@@ -26873,6 +26874,7 @@ struct Printer<'a> {
     namespace_destructuring_temps: HashMap<NodeId, String>,
     private_method_plans: HashMap<NodeId, PrivateMethodPlan>,
     active_private_method_plan: Option<PrivateMethodPlan>,
+    enclosing_private_method_plans: Vec<PrivateMethodPlan>,
     private_field_plans: HashMap<NodeId, PrivateFieldPlan>,
     active_private_field_plan: Option<PrivateFieldPlan>,
     enclosing_private_field_plans: Vec<PrivateFieldPlan>,
@@ -27746,6 +27748,24 @@ impl Printer<'_> {
             let has_instance_methods = private_methods
                 .iter()
                 .any(|(_, _, is_static, _)| !is_static);
+            let class_symbol = class
+                .local_symbol
+                .or(class.symbol)
+                .or_else(|| self.bindings.node_symbols.get(&class_name).copied())
+                .or_else(|| self.bindings.resolve_name_at(class_name, class_text));
+            let references_class_value = class_symbol.is_some_and(|class_symbol| {
+                self.arena.iter().any(|(candidate, node)| {
+                    candidate != class_name
+                        && self.node_is_within(candidate, class_id)
+                        && matches!(
+                            &node.data,
+                            NodeData::Identifier(identifier) if identifier.text == class_text
+                        )
+                        && identifier_is_unqualified_value_reference(self.arena, candidate)
+                        && self.bindings.resolve_name_at(candidate, class_text)
+                            == Some(class_symbol)
+                })
+            });
             let mut declarations = Vec::new();
             let mut brand = None;
             if has_instance_methods {
@@ -27761,6 +27781,7 @@ impl Printer<'_> {
             }
 
             let needs_capture = private_methods.iter().any(|(_, _, is_static, _)| *is_static)
+                || references_class_value
                 || class.members.nodes.iter().any(|member| {
                     self.arena
                         .get(*member)
@@ -27884,12 +27905,8 @@ impl Printer<'_> {
                     (None, None) => {}
                 }
             }
-            let class_symbol = class
-                .local_symbol
-                .or(class.symbol)
-                .or_else(|| self.bindings.node_symbols.get(&class_name).copied())
-                .or_else(|| self.bindings.resolve_name_at(class_name, class_text));
             let capture_class_value = methods.iter().any(|method| method.is_static)
+                || references_class_value
                 || self.static_private_field_plans.contains_key(&class_name)
                 || class.members.nodes.iter().any(|member| {
                     let is_static_element = match self.arena.get(*member).map(|node| &node.data) {
@@ -28137,7 +28154,7 @@ impl Printer<'_> {
                 .map(|plan| plan.capture.clone());
         }
         let method = self.active_private_method(name)?;
-        let plan = self.active_private_method_plan.as_ref()?;
+        let plan = self.active_private_method_plan_for_member(method)?;
         if method.is_static {
             Some(plan.capture.clone().unwrap_or_else(|| plan.brand.clone()))
         } else {
@@ -28149,7 +28166,7 @@ impl Printer<'_> {
         let method = self
             .active_private_method(name)
             .filter(|method| method.kind == PrivateMemberKind::Method)?;
-        let plan = self.active_private_method_plan.as_ref()?;
+        let plan = self.active_private_method_plan_for_member(method)?;
         if method.is_static {
             Some(plan.capture.clone().unwrap_or_else(|| plan.brand.clone()))
         } else {
@@ -28271,14 +28288,36 @@ impl Printer<'_> {
             return None;
         };
         let private_name = name.text.trim_start_matches('#');
-        self.active_private_method_plan
-            .as_ref()?
-            .methods
+        for plan in self
+            .active_private_method_plan
             .iter()
-            .rev()
-            .find(|method| {
-                method.private_name == private_name
-                    && method.kind != PrivateMemberKind::Setter
+            .chain(self.enclosing_private_method_plans.iter().rev())
+        {
+            if plan
+                .methods
+                .iter()
+                .any(|method| method.private_name == private_name)
+            {
+                return plan.methods.iter().rev().find(|method| {
+                    method.private_name == private_name
+                        && method.kind != PrivateMemberKind::Setter
+                });
+            }
+        }
+        None
+    }
+
+    fn active_private_method_plan_for_member(
+        &self,
+        member: &PrivateMethodInfo,
+    ) -> Option<&PrivateMethodPlan> {
+        self.active_private_method_plan
+            .iter()
+            .chain(self.enclosing_private_method_plans.iter().rev())
+            .find(|plan| {
+                plan.methods
+                    .iter()
+                    .any(|candidate| candidate.method == member.method)
             })
     }
 
@@ -28406,15 +28445,23 @@ impl Printer<'_> {
             return None;
         };
         let private_name = name.text.trim_start_matches('#');
-        self.active_private_method_plan
-            .as_ref()?
-            .methods
+        for plan in self
+            .active_private_method_plan
             .iter()
-            .rev()
-            .find(|method| {
-                method.private_name == private_name
-                    && method.kind == PrivateMemberKind::Setter
-            })
+            .chain(self.enclosing_private_method_plans.iter().rev())
+        {
+            if plan
+                .methods
+                .iter()
+                .any(|method| method.private_name == private_name)
+            {
+                return plan.methods.iter().rev().find(|method| {
+                    method.private_name == private_name
+                        && method.kind == PrivateMemberKind::Setter
+                });
+            }
+        }
+        None
     }
 
     fn active_private_accessor_exists(&self, name: NodeId) -> bool {
@@ -28424,15 +28471,26 @@ impl Printer<'_> {
             return false;
         };
         let private_name = name.text.trim_start_matches('#');
-        self.active_private_method_plan.as_ref().is_some_and(|plan| {
-            plan.methods.iter().any(|method| {
-                method.private_name == private_name
-                    && matches!(
-                        method.kind,
-                        PrivateMemberKind::Getter | PrivateMemberKind::Setter
-                    )
-            })
-        })
+        for plan in self
+            .active_private_method_plan
+            .iter()
+            .chain(self.enclosing_private_method_plans.iter().rev())
+        {
+            if plan
+                .methods
+                .iter()
+                .any(|method| method.private_name == private_name)
+            {
+                return plan.methods.iter().any(|method| {
+                    method.private_name == private_name
+                        && matches!(
+                            method.kind,
+                            PrivateMemberKind::Getter | PrivateMemberKind::Setter
+                        )
+                });
+            }
+        }
+        false
     }
 
     fn private_accessors_need_set_helper(&self) -> bool {
@@ -28482,6 +28540,36 @@ impl Printer<'_> {
         })
     }
 
+    fn private_access_has_lexical_declaration(
+        &self,
+        access: NodeId,
+        private_name: &str,
+    ) -> bool {
+        let mut current = access;
+        while let Some(parent) = self.arena.get(current).and_then(|node| node.parent) {
+            let class_members = match self.arena.get(parent).map(|node| &node.data) {
+                Some(NodeData::ClassDeclaration(class)) => Some(&class.members),
+                Some(NodeData::ClassExpression(class)) => Some(&class.members),
+                _ => None,
+            };
+            if let Some(members) = class_members
+                && members.nodes.iter().any(|member| {
+                    type_member_name(self.arena, *member).is_some_and(|name| {
+                        matches!(
+                            self.arena.get(name).map(|node| &node.data),
+                            Some(NodeData::PrivateIdentifier(identifier))
+                                if identifier.text.trim_start_matches('#') == private_name
+                        )
+                    })
+                })
+            {
+                return true;
+            }
+            current = parent;
+        }
+        false
+    }
+
     fn private_fields_need_set_helper(&self) -> bool {
         let field_names = self
             .private_field_plans
@@ -28508,6 +28596,12 @@ impl Printer<'_> {
                 return false;
             };
             if !field_names.contains(name.text.trim_start_matches('#')) {
+                return false;
+            }
+            if !self.private_access_has_lexical_declaration(
+                access_id,
+                name.text.trim_start_matches('#'),
+            ) {
                 return false;
             }
             let mut current = access_id;
@@ -28570,6 +28664,12 @@ impl Printer<'_> {
                 return false;
             };
             if !method_names.contains(name.text.trim_start_matches('#')) {
+                return false;
+            }
+            if !self.private_access_has_lexical_declaration(
+                access_id,
+                name.text.trim_start_matches('#'),
+            ) {
                 return false;
             }
             let mut current = access_id;
@@ -52735,6 +52835,12 @@ impl Printer<'_> {
             let previous = self.active_private_field_plan.clone();
             let previous_method = self.active_private_method_plan.clone();
             let previous_static = self.active_static_private_field_plan.clone();
+            if let Some(previous) = &previous {
+                self.enclosing_private_field_plans.push(previous.clone());
+            }
+            if let Some(previous) = &previous_method {
+                self.enclosing_private_method_plans.push(previous.clone());
+            }
             self.active_private_field_plan = self.private_field_plan(data);
             self.active_private_method_plan = self.private_method_plan(data);
             self.active_static_private_field_plan = self.static_private_field_plan(data);
@@ -52742,10 +52848,19 @@ impl Printer<'_> {
             self.active_private_field_plan = previous;
             self.active_private_method_plan = previous_method;
             self.active_static_private_field_plan = previous_static;
+            if self.active_private_field_plan.is_some() {
+                self.enclosing_private_field_plans.pop();
+            }
+            if self.active_private_method_plan.is_some() {
+                self.enclosing_private_method_plans.pop();
+            }
             return result;
         }
         let private_plan = self.private_method_plan(data);
         let previous_private_plan = self.active_private_method_plan.clone();
+        if let Some(previous) = &previous_private_plan {
+            self.enclosing_private_method_plans.push(previous.clone());
+        }
         let private_field_plan = self.private_field_plan(data);
         let previous_private_field_plan = self.active_private_field_plan.clone();
         if let Some(previous) = &previous_private_field_plan {
@@ -53280,6 +53395,9 @@ impl Printer<'_> {
         }
         self.active_private_method_plan = previous_private_plan;
         self.active_private_field_plan = previous_private_field_plan;
+        if self.active_private_method_plan.is_some() {
+            self.enclosing_private_method_plans.pop();
+        }
         if self.active_private_field_plan.is_some() {
             self.enclosing_private_field_plans.pop();
         }
@@ -63666,7 +63784,10 @@ impl Printer<'_> {
         method: &PrivateMethodInfo,
         receiver_temp: Option<&str>,
     ) -> Result<(), EmitError> {
-        let Some(plan) = self.active_private_method_plan.clone() else {
+        let Some(plan) = self
+            .active_private_method_plan_for_member(method)
+            .cloned()
+        else {
             return Ok(());
         };
         self.emit_helper_reference("__classPrivateFieldGet");
@@ -72318,7 +72439,10 @@ mod tests {
             output.starts_with("\"use strict\";\nvar __classPrivateFieldGet"),
             "{output}"
         );
-        assert!(output.contains("var _C_instances, _C_read;"), "{output}");
+        assert!(
+            output.contains("var _C_instances, _a, _C_read;"),
+            "{output}"
+        );
         assert!(
             output.contains(
                 "constructor(value) {\n        _C_instances.add(this);\n        this.value = value;"
@@ -72333,7 +72457,7 @@ mod tests {
         );
         assert!(
             output.contains(
-                "_C_instances = new WeakSet(), _C_read = function _C_read() { return C; };"
+                "_a = C, _C_instances = new WeakSet(), _C_read = function _C_read() { return _a; };"
             ),
             "{output}"
         );
@@ -72367,6 +72491,48 @@ mod tests {
             "{output}"
         );
         assert!(!output.starts_with("var _a, _A_field, _A_method;"), "{output}");
+    }
+
+    #[test]
+    fn resolves_outer_private_members_inside_nested_classes() {
+        let output = emit_with(
+            concat!(
+                "class C { #foo = 1; #bar() { new C().#baz; } ",
+                "get #baz() { return 1; } m() { return class D { #bar() {} ",
+                "n() { new C().#foo; new C().#baz; new D().#bar; } }; } }",
+            ),
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(
+            output.contains("__classPrivateFieldGet(new _a(), _C_foo, \"f\")"),
+            "{output}"
+        );
+        assert!(
+            output.contains(
+                "__classPrivateFieldGet(new _a(), _C_instances, \"a\", _C_baz_get)"
+            ),
+            "{output}"
+        );
+        assert!(
+            output.contains(
+                "__classPrivateFieldGet(new _b(), _D_instances, \"m\", _D_bar)"
+            ),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn omits_private_set_helper_for_out_of_class_recovery() {
+        let output = emit_with(
+            "class A { #foo = 3; } new A().#foo = 4;",
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(!output.contains("__classPrivateFieldSet"), "{output}");
+        assert!(output.contains("new A(). = 4;"), "{output}");
     }
 
     #[test]

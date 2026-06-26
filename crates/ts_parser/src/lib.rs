@@ -1173,7 +1173,11 @@ impl<'a> Parser<'a> {
 
     fn parse_variable_declaration(&mut self) -> NodeId {
         let start = self.current.range.start;
-        let name = self.parse_binding_name("Expected a variable name.");
+        let name = if self.current.kind == SyntaxKind::PrivateIdentifier {
+            self.parse_private_identifier()
+        } else {
+            self.parse_binding_name("Expected a variable name.")
+        };
         let exclamation_token = if self.current.kind == SyntaxKind::ExclamationToken {
             Some(self.consume_token_node())
         } else {
@@ -10657,6 +10661,34 @@ mod tests {
                     result.arena.get(statement.expression).map(|node| &node.data),
                     Some(NodeData::PrivateIdentifier(identifier)) if identifier.text == "#"
                 )
+        ));
+    }
+
+    #[test]
+    fn preserves_a_private_identifier_as_a_recovered_variable_name() {
+        let result = parse_source_file("const #foo = 3;");
+        let statements = source_statements(&result);
+        let NodeData::VariableStatement(statement) =
+            &result.arena.get(statements[0]).unwrap().data
+        else {
+            panic!("expected variable statement");
+        };
+        let NodeData::VariableDeclarationList(list) = &result
+            .arena
+            .get(statement.declaration_list)
+            .unwrap()
+            .data
+        else {
+            panic!("expected variable declaration list");
+        };
+        let NodeData::VariableDeclaration(declaration) =
+            &result.arena.get(list.declarations.nodes[0]).unwrap().data
+        else {
+            panic!("expected variable declaration");
+        };
+        assert!(matches!(
+            result.arena.get(declaration.name).map(|node| &node.data),
+            Some(NodeData::PrivateIdentifier(identifier)) if identifier.text == "#foo"
         ));
     }
 
