@@ -1165,10 +1165,7 @@ pub fn emit_source_file_with_context(
     let needs_set_function_name_helper = (!settings.experimental_decorators
         && source_needs_standard_decorator_set_function_name_helper(arena))
         || (settings.target < ScriptTarget::Es2022
-            && source_needs_set_function_name_helper(
-                arena,
-                settings.use_define_for_class_fields == Some(true),
-            ));
+            && source_needs_set_function_name_helper(arena));
     let defer_set_function_name_for_private_get = !needs_standard_decorator_helpers
         && settings.target < ScriptTarget::Es2022
         && source_needs_private_field_get_helper(arena)
@@ -2643,7 +2640,31 @@ fn source_needs_standard_decorator_set_function_name_helper(arena: &NodeArena) -
     })
 }
 
-fn source_needs_set_function_name_helper(arena: &NodeArena, use_define: bool) -> bool {
+fn class_expression_has_name_restoring_static_elements(
+    arena: &NodeArena,
+    members: &NodeList,
+) -> bool {
+    members.nodes.iter().any(|member| {
+        match arena.get(*member).map(|node| &node.data) {
+            Some(NodeData::ClassStaticBlockDeclaration(_)) => true,
+            Some(NodeData::PropertyDeclaration(property)) => {
+                (property.initializer.is_some()
+                    || matches!(
+                        arena.get(property.name).map(|node| &node.data),
+                        Some(NodeData::PrivateIdentifier(_))
+                    ))
+                    && declaration_has_modifier_in_list(
+                        arena,
+                        property.modifiers.as_ref(),
+                        SyntaxKind::StaticKeyword,
+                    )
+            }
+            _ => false,
+        }
+    })
+}
+
+fn source_needs_set_function_name_helper(arena: &NodeArena) -> bool {
     arena.iter().any(|(id, node)| {
         let NodeData::ClassExpression(class) = &node.data else {
             return false;
@@ -2661,25 +2682,7 @@ fn source_needs_set_function_name_helper(arena: &NodeArena, use_define: bool) ->
             _ => false,
         };
         inferred_initializer
-            && class.members.nodes.iter().any(|member| {
-                match arena.get(*member).map(|node| &node.data) {
-                    Some(NodeData::ClassStaticBlockDeclaration(_)) => true,
-                    Some(NodeData::PropertyDeclaration(property)) => {
-                        (property.initializer.is_some()
-                            || use_define
-                            || matches!(
-                                arena.get(property.name).map(|node| &node.data),
-                                Some(NodeData::PrivateIdentifier(_))
-                            ))
-                            && declaration_has_modifier_in_list(
-                                arena,
-                                property.modifiers.as_ref(),
-                                SyntaxKind::StaticKeyword,
-                            )
-                    }
-                    _ => false,
-                }
-            })
+            && class_expression_has_name_restoring_static_elements(arena, &class.members)
     })
 }
 
@@ -56571,6 +56574,7 @@ impl Printer<'_> {
             && anonymous_private_plan
                 .as_ref()
                 .is_none_or(|plan| plan.methods.is_empty())
+            && class_expression_has_name_restoring_static_elements(self.arena, &data.members)
             && let Some(name) = self.class_expression_inferred_name(id)
         {
             self.writer.newline();
@@ -79518,6 +79522,13 @@ mod tests {
             "{output}"
         );
         assert!(!output.contains("__setFunctionName(_b, \"y\")"), "{output}");
+
+        let uninitialized = emit_with_define(
+            "const y = class { static value; static [key]; };",
+            ScriptTarget::Es2015,
+        )
+        .code;
+        assert!(!uninitialized.contains("__setFunctionName"), "{uninitialized}");
     }
 
     #[test]
