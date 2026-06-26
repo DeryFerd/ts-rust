@@ -862,6 +862,7 @@ impl Program {
                     verbatim_module_syntax: self.options.verbatim_module_syntax,
                     isolated_modules: self.options.isolated_modules,
                     strict_null_checks: self.options.strict_null_checks,
+                    no_lib: self.options.no_lib,
                     force_use_strict: fixed_es_module && settings.module == ModuleKind::CommonJs,
                     jsx_factory: jsx_factory.as_deref(),
                     jsx_fragment_factory,
@@ -1301,6 +1302,7 @@ impl Program {
                     verbatim_module_syntax: self.options.verbatim_module_syntax,
                     isolated_modules: self.options.isolated_modules,
                     strict_null_checks: self.options.strict_null_checks,
+                    no_lib: self.options.no_lib,
                     force_use_strict: false,
                     jsx_factory: jsx_factory.as_deref(),
                     jsx_fragment_factory,
@@ -1399,7 +1401,6 @@ impl Program {
                 return output;
             }
             let mut code = String::new();
-            let mut preserved_references = BTreeSet::new();
             if let Some(declaration_file) = paths.declaration.as_deref() {
                 for source in declaration_sources {
                     let lower = source.file_name.to_ascii_lowercase();
@@ -1412,10 +1413,8 @@ impl Program {
                     for directive in
                         preserved_reference_directives(source, declaration_file).lines()
                     {
-                        if preserved_references.insert(directive.to_owned()) {
-                            code.push_str(directive);
-                            code.push('\n');
-                        }
+                        code.push_str(directive);
+                        code.push('\n');
                     }
                 }
             }
@@ -4783,6 +4782,35 @@ fn append_bundle_declaration_module(
     module_name: &str,
     preserve_amd_pragma: bool,
 ) {
+    let preserves_explicit_empty_export = source
+        .parse
+        .arena
+        .get(source.parse.source_file)
+        .and_then(|node| match &node.data {
+            NodeData::SourceFile(file) => Some(file),
+            _ => None,
+        })
+        .is_some_and(|file| {
+            file.statements.nodes.iter().any(|statement| {
+                let Some(NodeData::ExportDeclaration(export)) = source
+                    .parse
+                    .arena
+                    .get(*statement)
+                    .map(|node| &node.data)
+                else {
+                    return false;
+                };
+                !export.is_type_only
+                    && export.module_specifier.is_none()
+                    && matches!(
+                        export
+                            .export_clause
+                            .and_then(|clause| source.parse.arena.get(clause))
+                            .map(|node| &node.data),
+                        Some(NodeData::NamedExports(exports)) if exports.elements.nodes.is_empty()
+                    )
+            })
+        });
     if preserve_amd_pragma && let Some(pragma) = source.parse.amd_module_names.last() {
         let start = usize::try_from(pragma.range.start.get()).unwrap_or(usize::MAX);
         let end = usize::try_from(pragma.range.end.get()).unwrap_or(usize::MAX);
@@ -4801,7 +4829,7 @@ fn append_bundle_declaration_module(
                 continue;
             }
         }
-        if line.trim() == "export {};" {
+        if line.trim() == "export {};" && !preserves_explicit_empty_export {
             continue;
         }
         let line = line.strip_prefix("export declare ").map_or_else(

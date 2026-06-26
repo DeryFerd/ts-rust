@@ -88,6 +88,7 @@ pub struct EmitContext<'a> {
     pub verbatim_module_syntax: bool,
     pub isolated_modules: bool,
     pub strict_null_checks: bool,
+    pub no_lib: bool,
     pub force_use_strict: bool,
     pub jsx_factory: Option<&'a str>,
     pub jsx_fragment_factory: Option<&'a str>,
@@ -234,6 +235,7 @@ pub fn emit_source_file_with_settings_and_bindings(
             verbatim_module_syntax: false,
             isolated_modules: false,
             strict_null_checks: false,
+            no_lib: false,
             force_use_strict: false,
             jsx_factory: None,
             jsx_fragment_factory: None,
@@ -1791,6 +1793,15 @@ pub fn emit_source_file_with_context(
                         node.range.start.get(),
                     );
                 }
+            } else if context.no_lib
+                && has_runtime_statement
+                && declaration_has_modifier(arena, node, SyntaxKind::ExportKeyword)
+            {
+                printer.emit_lib_reference_directives_between(
+                    reference_owner_start,
+                    node.range.start.get(),
+                    false,
+                );
             } else if settings.module != ModuleKind::None
                 && has_runtime_statement
                 && !(printer.automatic_jsx.any() && erased_import)
@@ -5421,6 +5432,7 @@ impl DeclarationPrinter<'_> {
             .declaration_reachability
             .and_then(|reachability| reachability.get(&scope))
             && !retained.contains(&id)
+            && !export_declaration_is_empty(self.arena, &node)
             && !self.statement_is_local_export_dependency(id)
             && !self.statement_is_synthesized_export_type_dependency(id)
             && !self.import_is_local_export_dependency(id)
@@ -5702,12 +5714,7 @@ impl DeclarationPrinter<'_> {
                             "var "
                         });
                         if reserved {
-                            let index = reserved_aliases.len();
-                            let alias = if index < 26 {
-                                format!("_{}", char::from(b'a' + u8::try_from(index).unwrap_or(25)))
-                            } else {
-                                format!("_a_{index}")
-                            };
+                            let alias = self.generate_declaration_temp_name();
                             self.writer.write(&alias);
                             reserved_aliases.push((alias, *property));
                         } else {
@@ -5718,11 +5725,18 @@ impl DeclarationPrinter<'_> {
                         self.writer.write(";");
                         self.writer.newline();
                     }
-                    for (alias, property) in reserved_aliases {
+                    if !reserved_aliases.is_empty() {
                         self.writer.write("export { ");
+                    }
+                    for (index, (alias, property)) in reserved_aliases.iter().enumerate() {
+                        if index != 0 {
+                            self.writer.write(", ");
+                        }
                         self.writer.write(&alias);
                         self.writer.write(" as ");
-                        self.emit_name(property)?;
+                        self.emit_name(*property)?;
+                    }
+                    if !reserved_aliases.is_empty() {
                         self.writer.write(" };");
                         self.writer.newline();
                     }
@@ -15153,6 +15167,27 @@ impl DeclarationPrinter<'_> {
                 return candidate;
             }
             index += 1;
+        }
+    }
+
+    fn generate_declaration_temp_name(&mut self) -> String {
+        let source_names = self
+            .arena
+            .iter()
+            .filter_map(|(_, node)| match &node.data {
+                NodeData::Identifier(identifier) => Some(identifier.text.as_str()),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        let mut count = 0_u32;
+        loop {
+            if let Some(candidate) = generated_temp_name(count)
+                && !source_names.contains(candidate.as_str())
+                && self.generated_names.insert(candidate.clone())
+            {
+                return candidate;
+            }
+            count += 1;
         }
     }
 
@@ -31132,6 +31167,11 @@ impl Printer<'_> {
             .map_or(0, |node| node.range.start.get());
         let mut reference_owner_start = 0;
         let mut previous_emitted = false;
+        let has_runtime_statement = data.statements.nodes.iter().any(|statement| {
+            self.arena
+                .get(*statement)
+                .is_some_and(|node| self.statement_emits_runtime(*statement, node))
+        });
         for statement in &data.statements.nodes {
             if let Some(node) = self.arena.get(*statement) {
                 let skip_import = match &node.data {
@@ -31156,6 +31196,17 @@ impl Printer<'_> {
                     self.emit_reference_directives_between(
                         reference_owner_start,
                         node.range.start.get(),
+                    );
+                } else if declaration_has_modifier(
+                    self.arena,
+                    node,
+                    SyntaxKind::ExportKeyword,
+                ) && (!has_runtime_statement || context.no_lib)
+                {
+                    self.emit_lib_reference_directives_between(
+                        reference_owner_start,
+                        node.range.start.get(),
+                        !context.no_lib,
                     );
                 }
                 previous_end = node.range.end.get();
@@ -31997,6 +32048,15 @@ impl Printer<'_> {
     }
 
     fn emit_preserved_lib_reference_directives_between(&mut self, start: u32, end: u32) {
+        self.emit_lib_reference_directives_between(start, end, true);
+    }
+
+    fn emit_lib_reference_directives_between(
+        &mut self,
+        start: u32,
+        end: u32,
+        require_preserve: bool,
+    ) {
         if self.settings.remove_comments {
             return;
         }
@@ -32024,7 +32084,8 @@ impl Printer<'_> {
             if trivia[line_start..index].trim().is_empty()
                 && is_reference_directive(comment)
                 && comment.contains("<reference lib=")
-                && (comment.contains("preserve=\"true\"")
+                && (!require_preserve
+                    || comment.contains("preserve=\"true\"")
                     || comment.contains("preserve='true'"))
                 && self.emitted_source_comments.insert(comment_range)
             {
@@ -74908,6 +74969,7 @@ mod tests {
                 verbatim_module_syntax: false,
                 isolated_modules: false,
                 strict_null_checks,
+                no_lib: false,
                 force_use_strict: false,
                 jsx_factory: None,
                 jsx_fragment_factory: None,
@@ -74991,6 +75053,7 @@ mod tests {
                 verbatim_module_syntax,
                 isolated_modules: false,
                 strict_null_checks: false,
+                no_lib: false,
                 force_use_strict: false,
                 jsx_factory: None,
                 jsx_fragment_factory: None,
@@ -75161,6 +75224,7 @@ mod tests {
                 verbatim_module_syntax: false,
                 isolated_modules: false,
                 strict_null_checks: false,
+                no_lib: false,
                 force_use_strict: false,
                 jsx_factory: None,
                 jsx_fragment_factory: None,
@@ -79079,6 +79143,7 @@ mod tests {
                 verbatim_module_syntax: false,
                 isolated_modules: false,
                 strict_null_checks: false,
+                no_lib: false,
                 force_use_strict: false,
                 jsx_factory: None,
                 jsx_fragment_factory: None,
@@ -79771,6 +79836,7 @@ mod tests {
                     verbatim_module_syntax: false,
                     isolated_modules: false,
                     strict_null_checks: false,
+                    no_lib: false,
                     force_use_strict: false,
                     jsx_factory: None,
                     jsx_fragment_factory: None,
@@ -83058,6 +83124,7 @@ class Board {
                 verbatim_module_syntax: false,
                 isolated_modules: false,
                 strict_null_checks: false,
+                no_lib: false,
                 force_use_strict: false,
                 jsx_factory: None,
                 jsx_fragment_factory: None,
