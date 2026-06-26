@@ -350,6 +350,7 @@ pub fn emit_source_file_with_context(
         class_expression_name_exclusions: HashSet::new(),
         suppressed_class_empty_element_ranges: Vec::new(),
         computed_property_temps: HashMap::new(),
+        es5_local_class_computed_temps: HashSet::new(),
         class_expression_computed_properties: HashSet::new(),
         consumed_class_expression_computed_properties: HashSet::new(),
         native_class_expression_computed_callbacks: HashMap::new(),
@@ -28761,6 +28762,7 @@ struct Printer<'a> {
     class_expression_name_exclusions: HashSet<NodeId>,
     suppressed_class_empty_element_ranges: Vec<(u32, u32)>,
     computed_property_temps: HashMap<NodeId, String>,
+    es5_local_class_computed_temps: HashSet<NodeId>,
     class_expression_computed_properties: HashSet<NodeId>,
     consumed_class_expression_computed_properties: HashSet<NodeId>,
     native_class_expression_computed_callbacks: HashMap<NodeId, String>,
@@ -42047,7 +42049,13 @@ impl Printer<'_> {
                 claimed.insert(temp.clone());
                 self.computed_property_temps
                     .insert(property.name, temp.clone());
-                field_temps.push(temp);
+                if self.settings.target < ScriptTarget::Es2015 && !*is_expression {
+                    self.es5_local_class_computed_temps
+                        .insert(property.name);
+                    self.generated_names.used.insert(temp);
+                } else {
+                    field_temps.push(temp);
+                }
             }
             let needs_class_temp = self.settings.target < ScriptTarget::Es2022
                 && *is_expression
@@ -57758,7 +57766,9 @@ impl Printer<'_> {
         if fields.is_empty() {
             return Ok(());
         }
-        self.writer.newline();
+        if !self.writer.line_start {
+            self.writer.newline();
+        }
         for (index, name) in fields.iter().enumerate() {
             if index != 0 {
                 self.writer.write(", ");
@@ -57772,6 +57782,8 @@ impl Printer<'_> {
                 self.writer.write(" = ");
             }
             self.emit_expression(expression, 0)?;
+            self.consumed_class_expression_computed_properties
+                .insert(*name);
         }
         self.writer.write(";");
         Ok(())
@@ -59521,6 +59533,7 @@ impl Printer<'_> {
     }
 
     fn computed_property_expression_may_have_side_effects(&self, expression: NodeId) -> bool {
+        let expression = self.unwrap_erased_expression(expression);
         match self.arena.get(expression).map(|node| &node.data) {
             Some(
                 NodeData::Identifier(_)
@@ -59529,9 +59542,6 @@ impl Printer<'_> {
                 | NodeData::NoSubstitutionTemplateLiteral(_)
                 | NodeData::KeywordExpression(_),
             ) => false,
-            Some(NodeData::ParenthesizedExpression(parenthesized)) => {
-                self.computed_property_expression_may_have_side_effects(parenthesized.expression)
-            }
             _ => true,
         }
     }
@@ -60904,6 +60914,29 @@ impl Printer<'_> {
             self.writer.newline();
         }
 
+        let mut local_computed_temps = data
+            .members
+            .nodes
+            .iter()
+            .filter_map(|member| {
+                let NodeData::PropertyDeclaration(property) = &self.arena.get(*member)?.data
+                else {
+                    return None;
+                };
+                self.es5_local_class_computed_temps
+                    .contains(&property.name)
+                    .then(|| self.computed_property_temps.get(&property.name).cloned())
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        local_computed_temps.dedup();
+        if !local_computed_temps.is_empty() {
+            self.writer.write("var ");
+            self.writer.write(&local_computed_temps.join(", "));
+            self.writer.write(";");
+            self.writer.newline();
+        }
+
         if let Some(capture) = legacy_decorated_capture.as_deref() {
             self.writer.write(capture);
             self.writer.write(" = ");
@@ -61214,6 +61247,10 @@ impl Printer<'_> {
         let previous_static_super = super_capture
             .as_ref()
             .and_then(|capture| self.downlevel_super_context.replace((capture.clone(), true)));
+        self.emit_unconsumed_class_declaration_computed_properties(data)?;
+        if !self.writer.line_start {
+            self.writer.newline();
+        }
         let static_result = self.emit_static_fields(data, name);
         if super_capture.is_some() {
             self.downlevel_super_context = previous_static_super;
@@ -73910,7 +73947,7 @@ impl Printer<'_> {
         data: &ts_ast::TemplateExpressionData,
         parent_precedence: u8,
     ) -> Result<(), EmitError> {
-        let wrap = parent_precedence > 12;
+        let wrap = parent_precedence > 18;
         if wrap {
             self.writer.write("(");
         }
@@ -73978,15 +74015,19 @@ impl Printer<'_> {
             let NodeData::TemplateSpan(span) = &node.data else {
                 return Err(Self::unsupported(*span_id, node.kind));
             };
-            self.writer.write(" + ");
-            self.emit_expression(span.expression, 13)?;
-            self.writer.write(" + ");
+            self.writer.write(".concat(");
+            self.emit_expression(span.expression, 0)?;
             let literal = self.node(span.literal)?.clone();
-            match &literal.data {
-                NodeData::TemplateMiddle(data) => write_quoted(&mut self.writer, &data.text),
-                NodeData::TemplateTail(data) => write_quoted(&mut self.writer, &data.text),
+            let text = match &literal.data {
+                NodeData::TemplateMiddle(data) => &data.text,
+                NodeData::TemplateTail(data) => &data.text,
                 _ => return Err(Self::unsupported(span.literal, literal.kind)),
+            };
+            if !text.is_empty() {
+                self.writer.write(", ");
+                write_quoted(&mut self.writer, text);
             }
+            self.writer.write(")");
         }
         if wrap {
             self.writer.write(")");
@@ -78189,6 +78230,19 @@ mod tests {
                 "import main, { read as load, write } from 'pkg'; import 'side'; const value = load({ x: 1 }, [2, 3]); const message = `value=${value}`; export { value as result }; export * from 'other'; export default value;"
             ),
             "import main, { read as load, write } from \"pkg\";\nimport \"side\";\nconst value = load({ x: 1 }, [2, 3]);\nconst message = `value=${value}`;\nexport { value as result };\nexport * from \"other\";\nexport default value;\n"
+        );
+    }
+
+    #[test]
+    fn downlevels_template_expressions_with_concat_calls() {
+        let source = "const message = `hello ${first} and ${second}`;";
+        assert_eq!(
+            emit_with(source, ScriptTarget::Es5, ModuleKind::None).code,
+            "var message = \"hello \".concat(first, \" and \").concat(second);\n",
+        );
+        assert_eq!(
+            emit_with(source, ScriptTarget::Es2015, ModuleKind::None).code,
+            "const message = `hello ${first} and ${second}`;\n",
         );
     }
 
@@ -82785,6 +82839,26 @@ mod tests {
             result.code,
             "var __extends = (this && this.__extends) || (function () {\n    var extendStatics = function (d, b) {\n        extendStatics = Object.setPrototypeOf ||\n            ({ __proto__: [] } instanceof Array && function (d, b) { d.__proto__ = b; }) ||\n            function (d, b) { for (var p in b) if (Object.prototype.hasOwnProperty.call(b, p)) d[p] = b[p]; };\n        return extendStatics(d, b);\n    };\n    return function (d, b) {\n        if (typeof b !== \"function\" && b !== null)\n            throw new TypeError(\"Class extends value \" + String(b) + \" is not a constructor or null\");\n        extendStatics(d, b);\n        function __() { this.constructor = d; }\n        d.prototype = b === null ? Object.create(b) : (__.prototype = b.prototype, new __());\n    };\n})();\nvar Point = /** @class */ (function () {\n    function Point(y) {\n        this.x = 1;\n        this.y = y;\n    }\n    Point.prototype.move = function (d) { this.x = this.x + d; };\n    Point.make = function () { return new Point(0); };\n    Point.origin = 0;\n    return Point;\n}());\nvar ColoredPoint = /** @class */ (function (_super) {\n    __extends(ColoredPoint, _super);\n    function ColoredPoint(y) {\n        var _this = _super.call(this, y) || this;\n        _this.color = 'red';\n        _this.color = 'blue';\n        return _this;\n    }\n    ColoredPoint.prototype.paint = function () { return this.color; };\n    return ColoredPoint;\n}(Point));\n"
         );
+    }
+
+    #[test]
+    fn scopes_es5_computed_field_temps_to_the_class_factory() {
+        let source = concat!(
+            "var s: string, n: number, a: any; class C { ",
+            "[n] = n; [s + n] = 2; static [<any>true]: number; ",
+            "static [`hello ${a} bye`] = 0; }",
+        );
+        let es5 = emit_with(source, ScriptTarget::Es5, ModuleKind::None).code;
+        assert!(!es5.starts_with("var _a"), "{es5}");
+        assert!(es5.contains("    var _a, _b, _c;"), "{es5}");
+        assert!(
+            es5.contains("    _a = n, _b = s + n, _c = \"hello \".concat(a, \" bye\");"),
+            "{es5}",
+        );
+        assert!(!es5.contains(", true,"), "{es5}");
+
+        let es2015 = emit_with(source, ScriptTarget::Es2015, ModuleKind::None).code;
+        assert!(!es2015.contains(", true,"), "{es2015}");
     }
 
     #[test]
