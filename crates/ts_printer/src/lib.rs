@@ -42552,6 +42552,7 @@ impl Printer<'_> {
                 };
                 if !self.class_expression_belongs_to_source_scope(id, source_file)
                     || self.node_has_class_ancestor(id, source_file)
+                    || self.node_has_namespace_ancestor(id, source_file)
                 {
                     return None;
                 }
@@ -42598,6 +42599,51 @@ impl Printer<'_> {
                 Some(NodeData::ClassDeclaration(_) | NodeData::ClassExpression(_))
             ) {
                 return true;
+            }
+            current = parent;
+        }
+        false
+    }
+
+    fn node_has_namespace_ancestor(&self, node: NodeId, boundary: NodeId) -> bool {
+        let mut current = node;
+        while let Some(parent) = self.arena.get(current).and_then(|node| node.parent) {
+            if parent == boundary {
+                return false;
+            }
+            if matches!(
+                self.arena.get(parent).map(|node| &node.data),
+                Some(NodeData::ModuleDeclaration(_) | NodeData::ModuleBlock(_))
+            ) {
+                return true;
+            }
+            current = parent;
+        }
+        false
+    }
+
+    fn node_belongs_to_namespace_block(&self, node: NodeId, block: NodeId) -> bool {
+        let mut current = node;
+        while let Some(parent) = self.arena.get(current).and_then(|node| node.parent) {
+            if parent == block {
+                return true;
+            }
+            if matches!(
+                self.arena.get(parent).map(|node| &node.data),
+                Some(
+                    NodeData::FunctionDeclaration(_)
+                        | NodeData::FunctionExpression(_)
+                        | NodeData::ArrowFunction(_)
+                        | NodeData::MethodDeclaration(_)
+                        | NodeData::ConstructorDeclaration(_)
+                        | NodeData::GetAccessorDeclaration(_)
+                        | NodeData::SetAccessorDeclaration(_)
+                        | NodeData::ClassDeclaration(_)
+                        | NodeData::ClassExpression(_)
+                        | NodeData::ModuleDeclaration(_)
+                )
+            ) {
+                return false;
             }
             current = parent;
         }
@@ -63402,7 +63448,52 @@ impl Printer<'_> {
             let body_node = self.node(body)?.clone();
             match &body_node.data {
                 NodeData::ModuleBlock(block) => {
-                    let mut destructuring_temps = Vec::new();
+                    let mut namespace_temps = Vec::new();
+                    if self.settings.target < ScriptTarget::Es2015 {
+                        let mut objects = self
+                            .arena
+                            .iter()
+                            .filter_map(|(id, node)| {
+                                let NodeData::ObjectLiteralExpression(object) = &node.data else {
+                                    return None;
+                                };
+                                (self.node_belongs_to_namespace_block(id, body)
+                                    && object.properties.nodes.iter().any(|property| {
+                                        let name = match self
+                                            .arena
+                                            .get(*property)
+                                            .map(|node| &node.data)
+                                        {
+                                            Some(NodeData::PropertyAssignment(property)) => {
+                                                property.name
+                                            }
+                                            Some(NodeData::MethodDeclaration(method)) => method.name,
+                                            Some(NodeData::GetAccessorDeclaration(accessor)) => {
+                                                accessor.name
+                                            }
+                                            Some(NodeData::SetAccessorDeclaration(accessor)) => {
+                                                accessor.name
+                                            }
+                                            _ => return false,
+                                        };
+                                        matches!(
+                                            self.arena.get(name).map(|node| &node.data),
+                                            Some(NodeData::ComputedPropertyName(_))
+                                        )
+                                    }))
+                                .then_some((node.range.start, id))
+                            })
+                            .collect::<Vec<_>>();
+                        objects.sort_by_key(|(start, _)| *start);
+                        for (_, object) in objects {
+                            if self.computed_property_temps.contains_key(&object) {
+                                continue;
+                            }
+                            let temp = self.generated_names.generate_temp();
+                            self.computed_property_temps.insert(object, temp.clone());
+                            namespace_temps.push(temp);
+                        }
+                    }
                     for statement_id in &block.statements.nodes {
                         let Some(NodeData::VariableStatement(statement)) =
                             self.arena.get(*statement_id).map(|node| &node.data)
@@ -63437,12 +63528,12 @@ impl Printer<'_> {
                             let temp = self.generated_names.generate_temp();
                             self.namespace_destructuring_temps
                                 .insert(*statement_id, temp.clone());
-                            destructuring_temps.push(temp);
+                            namespace_temps.push(temp);
                         }
                     }
-                    if !destructuring_temps.is_empty() {
+                    if !namespace_temps.is_empty() {
                         self.writer.write("var ");
-                        self.writer.write(&destructuring_temps.join(", "));
+                        self.writer.write(&namespace_temps.join(", "));
                         self.writer.write(";");
                         self.writer.newline();
                     }
@@ -73456,6 +73547,7 @@ impl Printer<'_> {
                 }
                 NodeData::GetAccessorDeclaration(accessor) => {
                     self.emit_es5_object_accessor_definition(
+                        *property_id,
                         temp,
                         accessor.name,
                         "get",
@@ -73465,6 +73557,7 @@ impl Printer<'_> {
                 }
                 NodeData::SetAccessorDeclaration(accessor) => {
                     self.emit_es5_object_accessor_definition(
+                        *property_id,
                         temp,
                         accessor.name,
                         "set",
@@ -73499,6 +73592,7 @@ impl Printer<'_> {
 
     fn emit_es5_object_accessor_definition(
         &mut self,
+        member: NodeId,
         temp: &str,
         name: NodeId,
         kind: &str,
@@ -73528,6 +73622,7 @@ impl Printer<'_> {
         } else {
             self.writer.write("{ }");
         }
+        self.emit_es5_object_accessor_trailing_line_comment(member);
         self.writer.write(",");
         self.writer.newline();
         self.writer.write("enumerable: false,");
@@ -73537,6 +73632,32 @@ impl Printer<'_> {
         self.writer.newline();
         self.writer.write("})");
         Ok(())
+    }
+
+    fn emit_es5_object_accessor_trailing_line_comment(&mut self, member: NodeId) {
+        let Some(member_end) = self
+            .arena
+            .get(member)
+            .and_then(|member| usize::try_from(member.range.end.get()).ok())
+        else {
+            return;
+        };
+        let Some(suffix) = self.source_text.get(member_end..) else {
+            return;
+        };
+        let line_end = suffix.find(['\n', '\r']).unwrap_or(suffix.len());
+        let line = &suffix[..line_end];
+        let Some(comment_start) = line.find("//") else {
+            return;
+        };
+        if !line[..comment_start].trim().is_empty() {
+            return;
+        }
+        self.emitted_source_comments
+            .insert((member_end + comment_start, member_end + line_end));
+        self.writer.write(" ");
+        self.writer.write(&line[comment_start..]);
+        self.writer.newline_preserving_trailing_spaces();
     }
 
     fn emit_downlevel_object_spread(
@@ -82859,6 +82980,36 @@ mod tests {
 
         let es2015 = emit_with(source, ScriptTarget::Es2015, ModuleKind::None).code;
         assert!(!es2015.contains(", true,"), "{es2015}");
+    }
+
+    #[test]
+    fn preserves_trailing_line_comments_before_downlevel_accessor_commas() {
+        let source = concat!(
+            "var value = { get [0 + 1]() { return 0 }, ",
+            "set [0 + 1](next: string) { } // retained\n};",
+        );
+        let output = emit_with(
+            source,
+            ScriptTarget::Es5,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(
+            output.contains("set: function (next) { } // retained\n        ,"),
+            "{output}",
+        );
+    }
+
+    #[test]
+    fn scopes_computed_object_literal_temps_to_namespaces() {
+        let output = emit_with(
+            "namespace M { var obj = { [this.bar]: 0 }; }",
+            ScriptTarget::Es5,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(output.starts_with("var M;\n(function (M) {\n    var _a;"), "{output}");
+        assert!(output.contains("var obj = (_a = {},"), "{output}");
     }
 
     #[test]
