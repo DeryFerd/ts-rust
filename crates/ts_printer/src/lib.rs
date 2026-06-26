@@ -398,6 +398,7 @@ pub fn emit_source_file_with_context(
         active_anonymous_private_class: None,
         private_destructuring_rewrites: HashMap::new(),
         private_compound_assignment_receiver_temps: HashMap::new(),
+        private_update_temps: HashMap::new(),
         preemitted_source_prologues: HashSet::new(),
         preemitted_captured_while_loops: HashMap::new(),
         captured_loop_body: None,
@@ -1204,6 +1205,20 @@ pub fn emit_source_file_with_context(
     };
     let private_set_needed = printer.private_accessors_need_set_helper()
         || printer.private_fields_need_set_helper();
+    let mut emitted_private_get_helper = false;
+    if private_set_needed
+        && auto_accessor_storages.is_empty()
+        && source_private_get_precedes_set_helper(arena)
+        && (!printer.private_field_plans.is_empty()
+            || !printer.static_private_field_plans.is_empty()
+            || !printer.private_method_plans.is_empty())
+        && source_needs_private_field_get_helper(arena)
+        && !settings.no_emit_helpers
+        && !printer.imported_helpers.contains("__classPrivateFieldGet")
+    {
+        printer.emit_class_private_field_get_helper();
+        emitted_private_get_helper = true;
+    }
     if private_set_needed
         && auto_accessor_storages.is_empty()
         && !settings.no_emit_helpers
@@ -1211,9 +1226,9 @@ pub fn emit_source_file_with_context(
     {
         printer.emit_class_private_field_set_helper();
     }
-    let mut emitted_private_get_helper = false;
     if (!printer.private_field_plans.is_empty()
         || !printer.static_private_field_plans.is_empty())
+        && !emitted_private_get_helper
         && source_needs_private_field_get_helper(arena)
         && !settings.no_emit_helpers
         && !printer.imported_helpers.contains("__classPrivateFieldGet")
@@ -2045,8 +2060,78 @@ fn source_needs_private_field_get_helper(arena: &NodeArena) -> bool {
                     && arena.get(binary.operator_token).is_some_and(|operator| {
                         operator.kind == SyntaxKind::EqualsToken
                     })
-        )
+        ) && !private_access_is_within_simple_assignment_target(arena, id)
     })
+}
+
+fn private_access_is_within_simple_assignment_target(arena: &NodeArena, access: NodeId) -> bool {
+    arena.iter().any(|(_, node)| {
+        let NodeData::BinaryExpression(binary) = &node.data else {
+            return false;
+        };
+        if !arena
+            .get(binary.operator_token)
+            .is_some_and(|operator| operator.kind == SyntaxKind::EqualsToken)
+        {
+            return false;
+        }
+        let mut current = Some(access);
+        while let Some(node) = current {
+            if node == binary.left {
+                return true;
+            }
+            current = arena.get(node).and_then(|node| node.parent);
+        }
+        false
+    })
+}
+
+fn source_private_get_precedes_set_helper(arena: &NodeArena) -> bool {
+    arena
+        .iter()
+        .filter_map(|(id, node)| {
+            let NodeData::PropertyAccessExpression(access) = &node.data else {
+                return None;
+            };
+            matches!(
+                arena.get(access.name).map(|node| &node.data),
+                Some(NodeData::PrivateIdentifier(_))
+            )
+            .then_some((node.range.start, private_access_first_helper_is_get(arena, id)))
+        })
+        .min_by_key(|(start, _)| *start)
+        .is_some_and(|(_, get)| get)
+}
+
+fn private_access_first_helper_is_get(arena: &NodeArena, access: NodeId) -> bool {
+    if private_access_is_within_simple_assignment_target(arena, access) {
+        return false;
+    }
+    let mut current = access;
+    while let Some(parent) = arena.get(current).and_then(|node| node.parent) {
+        match arena.get(parent).map(|node| &node.data) {
+            Some(NodeData::BinaryExpression(binary)) if binary.left == current => {
+                return !arena
+                    .get(binary.operator_token)
+                    .is_some_and(|operator| operator.kind == SyntaxKind::EqualsToken);
+            }
+            Some(NodeData::PrefixUnaryExpression(unary)) if unary.operand == current => {
+                return true;
+            }
+            Some(NodeData::PostfixUnaryExpression(unary)) if unary.operand == current => {
+                return true;
+            }
+            Some(
+                NodeData::ParenthesizedExpression(_)
+                    | NodeData::AsExpression(_)
+                    | NodeData::SatisfiesExpression(_)
+                    | NodeData::TypeAssertion(_)
+                    | NodeData::NonNullExpression(_),
+            ) => current = parent,
+            _ => return true,
+        }
+    }
+    true
 }
 
 fn source_needs_private_field_in_helper(arena: &NodeArena) -> bool {
@@ -26576,8 +26661,16 @@ struct AnonymousPrivateClassPlan {
 struct PrivateDestructuringRewrite {
     receiver: NodeId,
     receiver_temp: String,
+    capture_receiver: bool,
     value_temp: String,
     storage: String,
+}
+
+#[derive(Clone)]
+struct PrivateUpdateTemps {
+    receiver: Option<String>,
+    value: String,
+    result: Option<String>,
 }
 
 type ParameterNameOverride = (NodeId, NodeId, String);
@@ -26746,6 +26839,7 @@ struct Printer<'a> {
     active_anonymous_private_class: Option<NodeId>,
     private_destructuring_rewrites: HashMap<NodeId, PrivateDestructuringRewrite>,
     private_compound_assignment_receiver_temps: HashMap<NodeId, String>,
+    private_update_temps: HashMap<NodeId, PrivateUpdateTemps>,
     preemitted_source_prologues: HashSet<NodeId>,
     preemitted_captured_while_loops: HashMap<NodeId, String>,
     captured_loop_body: Option<NodeId>,
@@ -26776,6 +26870,19 @@ struct StaticBlockDeclarationPlan {
 }
 
 impl Printer<'_> {
+    fn unwrap_erased_expression(&self, mut expression: NodeId) -> NodeId {
+        loop {
+            expression = match self.arena.get(expression).map(|node| &node.data) {
+                Some(NodeData::ParenthesizedExpression(data)) => data.expression,
+                Some(NodeData::AsExpression(data)) => data.expression,
+                Some(NodeData::SatisfiesExpression(data)) => data.expression,
+                Some(NodeData::TypeAssertion(data)) => data.expression,
+                Some(NodeData::NonNullExpression(data)) => data.expression,
+                _ => return expression,
+            };
+        }
+    }
+
     fn constant_property_name(&self, expression: NodeId) -> Option<String> {
         match &self.arena.get(expression)?.data {
             NodeData::StringLiteral(literal) => Some(literal.text.clone()),
@@ -27922,17 +28029,33 @@ impl Printer<'_> {
             })
             .collect::<Vec<_>>();
         candidates.sort_by_key(|(_, start, _, _)| *start);
+        let mut claimed = self.generated_names.used.clone();
         let mut declarations = Vec::new();
-        for (index, (id, _, receiver, storage)) in candidates.into_iter().enumerate() {
-            let receiver_temp = local_temp_name(index.saturating_mul(2));
-            let value_temp = local_temp_name(index.saturating_mul(2).saturating_add(1));
-            declarations.push(receiver_temp.clone());
+        let mut planned = Vec::new();
+        for (id, _, receiver, storage) in candidates {
+            let simple_receiver = self.arena.get(receiver).and_then(|node| match &node.data {
+                NodeData::Identifier(identifier) => Some(identifier.text.clone()),
+                _ => None,
+            });
+            let (receiver_temp, capture_receiver) = if let Some(receiver) = simple_receiver {
+                (receiver, false)
+            } else {
+                let temp = self.generate_block_temp(body, &claimed);
+                claimed.insert(temp.clone());
+                declarations.push(temp.clone());
+                (temp, true)
+            };
+            planned.push((id, receiver, storage, receiver_temp, capture_receiver));
+        }
+        let value_temp = self.generate_block_temp(body, &claimed);
+        for (id, receiver, storage, receiver_temp, capture_receiver) in planned {
             self.private_destructuring_rewrites.insert(
                 id,
                 PrivateDestructuringRewrite {
                     receiver,
                     receiver_temp,
-                    value_temp,
+                    capture_receiver,
+                    value_temp: value_temp.clone(),
                     storage,
                 },
             );
@@ -36821,6 +36944,14 @@ impl Printer<'_> {
             self.writer.write("{ }");
             return Ok(());
         }
+        let function_body = self.function_like_body_parameters(id).is_some();
+        let previous_private_destructuring_rewrites = function_body
+            .then(|| std::mem::take(&mut self.private_destructuring_rewrites));
+        let private_destructuring_temps = if function_body {
+            self.prepare_private_destructuring_rewrites(id)
+        } else {
+            Vec::new()
+        };
         self.writer.write("{");
         self.writer.newline();
         self.writer.indent += 1;
@@ -36828,6 +36959,12 @@ impl Printer<'_> {
         self.prepare_class_expression_temps(id, data);
         self.emit_commonjs_destructuring_assignment_hoists_for_body(id);
         self.emit_private_field_declarations_for_scope(id);
+        if !private_destructuring_temps.is_empty() {
+            self.writer.write("var ");
+            self.writer.write(&private_destructuring_temps.join(", "));
+            self.writer.write(";");
+            self.writer.newline();
+        }
         if let Some((_, names)) = self
             .async_generator_hoists
             .as_ref()
@@ -36933,6 +37070,9 @@ impl Printer<'_> {
         self.namespace_declarations.pop();
         self.writer.indent -= 1;
         self.writer.write("}");
+        if let Some(previous) = previous_private_destructuring_rewrites {
+            self.private_destructuring_rewrites = previous;
+        }
         Ok(())
     }
 
@@ -37211,6 +37351,7 @@ impl Printer<'_> {
                 &mut claimed,
                 &mut temps,
             );
+            self.prepare_private_update_temps(block_id, &mut claimed, &mut temps);
             self.prepare_private_tagged_template_receiver_temps(
                 block_id,
                 &mut claimed,
@@ -37374,6 +37515,113 @@ impl Printer<'_> {
             self.private_compound_assignment_receiver_temps
                 .insert(assignment, temp.clone());
             temps.push(temp);
+        }
+    }
+
+    fn prepare_private_update_temps(
+        &mut self,
+        body: NodeId,
+        claimed: &mut HashSet<String>,
+        temps: &mut Vec<String>,
+    ) {
+        let mut local_claimed = self
+            .arena
+            .iter()
+            .filter_map(|(id, node)| {
+                let NodeData::Identifier(identifier) = &node.data else {
+                    return None;
+                };
+                self.node_is_descendant_of(id, body)
+                    .then(|| identifier.text.clone())
+            })
+            .collect::<HashSet<_>>();
+        local_claimed.extend(temps.iter().cloned());
+        let mut updates = self
+            .arena
+            .iter()
+            .filter_map(|(id, node)| {
+                let (operand, postfix) = match &node.data {
+                    NodeData::PrefixUnaryExpression(unary)
+                        if matches!(
+                            unary.operator,
+                            SyntaxKind::PlusPlusToken | SyntaxKind::MinusMinusToken
+                        ) => (unary.operand, false),
+                    NodeData::PostfixUnaryExpression(unary)
+                        if matches!(
+                            unary.operator,
+                            SyntaxKind::PlusPlusToken | SyntaxKind::MinusMinusToken
+                        ) => (unary.operand, true),
+                    _ => return None,
+                };
+                if self.private_update_temps.contains_key(&id) {
+                    return None;
+                }
+                let target = self.unwrap_erased_expression(operand);
+                let NodeData::PropertyAccessExpression(access) = &self.arena.get(target)?.data
+                else {
+                    return None;
+                };
+                if self.active_private_field(access.name).is_none() {
+                    return None;
+                }
+                let mut current = id;
+                while let Some(parent) = self.arena.get(current).and_then(|node| node.parent) {
+                    if parent == body {
+                        return Some((node.range.start, id, access.expression, postfix));
+                    }
+                    if matches!(
+                        self.arena.get(parent).map(|node| &node.data),
+                        Some(
+                            NodeData::FunctionDeclaration(_)
+                                | NodeData::FunctionExpression(_)
+                                | NodeData::ArrowFunction(_)
+                                | NodeData::MethodDeclaration(_)
+                                | NodeData::ConstructorDeclaration(_)
+                                | NodeData::GetAccessorDeclaration(_)
+                                | NodeData::SetAccessorDeclaration(_)
+                                | NodeData::ClassDeclaration(_)
+                                | NodeData::ClassExpression(_)
+                        )
+                    ) {
+                        return None;
+                    }
+                    current = parent;
+                }
+                None
+            })
+            .collect::<Vec<_>>();
+        updates.sort_by_key(|(start, _, _, _)| *start);
+        for (_, update, receiver, postfix) in updates {
+            let receiver = (!matches!(
+                self.arena.get(receiver).map(|node| node.kind),
+                Some(SyntaxKind::Identifier | SyntaxKind::ThisKeyword)
+            ))
+            .then(|| {
+                let temp = self.generate_block_temp(body, &local_claimed);
+                local_claimed.insert(temp.clone());
+                claimed.insert(temp.clone());
+                temps.push(temp.clone());
+                temp
+            });
+            let result = (postfix && !self.expression_value_is_discarded(update)).then(|| {
+                let temp = self.generate_block_temp(body, &local_claimed);
+                local_claimed.insert(temp.clone());
+                claimed.insert(temp.clone());
+                temps.push(temp.clone());
+                temp
+            });
+            let value = self.generate_block_temp(body, &local_claimed);
+            local_claimed.insert(value.clone());
+            claimed.insert(value.clone());
+            temps.push(value.clone());
+            self.private_update_temps.insert(
+                update,
+                PrivateUpdateTemps {
+                    receiver,
+                    value,
+                    result,
+                },
+            );
         }
     }
 
@@ -37751,6 +37999,9 @@ impl Printer<'_> {
                 Some(NodeData::ParenthesizedExpression(_)) => current = parent,
                 Some(NodeData::ExpressionStatement(statement)) => {
                     return statement.expression == current;
+                }
+                Some(NodeData::ForStatement(statement)) => {
+                    return statement.incrementor == Some(current);
                 }
                 _ => return false,
             }
@@ -39258,6 +39509,10 @@ impl Printer<'_> {
     }
 
     fn emit_function_body(&mut self, body: NodeId) -> Result<(), EmitError> {
+        let previous_private_destructuring_rewrites =
+            std::mem::take(&mut self.private_destructuring_rewrites);
+        let private_destructuring_temps = self.prepare_private_destructuring_rewrites(body);
+        let force_multiline_private_destructuring = !private_destructuring_temps.is_empty();
         let force_multiline_async_super = self.emit_async_super_prelude_in_function_body
             && self
                 .active_async_super_plan
@@ -39267,7 +39522,8 @@ impl Printer<'_> {
             .async_generator_hoists
             .as_ref()
             .is_some_and(|(hoist_body, _)| *hoist_body == body);
-        if !force_multiline_async_super
+        let result = if !force_multiline_private_destructuring
+            && !force_multiline_async_super
             && !force_async_generator_hoists
             && let Some(statement) = self.single_line_body_statement(body)?
         {
@@ -39284,7 +39540,8 @@ impl Printer<'_> {
             self.writer.remove_trailing_newline();
             self.writer.write(" }");
             Ok(())
-        } else if !force_multiline_async_super
+        } else if !force_multiline_private_destructuring
+            && !force_multiline_async_super
             && !force_async_generator_hoists
             && let Some(statements) = self.compact_function_body_statements(body)?
         {
@@ -39301,7 +39558,9 @@ impl Printer<'_> {
             Ok(())
         } else {
             self.emit_block(body)
-        }
+        };
+        self.private_destructuring_rewrites = previous_private_destructuring_rewrites;
+        result
     }
 
     fn emit_compact_body_prelude(&mut self, body: NodeId) -> Result<(), EmitError> {
@@ -52596,7 +52855,9 @@ impl Printer<'_> {
                         self.writer.write("static ");
                     }
                     self.emit_expression(property.name, 0)?;
-                    if let Some(initializer) = property.initializer {
+                    if let Some(initializer) = property.initializer
+                        && !self.native_private_instance_initializer_is_lowered(property)
+                    {
                         self.writer.write(" = ");
                         self.emit_expression(initializer, 1)?;
                     }
@@ -55957,7 +56218,8 @@ impl Printer<'_> {
                 && matches!(
                     &node.data,
                     NodeData::PropertyDeclaration(property)
-                        if !self.property_is_native_private_field(property)
+                        if (!self.property_is_native_private_field(property)
+                            || self.native_private_instance_initializer_is_lowered(property))
                             && (matches!(
                                 self.arena.get(property.name).map(|node| &node.data),
                                 Some(NodeData::PrivateIdentifier(_))
@@ -56138,7 +56400,9 @@ impl Printer<'_> {
             if self.property_is_static(property) {
                 continue;
             }
-            if self.property_is_native_private_field(property) {
+            if self.property_is_native_private_field(property)
+                && !self.native_private_instance_initializer_is_lowered(property)
+            {
                 continue;
             }
             if self.class_private_name_is_duplicate(data, property.name)
@@ -56231,7 +56495,12 @@ impl Printer<'_> {
                 self.emit_class_field_definition(receiver, property.name, initializer)?;
             } else {
                 self.writer.write(receiver);
-                self.emit_downlevel_member_access(property.name)?;
+                if self.native_private_instance_initializer_is_lowered(property) {
+                    self.writer.write(".");
+                    self.emit_expression(property.name, 0)?;
+                } else {
+                    self.emit_downlevel_member_access(property.name)?;
+                }
                 self.writer.write(" = ");
                 self.emit_expression(
                     initializer.expect("assignment fields require initializer"),
@@ -56286,6 +56555,16 @@ impl Printer<'_> {
                 self.arena.get(property.name).map(|node| &node.data),
                 Some(NodeData::PrivateIdentifier(_))
             )
+    }
+
+    fn native_private_instance_initializer_is_lowered(
+        &self,
+        property: &ts_ast::PropertyDeclarationData,
+    ) -> bool {
+        self.property_is_native_private_field(property)
+            && !self.property_is_static(property)
+            && property.initializer.is_some()
+            && self.settings.use_define_for_class_fields == Some(false)
     }
 
     fn emit_class_field_definition(
@@ -61673,6 +61952,14 @@ impl Printer<'_> {
                 }
             }
             NodeData::PrefixUnaryExpression(data) => {
+                if self.emit_private_field_update(
+                    id,
+                    data.operand,
+                    data.operator,
+                    false,
+                )? {
+                    return Ok(());
+                }
                 if self.emit_static_super_update(id, data.operand, data.operator, false)? {
                     return Ok(());
                 }
@@ -61731,6 +62018,14 @@ impl Printer<'_> {
                 }
             }
             NodeData::PostfixUnaryExpression(data) => {
+                if self.emit_private_field_update(
+                    id,
+                    data.operand,
+                    data.operator,
+                    true,
+                )? {
+                    return Ok(());
+                }
                 if self.emit_static_super_update(id, data.operand, data.operator, true)? {
                     return Ok(());
                 }
@@ -64389,6 +64684,72 @@ impl Printer<'_> {
         Ok(true)
     }
 
+    fn emit_private_field_update(
+        &mut self,
+        expression: NodeId,
+        operand: NodeId,
+        operator: SyntaxKind,
+        postfix: bool,
+    ) -> Result<bool, EmitError> {
+        let Some(temps) = self.private_update_temps.get(&expression).cloned() else {
+            return Ok(false);
+        };
+        let target = self.unwrap_erased_expression(operand);
+        let Some(NodeData::PropertyAccessExpression(access)) =
+            self.arena.get(target).map(|node| &node.data)
+        else {
+            return Ok(false);
+        };
+        let Some(field) = self.active_private_field(access.name).cloned() else {
+            return Ok(false);
+        };
+        if temps.result.is_some() {
+            self.writer.write("(");
+        }
+        self.emit_helper_reference("__classPrivateFieldSet");
+        self.writer.write("(");
+        if let Some(receiver) = &temps.receiver {
+            self.writer.write(receiver);
+            self.writer.write(" = ");
+        }
+        self.emit_expression(access.expression, 1)?;
+        self.writer.write(", ");
+        self.writer.write(&field.storage);
+        self.writer.write(", (");
+        self.writer.write(&temps.value);
+        self.writer.write(" = ");
+        self.emit_helper_reference("__classPrivateFieldGet");
+        self.writer.write("(");
+        if let Some(receiver) = &temps.receiver {
+            self.writer.write(receiver);
+        } else {
+            self.emit_expression(access.expression, 1)?;
+        }
+        self.writer.write(", ");
+        self.writer.write(&field.storage);
+        self.writer.write(", \"f\"), ");
+        if postfix {
+            if let Some(result) = &temps.result {
+                self.writer.write(result);
+                self.writer.write(" = ");
+            }
+            self.writer.write(&temps.value);
+            self.writer.write(operator_text(operator).unwrap_or("++"));
+            self.writer.write(", ");
+            self.writer.write(&temps.value);
+        } else {
+            self.writer.write(operator_text(operator).unwrap_or("++"));
+            self.writer.write(&temps.value);
+        }
+        self.writer.write("), \"f\")");
+        if let Some(result) = &temps.result {
+            self.writer.write(", ");
+            self.writer.write(result);
+            self.writer.write(")");
+        }
+        Ok(true)
+    }
+
     fn emit_static_super_update(
         &mut self,
         expression: NodeId,
@@ -64621,6 +64982,10 @@ impl Printer<'_> {
                 .arena
                 .get(binary.operator_token)
                 .is_some_and(|operator| operator.kind == SyntaxKind::EqualsToken)
+            && matches!(
+                self.arena.get(binary.left).map(|node| &node.data),
+                Some(NodeData::ObjectLiteralExpression(_) | NodeData::ArrayLiteralExpression(_))
+            )
         {
             let mut rewrites = self
                 .private_destructuring_rewrites
@@ -64630,6 +64995,9 @@ impl Printer<'_> {
                 .collect::<Vec<_>>();
             rewrites.sort_by(|left, right| left.receiver_temp.cmp(&right.receiver_temp));
             for rewrite in rewrites {
+                if !rewrite.capture_receiver {
+                    continue;
+                }
                 self.writer.write(&rewrite.receiver_temp);
                 self.writer.write(" = ");
                 self.emit_expression(rewrite.receiver, 1)?;
@@ -64640,8 +65008,9 @@ impl Printer<'_> {
             self.arena.get(expression).map(|node| &node.data)
             && let Some(operator) = self.arena.get(binary.operator_token).map(|node| node.kind)
             && operator.is_compound_assignment_operator()
+            && let private_target = self.unwrap_erased_expression(binary.left)
             && let Some(NodeData::PropertyAccessExpression(access)) =
-                self.arena.get(binary.left).map(|node| &node.data)
+                self.arena.get(private_target).map(|node| &node.data)
             && let Some(field) = self.active_private_field(access.name).cloned()
         {
             let receiver_temp = self
@@ -64698,9 +65067,11 @@ impl Printer<'_> {
                 .arena
                 .get(binary.operator_token)
                 .is_some_and(|operator| operator.kind == SyntaxKind::EqualsToken)
+            && let private_target = self.unwrap_erased_expression(binary.left)
             && let Some(NodeData::PropertyAccessExpression(access)) =
-                self.arena.get(binary.left).map(|node| &node.data)
+                self.arena.get(private_target).map(|node| &node.data)
             && self.active_private_accessor_exists(access.name)
+            && !self.private_destructuring_rewrites.contains_key(&private_target)
         {
             let Some(plan) = self.active_private_method_plan.clone() else {
                 return Err(Self::unsupported(expression, SyntaxKind::BinaryExpression));
@@ -64735,9 +65106,11 @@ impl Printer<'_> {
                 .arena
                 .get(binary.operator_token)
                 .is_some_and(|operator| operator.kind == SyntaxKind::EqualsToken)
+            && let private_target = self.unwrap_erased_expression(binary.left)
             && let Some(NodeData::PropertyAccessExpression(access)) =
-                self.arena.get(binary.left).map(|node| &node.data)
+                self.arena.get(private_target).map(|node| &node.data)
             && let Some(field) = self.active_private_field(access.name).cloned()
+            && !self.private_destructuring_rewrites.contains_key(&private_target)
         {
             self.emit_helper_reference("__classPrivateFieldSet");
             self.writer.write("(");
@@ -67441,15 +67814,6 @@ fn normalize_jsx_text(text: &str) -> String {
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-fn local_temp_name(index: usize) -> String {
-    let letter = char::from(b'a'.saturating_add(u8::try_from(index % 26).unwrap_or(0)));
-    if index < 26 {
-        format!("_{letter}")
-    } else {
-        format!("_{letter}_{}", index / 26)
-    }
 }
 
 fn generated_temp_name(count: u32) -> Option<String> {
@@ -71711,6 +72075,25 @@ mod tests {
             "{output}"
         );
         assert!(output.ends_with("_A_value = new WeakMap();\n"), "{output}");
+    }
+
+    #[test]
+    fn lowers_private_fields_in_method_destructuring_without_a_get_helper() {
+        let output = emit_with(
+            "class A { #field: number; static write(value: A) { [value.#field] = [1]; } }",
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(output.contains("var __classPrivateFieldSet"), "{output}");
+        assert!(!output.contains("var __classPrivateFieldGet"), "{output}");
+        assert!(
+            output.contains(concat!(
+                "[({ set value(_a) { ",
+                "__classPrivateFieldSet(value, _A_field, _a, \"f\"); } }).value] = [1];",
+            )),
+            "{output}"
+        );
     }
 
     #[test]
