@@ -2725,10 +2725,17 @@ impl<'a> ProgramChecker<'a> {
             if let Some(name) = clause_data.name
                 && let Some(symbol) = source.bindings.node_symbols.get(&name)
             {
+                let reference_module = self.preferred_import_reference_specifier(
+                    source,
+                    "default",
+                    specifier,
+                    preliminary,
+                    completed,
+                );
                 Self::bind_import(
                     *symbol,
                     "default",
-                    specifier,
+                    &reference_module,
                     name,
                     &module_exports,
                     &mut symbols,
@@ -2758,10 +2765,17 @@ impl<'a> ProgramChecker<'a> {
                     else {
                         continue;
                     };
+                    let reference_module = self.preferred_import_reference_specifier(
+                        source,
+                        imported_name,
+                        specifier,
+                        preliminary,
+                        completed,
+                    );
                     Self::bind_import(
                         *symbol,
                         imported_name,
-                        specifier,
+                        &reference_module,
                         *specifier_node,
                         &module_exports,
                         &mut symbols,
@@ -2840,6 +2854,59 @@ impl<'a> ProgramChecker<'a> {
             }
         }
         (symbols, import_references, diagnostics, runtime_meanings)
+    }
+
+    fn preferred_import_reference_specifier(
+        &self,
+        source: &ProgramSource<'_>,
+        imported_name: &str,
+        module_name: &str,
+        preliminary: &[CheckResult],
+        completed: &[CheckResult],
+    ) -> String {
+        if is_relative_module_specifier(module_name) {
+            return module_name.to_owned();
+        }
+        let package_part_count = if module_name.starts_with('@') { 2 } else { 1 };
+        let module_part_count = module_name.split('/').count();
+        if module_part_count == package_part_count {
+            return module_name.to_owned();
+        }
+        let package_root = module_name
+            .split('/')
+            .take(package_part_count)
+            .collect::<Vec<_>>()
+            .join("/");
+        source
+            .resolved_modules
+            .iter()
+            .filter(|(candidate, _)| {
+                !is_relative_module_specifier(candidate)
+                    && candidate.split('/').count() < module_part_count
+                    && candidate
+                        .split('/')
+                        .take(package_part_count)
+                        .collect::<Vec<_>>()
+                        .join("/")
+                        == package_root
+            })
+            .filter_map(|(candidate, target)| {
+                let result = completed
+                    .get(*target)
+                    .or_else(|| preliminary.get(*target))?;
+                self.resolved_module_exports(
+                    *target,
+                    candidate,
+                    result,
+                    preliminary,
+                    completed,
+                )
+                .contains_key(imported_name)
+                .then_some(candidate)
+            })
+            .min_by_key(|candidate| (candidate.split('/').count(), candidate.len()))
+            .cloned()
+            .unwrap_or_else(|| module_name.to_owned())
     }
 
     fn import_rebase_paths(&self, source: usize, target: usize) -> Option<(&str, &str)> {
