@@ -361,6 +361,7 @@ pub fn emit_source_file_with_context(
         es5_async_control_targets: Vec::new(),
         es5_async_hoisted_variable_lists: HashSet::new(),
         es5_async_hoisted_function_declarations: HashSet::new(),
+        async_generator_hoists: None,
         es5_async_for_of_names: HashMap::new(),
         es5_async_for_in_plans: HashMap::new(),
         async_loop_counter: 0,
@@ -390,6 +391,7 @@ pub fn emit_source_file_with_context(
         preemitted_captured_while_loops: HashMap::new(),
         captured_loop_body: None,
         active_async_super_plan: None,
+        emit_async_super_prelude_in_function_body: false,
         downlevel_super_context: None,
         downlevel_constructor_super_capture: None,
         is_external_module: false,
@@ -26445,6 +26447,7 @@ struct Printer<'a> {
     es5_async_control_targets: Vec<Es5AsyncControlTarget>,
     es5_async_hoisted_variable_lists: HashSet<NodeId>,
     es5_async_hoisted_function_declarations: HashSet<NodeId>,
+    async_generator_hoists: Option<(NodeId, Vec<String>)>,
     es5_async_for_of_names: HashMap<NodeId, Es5AsyncForOfPlan>,
     es5_async_for_in_plans: HashMap<NodeId, Es5AsyncForInPlan>,
     async_loop_counter: u32,
@@ -26474,6 +26477,7 @@ struct Printer<'a> {
     preemitted_captured_while_loops: HashMap<NodeId, String>,
     captured_loop_body: Option<NodeId>,
     active_async_super_plan: Option<AsyncSuperPlan>,
+    emit_async_super_prelude_in_function_body: bool,
     downlevel_super_context: Option<(String, bool)>,
     downlevel_constructor_super_capture: Option<String>,
     is_external_module: bool,
@@ -35821,6 +35825,24 @@ impl Printer<'_> {
         self.prepare_class_expression_temps(id, data);
         self.emit_commonjs_destructuring_assignment_hoists_for_body(id);
         self.emit_private_field_declarations_for_scope(id);
+        if let Some((_, names)) = self
+            .async_generator_hoists
+            .as_ref()
+            .filter(|(body, _)| *body == id)
+        {
+            self.writer.write("var ");
+            self.writer.write(&names.join(", "));
+            self.writer.write(";");
+            self.writer.newline();
+        }
+        if self.emit_async_super_prelude_in_function_body
+            && self
+                .active_async_super_plan
+                .as_ref()
+                .is_some_and(|plan| plan.body == id)
+        {
+            self.emit_async_super_prelude(false);
+        }
         let mut previous_end = node.range.start.get().saturating_add(1);
         if self.body_opening_line_comment_is_unowned(id) {
             let comment_end = data
@@ -37342,7 +37364,19 @@ impl Printer<'_> {
     }
 
     fn emit_function_body(&mut self, body: NodeId) -> Result<(), EmitError> {
-        if let Some(statement) = self.single_line_body_statement(body)? {
+        let force_multiline_async_super = self.emit_async_super_prelude_in_function_body
+            && self
+                .active_async_super_plan
+                .as_ref()
+                .is_some_and(|plan| plan.body == body && plan.has_element_access);
+        let force_async_generator_hoists = self
+            .async_generator_hoists
+            .as_ref()
+            .is_some_and(|(hoist_body, _)| *hoist_body == body);
+        if !force_multiline_async_super
+            && !force_async_generator_hoists
+            && let Some(statement) = self.single_line_body_statement(body)?
+        {
             let body_node = self.node(body)?.clone();
             let statement_node = self.node(statement)?.clone();
             self.writer.write("{ ");
@@ -37356,7 +37390,10 @@ impl Printer<'_> {
             self.writer.remove_trailing_newline();
             self.writer.write(" }");
             Ok(())
-        } else if let Some(statements) = self.compact_function_body_statements(body)? {
+        } else if !force_multiline_async_super
+            && !force_async_generator_hoists
+            && let Some(statements) = self.compact_function_body_statements(body)?
+        {
             self.writer.write("{ ");
             self.emit_compact_body_prelude(body)?;
             for (index, statement) in statements.iter().enumerate() {
@@ -37380,6 +37417,14 @@ impl Printer<'_> {
         };
         self.prepare_class_expression_temps(body, block);
         self.emit_commonjs_destructuring_assignment_hoists_for_body(body);
+        if self.emit_async_super_prelude_in_function_body
+            && self
+                .active_async_super_plan
+                .as_ref()
+                .is_some_and(|plan| plan.body == body)
+        {
+            self.emit_async_super_prelude(false);
+        }
         if self.writer.line_start {
             self.writer.remove_trailing_newline();
             self.writer.write(" ");
@@ -37674,7 +37719,7 @@ impl Printer<'_> {
         })
     }
 
-    fn emit_async_super_prelude(&mut self) {
+    fn emit_async_super_prelude(&mut self, include_empty_property_capture: bool) {
         let Some(plan) = self.active_async_super_plan.clone() else {
             return;
         };
@@ -37696,7 +37741,15 @@ impl Printer<'_> {
             }
             self.writer.newline();
         }
-        if !plan.property_names.is_empty() {
+        if plan.property_names.is_empty()
+            && plan.has_element_access
+            && include_empty_property_capture
+        {
+            self.writer.write("const ");
+            self.writer.write(&plan.property_capture);
+            self.writer.write(" = Object.create(null, {});");
+            self.writer.newline();
+        } else if !plan.property_names.is_empty() {
             self.writer.write("const ");
             self.writer.write(&plan.property_capture);
             self.writer.write(" = Object.create(null, {");
@@ -37832,7 +37885,7 @@ impl Printer<'_> {
         self.writer.write("{");
         self.writer.newline();
         self.writer.indent += 1;
-        self.emit_async_super_prelude();
+        self.emit_async_super_prelude(false);
         let arguments_alias = self
             .subtree_uses_lexical_arguments(body, true)
             .then(|| self.generate_arguments_capture_name());
@@ -39019,6 +39072,7 @@ impl Printer<'_> {
         self.writer.write("{");
         self.writer.newline();
         self.writer.indent += 1;
+        self.emit_async_super_prelude(true);
         self.writer.write("return ");
         self.emit_helper_reference("__asyncGenerator");
         self.writer.write("(this, arguments, function* ");
@@ -46241,6 +46295,17 @@ impl Printer<'_> {
         let NodeData::VariableDeclarationList(list) = &node.data else {
             return Err(Self::unsupported(initializer, node.kind));
         };
+        let in_for_initializer = node.parent.is_some_and(|parent| {
+            matches!(
+                self.arena.get(parent).map(|node| &node.data),
+                Some(NodeData::ForStatement(statement))
+                    if statement.initializer == Some(initializer)
+            ) || matches!(
+                self.arena.get(parent).map(|node| &node.data),
+                Some(NodeData::ForInOrOfStatement(statement))
+                    if statement.initializer == initializer
+            )
+        });
         let mut emitted = false;
         for declaration in &list.declarations.nodes {
             let declaration_node = self.node(*declaration)?.clone();
@@ -46253,9 +46318,47 @@ impl Printer<'_> {
             if emitted {
                 self.writer.write(", ");
             }
-            self.emit_expression(declaration.name, 1)?;
-            self.writer.write(" = ");
-            self.emit_expression(value, 1)?;
+            let object_pattern = self
+                .arena
+                .get(declaration.name)
+                .is_some_and(|name| name.kind == SyntaxKind::ObjectBindingPattern);
+            let has_object_rest = self.settings.target < ScriptTarget::Es2018
+                && self.binding_pattern_contains_object_rest(declaration.name);
+            if has_object_rest {
+                let pure_root_rest = matches!(
+                    self.arena.get(declaration.name).map(|node| &node.data),
+                    Some(NodeData::BindingPattern(pattern))
+                        if pattern.elements.nodes.iter().all(|element| {
+                            matches!(
+                                self.arena.get(*element).map(|node| &node.data),
+                                Some(NodeData::BindingElement(element))
+                                    if element.dot_dot_dot_token.is_some()
+                            )
+                        })
+                );
+                if object_pattern && !pure_root_rest && !in_for_initializer {
+                    self.writer.write("(");
+                }
+                let mut assignment_emitted = false;
+                self.emit_object_rest_variable_declarators(
+                    declaration.name,
+                    value,
+                    &mut assignment_emitted,
+                )?;
+                if object_pattern && !pure_root_rest && !in_for_initializer {
+                    self.writer.write(")");
+                }
+            } else {
+                if object_pattern && !in_for_initializer {
+                    self.writer.write("(");
+                }
+                self.emit_expression(declaration.name, 1)?;
+                self.writer.write(" = ");
+                self.emit_expression(value, 1)?;
+                if object_pattern && !in_for_initializer {
+                    self.writer.write(")");
+                }
+            }
             emitted = true;
         }
         Ok(emitted)
@@ -46666,6 +46769,81 @@ impl Printer<'_> {
         this_argument: &str,
         parameters: Option<&NodeList>,
     ) -> Result<(), EmitError> {
+        let mut shadowed_lists = HashSet::new();
+        let mut shadowed_names = Vec::new();
+        if expression_body.is_none() {
+            self.collect_es5_async_variable_hoists(
+                body,
+                &mut shadowed_lists,
+                &mut shadowed_names,
+            );
+            self.collect_es5_async_for_hoists(
+                body,
+                &mut shadowed_lists,
+                &mut shadowed_names,
+            );
+            shadowed_lists.retain(|list| {
+                self.arena
+                    .get(*list)
+                    .is_some_and(|list| !variable_list_is_block_scoped(list))
+                    && !self.async_variable_list_is_catch_scoped(*list)
+            });
+            let mut ordered_lists = shadowed_lists.iter().copied().collect::<Vec<_>>();
+            ordered_lists.sort_by_key(|list| {
+                self.arena.get(*list).map(|list| list.range.start)
+            });
+            shadowed_names.clear();
+            for list in ordered_lists {
+                for name in simple_variable_names(self.arena, list) {
+                    push_unique(&mut shadowed_names, &name);
+                }
+            }
+            let mut parameter_names = Vec::new();
+            if let Some(parameters) = self.function_like_body_parameters(body) {
+                for parameter in &parameters.nodes {
+                    if let Some(NodeData::ParameterDeclaration(parameter)) =
+                        self.arena.get(*parameter).map(|node| &node.data)
+                    {
+                        collect_binding_names(self.arena, parameter.name, &mut parameter_names);
+                    }
+                }
+            }
+            shadowed_lists.retain(|list| {
+                simple_variable_names(self.arena, *list)
+                    .iter()
+                    .any(|name| parameter_names.contains(name))
+            });
+            let mut ordered_lists = shadowed_lists.iter().copied().collect::<Vec<_>>();
+            ordered_lists.sort_by_key(|list| {
+                self.arena.get(*list).map(|list| list.range.start)
+            });
+            shadowed_names.clear();
+            for list in ordered_lists {
+                for name in simple_variable_names(self.arena, list) {
+                    push_unique(&mut shadowed_names, &name);
+                }
+            }
+            if !shadowed_names
+                .iter()
+                .any(|name| parameter_names.contains(name))
+            {
+                shadowed_lists.clear();
+                shadowed_names.clear();
+            }
+        }
+        let previous_hoisted_lists = if shadowed_lists.is_empty() {
+            None
+        } else {
+            Some(std::mem::replace(
+                &mut self.es5_async_hoisted_variable_lists,
+                shadowed_lists,
+            ))
+        };
+        let previous_generator_hoists = if shadowed_names.is_empty() {
+            None
+        } else {
+            Some(self.async_generator_hoists.replace((body, shadowed_names)))
+        };
         self.emit_awaiter_reference();
         self.writer.write("(");
         self.writer.write(this_argument);
@@ -46694,9 +46872,48 @@ impl Printer<'_> {
             }
         });
         self.async_expression_transform = previous;
+        if let Some(previous) = previous_hoisted_lists {
+            self.es5_async_hoisted_variable_lists = previous;
+        }
+        if let Some(previous) = previous_generator_hoists {
+            self.async_generator_hoists = previous;
+        }
         result?;
         self.writer.write(")");
         Ok(())
+    }
+
+    fn async_variable_list_is_catch_scoped(&self, list: NodeId) -> bool {
+        let list_names = simple_variable_names(self.arena, list);
+        if list_names.is_empty() {
+            return false;
+        }
+        let mut current = self.arena.get(list).and_then(|node| node.parent);
+        while let Some(node_id) = current {
+            let Some(node) = self.arena.get(node_id) else {
+                return false;
+            };
+            if let NodeData::CatchClause(catch) = &node.data
+                && let Some(variable) = catch.variable_declaration
+                && let Some(NodeData::VariableDeclaration(variable)) =
+                    self.arena.get(variable).map(|node| &node.data)
+            {
+                let mut catch_names = Vec::new();
+                collect_binding_names(self.arena, variable.name, &mut catch_names);
+                return list_names.iter().all(|name| catch_names.contains(name));
+            }
+            if matches!(
+                node.data,
+                NodeData::FunctionDeclaration(_)
+                    | NodeData::FunctionExpression(_)
+                    | NodeData::ArrowFunction(_)
+                    | NodeData::MethodDeclaration(_)
+            ) {
+                return false;
+            }
+            current = node.parent;
+        }
+        false
     }
 
     fn emit_awaiter_call_with_arrow_parameters(
@@ -46987,9 +47204,27 @@ impl Printer<'_> {
         let NodeData::Block(block) = &body_node.data else {
             return Err(Self::unsupported(body, body_node.kind));
         };
+        let mut previous_end = body_node.range.start.get().saturating_add(1);
+        let mut previous_emitted = false;
         for statement in &block.statements.nodes {
+            let statement_node = self.node(*statement)?.clone();
+            let current_emitted = self.statement_emits_in_place(*statement, &statement_node);
+            self.emit_source_comments_between_with_ownership(
+                previous_end,
+                statement_node.range.start.get(),
+                previous_emitted
+                    || previous_end == body_node.range.start.get().saturating_add(1),
+                current_emitted,
+            );
             self.emit_statement(*statement)?;
+            previous_end = statement_node.range.end.get();
+            previous_emitted = statement_emits_javascript(self.arena, &statement_node);
         }
+        self.emit_source_comments_between_with_trailing(
+            previous_end,
+            body_node.range.end.get().saturating_sub(1),
+            previous_emitted,
+        );
         Ok(())
     }
 
@@ -49897,6 +50132,9 @@ impl Printer<'_> {
                     }
                     let is_async =
                         self.has_modifier(method.modifiers.as_ref(), SyntaxKind::AsyncKeyword);
+                    let downlevel_async_generator = method.asterisk_token.is_some()
+                        && is_async
+                        && self.settings.target < ScriptTarget::Es2018;
                     let downlevel_async = method.asterisk_token.is_none()
                         && is_async
                         && self.settings.target < ScriptTarget::Es2017;
@@ -49907,16 +50145,30 @@ impl Printer<'_> {
                     {
                         self.writer.write("static ");
                     }
-                    if !downlevel_async && is_async {
+                    if !downlevel_async && !downlevel_async_generator && is_async {
                         self.writer.write("async ");
                     }
-                    if method.asterisk_token.is_some() {
+                    if method.asterisk_token.is_some() && !downlevel_async_generator {
                         self.writer.write("*");
                     }
                     self.emit_class_member_name(data, member_index, method.name, lower_fields)?;
                     self.emit_parameters(&method.parameters)?;
                     self.writer.write(" ");
-                    if downlevel_async {
+                    if downlevel_async_generator {
+                        let previous_async_super_plan = self.active_async_super_plan.clone();
+                        self.active_async_super_plan = self.async_super_plan(
+                            method.body.expect("body checked above"),
+                        );
+                        let inner_name = self.generated_names.generate(
+                            declaration_name_text(self.arena, method.name).unwrap_or("_method"),
+                        );
+                        let result = self.emit_downlevel_async_generator_body(
+                            method.body.expect("body checked above"),
+                            &inner_name,
+                        );
+                        self.active_async_super_plan = previous_async_super_plan;
+                        result?;
+                    } else if downlevel_async {
                         let previous_async_super_plan = self.active_async_super_plan.clone();
                         self.active_async_super_plan = self.async_super_plan(
                             method.body.expect("body checked above"),
@@ -49928,7 +50180,22 @@ impl Printer<'_> {
                         self.active_async_super_plan = previous_async_super_plan;
                         result?;
                     } else {
-                        self.emit_function_body(method.body.expect("body checked above"))?;
+                        let body = method.body.expect("body checked above");
+                        let previous_async_super_plan = self.active_async_super_plan.clone();
+                        if self.settings.target < ScriptTarget::Es2017
+                            && self.body_has_downlevel_async_arrow(body)
+                        {
+                            self.active_async_super_plan = self.async_super_plan(body);
+                        }
+                        let previous_emit_async_super_prelude =
+                            self.emit_async_super_prelude_in_function_body;
+                        self.emit_async_super_prelude_in_function_body =
+                            self.active_async_super_plan.is_some();
+                        let result = self.emit_function_body(body);
+                        self.emit_async_super_prelude_in_function_body =
+                            previous_emit_async_super_prelude;
+                        self.active_async_super_plan = previous_async_super_plan;
+                        result?;
                     }
                     self.writer.newline();
                 }
