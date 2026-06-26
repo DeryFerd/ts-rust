@@ -11658,6 +11658,9 @@ impl DeclarationPrinter<'_> {
             .and_then(|types| types.get(&initializer))
             .and_then(|type_id| self.semantic_types?.get(*type_id))
             .is_some_and(|type_| matches!(type_.kind, TypeKind::Any));
+        if inferred_any && expression_is_class {
+            return None;
+        }
         let malformed_external_import = inferred_any
             && root_external_module
                 .is_some_and(|module| self.nested_string_module_declaration_exists(module));

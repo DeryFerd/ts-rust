@@ -7449,6 +7449,51 @@ impl<'a> Checker<'a> {
         }
     }
 
+    fn class_constructor_is_inaccessible_from(
+        &self,
+        symbol: SymbolId,
+        use_site: NodeId,
+    ) -> bool {
+        self.bindings
+            .symbols
+            .get(symbol)
+            .into_iter()
+            .flat_map(|symbol| &symbol.declarations)
+            .any(|declaration| {
+                let Some(NodeData::ClassDeclaration(class)) =
+                    self.arena.get(*declaration).map(|node| &node.data)
+                else {
+                    return false;
+                };
+                let inaccessible = class.members.nodes.iter().any(|member| {
+                    let modifiers = match self.arena.get(*member).map(|node| &node.data) {
+                        Some(NodeData::ConstructorDeclaration(constructor)) => {
+                            constructor.modifiers.as_ref()
+                        }
+                        Some(NodeData::MethodDeclaration(method))
+                            if self.property_name(method.name).as_deref()
+                                == Some("constructor") =>
+                        {
+                            method.modifiers.as_ref()
+                        }
+                        _ => return false,
+                    };
+                    self.has_ast_modifier(modifiers, SyntaxKind::PrivateKeyword)
+                        || self.has_ast_modifier(modifiers, SyntaxKind::ProtectedKeyword)
+                });
+                let mut current = use_site;
+                let mut inside_class = false;
+                while let Some(parent) = self.arena.get(current).and_then(|node| node.parent) {
+                    if parent == *declaration {
+                        inside_class = true;
+                        break;
+                    }
+                    current = parent;
+                }
+                inaccessible && !inside_class
+            })
+    }
+
     fn class_constructor_signature(
         &mut self,
         members: &[NodeId],
@@ -9448,9 +9493,12 @@ impl<'a> Checker<'a> {
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default();
-                let declared_class_value = self
-                    .resolve_value_expression_symbol(data.expression)
-                    .and_then(|symbol| {
+                let declared_class_symbol =
+                    self.resolve_value_expression_symbol(data.expression);
+                let inaccessible_constructor = declared_class_symbol.is_some_and(|symbol| {
+                    self.class_constructor_is_inaccessible_from(symbol, node_id)
+                });
+                let declared_class_value = declared_class_symbol.and_then(|symbol| {
                         self.instantiate_declared_class_value(symbol, &type_arguments)
                     });
                 let callee = declared_class_value
@@ -9460,7 +9508,11 @@ impl<'a> Checker<'a> {
                 self.preserve_literal_inference = false;
                 let result = self.call_expression_type(node_id, callee, arguments, true);
                 self.preserve_literal_inference = previous;
-                self.preserve_constructed_type_name(result, data.expression, &type_arguments)
+                if inaccessible_constructor {
+                    self.result.types.any()
+                } else {
+                    self.preserve_constructed_type_name(result, data.expression, &type_arguments)
+                }
             }
             NodeData::DeleteExpression(data) => {
                 let operand = self.type_of_expression(data.expression);
@@ -23348,6 +23400,30 @@ mod tests {
                 .collect::<Vec<_>>(),
             [18046, 7008]
         );
+    }
+
+    #[test]
+    fn inaccessible_constructor_calls_infer_any() {
+        let parsed = parse_source_file(
+            "class D { private constructor() {} } class E { protected constructor() {} } var d = new D(); var e = new E();",
+        );
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        let root = bindings.root_scope().unwrap();
+        for name in ["d", "e"] {
+            let symbol = root.symbols.get(name).unwrap();
+            let declaration = bindings.symbols.get(symbol).unwrap().declarations[0];
+            assert_eq!(result.type_of_node(declaration), Some(result.types.any()));
+            let NodeData::VariableDeclaration(variable) =
+                &parsed.arena.get(declaration).unwrap().data
+            else {
+                panic!("expected variable declaration");
+            };
+            assert_eq!(
+                result.type_of_node(variable.initializer.unwrap()),
+                Some(result.types.any())
+            );
+        }
     }
 
     #[test]
