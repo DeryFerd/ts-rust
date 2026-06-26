@@ -59926,6 +59926,12 @@ impl Printer<'_> {
             self.emit_class_empty_elements_between(previous_end, data.members.range.end.get());
         }
         self.emit_es5_auto_accessor_post_class(data, name)?;
+        if let Some(capture) = legacy_decorated_capture.as_deref() {
+            self.writer.write("var ");
+            self.writer.write(capture);
+            self.writer.write(";");
+            self.writer.newline();
+        }
         let legacy_decorated_class = self.settings.experimental_decorators
             && (!self
                 .class_decorator_expressions(data.modifiers.as_ref())
@@ -60014,12 +60020,6 @@ impl Printer<'_> {
         self.class_static_this_capture = previous_static_this_capture;
         self.this_alias = previous_this_alias;
         static_result?;
-        if let Some(capture) = legacy_decorated_capture.as_deref() {
-            self.writer.write("var ");
-            self.writer.write(capture);
-            self.writer.write(";");
-            self.writer.newline();
-        }
         self.emit_downlevel_class_decorator_metadata_temps(data);
         self.emit_class_member_decorators(data)?;
         let decorators = self.class_decorator_expressions(data.modifiers.as_ref());
