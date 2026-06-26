@@ -31079,7 +31079,9 @@ impl Printer<'_> {
             && !self.settings.no_emit_helpers
         {
             self.emit_decorate_helper();
-            if self.emit_decorator_metadata {
+            if self.emit_decorator_metadata
+                && source_needs_legacy_metadata_helper(self.arena)
+            {
                 self.emit_metadata_helper();
             }
             if source_needs_legacy_param_helper(self.arena) {
@@ -31449,6 +31451,33 @@ impl Printer<'_> {
             self.const_enum_emit_mode.preserves_declarations(),
             context.amd_generated_name_offsets,
         );
+        let mut decorated_class_captures = self
+            .legacy_decorated_class_captures
+            .iter()
+            .filter_map(|(class_id, capture)| {
+                let node = self.arena.get(*class_id)?;
+                let NodeData::ClassDeclaration(class) = &node.data else {
+                    return None;
+                };
+                let name = declaration_name_text(self.arena, class.name?)?;
+                Some((node.range.start, name.to_owned(), capture.clone()))
+            })
+            .collect::<Vec<_>>();
+        decorated_class_captures.sort_by_key(|(start, _, _)| *start);
+        for (_, class_name, capture) in decorated_class_captures {
+            if plan.hoisted_names.contains(&capture) {
+                continue;
+            }
+            if let Some(index) = plan
+                .hoisted_names
+                .iter()
+                .position(|name| name == &class_name)
+            {
+                plan.hoisted_names.insert(index, capture);
+            } else {
+                plan.hoisted_names.push(capture);
+            }
+        }
         for temp in self.prepare_source_class_static_block_declaration_plans(source_file) {
             push_unique(&mut plan.hoisted_names, &temp);
         }
@@ -31553,7 +31582,9 @@ impl Printer<'_> {
             && !self.settings.no_emit_helpers
         {
             self.emit_decorate_helper();
-            if self.emit_decorator_metadata {
+            if self.emit_decorator_metadata
+                && source_needs_legacy_metadata_helper(self.arena)
+            {
                 self.emit_metadata_helper();
             }
             if source_needs_legacy_param_helper(self.arena) {
@@ -32112,8 +32143,29 @@ impl Printer<'_> {
                 } else {
                     return self.emit_statement(statement);
                 };
+                let capture = self
+                    .legacy_decorated_class_captures
+                    .get(&statement)
+                    .cloned();
+                let class_symbol = class
+                    .name
+                    .and_then(|name| self.bindings.node_symbols.get(&name).copied())
+                    .or(class.local_symbol)
+                    .or(class.symbol);
+                let previous_rewrite = capture.as_ref().and_then(|capture| {
+                    class_symbol.and_then(|symbol| {
+                        self.identifier_rewrites
+                            .insert(symbol, capture.clone())
+                    })
+                });
                 self.writer.write(&name);
                 self.writer.write(" = ");
+                if self.settings.target < ScriptTarget::Es2022
+                    && let Some(capture) = capture.as_deref()
+                {
+                    self.writer.write(capture);
+                    self.writer.write(" = ");
+                }
                 let defer_system_static_fields = self.settings.target >= ScriptTarget::Es2015
                     && (self.settings.target < ScriptTarget::Es2022
                         || self.settings.use_define_for_class_fields == Some(false));
@@ -32145,6 +32197,18 @@ impl Printer<'_> {
                     self.writer.write(");");
                     self.writer.newline();
                 }
+                if defer_system_static_fields {
+                    self.writer.remove_trailing_newline();
+                    self.emit_native_static_fields(emitted_class)?;
+                    self.writer.newline();
+                }
+                if let Some(symbol) = class_symbol {
+                    if let Some(previous) = previous_rewrite {
+                        self.identifier_rewrites.insert(symbol, previous);
+                    } else if capture.is_some() {
+                        self.identifier_rewrites.remove(&symbol);
+                    }
+                }
                 let decorators = self.class_decorator_expressions(class.modifiers.as_ref());
                 if !decorators.is_empty()
                     || self.settings.experimental_decorators
@@ -32155,11 +32219,6 @@ impl Printer<'_> {
                 }
                 if let Some(name) = class.name {
                     self.emit_system_local_exports_for_binding(name)?;
-                }
-                if defer_system_static_fields {
-                    self.writer.remove_trailing_newline();
-                    self.emit_native_static_fields(emitted_class)?;
-                    self.writer.newline();
                 }
                 if lower_static_blocks {
                     for member in &class.members.nodes {
@@ -56272,10 +56331,6 @@ impl Printer<'_> {
             && data.name.is_some()
             && self.has_modifier(data.modifiers.as_ref(), SyntaxKind::ExportKeyword)
             && !self.has_modifier(data.modifiers.as_ref(), SyntaxKind::DefaultKeyword)
-            && self
-                .class_decorator_expressions(data.modifiers.as_ref())
-                .is_empty()
-            && !class_has_legacy_constructor_parameter_decorators(self.arena, data)
             && (self.settings.target < ScriptTarget::Es2022
                 || self.settings.use_define_for_class_fields == Some(false))
             && data.members.nodes.iter().any(|member_id| {
