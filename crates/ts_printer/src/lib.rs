@@ -47966,6 +47966,16 @@ impl Printer<'_> {
         let mut previous_emitted = false;
         for (member_index, member) in data.members.nodes.iter().enumerate() {
             let node = self.node(*member)?.clone();
+            let current_is_inline_static_field = lower_fields
+                && self.settings.target >= ScriptTarget::Es2022
+                && self.settings.use_define_for_class_fields == Some(false)
+                && matches!(
+                    &node.data,
+                    NodeData::PropertyDeclaration(property)
+                        if self.property_is_static(property)
+                            && property.initializer.is_some()
+                            && !self.property_is_native_private_field(property)
+                );
             let current_is_lowered_field = lower_fields
                 && matches!(
                     &node.data,
@@ -47991,7 +48001,8 @@ impl Printer<'_> {
                         !self.has_modifier(
                             property.modifiers.as_ref(),
                             SyntaxKind::DeclareKeyword,
-                        ) && (self.property_is_auto_accessor(property)
+                        ) && (current_is_inline_static_field
+                            || self.property_is_auto_accessor(property)
                             || !lower_fields
                             || self.property_is_native_private_field(property))
                     }
@@ -48106,6 +48117,17 @@ impl Printer<'_> {
                         node.range.end.get(),
                         comment_end,
                     )?;
+                }
+                NodeData::PropertyDeclaration(property) if current_is_inline_static_field => {
+                    self.writer.write("static { this");
+                    self.emit_downlevel_member_access(property.name)?;
+                    self.writer.write(" = ");
+                    self.emit_expression(
+                        property.initializer.expect("inline static field has initializer"),
+                        1,
+                    )?;
+                    self.writer.write("; }");
+                    self.writer.newline();
                 }
                 NodeData::PropertyDeclaration(property)
                     if lower_fields && !self.property_is_native_private_field(property) => {}
@@ -49830,6 +49852,11 @@ impl Printer<'_> {
                 continue;
             }
             if !self.property_is_static(property) {
+                continue;
+            }
+            if self.settings.target >= ScriptTarget::Es2022
+                && self.settings.use_define_for_class_fields == Some(false)
+            {
                 continue;
             }
             if self.property_is_native_private_field(property) {
@@ -62426,6 +62453,14 @@ mod tests {
     }
 
     fn emit_with_define(source: &str, target: ScriptTarget) -> super::EmitResult {
+        emit_with_class_field_semantics(source, target, true)
+    }
+
+    fn emit_with_class_field_semantics(
+        source: &str,
+        target: ScriptTarget,
+        use_define: bool,
+    ) -> super::EmitResult {
         let parsed = parse_source_file(source);
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         emit_source_file_with_settings(
@@ -62446,7 +62481,7 @@ mod tests {
                 no_emit_helpers: false,
                 experimental_decorators: false,
                 remove_comments: false,
-                use_define_for_class_fields: Some(true),
+                use_define_for_class_fields: Some(use_define),
             },
         )
         .unwrap()
@@ -66370,6 +66405,29 @@ mod tests {
                 "async function* stream(source) { await source?.next?.(); yield* source?.[0]!; } class Box { #value = 1; static count = 0; *values() { yield this.#value; } async read() { return await this.#value; } static { this.count++; } } for await (const item of items) { item; } const { first, ...rest } = input; const [head, ...tail] = items; const copy = { first, ...rest, async run() { await task; }, *iter() { yield 1; } }; const values = [0, ...items]; const typed = (value as number)! satisfies number; const run = async (value) => await value; import data from 'pkg' with { type: 'json' }; export { data } from 'pkg' with { type: 'json' };"
             ),
             "async function* stream(source) {\n    await source?.next?.();\n    yield* source?.[0];\n}\nclass Box {\n    #value = 1;\n    static count = 0;\n    *values() {\n        yield this.#value;\n    }\n    async read() {\n        return await this.#value;\n    }\n    static {\n        this.count++;\n    }\n}\nfor await (const item of items) {\n    item;\n}\nconst { first, ...rest } = input;\nconst [head, ...tail] = items;\nconst copy = { first, ...rest, async run() {\n    await task;\n}, *iter() {\n    yield 1;\n} };\nconst values = [0, ...items];\nconst typed = (value);\nconst run = async (value) => await value;\nimport data from \"pkg\" with { type: \"json\" };\nexport { data } from \"pkg\" with { type: \"json\" };\n"
+        );
+    }
+
+    #[test]
+    fn lowers_esnext_assignment_static_fields_in_place() {
+        let output = emit_with_class_field_semantics(
+            concat!(
+                "class C { private static value = 1; static #native = 2; ",
+                "static read() { return C.value + this.#native; } }",
+            ),
+            ScriptTarget::EsNext,
+            false,
+        )
+        .code;
+        assert_eq!(
+            output,
+            concat!(
+                "class C {\n",
+                "    static { this.value = 1; }\n",
+                "    static #native = 2;\n",
+                "    static read() { return C.value + this.#native; }\n",
+                "}\n",
+            )
         );
     }
 
