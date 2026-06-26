@@ -358,6 +358,7 @@ struct Parser<'a> {
     disallow_in: bool,
     await_context: bool,
     await_identifier_context: bool,
+    next_function_is_async: bool,
     type_parse_context: TypeParseContext,
 }
 
@@ -394,6 +395,7 @@ impl<'a> Parser<'a> {
             disallow_in: false,
             await_context: false,
             await_identifier_context: false,
+            next_function_is_async: false,
             type_parse_context: TypeParseContext::Normal,
         }
     }
@@ -1211,6 +1213,10 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_function_declaration(&mut self) -> NodeId {
+        let is_async = self.next_function_is_async;
+        self.next_function_is_async = false;
+        let previous_await_context = self.await_context;
+        self.await_context = is_async;
         let start = self.consume().range.start;
         let asterisk_token = if self.current.kind == SyntaxKind::AsteriskToken {
             Some(self.consume_token_node())
@@ -1264,6 +1270,7 @@ impl<'a> Parser<'a> {
         children.extend(parameters.nodes.iter().copied());
         children.extend(return_type);
         children.extend(body);
+        self.await_context = previous_await_context;
         self.alloc_node(
             SyntaxKind::FunctionDeclaration,
             TextRange::new(start, end),
@@ -1380,12 +1387,70 @@ impl<'a> Parser<'a> {
             None
         };
         let type_node = self.parse_optional_type_annotation();
-        let initializer = if self.current.kind == SyntaxKind::EqualsToken {
+        let mut await_arrow_recovery = false;
+        let mut initializer = if self.current.kind == SyntaxKind::EqualsToken {
             self.bump();
+            await_arrow_recovery = self.await_context
+                && self.current.kind == SyntaxKind::AwaitKeyword
+                && self.next_token_kind() == SyntaxKind::EqualsGreaterThanToken;
             Some(self.parse_binary_expression(2))
         } else {
             None
         };
+        if await_arrow_recovery
+            && matches!(
+                self.current.kind,
+                SyntaxKind::EqualsGreaterThanToken | SyntaxKind::AwaitKeyword
+            )
+            && let Some(left) = initializer
+        {
+            let arrow_range = if self.current.kind == SyntaxKind::EqualsGreaterThanToken {
+                self.error_current("Expected ','.");
+                self.consume().range
+            } else {
+                self.arena
+                    .get(left)
+                    .and_then(|left| match &left.data {
+                        NodeData::AwaitExpression(awaited) => {
+                            self.arena.get(awaited.expression).map(|operand| operand.range)
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or(self.current.range)
+            };
+            if self.current.kind == SyntaxKind::AwaitKeyword {
+                let right_token = self.consume();
+                let right = self.alloc_node(
+                    SyntaxKind::Identifier,
+                    right_token.range,
+                    NodeData::Identifier(Box::new(IdentifierData {
+                        flow_node: None,
+                        text: token_value(&right_token),
+                    })),
+                    &[],
+                );
+                let comma = self.alloc_node(
+                    SyntaxKind::CommaToken,
+                    arrow_range,
+                    NodeData::Token(Box::new(TokenData)),
+                    &[],
+                );
+                initializer = Some(self.alloc_node(
+                    SyntaxKind::BinaryExpression,
+                    TextRange::new(self.node_start(left), self.node_end(right)),
+                    NodeData::BinaryExpression(Box::new(BinaryExpressionData {
+                        left,
+                        operator_token: comma,
+                        right,
+                        symbol: None,
+                        type_: None,
+                        facts: 0,
+                        modifiers: None,
+                    })),
+                    &[left, comma, right],
+                ));
+            }
+        }
         let end = initializer
             .or(type_node)
             .and_then(|id| self.arena.get(id))
@@ -3728,7 +3793,16 @@ impl<'a> Parser<'a> {
         ) {
             modifiers.push(self.consume_token_node());
         }
+        let parse_in_await_context = self.current.kind == SyntaxKind::FunctionKeyword
+            && modifiers.iter().any(|modifier| {
+                self.arena
+                    .get(*modifier)
+                    .is_some_and(|modifier| modifier.kind == SyntaxKind::AsyncKeyword)
+            });
+        let previous_next_function_is_async = self.next_function_is_async;
+        self.next_function_is_async = parse_in_await_context;
         let declaration = self.parse_statement();
+        self.next_function_is_async = previous_next_function_is_async;
         self.attach_modifiers(declaration, modifiers, start);
         declaration
     }
@@ -5037,22 +5111,27 @@ impl<'a> Parser<'a> {
         if is_prefix_operator(self.current.kind) {
             let operator_token = self.consume();
             let operator = operator_token.kind;
-            let operand = if self
-                .current
-                .flags
-                .contains(ScannerTokenFlags::PRECEDING_LINE_BREAK)
-                && matches!(
-                    self.current.kind,
-                    SyntaxKind::TryKeyword
-                        | SyntaxKind::ReturnKeyword
-                        | SyntaxKind::ThrowKeyword
-                        | SyntaxKind::IfKeyword
-                        | SyntaxKind::ForKeyword
-                        | SyntaxKind::WhileKeyword
-                        | SyntaxKind::SwitchKeyword
-                        | SyntaxKind::VarKeyword
-                        | SyntaxKind::ConstKeyword
-                ) {
+            let missing_before_await = self.await_context
+                && matches!(operator, SyntaxKind::PlusPlusToken | SyntaxKind::MinusMinusToken)
+                && self.current.kind == SyntaxKind::AwaitKeyword;
+            let operand = if missing_before_await
+                || (self
+                    .current
+                    .flags
+                    .contains(ScannerTokenFlags::PRECEDING_LINE_BREAK)
+                    && matches!(
+                        self.current.kind,
+                        SyntaxKind::TryKeyword
+                            | SyntaxKind::ReturnKeyword
+                            | SyntaxKind::ThrowKeyword
+                            | SyntaxKind::IfKeyword
+                            | SyntaxKind::ForKeyword
+                            | SyntaxKind::WhileKeyword
+                            | SyntaxKind::SwitchKeyword
+                            | SyntaxKind::VarKeyword
+                            | SyntaxKind::ConstKeyword
+                    ))
+            {
                 self.error_current("Expected an expression.");
                 self.missing_identifier(self.current.range.start)
             } else {
@@ -7245,6 +7324,10 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_function_expression(&mut self) -> NodeId {
+        let is_async = self.next_function_is_async;
+        self.next_function_is_async = false;
+        let previous_await_context = self.await_context;
+        self.await_context = is_async;
         let start = self.consume().range.start;
         let asterisk_token =
             (self.current.kind == SyntaxKind::AsteriskToken).then(|| self.consume_token_node());
@@ -7283,6 +7366,7 @@ impl<'a> Parser<'a> {
         children.extend(parameters.nodes.iter().copied());
         children.extend(return_type);
         children.push(body);
+        self.await_context = previous_await_context;
         self.alloc_node(
             SyntaxKind::FunctionExpression,
             TextRange::new(start, self.node_end(body)),
@@ -7310,7 +7394,10 @@ impl<'a> Parser<'a> {
     fn parse_async_function_expression(&mut self) -> NodeId {
         let start = self.current.range.start;
         let async_modifier = self.consume_token_node();
+        let previous_next_function_is_async = self.next_function_is_async;
+        self.next_function_is_async = true;
         let expression = self.parse_function_expression();
+        self.next_function_is_async = previous_next_function_is_async;
         self.attach_modifiers(expression, vec![async_modifier], start);
         expression
     }
@@ -13993,6 +14080,108 @@ mod tests {
             &result.arena.get(arrow.body).unwrap().data,
             NodeData::Identifier(identifier) if identifier.text == "await"
         ));
+    }
+
+    #[test]
+    fn recovers_await_arrow_in_async_function_parameters_as_comma_expression() {
+        let result = parse_source_file(
+            "async function foo(a = await => await): Promise<void> {}",
+        );
+        let statements = source_statements(&result);
+        assert_eq!(
+            statements
+                .iter()
+                .map(|statement| result.arena.get(*statement).unwrap().kind)
+                .collect::<Vec<_>>(),
+            [SyntaxKind::FunctionDeclaration]
+        );
+        let NodeData::FunctionDeclaration(function) =
+            &result.arena.get(statements[0]).unwrap().data
+        else {
+            unreachable!();
+        };
+        let NodeData::ParameterDeclaration(parameter) =
+            &result.arena.get(function.parameters.nodes[0]).unwrap().data
+        else {
+            unreachable!();
+        };
+        assert!(matches!(
+            parameter
+                .initializer
+                .and_then(|initializer| result.arena.get(initializer))
+                .map(|node| &node.data),
+            Some(NodeData::BinaryExpression(_))
+        ));
+    }
+
+    #[test]
+    fn separates_invalid_prefix_updates_from_await_expressions() {
+        let result = parse_source_file(
+            "async function f() { ++await 1; --await 2; }",
+        );
+        let statements = source_statements(&result);
+        let NodeData::FunctionDeclaration(function) =
+            &result.arena.get(statements[0]).unwrap().data
+        else {
+            unreachable!();
+        };
+        let NodeData::Block(block) =
+            &result.arena.get(function.body.unwrap()).unwrap().data
+        else {
+            unreachable!();
+        };
+        assert_eq!(block.statements.nodes.len(), 4);
+        for (index, statement) in block.statements.nodes.iter().enumerate() {
+            let NodeData::ExpressionStatement(statement) =
+                &result.arena.get(*statement).unwrap().data
+            else {
+                unreachable!();
+            };
+            if index % 2 == 0 {
+                let NodeData::PrefixUnaryExpression(prefix) =
+                    &result.arena.get(statement.expression).unwrap().data
+                else {
+                    unreachable!();
+                };
+                assert!(matches!(
+                    &result.arena.get(prefix.operand).unwrap().data,
+                    NodeData::Identifier(identifier) if identifier.text.is_empty()
+                ));
+            } else {
+                assert!(matches!(
+                    result.arena.get(statement.expression).map(|node| &node.data),
+                    Some(NodeData::AwaitExpression(_))
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn restores_await_context_for_nested_ordinary_functions() {
+        let result = parse_source_file(
+            "async function outer() { function inner() { await(value); } await(value); }",
+        );
+        let await_expressions = result
+            .arena
+            .iter()
+            .filter(|(_, node)| matches!(node.data, NodeData::AwaitExpression(_)))
+            .count();
+        let await_calls = result
+            .arena
+            .iter()
+            .filter(|(_, node)| {
+                matches!(
+                    &node.data,
+                    NodeData::CallExpression(call)
+                        if matches!(
+                            result.arena.get(call.expression).map(|node| &node.data),
+                            Some(NodeData::Identifier(identifier)) if identifier.text == "await"
+                        )
+                )
+            })
+            .count();
+        assert_eq!(await_expressions, 1);
+        assert_eq!(await_calls, 1);
     }
 
     #[test]
