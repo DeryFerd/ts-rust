@@ -34316,6 +34316,9 @@ impl Printer<'_> {
         if self.statement_is_recovered_type_predicate_tail(id, &node) {
             return Ok(());
         }
+        if self.statement_is_recovered_object_generator_tail(id) {
+            return Ok(());
+        }
         if let NodeData::FunctionDeclaration(function) = &node.data
             && let Some(body) = self.recovered_type_predicate_function_body(id, &node)
         {
@@ -35402,6 +35405,110 @@ impl Printer<'_> {
             .and_then(|index| statements.get(index))
             .and_then(|previous| self.recovered_accessor_modifier_statement_after(*previous))
             == Some(statement)
+    }
+
+    fn recovered_object_generator_parts(
+        &self,
+        binary: NodeId,
+    ) -> Option<(NodeId, String, NodeId, Option<NodeId>)> {
+        let NodeData::BinaryExpression(binary_data) = &self.arena.get(binary)?.data else {
+            return None;
+        };
+        if !self
+            .arena
+            .get(binary_data.operator_token)
+            .is_some_and(|operator| operator.kind == SyntaxKind::AsteriskToken)
+        {
+            return None;
+        }
+        let NodeData::ObjectLiteralExpression(object) = &self.arena.get(binary_data.left)?.data
+        else {
+            return None;
+        };
+        let last = *object.properties.nodes.last()?;
+        let NodeData::ShorthandPropertyAssignment(shorthand) = &self.arena.get(last)?.data else {
+            return None;
+        };
+        if !matches!(
+            declaration_name_text(self.arena, shorthand.name),
+            Some("get" | "set")
+        ) {
+            return None;
+        }
+        let NodeData::CallExpression(call) = &self.arena.get(binary_data.right)?.data else {
+            return None;
+        };
+        if !call.arguments.nodes.is_empty() {
+            return None;
+        }
+        let generator_name = declaration_name_text(self.arena, call.expression)?.to_owned();
+        let variable = self.arena.get(binary)?.parent?;
+        let list = self.arena.get(variable)?.parent?;
+        let statement = self.arena.get(list)?.parent?;
+        let source = self.arena.get(statement)?.parent?;
+        let statements = match &self.arena.get(source)?.data {
+            NodeData::SourceFile(source) => &source.statements.nodes,
+            NodeData::Block(block) => &block.statements.nodes,
+            NodeData::ModuleBlock(block) => &block.statements.nodes,
+            _ => return None,
+        };
+        let index = statements.iter().position(|candidate| *candidate == statement)?;
+        let block = *statements.get(index + 1)?;
+        if !matches!(
+            self.arena.get(block).map(|node| &node.data),
+            Some(NodeData::Block(block)) if block.statements.nodes.is_empty()
+        ) {
+            return None;
+        }
+        let empty = statements.get(index + 2).copied().filter(|empty| {
+            matches!(
+                self.arena.get(*empty).map(|node| &node.data),
+                Some(NodeData::EmptyStatement(_))
+            )
+        });
+        Some((binary_data.left, generator_name, block, empty))
+    }
+
+    fn statement_is_recovered_object_generator_tail(&self, statement: NodeId) -> bool {
+        self.arena.iter().any(|(id, node)| {
+            matches!(node.data, NodeData::BinaryExpression(_))
+                && self
+                    .recovered_object_generator_parts(id)
+                    .is_some_and(|(_, _, block, empty)| {
+                        block == statement || empty == Some(statement)
+                    })
+        })
+    }
+
+    fn emit_recovered_object_generator_binary(
+        &mut self,
+        binary: NodeId,
+    ) -> Result<bool, EmitError> {
+        let Some((object, generator_name, _, _)) =
+            self.recovered_object_generator_parts(binary)
+        else {
+            return Ok(false);
+        };
+        let NodeData::ObjectLiteralExpression(object) = &self.node(object)?.data else {
+            unreachable!();
+        };
+        let properties = object.properties.nodes.clone();
+        self.writer.write("{");
+        self.writer.indent += 1;
+        self.writer.newline();
+        for property in properties {
+            let node = self.node(property)?.clone();
+            self.emit_object_property(property, &node)?;
+            self.writer.write(",");
+            self.writer.newline();
+        }
+        self.writer.write("*");
+        self.writer.write(&generator_name);
+        self.writer.write("() { }");
+        self.writer.indent -= 1;
+        self.writer.newline();
+        self.writer.write("}");
+        Ok(true)
     }
 
     fn verbatim_module_statement_with_internal_comments(
@@ -64591,7 +64698,9 @@ impl Printer<'_> {
                 }
             }
             NodeData::BinaryExpression(_) => {
-                self.emit_binary_expression(id, parent_precedence)?;
+                if !self.emit_recovered_object_generator_binary(id)? {
+                    self.emit_binary_expression(id, parent_precedence)?;
+                }
             }
             NodeData::PropertyAccessExpression(data) => {
                 if self.is_active_async_super_access(id) {
@@ -76975,6 +77084,18 @@ mod tests {
         assert!(es2017.contains("class D"), "{es2017}");
         assert!(!es2017.contains("accessor class D"), "{es2017}");
         assert!(es2017.contains("accessor var E;"), "{es2017}");
+    }
+
+    #[test]
+    fn recovers_get_set_before_object_generators() {
+        let output = emit_with_parse_errors(
+            "const c = {\n    get\n    *x() {}\n}; const d = {\n    set\n    *x() {}\n};",
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(output.contains("get,\n    *x() { }"), "{output}");
+        assert!(output.contains("set,\n    *x() { }"), "{output}");
     }
 
     #[test]
