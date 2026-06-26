@@ -2789,6 +2789,7 @@ impl<'a> Parser<'a> {
         matches!(
             name.kind,
             SyntaxKind::Identifier
+                | SyntaxKind::PrivateIdentifier
                 | SyntaxKind::StringLiteral
                 | SyntaxKind::NumericLiteral
                 | SyntaxKind::OpenBracketToken
@@ -10594,6 +10595,35 @@ mod tests {
             panic!("expected setter");
         };
         assert!(setter.body.is_none());
+    }
+
+    #[test]
+    fn parses_private_class_accessors() {
+        let result = parse_source_file(
+            "class C { get #value() { return 1; } set #value(next: number) {} }",
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let statements = source_statements(&result);
+        let NodeData::ClassDeclaration(class) = &result.arena.get(statements[0]).unwrap().data
+        else {
+            panic!("expected class");
+        };
+        assert!(matches!(
+            &result.arena.get(class.members.nodes[0]).unwrap().data,
+            NodeData::GetAccessorDeclaration(accessor)
+                if matches!(
+                    result.arena.get(accessor.name).map(|node| &node.data),
+                    Some(NodeData::PrivateIdentifier(_))
+                )
+        ));
+        assert!(matches!(
+            &result.arena.get(class.members.nodes[1]).unwrap().data,
+            NodeData::SetAccessorDeclaration(accessor)
+                if matches!(
+                    result.arena.get(accessor.name).map(|node| &node.data),
+                    Some(NodeData::PrivateIdentifier(_))
+                )
+        ));
     }
 
     #[test]
