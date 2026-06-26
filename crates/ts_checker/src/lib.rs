@@ -5922,10 +5922,11 @@ impl<'a> Checker<'a> {
         let Some(class_members) = class_members else {
             return BTreeMap::new();
         };
+        let mut assignment_expressions = BTreeMap::<String, Vec<NodeId>>::new();
         let mut assignments = BTreeMap::new();
-        for member in class_members {
+        for member in &class_members {
             let Some(NodeData::ClassStaticBlockDeclaration(block)) =
-                self.arena.get(member).map(|node| &node.data)
+                self.arena.get(*member).map(|node| &node.data)
             else {
                 continue;
             };
@@ -5955,13 +5956,99 @@ impl<'a> Checker<'a> {
                         .is_some_and(|operator| operator.kind == SyntaxKind::EqualsToken)
                     && let Some(name) = self.this_property_name(assignment.left)
                 {
-                    let type_id = self.type_of_expression(assignment.right);
-                    let type_id = self.widen_literal(type_id);
-                    self.add_assignment_type(&mut assignments, name, type_id);
+                    assignment_expressions
+                        .entry(name)
+                        .or_default()
+                        .push(assignment.right);
                 }
                 if let Some(children) = self.children.get(&node_id) {
                     pending.extend(children.iter().copied());
                 }
+            }
+        }
+        if assignment_expressions.is_empty() {
+            return assignments;
+        }
+        loop {
+            let dependencies = assignment_expressions
+                .values()
+                .flatten()
+                .filter_map(|expression| self.this_property_name(*expression))
+                .filter(|name| {
+                    !assignments.contains_key(name)
+                        && !assignment_expressions.contains_key(name)
+                })
+                .collect::<BTreeSet<_>>();
+            if dependencies.is_empty() {
+                break;
+            }
+            let mut progressed = false;
+            for dependency in dependencies {
+                let property = class_members.iter().find_map(|member| {
+                    let NodeData::PropertyDeclaration(property) =
+                        &self.arena.get(*member)?.data
+                    else {
+                        return None;
+                    };
+                    (self.has_ast_modifier(
+                        property.modifiers.as_ref(),
+                        SyntaxKind::StaticKeyword,
+                    ) && self.type_property_name(property.name).as_deref()
+                        == Some(dependency.as_str()))
+                    .then_some(property.as_ref())
+                });
+                let Some(property) = property else {
+                    continue;
+                };
+                if let Some(type_node) = property.type_ {
+                    assignments.insert(dependency, self.type_from_type_node(type_node));
+                    progressed = true;
+                } else if let Some(initializer) = property.initializer {
+                    assignment_expressions
+                        .entry(dependency)
+                        .or_default()
+                        .push(initializer);
+                    progressed = true;
+                }
+            }
+            if !progressed {
+                break;
+            }
+        }
+        for _ in 0..=assignment_expressions.len() {
+            let mut progressed = false;
+            for (name, expressions) in &assignment_expressions {
+                if assignments.contains_key(name) {
+                    continue;
+                }
+                let mut expression_types = Vec::with_capacity(expressions.len());
+                for expression in expressions {
+                    let type_id = if let Some(dependency) = self.this_property_name(*expression) {
+                        let Some(type_id) = assignments.get(&dependency).copied() else {
+                            expression_types.clear();
+                            break;
+                        };
+                        type_id
+                    } else {
+                        let type_id = self.type_of_expression(*expression);
+                        self.widen_literal(type_id)
+                    };
+                    expression_types.push(type_id);
+                }
+                let Some(first) = expression_types.first().copied() else {
+                    continue;
+                };
+                let type_id = expression_types[1..]
+                    .iter()
+                    .copied()
+                    .fold(first, |previous, type_id| {
+                        self.result.types.union([previous, type_id])
+                    });
+                assignments.insert(name.clone(), type_id);
+                progressed = true;
+            }
+            if !progressed {
+                break;
             }
         }
         assignments
@@ -23186,6 +23273,13 @@ mod tests {
                 class Example5 { static accessor value; }
                 Example5.value = 123;
                 Example5.value++;
+                class Example6 {
+                    static accessor x;
+                    static { this.x = 1; }
+                    static accessor y = this.x;
+                    static accessor z;
+                    static { this.z = this.y; }
+                }
             ",
         );
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
@@ -23245,13 +23339,14 @@ mod tests {
             &[result.types.number(), result.types.null()],
         );
         assert_eq!(accessor_type("Example5", "value"), result.types.any());
+        assert_eq!(accessor_type("Example6", "z"), result.types.number());
         assert_eq!(
             result
                 .diagnostics
                 .iter()
                 .map(|diagnostic| diagnostic.diagnostic.code())
                 .collect::<Vec<_>>(),
-            [7008]
+            [18046, 7008]
         );
     }
 
