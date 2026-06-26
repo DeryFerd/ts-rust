@@ -343,6 +343,7 @@ pub fn parse_jsdoc_comment(source: &str) -> JsDocParseResult {
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum TypeParseContext {
     Normal,
+    ExpressionCast,
     TupleElement,
 }
 
@@ -5667,7 +5668,10 @@ impl<'a> Parser<'a> {
                 }
                 SyntaxKind::AsKeyword | SyntaxKind::SatisfiesKeyword => {
                     let kind = self.consume().kind;
+                    let previous_context = self.type_parse_context;
+                    self.type_parse_context = TypeParseContext::ExpressionCast;
                     let type_node = self.parse_type();
+                    self.type_parse_context = previous_context;
                     let data = if kind == SyntaxKind::AsKeyword {
                         NodeData::AsExpression(Box::new(AsExpressionData {
                             expression,
@@ -7920,6 +7924,7 @@ impl<'a> Parser<'a> {
                 continue;
             }
             if self.current.kind == SyntaxKind::QuestionToken
+                && self.type_parse_context != TypeParseContext::ExpressionCast
                 && !self
                     .current
                     .flags
