@@ -26742,6 +26742,7 @@ struct Es5AsyncCapturedLoop {
 
 struct Es5AsyncCapturePlan {
     temps: Vec<String>,
+    generator_temps: Vec<String>,
     captures: HashMap<NodeId, Vec<(NodeId, String)>>,
     conditional_temps: HashMap<NodeId, String>,
     array_temps: HashMap<NodeId, Option<String>>,
@@ -45427,10 +45428,11 @@ impl Printer<'_> {
             .map(|(_, temp)| temp.clone())
             .collect::<Vec<_>>();
         let capture_plan = if expression_body.is_none() {
-            self.es5_async_capture_plan(body, &computed_temp_names)
+            self.es5_async_capture_plan(body, &computed_temp_names, requested_state_parameter)
         } else {
             Es5AsyncCapturePlan {
                 temps: Vec::new(),
+                generator_temps: Vec::new(),
                 captures: HashMap::new(),
                 conditional_temps: HashMap::new(),
                 array_temps: HashMap::new(),
@@ -45450,6 +45452,7 @@ impl Printer<'_> {
         };
         let Es5AsyncCapturePlan {
             temps: planned_temps,
+            generator_temps,
             captures: await_captures,
             conditional_temps,
             array_temps,
@@ -45763,6 +45766,17 @@ impl Printer<'_> {
         self.writer.write(") {");
         self.writer.newline();
         self.writer.indent += 1;
+        if !generator_temps.is_empty() {
+            self.writer.write("var ");
+            for (index, temp) in generator_temps.iter().enumerate() {
+                if index != 0 {
+                    self.writer.write(", ");
+                }
+                self.writer.write(temp);
+            }
+            self.writer.write(";");
+            self.writer.newline();
+        }
 
         if let Some(expression) = expression_body {
             self.emit_es5_async_expression_state_machine(
@@ -45927,6 +45941,7 @@ impl Printer<'_> {
         &mut self,
         body: NodeId,
         additional_claimed: &[String],
+        requested_state_parameter: &str,
     ) -> Es5AsyncCapturePlan {
         let mut await_captures = Vec::new();
         let mut conditional_nodes = Vec::new();
@@ -46144,8 +46159,42 @@ impl Printer<'_> {
             || !additional_claimed.is_empty()
             || has_suspending_for_of)
             .then(|| self.generate_block_temp(body, &claimed));
+        let mut generator_temps = Vec::new();
+        if self.settings.module == ModuleKind::Umd && self.settings.target < ScriptTarget::Es2015 {
+            claimed.insert(requested_state_parameter.to_owned());
+            let container = self.arena.get(body).and_then(|node| node.parent);
+            let mut dynamic_imports = self
+                .arena
+                .iter()
+                .filter_map(|(call_id, node)| {
+                    let NodeData::CallExpression(call) = &node.data else {
+                        return None;
+                    };
+                    let argument = call.arguments.nodes.first().copied()?;
+                    (self.is_dynamic_import_call(call)
+                        && self.node_is_descendant_of(call_id, body)
+                        && self.nearest_function_like_container(call_id) == container
+                        && !matches!(
+                            self.arena.get(argument).map(|node| &node.data),
+                            Some(
+                                NodeData::StringLiteral(_)
+                                    | NodeData::NoSubstitutionTemplateLiteral(_)
+                            )
+                        ))
+                    .then_some((node.range.start, call_id))
+                })
+                .collect::<Vec<_>>();
+            dynamic_imports.sort_by_key(|(start, _)| *start);
+            for (_, call) in dynamic_imports {
+                let temp = self.generate_block_temp(body, &claimed);
+                claimed.insert(temp.clone());
+                generator_temps.push(temp.clone());
+                self.amd_dynamic_import_temps.insert(call, temp);
+            }
+        }
         Es5AsyncCapturePlan {
             temps,
+            generator_temps,
             captures,
             conditional_temps,
             array_temps,
@@ -47500,7 +47549,7 @@ impl Printer<'_> {
             self.writer.write(" ");
         }
         self.writer.write("return [4 /*yield*/, ");
-        self.emit_expression(awaited, 0)?;
+        self.emit_expression(awaited, 1)?;
         self.writer.write("];");
         self.emit_es5_async_await_trailing_line_comment(awaited);
         self.writer.newline();
