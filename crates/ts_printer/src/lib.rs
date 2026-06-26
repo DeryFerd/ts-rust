@@ -12697,6 +12697,39 @@ impl DeclarationPrinter<'_> {
     }
 
     fn enum_member_type_expression(&self, initializer: NodeId) -> Option<NodeId> {
+        if let NodeData::ElementAccessExpression(access) = &self.arena.get(initializer)?.data {
+            let member_name = match self.arena.get(access.argument_expression).map(|node| &node.data)
+            {
+                Some(NodeData::StringLiteral(literal)) => literal.text.as_str(),
+                Some(NodeData::NoSubstitutionTemplateLiteral(literal)) => literal.text.as_str(),
+                _ => return None,
+            };
+            let root = self.entity_expression_root_identifier(access.expression)?;
+            let root_name = declaration_name_text(self.arena, root)?;
+            let root_symbol = self.bindings.resolve_name_at(root, root_name)?;
+            let is_enum_member = self
+                .bindings
+                .symbols
+                .get(root_symbol)?
+                .declarations
+                .iter()
+                .any(|declaration| {
+                    let Some(NodeData::EnumDeclaration(enumeration)) =
+                        self.arena.get(*declaration).map(|node| &node.data)
+                    else {
+                        return false;
+                    };
+                    enumeration.members.nodes.iter().any(|member| {
+                        matches!(
+                            self.arena.get(*member).map(|node| &node.data),
+                            Some(NodeData::EnumMember(member))
+                                if declaration_name_text(self.arena, member.name)
+                                    == Some(member_name)
+                        )
+                    })
+                });
+            return is_enum_member.then_some(access.expression);
+        }
         let NodeData::PropertyAccessExpression(access) = &self.arena.get(initializer)?.data else {
             return None;
         };
@@ -15138,6 +15171,44 @@ impl DeclarationPrinter<'_> {
             .and_then(|name| object.properties.get(name).copied())
     }
 
+    fn computed_enum_setter_parameter_type(
+        &self,
+        member: NodeId,
+        name: NodeId,
+    ) -> Option<NodeId> {
+        let NodeData::ComputedPropertyName(computed) = &self.arena.get(name)?.data else {
+            return None;
+        };
+        if self.enum_member_type_expression(computed.expression).is_none() {
+            return None;
+        }
+        let symbol = self.resolve_entity_expression_symbol(computed.expression)?;
+        let class = self.arena.get(member)?.parent?;
+        let members = match &self.arena.get(class)?.data {
+            NodeData::ClassDeclaration(class) => &class.members,
+            NodeData::ClassExpression(class) => &class.members,
+            _ => return None,
+        };
+        members.nodes.iter().find_map(|candidate| {
+            let NodeData::SetAccessorDeclaration(setter) = &self.arena.get(*candidate)?.data else {
+                return None;
+            };
+            let NodeData::ComputedPropertyName(candidate_name) =
+                &self.arena.get(setter.name)?.data
+            else {
+                return None;
+            };
+            if self.resolve_entity_expression_symbol(candidate_name.expression) != Some(symbol) {
+                return None;
+            }
+            let parameter = setter.parameters.nodes.first()?;
+            let NodeData::ParameterDeclaration(parameter) = &self.arena.get(*parameter)?.data else {
+                return None;
+            };
+            parameter.type_
+        })
+    }
+
     fn class_getter_jsdoc_return_hint(&self, member: NodeId, name: NodeId) -> Option<String> {
         let class = self.arena.get(member)?.parent?;
         let members = match &self.arena.get(class)?.data {
@@ -17189,7 +17260,7 @@ impl DeclarationPrinter<'_> {
                         if matches!(
                             self.arena.get(computed.expression).map(|expression| &expression.data),
                             Some(NodeData::PropertyAccessExpression(_))
-                        )
+                        ) && self.enum_member_type_expression(computed.expression).is_none()
                 );
                 let class_expression_member = self
                     .arena
@@ -17489,6 +17560,11 @@ impl DeclarationPrinter<'_> {
                 {
                     self.writer.write(": ");
                     self.emit_jsdoc_type_hint(&hint);
+                } else if data.type_.is_none()
+                    && let Some(type_) = self.computed_enum_setter_parameter_type(id, data.name)
+                {
+                    self.writer.write(": ");
+                    self.emit_type(type_)?;
                 } else if data.type_.is_none()
                     && let Some(type_id) = self.node_types.and_then(|types| types.get(&id).copied())
                 {
@@ -73382,6 +73458,24 @@ mod tests {
             "const key = Symbol(); class C { #value: string; [key]: number; }",
         );
         assert!(!script.ends_with("export {};\n"), "{script}");
+    }
+
+    #[test]
+    fn declaration_computed_const_enum_methods_keep_method_syntax() {
+        let declarations = emit_declarations_with_semantics(
+            concat!(
+                "const enum G { A = 1, B = 2 } ",
+                "var a1 = G[\"A\"]; ",
+                "class C { [G.A]() {} get [G.B]() { return true; } set [G.B](x: number) {} }",
+            ),
+        );
+        assert!(declarations.contains("declare var a1: G;"), "{declarations}");
+        assert!(declarations.contains("[G.A](): void;"), "{declarations}");
+        assert!(declarations.contains("get [G.B](): number;"), "{declarations}");
+        assert!(
+            declarations.contains("set [G.B](x: number);"),
+            "{declarations}"
+        );
     }
 
     #[test]
