@@ -605,7 +605,8 @@ impl<'a> Parser<'a> {
                 || self.next_tokens_are(
                     SyntaxKind::ModuleKeyword,
                     SyntaxKind::OpenBraceToken,
-                ));
+                )
+                || self.declare_precedes_invalid_namespace_name());
         let async_starts_function = self.current.kind == SyntaxKind::AsyncKeyword
             && !self.next_token_preceded_by_line_break()
             && self.next_token_kind() == SyntaxKind::FunctionKeyword;
@@ -1000,6 +1001,14 @@ impl<'a> Parser<'a> {
         let matches = self.scanner.scan().kind == first && self.scanner.scan().kind == second;
         self.scanner.rewind(checkpoint);
         matches
+    }
+
+    fn declare_precedes_invalid_namespace_name(&mut self) -> bool {
+        let checkpoint = self.scanner.mark();
+        let namespace = self.scanner.scan().kind;
+        let name = self.scanner.scan().kind;
+        self.scanner.rewind(checkpoint);
+        namespace == SyntaxKind::NamespaceKeyword && !is_module_name_token(name)
     }
 
     fn next_token_preceded_by_line_break(&mut self) -> bool {
@@ -11243,6 +11252,28 @@ mod tests {
         assert_eq!(
             result.arena.get(block.statements.nodes[0]).unwrap().parent,
             Some(block_id)
+        );
+    }
+
+    #[test]
+    fn recovers_declare_before_an_invalid_root_namespace_name() {
+        let result = parse_source_file(concat!(
+            "declare namespace test.class {}\n",
+            "declare namespace debugger {}",
+        ));
+        let kinds = source_statements(&result)
+            .iter()
+            .map(|statement| result.arena.get(*statement).unwrap().kind)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            [
+                SyntaxKind::ModuleDeclaration,
+                SyntaxKind::ExpressionStatement,
+                SyntaxKind::ExpressionStatement,
+                SyntaxKind::DebuggerStatement,
+                SyntaxKind::Block,
+            ]
         );
     }
 
