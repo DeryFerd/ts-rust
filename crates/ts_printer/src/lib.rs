@@ -348,6 +348,7 @@ pub fn emit_source_file_with_context(
         es5_async_conditional_temps: HashMap::new(),
         es5_async_array_temps: HashMap::new(),
         es5_async_call_temps: HashMap::new(),
+        es5_async_class_factory_temps: HashMap::new(),
         es5_async_new_temps: HashMap::new(),
         es5_async_binary_temps: HashMap::new(),
         es5_async_object_plans: HashMap::new(),
@@ -24895,6 +24896,7 @@ struct Es5AsyncCapturePlan {
     conditional_temps: HashMap<NodeId, String>,
     array_temps: HashMap<NodeId, Option<String>>,
     call_temps: HashMap<NodeId, Vec<String>>,
+    class_factory_temps: HashMap<NodeId, String>,
     new_temps: HashMap<NodeId, Vec<String>>,
     binary_temps: HashMap<NodeId, Vec<String>>,
     object_plans: HashMap<NodeId, Es5AsyncObjectPlan>,
@@ -26420,6 +26422,7 @@ struct Printer<'a> {
     es5_async_conditional_temps: HashMap<NodeId, String>,
     es5_async_array_temps: HashMap<NodeId, Option<String>>,
     es5_async_call_temps: HashMap<NodeId, Vec<String>>,
+    es5_async_class_factory_temps: HashMap<NodeId, String>,
     es5_async_new_temps: HashMap<NodeId, Vec<String>>,
     es5_async_binary_temps: HashMap<NodeId, Vec<String>>,
     es5_async_object_plans: HashMap<NodeId, Es5AsyncObjectPlan>,
@@ -28677,7 +28680,7 @@ impl Printer<'_> {
                     && (self.settings.target < ScriptTarget::Es2022
                         || self.settings.use_define_for_class_fields == Some(false));
                 if self.settings.target < ScriptTarget::Es2015 {
-                    self.emit_downlevel_class_value(class, &name)?;
+                    self.emit_downlevel_class_value(class, &name, false)?;
                 } else {
                     let previous_defer_static_fields = self.defer_static_fields;
                     self.defer_static_fields = defer_system_static_fields;
@@ -39761,6 +39764,8 @@ impl Printer<'_> {
         let previous_conditional_temps = std::mem::take(&mut self.es5_async_conditional_temps);
         let previous_array_temps = std::mem::take(&mut self.es5_async_array_temps);
         let previous_call_temps = std::mem::take(&mut self.es5_async_call_temps);
+        let previous_class_factory_temps =
+            std::mem::take(&mut self.es5_async_class_factory_temps);
         let previous_new_temps = std::mem::take(&mut self.es5_async_new_temps);
         let previous_binary_temps = std::mem::take(&mut self.es5_async_binary_temps);
         let previous_object_plans = std::mem::take(&mut self.es5_async_object_plans);
@@ -39851,6 +39856,7 @@ impl Printer<'_> {
                 conditional_temps: HashMap::new(),
                 array_temps: HashMap::new(),
                 call_temps: HashMap::new(),
+                class_factory_temps: HashMap::new(),
                 new_temps: HashMap::new(),
                 binary_temps: HashMap::new(),
                 object_plans: HashMap::new(),
@@ -39869,6 +39875,7 @@ impl Printer<'_> {
             conditional_temps,
             array_temps,
             call_temps,
+            class_factory_temps,
             new_temps,
             binary_temps,
             object_plans,
@@ -39888,6 +39895,7 @@ impl Printer<'_> {
         self.es5_async_conditional_temps = conditional_temps;
         self.es5_async_array_temps = array_temps;
         self.es5_async_call_temps = call_temps;
+        self.es5_async_class_factory_temps = class_factory_temps;
         self.es5_async_new_temps = new_temps;
         self.es5_async_binary_temps = binary_temps;
         self.es5_async_object_plans = object_plans;
@@ -40198,6 +40206,7 @@ impl Printer<'_> {
         self.es5_async_conditional_temps = previous_conditional_temps;
         self.es5_async_array_temps = previous_array_temps;
         self.es5_async_call_temps = previous_call_temps;
+        self.es5_async_class_factory_temps = previous_class_factory_temps;
         self.es5_async_new_temps = previous_new_temps;
         self.es5_async_binary_temps = previous_binary_temps;
         self.es5_async_object_plans = previous_object_plans;
@@ -40298,6 +40307,7 @@ impl Printer<'_> {
         let mut conditional_nodes = Vec::new();
         let mut array_nodes = Vec::new();
         let mut call_nodes = Vec::new();
+        let mut class_nodes = Vec::new();
         let mut new_nodes = Vec::new();
         let mut binary_nodes = Vec::new();
         let mut object_nodes = Vec::new();
@@ -40311,6 +40321,7 @@ impl Printer<'_> {
                 self.collect_es5_async_conditional_temps(*statement, &mut conditional_nodes);
                 self.collect_es5_async_array_temps(*statement, &mut array_nodes);
                 self.collect_es5_async_call_temps(*statement, &mut call_nodes);
+                self.collect_es5_async_class_factories(*statement, &mut class_nodes);
                 self.collect_es5_async_new_temps(*statement, &mut new_nodes);
                 self.collect_es5_async_binary_temps(*statement, &mut binary_nodes);
                 self.collect_es5_async_object_plans(*statement, &mut object_nodes);
@@ -40381,6 +40392,13 @@ impl Printer<'_> {
                 planned.push(temp);
             }
             call_temps.insert(call, planned);
+        }
+        let mut class_factory_temps = HashMap::new();
+        for class in class_nodes {
+            let temp = self.generate_block_temp(body, &claimed);
+            claimed.insert(temp.clone());
+            temps.push(temp.clone());
+            class_factory_temps.insert(class, temp);
         }
         let mut new_temps = HashMap::new();
         for expression in new_nodes {
@@ -40507,6 +40525,7 @@ impl Printer<'_> {
             conditional_temps,
             array_temps,
             call_temps,
+            class_factory_temps,
             new_temps,
             binary_temps,
             object_plans,
@@ -40989,6 +41008,63 @@ impl Printer<'_> {
                     calls.push(statement.expression);
                 }
             }
+            Some(NodeData::VariableStatement(_)) => {
+                if let Some((_, initializer)) =
+                    self.es5_async_variable_binding_initializer(statement)
+                    && let Some(NodeData::CallExpression(call)) =
+                        self.arena.get(initializer).map(|node| &node.data)
+                    && self.es5_async_call_internal_await_count(call) != 0
+                {
+                    calls.push(initializer);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_es5_async_class_factories(&self, statement: NodeId, classes: &mut Vec<NodeId>) {
+        match self.arena.get(statement).map(|node| &node.data) {
+            Some(NodeData::Block(block)) => {
+                for statement in &block.statements.nodes {
+                    self.collect_es5_async_class_factories(*statement, classes);
+                }
+            }
+            Some(NodeData::IfStatement(statement)) => {
+                self.collect_es5_async_class_factories(statement.then_statement, classes);
+                if let Some(statement) = statement.else_statement {
+                    self.collect_es5_async_class_factories(statement, classes);
+                }
+            }
+            Some(NodeData::WhileStatement(statement)) => {
+                self.collect_es5_async_class_factories(statement.statement, classes);
+            }
+            Some(NodeData::DoStatement(statement)) => {
+                self.collect_es5_async_class_factories(statement.statement, classes);
+            }
+            Some(NodeData::ForStatement(statement)) => {
+                self.collect_es5_async_class_factories(statement.statement, classes);
+            }
+            Some(NodeData::LabeledStatement(statement)) => {
+                self.collect_es5_async_class_factories(statement.statement, classes);
+            }
+            Some(NodeData::WithStatement(statement)) => {
+                self.collect_es5_async_class_factories(statement.statement, classes);
+            }
+            Some(NodeData::TryStatement(statement)) => self.collect_es5_async_try_regions(
+                statement,
+                classes,
+                Self::collect_es5_async_class_factories,
+            ),
+            Some(NodeData::SwitchStatement(statement)) => self.collect_es5_async_switch_regions(
+                statement,
+                classes,
+                Self::collect_es5_async_class_factories,
+            ),
+            Some(NodeData::ClassDeclaration(_))
+                if self.es5_async_class_heritage_await(statement).is_some() =>
+            {
+                classes.push(statement);
+            }
             _ => {}
         }
     }
@@ -41278,6 +41354,37 @@ impl Printer<'_> {
         is_last: bool,
     ) -> Result<(), EmitError> {
         let node = self.node(statement)?.clone();
+        if let NodeData::ClassDeclaration(class) = &node.data
+            && let Some(temp) = self.es5_async_class_factory_temps.get(&statement).cloned()
+            && let Some((_, awaited)) = self.es5_async_class_heritage_await(statement)
+        {
+            if !self.writer.line_start {
+                self.writer.newline();
+            }
+            let name = class
+                .name
+                .and_then(|name| declaration_name_text(self.arena, name))
+                .unwrap_or("_class")
+                .to_owned();
+            self.writer.write(&temp);
+            self.writer.write(" = ");
+            self.emit_downlevel_class_value(class, &name, true)?;
+            self.writer.write(";");
+            self.writer.newline();
+            self.emit_es5_async_yield(awaited, case, false)?;
+            self.writer.write(&name);
+            self.writer.write(" = ");
+            if !self.settings.remove_comments {
+                self.writer.write("/** @class */ ");
+            }
+            self.writer.write("(");
+            self.writer.write(&temp);
+            self.writer.write(".apply(void 0, [(");
+            self.writer.write(state);
+            self.writer.write(".sent())]));");
+            self.writer.newline();
+            return Ok(());
+        }
         if let NodeData::Block(block) = &node.data {
             if self.es5_async_simple_suspension_count(statement) != 0 {
                 for (index, statement) in block.statements.nodes.iter().enumerate() {
@@ -41570,6 +41677,18 @@ impl Printer<'_> {
         {
             return self.emit_es5_async_call_statement(expression.expression, &temps, state, case);
         }
+        if let Some((name, initializer)) =
+            self.es5_async_variable_binding_initializer(statement)
+            && let Some(temps) = self.es5_async_call_temps.get(&initializer).cloned()
+        {
+            return self.emit_es5_async_call_assignment(
+                name,
+                initializer,
+                &temps,
+                state,
+                case,
+            );
+        }
         if let Some((left, array)) = self.es5_async_array_assignment(statement)
             && let Some(temp) = self.es5_async_array_temps.get(&array).cloned()
         {
@@ -41601,7 +41720,20 @@ impl Printer<'_> {
                             })
                     )
             );
-            let replacement = if initializer == await_id || initializer_wraps_comma {
+            let await_is_parenthesized = self
+                .arena
+                .get(await_id)
+                .and_then(|node| node.parent)
+                .is_some_and(|parent| {
+                    matches!(
+                        self.arena.get(parent).map(|node| &node.data),
+                        Some(NodeData::ParenthesizedExpression(_))
+                    )
+                });
+            let replacement = if initializer == await_id
+                || initializer_wraps_comma
+                || await_is_parenthesized
+            {
                 format!("{state}.sent()")
             } else {
                 format!("({state}.sent())")
@@ -42905,6 +43037,29 @@ impl Printer<'_> {
         state: &str,
         case: &mut usize,
     ) -> Result<(), EmitError> {
+        self.emit_es5_async_call(call_id, temps, state, case, None)
+    }
+
+    fn emit_es5_async_call_assignment(
+        &mut self,
+        target: NodeId,
+        call_id: NodeId,
+        temps: &[String],
+        state: &str,
+        case: &mut usize,
+    ) -> Result<(), EmitError> {
+        self.emit_es5_async_call(call_id, temps, state, case, Some(target))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn emit_es5_async_call(
+        &mut self,
+        call_id: NodeId,
+        temps: &[String],
+        state: &str,
+        case: &mut usize,
+        target: Option<NodeId>,
+    ) -> Result<(), EmitError> {
         let node = self.node(call_id)?.clone();
         let NodeData::CallExpression(call) = &node.data else {
             return Err(Self::unsupported(call_id, node.kind));
@@ -42920,7 +43075,7 @@ impl Printer<'_> {
             })
             .collect::<Vec<_>>();
         if awaited_arguments.is_empty() {
-            return self.emit_es5_async_computed_call(call, temps, state, case);
+            return self.emit_es5_async_computed_call(call, temps, state, case, target);
         }
         if call.arguments.nodes.iter().any(|argument| {
             matches!(
@@ -42928,7 +43083,7 @@ impl Printer<'_> {
                 Some(NodeData::SpreadElement(_))
             )
         }) {
-            return self.emit_es5_async_spread_call(call, temps, state, case);
+            return self.emit_es5_async_spread_call(call, temps, state, case, target);
         }
         let (await_index, await_id) = awaited_arguments[0];
         if !self.writer.line_start {
@@ -42987,6 +43142,10 @@ impl Printer<'_> {
         };
         let awaited_expression = awaited.expression;
         self.emit_es5_async_yield(awaited_expression, case, false)?;
+        if let Some(target) = target {
+            self.emit_expression(target, 1)?;
+            self.writer.write(" = ");
+        }
         self.writer.write(function_temp);
         self.writer.write(".apply(");
         self.writer
@@ -43831,6 +43990,7 @@ impl Printer<'_> {
         temps: &[String],
         state: &str,
         case: &mut usize,
+        target: Option<NodeId>,
     ) -> Result<(), EmitError> {
         let Some(NodeData::ElementAccessExpression(access)) =
             self.arena.get(call.expression).map(|node| &node.data)
@@ -43862,6 +44022,10 @@ impl Printer<'_> {
         self.writer.write(";");
         self.writer.newline();
         self.emit_es5_async_yield(awaited_expression, case, false)?;
+        if let Some(target) = target {
+            self.emit_expression(target, 1)?;
+            self.writer.write(" = ");
+        }
         self.writer.write(&temps[0]);
         self.writer.write("[");
         self.writer.write(state);
@@ -43884,6 +44048,7 @@ impl Printer<'_> {
         temps: &[String],
         state: &str,
         case: &mut usize,
+        target: Option<NodeId>,
     ) -> Result<(), EmitError> {
         let spread_index = call
             .arguments
@@ -43955,6 +44120,10 @@ impl Printer<'_> {
             self.writer.newline();
         }
         self.emit_es5_async_yield(awaited_expression, case, false)?;
+        if let Some(target) = target {
+            self.emit_expression(target, 1)?;
+            self.writer.write(" = ");
+        }
         self.writer.write(&temps[1]);
         self.writer.write(".apply(");
         self.writer.write(&temps[0]);
@@ -44461,12 +44630,23 @@ impl Printer<'_> {
                 .iter()
                 .map(|statement| self.es5_async_simple_suspension_count(*statement))
                 .sum(),
-            Some(NodeData::VariableStatement(_)) => self
-                .es5_async_object_assignment(statement)
-                .map_or_else(
-                    || usize::from(self.es5_async_await_binding(statement).is_some()),
-                    |(_, object)| self.es5_async_object_await_count(object),
-                ),
+            Some(NodeData::VariableStatement(_)) => {
+                if let Some((_, object)) = self.es5_async_object_assignment(statement) {
+                    self.es5_async_object_await_count(object)
+                } else if let Some((_, initializer)) =
+                    self.es5_async_variable_binding_initializer(statement)
+                    && let Some(NodeData::CallExpression(call)) =
+                        self.arena.get(initializer).map(|node| &node.data)
+                    && self.es5_async_call_internal_await_count(call) != 0
+                {
+                    self.es5_async_call_internal_await_count(call)
+                } else {
+                    usize::from(self.es5_async_await_binding(statement).is_some())
+                }
+            }
+            Some(NodeData::ClassDeclaration(_)) => {
+                usize::from(self.es5_async_class_heritage_await(statement).is_some())
+            }
             Some(NodeData::ExpressionStatement(expression)) => {
                 if let Some((_, object)) = self.es5_async_object_assignment(statement) {
                     self.es5_async_object_await_count(object)
@@ -45603,6 +45783,16 @@ impl Printer<'_> {
                     push_unique(names, &name);
                 }
             }
+            Some(NodeData::ClassDeclaration(class))
+                if self.es5_async_class_heritage_await(statement).is_some() =>
+            {
+                if let Some(name) = class
+                    .name
+                    .and_then(|name| declaration_name_text(self.arena, name))
+                {
+                    push_unique(names, name);
+                }
+            }
             Some(NodeData::IfStatement(statement)) => {
                 self.collect_es5_async_variable_hoists(statement.then_statement, lists, names);
                 if let Some(statement) = statement.else_statement {
@@ -45982,6 +46172,18 @@ impl Printer<'_> {
         &self,
         statement: NodeId,
     ) -> Option<(NodeId, NodeId, NodeId, NodeId)> {
+        let (name, initializer) = self.es5_async_variable_binding_initializer(statement)?;
+        let await_id = self.es5_async_simple_await_in_expression(initializer)?;
+        let NodeData::AwaitExpression(awaited) = &self.arena.get(await_id)?.data else {
+            return None;
+        };
+        Some((name, initializer, await_id, awaited.expression))
+    }
+
+    fn es5_async_variable_binding_initializer(
+        &self,
+        statement: NodeId,
+    ) -> Option<(NodeId, NodeId)> {
         let NodeData::VariableStatement(variable) = &self.arena.get(statement)?.data else {
             return None;
         };
@@ -45997,15 +46199,23 @@ impl Printer<'_> {
             return None;
         };
         let initializer = declaration.initializer?;
-        let await_id = self.es5_async_simple_await_in_expression(initializer)?;
+        matches!(
+            self.arena.get(declaration.name).map(|node| &node.data),
+            Some(NodeData::Identifier(_))
+        )
+        .then_some((declaration.name, initializer))
+    }
+
+    fn es5_async_class_heritage_await(&self, statement: NodeId) -> Option<(NodeId, NodeId)> {
+        let NodeData::ClassDeclaration(class) = &self.arena.get(statement)?.data else {
+            return None;
+        };
+        let base = self.class_base_expression(class).ok().flatten()?;
+        let await_id = self.es5_async_simple_await_in_expression(base)?;
         let NodeData::AwaitExpression(awaited) = &self.arena.get(await_id)?.data else {
             return None;
         };
-        matches!(
-        self.arena.get(declaration.name).map(|node| &node.data),
-            Some(NodeData::Identifier(_))
-        )
-        .then_some((declaration.name, initializer, await_id, awaited.expression))
+        Some((await_id, awaited.expression))
     }
 
     fn es5_async_captured_for_loop(
@@ -50015,7 +50225,7 @@ impl Printer<'_> {
         }
         if self.settings.target < ScriptTarget::Es2015 {
             let name = self.class_expression_downlevel_name(id, &declaration);
-            return self.emit_downlevel_class_value(&declaration, &name);
+            return self.emit_downlevel_class_value(&declaration, &name, false);
         }
         self.emit_class(&declaration)
     }
@@ -50546,7 +50756,7 @@ impl Printer<'_> {
         let previous_anonymous_private_class = self.active_anonymous_private_class;
         self.active_anonymous_private_class = anonymous_private_plan.as_ref().map(|_| id);
         if let Some(name) = downlevel_name {
-            self.emit_downlevel_class_value(&core, name)?;
+            self.emit_downlevel_class_value(&core, name, false)?;
         } else {
             self.emit_class(&core)?;
         }
@@ -51458,7 +51668,7 @@ impl Printer<'_> {
         self.writer.write("var ");
         self.writer.write(&name);
         self.writer.write(" = ");
-        self.emit_downlevel_class_value(data, &name)?;
+        self.emit_downlevel_class_value(data, &name, false)?;
         self.writer.write(";");
         Ok(())
     }
@@ -51468,6 +51678,7 @@ impl Printer<'_> {
         &mut self,
         data: &ts_ast::ClassDeclarationData,
         name: &str,
+        factory_only: bool,
     ) -> Result<(), EmitError> {
         let base = self.class_base_expression(data)?;
         let base_is_null = base.is_some_and(|base| {
@@ -51478,10 +51689,11 @@ impl Printer<'_> {
         let super_capture = base.is_some().then(|| self.es5_super_capture_name());
         let field_object_temps = self.prepare_es5_class_field_object_temps(data);
         let captures_field_this = self.es5_class_fields_capture_this(data);
-        if !self.settings.remove_comments {
+        if !factory_only && !self.settings.remove_comments {
             self.writer.write("/** @class */ ");
         }
-        self.writer.write("(function (");
+        self.writer
+            .write(if factory_only { "function (" } else { "(function (" });
         if let Some(super_capture) = &super_capture {
             self.writer.write(super_capture);
         }
@@ -51936,11 +52148,15 @@ impl Printer<'_> {
         self.writer.write(";");
         self.writer.newline();
         self.writer.indent -= 1;
-        self.writer.write("}(");
-        if let Some(base) = base {
-            self.emit_expression(base, 0)?;
+        if factory_only {
+            self.writer.write("}");
+        } else {
+            self.writer.write("}(");
+            if let Some(base) = base {
+                self.emit_expression(base, 0)?;
+            }
+            self.writer.write("))");
         }
-        self.writer.write("))");
         Ok(())
     }
 
