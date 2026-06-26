@@ -2659,7 +2659,10 @@ impl<'a> Parser<'a> {
 
     fn parse_class_static_block(&mut self, start: TextPos) -> NodeId {
         let static_modifier = self.consume_token_node();
+        let previous_await_identifier_context = self.await_identifier_context;
+        self.await_identifier_context = true;
         let body = self.parse_block();
+        self.await_identifier_context = previous_await_identifier_context;
         self.alloc_node(
             SyntaxKind::ClassStaticBlockDeclaration,
             TextRange::new(start, self.node_end(body)),
@@ -4678,6 +4681,11 @@ impl<'a> Parser<'a> {
         if minimum_precedence <= 2
             && self.current.kind == SyntaxKind::EqualsGreaterThanToken
             && self.arena.get(left).unwrap().kind == SyntaxKind::Identifier
+            && !(self.await_identifier_context
+                && matches!(
+                    self.arena.get(left).map(|node| &node.data),
+                    Some(NodeData::Identifier(identifier)) if identifier.text == "await"
+                ))
         {
             left = self.parse_single_parameter_arrow_function(left);
         }
@@ -5870,6 +5878,11 @@ impl<'a> Parser<'a> {
 
     #[allow(clippy::too_many_lines)]
     fn is_parenthesized_arrow(&mut self) -> bool {
+        if (self.await_context || self.await_identifier_context)
+            && self.next_token_kind() == SyntaxKind::AwaitKeyword
+        {
+            return false;
+        }
         let checkpoint = self.scanner.mark();
         let mut parenthesis_depth = 1_u32;
         let mut brace_depth = 0_u32;
@@ -9604,6 +9617,46 @@ mod tests {
             result.arena.get(*member).unwrap().kind
                 == SyntaxKind::ClassStaticBlockDeclaration
         }));
+    }
+
+    #[test]
+    fn recovers_await_label_inside_class_static_block() {
+        let result = parse_source_file(
+            "class C { static { await: // illegal\n break await; } }",
+        );
+        let kinds = result
+            .arena
+            .iter()
+            .filter_map(|(_, node)| {
+                matches!(
+                    node.kind,
+                    SyntaxKind::LabeledStatement
+                        | SyntaxKind::ExpressionStatement
+                        | SyntaxKind::BreakStatement
+                )
+                .then_some(node.kind)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            [
+                SyntaxKind::ExpressionStatement,
+                SyntaxKind::BreakStatement,
+                SyntaxKind::ExpressionStatement,
+            ]
+        );
+
+        let arrows = parse_source_file(
+            "class C { static { const ff = (await) => {}; const fff = await => {}; } }",
+        );
+        assert!(
+            arrows
+                .arena
+                .iter()
+                .all(|(_, node)| node.kind != SyntaxKind::ArrowFunction),
+            "{:?}",
+            arrows.diagnostics,
+        );
     }
 
     #[test]

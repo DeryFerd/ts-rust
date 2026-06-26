@@ -29002,7 +29002,11 @@ impl Printer<'_> {
 
     fn expression_ends_with_missing_gap(&self, expression: NodeId) -> bool {
         match self.arena.get(expression).map(|node| &node.data) {
-            Some(NodeData::Identifier(identifier)) => identifier.text.is_empty(),
+            Some(NodeData::Identifier(identifier)) => {
+                identifier.text.is_empty()
+                    || (identifier.text == "await"
+                        && self.identifier_is_in_static_block_await_context(expression))
+            }
             Some(NodeData::NewExpression(new_expression)) => self
                 .arena
                 .get(new_expression.expression)
@@ -32271,6 +32275,8 @@ impl Printer<'_> {
                         false,
                         false,
                     );
+                } else if self.break_is_recovered_static_block_await_label(id) {
+                    self.writer.write(" ");
                 }
                 self.writer.write(";");
             }
@@ -32529,7 +32535,19 @@ impl Printer<'_> {
                     if same_line_block_comment && parenthesized {
                         self.writer.remove_trailing_newline();
                     }
-                    self.writer.remove_trailing_spaces();
+                    let preserve_recovered_await_gap = matches!(
+                        self.arena.get(data.expression).map(|node| &node.data),
+                        Some(NodeData::AwaitExpression(awaited))
+                            if node_is_missing_identifier(self.arena, awaited.expression)
+                    ) || matches!(
+                        self.arena.get(data.expression).map(|node| &node.data),
+                        Some(NodeData::Identifier(identifier))
+                            if identifier.text == "await"
+                                && self.identifier_is_in_static_block_await_context(data.expression)
+                    );
+                    if !preserve_recovered_await_gap {
+                        self.writer.remove_trailing_spaces();
+                    }
                 }
                 let recovered_jsx_trailing_greater = matches!(
                     self.settings.jsx,
@@ -35998,7 +36016,7 @@ impl Printer<'_> {
         } else {
             false
         };
-        for statement in &data.statements.nodes {
+        for (statement_index, statement) in data.statements.nodes.iter().enumerate() {
             let statement_node = self.node(*statement)?.clone();
             let current_owns_source_comments =
                 self.statement_emits_in_place(*statement, &statement_node);
@@ -36019,12 +36037,32 @@ impl Printer<'_> {
                 })
                 .flatten();
             let comment_end = inline_comment_start.unwrap_or(statement_node.range.start.get());
-            self.emit_source_comments_between_with_ownership(
-                previous_end,
-                comment_end,
-                previous_emitted || previous_end == node.range.start.get().saturating_add(1),
-                current_owns_source_comments,
-            );
+            let recovered_await_label_break = matches!(statement_node.data, NodeData::BreakStatement(_))
+                && statement_index.checked_sub(1).and_then(|index| data.statements.nodes.get(index)).is_some_and(|previous| {
+                    matches!(
+                        self.arena.get(*previous).map(|node| &node.data),
+                        Some(NodeData::ExpressionStatement(expression))
+                            if declaration_name_text(self.arena, expression.expression) == Some("await")
+                    )
+                })
+                && data.statements.nodes.get(statement_index + 1).is_some_and(|next| {
+                    matches!(
+                        self.arena.get(*next).map(|node| &node.data),
+                        Some(NodeData::ExpressionStatement(expression))
+                            if declaration_name_text(self.arena, expression.expression) == Some("await")
+                    )
+                });
+            if recovered_await_label_break {
+                // The parser recovers `await: break await` as three statements. The line
+                // comment after the erased label belongs to the trailing recovered `await`.
+            } else {
+                self.emit_source_comments_between_with_ownership(
+                    previous_end,
+                    comment_end,
+                    previous_emitted || previous_end == node.range.start.get().saturating_add(1),
+                    current_owns_source_comments,
+                );
+            }
             if self.block_comment_touches_range_end(previous_end, comment_end)
                 && matches!(statement_node.data, NodeData::Block(_))
                 && self.writer.line_start
@@ -56797,6 +56835,12 @@ impl Printer<'_> {
     }
 
     fn emit_shorthand_property(&mut self, name: NodeId) -> Result<(), EmitError> {
+        if self.identifier_text(name).ok() == Some("await")
+            && self.identifier_is_in_static_block_await_context(name)
+        {
+            self.writer.write("await: ");
+            return Ok(());
+        }
         let rewrite = self
             .identifier_text(name)
             .ok()
@@ -57547,6 +57591,44 @@ impl Printer<'_> {
         self.writer.write(source.as_deref().unwrap_or(text));
     }
 
+    fn identifier_is_in_static_block_await_context(&self, identifier: NodeId) -> bool {
+        let mut current = identifier;
+        while let Some(parent) = self.arena.get(current).and_then(|node| node.parent) {
+            match self.arena.get(parent).map(|node| &node.data) {
+                Some(NodeData::ClassStaticBlockDeclaration(_)) => return true,
+                Some(
+                    NodeData::FunctionDeclaration(_)
+                    | NodeData::FunctionExpression(_)
+                    | NodeData::MethodDeclaration(_)
+                    | NodeData::ConstructorDeclaration(_)
+                    | NodeData::GetAccessorDeclaration(_)
+                    | NodeData::SetAccessorDeclaration(_),
+                ) => return false,
+                _ => current = parent,
+            }
+        }
+        false
+    }
+
+    fn break_is_recovered_static_block_await_label(&self, statement: NodeId) -> bool {
+        let block = self.arena.get(statement).and_then(|node| node.parent);
+        let Some(NodeData::Block(block)) = block.and_then(|block| self.arena.get(block)).map(|node| &node.data) else {
+            return false;
+        };
+        let Some(index) = block.statements.nodes.iter().position(|candidate| *candidate == statement) else {
+            return false;
+        };
+        [index.checked_sub(1).and_then(|index| block.statements.nodes.get(index)), block.statements.nodes.get(index + 1)]
+            .into_iter()
+            .all(|candidate| candidate.is_some_and(|candidate| {
+                matches!(
+                    self.arena.get(*candidate).map(|node| &node.data),
+                    Some(NodeData::ExpressionStatement(expression))
+                        if declaration_name_text(self.arena, expression.expression) == Some("await")
+                )
+            }))
+    }
+
     fn emit_expression(&mut self, id: NodeId, parent_precedence: u8) -> Result<(), EmitError> {
         let range = self.node(id)?.range;
         self.record_mapping_at(range.start.get());
@@ -57621,6 +57703,20 @@ impl Printer<'_> {
                 self.emit_expression(data.name, 0)?;
             }
             NodeData::Identifier(data) => {
+                let await_call_target = node.parent.is_some_and(|parent| {
+                    matches!(
+                        self.arena.get(parent).map(|node| &node.data),
+                        Some(NodeData::CallExpression(call)) if call.expression == id
+                    )
+                });
+                if data.text == "await"
+                    && !await_call_target
+                    && self.identifier_is_in_static_block_await_context(id)
+                {
+                    self.write_source_identifier(id, &data.text);
+                    self.writer.write(" ");
+                    return Ok(());
+                }
                 let is_declaration_name = node
                     .parent
                     .and_then(|parent| self.arena.get(parent))
