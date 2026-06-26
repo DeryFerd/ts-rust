@@ -43839,8 +43839,7 @@ impl Printer<'_> {
         self.writer.write(".label) {");
         self.writer.newline();
         self.writer.indent += 1;
-        self.writer.write("case 0:");
-        self.writer.newline();
+        self.writer.write("case 0: ");
         self.writer.indent += 1;
 
         self.emit_es5_generator_object_prefix(
@@ -44177,8 +44176,7 @@ impl Printer<'_> {
         self.writer.write(".label) {");
         self.writer.newline();
         self.writer.indent += 1;
-        self.writer.write("case 0:");
-        self.writer.newline();
+        self.writer.write("case 0: ");
         self.writer.indent += 1;
         let mut case = 0;
         for statement in statements {
@@ -44715,23 +44713,54 @@ impl Printer<'_> {
         let NodeData::Block(block) = &node.data else {
             return Err(Self::unsupported(body, node.kind));
         };
+        let compact = !self.node_source_is_multiline(body);
         self.writer.write("{");
-        self.writer.newline();
-        self.writer.indent += 1;
-        self.writer.write("return ");
+        if compact {
+            self.writer.write(" return ");
+        } else {
+            self.writer.newline();
+            self.writer.indent += 1;
+            self.writer.write("return ");
+        }
         self.emit_helper_reference("__asyncGenerator");
         self.writer.write("(this, arguments, function ");
         self.writer.write(inner_name);
         self.writer.write("() {");
-        self.writer.newline();
-        self.writer.indent += 1;
-        self.writer.write("return ");
+        if compact {
+            self.writer.write(" return ");
+        } else {
+            self.writer.newline();
+            self.writer.indent += 1;
+        }
+        let mut hoisted_names = Vec::new();
+        for statement in &block.statements.nodes {
+            if let Some(NodeData::VariableStatement(statement)) =
+                self.arena.get(*statement).map(|node| &node.data)
+            {
+                for name in simple_variable_names(self.arena, statement.declaration_list) {
+                    push_unique(&mut hoisted_names, &name);
+                }
+            }
+        }
+        if !hoisted_names.is_empty() {
+            self.writer.write("var ");
+            self.writer.write(&hoisted_names.join(", "));
+            self.writer.write(";");
+            self.writer.newline();
+        }
+        if !compact || !hoisted_names.is_empty() {
+            self.writer.write("return ");
+        }
         self.emit_generator_reference();
         self.writer.write("(this, function (_a) {");
         self.writer.newline();
         self.writer.indent += 1;
         self.emit_es5_async_generator_state_machine(&block.statements.nodes, "_a")?;
         self.writer.indent -= 1;
+        if compact {
+            self.writer.write("}); }); }");
+            return Ok(());
+        }
         self.writer.write("});");
         self.writer.newline();
         self.writer.indent -= 1;
@@ -44751,6 +44780,13 @@ impl Printer<'_> {
         let has_suspension = statements.iter().any(|statement| {
             self.direct_yield_expression(*statement).is_some()
                 || self.direct_await_expression(*statement).is_some()
+                || self
+                    .direct_async_generator_variable_suspension(*statement)
+                    .is_some()
+                || matches!(
+                    self.arena.get(*statement).map(|node| &node.data),
+                    Some(NodeData::ReturnStatement(statement)) if statement.expression.is_some()
+                )
         });
         if !has_suspension {
             for statement in statements {
@@ -44774,64 +44810,35 @@ impl Printer<'_> {
         self.writer.write(".label) {");
         self.writer.newline();
         self.writer.indent += 1;
-        self.writer.write("case 0:");
-        self.writer.newline();
+        self.writer.write("case 0: ");
         self.writer.indent += 1;
         let mut case = 0;
         for statement in statements {
-            if let Some(yielded) = self.direct_yield_expression(*statement).cloned() {
-                if yielded.asterisk_token.is_some() {
-                    self.writer.write("return [5 /*yield**/, ");
-                    self.emit_helper_reference("__values");
-                    self.writer.write("(");
-                    self.emit_helper_reference("__asyncDelegator");
-                    self.writer.write("(");
-                    self.emit_helper_reference("__asyncValues");
-                    self.writer.write("(");
-                    if let Some(expression) = yielded.expression {
-                        self.emit_expression(expression, 0)?;
-                    } else {
-                        self.writer.write("void 0");
+            if let Some((name, initializer)) =
+                self.direct_async_generator_variable_suspension(*statement)
+            {
+                match self.arena.get(initializer).map(|node| &node.data) {
+                    Some(NodeData::YieldExpression(yielded)) => {
+                        self.emit_es5_async_generator_yield(yielded, state, &mut case)?;
                     }
-                    self.writer.write(")))];");
-                    self.writer.newline();
-                    self.writer.indent -= 1;
-                    case += 1;
-                    self.writer.write("case ");
-                    self.writer.write(&case.to_string());
-                    self.writer.write(": return [4 /*yield*/, ");
-                    self.emit_helper_reference("__await");
-                    self.writer.write(".apply(void 0, [");
-                    self.writer.write(state);
-                    self.writer.write(".sent()])];");
-                    self.writer.newline();
-                    self.writer.indent += 1;
-                    self.emit_es5_state_case(&mut case);
-                    self.writer.write(state);
-                    self.writer.write(".sent();");
-                    self.writer.newline();
-                    continue;
+                    Some(NodeData::AwaitExpression(awaited)) => {
+                        self.writer.write("return [4 /*yield*/, ");
+                        self.emit_helper_reference("__await");
+                        self.writer.write("(");
+                        self.emit_expression(awaited.expression, 0)?;
+                        self.writer.write(")];");
+                        self.writer.newline();
+                        self.emit_es5_state_case(&mut case);
+                    }
+                    _ => unreachable!("suspending initializer checked above"),
                 }
-                self.writer.write("return [4 /*yield*/, ");
-                self.emit_helper_reference("__await");
-                self.writer.write("(");
-                if let Some(expression) = yielded.expression {
-                    self.emit_expression(expression, 0)?;
-                } else {
-                    self.writer.write("void 0");
-                }
-                self.writer.write(")];");
-                self.writer.newline();
-                self.writer.indent -= 1;
-                case += 1;
-                self.writer.write("case ");
-                self.writer.write(&case.to_string());
-                self.writer.write(": return [4 /*yield*/, ");
+                self.emit_expression(name, 0)?;
+                self.writer.write(" = ");
                 self.writer.write(state);
-                self.writer.write(".sent()];");
+                self.writer.write(".sent();");
                 self.writer.newline();
-                self.writer.indent += 1;
-                self.emit_es5_state_case(&mut case);
+            } else if let Some(yielded) = self.direct_yield_expression(*statement).cloned() {
+                self.emit_es5_async_generator_yield(&yielded, state, &mut case)?;
                 self.writer.write(state);
                 self.writer.write(".sent();");
                 self.writer.newline();
@@ -44849,7 +44856,25 @@ impl Printer<'_> {
             } else if let Some(NodeData::ReturnStatement(return_statement)) =
                 self.arena.get(*statement).map(|node| &node.data)
             {
-                self.emit_es5_generator_return(return_statement.expression)?;
+                if let Some(expression) = return_statement.expression {
+                    self.writer.write("return [4 /*yield*/, ");
+                    self.emit_helper_reference("__await");
+                    self.writer.write("(");
+                    self.emit_expression(expression, 0)?;
+                    self.writer.write(")];");
+                    self.writer.newline();
+                    self.writer.indent -= 1;
+                    case += 1;
+                    self.writer.write("case ");
+                    self.writer.write(&case.to_string());
+                    self.writer.write(": return [2 /*return*/, ");
+                    self.writer.write(state);
+                    self.writer.write(".sent()];");
+                    self.writer.newline();
+                    self.writer.indent += 1;
+                } else {
+                    self.emit_es5_generator_return(None)?;
+                }
             } else {
                 self.emit_statement(*statement)?;
             }
@@ -44861,6 +44886,64 @@ impl Printer<'_> {
         self.writer.indent -= 2;
         self.writer.write("}");
         self.writer.newline();
+        Ok(())
+    }
+
+    fn emit_es5_async_generator_yield(
+        &mut self,
+        yielded: &ts_ast::YieldExpressionData,
+        state: &str,
+        case: &mut usize,
+    ) -> Result<(), EmitError> {
+        if yielded.asterisk_token.is_some() {
+            self.writer.write("return [5 /*yield**/, ");
+            self.emit_helper_reference("__values");
+            self.writer.write("(");
+            self.emit_helper_reference("__asyncDelegator");
+            self.writer.write("(");
+            self.emit_helper_reference("__asyncValues");
+            self.writer.write("(");
+            if let Some(expression) = yielded.expression {
+                self.emit_expression(expression, 0)?;
+            } else {
+                self.writer.write("void 0");
+            }
+            self.writer.write(")))];");
+            self.writer.newline();
+            self.writer.indent -= 1;
+            *case += 1;
+            self.writer.write("case ");
+            self.writer.write(&case.to_string());
+            self.writer.write(": return [4 /*yield*/, ");
+            self.emit_helper_reference("__await");
+            self.writer.write(".apply(void 0, [");
+            self.writer.write(state);
+            self.writer.write(".sent()])];");
+            self.writer.newline();
+            self.writer.indent += 1;
+            self.emit_es5_state_case(case);
+            return Ok(());
+        }
+        self.writer.write("return [4 /*yield*/, ");
+        self.emit_helper_reference("__await");
+        self.writer.write("(");
+        if let Some(expression) = yielded.expression {
+            self.emit_expression(expression, 0)?;
+        } else {
+            self.writer.write("void 0");
+        }
+        self.writer.write(")];");
+        self.writer.newline();
+        self.writer.indent -= 1;
+        *case += 1;
+        self.writer.write("case ");
+        self.writer.write(&case.to_string());
+        self.writer.write(": return [4 /*yield*/, ");
+        self.writer.write(state);
+        self.writer.write(".sent()];");
+        self.writer.newline();
+        self.writer.indent += 1;
+        self.emit_es5_state_case(case);
         Ok(())
     }
 
@@ -44883,6 +44966,32 @@ impl Printer<'_> {
             return None;
         };
         Some(awaited.expression)
+    }
+
+    fn direct_async_generator_variable_suspension(
+        &self,
+        statement: NodeId,
+    ) -> Option<(NodeId, NodeId)> {
+        let NodeData::VariableStatement(statement) = &self.arena.get(statement)?.data else {
+            return None;
+        };
+        let NodeData::VariableDeclarationList(list) =
+            &self.arena.get(statement.declaration_list)?.data
+        else {
+            return None;
+        };
+        let [declaration] = list.declarations.nodes.as_slice() else {
+            return None;
+        };
+        let NodeData::VariableDeclaration(declaration) = &self.arena.get(*declaration)?.data else {
+            return None;
+        };
+        let initializer = declaration.initializer?;
+        matches!(
+            self.arena.get(initializer).map(|node| &node.data),
+            Some(NodeData::YieldExpression(_) | NodeData::AwaitExpression(_))
+        )
+        .then_some((declaration.name, initializer))
     }
 
     fn statements_end_in_return(&self, statements: &[NodeId]) -> bool {
@@ -60334,11 +60443,17 @@ impl Printer<'_> {
                             method.modifiers.as_ref(),
                             SyntaxKind::AsyncKeyword,
                         );
-                        if is_async && self.settings.target >= ScriptTarget::Es2017 {
+                        let downlevel_async_generator = is_async
+                            && method.asterisk_token.is_some()
+                            && self.settings.target < ScriptTarget::Es2018;
+                        if is_async
+                            && !downlevel_async_generator
+                            && self.settings.target >= ScriptTarget::Es2017
+                        {
                             self.writer.write("async ");
                         }
                         self.writer.write("function");
-                        if method.asterisk_token.is_some() {
+                        if method.asterisk_token.is_some() && !downlevel_async_generator {
                             self.writer.write("*");
                         }
                         self.writer.write(" ");
@@ -60349,7 +60464,13 @@ impl Printer<'_> {
                             super_capture.clone().unwrap_or_else(|| "_super".into()),
                             self.has_modifier(method.modifiers.as_ref(), SyntaxKind::StaticKeyword),
                         ));
-                        if is_async && self.settings.target < ScriptTarget::Es2017 {
+                        if downlevel_async_generator {
+                            let inner_name = self.generated_names.generate(
+                                declaration_name_text(self.arena, method.name)
+                                    .unwrap_or("_method"),
+                            );
+                            self.emit_es5_downlevel_async_generator_body(body, &inner_name)?;
+                        } else if is_async && self.settings.target < ScriptTarget::Es2017 {
                             self.emit_downlevel_async_function_body(body, "this")?;
                         } else if self.settings.target < ScriptTarget::Es2015
                             && self.body_has_downlevel_arrow_this(body)
@@ -67922,13 +68043,23 @@ impl Printer<'_> {
                                 && is_async
                                 && self.settings.target < ScriptTarget::Es2017;
                             if self.settings.target < ScriptTarget::Es2015
-                                && method.asterisk_token.is_none()
+                                && (method.asterisk_token.is_none()
+                                    || downlevel_async_generator)
                             {
                                 self.emit_object_literal_property_name(method.name)?;
                                 self.writer.write(": function ");
                                 self.emit_parameters(&method.parameters)?;
                                 self.writer.write(" ");
-                                if downlevel_async {
+                                if downlevel_async_generator {
+                                    let inner_name = self.generated_names.generate(
+                                        declaration_name_text(self.arena, method.name)
+                                            .unwrap_or("_method"),
+                                    );
+                                    self.emit_es5_downlevel_async_generator_body(
+                                        method.body.expect("body checked above"),
+                                        &inner_name,
+                                    )?;
+                                } else if downlevel_async {
                                     self.emit_downlevel_async_function_body(
                                         method.body.expect("body checked above"),
                                         "this",
@@ -76526,21 +76657,11 @@ mod tests {
         assert!(es5.contains("var __await ="), "{es5}");
         assert!(es5.contains("var __asyncGenerator ="), "{es5}");
         assert!(
-            es5.contains(concat!(
-                "var value = (function named() {\n",
-                "    return __asyncGenerator(this, arguments, function named_1() {\n",
-                "        return __generator(this, function (_a) {\n",
-                "            switch (_a.label) {\n",
-                "                case 0:\n",
-                "                    return [4 /*yield*/, __await(ready)];\n",
-                "                case 1:\n",
-                "                    _a.sent();\n",
-                "                    return [4 /*yield*/, __await(item)];\n",
-                "                case 2: return [4 /*yield*/, _a.sent()];\n",
-                "                case 3:\n",
-                "                    _a.sent();\n",
-                "                    return [2 /*return*/, done];\n",
-            )),
+            es5.contains("function named() { return __asyncGenerator(this, arguments, function named_1() { return __generator(this, function (_a) {")
+                && es5.contains("case 0: return [4 /*yield*/, __await(ready)];")
+                && es5.contains("return [4 /*yield*/, __await(item)];")
+                && es5.contains("return [4 /*yield*/, __await(done)];")
+                && es5.contains("case 4: return [2 /*return*/, _a.sent()];"),
             "{es5}"
         );
 
