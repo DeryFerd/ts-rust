@@ -40763,7 +40763,8 @@ impl Printer<'_> {
         claimed: &mut HashSet<String>,
         temps: &mut Vec<String>,
     ) {
-        let downlevels_async_container = self.settings.target < ScriptTarget::Es2017
+        let downlevels_async_container = self.settings.module == ModuleKind::Amd
+            && self.settings.target < ScriptTarget::Es2017
             && self.arena.get(container).is_some_and(|node| {
                 declaration_has_modifier(self.arena, node, SyntaxKind::AsyncKeyword)
             });
@@ -64962,14 +64963,12 @@ impl Printer<'_> {
         call: &ts_ast::CallExpressionData,
         parent_precedence: u8,
     ) -> Result<(), EmitError> {
-        self.amd_dynamic_import_counter += 1;
-        let suffix = self.amd_dynamic_import_counter;
-        let resolve = format!("resolve_{suffix}");
-        let reject = format!("reject_{suffix}");
         let argument = call.arguments.nodes.first().copied();
         let temp = self.amd_dynamic_import_temps.get(&call_id).cloned();
         let wrap = (temp.is_some() && parent_precedence > 0)
-            || (self.settings.module == ModuleKind::Umd && parent_precedence > 1);
+            || (self.settings.module == ModuleKind::Umd
+                && parent_precedence > 1
+                && self.async_expression_transform == AsyncExpressionTransform::None);
         if wrap {
             self.writer.write("(");
         }
@@ -64979,6 +64978,10 @@ impl Printer<'_> {
             self.emit_expression(argument.expect("dynamic import temp has argument"), 1)?;
             self.writer.write(", ");
         }
+        self.amd_dynamic_import_counter += 1;
+        let suffix = self.amd_dynamic_import_counter;
+        let resolve = format!("resolve_{suffix}");
+        let reject = format!("reject_{suffix}");
         if self.settings.module == ModuleKind::Umd {
             self.writer.write("__syncRequire ? Promise.resolve().then(");
             if self.settings.target < ScriptTarget::Es2015 {
