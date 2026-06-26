@@ -15793,6 +15793,56 @@ impl DeclarationPrinter<'_> {
             .and_then(|name| object.properties.get(name).copied())
     }
 
+    fn class_getter_semantic_property_type(
+        &self,
+        member: NodeId,
+        name: NodeId,
+    ) -> Option<TypeId> {
+        let class = self.arena.get(member)?.parent?;
+        let members = match &self.arena.get(class)?.data {
+            NodeData::ClassDeclaration(class) => &class.members,
+            NodeData::ClassExpression(class) => &class.members,
+            _ => return None,
+        };
+        members.nodes.iter().find_map(|candidate| {
+            let NodeData::GetAccessorDeclaration(getter) = &self.arena.get(*candidate)?.data else {
+                return None;
+            };
+            self.declaration_member_names_match(name, getter.name)
+                .then(|| self.node_types?.get(candidate).copied())
+                .flatten()
+        })
+    }
+
+    fn declaration_member_names_match(&self, left: NodeId, right: NodeId) -> bool {
+        if let (Some(left), Some(right)) = (
+            declaration_name_text(self.arena, left),
+            declaration_name_text(self.arena, right),
+        ) {
+            return left == right;
+        }
+        let computed_expression = |name| match self.arena.get(name).map(|node| &node.data) {
+            Some(NodeData::ComputedPropertyName(computed)) => Some(computed.expression),
+            _ => None,
+        };
+        let Some((left, right)) =
+            computed_expression(left).zip(computed_expression(right))
+        else {
+            return false;
+        };
+        let source = |expression| {
+            let range = self.arena.get(expression)?.range;
+            usize::try_from(range.start.get())
+                .ok()
+                .zip(usize::try_from(range.end.get()).ok())
+                .and_then(|(start, end)| self.source_text.get(start..end))
+                .map(str::trim)
+        };
+        source(left)
+            .zip(source(right))
+            .is_some_and(|(left, right)| left == right)
+    }
+
     fn computed_enum_setter_parameter_type(
         &self,
         member: NodeId,
@@ -17889,7 +17939,8 @@ impl DeclarationPrinter<'_> {
                             self.arena.get(computed.expression).map(|expression| &expression.data),
                             Some(NodeData::PropertyAccessExpression(_))
                         ) && self.enum_member_type_expression(computed.expression).is_none()
-                );
+                ) && !self.computed_method_is_global_symbol_property(data.name)
+                    && self.computed_method_requires_symbol_property(data.name);
                 let class_expression_member = self
                     .arena
                     .get(data.name)
@@ -18249,6 +18300,10 @@ impl DeclarationPrinter<'_> {
                         self.emit_jsdoc_type_hint(&hint);
                     } else if let Some(type_id) =
                         self.class_member_semantic_property_type(id, data.name)
+                    {
+                        self.emit_semantic_type(type_id)?;
+                    } else if let Some(type_id) =
+                        self.class_getter_semantic_property_type(id, data.name)
                     {
                         self.emit_semantic_type(type_id)?;
                     } else {
@@ -22582,6 +22637,30 @@ impl DeclarationPrinter<'_> {
                         .is_some_and(|type_node| type_node.kind == SyntaxKind::SymbolKeyword)
                 })
         })
+    }
+
+    fn computed_method_is_global_symbol_property(&self, name: NodeId) -> bool {
+        let Some(NodeData::ComputedPropertyName(computed)) =
+            self.arena.get(name).map(|node| &node.data)
+        else {
+            return false;
+        };
+        let Some(NodeData::PropertyAccessExpression(access)) =
+            self.arena.get(computed.expression).map(|node| &node.data)
+        else {
+            return false;
+        };
+        let Some(NodeData::Identifier(identifier)) =
+            self.arena.get(access.expression).map(|node| &node.data)
+        else {
+            return false;
+        };
+        if identifier.text != "Symbol" {
+            return false;
+        }
+        self.resolve_lexical_name_at(access.expression, &identifier.text)
+            .and_then(|symbol| self.bindings.symbols.get(symbol))
+            .is_none_or(|symbol| symbol.declarations.is_empty())
     }
 
     fn javascript_computed_method_is_rebound(&self, name: NodeId) -> bool {
