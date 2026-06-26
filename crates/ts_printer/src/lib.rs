@@ -36726,7 +36726,6 @@ impl Printer<'_> {
                 self.arena.get(*parameter).map(|node| &node.data),
                 Some(NodeData::ParameterDeclaration(parameter))
                     if parameter.initializer.is_some()
-                        || parameter.dot_dot_dot_token.is_some()
                         || matches!(
                             self.arena.get(parameter.name).map(|node| &node.data),
                             Some(NodeData::BindingPattern(_))
@@ -37656,6 +37655,7 @@ impl Printer<'_> {
                 this_argument,
                 "this",
                 "_a",
+                None,
                 None,
                 false,
             );
@@ -39534,15 +39534,23 @@ impl Printer<'_> {
         generator_this: &str,
         requested_state_parameter: &str,
         object_rest: Option<(NodeId, &str, Option<&str>)>,
+        parameter_prologue: Option<&NodeList>,
         compact_outer: bool,
     ) -> Result<(), EmitError> {
+        let compact_outer = compact_outer && parameter_prologue.is_none();
+        let empty_single_line_block = self.arena.get(body).is_some_and(|node| {
+            matches!(&node.data, NodeData::Block(block) if block.statements.nodes.is_empty())
+                && usize::try_from(node.range.start.get())
+                    .ok()
+                    .zip(usize::try_from(node.range.end.get()).ok())
+                    .and_then(|(start, end)| self.source_text.get(start..end))
+                    .is_some_and(|source| !source.contains(['\n', '\r']))
+        });
         if !compact_outer
             && expression_body.is_none()
             && object_rest.is_none()
-            && matches!(
-                self.arena.get(body).map(|node| &node.data),
-                Some(NodeData::Block(block)) if block.statements.nodes.is_empty()
-            )
+            && parameter_prologue.is_none()
+            && empty_single_line_block
         {
             self.writer.write("{");
             self.writer.newline();
@@ -39613,8 +39621,49 @@ impl Printer<'_> {
                 hoisted_functions.iter().copied().collect();
             self.es5_async_hoisted_variable_lists = hoisted_lists;
         }
+        let mut computed_objects = self
+            .arena
+            .iter()
+            .filter_map(|(id, node)| {
+                let NodeData::ObjectLiteralExpression(object) = &node.data else {
+                    return None;
+                };
+                (self.node_belongs_to_async_super_body(id, body)
+                    && self.es5_async_object_await_count(id) == 0
+                    && object.properties.nodes.iter().any(|property| {
+                        let name = match self.arena.get(*property).map(|node| &node.data) {
+                            Some(NodeData::PropertyAssignment(property)) => property.name,
+                            Some(NodeData::MethodDeclaration(method)) => method.name,
+                            Some(NodeData::GetAccessorDeclaration(accessor)) => accessor.name,
+                            Some(NodeData::SetAccessorDeclaration(accessor)) => accessor.name,
+                            _ => return false,
+                        };
+                        matches!(
+                            self.arena.get(name).map(|node| &node.data),
+                            Some(NodeData::ComputedPropertyName(_))
+                        )
+                    }))
+                .then_some((node.range.start, id))
+            })
+            .collect::<Vec<_>>();
+        computed_objects.sort_by_key(|(start, _)| *start);
+        let mut computed_object_temps = Vec::new();
+        let mut computed_claimed = HashSet::new();
+        for (_, object) in computed_objects {
+            if self.computed_property_temps.contains_key(&object) {
+                continue;
+            }
+            let temp = self.generate_block_temp(body, &computed_claimed);
+            computed_claimed.insert(temp.clone());
+            self.computed_property_temps.insert(object, temp.clone());
+            computed_object_temps.push((object, temp));
+        }
+        let computed_temp_names = computed_object_temps
+            .iter()
+            .map(|(_, temp)| temp.clone())
+            .collect::<Vec<_>>();
         let capture_plan = if expression_body.is_none() {
-            self.es5_async_capture_plan(body)
+            self.es5_async_capture_plan(body, &computed_temp_names)
         } else {
             Es5AsyncCapturePlan {
                 temps: Vec::new(),
@@ -39673,6 +39722,9 @@ impl Printer<'_> {
         }
         if !compact_outer {
             self.writer.indent += 1;
+        }
+        if let Some(parameters) = parameter_prologue {
+            self.emit_downlevel_rest_parameter_prologue(parameters)?;
         }
         if !compact_outer {
             self.writer.write("return ");
@@ -39756,6 +39808,23 @@ impl Printer<'_> {
             self.writer.write(";");
             self.writer.newline();
         }
+        for (_, temp) in &computed_object_temps {
+            self.writer.write("var ");
+            self.writer.write(temp);
+            self.writer.write(";");
+            self.writer.newline();
+        }
+        let previous_this_alias = self.this_alias.clone();
+        let local_this_alias = self
+            .body_has_downlevel_arrow_this(body)
+            .then(|| self.generate_this_capture_name(body));
+        if let Some(alias) = local_this_alias.as_deref() {
+            self.writer.write("var ");
+            self.writer.write(alias);
+            self.writer.write(" = this;");
+            self.writer.newline();
+            self.this_alias = Some(alias.to_owned());
+        }
 
         self.writer.write("return ");
         self.emit_generator_reference();
@@ -39816,6 +39885,10 @@ impl Printer<'_> {
         self.es5_async_hoisted_function_declarations = previous_hoisted_function_declarations;
         self.es5_async_for_of_names = previous_for_of_names;
         self.es5_async_for_in_plans = previous_for_in_plans;
+        self.this_alias = previous_this_alias;
+        for (object, _) in computed_object_temps {
+            self.computed_property_temps.remove(&object);
+        }
         Ok(())
     }
 
@@ -39871,7 +39944,11 @@ impl Printer<'_> {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn es5_async_capture_plan(&mut self, body: NodeId) -> Es5AsyncCapturePlan {
+    fn es5_async_capture_plan(
+        &mut self,
+        body: NodeId,
+        additional_claimed: &[String],
+    ) -> Es5AsyncCapturePlan {
         let mut await_captures = Vec::new();
         let mut conditional_nodes = Vec::new();
         let mut array_nodes = Vec::new();
@@ -39898,7 +39975,7 @@ impl Printer<'_> {
                 self.collect_es5_async_for_in_plans(*statement, &mut for_in_nodes);
             }
         }
-        let mut claimed = HashSet::new();
+        let mut claimed = additional_claimed.iter().cloned().collect::<HashSet<_>>();
         let mut for_of_nodes = Vec::new();
         self.collect_es5_async_for_of_nodes(body, &mut for_of_nodes);
         let mut has_suspending_for_of = false;
@@ -40075,7 +40152,9 @@ impl Printer<'_> {
                 },
             );
         }
-        let state_parameter = (!temps.is_empty() || has_suspending_for_of)
+        let state_parameter = (!temps.is_empty()
+            || !additional_claimed.is_empty()
+            || has_suspending_for_of)
             .then(|| self.generate_block_temp(body, &claimed));
         Es5AsyncCapturePlan {
             temps,
@@ -57607,6 +57686,13 @@ impl Printer<'_> {
                         } else {
                             "this"
                         };
+                        let parameter_prologue = data.parameters.nodes.iter().any(|parameter| {
+                            matches!(
+                                self.arena.get(*parameter).map(|node| &node.data),
+                                Some(NodeData::ParameterDeclaration(parameter))
+                                    if parameter.dot_dot_dot_token.is_some()
+                            )
+                        }).then_some(&data.parameters);
                         self.emit_es5_async_function_body(
                             data.body,
                             expression_body,
@@ -57614,6 +57700,7 @@ impl Printer<'_> {
                             generator_this,
                             state,
                             object_rest,
+                            parameter_prologue,
                             true,
                         )?;
                     } else if let Some(pattern) = object_rest_parameter {
@@ -65107,6 +65194,45 @@ mod tests {
                 "    }); });",
             )),
             "{output}"
+        );
+
+        let multiline = emit_with(
+            "async function run() {\n}",
+            ScriptTarget::Es5,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(
+            multiline.contains(concat!(
+                "return __awaiter(this, void 0, void 0, function () {\n",
+                "        return __generator(this, function (_a) {",
+            )),
+            "{multiline}"
+        );
+    }
+
+    #[test]
+    fn lowers_rest_async_arrow_computed_objects_for_es5() {
+        let source = concat!(
+            "class A { b = async (...args: any[]) => { ",
+            "await task(); const obj = { [\"a\"]: () => this }; ",
+            "}; }",
+        );
+        let es2015 = emit_with(source, ScriptTarget::Es2015, ModuleKind::None).code;
+        assert!(
+            es2015.contains("this.b = (...args) => __awaiter(this, void 0, void 0, function* ()"),
+            "{es2015}"
+        );
+
+        let es5 = emit_with(source, ScriptTarget::Es5, ModuleKind::None).code;
+        assert!(es5.contains("this.b = function () {\n"), "{es5}");
+        assert!(es5.contains("var args = [];"), "{es5}");
+        assert!(es5.contains("var obj;\n"), "{es5}");
+        assert!(es5.contains("var _a;\n"), "{es5}");
+        assert!(es5.contains("var _this = this;\n"), "{es5}");
+        assert!(
+            es5.contains("obj = (_a = {}, _a[\"a\"] = function () { return _this; }, _a);"),
+            "{es5}"
         );
     }
 

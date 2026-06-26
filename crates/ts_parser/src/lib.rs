@@ -5068,6 +5068,7 @@ impl<'a> Parser<'a> {
         if self.current.kind == SyntaxKind::AwaitKeyword
             && (self.await_context
                 || (!self.await_identifier_context
+                    && !is_expression_terminator(self.next_token_kind())
                     && !matches!(
                         self.next_token_kind(),
                         SyntaxKind::OpenParenToken | SyntaxKind::EqualsGreaterThanToken
@@ -14182,6 +14183,31 @@ mod tests {
             .count();
         assert_eq!(await_expressions, 1);
         assert_eq!(await_calls, 1);
+    }
+
+    #[test]
+    fn parses_bare_await_before_expression_terminators_as_an_identifier() {
+        let result = parse_source_file(
+            "var value = { [await]: 1 }; function f(await = await) {}",
+        );
+        assert_eq!(
+            result
+                .arena
+                .iter()
+                .filter(|(_, node)| matches!(node.data, NodeData::AwaitExpression(_)))
+                .count(),
+            0
+        );
+        assert!(
+            result
+                .arena
+                .iter()
+                .filter(|(_, node)| {
+                    matches!(&node.data, NodeData::Identifier(identifier) if identifier.text == "await")
+                })
+                .count()
+                >= 3
+        );
     }
 
     #[test]
