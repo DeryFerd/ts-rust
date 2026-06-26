@@ -1848,8 +1848,8 @@ impl<'a> Parser<'a> {
                 | SyntaxKind::ExtendsKeyword
                 | SyntaxKind::ImplementsKeyword
         );
-        let name = if (self.current.kind == SyntaxKind::Identifier
-            || self.current.kind.is_keyword())
+        let name = if self.current.kind != SyntaxKind::VoidKeyword
+            && (self.current.kind == SyntaxKind::Identifier || self.current.kind.is_keyword())
             && (!matches!(
                 self.current.kind,
                 SyntaxKind::ExtendsKeyword | SyntaxKind::ImplementsKeyword
@@ -1891,7 +1891,8 @@ impl<'a> Parser<'a> {
 
     fn parse_class_expression(&mut self) -> NodeId {
         let start = self.consume().range.start;
-        let name = if !matches!(
+        let name = if self.current.kind != SyntaxKind::VoidKeyword
+            && !matches!(
             self.current.kind,
             SyntaxKind::ExtendsKeyword | SyntaxKind::ImplementsKeyword
         ) && (self.current.kind == SyntaxKind::Identifier
@@ -13104,6 +13105,19 @@ mod tests {
 
         let void = parse_source_file("class C extends void {}");
         assert!(source_statements(&void).len() >= 2, "{:?}", void.diagnostics);
+    }
+
+    #[test]
+    fn leaves_void_after_an_anonymous_recovered_class() {
+        let result = parse_source_file("class void {}");
+        let statements = source_statements(&result);
+        assert!(statements.len() >= 2, "{:?}", result.diagnostics);
+        let NodeData::ClassDeclaration(class) = &result.arena.get(statements[0]).unwrap().data
+        else {
+            panic!("expected class declaration");
+        };
+        assert!(class.name.is_none());
+        assert!(class.members.nodes.is_empty());
     }
 
     #[test]
