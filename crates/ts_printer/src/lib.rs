@@ -47574,20 +47574,20 @@ impl Printer<'_> {
                 let NodeData::ParameterDeclaration(parameter) = &parameter_node.data else {
                     return false;
                 };
-                let is_async_arrow_parameter = parameter_node
+                let is_async_function_parameter = parameter_node
                     .parent
                     .and_then(|parent| self.arena.get(parent))
                     .is_some_and(|parent| {
-                        matches!(
-                            &parent.data,
-                            NodeData::ArrowFunction(arrow)
-                                if self.has_modifier(
-                                    arrow.modifiers.as_ref(),
-                                    SyntaxKind::AsyncKeyword,
-                                )
-                        )
+                        let modifiers = match &parent.data {
+                            NodeData::ArrowFunction(function) => function.modifiers.as_ref(),
+                            NodeData::FunctionDeclaration(function) => function.modifiers.as_ref(),
+                            NodeData::FunctionExpression(function) => function.modifiers.as_ref(),
+                            NodeData::MethodDeclaration(function) => function.modifiers.as_ref(),
+                            _ => return false,
+                        };
+                        self.has_modifier(modifiers, SyntaxKind::AsyncKeyword)
                     });
-                if !is_async_arrow_parameter {
+                if !is_async_function_parameter {
                     return false;
                 }
                 matches!(
@@ -64959,6 +64959,17 @@ mod tests {
         assert!(
             missing_operand.contains("var foo = async (a = await ) =>"),
             "{missing_operand}"
+        );
+
+        let missing_function_operand = emit_with_parse_errors(
+            "async function foo(a = await): Promise<void> {}",
+            ScriptTarget::Es2017,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(
+            missing_function_operand.contains("async function foo(a = await )"),
+            "{missing_function_operand}"
         );
 
         let ordinary_function = emit_with_parse_errors(
