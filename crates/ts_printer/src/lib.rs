@@ -69874,7 +69874,7 @@ impl Printer<'_> {
                             .zip(usize::try_from(end).ok())
                             .and_then(|(start, end)| self.source_text.get(start..end))
                             .is_some_and(|trivia| trivia.ends_with("*/"));
-                        if comment_ends_immediately && !self.writer.line_start {
+                        if comment_ends_immediately && !comma && !self.writer.line_start {
                             self.writer.write(" ");
                         }
                     } else if line_break {
@@ -76102,6 +76102,20 @@ mod tests {
         assert_eq!(
             output,
             "if ( /** @type { B } */(a).y !== 0)\n    throw TypeError();\n"
+        );
+    }
+
+    #[test]
+    fn keeps_trailing_binary_comments_attached_to_commas() {
+        let output = emit_with(
+            "if (x /* RegExp */, (x = true)) {}",
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(
+            output.contains("if (x /* RegExp */, (x = true))"),
+            "{output}"
         );
     }
 
