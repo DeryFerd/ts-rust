@@ -8953,7 +8953,17 @@ impl<'a> Checker<'a> {
                     {
                         self.assignability_error(*element, actual, expected);
                     }
-                    element_types.push(self.widen_literal(actual));
+                    let preserve_loose_nullish = expected.is_none()
+                        && !self.options.strict_null_checks
+                        && matches!(
+                            self.result.types.get(actual).map(|type_| &type_.kind),
+                            Some(TypeKind::Null | TypeKind::Undefined)
+                        );
+                    element_types.push(if preserve_loose_nullish {
+                        actual
+                    } else {
+                        self.widen_literal(actual)
+                    });
                 }
                 if let Some(expected) = expected_tuple {
                     if expected.len() == element_types.len() {
@@ -8970,6 +8980,33 @@ impl<'a> Checker<'a> {
                                 self.result.types.any()
                             }
                         } else {
+                            let non_nullish = (!self.options.strict_null_checks)
+                                .then(|| {
+                                    element_types
+                                        .iter()
+                                        .copied()
+                                        .filter(|element| {
+                                            !matches!(
+                                                self.result
+                                                    .types
+                                                    .get(*element)
+                                                    .map(|type_| &type_.kind),
+                                                Some(TypeKind::Null | TypeKind::Undefined)
+                                            )
+                                        })
+                                        .collect::<Vec<_>>()
+                                })
+                                .filter(|elements| !elements.is_empty());
+                            let element_types = if let Some(non_nullish) = non_nullish {
+                                non_nullish
+                            } else if !self.options.strict_null_checks {
+                                element_types
+                                    .into_iter()
+                                    .map(|element| self.widen_literal(element))
+                                    .collect()
+                            } else {
+                                element_types
+                            };
                             let element_types = self.complete_object_union_members(element_types);
                             let element_types = self.reduce_subtype_union_members(&element_types);
                             self.result.types.union(element_types)
@@ -28507,6 +28544,47 @@ mod tests {
             panic!("expected array type");
         };
         assert_eq!(*strict_element, strict.types.never());
+    }
+
+    #[test]
+    fn loose_array_literals_ignore_nullish_elements_when_finding_a_common_type() {
+        let parsed = parse_source_file(
+            "let x; const first = [3, (3, null)]; const second = [3, (x = null)]; const nil = [null];",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let checked = check_source_file_with_options(
+            &parsed.arena,
+            parsed.source_file,
+            &bindings,
+            CheckerOptions {
+                strict_null_checks: false,
+                ..CheckerOptions::default()
+            },
+        );
+        let mut arrays = parsed
+            .arena
+            .iter()
+            .filter_map(|(id, node)| {
+                matches!(node.data, NodeData::ArrayLiteralExpression(_))
+                    .then_some((node.range.start, id))
+            })
+            .collect::<Vec<_>>();
+        arrays.sort_by_key(|(start, _)| *start);
+        let element = |array: NodeId| {
+            let TypeKind::Array(element) = &checked
+                .types
+                .get(*checked.node_types.get(&array).unwrap())
+                .unwrap()
+                .kind
+            else {
+                panic!("expected array type");
+            };
+            *element
+        };
+        assert_eq!(element(arrays[0].1), checked.types.number());
+        assert_eq!(element(arrays[1].1), checked.types.number());
+        assert_eq!(element(arrays[2].1), checked.types.any());
     }
 
     #[test]

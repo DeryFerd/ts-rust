@@ -13670,7 +13670,14 @@ impl DeclarationPrinter<'_> {
                 && precedes_required
                 && let Some(type_id) = type_id
             {
-                self.emit_semantic_type_with_nullish_last(type_id)?;
+                if let Some(type_) = parameter.type_ {
+                    self.emit_type(type_)?;
+                    if !self.source_type_semantically_includes_undefined(type_) {
+                        self.writer.write(" | undefined");
+                    }
+                } else {
+                    self.emit_semantic_type_with_nullish_last(type_id)?;
+                }
             } else if matches!(
                 self.arena.get(parameter.name).map(|node| &node.data),
                 Some(NodeData::BindingPattern(_))
@@ -13701,7 +13708,13 @@ impl DeclarationPrinter<'_> {
                             Some(NodeData::Block(_))
                         )
                     });
-                let result = if let Some(body) = local_body {
+                let preserve_source = !optional
+                    || self.source_type_semantically_includes_undefined(type_);
+                let result = if !preserve_source {
+                    self.emit_type(type_)?;
+                    self.writer.write(" | undefined");
+                    Ok(())
+                } else if let Some(body) = local_body {
                     self.emit_compact_local_alias_type(body, type_, &mut HashSet::new())
                 } else {
                     self.emit_type(type_)
@@ -16297,8 +16310,9 @@ impl DeclarationPrinter<'_> {
                 }
                 self.writer.write(";");
             }
-            NodeData::SemicolonClassElement(_) => self.writer.write(";"),
-            NodeData::ClassStaticBlockDeclaration(_) => return Ok(()),
+            NodeData::SemicolonClassElement(_) | NodeData::ClassStaticBlockDeclaration(_) => {
+                return Ok(());
+            }
             _ => return Err(Self::unsupported(id, node.kind)),
         }
         self.writer.newline();
@@ -16752,14 +16766,19 @@ impl DeclarationPrinter<'_> {
                         }
                         _ => None,
                     });
-                if let Some(type_id) = semantic_type {
+                if let Some(type_) = parameter.type_ {
+                    self.emit_type(type_)?;
+                    if parameter.question_token.is_some()
+                        && !self.source_type_semantically_includes_undefined(type_)
+                    {
+                        self.writer.write(" | undefined");
+                    }
+                } else if let Some(type_id) = semantic_type {
                     if parameter.initializer.is_some() {
                         self.emit_widened_semantic_type(type_id)?;
                     } else {
                         self.emit_semantic_type_with_nullish_last(type_id)?;
                     }
-                } else if let Some(type_) = parameter.type_ {
-                    self.emit_type(type_)?;
                 } else {
                     self.writer.write("any");
                 }
@@ -19857,6 +19876,73 @@ impl DeclarationPrinter<'_> {
             }
             _ => false,
         }
+    }
+
+    fn source_type_semantically_includes_undefined(&self, type_node: NodeId) -> bool {
+        self.source_type_semantically_includes_undefined_worker(
+            type_node,
+            &mut HashSet::new(),
+        )
+    }
+
+    fn source_type_semantically_includes_undefined_worker(
+        &self,
+        type_node: NodeId,
+        visited: &mut HashSet<NodeId>,
+    ) -> bool {
+        if !visited.insert(type_node) {
+            return false;
+        }
+        if self.source_type_explicitly_includes_undefined(type_node)
+            || self
+                .node_types
+                .and_then(|types| types.get(&type_node).copied())
+                .is_some_and(|type_id| self.semantic_type_includes_undefined(type_id))
+        {
+            return true;
+        }
+        let Some(NodeData::TypeReferenceNode(reference)) =
+            self.arena.get(type_node).map(|node| &node.data)
+        else {
+            return false;
+        };
+        let Some(name) = declaration_name_text(self.arena, reference.type_name) else {
+            return false;
+        };
+        if name == "Exclude"
+            && let Some(arguments) = &reference.type_arguments
+            && let Some(included) = arguments.nodes.first()
+        {
+            let excluded = arguments.nodes.get(1);
+            let mut included_visited = visited.clone();
+            let includes_undefined = self.source_type_semantically_includes_undefined_worker(
+                *included,
+                &mut included_visited,
+            );
+            let mut excluded_visited = visited.clone();
+            let excludes_undefined = excluded.is_some_and(|excluded| {
+                self.source_type_semantically_includes_undefined_worker(
+                    *excluded,
+                    &mut excluded_visited,
+                )
+            });
+            return includes_undefined && !excludes_undefined;
+        }
+        let Some(symbol) = self.bindings.resolve_name_at(reference.type_name, name) else {
+            return false;
+        };
+        self.bindings
+            .symbols
+            .get(symbol)
+            .into_iter()
+            .flat_map(|symbol| &symbol.declarations)
+            .any(|declaration| {
+                matches!(
+                    self.arena.get(*declaration).map(|node| &node.data),
+                    Some(NodeData::TypeAliasDeclaration(alias))
+                        if self.source_type_semantically_includes_undefined_worker(alias.type_, visited)
+                )
+            })
     }
 
     fn source_type_literal_property_is_computed_string(
@@ -31828,25 +31914,11 @@ impl Printer<'_> {
                     self.record_mapping_at(node.range.end.get());
                     return Ok(());
                 }
-                self.writer.write("while (");
-                self.emit_expression(data.expression, 0)?;
-                self.writer.write(") ");
-                self.emit_embedded(data.statement)?;
+                self.emit_while_statement(id, data)?;
             }
             NodeData::DoStatement(data) => {
                 if !self.emit_es5_captured_do_loop(data)? {
-                    let body_is_block =
-                        matches!(&self.node(data.statement)?.data, NodeData::Block(_));
-                    self.writer.write("do ");
-                    self.emit_embedded(data.statement)?;
-                    if body_is_block {
-                        self.writer.write(" while (");
-                    } else {
-                        self.writer.newline();
-                        self.writer.write("while (");
-                    }
-                    self.emit_expression(data.expression, 0)?;
-                    self.writer.write(");");
+                    self.emit_do_statement(id, data)?;
                 }
             }
             NodeData::ForStatement(data) => {
@@ -32917,6 +32989,105 @@ impl Printer<'_> {
         self.source_text
             .get(start..end)
             .is_some_and(|text| !text.contains(['\n', '\r']))
+    }
+
+    fn emit_while_statement(
+        &mut self,
+        id: NodeId,
+        data: &ts_ast::WhileStatementData,
+    ) -> Result<(), EmitError> {
+        let node = self.node(id)?.clone();
+        let expression = self.node(data.expression)?.clone();
+        let statement = self.node(data.statement)?.clone();
+        let keyword_end = node.range.start.get().saturating_add(5);
+        let open = self
+            .source_punctuation_between(keyword_end, expression.range.start.get(), b'(')
+            .unwrap_or(keyword_end);
+        let close = self
+            .source_punctuation_between(
+                expression.range.end.get(),
+                statement.range.start.get(),
+                b')',
+            )
+            .unwrap_or(expression.range.end.get());
+        self.writer.write("while");
+        self.emit_for_block_comment_gap(keyword_end, open, true, true);
+        self.writer.write("(");
+        self.emit_for_block_comment_gap(
+            open.saturating_add(1),
+            expression.range.start.get(),
+            false,
+            false,
+        );
+        self.emit_expression(data.expression, 0)?;
+        self.emit_for_block_comment_gap(expression.range.end.get(), close, false, false);
+        self.writer.write(")");
+        self.emit_for_block_comment_gap(
+            close.saturating_add(1),
+            statement.range.start.get(),
+            true,
+            true,
+        );
+        self.emit_embedded(data.statement)
+    }
+
+    fn emit_do_statement(
+        &mut self,
+        id: NodeId,
+        data: &ts_ast::DoStatementData,
+    ) -> Result<(), EmitError> {
+        let node = self.node(id)?.clone();
+        let statement = self.node(data.statement)?.clone();
+        let expression = self.node(data.expression)?.clone();
+        let body_is_block = matches!(statement.data, NodeData::Block(_));
+        let do_end = node.range.start.get().saturating_add(2);
+        self.writer.write("do");
+        self.emit_for_block_comment_gap(do_end, statement.range.start.get(), true, true);
+        self.emit_embedded(data.statement)?;
+        let while_start = self
+            .source_keyword_between(
+                statement.range.end.get(),
+                expression.range.start.get(),
+                "while",
+            )
+            .unwrap_or(statement.range.end.get());
+        if body_is_block {
+            self.emit_for_block_comment_gap(
+                statement.range.end.get(),
+                while_start,
+                true,
+                true,
+            );
+        } else {
+            self.emit_source_comments_between_with_trailing(
+                statement.range.end.get(),
+                while_start,
+                true,
+            );
+            if !self.writer.line_start {
+                self.writer.newline();
+            }
+        }
+        self.writer.write("while");
+        let keyword_end = while_start.saturating_add(5);
+        let open = self
+            .source_punctuation_between(keyword_end, expression.range.start.get(), b'(')
+            .unwrap_or(keyword_end);
+        let close = self
+            .source_punctuation_between(expression.range.end.get(), node.range.end.get(), b')')
+            .unwrap_or(expression.range.end.get());
+        self.emit_for_block_comment_gap(keyword_end, open, true, true);
+        self.writer.write("(");
+        self.emit_for_block_comment_gap(
+            open.saturating_add(1),
+            expression.range.start.get(),
+            false,
+            false,
+        );
+        self.emit_expression(data.expression, 0)?;
+        self.emit_for_block_comment_gap(expression.range.end.get(), close, false, false);
+        self.writer.write(");");
+        Ok(())
     }
 
     fn emit_if_statement(
@@ -46587,20 +46758,29 @@ impl Printer<'_> {
                 return Err(Self::unsupported(*parameter, node.kind));
             };
             if index == 0 {
-                let comment_start = self
-                    .source_text
-                    .get(
-                        usize::try_from(previous_end).unwrap_or(usize::MAX)
-                            ..usize::try_from(node.range.start.get()).unwrap_or(usize::MAX),
-                    )
-                    .and_then(|trivia| {
-                        let comment = trivia.find("/*")?;
-                        (!trivia[..comment].contains(['\n', '\r'])).then_some(
-                            previous_end.saturating_add(u32::try_from(comment).unwrap_or(u32::MAX)),
+                if self.source_range_contains_line_comment(previous_end, node.range.start.get()) {
+                    self.emit_parameter_line_comments(
+                        previous_end,
+                        node.range.start.get(),
+                        false,
+                    );
+                } else {
+                    let comment_start = self
+                        .source_text
+                        .get(
+                            usize::try_from(previous_end).unwrap_or(usize::MAX)
+                                ..usize::try_from(node.range.start.get()).unwrap_or(usize::MAX),
                         )
-                    })
-                    .unwrap_or(previous_end);
-                self.emit_block_comment_trivia(comment_start, node.range.start.get(), true);
+                        .and_then(|trivia| {
+                            let comment = trivia.find("/*")?;
+                            (!trivia[..comment].contains(['\n', '\r'])).then_some(
+                                previous_end
+                                    .saturating_add(u32::try_from(comment).unwrap_or(u32::MAX)),
+                            )
+                        })
+                        .unwrap_or(previous_end);
+                    self.emit_block_comment_trivia(comment_start, node.range.start.get(), true);
+                }
             } else {
                 let trivia = self
                     .source_text
@@ -46619,7 +46799,13 @@ impl Printer<'_> {
                 self.writer.remove_trailing_spaces();
                 self.writer.write(",");
                 let after_comma = comma_position.saturating_add(1);
-                if self.trivia_has_block_comment(after_comma, node.range.start.get()) {
+                if self.source_range_contains_line_comment(after_comma, node.range.start.get()) {
+                    self.emit_parameter_line_comments(
+                        after_comma,
+                        node.range.start.get(),
+                        true,
+                    );
+                } else if self.trivia_has_block_comment(after_comma, node.range.start.get()) {
                     if self
                         .source_text
                         .get(
@@ -47966,7 +48152,29 @@ impl Printer<'_> {
                 }
             }
         }
-        self.writer.write(" {");
+        let header_end = data
+            .heritage_clauses
+            .as_ref()
+            .and_then(|clauses| clauses.nodes.last())
+            .and_then(|clause| self.arena.get(*clause))
+            .map(|clause| clause.range.end.get())
+            .or_else(|| {
+                data.name
+                    .and_then(|name| self.arena.get(name))
+                    .map(|name| name.range.end.get())
+            });
+        if let Some(header_end) = header_end
+            && self.trivia_has_block_comment(header_end, data.members.range.start.get())
+        {
+            self.emit_block_comment_trivia(
+                header_end,
+                data.members.range.start.get(),
+                true,
+            );
+            self.writer.write("{");
+        } else {
+            self.writer.write(" {");
+        }
         self.writer.newline();
         self.writer.indent += 1;
         if let Some(capture) = data
@@ -60377,6 +60585,34 @@ impl Printer<'_> {
         self.emit_source_comments_between_with_trailing(start, end, true);
     }
 
+    fn emit_parameter_line_comments(
+        &mut self,
+        start: u32,
+        end: u32,
+        preserve_preceding_space: bool,
+    ) {
+        if self.settings.remove_comments {
+            return;
+        }
+        let starts_on_new_line = usize::try_from(start)
+            .ok()
+            .zip(usize::try_from(end).ok())
+            .and_then(|(start, end)| self.source_text.get(start..end))
+            .and_then(|trivia| trivia.find("//").map(|comment| &trivia[..comment]))
+            .is_some_and(|leading| leading.contains(['\n', '\r']));
+        if starts_on_new_line && !self.writer.line_start {
+            if preserve_preceding_space {
+                self.writer.write(" ");
+                self.writer.newline_preserving_trailing_spaces();
+            } else {
+                self.writer.newline();
+            }
+        } else if !self.writer.line_start {
+            self.writer.write(" ");
+        }
+        self.emit_source_comments_between_with_trailing(start, end, true);
+    }
+
     fn single_line_return_expression(&self, block: NodeId) -> Result<Option<NodeId>, EmitError> {
         let node = self.node(block)?;
         let NodeData::Block(data) = &node.data else {
@@ -61945,6 +62181,46 @@ mod tests {
                 "}\n",
             )
         );
+    }
+
+    #[test]
+    fn declaration_emit_preserves_accurate_parameter_type_nodes() {
+        let output = emit_declarations_with_semantics(concat!(
+            "type Map = {} & { [P in string]: any };\n",
+            "type Maybe = Map | undefined | 'dummy';\n",
+            "export class Foo { constructor(public first?: Map | undefined, ",
+            "public second?: Exclude<Maybe, 'dummy'>, public resolved?: Map) {} }\n",
+            "export function f(first: Map | undefined = {}, ",
+            "second: Exclude<Maybe, 'dummy'> = {}, resolved: Map = {}, required: number) {}",
+        ));
+        assert!(
+            output.contains("first?: Map | undefined;\n"),
+            "{output}"
+        );
+        assert!(
+            output.contains("second?: Exclude<Maybe, 'dummy'>;\n"),
+            "{output}"
+        );
+        assert!(output.contains("resolved?: Map | undefined;\n"), "{output}");
+        assert!(
+            output.contains(concat!(
+                "export declare function f(first: Map | undefined, ",
+                "second: Exclude<Maybe, 'dummy'>, resolved: Map | undefined, ",
+                "required: number): void;",
+            )),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn preserves_line_comments_between_runtime_parameters() {
+        let output = emit_with(
+            "function f(\n// first\na, b,\n// second\nc) {}",
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(output.contains("f(\n// first\na, b, \n// second\nc)"), "{output}");
     }
 
     #[test]
@@ -66525,6 +66801,46 @@ mod tests {
     #[test]
     fn preserves_semicolon_class_elements_in_javascript() {
         assert_eq!(emit("class C { ; }"), "class C {\n    ;\n}\n");
+    }
+
+    #[test]
+    fn omits_semicolon_class_elements_from_declarations() {
+        assert_eq!(
+            emit_declarations_with_semantics("class C { run() {}; bark() {}; }"),
+            "declare class C {\n    run(): void;\n    bark(): void;\n}\n"
+        );
+    }
+
+    #[test]
+    fn preserves_block_comments_between_class_names_and_bodies() {
+        assert_eq!(
+            emit_with(
+                "class ConnectionError /* extends Error */ {}",
+                ScriptTarget::Es2015,
+                ModuleKind::None,
+            )
+            .code,
+            "class ConnectionError /* extends Error */ {\n}\n"
+        );
+    }
+
+    #[test]
+    fn preserves_comments_inside_while_and_do_statements() {
+        assert_eq!(
+            emit_with(
+                concat!(
+                    "/*a*/ while /*b*/ ( /*c*/ false /*d*/ ) /*e*/ {}\n",
+                    "/*a*/ do /*b*/ {} /*c*/ while /*d*/ ( /*e*/ true /*f*/ );",
+                ),
+                ScriptTarget::Es2015,
+                ModuleKind::None,
+            )
+            .code,
+            concat!(
+                "/*a*/ while /*b*/ ( /*c*/false /*d*/) /*e*/ { }\n",
+                "/*a*/ do /*b*/ { } /*c*/ while /*d*/ ( /*e*/true /*f*/);\n",
+            )
+        );
     }
 
     #[test]
