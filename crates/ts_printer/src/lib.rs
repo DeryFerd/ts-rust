@@ -36779,16 +36779,13 @@ impl Printer<'_> {
             return Vec::new();
         }
         let mut classes = Vec::new();
-        for parameter in &parameters.nodes {
-            let Some(NodeData::ParameterDeclaration(parameter)) =
-                self.arena.get(*parameter).map(|node| &node.data)
+        for parameter_id in &parameters.nodes {
+            let Some(NodeData::ParameterDeclaration(_)) =
+                self.arena.get(*parameter_id).map(|node| &node.data)
             else {
                 continue;
             };
-            let Some(initializer) = parameter.initializer else {
-                continue;
-            };
-            let Some(range) = self.arena.get(initializer).map(|node| node.range) else {
+            let Some(range) = self.arena.get(*parameter_id).map(|node| node.range) else {
                 continue;
             };
             for (id, node) in self.arena.iter() {
@@ -36837,7 +36834,31 @@ impl Printer<'_> {
                 &mut temps,
             );
         }
+        for temp in &temps {
+            self.generated_names.used.insert(temp.clone());
+        }
         temps
+    }
+
+    fn parameters_require_class_expression_temps(&self, parameters: &NodeList) -> bool {
+        if self.settings.target >= ScriptTarget::Es2022 {
+            return false;
+        }
+        parameters.nodes.iter().any(|parameter| {
+            let Some(range) = self.arena.get(*parameter).map(|node| node.range) else {
+                return false;
+            };
+            self.arena.iter().any(|(_, node)| {
+                let NodeData::ClassExpression(class) = &node.data else {
+                    return false;
+                };
+                range.start <= node.range.start
+                    && node.range.end <= range.end
+                    && self.class_expression_requires_post_class_lowering(
+                        &Self::class_expression_as_declaration(class),
+                    )
+            })
+        })
     }
 
     fn emit_function_body_with_parameter_defaults(
@@ -36846,7 +36867,8 @@ impl Printer<'_> {
         parameters: &NodeList,
         temps: &[String],
     ) -> Result<(), EmitError> {
-        let compact = matches!(
+        let compact = self.settings.target >= ScriptTarget::Es2015
+            && matches!(
             self.arena.get(body).map(|node| &node.data),
             Some(NodeData::Block(block)) if block.statements.nodes.is_empty()
         ) && !self.node_source_is_multiline(body);
@@ -36887,6 +36909,15 @@ impl Printer<'_> {
         parameters: &NodeList,
         function: NodeId,
     ) -> Vec<ParameterNameOverride> {
+        self.binding_parameter_overrides(parameters, function, false)
+    }
+
+    fn binding_parameter_overrides(
+        &self,
+        parameters: &NodeList,
+        function: NodeId,
+        force: bool,
+    ) -> Vec<ParameterNameOverride> {
         let mut claimed = HashSet::new();
         let mut result = Vec::new();
         for parameter_id in &parameters.nodes {
@@ -36901,7 +36932,8 @@ impl Printer<'_> {
             ) {
                 continue;
             }
-            if self.settings.target >= ScriptTarget::Es2015
+            if !force
+                && self.settings.target >= ScriptTarget::Es2015
                 && !(self
                     .arena
                     .get(parameter.name)
@@ -37105,12 +37137,27 @@ impl Printer<'_> {
         if self.settings.target >= ScriptTarget::Es2015
             && block.statements.nodes.is_empty()
             && !self.node_source_is_multiline(body)
-            && class_temps.is_empty()
-            && !downlevel_parameter_defaults
         {
             self.writer.write("{ ");
+            self.emit_commonjs_destructuring_assignment_hoists_for_body(body);
+            self.writer.remove_trailing_newline();
+            if !class_temps.is_empty() {
+                self.writer.write("var ");
+                self.writer.write(&class_temps.join(", "));
+                self.writer.write("; ");
+            }
+            if downlevel_parameter_defaults {
+                self.emit_parameter_default_prologues_with_overrides(
+                    parameters,
+                    binding_parameters,
+                )?;
+                self.writer.remove_trailing_newline();
+                self.writer.remove_trailing_spaces();
+                self.writer.write(" ");
+            }
             self.emit_downlevel_binding_parameter_prologues(binding_parameters)?;
             self.writer.remove_trailing_newline();
+            self.writer.remove_trailing_spaces();
             self.writer.write(" }");
             return Ok(());
         }
@@ -37160,6 +37207,13 @@ impl Printer<'_> {
                 && self.object_binding_pattern_has_rest(*pattern)
             {
                 self.emit_object_rest_parameter_prologue(*pattern, temp, "var")?;
+            } else if self.settings.target >= ScriptTarget::Es2015 {
+                self.writer.write("var ");
+                self.emit_expression(*pattern, 0)?;
+                self.writer.write(" = ");
+                self.writer.write(temp);
+                self.writer.write(";");
+                self.writer.newline();
             } else {
                 self.writer.write("var ");
                 let mut emitted = false;
@@ -47119,7 +47173,7 @@ impl Printer<'_> {
     fn emit_es5_arrow_parameters(
         &mut self,
         parameters: &NodeList,
-    ) -> Result<Vec<(NodeId, String)>, EmitError> {
+    ) -> Result<Vec<ParameterNameOverride>, EmitError> {
         let mut bindings = Vec::new();
         let mut overrides = Vec::new();
         for parameter_id in &parameters.nodes {
@@ -47137,7 +47191,7 @@ impl Printer<'_> {
                 Some(NodeData::BindingPattern(_))
             ) {
                 let temp = self.generated_names.generate_temp();
-                bindings.push((parameter.name, temp.clone()));
+                bindings.push((*parameter_id, parameter.name, temp.clone()));
                 overrides.push((*parameter_id, parameter.name, temp));
             }
         }
@@ -47148,7 +47202,7 @@ impl Printer<'_> {
     fn emit_es5_arrow_binding_body(
         &mut self,
         body: NodeId,
-        bindings: &[(NodeId, String)],
+        bindings: &[ParameterNameOverride],
         rest_parameters: Option<&NodeList>,
     ) -> Result<(), EmitError> {
         self.writer.write("{");
@@ -47157,7 +47211,7 @@ impl Printer<'_> {
         if let Some(parameters) = rest_parameters {
             self.emit_downlevel_rest_parameter_prologue(parameters)?;
         }
-        for (pattern, temp) in bindings {
+        for (_, pattern, temp) in bindings {
             self.writer.write("var ");
             let mut emitted = false;
             self.emit_downlevel_binding_declarators(
@@ -58858,12 +58912,48 @@ impl Printer<'_> {
                     }
                     self.writer.write("function ");
                     let downlevel_bindings = self.emit_es5_arrow_parameters(&data.parameters)?;
+                    let parameter_class_temps = self
+                        .parameters_require_class_expression_temps(&data.parameters)
+                        .then(|| {
+                            self.prepare_parameter_class_expression_temps(
+                                &data.parameters,
+                                data.body,
+                            )
+                        })
+                        .unwrap_or_default();
+                    let downlevel_parameter_defaults = data.parameters.nodes.iter().any(|parameter| {
+                        matches!(
+                            self.arena.get(*parameter).map(|node| &node.data),
+                            Some(NodeData::ParameterDeclaration(parameter))
+                                if parameter.initializer.is_some()
+                        )
+                    });
                     self.writer.write(" ");
                     let previous_this_alias = self.this_alias.clone();
                     if let Some(alias) = self.capture_arrow_this.clone() {
                         self.this_alias = Some(alias);
                     }
-                    let body_result = if !downlevel_bindings.is_empty() {
+                    let body_is_block = matches!(&self.node(data.body)?.data, NodeData::Block(_));
+                    let body_result = if body_is_block
+                        && (!downlevel_bindings.is_empty()
+                            || self.parameters_have_rest_parameter(&data.parameters))
+                    {
+                        self.emit_function_body_with_binding_parameters(
+                            data.body,
+                            &data.parameters,
+                            &parameter_class_temps,
+                            downlevel_parameter_defaults,
+                            &downlevel_bindings,
+                        )
+                    } else if body_is_block
+                        && (!parameter_class_temps.is_empty() || downlevel_parameter_defaults)
+                    {
+                        self.emit_function_body_with_parameter_defaults(
+                            data.body,
+                            &data.parameters,
+                            &parameter_class_temps,
+                        )
+                    } else if !downlevel_bindings.is_empty() {
                         self.emit_es5_arrow_binding_body(
                             data.body,
                             &downlevel_bindings,
@@ -58928,6 +59018,32 @@ impl Printer<'_> {
                     && self.arguments_alias.is_none()
                     && self.arrow_body_uses_lexical_arguments(data.body))
                     .then(|| self.generate_arguments_capture_name());
+                let parameter_classes_need_lowering = !downlevel_async
+                    && self.parameters_require_class_expression_temps(&data.parameters);
+                let parameter_binding_overrides = if parameter_classes_need_lowering {
+                    self.binding_parameter_overrides(&data.parameters, id, true)
+                } else {
+                    Vec::new()
+                };
+                for (_, _, temp) in &parameter_binding_overrides {
+                    self.generated_names.used.insert(temp.clone());
+                }
+                let parameter_class_temps = parameter_classes_need_lowering
+                    .then(|| {
+                        self.prepare_parameter_class_expression_temps(
+                            &data.parameters,
+                            data.body,
+                        )
+                    })
+                    .unwrap_or_default();
+                let moved_parameter_defaults = parameter_classes_need_lowering
+                    && data.parameters.nodes.iter().any(|parameter| {
+                        matches!(
+                            self.arena.get(*parameter).map(|node| &node.data),
+                            Some(NodeData::ParameterDeclaration(parameter))
+                                if parameter.initializer.is_some()
+                        )
+                    });
                 if self.settings.target < ScriptTarget::Es2015 && downlevel_async {
                     self.writer.write("function ");
                 }
@@ -58959,6 +59075,16 @@ impl Printer<'_> {
                             &plan.outer_parameters,
                             false,
                             &plan.overrides,
+                        )?;
+                    }
+                } else if parameter_classes_need_lowering {
+                    if parameter_binding_overrides.is_empty() {
+                        self.emit_parameters_without_initializers(&data.parameters)?;
+                    } else {
+                        self.emit_parameters_with_name_overrides(
+                            &data.parameters,
+                            false,
+                            &parameter_binding_overrides,
                         )?;
                     }
                 } else if !downlevel_async && self.arrow_uses_bare_parameter(id, data) {
@@ -59090,6 +59216,24 @@ impl Printer<'_> {
                     }
                 } else if let Some(pattern) = object_rest_parameter {
                     self.emit_arrow_body_with_object_rest_parameter(data.body, pattern, "_a")?;
+                } else if parameter_classes_need_lowering
+                    && matches!(&self.node(data.body)?.data, NodeData::Block(_))
+                {
+                    if parameter_binding_overrides.is_empty() {
+                        self.emit_function_body_with_parameter_defaults(
+                            data.body,
+                            &data.parameters,
+                            &parameter_class_temps,
+                        )?;
+                    } else {
+                        self.emit_function_body_with_binding_parameters(
+                            data.body,
+                            &data.parameters,
+                            &parameter_class_temps,
+                            moved_parameter_defaults,
+                            &parameter_binding_overrides,
+                        )?;
+                    }
                 } else if matches!(&self.node(data.body)?.data, NodeData::Block(_)) {
                     self.emit_function_body(data.body)?;
                 } else if self.settings.target < ScriptTarget::Es2020
@@ -65437,6 +65581,20 @@ mod tests {
             .code
             .contains("class C extends { foo: string } {")
         );
+    }
+
+    #[test]
+    fn lowers_static_field_class_expressions_in_arrow_parameters() {
+        let binding = "(({ [class { static x = 1 }.x]: b = \"\" }) => {})();";
+        let es2015 = emit_with(binding, ScriptTarget::Es2015, ModuleKind::EsNext).code;
+        assert!(es2015.contains("((_a) => { var _b; var { [(_b = class {"), "{es2015}");
+        assert!(es2015.contains("_b.x = 1,"), "{es2015}");
+
+        let initializer = "((b = class { static x = 1 }) => {})();";
+        let es5 = emit_with(initializer, ScriptTarget::Es5, ModuleKind::EsNext).code;
+        assert!(es5.contains("(function (b) {\n    var _a;"), "{es5}");
+        assert!(es5.contains("if (b === void 0) { b = (_a ="), "{es5}");
+        assert!(es5.contains("_a.x = 1,"), "{es5}");
     }
 
     #[test]
