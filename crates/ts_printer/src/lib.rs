@@ -2771,10 +2771,17 @@ fn runtime_auto_accessor_storage_names(
             } else {
                 downlevel_auto_accessor_storage_base_name(arena, class, property)
             };
-            let Some(property_name) = property_name
+            let Some(mut property_name) = property_name
             else {
                 continue;
             };
+            if matches!(
+                arena.get(property.name).map(|node| &node.data),
+                Some(NodeData::PrivateIdentifier(_))
+            ) && class_member_has_legacy_decorators(arena, *member)
+            {
+                property_name.push_str("_1");
+            }
             names.push(format!("_{class_name}_{property_name}_accessor_storage"));
         }
     }
@@ -28611,6 +28618,27 @@ impl Printer<'_> {
                     .map_or(u32::MAX, |class| class.range.start.get());
             }
         }
+        for (class_id, node) in self.arena.iter() {
+            let NodeData::ClassDeclaration(class) = &node.data else {
+                continue;
+            };
+            if self.auto_accessor_class_capture_name(class).as_deref() == Some(name)
+                || class.members.nodes.iter().any(|member| {
+                    matches!(
+                        self.arena.get(*member).map(|node| &node.data),
+                        Some(NodeData::PropertyDeclaration(property))
+                            if self.property_is_auto_accessor(property)
+                                && self.auto_accessor_storage_name(class, property).as_deref()
+                                    == Some(name)
+                    )
+                })
+            {
+                return self
+                    .arena
+                    .get(class_id)
+                    .map_or(u32::MAX, |class| class.range.start.get());
+            }
+        }
         self.class_expression_temps
             .iter()
             .find_map(|(class, temp)| {
@@ -29100,6 +29128,34 @@ impl Printer<'_> {
             anonymous_captures.sort_by_key(|(start, _)| *start);
             let mut anonymous_index = 0;
             let mut claimed = HashSet::new();
+            for (index, (class_name, class_id)) in self
+                .arena
+                .iter()
+                .filter_map(|(class_id, node)| {
+                    let NodeData::ClassDeclaration(class) = &node.data else {
+                        return None;
+                    };
+                    let class_name = class.name?;
+                    (self.private_field_storage_scope(class_id) == Some(scope)
+                        && class.members.nodes.iter().any(|member| {
+                            matches!(
+                                self.arena.get(*member).map(|node| &node.data),
+                                Some(NodeData::PropertyDeclaration(property))
+                                    if self.property_is_auto_accessor(property)
+                                        && self.property_is_static(property)
+                            )
+                        }))
+                    .then_some((class_name, class_id))
+                })
+                .enumerate()
+            {
+                if !self.private_method_plans.contains_key(&class_name)
+                    && !self.static_private_field_plans.contains_key(&class_name)
+                {
+                    let _ = class_id;
+                    claimed.insert(auto_accessor_capture_name(index));
+                }
+            }
             for class in classes {
                 let class_start = self
                     .arena
@@ -53570,7 +53626,11 @@ impl Printer<'_> {
                     None,
                     None,
                     data.type_,
-                    "void 0",
+                    if self.property_is_auto_accessor(data) {
+                        "null"
+                    } else {
+                        "void 0"
+                    },
                     true,
                     false,
                 ),
@@ -59866,6 +59926,36 @@ impl Printer<'_> {
             property_name
         } else {
             downlevel_auto_accessor_storage_base_name(self.arena, class, property)?
+        };
+        let legacy_decorated = class.members.nodes.iter().enumerate().any(|(index, member)| {
+            let Some(node) = self.arena.get(*member) else {
+                return false;
+            };
+            if !matches!(
+                &node.data,
+                NodeData::PropertyDeclaration(candidate) if candidate.name == property.name
+            ) {
+                return false;
+            }
+            let start = index
+                .checked_sub(1)
+                .and_then(|previous| class.members.nodes.get(previous))
+                .and_then(|previous| self.arena.get(*previous))
+                .map_or(class.members.range.start.get(), |previous| previous.range.end.get());
+            usize::try_from(start)
+                .ok()
+                .zip(usize::try_from(node.range.end.get()).ok())
+                .and_then(|(start, end)| self.source_text.get(start..end))
+                .is_some_and(|source| source.contains('@'))
+        });
+        let property_name = if matches!(
+            self.arena.get(property.name).map(|node| &node.data),
+            Some(NodeData::PrivateIdentifier(_))
+        ) && legacy_decorated
+        {
+            format!("{property_name}_1")
+        } else {
+            property_name
         };
         Some(format!("_{class_name}_{property_name}_accessor_storage"))
     }
@@ -76795,6 +76885,24 @@ mod tests {
             es5.contains("(_C2__a_accessor_storage = new WeakMap(), _a = f())"),
             "{es5}"
         );
+    }
+
+    #[test]
+    fn lowers_legacy_decorated_auto_accessors() {
+        let output = emit_with_legacy_decorators_and_define(
+            concat!(
+                "declare function dec(...args: any[]): any; ",
+                "class C1 { @dec accessor value: any; } ",
+                "class C2 { @dec accessor #value: any; }",
+            ),
+            ScriptTarget::Es2015,
+        )
+        .code;
+        assert!(
+            output.contains("], C1.prototype, \"value\", null);"),
+            "{output}"
+        );
+        assert!(output.contains("_C2_value_1_accessor_storage"), "{output}");
     }
 
     #[test]
