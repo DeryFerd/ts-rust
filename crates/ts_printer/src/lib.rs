@@ -34090,6 +34090,11 @@ impl Printer<'_> {
         match &node.data {
             NodeData::InterfaceDeclaration(_) | NodeData::TypeAliasDeclaration(_) => return Ok(()),
             NodeData::FunctionDeclaration(data) if data.body.is_none() => return Ok(()),
+            NodeData::Block(_)
+                if self.recovered_object_literal_preceding_statement(id).is_some() =>
+            {
+                return Ok(());
+            }
             NodeData::ExportDeclaration(_)
                 if !self.verbatim_module_syntax
                     && export_declaration_is_empty(self.arena, &node) =>
@@ -34108,7 +34113,14 @@ impl Printer<'_> {
             return Ok(());
         }
         match &node.data {
-            NodeData::Block(_) => self.emit_block(id)?,
+            NodeData::Block(_) => {
+                if let Some(name) = self.recovered_nested_class_name(id) {
+                    self.writer.write("class ");
+                    self.writer.write(&name);
+                    self.writer.write(" ");
+                }
+                self.emit_block(id)?;
+            }
             NodeData::EmptyStatement(_) => self.writer.write(";"),
             NodeData::VariableStatement(data) => {
                 if self.exported_object_rest_temps.contains_key(&id) {
@@ -34126,6 +34138,10 @@ impl Printer<'_> {
                             && self
                                 .has_modifier(data.modifiers.as_ref(), SyntaxKind::ExportKeyword),
                     )?;
+                    if self.recovered_object_literal_trailing_block(id).is_some() {
+                        self.writer.write(", ");
+                        self.writer.write("{}");
+                    }
                     self.writer.write(";");
                     if !self.variable_list_is_uninitialized(data.declaration_list) {
                         let names = self.variable_declaration_names(data.declaration_list)?;
@@ -38494,6 +38510,90 @@ impl Printer<'_> {
             .zip(usize::try_from(next.range.start.get()).ok())
             .and_then(|(start, end)| self.source_text.get(start..end))
             .is_some_and(|source| source.contains(['\n', '\r']))
+    }
+
+    fn recovered_nested_class_name(&self, block: NodeId) -> Option<String> {
+        let parent = self.arena.get(block)?.parent?;
+        let NodeData::SourceFile(source) = &self.arena.get(parent)?.data else {
+            return None;
+        };
+        let index = source
+            .statements
+            .nodes
+            .iter()
+            .position(|statement| *statement == block)?;
+        let previous = *source.statements.nodes.get(index.checked_sub(1)?)?;
+        let NodeData::ClassDeclaration(class) = &self.arena.get(previous)?.data else {
+            return None;
+        };
+        let [.., keyword, name] = class.members.nodes.as_slice() else {
+            return None;
+        };
+        let NodeData::PropertyDeclaration(keyword) = &self.arena.get(*keyword)?.data else {
+            return None;
+        };
+        let NodeData::PropertyDeclaration(name) = &self.arena.get(*name)?.data else {
+            return None;
+        };
+        (declaration_name_text(self.arena, keyword.name) == Some("class"))
+            .then(|| declaration_name_text(self.arena, name.name).map(str::to_owned))
+            .flatten()
+    }
+
+    fn recovered_object_literal_trailing_block(&self, statement: NodeId) -> Option<NodeId> {
+        let parent = self.arena.get(statement)?.parent?;
+        let NodeData::SourceFile(source) = &self.arena.get(parent)?.data else {
+            return None;
+        };
+        let index = source
+            .statements
+            .nodes
+            .iter()
+            .position(|candidate| *candidate == statement)?;
+        let block = *source.statements.nodes.get(index + 1)?;
+        if !matches!(self.arena.get(block)?.data, NodeData::Block(_)) {
+            return None;
+        }
+        let NodeData::VariableStatement(variable) = &self.arena.get(statement)?.data else {
+            return None;
+        };
+        let NodeData::VariableDeclarationList(list) =
+            &self.arena.get(variable.declaration_list)?.data
+        else {
+            return None;
+        };
+        let [declaration] = list.declarations.nodes.as_slice() else {
+            return None;
+        };
+        let NodeData::VariableDeclaration(declaration) = &self.arena.get(*declaration)?.data else {
+            return None;
+        };
+        let NodeData::ObjectLiteralExpression(object) =
+            &self.arena.get(declaration.initializer?)?.data
+        else {
+            return None;
+        };
+        object.properties.nodes.iter().any(|property| {
+            matches!(
+                self.arena.get(*property).map(|node| &node.data),
+                Some(NodeData::PropertyAssignment(property))
+                    if declaration_name_text(self.arena, property.name) == Some("class")
+            )
+        }).then_some(block)
+    }
+
+    fn recovered_object_literal_preceding_statement(&self, block: NodeId) -> Option<NodeId> {
+        let parent = self.arena.get(block)?.parent?;
+        let NodeData::SourceFile(source) = &self.arena.get(parent)?.data else {
+            return None;
+        };
+        let index = source
+            .statements
+            .nodes
+            .iter()
+            .position(|statement| *statement == block)?;
+        let previous = *source.statements.nodes.get(index.checked_sub(1)?)?;
+        (self.recovered_object_literal_trailing_block(previous) == Some(block)).then_some(previous)
     }
 
     fn block_comment_touches_range_end(&self, start: u32, end: u32) -> bool {
@@ -70551,6 +70651,21 @@ mod tests {
             .unwrap()
             .code;
         assert_eq!(output, "(a, new );\n");
+    }
+
+    #[test]
+    fn recovers_a_nested_class_declaration_as_a_following_statement() {
+        let parsed = parse_source_file("class C { x: string; class C2 {} }");
+        assert!(!parsed.diagnostics.is_empty());
+        let output = emit_source_file(&parsed.arena, parsed.source_file)
+            .unwrap()
+            .code;
+        assert!(output.ends_with("class C2 { }\n"), "{output}");
+        let object = parse_source_file("var x = { class C4 {} }");
+        let output = emit_source_file(&object.arena, object.source_file)
+            .unwrap()
+            .code;
+        assert!(output.contains("}, {};"), "{output}");
     }
 
     #[test]
