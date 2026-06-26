@@ -729,7 +729,9 @@ pub fn emit_source_file_with_context(
         {
             helpers.insert("__values");
         }
-        if !printer.private_field_plans.is_empty() {
+        if !printer.private_field_plans.is_empty()
+            || !printer.static_private_field_plans.is_empty()
+        {
             if source_needs_private_field_get_helper(arena) {
                 helpers.insert("__classPrivateFieldGet");
             }
@@ -37683,6 +37685,7 @@ impl Printer<'_> {
         class_declarations.sort_by_key(|(start, _, _)| *start);
         let mut claimed = self.generated_names.used.clone();
         let mut temps = Vec::new();
+        let mut private_receiver_temps = Vec::new();
         let mut declaration_index = 0;
         for (class_start, class_expression) in class_expressions {
             while class_declarations
@@ -37794,10 +37797,13 @@ impl Printer<'_> {
             self.prepare_private_tagged_template_receiver_temps(
                 block_id,
                 &mut claimed,
-                &mut temps,
+                &mut private_receiver_temps,
             );
         }
         self.generated_names.used.extend(temps.iter().cloned());
+        self.generated_names
+            .used
+            .extend(private_receiver_temps.iter().cloned());
         let block_scoped_private_declarations =
             self.block_scoped_private_class_declarations(block_id);
         if !block_scoped_private_declarations.is_empty() {
@@ -37810,6 +37816,12 @@ impl Printer<'_> {
         if !temps.is_empty() {
             self.writer.write("var ");
             self.writer.write(&temps.join(", "));
+            self.writer.write(";");
+            self.writer.newline();
+        }
+        if !private_receiver_temps.is_empty() {
+            self.writer.write("var ");
+            self.writer.write(&private_receiver_temps.join(", "));
             self.writer.write(";");
             self.writer.newline();
         }
@@ -37834,6 +37846,7 @@ impl Printer<'_> {
                         };
                         if !(self.active_private_accessor_exists(access.name)
                             || self.active_private_field(access.name).is_some()
+                            || self.active_static_private_field(access.name).is_some()
                             || self.active_private_method(access.name).is_some())
                         {
                             return None;
@@ -37924,13 +37937,16 @@ impl Printer<'_> {
                 else {
                     return None;
                 };
+                let static_private_field =
+                    self.active_static_private_field(access.name).is_some();
                 if !(self.active_private_field(access.name).is_some()
-                    || self.active_static_private_field(access.name).is_some()
+                    || static_private_field
                     || self.active_private_accessor_exists(access.name))
-                    || matches!(
-                        self.arena.get(access.expression).map(|node| node.kind),
-                        Some(SyntaxKind::Identifier | SyntaxKind::ThisKeyword)
-                    )
+                    || (!static_private_field
+                        && matches!(
+                            self.arena.get(access.expression).map(|node| node.kind),
+                            Some(SyntaxKind::Identifier | SyntaxKind::ThisKeyword)
+                        ))
                 {
                     return None;
                 }
@@ -62378,7 +62394,8 @@ impl Printer<'_> {
                     .and_then(|target| match &target.data {
                         NodeData::PropertyAccessExpression(access) => Some(
                             self.active_private_method(access.name).is_some()
-                                || self.active_private_field(access.name).is_some(),
+                                || self.active_private_field(access.name).is_some()
+                                || self.active_static_private_field(access.name).is_some(),
                         ),
                         _ => None,
                     })
@@ -63545,6 +63562,13 @@ impl Printer<'_> {
                 .map(|field| (access.expression, field)),
             _ => None,
         });
+        let static_private_field = self.arena.get(data.tag).and_then(|tag| match &tag.data {
+            NodeData::PropertyAccessExpression(access) => self
+                .active_static_private_field(access.name)
+                .cloned()
+                .map(|field| (access.expression, field)),
+            _ => None,
+        });
         let private_method = self.arena.get(data.tag).and_then(|tag| match &tag.data {
             NodeData::PropertyAccessExpression(access) => self
                 .active_private_method(access.name)
@@ -63562,7 +63586,37 @@ impl Printer<'_> {
                     .clone()
                     .map(|receiver| (base, property, is_element, receiver))
             });
-        if let Some((receiver, field)) = private_field {
+        if let Some((receiver, field)) = static_private_field {
+            let Some(plan) = self.active_static_private_field_plan.clone() else {
+                return Err(Self::unsupported(data.tag, SyntaxKind::PropertyAccessExpression));
+            };
+            let receiver_temp = self
+                .private_tagged_template_receiver_temps
+                .get(&id)
+                .cloned();
+            self.emit_helper_reference("__classPrivateFieldGet");
+            self.writer.write("(");
+            if let Some(temp) = &receiver_temp {
+                self.writer.write("(");
+                self.writer.write(temp);
+                self.writer.write(" = ");
+                self.emit_expression(receiver, 1)?;
+                self.writer.write(")");
+            } else {
+                self.emit_expression(receiver, 1)?;
+            }
+            self.writer.write(", ");
+            self.writer.write(&plan.capture);
+            self.writer.write(", \"f\", ");
+            self.writer.write(&field.storage);
+            self.writer.write(").bind(");
+            if let Some(temp) = receiver_temp {
+                self.writer.write(&temp);
+            } else {
+                self.emit_expression(receiver, 1)?;
+            }
+            self.writer.write(")");
+        } else if let Some((receiver, field)) = private_field {
             let receiver_temp = self
                 .private_tagged_template_receiver_temps
                 .get(&id)
@@ -72988,8 +73042,34 @@ mod tests {
         );
         assert!(
             output.contains(concat!(
-                "__classPrivateFieldSet(_a, _a, ",
-                "__classPrivateFieldGet(_a, _a, \"f\", _A_x) + 3, \"f\", _A_x);",
+                "__classPrivateFieldSet(_b = _a, _a, ",
+                "__classPrivateFieldGet(_b, _a, \"f\", _A_x) + 3, \"f\", _A_x);",
+            )),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn binds_static_private_field_tagged_templates_to_the_receiver_once() {
+        let output = emit_with(
+            concat!(
+                "class A { static #tag = String.raw; m() { A.#tag`a`; ",
+                "this.getClass().#tag`b`; } getClass() { return A; } }",
+            ),
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(
+            output.contains(
+                "__classPrivateFieldGet(_a, _a, \"f\", _A_tag).bind(_a) `a`"
+            ),
+            "{output}"
+        );
+        assert!(
+            output.contains(concat!(
+                "__classPrivateFieldGet((_b = this.getClass()), _a, \"f\", _A_tag)",
+                ".bind(_b) `b`",
             )),
             "{output}"
         );
