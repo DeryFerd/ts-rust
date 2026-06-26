@@ -2099,9 +2099,16 @@ impl<'a> Parser<'a> {
                 | SyntaxKind::NumericLiteral
                 | SyntaxKind::NullKeyword
                 | SyntaxKind::OpenParenToken
+                | SyntaxKind::OpenBracketToken
+                | SyntaxKind::OpenBraceToken
                 | SyntaxKind::ClassKeyword
         ) {
             self.parse_postfix_expression()
+        } else if self.current.kind == SyntaxKind::VoidKeyword {
+            // `extends void {}` is recovered by TypeScript as a missing heritage name,
+            // leaving `void {}` to be parsed as the following statement.
+            self.error_current("Expected a heritage name.");
+            self.missing_identifier(self.current.range.start)
         } else if is_keyword_type(self.current.kind) {
             // Invalid primitive heritage names still belong to the clause. Consuming the token
             // here lets semantic checking report the invalid implementation without losing the
@@ -2110,6 +2117,22 @@ impl<'a> Parser<'a> {
         } else {
             self.parse_entity_name()
         };
+        while self.current.kind == SyntaxKind::QuestionDotToken {
+            let question_dot_token = self.consume_token_node();
+            let name = self.parse_property_name("Expected a property name.");
+            expression = self.alloc_node(
+                SyntaxKind::PropertyAccessExpression,
+                TextRange::new(self.node_start(expression), self.node_end(name)),
+                NodeData::PropertyAccessExpression(Box::new(PropertyAccessExpressionData {
+                    expression,
+                    flow_node: None,
+                    question_dot_token: Some(question_dot_token),
+                    facts: 0,
+                    name,
+                })),
+                &[expression, question_dot_token, name],
+            );
+        }
         while self.current.kind == SyntaxKind::OpenParenToken {
             let arguments = self.parse_argument_list();
             let end = arguments.range.end;
@@ -13047,6 +13070,40 @@ mod tests {
             result.arena.get(statements[1]).unwrap().data,
             NodeData::VariableStatement(_)
         ));
+    }
+
+    #[test]
+    fn recovers_optional_object_and_void_class_heritage() {
+        let optional = parse_source_file("class C extends A?.B {}");
+        let NodeData::ClassDeclaration(class) =
+            &optional.arena.get(source_statements(&optional)[0]).unwrap().data
+        else {
+            panic!("expected class declaration");
+        };
+        let clause = class.heritage_clauses.as_ref().unwrap().nodes[0];
+        let NodeData::HeritageClause(clause) = &optional.arena.get(clause).unwrap().data else {
+            panic!("expected heritage clause");
+        };
+        let NodeData::ExpressionWithTypeArguments(heritage) =
+            &optional.arena.get(clause.types.nodes[0]).unwrap().data
+        else {
+            panic!("expected heritage expression");
+        };
+        assert!(matches!(
+            optional.arena.get(heritage.expression).unwrap().data,
+            NodeData::PropertyAccessExpression(ref access) if access.question_dot_token.is_some()
+        ));
+
+        let object = parse_source_file("class C extends { foo: string; } {}");
+        let NodeData::ClassDeclaration(class) =
+            &object.arena.get(source_statements(&object)[0]).unwrap().data
+        else {
+            panic!("expected class declaration");
+        };
+        assert_eq!(class.members.nodes.len(), 0);
+
+        let void = parse_source_file("class C extends void {}");
+        assert!(source_statements(&void).len() >= 2, "{:?}", void.diagnostics);
     }
 
     #[test]

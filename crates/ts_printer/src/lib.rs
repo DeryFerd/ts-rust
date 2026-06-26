@@ -31400,7 +31400,7 @@ impl Printer<'_> {
                 return false;
             };
             if let NodeData::ModuleBlock(block) = &node.data {
-                return block.statements.nodes.iter().any(|statement| {
+                let has_local_value = block.statements.nodes.iter().any(|statement| {
                     let Some(statement) = self.arena.get(*statement) else {
                         return false;
                     };
@@ -31427,6 +31427,9 @@ impl Printer<'_> {
                         _ => false,
                     }
                 });
+                if has_local_value {
+                    return true;
+                }
             }
             current = node.parent;
         }
@@ -50117,7 +50120,9 @@ impl Printer<'_> {
                             .write(if index == 0 { " extends " } else { ", " });
                         let base_node = self.node(*base)?.clone();
                         if let NodeData::ExpressionWithTypeArguments(base) = &base_node.data {
-                            self.emit_expression(base.expression, 0)?;
+                            // A downleveled optional chain becomes a conditional expression,
+                            // which must remain grouped in a class heritage clause.
+                            self.emit_expression(base.expression, 3)?;
                         }
                     }
                 }
@@ -65412,6 +65417,29 @@ mod tests {
     }
 
     #[test]
+    fn emits_recovered_class_heritage_expressions() {
+        let optional = emit_with(
+            "declare const A: any; class C extends A?.B {}",
+            ScriptTarget::Es2015,
+            ModuleKind::EsNext,
+        )
+        .code;
+        assert!(
+            optional.contains("class C extends (A === null || A === void 0 ? void 0 : A.B) {"),
+            "{optional}",
+        );
+        assert!(
+            emit_with(
+                "class C extends { foo: string; } {}",
+                ScriptTarget::Es2015,
+                ModuleKind::EsNext,
+            )
+            .code
+            .contains("class C extends { foo: string } {")
+        );
+    }
+
+    #[test]
     fn prints_switch_try_and_loop_control_statements() {
         assert_eq!(
             emit(
@@ -68270,6 +68298,24 @@ mod tests {
             already_qualified.code
         );
         assert!(!already_qualified.code.contains("M.M.N"));
+    }
+
+    #[test]
+    fn preserves_qualified_sibling_namespaces_from_nested_namespaces() {
+        let emitted = emit_with(
+            concat!(
+                "namespace O { namespace P { export class D {} } ",
+                "namespace Q { export class E extends P.D {} } }",
+            ),
+            ScriptTarget::Es2015,
+            ModuleKind::EsNext,
+        );
+        assert!(
+            emitted.code.contains("class E extends P.D {"),
+            "{}",
+            emitted.code,
+        );
+        assert!(!emitted.code.contains("extends O.P.D"), "{}", emitted.code);
     }
 
     #[test]
