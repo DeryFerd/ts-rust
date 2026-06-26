@@ -27571,24 +27571,26 @@ impl Printer<'_> {
                             _ => return None,
                         };
                     body?;
-                    if declaration_has_modifier_in_list(
+                    let is_static = declaration_has_modifier_in_list(
                         self.arena,
                         modifiers,
                         SyntaxKind::StaticKeyword,
-                    ) {
-                        return None;
-                    };
+                    );
                     let NodeData::PrivateIdentifier(name) = &self.arena.get(name)?.data else {
                         return None;
                     };
                     Some((
                         *member,
                         name.text.trim_start_matches('#').to_owned(),
+                        is_static,
                         kind,
                     ))
                 })
                 .collect::<Vec<_>>();
             let has_private_methods = !private_methods.is_empty();
+            let has_instance_private_methods = private_methods
+                .iter()
+                .any(|(_, _, is_static, _)| !is_static);
             let inferred_name = self.class_expression_inferred_name(class_id);
             let explicit_name = class
                 .name
@@ -27644,7 +27646,7 @@ impl Printer<'_> {
             if fields.is_empty() && static_fields.is_empty() && private_methods.is_empty() {
                 continue;
             }
-            let brand = has_private_methods.then(|| {
+            let brand = has_instance_private_methods.then(|| {
                 let preferred = prefix
                     .map_or_else(|| "_instances".to_owned(), |name| format!("_{name}_instances"));
                 self.generated_names
@@ -27653,7 +27655,7 @@ impl Printer<'_> {
             });
             let methods = private_methods
                 .into_iter()
-                .map(|(method, private_name, kind)| {
+                .map(|(method, private_name, is_static, kind)| {
                     let suffix = match kind {
                         PrivateMemberKind::Method => "",
                         PrivateMemberKind::Getter => "_get",
@@ -27668,7 +27670,7 @@ impl Printer<'_> {
                         method,
                         private_name,
                         function_name,
-                        is_static: false,
+                        is_static,
                         kind,
                     }
                 })
@@ -27748,6 +27750,11 @@ impl Printer<'_> {
                     .map(|field| field.storage.clone()),
             );
             declarations.extend(plan.fields.iter().map(|field| field.storage.clone()));
+            declarations.extend(
+                plan.methods
+                    .iter()
+                    .map(|method| method.function_name.clone()),
+            );
         }
     }
 
@@ -28292,14 +28299,17 @@ impl Printer<'_> {
             .or_else(|| {
                 let class_id = self.active_anonymous_private_class?;
                 let plan = self.anonymous_private_class_plans.get(&class_id)?;
+                let class_temp = self.class_expression_temps.get(&class_id)?.clone();
+                let has_static_methods = plan.methods.iter().any(|method| method.is_static);
+                let has_instance_methods = plan.methods.iter().any(|method| !method.is_static);
                 Some(PrivateMethodPlan {
                     scope: plan.scope,
-                    brand: plan.brand.clone()?,
-                    capture: None,
+                    brand: plan.brand.clone().unwrap_or_else(|| class_temp.clone()),
+                    capture: has_static_methods.then_some(class_temp),
                     capture_class_value: false,
                     declarations: Vec::new(),
                     methods: plan.methods.clone(),
-                    has_instance_methods: true,
+                    has_instance_methods,
                     class_name: class_id,
                     class_symbol: None,
                 })
@@ -38243,6 +38253,15 @@ impl Printer<'_> {
                     .then(|| identifier.text.clone())
             })
             .collect::<HashSet<_>>();
+        local_claimed.extend(
+            self.identifier_rewrites
+                .values()
+                .filter(|name| is_identifier_text(name))
+                .cloned(),
+        );
+        if let Some(plan) = &self.active_static_private_field_plan {
+            local_claimed.insert(plan.capture.clone());
+        }
         local_claimed.extend(temps.iter().cloned());
         let mut updates = self
             .arena
@@ -73677,6 +73696,30 @@ mod tests {
                 && output
                     .contains("_ClassExpressionStatic_staticPrivate = { value: \"hidden\" },")
                 && output.contains("_b);"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn lowers_static_async_private_methods_in_anonymous_classes() {
+        let output = emit_with(
+            concat!(
+                "const C = class { static async #bar() { return await Promise.resolve(1); } ",
+                "static async call() { return await this.#bar(); } };",
+            ),
+            ScriptTarget::Es2019,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(output.contains("var _a, _C_bar;"), "{output}");
+        assert!(
+            output.contains(
+                "await __classPrivateFieldGet(this, _a, \"m\", _C_bar).call(this)"
+            ),
+            "{output}"
+        );
+        assert!(
+            output.contains("_C_bar = async function _C_bar()"),
             "{output}"
         );
     }
