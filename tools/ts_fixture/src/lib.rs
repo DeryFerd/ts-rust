@@ -1505,6 +1505,11 @@ fn parse_directive_line(line: &str) -> Option<(&str, &str)> {
     if name.is_empty() || !name.chars().all(is_directive_name_character) {
         return None;
     }
+    if name.eq_ignore_ascii_case("ts-ignore")
+        || name.eq_ignore_ascii_case("ts-expect-error")
+    {
+        return None;
+    }
     Some((name, value.trim()))
 }
 
@@ -1679,6 +1684,20 @@ mod tests {
     fn ignores_comment_text_that_is_not_a_directive() {
         let source = "// @not a directive\n// ordinary comment\nconst value = 1;";
         let case = Case::parse("comments.ts", source).unwrap();
+
+        assert!(case.directives.is_empty());
+        assert_eq!(case.units[0].source_text, source);
+    }
+
+    #[test]
+    fn preserves_typescript_error_directive_comments() {
+        let source = concat!(
+            "// @ts-ignore: explanation\n",
+            "const first: number = 'nope';\n",
+            "// @ts-expect-error: explanation\n",
+            "const second: number = 'nope';\n",
+        );
+        let case = Case::parse("directives.ts", source).unwrap();
 
         assert!(case.directives.is_empty());
         assert_eq!(case.units[0].source_text, source);
