@@ -5,7 +5,7 @@ use std::{
     path::Path,
 };
 
-use ts_ast::{NodeData, NodeId};
+use ts_ast::{NodeData, NodeId, SyntaxKind};
 use ts_binder::{BindResult, SymbolFlags, bind_source_file};
 use ts_checker::{
     CheckDiagnostic, CheckResult, CheckerOptions, EnumConstantValue as CheckerConstantValue,
@@ -17,7 +17,8 @@ use ts_diagnostics::{Diagnostic, message_by_code};
 use ts_glob::{DiscoveryOptions, discover_files};
 use ts_module::{ResolutionOptions, Resolver, automatic_type_directive_names, parse_package_json};
 use ts_options::{
-    CompilerOptions, ModuleDetectionKind, ModuleKind, PrinterSettings, parse_project_options,
+    CompilerOptions, ModuleDetectionKind, ModuleKind, PrinterSettings, ScriptTarget,
+    parse_project_options,
 };
 use ts_parser::{
     ParseResult, parse_javascript_source_file, parse_jsx_source_file, parse_source_file,
@@ -2395,6 +2396,33 @@ impl Program {
                     .render()
                     .unwrap_or_else(|error| error.to_string()),
             });
+        }
+        if self.options.target < ScriptTarget::Es2015
+            && let Some(message) = message_by_code(18045)
+        {
+            for (_, node) in parse.arena.iter() {
+                let NodeData::PropertyDeclaration(property) = &node.data else {
+                    continue;
+                };
+                let auto_accessor = property.modifiers.as_ref().is_some_and(|modifiers| {
+                    modifiers.list.nodes.iter().any(|modifier| {
+                        parse
+                            .arena
+                            .get(*modifier)
+                            .is_some_and(|modifier| modifier.kind == SyntaxKind::AccessorKeyword)
+                    })
+                });
+                if auto_accessor {
+                    self.diagnostics.push(ProgramDiagnostic {
+                        file_name: Some(file_name.to_owned()),
+                        range: Some(node.range),
+                        code: Some(message.code()),
+                        message: message
+                            .format(&[])
+                            .unwrap_or_else(|error| error.to_string()),
+                    });
+                }
+            }
         }
         let checking = empty_check_result();
         let index = self.source_files.len();
@@ -7693,6 +7721,50 @@ export function create() { return new M.Value(); }"#,
             },
         );
         assert_eq!(ordinary.emit().files.len(), 1);
+    }
+
+    #[test]
+    fn auto_accessors_require_es2015_when_no_emit_on_error_is_enabled() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/auto-accessor.ts", "class C { accessor value = 1; }")
+            .unwrap();
+
+        let es5 = Program::new_with_options(
+            &fs,
+            "/",
+            &["auto-accessor.ts".to_owned()],
+            CompilerOptions {
+                target: ScriptTarget::Es5,
+                no_emit_on_error: true,
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        assert!(
+            es5.diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code == Some(18045))
+        );
+        assert!(es5.emit().files.is_empty());
+
+        let es2015 = Program::new_with_options(
+            &fs,
+            "/",
+            &["auto-accessor.ts".to_owned()],
+            CompilerOptions {
+                target: ScriptTarget::Es2015,
+                no_emit_on_error: true,
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        assert!(
+            es2015
+                .diagnostics()
+                .iter()
+                .all(|diagnostic| diagnostic.code != Some(18045))
+        );
+        assert_eq!(es2015.emit().files.len(), 1);
     }
 
     #[test]

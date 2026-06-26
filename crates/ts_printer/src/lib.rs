@@ -1234,7 +1234,7 @@ pub fn emit_source_file_with_context(
         printer.writer.write(";");
         printer.writer.newline();
     }
-    let auto_accessor_storages = if settings.target < ScriptTarget::EsNext {
+    let auto_accessor_storages = if settings.target < ScriptTarget::Es2022 {
         runtime_auto_accessor_storage_names(arena)
     } else {
         Vec::new()
@@ -1288,12 +1288,10 @@ pub fn emit_source_file_with_context(
     }
     if !auto_accessor_storages.is_empty() {
         printer.emit_auto_accessor_helpers();
-        for storage in &auto_accessor_storages {
-            printer.writer.write("var ");
-            printer.writer.write(storage);
-            printer.writer.write(";");
-            printer.writer.newline();
-        }
+        printer.writer.write("var ");
+        printer.writer.write(&auto_accessor_storages.join(", "));
+        printer.writer.write(";");
+        printer.writer.newline();
     } else if !printer.private_method_plans.is_empty()
         && !emitted_private_get_helper
         && source_needs_private_field_get_helper(arena)
@@ -2661,6 +2659,7 @@ fn source_needs_set_function_name_helper(arena: &NodeArena, use_define: bool) ->
 
 fn runtime_auto_accessor_storage_names(arena: &NodeArena) -> Vec<String> {
     let mut names = Vec::new();
+    let mut capture_index = 0;
     for (id, node) in arena.iter() {
         let NodeData::ClassDeclaration(class) = &node.data else {
             continue;
@@ -2674,6 +2673,25 @@ fn runtime_auto_accessor_storage_names(arena: &NodeArena) -> Vec<String> {
         else {
             continue;
         };
+        let has_static = class.members.nodes.iter().any(|member| {
+            matches!(
+                arena.get(*member).map(|node| &node.data),
+                Some(NodeData::PropertyDeclaration(property))
+                    if declaration_has_modifier_in_list(
+                        arena,
+                        property.modifiers.as_ref(),
+                        SyntaxKind::AccessorKeyword,
+                    ) && declaration_has_modifier_in_list(
+                        arena,
+                        property.modifiers.as_ref(),
+                        SyntaxKind::StaticKeyword,
+                    )
+            )
+        });
+        if has_static {
+            names.push(auto_accessor_capture_name(capture_index));
+            capture_index += 1;
+        }
         for member in &class.members.nodes {
             let Some(NodeData::PropertyDeclaration(property)) =
                 arena.get(*member).map(|node| &node.data)
@@ -2684,10 +2702,6 @@ fn runtime_auto_accessor_storage_names(arena: &NodeArena) -> Vec<String> {
                 arena,
                 property.modifiers.as_ref(),
                 SyntaxKind::AccessorKeyword,
-            ) || declaration_has_modifier_in_list(
-                arena,
-                property.modifiers.as_ref(),
-                SyntaxKind::StaticKeyword,
             ) {
                 continue;
             }
@@ -2698,6 +2712,14 @@ fn runtime_auto_accessor_storage_names(arena: &NodeArena) -> Vec<String> {
         }
     }
     names
+}
+
+fn auto_accessor_capture_name(index: usize) -> String {
+    if index < 26 {
+        format!("_{}", char::from(b'a' + u8::try_from(index).unwrap_or(25)))
+    } else {
+        format!("_a_{index}")
+    }
 }
 
 fn node_is_in_ambient_context(arena: &NodeArena, mut id: NodeId) -> bool {
@@ -31085,7 +31107,7 @@ impl Printer<'_> {
                     result?;
                 }
                 self.writer.write(";");
-                self.emit_auto_accessor_storage_initializers(class);
+                self.emit_auto_accessor_storage_initializers(class)?;
                 self.writer.newline();
                 if self.has_modifier(class.modifiers.as_ref(), SyntaxKind::ExportKeyword) {
                     let exported_name = if self
@@ -34372,7 +34394,7 @@ impl Printer<'_> {
                 } else if !emitted_stage3_class_decorators {
                     self.emit_decorated_class_binding(data)?;
                 }
-                self.emit_auto_accessor_storage_initializers(data);
+                self.emit_auto_accessor_storage_initializers(data)?;
                 if lower_preserved_default && let Some(name) = data.name {
                     self.writer.newline();
                     self.writer.write("export default ");
@@ -54481,6 +54503,17 @@ impl Printer<'_> {
                 NodeData::PropertyDeclaration(property)
                     if self.property_is_auto_accessor(property) =>
                 {
+                    if self.auto_accessor_modifier_precedes_line_break(property) {
+                        if self.has_modifier(
+                            property.modifiers.as_ref(),
+                            SyntaxKind::StaticKeyword,
+                        ) {
+                            self.writer.write("static ");
+                        }
+                        self.writer.write("accessor;");
+                        self.writer.newline();
+                        continue;
+                    }
                     if self.settings.target >= ScriptTarget::EsNext {
                         if self.has_modifier(property.modifiers.as_ref(), SyntaxKind::StaticKeyword)
                         {
@@ -54526,10 +54559,40 @@ impl Printer<'_> {
                         && !self.class_private_name_is_duplicate(data, property.name)
                         && self.current_static_private_field(property.name).is_none() => {}
                 NodeData::PropertyDeclaration(property) => {
+                    let property_name = declaration_name_text(self.arena, property.name);
+                    let recovered_static_accessor = property_name == Some("static")
+                        && data.members.nodes.get(member_index + 1).is_some_and(|next| {
+                            matches!(
+                                self.arena.get(*next).map(|node| &node.data),
+                                Some(NodeData::PropertyDeclaration(next))
+                                    if declaration_name_text(self.arena, next.name)
+                                        == Some("accessor")
+                            )
+                        });
+                    if recovered_static_accessor {
+                        continue;
+                    }
                     if self.has_modifier(property.modifiers.as_ref(), SyntaxKind::StaticKeyword) {
                         self.writer.write("static ");
+                    } else if property_name == Some("accessor")
+                        && member_index.checked_sub(1).is_some_and(|previous| {
+                            matches!(
+                                self.arena
+                                    .get(data.members.nodes[previous])
+                                    .map(|node| &node.data),
+                                Some(NodeData::PropertyDeclaration(previous))
+                                    if declaration_name_text(self.arena, previous.name)
+                                        == Some("static")
+                            )
+                        })
+                    {
+                        self.writer.write("static ");
                     }
-                    self.emit_expression(property.name, 0)?;
+                    if property_name == Some("accessor") {
+                        self.writer.write("accessor");
+                    } else {
+                        self.emit_expression(property.name, 0)?;
+                    }
                     if let Some(initializer) = property.initializer
                         && !self.native_private_instance_initializer_is_lowered(property)
                     {
@@ -55992,25 +56055,115 @@ impl Printer<'_> {
         comment_start: u32,
         comment_end: u32,
     ) -> Result<(), EmitError> {
+        if self.settings.target >= ScriptTarget::Es2022 {
+            let Some(property_name) = declaration_name_text(self.arena, property.name) else {
+                return Ok(());
+            };
+            let storage = format!(
+                "#{}",
+                self.native_auto_accessor_storage_name(class, property_name)
+            );
+            let static_ = self.has_modifier(property.modifiers.as_ref(), SyntaxKind::StaticKeyword);
+            if static_ {
+                self.writer.write("static ");
+            }
+            self.writer.write(&storage);
+            if let Some(initializer) = property.initializer {
+                self.writer.write(" = ");
+                self.emit_expression(initializer, 1)?;
+            }
+            self.writer.write(";");
+            self.writer.newline();
+            if static_ {
+                self.writer.write("static ");
+            }
+            self.writer.write("get ");
+            self.emit_expression(property.name, 0)?;
+            self.writer.write("() { return ");
+            if static_ {
+                let Some(class_name) = class.name else {
+                    return Ok(());
+                };
+                self.emit_expression(class_name, 0)?;
+            } else {
+                self.writer.write("this");
+            }
+            self.writer.write(".");
+            self.writer.write(&storage);
+            self.writer.write("; }");
+            let comment_count = self.emitted_source_comments.len();
+            self.emit_source_comments_between_with_trailing(comment_start, comment_end, true);
+            if self.emitted_source_comments.len() == comment_count {
+                self.writer.newline();
+            }
+            if static_ {
+                self.writer.write("static ");
+            }
+            self.writer.write("set ");
+            self.emit_expression(property.name, 0)?;
+            self.writer.write("(value) { ");
+            if static_ {
+                let Some(class_name) = class.name else {
+                    return Ok(());
+                };
+                self.emit_expression(class_name, 0)?;
+            } else {
+                self.writer.write("this");
+            }
+            self.writer.write(".");
+            self.writer.write(&storage);
+            self.writer.write(" = value; }");
+            self.writer.newline();
+            return Ok(());
+        }
         let Some(storage) = self.auto_accessor_storage_name(class, property) else {
             return Ok(());
         };
+        let static_ = self.has_modifier(property.modifiers.as_ref(), SyntaxKind::StaticKeyword);
+        let capture = static_
+            .then(|| self.auto_accessor_class_capture_name(class))
+            .flatten();
+        if static_ {
+            self.writer.write("static ");
+        }
         self.writer.write("get ");
         self.emit_expression(property.name, 0)?;
-        self.writer
-            .write("() { return __classPrivateFieldGet(this, ");
-        self.writer.write(&storage);
-        self.writer.write(", \"f\"); }");
+        self.writer.write("() { return __classPrivateFieldGet(");
+        if let Some(capture) = capture.as_deref() {
+            self.writer.write(capture);
+            self.writer.write(", ");
+            self.writer.write(capture);
+            self.writer.write(", \"f\", ");
+            self.writer.write(&storage);
+        } else {
+            self.writer.write("this, ");
+            self.writer.write(&storage);
+            self.writer.write(", \"f\"");
+        }
+        self.writer.write("); }");
         let comment_count = self.emitted_source_comments.len();
         self.emit_source_comments_between_with_trailing(comment_start, comment_end, true);
         if self.emitted_source_comments.len() == comment_count {
             self.writer.newline();
         }
+        if static_ {
+            self.writer.write("static ");
+        }
         self.writer.write("set ");
         self.emit_expression(property.name, 0)?;
-        self.writer.write("(value) { __classPrivateFieldSet(this, ");
-        self.writer.write(&storage);
-        self.writer.write(", value, \"f\"); }");
+        self.writer.write("(value) { __classPrivateFieldSet(");
+        if let Some(capture) = capture.as_deref() {
+            self.writer.write(capture);
+            self.writer.write(", ");
+            self.writer.write(capture);
+            self.writer.write(", value, \"f\", ");
+            self.writer.write(&storage);
+        } else {
+            self.writer.write("this, ");
+            self.writer.write(&storage);
+            self.writer.write(", value, \"f\"");
+        }
+        self.writer.write("); }");
         self.writer.newline();
         Ok(())
     }
@@ -56929,6 +57082,7 @@ impl Printer<'_> {
             || (self.settings.target >= ScriptTarget::Es2022
                 && self.settings.use_define_for_class_fields == Some(false))
             || self.property_is_native_private_field(property)
+            || self.property_is_auto_accessor(property)
             || self.current_static_private_field(property.name).is_some()
         {
             return Ok(());
@@ -58509,6 +58663,38 @@ impl Printer<'_> {
         self.has_modifier(property.modifiers.as_ref(), SyntaxKind::AccessorKeyword)
     }
 
+    fn auto_accessor_modifier_precedes_line_break(
+        &self,
+        property: &ts_ast::PropertyDeclarationData,
+    ) -> bool {
+        let Some(modifier) = property.modifiers.as_ref().and_then(|modifiers| {
+            modifiers.list.nodes.iter().find(|modifier| {
+                self.arena
+                    .get(**modifier)
+                    .is_some_and(|modifier| modifier.kind == SyntaxKind::AccessorKeyword)
+            })
+        }) else {
+            return false;
+        };
+        let Some(modifier_end) = self
+            .arena
+            .get(*modifier)
+            .and_then(|modifier| usize::try_from(modifier.range.end.get()).ok())
+        else {
+            return false;
+        };
+        let Some(name_start) = self
+            .arena
+            .get(property.name)
+            .and_then(|name| usize::try_from(name.range.start.get()).ok())
+        else {
+            return false;
+        };
+        self.source_text
+            .get(modifier_end..name_start)
+            .is_some_and(|gap| gap.contains(['\n', '\r']))
+    }
+
     fn property_is_recovered_super_call_type(
         &self,
         property: &ts_ast::PropertyDeclarationData,
@@ -58651,28 +58837,161 @@ impl Printer<'_> {
         Some(format!("_{class_name}_{property_name}_accessor_storage"))
     }
 
-    fn emit_auto_accessor_storage_initializers(&mut self, class: &ts_ast::ClassDeclarationData) {
-        if self.settings.target >= ScriptTarget::EsNext {
-            return;
+    fn native_auto_accessor_storage_name(
+        &self,
+        class: &ts_ast::ClassDeclarationData,
+        property_name: &str,
+    ) -> String {
+        let class_id = self.arena.iter().find_map(|(id, node)| match &node.data {
+            NodeData::ClassDeclaration(candidate)
+                if candidate.members.nodes == class.members.nodes =>
+            {
+                Some(id)
+            }
+            _ => None,
+        });
+        let conflicts = |name: &str| {
+            let mut current = class_id;
+            while let Some(id) = current {
+                let Some(node) = self.arena.get(id) else {
+                    break;
+                };
+                let members = match &node.data {
+                    NodeData::ClassDeclaration(class) => Some(&class.members.nodes),
+                    NodeData::ClassExpression(class) => Some(&class.members.nodes),
+                    _ => None,
+                };
+                if members.is_some_and(|members| {
+                    members.iter().any(|member| {
+                        let private_name = match self.arena.get(*member).map(|node| &node.data) {
+                            Some(NodeData::PropertyDeclaration(property)) => property.name,
+                            Some(NodeData::MethodDeclaration(method)) => method.name,
+                            Some(NodeData::GetAccessorDeclaration(accessor)) => accessor.name,
+                            Some(NodeData::SetAccessorDeclaration(accessor)) => accessor.name,
+                            _ => return false,
+                        };
+                        matches!(
+                            self.arena.get(private_name).map(|node| &node.data),
+                            Some(NodeData::PrivateIdentifier(identifier))
+                                if identifier.text.trim_start_matches('#') == name
+                        )
+                    })
+                }) {
+                    return true;
+                }
+                current = node.parent;
+            }
+            false
+        };
+        let mut name = format!("{property_name}_accessor_storage");
+        let mut index = 1;
+        while conflicts(&name) {
+            name = format!("{property_name}_{index}_accessor_storage");
+            index += 1;
         }
-        for member in &class.members.nodes {
+        name
+    }
+
+    fn auto_accessor_class_capture_name(
+        &self,
+        class: &ts_ast::ClassDeclarationData,
+    ) -> Option<String> {
+        class.name?;
+        self.arena
+            .iter()
+            .filter_map(|(id, node)| {
+                let NodeData::ClassDeclaration(candidate) = &node.data else {
+                    return None;
+                };
+                if node_is_in_ambient_context(self.arena, id)
+                    || !candidate.members.nodes.iter().any(|member| {
+                        matches!(
+                            self.arena.get(*member).map(|node| &node.data),
+                            Some(NodeData::PropertyDeclaration(property))
+                                if self.property_is_auto_accessor(property)
+                                    && self.property_is_static(property)
+                        )
+                    })
+                {
+                    return None;
+                }
+                Some(candidate.as_ref())
+            })
+            .position(|candidate| candidate.members.nodes == class.members.nodes)
+            .map(auto_accessor_capture_name)
+    }
+
+    fn emit_auto_accessor_storage_initializers(
+        &mut self,
+        class: &ts_ast::ClassDeclarationData,
+    ) -> Result<(), EmitError> {
+        if self.settings.target >= ScriptTarget::Es2022 {
+            return Ok(());
+        }
+        let properties = class.members.nodes.iter().filter_map(|member| {
             let Some(NodeData::PropertyDeclaration(property)) =
                 self.arena.get(*member).map(|node| &node.data)
             else {
-                continue;
+                return None;
             };
-            if !self.property_is_auto_accessor(property)
-                || self.has_modifier(property.modifiers.as_ref(), SyntaxKind::StaticKeyword)
+            self.property_is_auto_accessor(property)
+                .then(|| property.as_ref().clone())
+        }).collect::<Vec<_>>();
+        if properties.is_empty() {
+            return Ok(());
+        }
+        let instance = properties
+            .iter()
+            .filter(|property| !self.property_is_static(property))
+            .collect::<Vec<_>>();
+        let static_ = properties
+            .iter()
+            .filter(|property| self.property_is_static(property))
+            .collect::<Vec<_>>();
+        if !instance.is_empty() || !static_.is_empty() {
+            self.writer.newline();
+            let mut emitted = false;
+            if !static_.is_empty()
+                && let (Some(capture), Some(class_name)) = (
+                    self.auto_accessor_class_capture_name(class),
+                    class.name,
+                )
             {
-                continue;
+                self.writer.write(&capture);
+                self.writer.write(" = ");
+                self.emit_expression(class_name, 0)?;
+                emitted = true;
             }
+            for property in instance {
+                if emitted {
+                    self.writer.write(", ");
+                }
+                let Some(storage) = self.auto_accessor_storage_name(class, property) else {
+                    continue;
+                };
+                self.writer.write(&storage);
+                self.writer.write(" = new WeakMap()");
+                emitted = true;
+            }
+            if emitted {
+                self.writer.write(";");
+            }
+        }
+        for property in static_ {
             let Some(storage) = self.auto_accessor_storage_name(class, property) else {
                 continue;
             };
             self.writer.newline();
             self.writer.write(&storage);
-            self.writer.write(" = new WeakMap();");
+            self.writer.write(" = { value: ");
+            if let Some(initializer) = property.initializer {
+                self.emit_expression(initializer, 1)?;
+            } else {
+                self.writer.write("void 0");
+            }
+            self.writer.write(" };");
         }
+        Ok(())
     }
 
     fn emit_static_fields(
@@ -58700,6 +59019,9 @@ impl Printer<'_> {
                 continue;
             }
             if !self.property_is_static(property) {
+                continue;
+            }
+            if self.property_is_auto_accessor(property) {
                 continue;
             }
             if self.current_static_private_field(property.name).is_some() {
@@ -70669,7 +70991,6 @@ mod tests {
             .code;
         assert!(output.contains("}, {};"), "{output}");
     }
-
     #[test]
     fn preserves_a_recovered_missing_binary_operand_gap() {
         let source = "x = (y = z ==== 'function') {";
