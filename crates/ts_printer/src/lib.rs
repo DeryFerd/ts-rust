@@ -57665,15 +57665,12 @@ impl Printer<'_> {
                 let NodeData::PropertyDeclaration(field) = &self.arena.get(*member)?.data else {
                     return None;
                 };
-                let erased_private = field.initializer.is_none()
-                    && self.has_modifier(field.modifiers.as_ref(), SyntaxKind::PrivateKeyword);
                 (!self
                     .class_expression_computed_properties
                     .contains(&field.name)
                     && !self
                         .consumed_class_expression_computed_properties
                         .contains(&field.name)
-                    && !erased_private
                     && matches!(
                         self.arena.get(field.name).map(|node| &node.data),
                         Some(NodeData::ComputedPropertyName(_))
