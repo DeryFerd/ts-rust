@@ -74685,7 +74685,13 @@ impl Printer<'_> {
         let invalid_leading_zero = bytes.len() > 1
             && bytes[0] == b'0'
             && bytes[1].is_ascii_digit();
+        let downlevel_binary_or_octal = self.settings.target < ScriptTarget::Es2015
+            && (bytes.starts_with(b"0b")
+                || bytes.starts_with(b"0B")
+                || bytes.starts_with(b"0o")
+                || bytes.starts_with(b"0O"));
         if invalid_leading_zero
+            || downlevel_binary_or_octal
             || (self.settings.target < ScriptTarget::Es2021 && literal.text.contains('_'))
         {
             let normalized = literal.text.replace('_', "");
@@ -76701,6 +76707,19 @@ mod tests {
         assert_eq!(
             emit_with(source, ScriptTarget::EsNext, ModuleKind::None).code,
             "1_000_000_000_000;\n0b1010_0001_1000_0101;\n0xA0_B0_C0;\n"
+        );
+    }
+
+    #[test]
+    fn downlevels_binary_and_octal_literals_before_es2015() {
+        let source = "0b11010; 0B11010; 0o45436; 0O45436;";
+        assert_eq!(
+            emit_with(source, ScriptTarget::Es5, ModuleKind::None).code,
+            "26;\n26;\n19230;\n19230;\n",
+        );
+        assert_eq!(
+            emit_with(source, ScriptTarget::Es2015, ModuleKind::None).code,
+            "0b11010;\n0B11010;\n0o45436;\n0O45436;\n",
         );
     }
 
