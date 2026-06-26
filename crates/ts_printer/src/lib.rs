@@ -51076,6 +51076,13 @@ impl Printer<'_> {
         name: NodeId,
         lower_fields: bool,
     ) -> Result<(), EmitError> {
+        if matches!(
+            self.arena.get(name).map(|node| &node.data),
+            Some(NodeData::StringLiteral(literal)) if literal.text == "constructor"
+        ) {
+            self.writer.write("constructor");
+            return Ok(());
+        }
         let Some(NodeData::ComputedPropertyName(computed)) =
             self.arena.get(name).map(|node| &node.data)
         else {
@@ -64419,9 +64426,10 @@ impl Printer<'_> {
     }
 
     fn is_constructor_name(&self, id: NodeId) -> bool {
-        self.arena.get(id).is_some_and(
-            |node| matches!(&node.data, NodeData::Identifier(data) if data.text == "constructor"),
-        )
+        self.arena.get(id).is_some_and(|node| {
+            matches!(&node.data, NodeData::Identifier(data) if data.text == "constructor")
+                || matches!(&node.data, NodeData::StringLiteral(data) if data.text == "constructor")
+        })
     }
 }
 
