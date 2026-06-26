@@ -26847,6 +26847,7 @@ struct AmdRuntimeDependency {
 struct AmdImportInitializer {
     parameter: String,
     helper: &'static str,
+    require_path: Option<String>,
 }
 
 struct SystemModulePlan {
@@ -27326,7 +27327,12 @@ impl SystemModulePlan {
                     .map(|node| &node.data)
                 && let Some(exported_name) = declaration_name_text(arena, namespace.name)
             {
-                let parameter = names.generate(exported_name);
+                let parameter = if exported_name == "default" {
+                    let base = names.generate(&module_identifier_base(specifier));
+                    names.generate(&base)
+                } else {
+                    names.generate(exported_name)
+                };
                 dependencies.push(SystemDependency {
                     specifier: specifier.to_owned(),
                     storages: Vec::new(),
@@ -31025,6 +31031,8 @@ impl Printer<'_> {
                             import_initializers.push(AmdImportInitializer {
                                 parameter: parameter.clone(),
                                 helper: "__importDefault",
+                                require_path: (self.settings.module == ModuleKind::Umd)
+                                    .then(|| path.to_owned()),
                             });
                         }
                     }
@@ -31035,6 +31043,8 @@ impl Printer<'_> {
                                     import_initializers.push(AmdImportInitializer {
                                         parameter: parameter.clone(),
                                         helper: "__importStar",
+                                        require_path: (self.settings.module == ModuleKind::Umd)
+                                            .then(|| path.to_owned()),
                                     });
                                 }
                             }
@@ -31071,6 +31081,9 @@ impl Printer<'_> {
                                             import_initializers.push(AmdImportInitializer {
                                                 parameter: parameter.clone(),
                                                 helper: "__importDefault",
+                                                require_path: (self.settings.module
+                                                    == ModuleKind::Umd)
+                                                    .then(|| path.to_owned()),
                                             });
                                         }
                                     } else if let Some(symbol) =
@@ -31097,7 +31110,18 @@ impl Printer<'_> {
                             .map_or(path, String::as_str),
                         context.amd_bundle,
                     );
-                    if let Some(alias) = named_dependency_aliases.get(path) {
+                    if self.settings.module == ModuleKind::Umd {
+                        dependencies.push(AmdRuntimeDependency {
+                            path: dependency_path,
+                            parameter: None,
+                        });
+                        if !import_initializers.iter().any(|initializer| {
+                            initializer.parameter == parameter
+                                && initializer.require_path.is_some()
+                        }) {
+                            aliased_import_requires.push((parameter, path.to_owned()));
+                        }
+                    } else if let Some(alias) = named_dependency_aliases.get(path) {
                         dependencies.push(AmdRuntimeDependency {
                             path: dependency_path,
                             parameter: None,
@@ -31126,14 +31150,17 @@ impl Printer<'_> {
                             .map_or(path, String::as_str),
                         context.amd_bundle,
                     );
-                    let parameter = if let Some(NodeData::NamespaceExport(namespace)) = export
+                    let namespace_export = export
                         .export_clause
                         .and_then(|clause| self.arena.get(clause))
-                        .map(|node| &node.data)
-                    {
-                        declaration_name_text(self.arena, namespace.name)
-                            .unwrap_or("module")
-                            .to_owned()
+                        .and_then(|node| match &node.data {
+                            NodeData::NamespaceExport(namespace) => {
+                                declaration_name_text(self.arena, namespace.name)
+                            }
+                            _ => None,
+                        });
+                    let parameter = if namespace_export.is_some_and(|name| name != "default") {
+                        namespace_export.unwrap_or("module").to_owned()
                     } else {
                         let base = commonjs_module_temp_base(self.arena, module);
                         loop {
@@ -31145,11 +31172,15 @@ impl Printer<'_> {
                             }
                         }
                     };
+                    let umd_namespace_export =
+                        self.settings.module == ModuleKind::Umd && namespace_export.is_some();
                     dependencies.push(AmdRuntimeDependency {
                         path: dependency_path,
-                        parameter: Some(parameter.clone()),
+                        parameter: (!umd_namespace_export).then(|| parameter.clone()),
                     });
-                    self.amd_export_star_temps.insert(*statement, parameter);
+                    if !umd_namespace_export {
+                        self.amd_export_star_temps.insert(*statement, parameter);
+                    }
                 }
                 _ => {}
             }
@@ -31461,11 +31492,20 @@ impl Printer<'_> {
             }
         }
         for initializer in &import_initializers {
+            if initializer.require_path.is_some() {
+                self.writer.write("const ");
+            }
             self.writer.write(&initializer.parameter);
             self.writer.write(" = ");
             self.emit_helper_reference(initializer.helper);
             self.writer.write("(");
-            self.writer.write(&initializer.parameter);
+            if let Some(path) = initializer.require_path.as_deref() {
+                self.writer.write("require(");
+                write_quoted(&mut self.writer, path);
+                self.writer.write(")");
+            } else {
+                self.writer.write(&initializer.parameter);
+            }
             self.writer.write(");");
             self.writer.newline();
         }
@@ -63758,11 +63798,17 @@ impl Printer<'_> {
             self.emit_expression(module, 0)?;
             self.writer.write(";");
             self.writer.newline();
-            self.writer.write("export { ");
-            self.writer.write(&local);
-            self.writer.write(" as ");
-            self.writer.write(exported);
-            self.writer.write(" };");
+            if exported == "default" {
+                self.writer.write("export default ");
+                self.writer.write(&local);
+                self.writer.write(";");
+            } else {
+                self.writer.write("export { ");
+                self.writer.write(&local);
+                self.writer.write(" as ");
+                self.writer.write(exported);
+                self.writer.write(" };");
+            }
             return Ok(());
         }
         self.writer.write("export ");
