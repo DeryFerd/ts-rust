@@ -65,6 +65,8 @@ pub enum EmitConstantValue {
 #[allow(clippy::struct_excessive_bools)]
 pub struct EmitContext<'a> {
     pub bindings: &'a BindResult,
+    /// Runtime namespace members contributed by other source files in an `outFile` bundle.
+    pub bundle_namespace_members: &'a BTreeMap<Vec<String>, BTreeSet<String>>,
     pub amd_module_name: Option<&'a str>,
     pub amd_bundle: bool,
     pub preemitted_source_prologues: bool,
@@ -210,6 +212,7 @@ pub fn emit_source_file_with_settings_and_bindings(
         settings,
         &EmitContext {
             bindings,
+            bundle_namespace_members: &BTreeMap::new(),
             amd_module_name: None,
             amd_bundle: false,
             preemitted_source_prologues: false,
@@ -289,6 +292,7 @@ pub fn emit_source_file_with_context(
         capture_arrow_this: None,
         namespace_containers: Vec::new(),
         namespace_declarations: vec![HashSet::new()],
+        bundle_namespace_members: context.bundle_namespace_members,
         generated_names: GeneratedNames::new(arena),
         runtime_identifier_uses: HashSet::new(),
         synthetic_runtime_identifier_uses: HashSet::new(),
@@ -9585,7 +9589,6 @@ impl DeclarationPrinter<'_> {
                 };
                 self.binding_name_has_identifier(declaration.name)
                     && self.variable_declarator_is_reachable(
-                        *declaration_id,
                         declaration.name,
                         node.parent,
                         data.declarations.nodes.len(),
@@ -10147,7 +10150,6 @@ impl DeclarationPrinter<'_> {
 
     fn variable_declarator_is_reachable(
         &self,
-        declaration: NodeId,
         name: NodeId,
         statement: Option<NodeId>,
         declaration_count: usize,
@@ -10166,15 +10168,16 @@ impl DeclarationPrinter<'_> {
         ) {
             return true;
         }
-        let Some(name) = declaration_name_text(self.arena, name) else {
+        let name_node = name;
+        let Some(name) = declaration_name_text(self.arena, name_node) else {
             return true;
         };
         let declaration_symbol = self
             .bindings
             .node_symbols
-            .get(&declaration)
+            .get(&name_node)
             .copied()
-            .or_else(|| self.bindings.resolve_name_at(declaration, name));
+            .or_else(|| self.bindings.resolve_name_at(name_node, name));
         self.declaration_reachability.is_some_and(|reachability| {
             reachability.values().any(|retained| {
                 retained.iter().any(|retained_statement| {
@@ -10185,6 +10188,10 @@ impl DeclarationPrinter<'_> {
                                 NodeData::Identifier(identifier_data)
                                     if identifier_data.text == name
                             ) && self.node_is_within(identifier, *retained_statement)
+                                && self.identifier_occurs_in_declaration_emit_position(
+                                    identifier,
+                                    *retained_statement,
+                                )
                                 && declaration_symbol.is_none_or(|symbol| {
                                     self.bindings.resolve_name_at(identifier, name) == Some(symbol)
                                 })
@@ -10192,6 +10199,51 @@ impl DeclarationPrinter<'_> {
                 })
             })
         })
+    }
+
+    fn identifier_occurs_in_declaration_emit_position(
+        &self,
+        identifier: NodeId,
+        retained_statement: NodeId,
+    ) -> bool {
+        let mut child = identifier;
+        while child != retained_statement {
+            let Some(parent) = self.arena.get(child).and_then(|node| node.parent) else {
+                return false;
+            };
+            match self.arena.get(parent).map(|node| &node.data) {
+                Some(NodeData::ComputedPropertyName(_)) => return true,
+                Some(NodeData::PropertyDeclaration(property))
+                    if property.initializer == Some(child) =>
+                {
+                    return false;
+                }
+                Some(NodeData::MethodDeclaration(method)) if method.body == Some(child) => {
+                    return false;
+                }
+                Some(NodeData::GetAccessorDeclaration(accessor))
+                    if accessor.body == Some(child) =>
+                {
+                    return false;
+                }
+                Some(NodeData::SetAccessorDeclaration(accessor))
+                    if accessor.body == Some(child) =>
+                {
+                    return false;
+                }
+                Some(NodeData::ConstructorDeclaration(constructor))
+                    if constructor.body == Some(child) =>
+                {
+                    return false;
+                }
+                Some(NodeData::FunctionDeclaration(function)) if function.body == Some(child) => {
+                    return false;
+                }
+                _ => {}
+            }
+            child = parent;
+        }
+        true
     }
 
     fn variable_declaration_has_redeclarations(&self, declaration: NodeId) -> bool {
@@ -11905,7 +11957,7 @@ impl DeclarationPrinter<'_> {
         let node = self.node(name)?.clone();
         if matches!(node.data, NodeData::Identifier(_)) {
             if let Some(statement) = self.containing_variable_statement(name)
-                && !self.variable_declarator_is_reachable(name, name, Some(statement), 2)
+                && !self.variable_declarator_is_reachable(name, Some(statement), 2)
                 && !self.binding_name_is_explicitly_exported(name)
             {
                 return Ok(());
@@ -26123,6 +26175,7 @@ struct Printer<'a> {
     capture_arrow_this: Option<String>,
     namespace_containers: Vec<String>,
     namespace_declarations: Vec<HashSet<String>>,
+    bundle_namespace_members: &'a BTreeMap<Vec<String>, BTreeSet<String>>,
     generated_names: GeneratedNames,
     runtime_identifier_uses: HashSet<String>,
     synthetic_runtime_identifier_uses: HashSet<String>,
@@ -26239,26 +26292,6 @@ struct StaticBlockDeclarationPlan {
 }
 
 impl Printer<'_> {
-    fn constant_computed_property_name(&self, expression: NodeId) -> Option<String> {
-        if let Some(name) = self.constant_property_name(expression) {
-            return Some(name);
-        }
-        let name = declaration_name_text(self.arena, expression)?;
-        let symbol = self.bindings.resolve_name_at(expression, name)?;
-        self.bindings
-            .symbols
-            .get(symbol)?
-            .declarations
-            .iter()
-            .find_map(|declaration| {
-                let NodeData::VariableDeclaration(variable) = &self.arena.get(*declaration)?.data
-                else {
-                    return None;
-                };
-                self.constant_property_name(variable.initializer?)
-            })
-    }
-
     fn constant_property_name(&self, expression: NodeId) -> Option<String> {
         match &self.arena.get(expression)?.data {
             NodeData::StringLiteral(literal) => Some(literal.text.clone()),
@@ -31113,6 +31146,14 @@ impl Printer<'_> {
                 {
                     return Some(format!("{container}.{text}"));
                 }
+                if self
+                    .bundle_namespace_members
+                    .get(&path)
+                    .is_some_and(|members| members.contains(text))
+                    && let Some(container) = container
+                {
+                    return Some(format!("{container}.{text}"));
+                }
                 namespace_depth += 1;
             }
             ancestor = node.parent;
@@ -35921,9 +35962,7 @@ impl Printer<'_> {
                 }
                 if !self.class_field_emits_runtime_value(property)
                     || class_member_has_legacy_decorators(self.arena, *member)
-                    || self
-                        .constant_computed_property_name(computed.expression)
-                        .is_some()
+                    || self.constant_property_name(computed.expression).is_some()
                 {
                     continue;
                 }
@@ -36114,9 +36153,7 @@ impl Printer<'_> {
             let needs_temp = (class_member_has_legacy_decorators(self.arena, *member)
                 && self.constant_property_name(computed.expression).is_none())
                 || (self.class_field_emits_runtime_value(property)
-                    && self
-                        .constant_computed_property_name(computed.expression)
-                        .is_none());
+                    && self.constant_property_name(computed.expression).is_none());
             if !needs_temp || self.computed_property_temps.contains_key(&property.name) {
                 continue;
             }
@@ -49326,10 +49363,7 @@ impl Printer<'_> {
         if class_member_has_legacy_decorators(self.arena, member) {
             return self.constant_property_name(computed.expression).is_none();
         }
-        if self
-            .constant_computed_property_name(computed.expression)
-            .is_some()
-        {
+        if self.constant_property_name(computed.expression).is_some() {
             return false;
         }
         self.class_field_emits_runtime_value(property)
@@ -52002,7 +52036,9 @@ impl Printer<'_> {
             let NodeData::ImportClause(clause) = &clause_node.data else {
                 return Err(Self::unsupported(clause, clause_node.kind));
             };
-            let retain_unused = self.verbatim_module_syntax;
+            // JavaScript imports cannot be classified as type-only. Preserve their syntactic
+            // bindings even when a later declaration with the same name wins binder resolution.
+            let retain_unused = self.verbatim_module_syntax || self.source_is_javascript_input();
             let runtime_default = clause
                 .name
                 .filter(|name| {
@@ -54337,7 +54373,7 @@ impl Printer<'_> {
         if clause.phase_modifier == Some(SyntaxKind::TypeKeyword) {
             return false;
         }
-        if self.verbatim_module_syntax {
+        if self.verbatim_module_syntax || self.source_is_javascript_input() {
             return clause.name.is_some()
                 || clause
                     .named_bindings
@@ -59613,14 +59649,28 @@ impl Printer<'_> {
         } else {
             self.writer.write("{}");
         }
-        for (is_spread, properties) in &chunks[next_chunk..] {
+        for (chunk_offset, (is_spread, properties)) in chunks[next_chunk..].iter().enumerate() {
             self.writer.write(", ");
             if *is_spread {
-                let NodeData::SpreadAssignment(spread) = &self.node(properties[0])?.data else {
+                let spread_node = self.node(properties[0])?.clone();
+                let NodeData::SpreadAssignment(spread) = &spread_node.data else {
                     unreachable!("spread chunk checked above");
                 };
                 let expression = spread.expression;
                 self.emit_expression(expression, 1)?;
+                let chunk_index = next_chunk + chunk_offset;
+                let boundary = chunks
+                    .get(chunk_index + 1)
+                    .and_then(|(_, next)| next.first())
+                    .and_then(|next| self.arena.get(*next))
+                    .map_or(data.properties.range.end.get().saturating_sub(1), |next| {
+                        next.range.start.get()
+                    });
+                self.emit_source_comments_between_with_trailing(
+                    spread_node.range.end.get(),
+                    boundary,
+                    true,
+                );
             } else {
                 self.emit_downlevel_object_property_chunk(properties)?;
             }
@@ -62267,6 +62317,37 @@ mod tests {
         emit_with_decorator_mode(source, target, module, false)
     }
 
+    fn emit_javascript_with(
+        source: &str,
+        target: ScriptTarget,
+        module: ModuleKind,
+    ) -> super::EmitResult {
+        let parsed = parse_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        emit_source_file_with_settings(
+            &parsed.arena,
+            parsed.source_file,
+            "input.js",
+            source,
+            PrinterSettings {
+                always_strict: false,
+                target,
+                module,
+                jsx: JsxEmit::Preserve,
+                emit_javascript: true,
+                emit_declarations: false,
+                source_map: false,
+                inline_source_map: false,
+                import_helpers: false,
+                no_emit_helpers: false,
+                experimental_decorators: false,
+                remove_comments: false,
+                use_define_for_class_fields: None,
+            },
+        )
+        .unwrap()
+    }
+
     fn emit_with_parse_errors(
         source: &str,
         target: ScriptTarget,
@@ -62357,6 +62438,7 @@ mod tests {
             },
             &EmitContext {
                 bindings: &bindings,
+                bundle_namespace_members: &BTreeMap::new(),
                 amd_module_name: None,
                 amd_bundle: false,
                 preemitted_source_prologues: false,
@@ -62425,6 +62507,7 @@ mod tests {
             },
             &EmitContext {
                 bindings: &bindings,
+                bundle_namespace_members: &BTreeMap::new(),
                 amd_module_name: None,
                 amd_bundle: false,
                 preemitted_source_prologues: false,
@@ -62568,6 +62651,7 @@ mod tests {
             },
             &EmitContext {
                 bindings: &bindings,
+                bundle_namespace_members: &BTreeMap::new(),
                 amd_module_name: parsed.amd_module_name.as_deref(),
                 amd_bundle: false,
                 preemitted_source_prologues: false,
@@ -65104,6 +65188,7 @@ mod tests {
             },
             &EmitContext {
                 bindings: &bindings,
+                bundle_namespace_members: &BTreeMap::new(),
                 amd_module_name: None,
                 amd_bundle: false,
                 preemitted_source_prologues: false,
@@ -65777,6 +65862,7 @@ mod tests {
                 },
                 &EmitContext {
                     bindings: &bindings,
+                    bundle_namespace_members: &BTreeMap::new(),
                     amd_module_name: None,
                     amd_bundle: false,
                     preemitted_source_prologues: false,
@@ -66570,6 +66656,23 @@ mod tests {
             assert_eq!(output.matches(call).count(), 1, "{call}: {output}");
         }
         assert_eq!(output.matches("second()").count(), 2, "{output}");
+    }
+
+    #[test]
+    fn downlevel_object_spread_preserves_trailing_spread_comments() {
+        let output = emit_with(
+            "const value = { [key]: 1, ...{ get [key]() { return 0; } } // comment\n};",
+            ScriptTarget::Es2015,
+            ModuleKind::EsNext,
+        )
+        .code;
+        assert_eq!(
+            output,
+            concat!(
+                "const value = Object.assign({ [key]: 1 }, ",
+                "{ get [key]() { return 0; } } // comment\n);\n",
+            )
+        );
     }
 
     #[test]
@@ -68458,6 +68561,27 @@ class Board {
     }
 
     #[test]
+    fn preserves_javascript_import_bindings_shadowed_by_later_declarations() {
+        let result = emit_javascript_with(
+            concat!(
+                "import * as moment from 'moment';\n",
+                "import fallback from 'moment';\n",
+                "export const moment = fallback || moment;",
+            ),
+            ScriptTarget::Es2015,
+            ModuleKind::EsNext,
+        );
+        assert_eq!(
+            result.code,
+            concat!(
+                "import * as moment from 'moment';\n",
+                "import fallback from 'moment';\n",
+                "export const moment = fallback || moment;\n",
+            )
+        );
+    }
+
+    #[test]
     fn elides_imports_used_only_in_type_positions() {
         let source = "import Types = require('types'); import Runtime = require('runtime'); import 'side'; interface Box { value: Types.Value; } class Derived extends Runtime.Base {}";
         let result = emit_with(source, ScriptTarget::Es2015, ModuleKind::CommonJs);
@@ -68601,6 +68725,7 @@ class Board {
             },
             &EmitContext {
                 bindings: &bindings,
+                bundle_namespace_members: &BTreeMap::new(),
                 amd_module_name: None,
                 amd_bundle: false,
                 preemitted_source_prologues: false,
@@ -70943,6 +71068,24 @@ class Board {
         assert!(
             declaration.contains("const enum Color {\n    red = 0,\n    green = 1\n}"),
             "{declaration}"
+        );
+    }
+
+    #[test]
+    fn declaration_emit_filters_individual_variable_declarators() {
+        let output = emit_declarations_with_semantics(concat!(
+            "const key = Symbol(), value = 12;\n",
+            "export class Foo { [key] = value; }",
+        ));
+        assert_eq!(
+            output,
+            concat!(
+                "declare const key: unique symbol;\n",
+                "export declare class Foo {\n",
+                "    [key]: number;\n",
+                "}\n",
+                "export {};\n",
+            )
         );
     }
 

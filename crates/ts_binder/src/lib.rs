@@ -1105,24 +1105,48 @@ impl<'a> Binder<'a> {
         flags: SymbolFlags,
         parent_symbol: Option<SymbolId>,
     ) -> Option<SymbolId> {
+        let computed_expression = match self.arena.get(name_node).map(|node| &node.data) {
+            Some(NodeData::ComputedPropertyName(computed)) => Some(computed.expression),
+            _ => None,
+        };
+        if let Some(expression) = computed_expression {
+            let expression_scope = self
+                .result
+                .scope(scope)
+                .and_then(|scope| {
+                    matches!(
+                        scope.kind,
+                        ScopeKind::Class
+                            | ScopeKind::Interface
+                            | ScopeKind::Enum
+                            | ScopeKind::TypeAlias
+                    )
+                    .then_some(scope.parent)
+                    .flatten()
+                })
+                .unwrap_or(scope);
+            let expression_container = self
+                .result
+                .scope(expression_scope)
+                .map_or(declaration, |scope| scope.owner);
+            let expression_parent_symbol = self
+                .result
+                .node_symbols
+                .get(&expression_container)
+                .copied();
+            self.bind_node(
+                expression,
+                expression_scope,
+                expression_container,
+                expression_parent_symbol,
+            );
+        }
         let name = self.declaration_name_text(name_node)?;
         let id = self.declare_name(scope, declaration, name, flags, parent_symbol)?;
         self.result.node_symbols.insert(declaration, id);
         self.result.node_symbols.insert(name_node, id);
-        if let Some(NodeData::ComputedPropertyName(computed)) =
-            self.arena.get(name_node).map(|node| &node.data)
-        {
-            self.result.node_symbols.insert(computed.expression, id);
-        }
         if let Some(container) = self.result.containers.get(&declaration).copied() {
             self.result.containers.insert(name_node, container);
-            if let Some(NodeData::ComputedPropertyName(computed)) =
-                self.arena.get(name_node).map(|node| &node.data)
-            {
-                self.result
-                    .containers
-                    .insert(computed.expression, container);
-            }
         }
         Some(id)
     }
@@ -1887,13 +1911,69 @@ mod tests {
             if let NodeData::ComputedPropertyName(computed) =
                 &parsed.arena.get(member_data.name).unwrap().data
             {
-                assert!(result.node_symbols.contains_key(&computed.expression));
                 assert_eq!(
                     result.containers.get(&computed.expression),
-                    result.containers.get(member)
+                    Some(&parsed.source_file)
                 );
             }
         }
+    }
+
+    #[test]
+    fn computed_class_names_resolve_in_the_enclosing_scope() {
+        let parsed = parse_source_file(
+            "const key = Symbol(), value = 12; export class Foo { [key] = value; }",
+        );
+        let result = bind_source_file(&parsed.arena, parsed.source_file);
+        let key_declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(_, node)| {
+                let NodeData::VariableDeclaration(declaration) = &node.data else {
+                    return None;
+                };
+                matches!(
+                    parsed.arena.get(declaration.name).map(|name| &name.data),
+                    Some(NodeData::Identifier(name)) if name.text == "key"
+                )
+                .then_some(declaration.name)
+            })
+            .unwrap();
+        let computed_name = parsed
+            .arena
+            .iter()
+            .find_map(|(_, node)| {
+                let NodeData::PropertyDeclaration(property) = &node.data else {
+                    return None;
+                };
+                matches!(
+                    parsed.arena.get(property.name).map(|name| &name.data),
+                    Some(NodeData::ComputedPropertyName(_))
+                )
+                .then_some(property.name)
+            })
+            .unwrap();
+        let NodeData::ComputedPropertyName(computed) = &parsed.arena.get(computed_name).unwrap().data
+        else {
+            unreachable!();
+        };
+        let computed_expression = computed.expression;
+        assert_eq!(
+            result.root_scope().unwrap().symbols.get("key"),
+            result.node_symbols.get(&key_declaration).copied()
+        );
+        assert_eq!(
+            result.containers.get(&computed_expression),
+            Some(&parsed.source_file)
+        );
+        assert_eq!(
+            result.node_scopes.get(&parsed.source_file).copied(),
+            result.root_scope().map(|scope| scope.id)
+        );
+        assert_eq!(
+            result.resolve_name_at(computed_expression, "key"),
+            result.node_symbols.get(&key_declaration).copied()
+        );
     }
 
     #[test]

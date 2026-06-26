@@ -7677,7 +7677,19 @@ impl<'a> Checker<'a> {
                 NodeData::PropertyDeclaration(data) => {
                     if let Some(initializer) = data.initializer {
                         let expected = data.type_.map(|node| self.type_from_type_node(node));
+                        self.clear_cached_expression_types(initializer);
                         let actual = self.type_of_expression_context(initializer, expected);
+                        if expected.is_none() {
+                            let inferred = if self.has_ast_modifier(
+                                data.modifiers.as_ref(),
+                                SyntaxKind::ReadonlyKeyword,
+                            ) {
+                                actual
+                            } else {
+                                self.widen_literal(actual)
+                            };
+                            self.result.node_types.insert(*member, inferred);
+                        }
                         if let Some(expected) = expected
                             && !self.is_assignable(actual, expected)
                         {

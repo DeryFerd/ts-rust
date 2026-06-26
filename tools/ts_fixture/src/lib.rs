@@ -1178,7 +1178,7 @@ fn matrix_axes(case: &Case) -> Vec<String> {
         .iter()
         .filter_map(|name| {
             case.directive_values(name)
-                .next()
+                .last()
                 .filter(|value| {
                     value.trim() == "*"
                         || value
@@ -2053,6 +2053,43 @@ mod tests {
             variants[0].values.get("outFile").map(String::as_str),
             Some("second.js")
         );
+    }
+
+    #[test]
+    fn repeated_target_directive_emits_each_requested_variant() {
+        let case = Case::parse(
+            "useStrictLikePrologueString01.ts",
+            concat!(
+                "//@target: commonjs\n",
+                "//@target: es5, es2015\n\n",
+                "\"hey!\"\n",
+                "\" use strict \"\n",
+                "export function f() {   \n}\n",
+            ),
+        )
+        .unwrap();
+        assert_eq!(matrix_axes(&case), ["target"]);
+        let matrix = compile_case_matrix(&case).unwrap();
+        assert_eq!(matrix.len(), 2);
+        for (variant, compilation) in matrix {
+            let output = compilation
+                .outputs
+                .get("/case/useStrictLikePrologueString01.js")
+                .unwrap();
+            let expected = if variant.values["target"] == "es5" {
+                concat!(
+                    "\"use strict\";\n",
+                    "\"hey!\";\n",
+                    "\" use strict \";\n",
+                    "Object.defineProperty(exports, \"__esModule\", { value: true });\n",
+                    "exports.f = f;\n",
+                    "function f() {\n}\n",
+                )
+            } else {
+                "\"hey!\";\n\" use strict \";\nexport function f() {\n}\n"
+            };
+            assert_eq!(output, expected, "variant={variant:?}");
+        }
     }
 
     #[test]

@@ -6,7 +6,7 @@ use std::{
 };
 
 use ts_ast::{NodeData, NodeId};
-use ts_binder::{BindResult, bind_source_file};
+use ts_binder::{BindResult, SymbolFlags, bind_source_file};
 use ts_checker::{
     CheckDiagnostic, CheckResult, CheckerOptions, EnumConstantValue as CheckerConstantValue,
     ProgramSource, TypeId, TypeKind, check_program_with_paths, empty_check_result,
@@ -44,6 +44,70 @@ pub struct SourceFile {
     pub checking: CheckResult,
     pub is_default_library: bool,
     implied_node_format: ModuleKind,
+}
+
+fn bundle_namespace_path(source: &SourceFile, declaration: NodeId) -> Option<Vec<String>> {
+    let mut path = Vec::new();
+    let mut current = Some(declaration);
+    while let Some(id) = current {
+        let node = source.parse.arena.get(id)?;
+        if let NodeData::ModuleDeclaration(module) = &node.data {
+            let name = match &source.parse.arena.get(module.name)?.data {
+                NodeData::Identifier(name) => &name.text,
+                NodeData::StringLiteral(name) => &name.text,
+                _ => return None,
+            };
+            path.push(name.clone());
+        }
+        current = node.parent;
+    }
+    path.reverse();
+    Some(path)
+}
+
+fn bundle_namespace_members(
+    sources: &[&SourceFile],
+) -> BTreeMap<Vec<String>, BTreeSet<String>> {
+    let value_flags = SymbolFlags::FUNCTION
+        | SymbolFlags::CLASS
+        | SymbolFlags::FUNCTION_SCOPED_VARIABLE
+        | SymbolFlags::BLOCK_SCOPED_VARIABLE
+        | SymbolFlags::REGULAR_ENUM
+        | SymbolFlags::CONST_ENUM
+        | SymbolFlags::VALUE_MODULE
+        | SymbolFlags::NAMESPACE_MODULE;
+    let mut result = BTreeMap::<Vec<String>, BTreeSet<String>>::new();
+    for source in sources {
+        for (id, node) in source.parse.arena.iter() {
+            let NodeData::ModuleDeclaration(module) = &node.data else {
+                continue;
+            };
+            let Some(path) = bundle_namespace_path(source, id) else {
+                continue;
+            };
+            let symbol = source
+                .binding
+                .node_symbols
+                .get(&module.name)
+                .copied()
+                .or_else(|| source.binding.node_symbols.get(&id).copied());
+            let Some(symbol) = symbol.and_then(|symbol| source.binding.symbols.get(symbol)) else {
+                continue;
+            };
+            let members = result.entry(path).or_default();
+            for (name, member) in symbol.members.iter() {
+                if source
+                    .binding
+                    .symbols
+                    .get(member)
+                    .is_some_and(|member| member.flags.intersects(value_flags))
+                {
+                    members.insert(name.to_owned());
+                }
+            }
+        }
+    }
+    result
 }
 
 /// A diagnostic produced while constructing or parsing a Program.
@@ -783,6 +847,7 @@ impl Program {
                         || has_preserved_reference_directive(&source_file.source_text);
                 let emit_context = EmitContext {
                     bindings: &source_file.binding,
+                    bundle_namespace_members: &BTreeMap::new(),
                     amd_module_name: source_file.parse.amd_module_name.as_deref(),
                     amd_bundle: false,
                     preemitted_source_prologues: false,
@@ -1033,6 +1098,7 @@ impl Program {
                     || !source_is_external_module(source)
             })
             .collect::<Vec<_>>();
+        let bundle_namespace_members = bundle_namespace_members(&javascript_sources);
         let declaration_sources = if settings.emit_javascript
             && !matches!(settings.module, ModuleKind::Amd | ModuleKind::System)
         {
@@ -1228,6 +1294,7 @@ impl Program {
                 }
                 let emit_context = EmitContext {
                     bindings: &source.binding,
+                    bundle_namespace_members: &bundle_namespace_members,
                     amd_module_name: amd_module_name.as_deref(),
                     amd_bundle: true,
                     preemitted_source_prologues: !source_is_external_module(source),
@@ -7656,6 +7723,44 @@ export function create() { return new M.Value(); }"#,
         assert!(
             map.text
                 .contains("\"sources\":[\"/project/second.ts\",\"/project/first.ts\"]")
+        );
+    }
+
+    #[test]
+    fn out_file_qualifies_members_from_later_reopened_namespaces() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/a.ts",
+            "namespace ts { export function print() { return sys.version; } }",
+        )
+        .unwrap();
+        fs.write_file(
+            "/project/b.ts",
+            "namespace ts { export const sys = { version: '1.0' }; }",
+        )
+        .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["a.ts".to_owned(), "b.ts".to_owned()],
+            CompilerOptions {
+                out_file: Some("out.js".into()),
+                target: ScriptTarget::Es2015,
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        let emitted = program.emit();
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        let javascript = emitted
+            .files
+            .iter()
+            .find(|file| file.file_name == "/project/out.js")
+            .unwrap();
+        assert!(
+            javascript.text.contains("return ts.sys.version;"),
+            "{}",
+            javascript.text
         );
     }
 

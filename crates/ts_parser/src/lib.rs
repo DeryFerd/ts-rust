@@ -2046,7 +2046,7 @@ impl<'a> Parser<'a> {
         while self.current.kind != SyntaxKind::CloseBraceToken
             && self.current.kind != SyntaxKind::EndOfFile
         {
-            if !signature_only && self.current.kind == SyntaxKind::VarKeyword {
+            if !signature_only && self.class_var_keyword_starts_recovered_statement() {
                 self.error_code_at(self.current.range, 1068, std::iter::empty::<String>());
                 recovered_at_statement = true;
                 break;
@@ -2129,6 +2129,22 @@ impl<'a> Parser<'a> {
             nodes: members,
             has_trailing_comma: false,
         }
+    }
+
+    fn class_var_keyword_starts_recovered_statement(&mut self) -> bool {
+        self.current.kind == SyntaxKind::VarKeyword
+            && !self.next_token_preceded_by_line_break()
+            && !matches!(
+                self.next_token_kind(),
+                SyntaxKind::LessThanToken
+                    | SyntaxKind::OpenParenToken
+                    | SyntaxKind::QuestionToken
+                    | SyntaxKind::ExclamationToken
+                    | SyntaxKind::ColonToken
+                    | SyntaxKind::EqualsToken
+                    | SyntaxKind::SemicolonToken
+                    | SyntaxKind::CloseBraceToken
+            )
     }
 
     fn current_token_can_start_class_member(&mut self) -> bool {
@@ -2549,12 +2565,17 @@ impl<'a> Parser<'a> {
             self.current.kind,
             SyntaxKind::GetKeyword | SyntaxKind::SetKeyword
         ) && self.is_accessor_signature();
+        let construct_signature = self.current.kind == SyntaxKind::NewKeyword
+            && matches!(
+                self.next_token_kind(),
+                SyntaxKind::OpenParenToken | SyntaxKind::LessThanToken
+            );
 
         let member = match self.current.kind {
             SyntaxKind::OpenParenToken | SyntaxKind::LessThanToken => {
                 self.parse_signature_member(start, SyntaxKind::CallSignature)
             }
-            SyntaxKind::NewKeyword => {
+            SyntaxKind::NewKeyword if construct_signature => {
                 self.bump();
                 self.parse_signature_member(start, SyntaxKind::ConstructSignature)
             }
@@ -9347,6 +9368,22 @@ mod tests {
     }
 
     #[test]
+    fn parses_var_as_a_class_property_name() {
+        let result = parse_source_file("class C { var; } class D { var\nvalue = 1; }");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        for statement in source_statements(&result) {
+            let NodeData::ClassDeclaration(class) = &result.arena.get(*statement).unwrap().data
+            else {
+                panic!("expected class declaration");
+            };
+            assert_eq!(
+                result.arena.get(class.members.nodes[0]).unwrap().kind,
+                SyntaxKind::PropertyDeclaration
+            );
+        }
+    }
+
+    #[test]
     fn parses_arrow_postfix_aggregate_and_template_expressions() {
         let source = r"
             const f = (x: number): number => x + 1;
@@ -11607,6 +11644,7 @@ mod tests {
                 type Inline = {
                     (value: string): number;
                     new(): Inline;
+                    new?(): Inline;
                     [key: string]: unknown;
                     run(): void;
                 };
@@ -11643,7 +11681,11 @@ mod tests {
         else {
             panic!("expected type literal");
         };
-        assert_eq!(literal.members.nodes.len(), 4);
+        assert_eq!(literal.members.nodes.len(), 5);
+        assert_eq!(
+            result.arena.get(literal.members.nodes[2]).unwrap().kind,
+            SyntaxKind::MethodSignature
+        );
     }
 
     #[test]
