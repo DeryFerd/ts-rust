@@ -35684,7 +35684,59 @@ impl Printer<'_> {
                 if !emitted_stage3_class_decorators
                     && self.settings.target >= ScriptTarget::Es2015
                 {
-                    self.emit_class_member_decorators(data)?;
+                    let private_scoped =
+                        self.class_member_decorators_reference_private_name(data);
+                    if !(private_scoped && self.settings.target >= ScriptTarget::Es2022) {
+                        if private_scoped {
+                            if !self.writer.line_start {
+                                self.writer.newline();
+                            }
+                            self.writer.write("(() => {");
+                            self.writer.newline();
+                            self.writer.indent += 1;
+                            let previous_private_field_plan =
+                                self.active_private_field_plan.clone();
+                            if let Some(previous) = &previous_private_field_plan {
+                                self.enclosing_private_field_plans.push(previous.clone());
+                            }
+                            let previous_private_method_plan =
+                                self.active_private_method_plan.clone();
+                            if let Some(previous) = &previous_private_method_plan {
+                                self.enclosing_private_method_plans.push(previous.clone());
+                            }
+                            let previous_static_private_field_plan =
+                                self.active_static_private_field_plan.clone();
+                            if let Some(previous) = &previous_static_private_field_plan {
+                                self.enclosing_static_private_field_plans
+                                    .push(previous.clone());
+                            }
+                            self.active_private_field_plan = self.private_field_plan(data);
+                            self.active_private_method_plan = self.private_method_plan(data);
+                            self.active_static_private_field_plan =
+                                self.static_private_field_plan(data);
+                            let member_decorator_result =
+                                self.emit_class_member_decorators(data);
+                            self.active_private_field_plan = previous_private_field_plan;
+                            self.active_private_method_plan = previous_private_method_plan;
+                            self.active_static_private_field_plan =
+                                previous_static_private_field_plan;
+                            if self.active_private_field_plan.is_some() {
+                                self.enclosing_private_field_plans.pop();
+                            }
+                            if self.active_private_method_plan.is_some() {
+                                self.enclosing_private_method_plans.pop();
+                            }
+                            if self.active_static_private_field_plan.is_some() {
+                                self.enclosing_static_private_field_plans.pop();
+                            }
+                            member_decorator_result?;
+                            self.writer.newline();
+                            self.writer.indent -= 1;
+                            self.writer.write("})();");
+                        } else {
+                            self.emit_class_member_decorators(data)?;
+                        }
+                    }
                 }
                 if !emitted_stage3_class_decorators
                     && (!decorators.is_empty()
@@ -54504,6 +54556,24 @@ impl Printer<'_> {
         Ok(())
     }
 
+    fn class_member_decorators_reference_private_name(
+        &self,
+        class: &ts_ast::ClassDeclarationData,
+    ) -> bool {
+        class.members.nodes.iter().any(|member| {
+            self.arena.iter().any(|(decorator_id, node)| {
+                let NodeData::Decorator(decorator) = &node.data else {
+                    return false;
+                };
+                self.node_is_within(decorator_id, *member)
+                    && self.arena.iter().any(|(candidate, node)| {
+                        node.kind == SyntaxKind::PrivateIdentifier
+                            && self.node_is_within(candidate, decorator.expression)
+                    })
+            })
+        })
+    }
+
     #[allow(clippy::too_many_lines)]
     fn emit_class_member_decorators(
         &mut self,
@@ -56268,6 +56338,19 @@ impl Printer<'_> {
         }
         if previous_emitted {
             self.emit_class_empty_elements_between(previous_end, data.members.range.end.get());
+        }
+        if self.settings.experimental_decorators
+            && self.settings.target >= ScriptTarget::Es2022
+            && self.class_member_decorators_reference_private_name(data)
+        {
+            self.writer.write("static {");
+            self.writer.newline();
+            self.writer.indent += 1;
+            self.emit_class_member_decorators(data)?;
+            self.writer.newline();
+            self.writer.indent -= 1;
+            self.writer.write("}");
+            self.writer.newline();
         }
         self.writer.indent -= class_body_indent;
         if native_computed_callback.is_some() {
