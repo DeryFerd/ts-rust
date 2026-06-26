@@ -506,6 +506,16 @@ pub fn emit_source_file_with_context(
                     .chain(value_symbol)
                     .any(|symbol| {
                         printer.symbol_has_runtime_value(symbol, &mut HashSet::new())
+                            || printer.bindings.symbols.get(symbol).is_some_and(|symbol| {
+                                symbol.flags.intersects(
+                                    SymbolFlags::VARIABLE
+                                        | SymbolFlags::FUNCTION
+                                        | SymbolFlags::CLASS
+                                        | SymbolFlags::REGULAR_ENUM
+                                        | SymbolFlags::VALUE_MODULE
+                                        | SymbolFlags::NAMESPACE_MODULE,
+                                )
+                            })
                     })
                     .then(|| name.to_owned())
             })
@@ -31701,8 +31711,7 @@ impl Printer<'_> {
                 } else {
                     Vec::new()
                 };
-                let downlevel_async_parameters = (downlevel_async
-                    && self.settings.target >= ScriptTarget::Es2015)
+                let downlevel_async_parameters = downlevel_async
                     .then(|| self.downlevel_async_parameter_plan(&data.parameters, id))
                     .flatten();
                 if !downlevel_async && !downlevel_async_generator && is_async {
@@ -36869,6 +36878,48 @@ impl Printer<'_> {
         })
     }
 
+    fn recovered_async_await_arrow_parameter(
+        &self,
+        parameters: &NodeList,
+    ) -> Option<NodeId> {
+        parameters.nodes.iter().find_map(|parameter| {
+            let NodeData::ParameterDeclaration(parameter) =
+                &self.arena.get(*parameter)?.data
+            else {
+                return None;
+            };
+            let initializer = parameter.initializer?;
+            match &self.arena.get(initializer)?.data {
+                NodeData::ArrowFunction(arrow) => {
+                    let [arrow_parameter] = arrow.parameters.nodes.as_slice() else {
+                        return None;
+                    };
+                    let NodeData::ParameterDeclaration(arrow_parameter) =
+                        &self.arena.get(*arrow_parameter)?.data
+                    else {
+                        return None;
+                    };
+                    (declaration_name_text(self.arena, arrow_parameter.name) == Some("await")
+                        && declaration_name_text(self.arena, arrow.body) == Some("await"))
+                    .then_some(initializer)
+                }
+                NodeData::BinaryExpression(binary)
+                    if self.arena.get(binary.operator_token)?.kind
+                        == SyntaxKind::CommaToken
+                        && matches!(
+                            self.arena.get(binary.left).map(|node| &node.data),
+                            Some(NodeData::AwaitExpression(awaited))
+                                if node_is_missing_identifier(self.arena, awaited.expression)
+                        )
+                        && declaration_name_text(self.arena, binary.right) == Some("await") =>
+                {
+                    Some(initializer)
+                }
+                _ => None,
+            }
+        })
+    }
+
     fn function_body_uses_lexical_arguments_in_arrow(&self, body: NodeId) -> bool {
         self.subtree_uses_lexical_arguments(body, false)
     }
@@ -37735,6 +37786,10 @@ impl Printer<'_> {
         parameters: Option<&NodeList>,
     ) -> Result<(), EmitError> {
         if self.settings.target < ScriptTarget::Es2015 {
+            let parameter_plan = parameters.and_then(|parameters| {
+                let function = self.arena.get(body)?.parent?;
+                self.downlevel_async_parameter_plan(parameters, function)
+            });
             let mut hoisted_lists = HashSet::new();
             let mut hoisted_names = Vec::new();
             self.collect_es5_async_variable_hoists(
@@ -37743,13 +37798,7 @@ impl Printer<'_> {
                 &mut hoisted_names,
             );
             self.collect_es5_async_for_hoists(body, &mut hoisted_lists, &mut hoisted_names);
-            let compact_callback = self
-                .arena
-                .get(body)
-                .and_then(|node| node.parent)
-                .and_then(|parent| self.arena.get(parent))
-                .is_some_and(|parent| matches!(parent.data, NodeData::MethodDeclaration(_)))
-                && self.es5_async_simple_suspension_count(body) == 0
+            let compact_callback = !self.node_source_is_multiline(body)
                 && hoisted_names.is_empty();
             let state_parameter = if self
                 .class_expression_temps
@@ -37768,10 +37817,11 @@ impl Printer<'_> {
                 state_parameter,
                 None,
                 None,
-                None,
+                parameters.zip(parameter_plan.as_ref()),
                 None,
                 false,
                 compact_callback,
+                parameter_plan.is_some(),
             );
         }
         self.writer.write("{");
@@ -39662,7 +39712,19 @@ impl Printer<'_> {
         if !type_symbol
             .into_iter()
             .chain(value_symbol)
-            .any(|symbol| self.symbol_has_runtime_value(symbol, &mut HashSet::new()))
+            .any(|symbol| {
+                self.symbol_has_runtime_value(symbol, &mut HashSet::new())
+                    || self.bindings.symbols.get(symbol).is_some_and(|symbol| {
+                        symbol.flags.intersects(
+                            SymbolFlags::VARIABLE
+                                | SymbolFlags::FUNCTION
+                                | SymbolFlags::CLASS
+                                | SymbolFlags::REGULAR_ENUM
+                                | SymbolFlags::VALUE_MODULE
+                                | SymbolFlags::NAMESPACE_MODULE,
+                        )
+                    })
+            })
         {
             return None;
         }
@@ -39691,6 +39753,7 @@ impl Printer<'_> {
         arguments_capture: Option<&str>,
         compact_outer: bool,
         compact_callback: bool,
+        forward_arguments: bool,
     ) -> Result<(), EmitError> {
         let prologue_statements = self
             .arena
@@ -39918,7 +39981,8 @@ impl Printer<'_> {
         if let Some(parameters) = parameter_prologue {
             self.emit_downlevel_rest_parameter_prologue(parameters)?;
         }
-        if let Some((_, plan)) = async_parameter_plan
+        if !forward_arguments
+            && let Some((_, plan)) = async_parameter_plan
             && let Some(rest) = plan.rest_parameter.as_deref()
         {
             self.writer.write("var ");
@@ -39955,7 +40019,9 @@ impl Printer<'_> {
         self.writer.write("(");
         self.writer.write(this_argument);
         self.writer.write(", ");
-        if let Some((_, plan)) = async_parameter_plan
+        if forward_arguments {
+            self.writer.write("arguments");
+        } else if let Some((_, plan)) = async_parameter_plan
             && let Some(rest) = plan.rest_parameter.as_deref()
         {
             self.writer.write("__spreadArray([");
@@ -39979,8 +40045,15 @@ impl Printer<'_> {
             self.writer.write("void 0");
         }
         self.writer.write(", function ");
+        let recovered_await_parameter = async_parameter_plan.and_then(|(parameters, _)| {
+            self.recovered_async_await_arrow_parameter(parameters)
+        });
         if let Some((parameters, _)) = async_parameter_plan {
             self.emit_parameters_without_initializers(parameters)?;
+            if recovered_await_parameter.is_some() {
+                self.writer.remove_trailing_char(')');
+                self.writer.write(", await)");
+            }
         } else {
             self.writer.write("()");
         }
@@ -40009,11 +40082,16 @@ impl Printer<'_> {
                     return None;
                 };
                 let initializer = parameter.initializer?;
-                matches!(
-                    self.arena.get(initializer).map(|node| &node.data),
-                    Some(NodeData::AwaitExpression(_))
-                )
-                .then_some(initializer)
+                match self.arena.get(initializer).map(|node| &node.data) {
+                    Some(NodeData::AwaitExpression(awaited)) => {
+                        Some((initializer, Some(awaited.expression)))
+                    }
+                    _ if recovered_await_parameter == Some(initializer) =>
+                    {
+                        Some((initializer, None))
+                    }
+                    _ => None,
+                }
             })
             .collect::<Vec<_>>();
         if let Some((parameters, _)) = async_parameter_plan {
@@ -40034,7 +40112,8 @@ impl Printer<'_> {
                 if matches!(
                     self.arena.get(initializer).map(|node| &node.data),
                     Some(NodeData::AwaitExpression(_))
-                ) {
+                ) || recovered_await_parameter == Some(initializer)
+                {
                     self.writer.write(state_parameter);
                     self.writer.write(".sent()");
                 } else {
@@ -40169,11 +40248,21 @@ impl Printer<'_> {
             self.writer.write("case 0:");
             self.writer.indent += 1;
             let mut case = 0;
-            for initializer in awaited_parameter_defaults {
-                let NodeData::AwaitExpression(awaited) = &self.node(initializer)?.data else {
-                    unreachable!();
-                };
-                self.emit_es5_async_yield(awaited.expression, &mut case, true)?;
+            for (_, awaited) in awaited_parameter_defaults {
+                if let Some(awaited) = awaited {
+                    self.emit_es5_async_yield(awaited, &mut case, true)?;
+                } else {
+                    if !self.writer.line_start {
+                        self.writer.write(" ");
+                    }
+                    self.writer.write("return [4 /*yield*/, ];");
+                    self.writer.newline();
+                    case += 1;
+                    self.emit_es5_async_case_label(case, true);
+                    if self.es5_async_with_environments.is_empty() {
+                        self.writer.write(" ");
+                    }
+                }
             }
             self.writer.write("return [2 /*return*/];");
             self.writer.newline();
@@ -58500,6 +58589,7 @@ impl Printer<'_> {
                             local_arguments_alias.as_deref(),
                             true,
                             true,
+                            false,
                         )?;
                     } else if let Some(pattern) = object_rest_parameter {
                         self.emit_awaiter_call_with_object_rest_parameter(
