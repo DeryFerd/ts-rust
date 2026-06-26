@@ -386,6 +386,7 @@ pub fn emit_source_file_with_context(
         commonjs_destructuring_assignment_hoists: HashMap::new(),
         commonjs_postfix_export_temps: HashMap::new(),
         downlevel_nullish_temps: HashMap::new(),
+        logical_assignment_plans: HashMap::new(),
         downlevel_optional_temps: HashMap::new(),
         downlevel_spread_call_temps: HashMap::new(),
         nested_object_rest_assignment_temps: HashMap::new(),
@@ -26850,6 +26851,12 @@ struct AmdImportInitializer {
     require_path: Option<String>,
 }
 
+#[derive(Clone, Default)]
+struct LogicalAssignmentPlan {
+    receiver_temp: Option<String>,
+    key_temp: Option<String>,
+}
+
 struct SystemModulePlan {
     export_function: String,
     context_object: String,
@@ -28516,6 +28523,7 @@ struct Printer<'a> {
     commonjs_destructuring_assignment_hoists: HashMap<NodeId, Vec<String>>,
     commonjs_postfix_export_temps: HashMap<NodeId, String>,
     downlevel_nullish_temps: HashMap<NodeId, String>,
+    logical_assignment_plans: HashMap<NodeId, LogicalAssignmentPlan>,
     downlevel_optional_temps: HashMap<NodeId, String>,
     downlevel_spread_call_temps: HashMap<NodeId, String>,
     nested_object_rest_assignment_temps: HashMap<NodeId, Vec<String>>,
@@ -40498,6 +40506,7 @@ impl Printer<'_> {
             self.generated_names.used.clone()
         };
         let mut temps = Vec::new();
+        let mut logical_assignment_temps = Vec::new();
         let mut private_receiver_temps = Vec::new();
         let mut declaration_index = 0;
         for (class_start, class_expression) in class_expressions {
@@ -40589,6 +40598,11 @@ impl Printer<'_> {
                 );
             }
             self.prepare_downlevel_nullish_temps(block_id, &mut claimed, &mut temps);
+            self.prepare_logical_assignment_temps(
+                block_id,
+                &mut claimed,
+                &mut logical_assignment_temps,
+            );
             if matches!(self.settings.module, ModuleKind::Amd | ModuleKind::Umd)
                 && let Some(container) = self.arena.get(block_id).and_then(|node| node.parent)
             {
@@ -40616,6 +40630,9 @@ impl Printer<'_> {
         self.generated_names.used.extend(temps.iter().cloned());
         self.generated_names
             .used
+            .extend(logical_assignment_temps.iter().cloned());
+        self.generated_names
+            .used
             .extend(private_receiver_temps.iter().cloned());
         let block_scoped_private_declarations =
             self.block_scoped_private_class_declarations(block_id);
@@ -40629,6 +40646,12 @@ impl Printer<'_> {
         if !temps.is_empty() {
             self.writer.write("var ");
             self.writer.write(&temps.join(", "));
+            self.writer.write(";");
+            self.writer.newline();
+        }
+        if !logical_assignment_temps.is_empty() {
+            self.writer.write("var ");
+            self.writer.write(&logical_assignment_temps.join(", "));
             self.writer.write(";");
             self.writer.newline();
         }
@@ -41702,10 +41725,25 @@ impl Printer<'_> {
             }
         }
         self.prepare_downlevel_nullish_temps(source_file, &mut claimed, &mut field_temps);
+        let mut logical_assignment_temps = Vec::new();
+        self.prepare_logical_assignment_temps(
+            source_file,
+            &mut claimed,
+            &mut logical_assignment_temps,
+        );
         self.generated_names.used.extend(field_temps.iter().cloned());
+        self.generated_names
+            .used
+            .extend(logical_assignment_temps.iter().cloned());
         if !field_temps.is_empty() {
             self.writer.write("var ");
             self.writer.write(&field_temps.join(", "));
+            self.writer.write(";");
+            self.writer.newline();
+        }
+        if !logical_assignment_temps.is_empty() {
+            self.writer.write("var ");
+            self.writer.write(&logical_assignment_temps.join(", "));
             self.writer.write(";");
             self.writer.newline();
         }
@@ -42829,7 +42867,11 @@ impl Printer<'_> {
                             .arena
                             .get(binary.operator_token)
                             .is_some_and(|operator| {
-                                operator.kind == SyntaxKind::QuestionQuestionToken
+                                matches!(
+                                    operator.kind,
+                                    SyntaxKind::QuestionQuestionToken
+                                        | SyntaxKind::QuestionQuestionEqualsToken
+                                )
                             }) => (binary.left, false),
                     NodeData::PropertyAccessExpression(access)
                         if access.question_dot_token.is_some() => (access.expression, true),
@@ -42882,6 +42924,70 @@ impl Printer<'_> {
                     .insert(expression, temp.clone());
             }
             temps.push(temp);
+        }
+    }
+
+    fn prepare_logical_assignment_temps(
+        &mut self,
+        container: NodeId,
+        claimed: &mut HashSet<String>,
+        temps: &mut Vec<String>,
+    ) {
+        if self.settings.target >= ScriptTarget::Es2021 {
+            return;
+        }
+        let mut expressions = self
+            .arena
+            .iter()
+            .filter_map(|(id, node)| {
+                let NodeData::BinaryExpression(binary) = &node.data else {
+                    return None;
+                };
+                let operator = self.arena.get(binary.operator_token)?.kind;
+                if !matches!(
+                    operator,
+                    SyntaxKind::AmpersandAmpersandEqualsToken
+                        | SyntaxKind::BarBarEqualsToken
+                        | SyntaxKind::QuestionQuestionEqualsToken
+                ) || !self.node_belongs_to_temp_scope(id, container)
+                {
+                    return None;
+                }
+                Some((node.range.start, id, self.unwrap_erased_expression(binary.left)))
+            })
+            .collect::<Vec<_>>();
+        expressions.sort_by_key(|(start, ..)| *start);
+        for (_, expression, target) in expressions {
+            if self.logical_assignment_plans.contains_key(&expression) {
+                continue;
+            }
+            let mut plan = LogicalAssignmentPlan::default();
+            match self.arena.get(target).map(|node| &node.data) {
+                Some(NodeData::PropertyAccessExpression(access)) => {
+                    if self.downlevel_nullish_left_needs_temp(access.expression) {
+                        let temp = self.generate_block_temp(container, claimed);
+                        claimed.insert(temp.clone());
+                        temps.push(temp.clone());
+                        plan.receiver_temp = Some(temp);
+                    }
+                }
+                Some(NodeData::ElementAccessExpression(access)) => {
+                    if self.downlevel_nullish_left_needs_temp(access.expression) {
+                        let temp = self.generate_block_temp(container, claimed);
+                        claimed.insert(temp.clone());
+                        temps.push(temp.clone());
+                        plan.receiver_temp = Some(temp);
+                    }
+                    if self.downlevel_nullish_left_needs_temp(access.argument_expression) {
+                        let temp = self.generate_block_temp(container, claimed);
+                        claimed.insert(temp.clone());
+                        temps.push(temp.clone());
+                        plan.key_temp = Some(temp);
+                    }
+                }
+                _ => {}
+            }
+            self.logical_assignment_plans.insert(expression, plan);
         }
     }
 
@@ -70843,6 +70949,143 @@ impl Printer<'_> {
         Ok(true)
     }
 
+    fn emit_logical_assignment_target(
+        &mut self,
+        target: NodeId,
+        plan: &LogicalAssignmentPlan,
+        write: bool,
+    ) -> Result<(), EmitError> {
+        let target = self.unwrap_erased_expression(target);
+        if plan.receiver_temp.is_none() && plan.key_temp.is_none() {
+            return self.emit_expression(target, 18);
+        }
+        match &self.node(target)?.clone().data {
+            NodeData::PropertyAccessExpression(access) => {
+                if let Some(temp) = &plan.receiver_temp {
+                    if write {
+                        self.writer.write(temp);
+                    } else {
+                        self.writer.write("(");
+                        self.writer.write(temp);
+                        self.writer.write(" = ");
+                        self.emit_expression(access.expression, 1)?;
+                        self.writer.write(")");
+                    }
+                } else {
+                    self.emit_expression(access.expression, 18)?;
+                }
+                self.writer.write(".");
+                self.emit_expression(access.name, 18)?;
+            }
+            NodeData::ElementAccessExpression(access) => {
+                if let Some(temp) = &plan.receiver_temp {
+                    if write {
+                        self.writer.write(temp);
+                    } else {
+                        self.writer.write("(");
+                        self.writer.write(temp);
+                        self.writer.write(" = ");
+                        self.emit_expression(access.expression, 1)?;
+                        self.writer.write(")");
+                    }
+                } else {
+                    self.emit_expression(access.expression, 18)?;
+                }
+                self.writer.write("[");
+                if let Some(temp) = &plan.key_temp {
+                    self.writer.write(temp);
+                    if !write {
+                        self.writer.write(" = ");
+                        self.emit_expression(access.argument_expression, 1)?;
+                    }
+                } else {
+                    self.emit_expression(access.argument_expression, 0)?;
+                }
+                self.writer.write("]");
+            }
+            _ => self.emit_expression(target, 18)?,
+        }
+        Ok(())
+    }
+
+    fn emit_logical_assignment_write(
+        &mut self,
+        target: NodeId,
+        right: NodeId,
+        plan: &LogicalAssignmentPlan,
+    ) -> Result<(), EmitError> {
+        self.writer.write("(");
+        self.emit_logical_assignment_target(target, plan, true)?;
+        self.writer.write(" = ");
+        self.emit_expression(self.unwrap_erased_expression(right), 2)?;
+        self.writer.write(")");
+        Ok(())
+    }
+
+    fn emit_downlevel_logical_assignment(
+        &mut self,
+        expression: NodeId,
+        parent_precedence: u8,
+    ) -> Result<(), EmitError> {
+        let node = self.node(expression)?.clone();
+        let NodeData::BinaryExpression(binary) = &node.data else {
+            return Err(Self::unsupported(expression, node.kind));
+        };
+        let operator = self.node(binary.operator_token)?.kind;
+        let plan = self
+            .logical_assignment_plans
+            .get(&expression)
+            .cloned()
+            .unwrap_or_default();
+        if operator == SyntaxKind::QuestionQuestionEqualsToken
+            && self.settings.target < ScriptTarget::Es2020
+        {
+            let wrap = parent_precedence > 2;
+            if wrap {
+                self.writer.write("(");
+            }
+            if let Some(temp) = self.downlevel_nullish_temps.get(&expression).cloned() {
+                self.writer.write("(");
+                self.writer.write(&temp);
+                self.writer.write(" = ");
+                self.emit_logical_assignment_target(binary.left, &plan, false)?;
+                self.writer.write(") !== null && ");
+                self.writer.write(&temp);
+                self.writer.write(" !== void 0 ? ");
+                self.writer.write(&temp);
+            } else {
+                self.emit_logical_assignment_target(binary.left, &plan, false)?;
+                self.writer.write(" !== null && ");
+                self.emit_logical_assignment_target(binary.left, &plan, false)?;
+                self.writer.write(" !== void 0 ? ");
+                self.emit_logical_assignment_target(binary.left, &plan, false)?;
+            }
+            self.writer.write(" : ");
+            self.emit_logical_assignment_write(binary.left, binary.right, &plan)?;
+            if wrap {
+                self.writer.write(")");
+            }
+            return Ok(());
+        }
+        let (operator_text, precedence) = match operator {
+            SyntaxKind::AmpersandAmpersandEqualsToken => (" && ", 5),
+            SyntaxKind::BarBarEqualsToken => (" || ", 4),
+            SyntaxKind::QuestionQuestionEqualsToken => (" ?? ", 3),
+            _ => return Err(Self::unsupported(expression, node.kind)),
+        };
+        let wrap = parent_precedence > precedence;
+        if wrap {
+            self.writer.write("(");
+        }
+        self.emit_logical_assignment_target(binary.left, &plan, false)?;
+        self.writer.write(operator_text);
+        self.emit_logical_assignment_write(binary.left, binary.right, &plan)?;
+        if wrap {
+            self.writer.write(")");
+        }
+        Ok(())
+    }
+
     #[allow(clippy::items_after_statements, clippy::too_many_lines)]
     fn emit_binary_expression(
         &mut self,
@@ -70857,6 +71100,27 @@ impl Printer<'_> {
             .contains(&expression)
         {
             return self.emit_commonjs_destructuring_assignment(expression, parent_precedence);
+        }
+        if self.settings.target < ScriptTarget::Es2021
+            && self
+                .arena
+                .get(expression)
+                .and_then(|node| match &node.data {
+                    NodeData::BinaryExpression(binary) => {
+                        self.arena.get(binary.operator_token).map(|operator| operator.kind)
+                    }
+                    _ => None,
+                })
+                .is_some_and(|operator| {
+                    matches!(
+                        operator,
+                        SyntaxKind::AmpersandAmpersandEqualsToken
+                            | SyntaxKind::BarBarEqualsToken
+                            | SyntaxKind::QuestionQuestionEqualsToken
+                    )
+                })
+        {
+            return self.emit_downlevel_logical_assignment(expression, parent_precedence);
         }
         if let Some(temp) = self.downlevel_nullish_temps.get(&expression).cloned() {
             let node = self.node(expression)?.clone();
@@ -81563,6 +81827,30 @@ mod tests {
                 "constructor() {\n        var _a;\n        const value = (_a = new.target) !== null && _a !== void 0 ? _a : fallback;\n"
             ),
             "{output}"
+        );
+    }
+
+    #[test]
+    fn downlevels_logical_assignments_with_stable_access_targets() {
+        let output = emit_with(
+            concat!(
+                "a.value &&= first; ",
+                "a.foo[readKey()] ||= second; ",
+                "a.foo.bar().value ??= third;",
+            ),
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert_eq!(
+            output,
+            concat!(
+                "var _a;\n",
+                "var _b, _c, _d;\n",
+                "a.value && (a.value = first);\n",
+                "(_b = a.foo)[_c = readKey()] || (_b[_c] = second);\n",
+                "(_a = (_d = a.foo.bar()).value) !== null && _a !== void 0 ? _a : (_d.value = third);\n",
+            )
         );
     }
 
