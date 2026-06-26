@@ -56877,7 +56877,9 @@ impl Printer<'_> {
             ) {
                 continue;
             }
-            if self.settings.use_define_for_class_fields == Some(true) {
+            if self.settings.use_define_for_class_fields == Some(true)
+                && self.settings.target < ScriptTarget::Es2022
+            {
                 self.emit_class_field_definition(
                     receiver,
                     parameter.name,
