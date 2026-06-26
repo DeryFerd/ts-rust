@@ -742,6 +742,9 @@ pub fn emit_source_file_with_context(
             if source_needs_private_field_get_helper(arena) {
                 helpers.insert("__classPrivateFieldGet");
             }
+            if source_needs_private_field_in_helper(arena) {
+                helpers.insert("__classPrivateFieldIn");
+            }
             if printer.private_accessors_need_set_helper() {
                 helpers.insert("__classPrivateFieldSet");
             }
@@ -1205,6 +1208,16 @@ pub fn emit_source_file_with_context(
     };
     let private_set_needed = printer.private_accessors_need_set_helper()
         || printer.private_fields_need_set_helper();
+    if settings.target < ScriptTarget::Es2022
+        && (!printer.private_field_plans.is_empty()
+            || !printer.static_private_field_plans.is_empty()
+            || !printer.private_method_plans.is_empty())
+        && source_needs_private_field_in_helper(arena)
+        && !settings.no_emit_helpers
+        && !printer.imported_helpers.contains("__classPrivateFieldIn")
+    {
+        printer.emit_class_private_field_in_helper();
+    }
     let mut emitted_private_get_helper = false;
     if private_set_needed
         && auto_accessor_storages.is_empty()
@@ -1260,6 +1273,7 @@ pub fn emit_source_file_with_context(
         printer.emit_object_rest_helper();
     }
     let mut merged_private_storage_names = HashSet::new();
+    let mut private_storage_declarations = Vec::new();
     if settings.target >= ScriptTarget::Es2015 && !printer.private_method_plans.is_empty() {
         let mut plans = printer
             .private_method_plans
@@ -1337,12 +1351,7 @@ pub fn emit_source_file_with_context(
                 }
             }
         }
-        if !declarations.is_empty() {
-            printer.writer.write("var ");
-            printer.writer.write(&declarations.join(", "));
-            printer.writer.write(";");
-            printer.writer.newline();
-        }
+        private_storage_declarations.extend(declarations);
     }
     if settings.target >= ScriptTarget::Es2015
         && (!printer.private_field_plans.is_empty()
@@ -1425,12 +1434,15 @@ pub fn emit_source_file_with_context(
                 }
             }
         }
-        if !declarations.is_empty() {
-            printer.writer.write("var ");
-            printer.writer.write(&declarations.join(", "));
-            printer.writer.write(";");
-            printer.writer.newline();
-        }
+        private_storage_declarations.extend(declarations);
+    }
+    if !private_storage_declarations.is_empty() {
+        printer.writer.write("var ");
+        printer
+            .writer
+            .write(&private_storage_declarations.join(", "));
+        printer.writer.write(";");
+        printer.writer.newline();
     }
     if !printer.imported_helper_aliases.is_empty() {
         printer.writer.write("import { ");
@@ -3138,7 +3150,7 @@ fn statement_emits_javascript(arena: &NodeArena, node: &Node) -> bool {
         NodeData::ExpressionStatement(statement)
             if matches!(
                 arena.get(statement.expression).map(|node| &node.data),
-                Some(NodeData::PrivateIdentifier(_))
+                Some(NodeData::PrivateIdentifier(identifier)) if identifier.text != "#"
             ) =>
         {
             false
@@ -27992,6 +28004,25 @@ impl Printer<'_> {
             })
     }
 
+    fn active_private_in_state(&self, name: NodeId) -> Option<String> {
+        if let Some(field) = self.active_private_field(name) {
+            return Some(field.storage.clone());
+        }
+        if self.active_static_private_field(name).is_some() {
+            return self
+                .active_static_private_field_plan
+                .as_ref()
+                .map(|plan| plan.capture.clone());
+        }
+        let method = self.active_private_method(name)?;
+        let plan = self.active_private_method_plan.as_ref()?;
+        if method.is_static {
+            Some(plan.capture.clone().unwrap_or_else(|| plan.brand.clone()))
+        } else {
+            Some(plan.brand.clone())
+        }
+    }
+
     fn prepare_private_destructuring_rewrites(&mut self, body: NodeId) -> Vec<String> {
         self.private_destructuring_rewrites.clear();
         let mut candidates = self
@@ -30876,6 +30907,18 @@ impl Printer<'_> {
         }
     }
 
+    fn emit_class_private_field_in_helper(&mut self) {
+        for line in [
+            "var __classPrivateFieldIn = (this && this.__classPrivateFieldIn) || function(state, receiver) {",
+            "    if (receiver === null || (typeof receiver !== \"object\" && typeof receiver !== \"function\")) throw new TypeError(\"Cannot use 'in' operator on non-object\");",
+            "    return typeof state === \"function\" ? receiver === state : state.has(receiver);",
+            "};",
+        ] {
+            self.writer.write(line);
+            self.writer.newline();
+        }
+    }
+
     fn emit_class_private_field_set_helper(&mut self) {
         for line in [
             "var __classPrivateFieldSet = (this && this.__classPrivateFieldSet) || function (receiver, state, value, kind, f) {",
@@ -33437,7 +33480,7 @@ impl Printer<'_> {
             NodeData::ExpressionStatement(data) => {
                 if matches!(
                     self.arena.get(data.expression).map(|node| &node.data),
-                    Some(NodeData::PrivateIdentifier(_))
+                    Some(NodeData::PrivateIdentifier(identifier)) if identifier.text != "#"
                 ) {
                     return Ok(());
                 }
@@ -36941,7 +36984,17 @@ impl Printer<'_> {
             && !has_downlevel_rest
             && !has_binding_parameter_property
         {
-            self.writer.write("{ }");
+            let inner_start = node.range.start.get().saturating_add(1);
+            let inner_end = node.range.end.get().saturating_sub(1);
+            self.writer.write("{");
+            if !self.settings.remove_comments
+                && self.source_range_has_comment(inner_start, inner_end)
+            {
+                self.emit_block_comment_trivia(inner_start, inner_end, true);
+            } else {
+                self.writer.write(" ");
+            }
+            self.writer.write("}");
             return Ok(());
         }
         let function_body = self.function_like_body_parameters(id).is_some();
@@ -60733,7 +60786,18 @@ impl Printer<'_> {
                 self.emit_expression(data.name, 0)?;
             }
             NodeData::QualifiedName(data) => self.emit_qualified_name(data)?,
-            NodeData::PrivateIdentifier(data) => self.write_source_identifier(id, &data.text),
+            NodeData::PrivateIdentifier(data) => {
+                let declaration_name = node
+                    .parent
+                    .and_then(|parent| self.arena.get(parent))
+                    .is_some_and(|parent| identifier_is_declaration_name(id, parent));
+                if self.settings.target >= ScriptTarget::Es2022
+                    || data.text == "#"
+                    || declaration_name
+                {
+                    self.write_source_identifier(id, &data.text);
+                }
+            }
             NodeData::NumericLiteral(data) => self.write_numeric_literal(data),
             NodeData::BigIntLiteral(data) => {
                 self.writer.write(&canonical_bigint_literal(&data.text));
@@ -64862,6 +64926,7 @@ impl Printer<'_> {
         }
         if let Some(NodeData::BinaryExpression(binary)) =
             self.arena.get(expression).map(|node| &node.data)
+            && self.settings.target < ScriptTarget::Es2022
             && self
                 .arena
                 .get(binary.operator_token)
@@ -64870,9 +64935,7 @@ impl Printer<'_> {
                 self.arena.get(binary.left).map(|node| &node.data),
                 Some(NodeData::PrivateIdentifier(_))
             )
-            && let Some(storage) = self
-                .active_private_field(binary.left)
-                .map(|field| field.storage.clone())
+            && let Some(storage) = self.active_private_in_state(binary.left)
         {
             self.emit_helper_reference("__classPrivateFieldIn");
             self.writer.write("(");
@@ -65178,7 +65241,25 @@ impl Printer<'_> {
                         if line_break {
                             self.writer.indent += 1;
                         }
+                        let comment_starts_immediately = usize::try_from(start)
+                            .ok()
+                            .zip(usize::try_from(end).ok())
+                            .and_then(|(start, end)| self.source_text.get(start..end))
+                            .is_some_and(|trivia| {
+                                trivia.starts_with("/*") || trivia.starts_with("//")
+                            });
+                        if comment_starts_immediately && !self.writer.line_start {
+                            self.writer.write(" ");
+                        }
                         self.emit_binary_comment_trivia(start, end);
+                        let comment_ends_immediately = usize::try_from(start)
+                            .ok()
+                            .zip(usize::try_from(end).ok())
+                            .and_then(|(start, end)| self.source_text.get(start..end))
+                            .is_some_and(|trivia| trivia.ends_with("*/"));
+                        if comment_ends_immediately && !self.writer.line_start {
+                            self.writer.write(" ");
+                        }
                     } else if line_break {
                         self.writer.indent += 1;
                         self.writer.newline();
@@ -65196,7 +65277,25 @@ impl Printer<'_> {
                         if line_break && indent {
                             self.writer.indent += 1;
                         }
+                        let comment_starts_immediately = usize::try_from(start)
+                            .ok()
+                            .zip(usize::try_from(end).ok())
+                            .and_then(|(start, end)| self.source_text.get(start..end))
+                            .is_some_and(|trivia| {
+                                trivia.starts_with("/*") || trivia.starts_with("//")
+                            });
+                        if comment_starts_immediately && !self.writer.line_start {
+                            self.writer.write(" ");
+                        }
                         self.emit_binary_comment_trivia(start, end);
+                        let comment_ends_immediately = usize::try_from(start)
+                            .ok()
+                            .zip(usize::try_from(end).ok())
+                            .and_then(|(start, end)| self.source_text.get(start..end))
+                            .is_some_and(|trivia| trivia.ends_with("*/"));
+                        if comment_ends_immediately && !self.writer.line_start {
+                            self.writer.write(" ");
+                        }
                     } else if line_break {
                         if indent {
                             self.writer.indent += 1;
@@ -65213,6 +65312,22 @@ impl Printer<'_> {
                         return Err(Self::unsupported(id, node.kind));
                     };
                     let operator = self.node(binary.operator_token)?.kind;
+                    if self.settings.target < ScriptTarget::Es2022
+                        && operator == SyntaxKind::InKeyword
+                        && matches!(
+                            self.arena.get(binary.left).map(|node| &node.data),
+                            Some(NodeData::PrivateIdentifier(_))
+                        )
+                        && let Some(storage) = self.active_private_in_state(binary.left)
+                    {
+                        self.emit_helper_reference("__classPrivateFieldIn");
+                        self.writer.write("(");
+                        self.writer.write(&storage);
+                        self.writer.write(", ");
+                        self.emit_expression(binary.right, 1)?;
+                        self.writer.write(")");
+                        continue;
+                    }
                     let missing_left = self.arena.get(binary.left).is_some_and(|left| {
                         matches!(
                             &left.data,
@@ -72041,6 +72156,33 @@ mod tests {
             "{output}"
         );
         assert!(!output.contains("WeakSet"), "{output}");
+    }
+
+    #[test]
+    fn lowers_private_in_checks_to_the_correct_brand_state() {
+        let output = emit_with(
+            concat!(
+                "class C { #field = 1; #method() {} static #shared = 2; ",
+                "check(value: unknown) { return #field in value || #method in value ",
+                "|| #shared in value; } }",
+            ),
+            ScriptTarget::Es2020,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(output.contains("var __classPrivateFieldIn"), "{output}");
+        assert!(
+            output.contains("__classPrivateFieldIn(_C_field, value)"),
+            "{output}"
+        );
+        assert!(
+            output.contains("__classPrivateFieldIn(_C_instances, value)"),
+            "{output}"
+        );
+        assert!(
+            output.contains("__classPrivateFieldIn(_a, value)"),
+            "{output}"
+        );
     }
 
     #[test]

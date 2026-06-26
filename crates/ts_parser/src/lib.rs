@@ -474,6 +474,24 @@ impl<'a> Parser<'a> {
                 let range = self.current.range;
                 self.invalid_token_recovery_ranges.push(range);
                 self.bump();
+                let private_identifier = self.alloc_node(
+                    SyntaxKind::PrivateIdentifier,
+                    range,
+                    NodeData::PrivateIdentifier(Box::new(PrivateIdentifierData {
+                        text: "#".to_owned(),
+                    })),
+                    &[],
+                );
+                let end = self.parse_semicolon(range.end);
+                statements.push(self.alloc_node(
+                    SyntaxKind::ExpressionStatement,
+                    TextRange::new(range.start, end),
+                    NodeData::ExpressionStatement(Box::new(ExpressionStatementData {
+                        expression: private_identifier,
+                        flow_node: None,
+                    })),
+                    &[private_identifier],
+                ));
                 continue;
             }
             if self.current.kind == SyntaxKind::Unknown
@@ -10623,6 +10641,21 @@ mod tests {
                 if matches!(
                     result.arena.get(accessor.name).map(|node| &node.data),
                     Some(NodeData::PrivateIdentifier(_))
+                )
+        ));
+    }
+
+    #[test]
+    fn preserves_a_bare_hash_as_a_recovered_private_expression() {
+        let result = parse_source_file("#\nclass C {}");
+        let statements = source_statements(&result);
+        assert_eq!(statements.len(), 2);
+        assert!(matches!(
+            &result.arena.get(statements[0]).unwrap().data,
+            NodeData::ExpressionStatement(statement)
+                if matches!(
+                    result.arena.get(statement.expression).map(|node| &node.data),
+                    Some(NodeData::PrivateIdentifier(identifier)) if identifier.text == "#"
                 )
         ));
     }
