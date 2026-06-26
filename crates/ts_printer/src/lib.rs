@@ -2730,6 +2730,14 @@ fn runtime_auto_accessor_storage_names(
                         arena,
                         property.modifiers.as_ref(),
                         SyntaxKind::StaticKeyword,
+                    ) && !declaration_has_modifier_in_list(
+                        arena,
+                        property.modifiers.as_ref(),
+                        SyntaxKind::AbstractKeyword,
+                    ) && !declaration_has_modifier_in_list(
+                        arena,
+                        property.modifiers.as_ref(),
+                        SyntaxKind::DeclareKeyword,
                     )
             )
         });
@@ -2747,6 +2755,14 @@ fn runtime_auto_accessor_storage_names(
                 arena,
                 property.modifiers.as_ref(),
                 SyntaxKind::AccessorKeyword,
+            ) || declaration_has_modifier_in_list(
+                arena,
+                property.modifiers.as_ref(),
+                SyntaxKind::AbstractKeyword,
+            ) || declaration_has_modifier_in_list(
+                arena,
+                property.modifiers.as_ref(),
+                SyntaxKind::DeclareKeyword,
             ) {
                 continue;
             }
@@ -8089,6 +8105,38 @@ impl DeclarationPrinter<'_> {
         Some((class_id, base_type, include_any_index))
     }
 
+    fn returned_local_class_declaration(&self, body: NodeId) -> Option<NodeId> {
+        let NodeData::Block(body) = &self.arena.get(body)?.data else {
+            return None;
+        };
+        let returned = body.statements.nodes.iter().find_map(|statement| {
+            let NodeData::ReturnStatement(return_) = &self.arena.get(*statement)?.data else {
+                return None;
+            };
+            declaration_name_text(self.arena, return_.expression?)
+        })?;
+        body.statements.nodes.iter().find_map(|statement| {
+            let NodeData::ClassDeclaration(class) = &self.arena.get(*statement)?.data else {
+                return None;
+            };
+            (class
+                .name
+                .and_then(|name| declaration_name_text(self.arena, name))
+                == Some(returned)
+                && class.members.nodes.iter().any(|member| {
+                    matches!(
+                        self.arena.get(*member).map(|node| &node.data),
+                        Some(NodeData::PropertyDeclaration(property))
+                            if self.member_has_modifier(
+                                property.modifiers.as_ref(),
+                                SyntaxKind::AccessorKeyword,
+                            )
+                    )
+                }))
+            .then_some(*statement)
+        })
+    }
+
     fn emit_inferred_local_class_mixin_type(
         &mut self,
         class_id: NodeId,
@@ -8280,8 +8328,8 @@ impl DeclarationPrinter<'_> {
         self.writer.write("new (): {");
         self.writer.newline();
         self.writer.indent += 1;
-        for member in members {
-            let Some(member_node) = self.arena.get(member) else {
+        for member in &members {
+            let Some(member_node) = self.arena.get(*member) else {
                 continue;
             };
             match &member_node.data {
@@ -8323,17 +8371,25 @@ impl DeclarationPrinter<'_> {
                         SyntaxKind::ProtectedKeyword,
                     ) =>
                 {
-                    self.emit_name(property.name)?;
-                    self.writer.write(": ");
-                    if let Some(type_) = property.type_ {
-                        self.emit_type(type_)?;
-                    } else if let Some(type_id) = self
-                        .node_types
-                        .and_then(|types| types.get(&member).copied())
-                    {
-                        self.emit_widened_semantic_type(type_id)?;
+                    if self.member_has_modifier(
+                        property.modifiers.as_ref(),
+                        SyntaxKind::AccessorKeyword,
+                    ) {
+                        self.writer.write("get ");
+                        self.emit_name(property.name)?;
+                        self.writer.write("(): ");
+                        self.emit_auto_accessor_declaration_type(property, *member)?;
+                        self.writer.write(";");
+                        self.writer.newline();
+                        self.writer.write("set ");
+                        self.emit_name(property.name)?;
+                        self.writer.write("(arg: ");
+                        self.emit_auto_accessor_declaration_type(property, *member)?;
+                        self.writer.write(")");
                     } else {
-                        self.writer.write("any");
+                        self.emit_name(property.name)?;
+                        self.writer.write(": ");
+                        self.emit_auto_accessor_declaration_type(property, *member)?;
                     }
                 }
                 _ => continue,
@@ -8344,9 +8400,65 @@ impl DeclarationPrinter<'_> {
         self.writer.indent -= 1;
         self.writer.write("};");
         self.writer.newline();
+        for member in &members {
+            let Some(NodeData::PropertyDeclaration(property)) =
+                self.arena.get(*member).map(|node| &node.data)
+            else {
+                continue;
+            };
+            if !self.member_has_modifier(
+                property.modifiers.as_ref(),
+                SyntaxKind::AccessorKeyword,
+            )
+                || !self.member_has_modifier(
+                    property.modifiers.as_ref(),
+                    SyntaxKind::StaticKeyword,
+                )
+                || self.member_has_modifier(
+                    property.modifiers.as_ref(),
+                    SyntaxKind::PrivateKeyword,
+                )
+                || self.member_has_modifier(
+                    property.modifiers.as_ref(),
+                    SyntaxKind::ProtectedKeyword,
+                )
+            {
+                continue;
+            }
+            self.writer.write("get ");
+            self.emit_name(property.name)?;
+            self.writer.write("(): ");
+            self.emit_auto_accessor_declaration_type(property, *member)?;
+            self.writer.write(";");
+            self.writer.newline();
+            self.writer.write("set ");
+            self.emit_name(property.name)?;
+            self.writer.write("(arg: ");
+            self.emit_auto_accessor_declaration_type(property, *member)?;
+            self.writer.write(");");
+            self.writer.newline();
+        }
         self.writer.indent -= 1;
         self.writer.write("}");
         Ok(())
+    }
+
+    fn emit_auto_accessor_declaration_type(
+        &mut self,
+        property: &ts_ast::PropertyDeclarationData,
+        member: NodeId,
+    ) -> Result<(), EmitError> {
+        if let Some(type_) = property.type_ {
+            self.emit_type(type_)
+        } else if let Some(type_id) = self
+            .node_types
+            .and_then(|types| types.get(&member).copied())
+        {
+            self.emit_widened_semantic_type(type_id)
+        } else {
+            self.writer.write("any");
+            Ok(())
+        }
     }
 
     fn emit_synthetic_base_type(
@@ -9627,6 +9739,13 @@ impl DeclarationPrinter<'_> {
             self.returned_local_class_mixin(function)
         {
             self.emit_inferred_local_class_mixin_type(class, base_type, include_any_index)?;
+            return Ok(());
+        }
+        if let Some(class) = function
+            .body
+            .and_then(|body| self.returned_local_class_declaration(body))
+        {
+            self.emit_local_class_constructor_type(class)?;
             return Ok(());
         }
         if self.javascript_source
@@ -34307,6 +34426,11 @@ impl Printer<'_> {
         match &node.data {
             NodeData::InterfaceDeclaration(_) | NodeData::TypeAliasDeclaration(_) => return Ok(()),
             NodeData::FunctionDeclaration(data) if data.body.is_none() => return Ok(()),
+            NodeData::ExpressionStatement(_)
+                if self.recovered_accessor_modifier_statement_after(id).is_some() =>
+            {
+                return Ok(())
+            }
             NodeData::Block(_)
                 if self.recovered_object_literal_preceding_statement(id).is_some() =>
             {
@@ -34321,6 +34445,19 @@ impl Printer<'_> {
             _ => {}
         }
         self.record_mapping(&node);
+        if self.recovered_accessor_modifier_before_statement(id)
+            && (matches!(node.data, NodeData::ClassDeclaration(_))
+                && self.settings.target >= ScriptTarget::EsNext
+                || matches!(
+                    node.data,
+                    NodeData::EnumDeclaration(_)
+                        | NodeData::VariableStatement(_)
+                        | NodeData::FunctionDeclaration(_)
+                        | NodeData::ImportDeclaration(_)
+                ))
+        {
+            self.writer.write("accessor ");
+        }
         if let Some(source) = self.verbatim_module_statement_with_internal_comments(&node) {
             self.writer.write(&source);
             if !source.trim_end().ends_with(';') {
@@ -35154,6 +35291,61 @@ impl Printer<'_> {
         }
         self.writer.newline();
         Ok(())
+    }
+
+    fn recovered_accessor_modifier_statement_after(&self, statement: NodeId) -> Option<NodeId> {
+        let NodeData::ExpressionStatement(expression) = &self.arena.get(statement)?.data else {
+            return None;
+        };
+        if declaration_name_text(self.arena, expression.expression) != Some("accessor") {
+            return None;
+        }
+        let parent = self.arena.get(statement)?.parent?;
+        let statements = match &self.arena.get(parent)?.data {
+            NodeData::SourceFile(source) => &source.statements.nodes,
+            NodeData::Block(block) => &block.statements.nodes,
+            NodeData::ModuleBlock(block) => &block.statements.nodes,
+            _ => return None,
+        };
+        let index = statements
+            .iter()
+            .position(|candidate| *candidate == statement)?;
+        let next = *statements.get(index + 1)?;
+        let statement_node = self.arena.get(statement)?;
+        let statement_start = usize::try_from(statement_node.range.start.get()).ok()?;
+        let statement_end = usize::try_from(statement_node.range.end.get()).ok()?;
+        if self
+            .source_text
+            .get(statement_start..statement_end)
+            .is_some_and(|source| source.contains(';'))
+        {
+            return None;
+        }
+        let start = statement_end;
+        let end = usize::try_from(self.arena.get(next)?.range.start.get()).ok()?;
+        self.source_text
+            .get(start..end)
+            .is_some_and(|gap| gap.trim().is_empty() && !gap.contains(['\n', '\r']))
+            .then_some(next)
+    }
+
+    fn recovered_accessor_modifier_before_statement(&self, statement: NodeId) -> bool {
+        let Some(parent) = self.arena.get(statement).and_then(|node| node.parent) else {
+            return false;
+        };
+        let statements = match self.arena.get(parent).map(|node| &node.data) {
+            Some(NodeData::SourceFile(source)) => &source.statements.nodes,
+            Some(NodeData::Block(block)) => &block.statements.nodes,
+            Some(NodeData::ModuleBlock(block)) => &block.statements.nodes,
+            _ => return false,
+        };
+        statements
+            .iter()
+            .position(|candidate| *candidate == statement)
+            .and_then(|index| index.checked_sub(1))
+            .and_then(|index| statements.get(index))
+            .and_then(|previous| self.recovered_accessor_modifier_statement_after(*previous))
+            == Some(statement)
     }
 
     fn verbatim_module_statement_with_internal_comments(
@@ -54672,6 +54864,15 @@ impl Printer<'_> {
                     let downlevel_async = method.asterisk_token.is_none()
                         && is_async
                         && self.settings.target < ScriptTarget::Es2017;
+                    if self.settings.target >= ScriptTarget::EsNext
+                        && !self.is_constructor_name(method.name)
+                        && self.has_modifier(
+                            method.modifiers.as_ref(),
+                            SyntaxKind::AccessorKeyword,
+                        )
+                    {
+                        self.writer.write("accessor ");
+                    }
                     if self.modifier_count(
                         method.modifiers.as_ref(),
                         SyntaxKind::StaticKeyword,
@@ -54777,12 +54978,12 @@ impl Printer<'_> {
                     {
                         continue;
                     }
-                    if self.settings.target >= ScriptTarget::EsNext {
-                        if self.has_modifier(property.modifiers.as_ref(), SyntaxKind::StaticKeyword)
-                        {
-                            self.writer.write("static ");
-                        }
-                        self.writer.write("accessor ");
+                    if self.settings.target >= ScriptTarget::EsNext
+                        && !self.class_requires_assignment_field_lowering(data)
+                    {
+                        self.emit_preserved_auto_accessor_modifiers(
+                            property.modifiers.as_ref(),
+                        );
                         self.emit_expression(property.name, 0)?;
                         if let Some(initializer) = property.initializer {
                             self.writer.write(" = ");
@@ -54906,6 +55107,14 @@ impl Printer<'_> {
                     {
                         continue;
                     }
+                    if self.settings.target >= ScriptTarget::EsNext
+                        && self.has_modifier(
+                            accessor.modifiers.as_ref(),
+                            SyntaxKind::AccessorKeyword,
+                        )
+                    {
+                        self.writer.write("accessor ");
+                    }
                     if self.has_modifier(accessor.modifiers.as_ref(), SyntaxKind::StaticKeyword) {
                         self.writer.write("static ");
                     }
@@ -54925,6 +55134,14 @@ impl Printer<'_> {
                         && !self.class_private_name_is_duplicate(data, accessor.name)
                     {
                         continue;
+                    }
+                    if self.settings.target >= ScriptTarget::EsNext
+                        && self.has_modifier(
+                            accessor.modifiers.as_ref(),
+                            SyntaxKind::AccessorKeyword,
+                        )
+                    {
+                        self.writer.write("accessor ");
                     }
                     if self.has_modifier(accessor.modifiers.as_ref(), SyntaxKind::StaticKeyword) {
                         self.writer.write("static ");
@@ -56336,7 +56553,9 @@ impl Printer<'_> {
                 self.writer.write("static ");
             }
             self.writer.write(&storage);
-            if let Some(initializer) = property.initializer {
+            if let Some(initializer) = property.initializer
+                && (static_ || !self.class_requires_assignment_field_lowering(class))
+            {
                 self.writer.write(" = ");
                 self.emit_expression(initializer, 1)?;
             }
@@ -58976,6 +59195,7 @@ impl Printer<'_> {
     }
 
     fn has_instance_field_initializers(&self, data: &ts_ast::ClassDeclarationData) -> bool {
+        let lower_auto_accessors = self.class_requires_assignment_field_lowering(data);
         data.members.nodes.iter().any(|member| {
             let Some(node) = self.arena.get(*member) else {
                 return false;
@@ -58992,9 +59212,11 @@ impl Printer<'_> {
                             && (matches!(
                                 self.arena.get(property.name).map(|node| &node.data),
                                 Some(NodeData::PrivateIdentifier(_))
-                            ) || property.initializer.is_some()
+                            ) || (!self.property_is_auto_accessor(property)
+                                && property.initializer.is_some())
                                 || (self.property_is_auto_accessor(property)
-                                    && self.settings.target < ScriptTarget::Es2022)
+                                    && (self.settings.target < ScriptTarget::Es2022
+                                        || lower_auto_accessors))
                                 || self.settings.use_define_for_class_fields == Some(true))
                             && !self.property_is_static(property)
                             && (!self.class_private_name_is_duplicate(data, property.name)
@@ -59295,6 +59517,26 @@ impl Printer<'_> {
                 continue;
             }
             if self.property_is_auto_accessor(property) {
+                if self.settings.target >= ScriptTarget::Es2022 {
+                    let Some(property_name) =
+                        auto_accessor_storage_base_name(self.arena, data, property)
+                    else {
+                        continue;
+                    };
+                    let storage = self.native_auto_accessor_storage_name(data, &property_name);
+                    self.writer.write(receiver);
+                    self.writer.write(".#");
+                    self.writer.write(&storage);
+                    self.writer.write(" = ");
+                    if let Some(initializer) = property.initializer {
+                        self.emit_expression(initializer, 1)?;
+                    } else {
+                        self.writer.write("void 0");
+                    }
+                    self.writer.write(";");
+                    self.writer.newline();
+                    continue;
+                }
                 let Some(storage) = self.auto_accessor_storage_name(data, property) else {
                     continue;
                 };
@@ -59354,6 +59596,22 @@ impl Printer<'_> {
 
     fn property_is_auto_accessor(&self, property: &ts_ast::PropertyDeclarationData) -> bool {
         self.has_modifier(property.modifiers.as_ref(), SyntaxKind::AccessorKeyword)
+    }
+
+    fn emit_preserved_auto_accessor_modifiers(
+        &mut self,
+        modifiers: Option<&ts_ast::ModifierList>,
+    ) {
+        let Some(modifiers) = modifiers else {
+            return;
+        };
+        for modifier in &modifiers.list.nodes {
+            match self.arena.get(*modifier).map(|node| node.kind) {
+                Some(SyntaxKind::AccessorKeyword) => self.writer.write("accessor "),
+                Some(SyntaxKind::StaticKeyword) => self.writer.write("static "),
+                _ => {}
+            }
+        }
     }
 
     fn auto_accessor_modifier_precedes_line_break(
@@ -59444,10 +59702,31 @@ impl Printer<'_> {
                                 self.arena.get(member.name).map(|node| &node.data),
                                 Some(NodeData::PrivateIdentifier(_))
                             )
-                            && (member.initializer.is_some()
-                                || self.property_is_auto_accessor(member))
+                            && !self.property_is_auto_accessor(member)
+                            && member.initializer.is_some()
                     })
                 })
+    }
+
+    fn class_requires_assignment_field_lowering(
+        &self,
+        data: &ts_ast::ClassDeclarationData,
+    ) -> bool {
+        self.settings.use_define_for_class_fields == Some(false)
+            && self.settings.target >= ScriptTarget::Es2022
+            && data.members.nodes.iter().any(|member| {
+                matches!(
+                    self.arena.get(*member).map(|node| &node.data),
+                    Some(NodeData::PropertyDeclaration(property))
+                        if !self.property_is_static(property)
+                            && !self.property_is_auto_accessor(property)
+                            && property.initializer.is_some()
+                            && !matches!(
+                                self.arena.get(property.name).map(|node| &node.data),
+                                Some(NodeData::PrivateIdentifier(_))
+                            )
+                )
+            })
     }
 
     fn emit_class_field_definition(
@@ -59708,8 +59987,16 @@ impl Printer<'_> {
             else {
                 return None;
             };
-            self.property_is_auto_accessor(property)
-                .then(|| property.as_ref().clone())
+            (self.property_is_auto_accessor(property)
+                && !self.has_modifier(
+                    property.modifiers.as_ref(),
+                    SyntaxKind::AbstractKeyword,
+                )
+                && !self.has_modifier(
+                    property.modifiers.as_ref(),
+                    SyntaxKind::DeclareKeyword,
+                ))
+            .then(|| property.as_ref().clone())
         }).collect::<Vec<_>>();
         if properties.is_empty() {
             return Ok(());
@@ -76521,6 +76808,65 @@ mod tests {
             .code;
             assert!(!output.contains("constructor()"), "{output}");
         }
+
+        let ordered = emit_with_class_field_semantics(
+            "class C { first = 1; accessor second = 2; third = 3; }",
+            ScriptTarget::EsNext,
+            false,
+        )
+        .code;
+        let first = ordered.find("this.first = 1;").unwrap();
+        let second = ordered
+            .find("this.#second_accessor_storage = 2;")
+            .unwrap();
+        let third = ordered.find("this.third = 3;").unwrap();
+        assert!(first < second && second < third, "{ordered}");
+
+        let private_only = emit_with_class_field_semantics(
+            "class C { #first = 1; accessor second = 2; }",
+            ScriptTarget::EsNext,
+            false,
+        )
+        .code;
+        assert!(!private_only.contains("constructor()"), "{private_only}");
+    }
+
+    #[test]
+    fn declaration_emit_expands_returned_local_class_auto_accessors() {
+        let output = emit_declarations_with_semantics(concat!(
+            "function f() { class C { accessor value: any; ",
+            "static accessor shared: any; } return C; }",
+        ));
+        assert!(
+            output.contains(concat!(
+                "declare function f(): {\n",
+                "    new (): {\n",
+                "        get value(): any;\n",
+                "        set value(arg: any);\n",
+                "    };\n",
+                "    get shared(): any;\n",
+                "    set shared(arg: any);\n",
+                "};",
+            )),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn recovers_accessor_tokens_before_invalid_declarations() {
+        let source = concat!(
+            "abstract class C { accessor accessor value: any; } ",
+            "accessor class D {} accessor enum E {}",
+        );
+        let esnext = emit_with_parse_errors(source, ScriptTarget::EsNext, ModuleKind::None).code;
+        assert!(esnext.contains("accessor accessor value;"), "{esnext}");
+        assert!(esnext.contains("accessor class D"), "{esnext}");
+        assert!(esnext.contains("accessor var E;"), "{esnext}");
+
+        let es2017 = emit_with_parse_errors(source, ScriptTarget::Es2017, ModuleKind::None).code;
+        assert!(es2017.contains("class D"), "{es2017}");
+        assert!(!es2017.contains("accessor class D"), "{es2017}");
+        assert!(es2017.contains("accessor var E;"), "{es2017}");
     }
 
     #[test]
