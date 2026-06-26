@@ -4547,6 +4547,13 @@ impl<'a> Checker<'a> {
         for member_type in properties.values() {
             self.enum_member_owners.insert(*member_type, enum_type);
         }
+        self.result.named_type_references.insert(
+            enum_type,
+            NamedTypeReference {
+                name: enum_name,
+                type_arguments: Vec::new(),
+            },
+        );
         for (member_type, name) in member_type_names {
             self.result.named_type_references.insert(
                 member_type,
@@ -5320,7 +5327,21 @@ impl<'a> Checker<'a> {
                 })
             });
         if !exhaustive {
-            exits.push(before.clone());
+            let mut unmatched = before.clone();
+            if let Some(subject) = subject {
+                let remaining = self
+                    .union_members(subject_type)
+                    .into_iter()
+                    .filter(|member| {
+                        !case_types.iter().any(|case| {
+                            self.is_assignable(*member, *case)
+                                && self.is_assignable(*case, *member)
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                unmatched.insert(subject, self.result.types.union(remaining));
+            }
+            exits.push(unmatched);
         }
         self.flow_types = exits
             .into_iter()
@@ -14107,12 +14128,37 @@ impl<'a> Checker<'a> {
         } else {
             None
         };
-        let mut return_types = returns
+        let inferred_return_types = returns
             .iter()
             .copied()
-            .map(|expression| {
-                let type_id = self.inferred_function_return_expression_type(expression, body);
-                self.widen_literal(type_id)
+            .map(|expression| self.inferred_function_return_expression_type(expression, body))
+            .collect::<Vec<_>>();
+        let preserve_literal_union = inferred_return_types.len() > 1
+            && inferred_return_types.iter().all(|type_id| {
+                matches!(
+                    self.result.types.get(*type_id).map(|type_| &type_.kind),
+                    Some(
+                        TypeKind::BooleanLiteral(_)
+                            | TypeKind::NumberLiteral(_)
+                            | TypeKind::StringLiteral(_)
+                            | TypeKind::BigIntLiteral(_)
+                    )
+                )
+            })
+            && inferred_return_types
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>()
+                .len()
+                > 1;
+        let mut return_types = inferred_return_types
+            .into_iter()
+            .map(|type_id| {
+                if preserve_literal_union {
+                    type_id
+                } else {
+                    self.widen_literal(type_id)
+                }
             })
             .collect::<Vec<_>>();
         if self.options.strict_null_checks
@@ -14447,6 +14493,9 @@ impl<'a> Checker<'a> {
         expression: NodeId,
         body: NodeId,
     ) -> TypeId {
+        if let Some(type_id) = self.inferred_switch_indexed_access_type(expression, body) {
+            return type_id;
+        }
         let mut type_id = self.type_of_expression(expression);
         let Some(returned_name) = identifier_text(self.arena, expression) else {
             return type_id;
@@ -14498,6 +14547,94 @@ impl<'a> Checker<'a> {
             child = parent;
         }
         type_id
+    }
+
+    fn inferred_switch_indexed_access_type(
+        &mut self,
+        expression: NodeId,
+        body: NodeId,
+    ) -> Option<TypeId> {
+        let NodeData::ElementAccessExpression(access) = self.arena.get(expression)?.data.clone()
+        else {
+            return None;
+        };
+        let key_name = identifier_text(self.arena, access.argument_expression)?;
+        let receiver_name = identifier_text(self.arena, access.expression)?;
+        let key_type = self
+            .local_scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(key_name).copied())?;
+        let receiver_type = self
+            .local_scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(receiver_name).copied())?;
+        let NodeData::Block(body) = &self.arena.get(body)?.data else {
+            return None;
+        };
+        let return_index = body.statements.nodes.iter().position(|statement| {
+            matches!(
+                self.arena.get(*statement).map(|node| &node.data),
+                Some(NodeData::ReturnStatement(return_))
+                    if return_.expression == Some(expression)
+            )
+        })?;
+        let switch = body.statements.nodes[..return_index]
+            .iter()
+            .rev()
+            .find_map(|statement| {
+                let NodeData::SwitchStatement(switch) = &self.arena.get(*statement)?.data else {
+                    return None;
+                };
+                (identifier_text(self.arena, switch.expression) == Some(key_name))
+                    .then(|| switch.clone())
+            })?;
+        let NodeData::CaseBlock(block) = &self.arena.get(switch.case_block)?.data else {
+            return None;
+        };
+
+        let mut case_types = Vec::new();
+        let mut exit_types = Vec::new();
+        let mut has_default = false;
+        for clause_id in &block.clauses.nodes {
+            let clause_node = self.arena.get(*clause_id)?;
+            let NodeData::CaseOrDefaultClause(clause) = &clause_node.data else {
+                continue;
+            };
+            if clause_node.kind == SyntaxKind::DefaultClause {
+                has_default = true;
+            } else {
+                case_types.push(self.type_of_expression(clause.expression));
+            }
+            let assigned = clause.statements.nodes.iter().find_map(|statement| {
+                let NodeData::ExpressionStatement(statement) = &self.arena.get(*statement)?.data
+                else {
+                    return None;
+                };
+                let NodeData::BinaryExpression(binary) = &self.arena.get(statement.expression)?.data
+                else {
+                    return None;
+                };
+                (self.arena.get(binary.operator_token)?.kind == SyntaxKind::EqualsToken
+                    && identifier_text(self.arena, binary.left) == Some(key_name))
+                .then_some(binary.right)
+            });
+            if let Some(assigned) = assigned {
+                exit_types.push(self.type_of_expression(assigned));
+            } else if clause_node.kind != SyntaxKind::DefaultClause {
+                exit_types.push(self.type_of_expression(clause.expression));
+            }
+        }
+        if !has_default {
+            exit_types.extend(self.union_members(key_type).into_iter().filter(|member| {
+                !case_types.iter().any(|case| {
+                    self.is_assignable(*member, *case) && self.is_assignable(*case, *member)
+                })
+            }));
+        }
+        let narrowed_key = self.result.types.union(exit_types);
+        self.lookup_indexed_type(receiver_type, narrowed_key)
     }
 
     fn function_return_expressions(&self, body: NodeId) -> Vec<NodeId> {
@@ -17647,6 +17784,7 @@ impl<'a> DeclarationReachability<'a> {
     }
 
     fn retain_name(&mut self, name: &str) {
+        let type_only = !name.starts_with("typeof ");
         let name = name.strip_prefix("typeof ").unwrap_or(name);
         let root = name.split_once('.').map_or(name, |(root, _)| root);
         let Some(symbol) = self
@@ -17663,16 +17801,51 @@ impl<'a> DeclarationReachability<'a> {
             .and_then(|symbol| symbol.target)
             .unwrap_or(symbol);
         for candidate in [symbol, target] {
-            let declarations = self
-                .bindings
-                .symbols
-                .get(candidate)
-                .map(|symbol| symbol.declarations.clone())
-                .unwrap_or_default();
-            for declaration in declarations {
-                if let Some(statement) = self.declaration_statement(declaration) {
-                    self.retain(statement);
-                }
+            self.retain_symbol_declarations(candidate, type_only);
+        }
+    }
+
+    fn retain_symbol_declarations(&mut self, symbol: SymbolId, type_only: bool) {
+        let declarations = self
+            .bindings
+            .symbols
+            .get(symbol)
+            .map(|symbol| symbol.declarations.clone())
+            .unwrap_or_default();
+        let has_explicit_type_declaration = declarations.iter().any(|declaration| {
+            matches!(
+                self.arena.get(*declaration).map(|node| &node.data),
+                Some(
+                    NodeData::InterfaceDeclaration(_)
+                        | NodeData::TypeAliasDeclaration(_)
+                        | NodeData::ClassDeclaration(_)
+                        | NodeData::EnumDeclaration(_)
+                        | NodeData::ModuleDeclaration(_)
+                )
+            )
+        });
+        for declaration in declarations {
+            let has_type_meaning = matches!(
+                self.arena.get(declaration).map(|node| &node.data),
+                Some(
+                    NodeData::InterfaceDeclaration(_)
+                        | NodeData::TypeAliasDeclaration(_)
+                        | NodeData::ClassDeclaration(_)
+                        | NodeData::EnumDeclaration(_)
+                        | NodeData::ModuleDeclaration(_)
+                        | NodeData::TypeParameterDeclaration(_)
+                        | NodeData::ImportEqualsDeclaration(_)
+                        | NodeData::ImportSpecifier(_)
+                        | NodeData::ImportClause(_)
+                        | NodeData::NamespaceImport(_)
+                        | NodeData::ExportSpecifier(_)
+                )
+            );
+            if type_only && has_explicit_type_declaration && !has_type_meaning {
+                continue;
+            }
+            if let Some(statement) = self.declaration_statement(declaration) {
+                self.retain(statement);
             }
         }
     }
@@ -17816,7 +17989,7 @@ impl<'a> DeclarationReachability<'a> {
                         if !self
                             .type_reference_is_structural_assertion(node_id, reference.type_name)
                         {
-                            self.retain_entity(reference.type_name);
+                            self.retain_type_entity(reference.type_name);
                         }
                     }
                     NodeData::Identifier(_) => {
@@ -17915,6 +18088,14 @@ impl<'a> DeclarationReachability<'a> {
     }
 
     fn retain_entity(&mut self, entity: NodeId) {
+        self.retain_entity_with_meaning(entity, false);
+    }
+
+    fn retain_type_entity(&mut self, entity: NodeId) {
+        self.retain_entity_with_meaning(entity, true);
+    }
+
+    fn retain_entity_with_meaning(&mut self, entity: NodeId, type_only: bool) {
         let Some((identifier, name)) = self.leftmost_entity_name(entity) else {
             return;
         };
@@ -17952,17 +18133,7 @@ impl<'a> DeclarationReachability<'a> {
             .and_then(|symbol| symbol.target)
             .unwrap_or(symbol);
         for candidate in [symbol, target] {
-            let declarations = self
-                .bindings
-                .symbols
-                .get(candidate)
-                .map(|symbol| symbol.declarations.clone())
-                .unwrap_or_default();
-            for declaration in declarations {
-                if let Some(statement) = self.declaration_statement(declaration) {
-                    self.retain(statement);
-                }
-            }
+            self.retain_symbol_declarations(candidate, type_only);
         }
     }
 

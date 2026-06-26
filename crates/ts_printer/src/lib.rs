@@ -36519,6 +36519,7 @@ impl Printer<'_> {
                         | NodeData::ContinueStatement(_)
                         | NodeData::ExpressionStatement(_)
                         | NodeData::ReturnStatement(_)
+                        | NodeData::ThrowStatement(_)
                 )
                 && self.switch_clause_statement_is_inline(*clause_id, *statement)
             {
@@ -73985,6 +73986,52 @@ mod tests {
     }
 
     #[test]
+    fn declaration_preserves_distinct_literal_function_returns() {
+        let declarations = emit_declarations_with_semantics(concat!(
+            "function choose(value: 1 | 2) { switch (value) {",
+            "case 1: return 10; case 2: return 20; default: throw new Error();",
+            "} }",
+        ));
+        assert!(
+            declarations.contains("declare function choose(value: 1 | 2): 10 | 20;"),
+            "{declarations}"
+        );
+    }
+
+    #[test]
+    fn declaration_preserves_enum_return_from_assigned_local() {
+        let declarations = emit_declarations_with_semantics(concat!(
+            "enum Level { One, Two }",
+            "const enumObject = Level;",
+            "const nextLevel = (level: Level) => { let next: Level; switch (level) {",
+            "case Level.One: next = Level.Two; break;",
+            "case Level.Two: next = Level.One; break;",
+            "} return next; };",
+        ));
+        assert!(
+            declarations.contains("declare const nextLevel: (level: Level) => Level;"),
+            "{declarations}"
+        );
+        assert!(
+            declarations.contains("declare const enumObject: typeof Level;"),
+            "{declarations}"
+        );
+    }
+
+    #[test]
+    fn declaration_narrows_unmatched_switch_exit_paths() {
+        let declarations = emit_declarations_with_semantics(concat!(
+            "type O = { a: number; b: number };",
+            "type K = keyof O | 'c';",
+            "function read(o: O, k: K) { switch (k) { case 'c': k = 'a'; } return o[k]; }",
+        ));
+        assert!(
+            declarations.contains("declare function read(o: O, k: K): number;"),
+            "{declarations}"
+        );
+    }
+
+    #[test]
     fn declaration_uses_semantic_order_for_inferred_binding_pattern_types() {
         let declarations = emit_declarations_with_semantics(concat!(
             "function foo({ value1, test1 = value1.test1, test2 = value1.test2 }) {}",
@@ -73999,6 +74046,17 @@ mod tests {
             )),
             "{declarations}"
         );
+    }
+
+    #[test]
+    fn declaration_omits_local_value_merged_with_exported_interface() {
+        let declarations = emit_declarations_with_semantics(concat!(
+            "export interface Component<T extends object = object> { data: T; }",
+            "declare function register<T extends object>(value: T): Component<T>;",
+            "const Component = register({ value: 1 });",
+        ));
+        assert!(declarations.contains("export interface Component<"), "{declarations}");
+        assert!(!declarations.contains("declare const Component:"), "{declarations}");
     }
 
     #[test]
@@ -75401,6 +75459,14 @@ mod tests {
         assert_eq!(
             emit("switch (value) { case 0: return () => value; }"),
             "switch (value) {\n    case 0: return () => value;\n}\n"
+        );
+    }
+
+    #[test]
+    fn keeps_single_switch_throws_on_the_case_line() {
+        assert_eq!(
+            emit("switch (value) { default: throw new Error(\"bad\"); }"),
+            "switch (value) {\n    default: throw new Error(\"bad\");\n}\n"
         );
     }
 
