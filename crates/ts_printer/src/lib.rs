@@ -39663,11 +39663,14 @@ impl Printer<'_> {
         {
             return None;
         }
+        let entity = entity_name_string(self.arena, reference.type_name)
+            .unwrap_or_else(|| name.to_owned());
         Some(
             self.commonjs_named_import_text_rewrites
                 .get(name)
-                .cloned()
-                .unwrap_or_else(|| name.to_owned()),
+                .map_or(entity.clone(), |rewrite| {
+                    format!("{rewrite}{}", &entity[name.len()..])
+                }),
         )
     }
 
@@ -39686,10 +39689,27 @@ impl Printer<'_> {
         compact_outer: bool,
         compact_callback: bool,
     ) -> Result<(), EmitError> {
+        let prologue_statements = self
+            .arena
+            .get(body)
+            .and_then(|node| match &node.data {
+                NodeData::Block(block) => Some(
+                    block
+                        .statements
+                        .nodes
+                        .iter()
+                        .take_while(|statement| self.statement_is_string_prologue(**statement))
+                        .copied()
+                        .collect::<Vec<_>>(),
+                ),
+                _ => None,
+            })
+            .unwrap_or_default();
         let compact_outer = compact_outer
             && parameter_prologue.is_none()
             && async_parameter_plan.is_none()
-            && arguments_capture.is_none();
+            && arguments_capture.is_none()
+            && prologue_statements.is_empty();
         let empty_single_line_block = self.arena.get(body).is_some_and(|node| {
             matches!(&node.data, NodeData::Block(block) if block.statements.nodes.is_empty())
                 && usize::try_from(node.range.start.get())
@@ -39957,7 +39977,8 @@ impl Printer<'_> {
             self.writer.write("()");
         }
         self.writer.write(" {");
-        let callback_is_indented = !compact_callback || object_rest.is_some();
+        let callback_is_indented =
+            !compact_callback || object_rest.is_some() || !prologue_statements.is_empty();
         if callback_is_indented {
             self.writer.newline();
         } else {
@@ -39965,6 +39986,9 @@ impl Printer<'_> {
         }
         if callback_is_indented {
             self.writer.indent += 1;
+        }
+        for statement in &prologue_statements {
+            self.emit_statement(*statement)?;
         }
 
         let awaited_parameter_defaults = async_parameter_plan
@@ -40050,14 +40074,14 @@ impl Printer<'_> {
         {
             self.writer.write("var ");
             let mut index = 0;
-            for name in combined_planned_temps {
+            for name in &hoisted_names {
                 if index != 0 {
                     self.writer.write(", ");
                 }
                 self.writer.write(name);
                 index += 1;
             }
-            for name in &hoisted_names {
+            for name in combined_planned_temps {
                 if index != 0 {
                     self.writer.write(", ");
                 }
@@ -41159,21 +41183,32 @@ impl Printer<'_> {
         let NodeData::Block(block) = &node.data else {
             return Err(Self::unsupported(body, node.kind));
         };
-        if block.statements.nodes.is_empty() {
+        let prologue_count = block
+            .statements
+            .nodes
+            .iter()
+            .take_while(|statement| self.statement_is_string_prologue(**statement))
+            .count();
+        let statements = &block.statements.nodes[prologue_count..];
+        if statements.is_empty() {
             self.writer.write("return [2 /*return*/];");
             self.writer.newline();
             return Ok(());
         }
-        let suspension_count = block
-            .statements
-            .nodes
+        let suspension_count = statements
             .iter()
             .map(|statement| self.es5_async_simple_suspension_count(*statement))
             .sum::<usize>();
         if suspension_count == 0 {
-            let mut previous_end = node.range.start.get().saturating_add(1);
+            let mut previous_end = prologue_count
+                .checked_sub(1)
+                .and_then(|index| block.statements.nodes.get(index))
+                .and_then(|statement| self.arena.get(*statement))
+                .map_or(node.range.start.get().saturating_add(1), |statement| {
+                    statement.range.end.get()
+                });
             let mut previous_emitted = false;
-            for statement in &block.statements.nodes {
+            for statement in statements {
                 let statement_node = self.node(*statement)?.clone();
                 let current_owns_source_comments =
                     self.statement_emits_in_place(*statement, &statement_node);
@@ -41202,7 +41237,7 @@ impl Printer<'_> {
                 node.range.end.get().saturating_sub(1),
                 previous_emitted,
             );
-            if !self.statements_end_in_return(&block.statements.nodes) {
+            if !self.statements_end_in_return(statements) {
                 self.writer.write("return [2 /*return*/];");
                 self.writer.newline();
             }
@@ -41216,15 +41251,15 @@ impl Printer<'_> {
         self.writer.write("case 0:");
         self.writer.indent += 1;
         let mut case = 0;
-        for (index, statement) in block.statements.nodes.iter().enumerate() {
+        for (index, statement) in statements.iter().enumerate() {
             self.emit_es5_async_planned_statement(
                 *statement,
                 state,
                 &mut case,
-                index + 1 == block.statements.nodes.len(),
+                index + 1 == statements.len(),
             )?;
         }
-        if !self.es5_async_statements_end_in_suspending_return(&block.statements.nodes) {
+        if !self.es5_async_statements_end_in_suspending_return(statements) {
             self.writer.write("return [2 /*return*/];");
             self.writer.newline();
         }
@@ -41551,13 +41586,35 @@ impl Printer<'_> {
                 case,
             );
         }
-        if let Some((name, awaited)) = self.direct_await_binding(statement) {
+        if let Some((name, initializer, await_id, awaited)) =
+            self.es5_async_await_binding(statement)
+        {
             self.emit_es5_async_yield(awaited, case, false)?;
+            let initializer_wraps_comma = matches!(
+                self.arena.get(initializer).map(|node| &node.data),
+                Some(NodeData::ParenthesizedExpression(parenthesized))
+                    if matches!(
+                        self.arena.get(parenthesized.expression).map(|node| &node.data),
+                        Some(NodeData::BinaryExpression(binary))
+                            if self.arena.get(binary.operator_token).is_some_and(|operator| {
+                                operator.kind == SyntaxKind::CommaToken
+                            })
+                    )
+            );
+            let replacement = if initializer == await_id || initializer_wraps_comma {
+                format!("{state}.sent()")
+            } else {
+                format!("({state}.sent())")
+            };
+            let previous = self
+                .es5_async_expression_rewrites
+                .insert(await_id, replacement);
             self.emit_expression(name, 0)?;
             self.writer.write(" = ");
-            self.writer.write(state);
-            self.writer.write(".sent();");
+            self.emit_expression(initializer, 0)?;
+            self.writer.write(";");
             self.writer.newline();
+            self.restore_es5_async_expression_rewrite(await_id, previous);
             return Ok(());
         }
         if matches!(
@@ -44407,7 +44464,7 @@ impl Printer<'_> {
             Some(NodeData::VariableStatement(_)) => self
                 .es5_async_object_assignment(statement)
                 .map_or_else(
-                    || usize::from(self.direct_await_binding(statement).is_some()),
+                    || usize::from(self.es5_async_await_binding(statement).is_some()),
                     |(_, object)| self.es5_async_object_await_count(object),
                 ),
             Some(NodeData::ExpressionStatement(expression)) => {
@@ -45921,7 +45978,10 @@ impl Printer<'_> {
         self.emit_expression(declaration.name, 0)
     }
 
-    fn direct_await_binding(&self, statement: NodeId) -> Option<(NodeId, NodeId)> {
+    fn es5_async_await_binding(
+        &self,
+        statement: NodeId,
+    ) -> Option<(NodeId, NodeId, NodeId, NodeId)> {
         let NodeData::VariableStatement(variable) = &self.arena.get(statement)?.data else {
             return None;
         };
@@ -45937,14 +45997,15 @@ impl Printer<'_> {
             return None;
         };
         let initializer = declaration.initializer?;
-        let NodeData::AwaitExpression(awaited) = &self.arena.get(initializer)?.data else {
+        let await_id = self.es5_async_simple_await_in_expression(initializer)?;
+        let NodeData::AwaitExpression(awaited) = &self.arena.get(await_id)?.data else {
             return None;
         };
         matches!(
-            self.arena.get(declaration.name).map(|node| &node.data),
+        self.arena.get(declaration.name).map(|node| &node.data),
             Some(NodeData::Identifier(_))
         )
-        .then_some((declaration.name, awaited.expression))
+        .then_some((declaration.name, initializer, await_id, awaited.expression))
     }
 
     fn es5_async_captured_for_loop(

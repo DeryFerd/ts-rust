@@ -621,6 +621,8 @@ impl<'a> Parser<'a> {
                 SyntaxKind::ClassKeyword
                     | SyntaxKind::EnumKeyword
                     | SyntaxKind::InterfaceKeyword
+                    | SyntaxKind::NamespaceKeyword
+                    | SyntaxKind::ModuleKeyword
             );
         let let_starts_declaration = self.is_let_declaration();
         let static_starts_recovered_call = self.static_starts_recovered_call_statement();
