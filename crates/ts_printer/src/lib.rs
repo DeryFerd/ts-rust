@@ -27443,6 +27443,17 @@ impl Printer<'_> {
                 else {
                     continue;
                 };
+                if declaration_has_modifier_in_list(
+                    self.arena,
+                    property.modifiers.as_ref(),
+                    SyntaxKind::DeclareKeyword,
+                ) || declaration_has_modifier_in_list(
+                    self.arena,
+                    property.modifiers.as_ref(),
+                    SyntaxKind::AbstractKeyword,
+                ) {
+                    continue;
+                }
                 let Some(NodeData::PrivateIdentifier(name)) =
                     self.arena.get(property.name).map(|node| &node.data)
                 else {
@@ -27609,7 +27620,9 @@ impl Printer<'_> {
                             ),
                             _ => return None,
                         };
-                    body?;
+                    if kind == PrivateMemberKind::Method && body.is_none() {
+                        return None;
+                    }
                     let is_static = declaration_has_modifier_in_list(
                         self.arena,
                         modifiers,
@@ -27977,7 +27990,9 @@ impl Printer<'_> {
                         ),
                         _ => return None,
                     };
-                    body?;
+                    if kind == PrivateMemberKind::Method && body.is_none() {
+                        return None;
+                    }
                     let NodeData::PrivateIdentifier(name) = &self.arena.get(name)?.data else {
                         return None;
                     };
@@ -55120,29 +55135,54 @@ impl Printer<'_> {
                         self.has_modifier(method.modifiers.as_ref(), SyntaxKind::AsyncKeyword),
                         method.asterisk_token.is_some(),
                     ),
-                    NodeData::GetAccessorDeclaration(accessor) => {
-                        (&accessor.parameters, accessor.body, false, false)
-                    }
-                    NodeData::SetAccessorDeclaration(accessor) => {
-                        (&accessor.parameters, accessor.body, false, false)
-                    }
+                    NodeData::GetAccessorDeclaration(accessor) => (
+                        &accessor.parameters,
+                        accessor.body,
+                        self.has_modifier(accessor.modifiers.as_ref(), SyntaxKind::AsyncKeyword),
+                        false,
+                    ),
+                    NodeData::SetAccessorDeclaration(accessor) => (
+                        &accessor.parameters,
+                        accessor.body,
+                        self.has_modifier(accessor.modifiers.as_ref(), SyntaxKind::AsyncKeyword),
+                        false,
+                    ),
                     _ => return Err(Self::unsupported(private_method.method, node.kind)),
                 };
+                let downlevel_async_generator = is_async
+                    && generator
+                    && self.settings.target < ScriptTarget::Es2018;
+                let downlevel_async = is_async
+                    && !generator
+                    && self.settings.target < ScriptTarget::Es2017;
                 self.writer.newline();
                 self.writer.write(&private_method.function_name);
                 self.writer.write(" = ");
-                if is_async {
+                if is_async && !downlevel_async && !downlevel_async_generator {
                     self.writer.write("async ");
                 }
                 self.writer.write("function");
-                if generator {
+                if generator && !downlevel_async_generator {
                     self.writer.write("*");
                 }
                 self.writer.write(" ");
                 self.writer.write(&private_method.function_name);
                 self.emit_parameters(parameters)?;
                 self.writer.write(" ");
-                self.emit_function_body(body.expect("private member has a body"))?;
+                if let Some(body) = body {
+                    if downlevel_async_generator {
+                        let inner_name = self
+                            .generated_names
+                            .generate(&private_method.function_name);
+                        self.emit_downlevel_async_generator_body(body, &inner_name, None)?;
+                    } else if downlevel_async {
+                        self.emit_downlevel_async_function_body(body, "this")?;
+                    } else {
+                        self.emit_function_body(body)?;
+                    }
+                } else {
+                    self.writer.write("{ }");
+                }
                 self.writer.write(",");
             }
         }
@@ -55993,31 +56033,56 @@ impl Printer<'_> {
                     self.has_modifier(method.modifiers.as_ref(), SyntaxKind::AsyncKeyword),
                     method.asterisk_token.is_some(),
                 ),
-                NodeData::GetAccessorDeclaration(accessor) => {
-                    (&accessor.parameters, accessor.body, false, false)
-                }
-                NodeData::SetAccessorDeclaration(accessor) => {
-                    (&accessor.parameters, accessor.body, false, false)
-                }
+                NodeData::GetAccessorDeclaration(accessor) => (
+                    &accessor.parameters,
+                    accessor.body,
+                    self.has_modifier(accessor.modifiers.as_ref(), SyntaxKind::AsyncKeyword),
+                    false,
+                ),
+                NodeData::SetAccessorDeclaration(accessor) => (
+                    &accessor.parameters,
+                    accessor.body,
+                    self.has_modifier(accessor.modifiers.as_ref(), SyntaxKind::AsyncKeyword),
+                    false,
+                ),
                 _ => return Err(Self::unsupported(*member, node.kind)),
             };
             if wrote_initializer {
                 self.writer.write(", ");
             }
+            let downlevel_async_generator = is_async
+                && generator
+                && self.settings.target < ScriptTarget::Es2018;
+            let downlevel_async = is_async
+                && !generator
+                && self.settings.target < ScriptTarget::Es2017;
             self.writer.write(&private_method.function_name);
             self.writer.write(" = ");
-            if is_async {
+            if is_async && !downlevel_async && !downlevel_async_generator {
                 self.writer.write("async ");
             }
             self.writer.write("function");
-            if generator {
+            if generator && !downlevel_async_generator {
                 self.writer.write("*");
             }
             self.writer.write(" ");
             self.writer.write(&private_method.function_name);
             self.emit_parameters(parameters)?;
             self.writer.write(" ");
-            self.emit_function_body(body.expect("private member has a body"))?;
+            if let Some(body) = body {
+                if downlevel_async_generator {
+                    let inner_name = self
+                        .generated_names
+                        .generate(&private_method.function_name);
+                    self.emit_downlevel_async_generator_body(body, &inner_name, None)?;
+                } else if downlevel_async {
+                    self.emit_downlevel_async_function_body(body, "this")?;
+                } else {
+                    self.emit_function_body(body)?;
+                }
+            } else {
+                self.writer.write("{ }");
+            }
             wrote_initializer = true;
         }
         self.writer.write(";");
@@ -57395,7 +57460,10 @@ impl Printer<'_> {
                 && matches!(
                     &node.data,
                     NodeData::PropertyDeclaration(property)
-                        if (!self.property_is_native_private_field(property)
+                        if !self.has_modifier(
+                            property.modifiers.as_ref(),
+                            SyntaxKind::DeclareKeyword,
+                        ) && (!self.property_is_native_private_field(property)
                             || self.native_private_instance_initializer_is_lowered(property))
                             && (matches!(
                                 self.arena.get(property.name).map(|node| &node.data),
@@ -57602,6 +57670,24 @@ impl Printer<'_> {
                         })
                     })
                 });
+            let current_private_field = self.current_private_field(property.name).cloned();
+            let emits_field = current_private_field.is_some()
+                || self.property_is_auto_accessor(property)
+                || property.initializer.is_some()
+                || self.settings.use_define_for_class_fields == Some(true);
+            if emits_field {
+                let leading_start = index
+                    .checked_sub(1)
+                    .and_then(|previous| data.members.nodes.get(previous))
+                    .and_then(|previous| self.arena.get(*previous))
+                    .map_or(data.members.range.start.get(), |node| node.range.end.get());
+                self.emit_source_comments_between_with_ownership(
+                    leading_start,
+                    node.range.start.get(),
+                    false,
+                    true,
+                );
+            }
             if (self.class_private_name_is_duplicate(data, property.name)
                 && self.class_private_name_last_property_is_static(data, property.name))
                 && let Some(field) = static_duplicate_field
@@ -57617,7 +57703,7 @@ impl Printer<'_> {
                 self.writer.newline();
                 continue;
             }
-            if let Some(field) = self.current_private_field(property.name).cloned() {
+            if let Some(field) = current_private_field {
                 self.writer.write(&field.storage);
                 self.writer.write(".set(");
                 self.writer.write(receiver);
@@ -57645,22 +57731,6 @@ impl Printer<'_> {
                     self.writer.newline();
                 }
                 continue;
-            }
-            let emits_field = self.property_is_auto_accessor(property)
-                || property.initializer.is_some()
-                || self.settings.use_define_for_class_fields == Some(true);
-            if emits_field {
-                let leading_start = index
-                    .checked_sub(1)
-                    .and_then(|previous| data.members.nodes.get(previous))
-                    .and_then(|previous| self.arena.get(*previous))
-                    .map_or(data.members.range.start.get(), |node| node.range.end.get());
-                self.emit_source_comments_between_with_ownership(
-                    leading_start,
-                    node.range.start.get(),
-                    false,
-                    true,
-                );
             }
             if self.property_is_auto_accessor(property) {
                 let Some(storage) = self.auto_accessor_storage_name(data, property) else {
@@ -73508,6 +73578,50 @@ mod tests {
     }
 
     #[test]
+    fn private_async_members_and_bodyless_accessors_downlevel() {
+        let output = emit_with(
+            concat!(
+                "class C { async #method() { return 1; } ",
+                "async *#generator() { return 2; } ",
+                "declare get #value(); declare set #value(next: number); } ",
+                "const D = class { declare get #value(); };",
+            ),
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(output.contains("var __awaiter = "), "{output}");
+        assert!(output.contains("var __asyncGenerator = "), "{output}");
+        assert!(
+            output.contains("_C_method = function _C_method() {\n    return __awaiter("),
+            "{output}"
+        );
+        assert!(
+            output.contains("_C_generator = function _C_generator() { return __asyncGenerator("),
+            "{output}"
+        );
+        assert!(output.contains("_C_value_get = function _C_value_get() { }"), "{output}");
+        assert!(
+            output.contains("_C_value_set = function _C_value_set(next) { }"),
+            "{output}"
+        );
+        assert!(output.contains("_D_value_get = function _D_value_get() { }"), "{output}");
+    }
+
+    #[test]
+    fn private_field_planning_skips_declare_and_abstract_fields() {
+        let output = emit_with(
+            "class A { declare #what: number; } abstract class B { abstract #value = 1; }",
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(!output.contains("_A_what"), "{output}");
+        assert!(!output.contains("_B_value"), "{output}");
+        assert_eq!(output, "class A {\n}\nclass B {\n}\n");
+    }
+
+    #[test]
     fn preserves_reserved_private_constructor_recovery_without_get_helper() {
         let output = emit_with(
             "class A { #constructor() {} }",
@@ -74066,8 +74180,10 @@ mod tests {
     fn preserves_private_field_trailing_comments_in_a_synthesized_constructor() {
         let output = emit_with(
             concat!(
-                "class Parent {} class Child extends Parent { ",
+                "class Parent {} class Child extends Parent {\n",
+                "/** first docs */\n",
                 "#foo = \"foo\"; // first\n",
+                "/** second docs */\n",
                 "#bar = \"bar\"; // second\n",
                 "}",
             ),
@@ -74083,6 +74199,8 @@ mod tests {
             output.contains("_Child_bar.set(this, \"bar\"); // second"),
             "{output}"
         );
+        assert!(output.contains("/** first docs */\n        _Child_foo"), "{output}");
+        assert!(output.contains("/** second docs */\n        _Child_bar"), "{output}");
     }
 
     #[test]

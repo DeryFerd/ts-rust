@@ -1453,7 +1453,11 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        let name = self.parse_binding_name("Expected a parameter name.");
+        let name = if self.current.kind == SyntaxKind::PrivateIdentifier {
+            self.parse_private_identifier()
+        } else {
+            self.parse_binding_name("Expected a parameter name.")
+        };
         let question_token = if self.current.kind == SyntaxKind::QuestionToken {
             Some(self.consume_token_node())
         } else {
@@ -10713,6 +10717,31 @@ mod tests {
         };
         assert!(matches!(
             result.arena.get(declaration.name).map(|node| &node.data),
+            Some(NodeData::PrivateIdentifier(identifier)) if identifier.text == "#foo"
+        ));
+    }
+
+    #[test]
+    fn preserves_a_private_identifier_as_a_recovered_parameter_name() {
+        let result = parse_source_file("class A { setFoo(#foo: string) {} }");
+        let statements = source_statements(&result);
+        let NodeData::ClassDeclaration(class) = &result.arena.get(statements[0]).unwrap().data
+        else {
+            panic!("expected class declaration");
+        };
+        assert_eq!(class.members.nodes.len(), 1);
+        let NodeData::MethodDeclaration(method) =
+            &result.arena.get(class.members.nodes[0]).unwrap().data
+        else {
+            panic!("expected method declaration");
+        };
+        let NodeData::ParameterDeclaration(parameter) =
+            &result.arena.get(method.parameters.nodes[0]).unwrap().data
+        else {
+            panic!("expected parameter declaration");
+        };
+        assert!(matches!(
+            result.arena.get(parameter.name).map(|node| &node.data),
             Some(NodeData::PrivateIdentifier(identifier)) if identifier.text == "#foo"
         ));
     }
