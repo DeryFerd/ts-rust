@@ -31715,7 +31715,7 @@ impl Printer<'_> {
                 } else {
                     Vec::new()
                 };
-                let downlevel_async_parameters = downlevel_async
+                let downlevel_async_parameters = (downlevel_async || downlevel_async_generator)
                     .then(|| self.downlevel_async_parameter_plan(&data.parameters, id))
                     .flatten();
                 if !downlevel_async && !downlevel_async_generator && is_async {
@@ -31793,6 +31793,9 @@ impl Printer<'_> {
                         self.emit_downlevel_async_generator_body(
                             data.body.expect("body checked above"),
                             &inner_name,
+                            downlevel_async_parameters
+                                .as_ref()
+                                .map(|_| &data.parameters),
                         )?;
                     }
                 } else if downlevel_generator {
@@ -36050,20 +36053,77 @@ impl Printer<'_> {
             Vec::new()
         };
         class_expressions.sort_by_key(|(start, _)| *start);
+        let mut class_declarations = if is_function_body && self.settings.target < ScriptTarget::Es2022 {
+            self.arena
+                .iter()
+                .filter_map(|(id, node)| {
+                    let NodeData::ClassDeclaration(class) = &node.data else {
+                        return None;
+                    };
+                    if !block_range.is_some_and(|range| {
+                        range.start <= node.range.start && node.range.end <= range.end
+                    }) {
+                        return None;
+                    }
+                    let mut current = id;
+                    while let Some(parent) = self.arena.get(current).and_then(|node| node.parent) {
+                        if parent == block_id {
+                            return Some((node.range.start, class.members.nodes.clone()));
+                        }
+                        if matches!(
+                            self.arena.get(parent).map(|node| &node.data),
+                            Some(
+                                NodeData::FunctionDeclaration(_)
+                                    | NodeData::FunctionExpression(_)
+                                    | NodeData::ArrowFunction(_)
+                                    | NodeData::MethodDeclaration(_)
+                                    | NodeData::ConstructorDeclaration(_)
+                                    | NodeData::GetAccessorDeclaration(_)
+                                    | NodeData::SetAccessorDeclaration(_)
+                            )
+                        ) {
+                            return None;
+                        }
+                        current = parent;
+                    }
+                    None
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        class_declarations.sort_by_key(|(start, _)| *start);
         let mut claimed = HashSet::new();
         let mut temps = Vec::new();
-        for (_, class_expression) in class_expressions {
+        let mut declaration_index = 0;
+        for (class_start, class_expression) in class_expressions {
+            while class_declarations
+                .get(declaration_index)
+                .is_some_and(|(start, _)| *start < class_start)
+            {
+                let members = class_declarations[declaration_index].1.clone();
+                self.prepare_class_expression_computed_property_temps(
+                    &members,
+                    block_id,
+                    &mut claimed,
+                    &mut temps,
+                );
+                for member in &members {
+                    if let Some(NodeData::PropertyDeclaration(property)) =
+                        self.arena.get(*member).map(|node| &node.data)
+                    {
+                        self.class_expression_computed_properties
+                            .remove(&property.name);
+                    }
+                }
+                declaration_index += 1;
+            }
             self.append_anonymous_private_class_declarations(
                 class_expression,
                 block_id,
                 true,
                 &mut temps,
             );
-            let temp = self.generate_block_temp(block_id, &claimed);
-            claimed.insert(temp.clone());
-            self.class_expression_temps
-                .insert(class_expression, temp.clone());
-            temps.push(temp);
             if let Some(NodeData::ClassExpression(class)) =
                 self.arena.get(class_expression).map(|node| &node.data)
             {
@@ -36075,12 +36135,33 @@ impl Printer<'_> {
                     &mut temps,
                 );
             }
+            let temp = self.generate_block_temp(block_id, &claimed);
+            claimed.insert(temp.clone());
+            self.class_expression_temps
+                .insert(class_expression, temp.clone());
+            temps.push(temp);
             self.append_anonymous_private_class_declarations(
                 class_expression,
                 block_id,
                 false,
                 &mut temps,
             );
+        }
+        for (_, members) in &class_declarations[declaration_index..] {
+            self.prepare_class_expression_computed_property_temps(
+                members,
+                block_id,
+                &mut claimed,
+                &mut temps,
+            );
+            for member in members {
+                if let Some(NodeData::PropertyDeclaration(property)) =
+                    self.arena.get(*member).map(|node| &node.data)
+                {
+                    self.class_expression_computed_properties
+                        .remove(&property.name);
+                }
+            }
         }
         if is_function_body {
             self.prepare_downlevel_nullish_temps(block_id, &mut claimed, &mut temps);
@@ -39068,28 +39149,75 @@ impl Printer<'_> {
         &mut self,
         body: NodeId,
         inner_name: &str,
+        parameters: Option<&NodeList>,
     ) -> Result<(), EmitError> {
+        let compact = !self.node_source_is_multiline(body);
         self.writer.write("{");
-        self.writer.newline();
-        self.writer.indent += 1;
+        if compact {
+            self.writer.write(" ");
+        } else {
+            self.writer.newline();
+            self.writer.indent += 1;
+        }
         self.emit_async_super_prelude(true);
+        if compact && self.writer.line_start {
+            self.writer.remove_trailing_newline();
+            self.writer.write(" ");
+        }
         self.writer.write("return ");
         self.emit_helper_reference("__asyncGenerator");
         self.writer.write("(this, arguments, function* ");
         self.writer.write(inner_name);
-        self.writer.write("() {");
-        self.writer.newline();
-        self.writer.indent += 1;
+        let binding_parameters = parameters
+            .and_then(|_| self.arena.get(body).and_then(|body| body.parent))
+            .map_or_else(Vec::new, |function| {
+                self.downlevel_binding_parameters(
+                    parameters.expect("function checked above"),
+                    function,
+                )
+            });
+        if let Some(parameters) = parameters {
+            self.emit_parameters_with_name_overrides(parameters, true, &binding_parameters)?;
+        } else {
+            self.writer.write("()");
+        }
+        self.writer.write(" {");
+        if compact {
+            self.writer.write(" ");
+        } else {
+            self.writer.newline();
+            self.writer.indent += 1;
+        }
+        self.emit_downlevel_binding_parameter_prologues(&binding_parameters)?;
+        if compact && self.writer.line_start {
+            self.writer.remove_trailing_newline();
+            self.writer.write(" ");
+        }
         let previous = self.async_expression_transform;
         self.async_expression_transform = AsyncExpressionTransform::AsyncGenerator;
+        let compact_body_has_content = !binding_parameters.is_empty()
+            || self.arena.get(body).is_some_and(|body| {
+                matches!(&body.data, NodeData::Block(block) if !block.statements.nodes.is_empty())
+            });
         let result = self.emit_block_statements(body);
         self.async_expression_transform = previous;
         result?;
-        self.writer.indent -= 1;
+        if compact {
+            self.writer.remove_trailing_newline();
+            if compact_body_has_content {
+                self.writer.write(" ");
+            }
+        } else {
+            self.writer.indent -= 1;
+        }
         self.writer.write("});");
-        self.writer.newline();
-        self.writer.indent -= 1;
-        self.writer.write("}");
+        if compact {
+            self.writer.write(" }");
+        } else {
+            self.writer.newline();
+            self.writer.indent -= 1;
+            self.writer.write("}");
+        }
         Ok(())
     }
 
@@ -47112,7 +47240,7 @@ impl Printer<'_> {
         }
         self.writer.write(keyword);
         self.writer.write(" ");
-        if self.settings.target < ScriptTarget::Es2015 {
+        if self.settings.target < ScriptTarget::Es2015 && !ordinary.is_empty() {
             for (index, element_id) in ordinary.iter().enumerate() {
                 if index != 0 {
                     self.writer.write(", ");
@@ -47129,7 +47257,7 @@ impl Printer<'_> {
                 self.writer.write(parameter_temp);
                 self.emit_downlevel_member_access(element.property_name.unwrap_or(name))?;
             }
-        } else {
+        } else if !ordinary.is_empty() {
             self.writer.write("{ ");
             for (index, element) in ordinary.iter().enumerate() {
                 if index != 0 {
@@ -47141,7 +47269,9 @@ impl Printer<'_> {
             self.writer.write(parameter_temp);
         }
         if let Some(rest) = rest {
-            self.writer.write(", ");
+            if !ordinary.is_empty() {
+                self.writer.write(", ");
+            }
             self.emit_expression(rest, 0)?;
             self.writer.write(" = ");
             self.emit_helper_reference("__rest");
@@ -50023,7 +50153,7 @@ impl Printer<'_> {
             let NodeData::MethodDeclaration(method) = &node.data else {
                 return false;
             };
-            !self.class_member_is_abstract(node)
+            !self.class_member_is_erased_abstract(node)
                 && method.body.is_some()
                 && self.is_constructor_name(method.name)
         });
@@ -50061,7 +50191,7 @@ impl Printer<'_> {
                             && (property.initializer.is_some()
                                 || self.settings.use_define_for_class_fields == Some(true))
                 );
-            let current_emitted = !self.class_member_is_abstract(&node)
+            let current_emitted = !self.class_member_is_erased_abstract(&node)
                 && match &node.data {
                     NodeData::MethodDeclaration(method) => {
                         method.body.is_some()
@@ -50103,7 +50233,7 @@ impl Printer<'_> {
             }
             previous_end = node.range.end.get();
             previous_emitted = current_emitted;
-            if self.class_member_is_abstract(&node) {
+            if self.class_member_is_erased_abstract(&node) {
                 continue;
             }
             if matches!(
@@ -50135,6 +50265,9 @@ impl Printer<'_> {
                     let downlevel_async_generator = method.asterisk_token.is_some()
                         && is_async
                         && self.settings.target < ScriptTarget::Es2018;
+                    let downlevel_async_generator_parameters = downlevel_async_generator
+                        .then(|| self.downlevel_async_parameter_plan(&method.parameters, *member))
+                        .flatten();
                     let downlevel_async = method.asterisk_token.is_none()
                         && is_async
                         && self.settings.target < ScriptTarget::Es2017;
@@ -50152,7 +50285,15 @@ impl Printer<'_> {
                         self.writer.write("*");
                     }
                     self.emit_class_member_name(data, member_index, method.name, lower_fields)?;
-                    self.emit_parameters(&method.parameters)?;
+                    if let Some(plan) = &downlevel_async_generator_parameters {
+                        self.emit_parameters_with_name_overrides(
+                            &plan.outer_parameters,
+                            false,
+                            &plan.overrides,
+                        )?;
+                    } else {
+                        self.emit_parameters(&method.parameters)?;
+                    }
                     self.writer.write(" ");
                     if downlevel_async_generator {
                         let previous_async_super_plan = self.active_async_super_plan.clone();
@@ -50165,6 +50306,9 @@ impl Printer<'_> {
                         let result = self.emit_downlevel_async_generator_body(
                             method.body.expect("body checked above"),
                             &inner_name,
+                            downlevel_async_generator_parameters
+                                .as_ref()
+                                .map(|_| &method.parameters),
                         );
                         self.active_async_super_plan = previous_async_super_plan;
                         result?;
@@ -52331,7 +52475,7 @@ impl Printer<'_> {
         let mut previous_emitted_for_empty = false;
         for (index, member) in data.members.nodes.iter().enumerate() {
             let node = self.node(*member)?.clone();
-            let current_emitted = !self.class_member_is_abstract(&node)
+            let current_emitted = !self.class_member_is_erased_abstract(&node)
                 && (matches!(
                     &node.data,
                     NodeData::MethodDeclaration(method) if method.body.is_some()
@@ -52340,7 +52484,7 @@ impl Printer<'_> {
                     NodeData::PropertyDeclaration(property) if self.property_is_auto_accessor(property)
                 ));
             let current_emitted_for_empty = current_emitted
-                || (!self.class_member_is_abstract(&node)
+                || (!self.class_member_is_erased_abstract(&node)
                     && (matches!(
                         &node.data,
                         NodeData::GetAccessorDeclaration(accessor) if accessor.body.is_some()
@@ -52360,7 +52504,7 @@ impl Printer<'_> {
             previous_end = node.range.end.get();
             previous_emitted = current_emitted;
             previous_emitted_for_empty = current_emitted_for_empty;
-            if self.class_member_is_abstract(&node) {
+            if self.class_member_is_erased_abstract(&node) {
                 // Abstract members have no runtime representation.
             } else {
                 match &node.data {
@@ -52721,7 +52865,7 @@ impl Printer<'_> {
 
     fn accessor_info(&self, id: NodeId) -> Option<(bool, NodeId, bool, String)> {
         let node = self.arena.get(id)?;
-        if self.class_member_is_abstract(node) {
+        if self.class_member_is_erased_abstract(node) {
             return None;
         }
         let (is_getter, name, modifiers) = match &node.data {
@@ -55377,6 +55521,16 @@ impl Printer<'_> {
             _ => None,
         };
         self.has_modifier(modifiers, SyntaxKind::AbstractKeyword)
+    }
+
+    fn class_member_is_erased_abstract(&self, node: &Node) -> bool {
+        let has_body = match &node.data {
+            NodeData::MethodDeclaration(member) => member.body.is_some(),
+            NodeData::GetAccessorDeclaration(member) => member.body.is_some(),
+            NodeData::SetAccessorDeclaration(member) => member.body.is_some(),
+            _ => false,
+        };
+        self.class_member_is_abstract(node) && !has_body
     }
 
     fn emit_class_empty_elements_between(&mut self, start: u32, end: u32) {
@@ -59001,7 +59155,7 @@ impl Printer<'_> {
                     if self.settings.target < ScriptTarget::Es2015 {
                         self.emit_es5_downlevel_async_generator_body(data.body, &inner_name)?;
                     } else {
-                        self.emit_downlevel_async_generator_body(data.body, &inner_name)?;
+                        self.emit_downlevel_async_generator_body(data.body, &inner_name, None)?;
                     }
                 } else if downlevel_generator {
                     self.emit_es5_generator_body(data.body)?;
