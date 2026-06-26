@@ -388,6 +388,7 @@ pub fn emit_source_file_with_context(
         preemitted_source_prologues: HashSet::new(),
         preemitted_captured_while_loops: HashMap::new(),
         captured_loop_body: None,
+        active_async_super_plan: None,
         downlevel_super_context: None,
         downlevel_constructor_super_capture: None,
         is_external_module: false,
@@ -26237,6 +26238,16 @@ struct DownlevelAsyncParameterPlan {
 }
 
 #[derive(Clone)]
+struct AsyncSuperPlan {
+    body: NodeId,
+    property_names: Vec<String>,
+    has_element_access: bool,
+    has_assignment: bool,
+    property_capture: String,
+    element_capture: String,
+}
+
+#[derive(Clone)]
 enum CommonJsDestructuringValue {
     Expression(NodeId),
     Binding(DownlevelBindingValue),
@@ -26374,6 +26385,7 @@ struct Printer<'a> {
     preemitted_source_prologues: HashSet<NodeId>,
     preemitted_captured_while_loops: HashMap<NodeId, String>,
     captured_loop_body: Option<NodeId>,
+    active_async_super_plan: Option<AsyncSuperPlan>,
     downlevel_super_context: Option<(String, bool)>,
     downlevel_constructor_super_capture: Option<String>,
     is_external_module: bool,
@@ -37411,6 +37423,218 @@ impl Printer<'_> {
         }
     }
 
+    fn reusable_generated_name(&self, base: &str) -> String {
+        let mut suffix = 0_u32;
+        loop {
+            let candidate = if suffix == 0 {
+                base.to_owned()
+            } else {
+                format!("{base}_{suffix}")
+            };
+            let used = self.arena.iter().any(|(_, node)| {
+                matches!(&node.data, NodeData::Identifier(identifier) if identifier.text == candidate)
+            });
+            if !used {
+                return candidate;
+            }
+            suffix += 1;
+        }
+    }
+
+    fn node_belongs_to_async_super_body(&self, id: NodeId, body: NodeId) -> bool {
+        let mut current = Some(id);
+        while let Some(candidate) = current {
+            if candidate == body {
+                return true;
+            }
+            let Some(node) = self.arena.get(candidate) else {
+                return false;
+            };
+            if candidate != id
+                && matches!(
+                    node.data,
+                    NodeData::FunctionDeclaration(_)
+                        | NodeData::FunctionExpression(_)
+                        | NodeData::MethodDeclaration(_)
+                        | NodeData::ConstructorDeclaration(_)
+                        | NodeData::GetAccessorDeclaration(_)
+                        | NodeData::SetAccessorDeclaration(_)
+                        | NodeData::ClassDeclaration(_)
+                        | NodeData::ClassExpression(_)
+                )
+            {
+                return false;
+            }
+            current = node.parent;
+        }
+        false
+    }
+
+    fn async_super_access_is_assignment(&self, access: NodeId, body: NodeId) -> bool {
+        let mut current = self.arena.get(access).and_then(|node| node.parent);
+        while let Some(candidate) = current {
+            if candidate == body {
+                return false;
+            }
+            let Some(node) = self.arena.get(candidate) else {
+                return false;
+            };
+            if let NodeData::BinaryExpression(binary) = &node.data
+                && self
+                    .arena
+                    .get(binary.operator_token)
+                    .is_some_and(|operator| operator.kind.is_assignment_operator())
+                && self.node_is_within(access, binary.left)
+            {
+                return true;
+            }
+            current = node.parent;
+        }
+        false
+    }
+
+    fn async_super_plan(&self, body: NodeId) -> Option<AsyncSuperPlan> {
+        let mut property_names = Vec::new();
+        let mut property_accesses = Vec::new();
+        let mut has_element_access = false;
+        let mut has_assignment = false;
+        for (id, node) in self.arena.iter() {
+            if !self.node_belongs_to_async_super_body(id, body) {
+                continue;
+            }
+            match &node.data {
+                NodeData::PropertyAccessExpression(access)
+                    if self
+                        .arena
+                        .get(access.expression)
+                        .is_some_and(|expression| expression.kind == SyntaxKind::SuperKeyword) =>
+                {
+                    if let Some(name) = declaration_name_text(self.arena, access.name) {
+                        property_accesses.push((node.range.start, name.to_owned()));
+                    }
+                    has_assignment |= self.async_super_access_is_assignment(id, body);
+                }
+                NodeData::ElementAccessExpression(access)
+                    if self
+                        .arena
+                        .get(access.expression)
+                        .is_some_and(|expression| expression.kind == SyntaxKind::SuperKeyword) =>
+                {
+                    has_element_access = true;
+                    has_assignment |= self.async_super_access_is_assignment(id, body);
+                }
+                _ => {}
+            }
+        }
+        property_accesses.sort_by_key(|(start, _)| *start);
+        for (_, name) in property_accesses {
+            if !property_names.contains(&name) {
+                property_names.push(name);
+            }
+        }
+        (!property_names.is_empty() || has_element_access).then(|| AsyncSuperPlan {
+            body,
+            property_names,
+            has_element_access,
+            has_assignment,
+            property_capture: self.reusable_generated_name("_super"),
+            element_capture: self.reusable_generated_name("_superIndex"),
+        })
+    }
+
+    fn emit_async_super_prelude(&mut self) {
+        let Some(plan) = self.active_async_super_plan.clone() else {
+            return;
+        };
+        if plan.has_element_access {
+            self.writer.write("const ");
+            self.writer.write(&plan.element_capture);
+            if plan.has_assignment {
+                self.writer.write(" = (function (geti, seti) {");
+                self.writer.newline();
+                self.writer.indent += 1;
+                self.writer.write("const cache = Object.create(null);");
+                self.writer.newline();
+                self.writer.write("return name => cache[name] || (cache[name] = { get value() { return geti(name); }, set value(v) { seti(name, v); } });");
+                self.writer.newline();
+                self.writer.indent -= 1;
+                self.writer.write("})(name => super[name], (name, value) => super[name] = value);");
+            } else {
+                self.writer.write(" = name => super[name];");
+            }
+            self.writer.newline();
+        }
+        if !plan.property_names.is_empty() {
+            self.writer.write("const ");
+            self.writer.write(&plan.property_capture);
+            self.writer.write(" = Object.create(null, {");
+            self.writer.newline();
+            self.writer.indent += 1;
+            for (index, name) in plan.property_names.iter().enumerate() {
+                self.writer.write(name);
+                self.writer.write(": { get: () => super.");
+                self.writer.write(name);
+                if plan.has_assignment {
+                    self.writer.write(", set: v => super.");
+                    self.writer.write(name);
+                    self.writer.write(" = v");
+                }
+                self.writer.write(" }");
+                if index + 1 != plan.property_names.len() {
+                    self.writer.write(",");
+                }
+                self.writer.newline();
+            }
+            self.writer.indent -= 1;
+            self.writer.write("});");
+            self.writer.newline();
+        }
+    }
+
+    fn is_active_async_super_access(&self, id: NodeId) -> bool {
+        let Some(plan) = self.active_async_super_plan.as_ref() else {
+            return false;
+        };
+        if !self.node_belongs_to_async_super_body(id, plan.body) {
+            return false;
+        }
+        matches!(
+            self.arena.get(id).map(|node| &node.data),
+            Some(NodeData::PropertyAccessExpression(access))
+                if self.arena.get(access.expression).is_some_and(|expression| expression.kind == SyntaxKind::SuperKeyword)
+        ) || matches!(
+            self.arena.get(id).map(|node| &node.data),
+            Some(NodeData::ElementAccessExpression(access))
+                if self.arena.get(access.expression).is_some_and(|expression| expression.kind == SyntaxKind::SuperKeyword)
+        )
+    }
+
+    fn emit_active_async_super_access(&mut self, id: NodeId) -> Result<(), EmitError> {
+        let plan = self
+            .active_async_super_plan
+            .clone()
+            .expect("active async super access has a plan");
+        let node = self.node(id)?.clone();
+        match &node.data {
+            NodeData::PropertyAccessExpression(access) => {
+                self.writer.write(&plan.property_capture);
+                self.writer.write(".");
+                self.emit_expression(access.name, 18)
+            }
+            NodeData::ElementAccessExpression(access) => {
+                self.writer.write(&plan.element_capture);
+                self.writer.write("(");
+                self.emit_expression(access.argument_expression, 0)?;
+                self.writer.write(")");
+                if plan.has_assignment {
+                    self.writer.write(".value");
+                }
+                Ok(())
+            }
+            _ => unreachable!(),
+        }
+    }
+
     fn emit_downlevel_async_function_body(
         &mut self,
         body: NodeId,
@@ -37439,6 +37663,7 @@ impl Printer<'_> {
         self.writer.write("{");
         self.writer.newline();
         self.writer.indent += 1;
+        self.emit_async_super_prelude();
         let arguments_alias = self
             .function_body_uses_lexical_arguments_in_arrow(body)
             .then(|| self.generate_arguments_capture_name());
@@ -48811,10 +49036,16 @@ impl Printer<'_> {
                     self.emit_parameters(&method.parameters)?;
                     self.writer.write(" ");
                     if downlevel_async {
-                        self.emit_downlevel_async_function_body(
+                        let previous_async_super_plan = self.active_async_super_plan.clone();
+                        self.active_async_super_plan = self.async_super_plan(
+                            method.body.expect("body checked above"),
+                        );
+                        let result = self.emit_downlevel_async_function_body(
                             method.body.expect("body checked above"),
                             "this",
-                        )?;
+                        );
+                        self.active_async_super_plan = previous_async_super_plan;
+                        result?;
                     } else {
                         self.emit_function_body(method.body.expect("body checked above"))?;
                     }
@@ -56024,7 +56255,9 @@ impl Printer<'_> {
                 self.emit_binary_expression(id, parent_precedence)?;
             }
             NodeData::PropertyAccessExpression(data) => {
-                if let Some(rewrite) = self.private_destructuring_rewrites.get(&id).cloned() {
+                if self.is_active_async_super_access(id) {
+                    self.emit_active_async_super_access(id)?;
+                } else if let Some(rewrite) = self.private_destructuring_rewrites.get(&id).cloned() {
                     self.writer.write("({ set value(");
                     self.writer.write(&rewrite.value_temp);
                     self.writer.write(") { __classPrivateFieldSet(");
@@ -56184,7 +56417,9 @@ impl Printer<'_> {
                 }
             }
             NodeData::ElementAccessExpression(data) => {
-                if data.question_dot_token.is_some() && self.settings.target < ScriptTarget::Es2020
+                if self.is_active_async_super_access(id) {
+                    self.emit_active_async_super_access(id)?;
+                } else if data.question_dot_token.is_some() && self.settings.target < ScriptTarget::Es2020
                 {
                     self.emit_downlevel_optional_element(
                         id,
@@ -56236,6 +56471,7 @@ impl Printer<'_> {
                 }
             }
             NodeData::CallExpression(data) => {
+                let async_super_call = self.is_active_async_super_access(data.expression);
                 let downlevel_constructor_super = self
                     .downlevel_constructor_super_capture
                     .clone()
@@ -56266,7 +56502,15 @@ impl Printer<'_> {
                             .map(|method| (access.expression, method)),
                         _ => None,
                     });
-                if let Some(capture) = downlevel_constructor_super {
+                if async_super_call {
+                    self.emit_active_async_super_access(data.expression)?;
+                    self.writer.write(".call(this");
+                    if self.argument_list_has_expression(&data.arguments) {
+                        self.writer.write(", ");
+                        self.emit_argument_list(&data.arguments)?;
+                    }
+                    self.writer.write(")");
+                } else if let Some(capture) = downlevel_constructor_super {
                     self.writer.write("_this = ");
                     self.writer.write(&capture);
                     self.writer.write(".call(this");
@@ -64784,6 +65028,38 @@ mod tests {
         );
         assert_eq!(output.matches("var arguments_2 = arguments;").count(), 1, "{output}");
         assert!(output.contains("return arguments_2;"), "{output}");
+    }
+
+    #[test]
+    fn captures_super_accesses_in_downleveled_async_methods() {
+        let output = emit_with(
+            concat!(
+                "class B extends A { async method(key, value) { ",
+                "const _super = null; const _superIndex = null; ",
+                "super.x(); super[key] = value; return super[key]; ",
+                "} }",
+            ),
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(
+            output.contains("const _superIndex_1 = (function (geti, seti) {"),
+            "{output}"
+        );
+        assert!(
+            output.contains("const _super_1 = Object.create(null, {"),
+            "{output}"
+        );
+        assert!(output.contains("_super_1.x.call(this);"), "{output}");
+        assert!(
+            output.contains("_superIndex_1(key).value = value;"),
+            "{output}"
+        );
+        assert!(
+            output.contains("return _superIndex_1(key).value;"),
+            "{output}"
+        );
     }
 
     #[test]
