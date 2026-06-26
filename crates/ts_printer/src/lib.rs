@@ -762,7 +762,9 @@ pub fn emit_source_file_with_context(
             if source_needs_private_field_in_helper(arena) {
                 helpers.insert("__classPrivateFieldIn");
             }
-            if printer.private_methods_need_set_helper() {
+            if printer.private_methods_need_set_helper()
+                || printer.private_accessors_need_set_helper()
+            {
                 helpers.insert("__classPrivateFieldSet");
             }
         }
@@ -1243,7 +1245,8 @@ pub fn emit_source_file_with_context(
         && source_private_get_precedes_set_helper(arena)
         && (!printer.private_field_plans.is_empty()
             || !printer.static_private_field_plans.is_empty()
-            || !printer.private_method_plans.is_empty())
+            || !printer.private_method_plans.is_empty()
+            || !printer.anonymous_private_class_plans.is_empty())
         && source_needs_private_field_get_helper(arena)
         && !settings.no_emit_helpers
         && !printer.imported_helpers.contains("__classPrivateFieldGet")
@@ -28177,15 +28180,41 @@ impl Printer<'_> {
     fn active_private_update_state(
         &self,
         name: NodeId,
-    ) -> Option<(String, &'static str, Option<String>)> {
+    ) -> Option<(String, &'static str, Option<String>, Option<String>)> {
         if let Some(field) = self.active_private_field(name) {
-            return Some((field.storage.clone(), "f", None));
+            return Some((field.storage.clone(), "f", None, None));
+        }
+        if let Some(field) = self.active_static_private_field(name) {
+            let plan = self.active_static_private_field_plan.as_ref()?;
+            return Some((
+                plan.capture.clone(),
+                "f",
+                Some(field.storage.clone()),
+                Some(field.storage.clone()),
+            ));
+        }
+        if self.active_private_accessor_exists(name) {
+            let getter = self.active_private_getter(name).cloned();
+            let setter = self.active_private_setter(name).cloned();
+            let member = getter.as_ref().or(setter.as_ref())?;
+            let plan = self.active_private_method_plan_for_member(member)?;
+            let state = if member.is_static {
+                plan.capture.clone().unwrap_or_else(|| plan.brand.clone())
+            } else {
+                plan.brand.clone()
+            };
+            return Some((
+                state,
+                "a",
+                getter.map(|getter| getter.function_name),
+                setter.map(|setter| setter.function_name),
+            ));
         }
         let method = self
             .active_private_method(name)
             .filter(|method| method.kind == PrivateMemberKind::Method)?;
         let state = self.active_private_method_write_state(name)?;
-        Some((state, "m", Some(method.function_name.clone())))
+        Some((state, "m", Some(method.function_name.clone()), None))
     }
 
     fn prepare_private_destructuring_rewrites(&mut self, body: NodeId) -> Vec<String> {
@@ -28464,6 +28493,30 @@ impl Printer<'_> {
         None
     }
 
+    fn active_private_getter(&self, name: NodeId) -> Option<&PrivateMethodInfo> {
+        let NodeData::PrivateIdentifier(name) = &self.arena.get(name)?.data else {
+            return None;
+        };
+        let private_name = name.text.trim_start_matches('#');
+        for plan in self
+            .active_private_method_plan
+            .iter()
+            .chain(self.enclosing_private_method_plans.iter().rev())
+        {
+            if plan
+                .methods
+                .iter()
+                .any(|method| method.private_name == private_name)
+            {
+                return plan.methods.iter().rev().find(|method| {
+                    method.private_name == private_name
+                        && method.kind == PrivateMemberKind::Getter
+                });
+            }
+        }
+        None
+    }
+
     fn active_private_accessor_exists(&self, name: NodeId) -> bool {
         let Some(NodeData::PrivateIdentifier(name)) =
             self.arena.get(name).map(|node| &node.data)
@@ -28498,13 +28551,18 @@ impl Printer<'_> {
             .private_method_plans
             .values()
             .flat_map(|plan| plan.methods.iter())
+            .chain(
+                self.anonymous_private_class_plans
+                    .values()
+                    .flat_map(|plan| plan.methods.iter()),
+            )
             .filter(|member| member.kind == PrivateMemberKind::Setter)
             .map(|member| member.private_name.as_str())
             .collect::<HashSet<_>>();
         if setter_names.is_empty() {
             return false;
         }
-        self.arena.iter().any(|(_, node)| {
+        self.arena.iter().any(|(access_id, node)| {
             let target = match &node.data {
                 NodeData::BinaryExpression(binary)
                     if self
@@ -28537,6 +28595,10 @@ impl Printer<'_> {
                 return false;
             };
             setter_names.contains(name.text.trim_start_matches('#'))
+                && self.private_access_has_lexical_declaration(
+                    access_id,
+                    name.text.trim_start_matches('#'),
+                )
         })
     }
 
@@ -37863,6 +37925,7 @@ impl Printer<'_> {
                     return None;
                 };
                 if !(self.active_private_field(access.name).is_some()
+                    || self.active_static_private_field(access.name).is_some()
                     || self.active_private_accessor_exists(access.name))
                     || matches!(
                         self.arena.get(access.expression).map(|node| node.kind),
@@ -65222,7 +65285,9 @@ impl Printer<'_> {
         else {
             return Ok(false);
         };
-        let Some((state, kind, getter)) = self.active_private_update_state(access.name) else {
+        let Some((state, kind, getter, setter)) =
+            self.active_private_update_state(access.name)
+        else {
             return Ok(false);
         };
         if temps.result.is_some() {
@@ -65272,7 +65337,12 @@ impl Printer<'_> {
         }
         self.writer.write("), \"");
         self.writer.write(kind);
-        self.writer.write("\")");
+        self.writer.write("\"");
+        if let Some(setter) = setter {
+            self.writer.write(", ");
+            self.writer.write(&setter);
+        }
+        self.writer.write(")");
         if let Some(result) = &temps.result {
             self.writer.write(", ");
             self.writer.write(result);
@@ -65615,6 +65685,151 @@ impl Printer<'_> {
         }
         if let Some(NodeData::BinaryExpression(binary)) =
             self.arena.get(expression).map(|node| &node.data)
+            && let Some(operator) = self.arena.get(binary.operator_token).map(|node| node.kind)
+            && operator.is_compound_assignment_operator()
+            && let private_target = self.unwrap_erased_expression(binary.left)
+            && let Some(NodeData::PropertyAccessExpression(access)) =
+                self.arena.get(private_target).map(|node| &node.data)
+            && let Some(field) = self.active_static_private_field(access.name).cloned()
+            && let Some(plan) = self.active_static_private_field_plan.clone()
+        {
+            let receiver_temp = self
+                .private_compound_assignment_receiver_temps
+                .get(&expression)
+                .cloned();
+            self.emit_helper_reference("__classPrivateFieldSet");
+            self.writer.write("(");
+            if let Some(temp) = &receiver_temp {
+                self.writer.write(temp);
+                self.writer.write(" = ");
+            }
+            self.emit_expression(access.expression, 1)?;
+            self.writer.write(", ");
+            self.writer.write(&plan.capture);
+            self.writer.write(", ");
+            if operator == SyntaxKind::AsteriskAsteriskEqualsToken
+                && self.settings.target < ScriptTarget::Es2016
+            {
+                self.writer.write("Math.pow(");
+            }
+            self.emit_helper_reference("__classPrivateFieldGet");
+            self.writer.write("(");
+            if let Some(temp) = &receiver_temp {
+                self.writer.write(temp);
+            } else {
+                self.emit_expression(access.expression, 1)?;
+            }
+            self.writer.write(", ");
+            self.writer.write(&plan.capture);
+            self.writer.write(", \"f\", ");
+            self.writer.write(&field.storage);
+            self.writer.write(")");
+            if operator == SyntaxKind::AsteriskAsteriskEqualsToken
+                && self.settings.target < ScriptTarget::Es2016
+            {
+                self.writer.write(", ");
+                self.emit_expression(binary.right, 1)?;
+                self.writer.write(")");
+            } else {
+                self.writer.write(" ");
+                self.writer.write(
+                    operator_text(operator)
+                        .unwrap_or("+=")
+                        .trim_end_matches('='),
+                );
+                self.writer.write(" ");
+                self.emit_expression(binary.right, 1)?;
+            }
+            self.writer.write(", \"f\", ");
+            self.writer.write(&field.storage);
+            self.writer.write(")");
+            return Ok(());
+        }
+        if let Some(NodeData::BinaryExpression(binary)) =
+            self.arena.get(expression).map(|node| &node.data)
+            && let Some(operator) = self.arena.get(binary.operator_token).map(|node| node.kind)
+            && operator.is_compound_assignment_operator()
+            && let private_target = self.unwrap_erased_expression(binary.left)
+            && let Some(NodeData::PropertyAccessExpression(access)) =
+                self.arena.get(private_target).map(|node| &node.data)
+            && self.active_private_accessor_exists(access.name)
+        {
+            let getter = self.active_private_getter(access.name).cloned();
+            let setter = self.active_private_setter(access.name).cloned();
+            let Some(member) = getter.as_ref().or(setter.as_ref()) else {
+                return Err(Self::unsupported(expression, SyntaxKind::BinaryExpression));
+            };
+            let Some(plan) = self
+                .active_private_method_plan_for_member(member)
+                .cloned()
+            else {
+                return Err(Self::unsupported(expression, SyntaxKind::BinaryExpression));
+            };
+            let receiver_temp = self
+                .private_compound_assignment_receiver_temps
+                .get(&expression)
+                .cloned();
+            let state = if member.is_static {
+                plan.capture.as_deref().unwrap_or(&plan.brand)
+            } else {
+                &plan.brand
+            };
+            self.emit_helper_reference("__classPrivateFieldSet");
+            self.writer.write("(");
+            if let Some(temp) = &receiver_temp {
+                self.writer.write(temp);
+                self.writer.write(" = ");
+            }
+            self.emit_expression(access.expression, 1)?;
+            self.writer.write(", ");
+            self.writer.write(state);
+            self.writer.write(", ");
+            if operator == SyntaxKind::AsteriskAsteriskEqualsToken
+                && self.settings.target < ScriptTarget::Es2016
+            {
+                self.writer.write("Math.pow(");
+            }
+            self.emit_helper_reference("__classPrivateFieldGet");
+            self.writer.write("(");
+            if let Some(temp) = &receiver_temp {
+                self.writer.write(temp);
+            } else {
+                self.emit_expression(access.expression, 1)?;
+            }
+            self.writer.write(", ");
+            self.writer.write(state);
+            self.writer.write(", \"a\"");
+            if let Some(getter) = &getter {
+                self.writer.write(", ");
+                self.writer.write(&getter.function_name);
+            }
+            self.writer.write(")");
+            if operator == SyntaxKind::AsteriskAsteriskEqualsToken
+                && self.settings.target < ScriptTarget::Es2016
+            {
+                self.writer.write(", ");
+                self.emit_expression(binary.right, 1)?;
+                self.writer.write(")");
+            } else {
+                self.writer.write(" ");
+                self.writer.write(
+                    operator_text(operator)
+                        .unwrap_or("+=")
+                        .trim_end_matches('='),
+                );
+                self.writer.write(" ");
+                self.emit_expression(binary.right, 1)?;
+            }
+            self.writer.write(", \"a\"");
+            if let Some(setter) = &setter {
+                self.writer.write(", ");
+                self.writer.write(&setter.function_name);
+            }
+            self.writer.write(")");
+            return Ok(());
+        }
+        if let Some(NodeData::BinaryExpression(binary)) =
+            self.arena.get(expression).map(|node| &node.data)
             && self
                 .arena
                 .get(binary.operator_token)
@@ -65625,19 +65840,22 @@ impl Printer<'_> {
             && self.active_private_accessor_exists(access.name)
             && !self.private_destructuring_rewrites.contains_key(&private_target)
         {
-            let Some(plan) = self.active_private_method_plan.clone() else {
+            let setter = self.active_private_setter(access.name).cloned();
+            let getter = self.active_private_getter(access.name).cloned();
+            let Some(member) = setter.as_ref().or(getter.as_ref()) else {
                 return Err(Self::unsupported(expression, SyntaxKind::BinaryExpression));
             };
-            let setter = self.active_private_setter(access.name).cloned();
-            let is_static = setter
-                .as_ref()
-                .or_else(|| self.active_private_method(access.name))
-                .is_some_and(|member| member.is_static);
+            let Some(plan) = self
+                .active_private_method_plan_for_member(member)
+                .cloned()
+            else {
+                return Err(Self::unsupported(expression, SyntaxKind::BinaryExpression));
+            };
             self.emit_helper_reference("__classPrivateFieldSet");
             self.writer.write("(");
             self.emit_expression(access.expression, 1)?;
             self.writer.write(", ");
-            self.writer.write(if is_static {
+            self.writer.write(if member.is_static {
                 plan.capture.as_deref().unwrap_or(&plan.brand)
             } else {
                 &plan.brand
@@ -65649,6 +65867,31 @@ impl Printer<'_> {
                 self.writer.write(", ");
                 self.writer.write(&setter.function_name);
             }
+            self.writer.write(")");
+            return Ok(());
+        }
+        if let Some(NodeData::BinaryExpression(binary)) =
+            self.arena.get(expression).map(|node| &node.data)
+            && self
+                .arena
+                .get(binary.operator_token)
+                .is_some_and(|operator| operator.kind == SyntaxKind::EqualsToken)
+            && let private_target = self.unwrap_erased_expression(binary.left)
+            && let Some(NodeData::PropertyAccessExpression(access)) =
+                self.arena.get(private_target).map(|node| &node.data)
+            && let Some(field) = self.active_static_private_field(access.name).cloned()
+            && let Some(plan) = self.active_static_private_field_plan.clone()
+            && !self.private_destructuring_rewrites.contains_key(&private_target)
+        {
+            self.emit_helper_reference("__classPrivateFieldSet");
+            self.writer.write("(");
+            self.emit_expression(access.expression, 1)?;
+            self.writer.write(", ");
+            self.writer.write(&plan.capture);
+            self.writer.write(", ");
+            self.emit_expression(binary.right, 1)?;
+            self.writer.write(", \"f\", ");
+            self.writer.write(&field.storage);
             self.writer.write(")");
             return Ok(());
         }
@@ -72669,6 +72912,45 @@ mod tests {
     }
 
     #[test]
+    fn includes_set_helper_for_anonymous_setter_only_compound_writes() {
+        let output = emit_with(
+            "const C = class { set #x(value: number) {} m() { this.#x += 2; } };",
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(output.contains("var __classPrivateFieldGet"), "{output}");
+        assert!(output.contains("var __classPrivateFieldSet"), "{output}");
+        assert!(
+            output.contains(
+                "__classPrivateFieldSet(this, _C_instances, __classPrivateFieldGet(this, _C_instances, \"a\") + 2, \"a\", _C_x_set);"
+            ),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn lowers_private_accessor_updates_with_getter_and_setter_functions() {
+        let output = emit_with(
+            concat!(
+                "class C { get #x() { return 1; } set #x(value: number) {} ",
+                "m() { this.#x++; ++this.#x; } }",
+            ),
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(
+            output.contains(
+                "__classPrivateFieldGet(this, _C_instances, \"a\", _C_x_get)"
+            ),
+            "{output}"
+        );
+        assert!(output.contains("\"a\", _C_x_set)"), "{output}");
+        assert!(!output.contains("this.#x"), "{output}");
+    }
+
+    #[test]
     fn lowers_static_private_methods_with_the_class_as_the_brand() {
         let output = emit_with(
             "export class Foo { constructor() { Foo.#test(); } static #test() { return 'success'; } }",
@@ -72690,6 +72972,27 @@ mod tests {
             "{output}"
         );
         assert!(!output.contains("WeakSet"), "{output}");
+    }
+
+    #[test]
+    fn lowers_static_private_field_writes_with_the_backing_descriptor() {
+        let output = emit_with(
+            "class A { static #x = 1; static m() { A.#x = 2; A.#x += 3; } }",
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(
+            output.contains("__classPrivateFieldSet(_a, _a, 2, \"f\", _A_x);"),
+            "{output}"
+        );
+        assert!(
+            output.contains(concat!(
+                "__classPrivateFieldSet(_a, _a, ",
+                "__classPrivateFieldGet(_a, _a, \"f\", _A_x) + 3, \"f\", _A_x);",
+            )),
+            "{output}"
+        );
     }
 
     #[test]
