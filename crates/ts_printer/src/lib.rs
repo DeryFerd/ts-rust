@@ -706,7 +706,9 @@ pub fn emit_source_file_with_context(
             if source_needs_legacy_param_helper(arena) {
                 helpers.insert("__param");
             }
-            if context.emit_decorator_metadata {
+            if context.emit_decorator_metadata
+                && source_needs_legacy_metadata_helper(arena)
+            {
                 helpers.insert("__metadata");
             }
         }
@@ -1133,7 +1135,10 @@ pub fn emit_source_file_with_context(
         && !printer.imported_helpers.contains("__decorate")
     {
         printer.emit_decorate_helper();
-        if printer.emit_decorator_metadata && !preemit_isolated_metadata_import_star {
+        if printer.emit_decorator_metadata
+            && source_needs_legacy_metadata_helper(arena)
+            && !preemit_isolated_metadata_import_star
+        {
             printer.emit_metadata_helper();
         }
         if source_needs_legacy_param_helper(arena) {
@@ -1201,7 +1206,9 @@ pub fn emit_source_file_with_context(
     {
         printer.emit_values_helper();
     }
-    if !printer.legacy_decorated_class_captures.is_empty() {
+    if settings.target >= ScriptTarget::Es2015
+        && !printer.legacy_decorated_class_captures.is_empty()
+    {
         let mut captures = printer
             .legacy_decorated_class_captures
             .iter()
@@ -3767,6 +3774,33 @@ fn class_has_legacy_constructor_parameter_decorators(
                         declaration_has_modifier(arena, parameter, SyntaxKind::Decorator)
                     })
                 })
+            })
+    })
+}
+
+fn source_needs_legacy_metadata_helper(arena: &NodeArena) -> bool {
+    arena.iter().any(|(class_id, node)| {
+        let NodeData::ClassDeclaration(class) = &node.data else {
+            return false;
+        };
+        if node_is_in_ambient_context(arena, class_id) {
+            return false;
+        }
+        let has_constructor = class
+            .members
+            .nodes
+            .iter()
+            .any(|member| class_member_is_constructor(arena, *member));
+        let class_emits_metadata = has_constructor
+            && (declaration_has_modifier_in_list(
+                arena,
+                class.modifiers.as_ref(),
+                SyntaxKind::Decorator,
+            ) || class_has_legacy_constructor_parameter_decorators(arena, class));
+        class_emits_metadata
+            || class.members.nodes.iter().any(|member| {
+                !class_member_is_constructor(arena, *member)
+                    && class_member_has_legacy_decorators(arena, *member)
             })
     })
 }
@@ -28575,9 +28609,7 @@ impl Printer<'_> {
     }
 
     fn prepare_legacy_decorated_class_captures(&mut self) {
-        if !self.settings.experimental_decorators
-            || self.settings.target < ScriptTarget::Es2022
-        {
+        if !self.settings.experimental_decorators {
             return;
         }
         let mut classes = self
@@ -28615,14 +28647,46 @@ impl Printer<'_> {
                         Some(NodeData::ClassStaticBlockDeclaration(block)) => {
                             self.subtree_references_symbol(block.body, symbol)
                         }
+                        Some(NodeData::MethodDeclaration(method))
+                            if self.has_modifier(
+                                method.modifiers.as_ref(),
+                                SyntaxKind::StaticKeyword,
+                            ) =>
+                        {
+                            self.subtree_references_symbol(*member, symbol)
+                        }
+                        Some(NodeData::GetAccessorDeclaration(accessor))
+                            if self.has_modifier(
+                                accessor.modifiers.as_ref(),
+                                SyntaxKind::StaticKeyword,
+                            ) =>
+                        {
+                            self.subtree_references_symbol(*member, symbol)
+                        }
+                        Some(NodeData::SetAccessorDeclaration(accessor))
+                            if self.has_modifier(
+                                accessor.modifiers.as_ref(),
+                                SyntaxKind::StaticKeyword,
+                            ) =>
+                        {
+                            self.subtree_references_symbol(*member, symbol)
+                        }
                         _ => false,
                     }
                 });
-                captures_self.then_some((node.range.start, class_id, name))
+                captures_self.then_some((node.range.start, class_id, symbol, name))
             })
             .collect::<Vec<_>>();
-        classes.sort_by_key(|(start, _, _)| *start);
-        for (_, class_id, name) in classes {
+        classes.sort_by_key(|(start, _, _, _)| *start);
+        for (_, class_id, symbol, name) in classes {
+            if self.settings.target < ScriptTarget::Es2015
+                && let Some(lexical_scope) = self.symbol_declaration_scope(symbol)
+                && let Some(var_scope) = self.nearest_var_scope(lexical_scope)
+                && lexical_scope != var_scope
+            {
+                let emitted_name = self.generated_names.generate(&name);
+                self.identifier_rewrites.insert(symbol, emitted_name);
+            }
             let capture = self.generated_names.generate(&name);
             self.legacy_decorated_class_captures
                 .insert(class_id, capture);
@@ -53967,16 +54031,6 @@ impl Printer<'_> {
         let Some(name) = data.name else {
             return self.emit_class(data);
         };
-        if self.settings.target < ScriptTarget::Es2015 {
-            let previous_this_alias = self.this_alias.clone();
-            let previous_this_alias_scope = self.this_alias_scope;
-            self.this_alias = Some("(void 0)".to_owned());
-            self.this_alias_scope = self.arena.get(name).and_then(|node| node.parent);
-            let result = self.emit_class(data);
-            self.this_alias = previous_this_alias;
-            self.this_alias_scope = previous_this_alias_scope;
-            return result;
-        }
         let capture = self
             .arena
             .get(name)
@@ -53990,6 +54044,32 @@ impl Printer<'_> {
             .copied()
             .or(data.local_symbol)
             .or(data.symbol);
+        if self.settings.target < ScriptTarget::Es2015 {
+            let previous_this_alias = self.this_alias.clone();
+            let previous_this_alias_scope = self.this_alias_scope;
+            let emitted_name = class_symbol
+                .and_then(|symbol| self.identifier_rewrites.get(&symbol))
+                .cloned();
+            let previous_rewrite = capture.as_ref().and_then(|capture| {
+                class_symbol.and_then(|symbol| {
+                    self.identifier_rewrites
+                        .insert(symbol, capture.clone())
+                })
+            });
+            self.this_alias = Some("(void 0)".to_owned());
+            self.this_alias_scope = self.arena.get(name).and_then(|node| node.parent);
+            let result = self.emit_class_with_name(data, emitted_name.as_deref());
+            self.this_alias = previous_this_alias;
+            self.this_alias_scope = previous_this_alias_scope;
+            if let Some(symbol) = class_symbol {
+                if let Some(previous) = previous_rewrite {
+                    self.identifier_rewrites.insert(symbol, previous);
+                } else if capture.is_some() {
+                    self.identifier_rewrites.remove(&symbol);
+                }
+            }
+            return result;
+        }
         let previous_rewrite = capture.as_ref().and_then(|capture| {
             class_symbol.and_then(|symbol| {
                 self.identifier_rewrites
@@ -53999,6 +54079,12 @@ impl Printer<'_> {
         self.writer.write("let ");
         self.emit_expression(name, 0)?;
         self.writer.write(" = ");
+        if self.settings.target < ScriptTarget::Es2022
+            && let Some(capture) = capture.as_deref()
+        {
+            self.writer.write(capture);
+            self.writer.write(" = ");
+        }
         let previous_static_capture = self.class_static_this_capture.clone();
         let previous_this_alias = self.this_alias.clone();
         let previous_this_alias_scope = self.this_alias_scope;
@@ -55609,10 +55695,11 @@ impl Printer<'_> {
         if !lower_fields {
             self.emit_native_parameter_property_declarations(data)?;
         }
-        if let Some(capture) = data
-            .name
-            .and_then(|name| self.arena.get(name)?.parent)
-            .and_then(|class| self.legacy_decorated_class_captures.get(&class))
+        if self.settings.target >= ScriptTarget::Es2022
+            && let Some(capture) = data
+                .name
+                .and_then(|name| self.arena.get(name)?.parent)
+                .and_then(|class| self.legacy_decorated_class_captures.get(&class))
         {
             self.writer.write("static { ");
             self.writer.write(capture);
@@ -59207,16 +59294,17 @@ impl Printer<'_> {
         data: &ts_ast::ClassDeclarationData,
         emitted_name: Option<&str>,
     ) -> Result<(), EmitError> {
-        let name = data
+        let source_name = data
             .name
             .and_then(|name| self.identifier_text(name).ok())
             .or(emitted_name)
             .unwrap_or("_class")
             .to_owned();
+        let name = emitted_name.unwrap_or(&source_name).to_owned();
         self.writer.write("var ");
         self.writer.write(&name);
         self.writer.write(" = ");
-        self.emit_downlevel_class_value(data, &name, false)?;
+        self.emit_downlevel_class_value(data, &source_name, false)?;
         self.writer.write(";");
         if self.commonjs_class_export_precedes_static_initializers(data)
             && let Some(name) = data.name
@@ -59235,6 +59323,12 @@ impl Printer<'_> {
         name: &str,
         factory_only: bool,
     ) -> Result<(), EmitError> {
+        let legacy_decorated_capture = data
+            .name
+            .and_then(|name| self.arena.get(name))
+            .and_then(|name| name.parent)
+            .and_then(|class| self.legacy_decorated_class_captures.get(&class))
+            .cloned();
         let base = self.class_base_expression(data)?;
         let base_is_null = base.is_some_and(|base| {
             self.arena
@@ -59550,6 +59644,14 @@ impl Printer<'_> {
             self.writer.newline();
         }
 
+        if let Some(capture) = legacy_decorated_capture.as_deref() {
+            self.writer.write(capture);
+            self.writer.write(" = ");
+            self.writer.write(name);
+            self.writer.write(";");
+            self.writer.newline();
+        }
+
         if let Some(class_name) = data.name {
             let declarations = self.private_declarations_for_class(class_name);
             if !declarations.is_empty() {
@@ -59841,6 +59943,12 @@ impl Printer<'_> {
         self.class_static_this_capture = previous_static_this_capture;
         self.this_alias = previous_this_alias;
         static_result?;
+        if let Some(capture) = legacy_decorated_capture.as_deref() {
+            self.writer.write("var ");
+            self.writer.write(capture);
+            self.writer.write(";");
+            self.writer.newline();
+        }
         self.emit_downlevel_class_decorator_metadata_temps(data);
         self.emit_class_member_decorators(data)?;
         let decorators = self.class_decorator_expressions(data.modifiers.as_ref());

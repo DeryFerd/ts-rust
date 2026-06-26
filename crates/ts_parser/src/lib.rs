@@ -1407,7 +1407,7 @@ impl<'a> Parser<'a> {
                                 )
                     ) && (self.current.kind == SyntaxKind::Identifier
                         || self.current.kind.is_keyword());
-                if recovers_modifier_after_rest {
+                if recovers_modifier_after_rest || self.current.kind == SyntaxKind::AtToken {
                     self.error_current("Expected ','.");
                     continue;
                 }
@@ -14830,6 +14830,31 @@ mod tests {
             })
             .unwrap();
         assert!(parameter.modifiers.as_ref().is_some_and(|modifiers| {
+            modifiers.list.nodes.iter().any(|modifier| {
+                result
+                    .arena
+                    .get(*modifier)
+                    .is_some_and(|modifier| modifier.kind == SyntaxKind::Decorator)
+            })
+        }));
+    }
+
+    #[test]
+    fn recovers_parameter_decorators_after_accessibility_names() {
+        let result = parse_source_file("class C { constructor(public @dec value: number) {} }");
+        assert!(!result.diagnostics.is_empty());
+        let parameters = result
+            .arena
+            .iter()
+            .filter_map(|(_, node)| {
+                let NodeData::ParameterDeclaration(parameter) = &node.data else {
+                    return None;
+                };
+                Some(parameter)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(parameters.len(), 2);
+        assert!(parameters[1].modifiers.as_ref().is_some_and(|modifiers| {
             modifiers.list.nodes.iter().any(|modifier| {
                 result
                     .arena
