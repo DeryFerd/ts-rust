@@ -2329,6 +2329,7 @@ impl<'a> Parser<'a> {
             name = self.scanner.scan().kind;
         }
         if !(name == SyntaxKind::Identifier
+            || name == SyntaxKind::PrivateIdentifier
             || name.is_keyword()
             || matches!(
                 name,
@@ -10624,6 +10625,24 @@ mod tests {
                     Some(NodeData::PrivateIdentifier(_))
                 )
         ));
+    }
+
+    #[test]
+    fn parses_private_type_members() {
+        let result = parse_source_file(concat!(
+            "type A = { #value: string; #read(): string; }; ",
+            "interface B { #value: string; #read(): string; }",
+        ));
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert_eq!(source_statements(&result).len(), 2);
+        assert_eq!(
+            result
+                .arena
+                .iter()
+                .filter(|(_, node)| matches!(node.data, NodeData::PrivateIdentifier(_)))
+                .count(),
+            4
+        );
     }
 
     #[test]
