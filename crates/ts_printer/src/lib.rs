@@ -36563,6 +36563,14 @@ impl Printer<'_> {
                 Some(NodeData::ClassStaticBlockDeclaration(_))
             )
         });
+        if self.settings.experimental_decorators
+            && !has_static_block
+            && !self
+                .class_decorator_expressions(class.modifiers.as_ref())
+                .is_empty()
+        {
+            return;
+        }
         let has_runtime_static_field = members.iter().any(|member| {
             matches!(
                 self.arena.get(*member).map(|node| &node.data),
@@ -49685,10 +49693,19 @@ impl Printer<'_> {
         &mut self,
         data: &ts_ast::ClassDeclarationData,
     ) -> Result<(), EmitError> {
-        if self.settings.target < ScriptTarget::Es2015 || data.name.is_none() {
+        let Some(name) = data.name else {
             return self.emit_class(data);
+        };
+        if self.settings.target < ScriptTarget::Es2015 {
+            let previous_this_alias = self.this_alias.clone();
+            let previous_this_alias_scope = self.this_alias_scope;
+            self.this_alias = Some("(void 0)".to_owned());
+            self.this_alias_scope = self.arena.get(name).and_then(|node| node.parent);
+            let result = self.emit_class(data);
+            self.this_alias = previous_this_alias;
+            self.this_alias_scope = previous_this_alias_scope;
+            return result;
         }
-        let name = data.name.expect("decorated class name checked");
         let capture = self
             .arena
             .get(name)
@@ -49711,9 +49728,25 @@ impl Printer<'_> {
         self.writer.write("let ");
         self.emit_expression(name, 0)?;
         self.writer.write(" = ");
+        let previous_static_capture = self.class_static_this_capture.clone();
+        let previous_this_alias = self.this_alias.clone();
+        let previous_this_alias_scope = self.this_alias_scope;
+        let previous_super = self.downlevel_super_context.clone();
+        if self.settings.target < ScriptTarget::Es2022 {
+            self.class_static_this_capture = None;
+            self.this_alias = Some("(void 0)".to_owned());
+            self.this_alias_scope = self.arena.get(name).and_then(|node| node.parent);
+            if self.settings.target >= ScriptTarget::Es2015 {
+                self.downlevel_super_context = Some(("(void 0)".to_owned(), true));
+            }
+        }
         self.class_binding_terminator_before_lowering = true;
         let result = self.emit_class(data);
         self.class_binding_terminator_before_lowering = false;
+        self.class_static_this_capture = previous_static_capture;
+        self.this_alias = previous_this_alias;
+        self.this_alias_scope = previous_this_alias_scope;
+        self.downlevel_super_context = previous_super;
         result?;
         if let Some(symbol) = class_symbol {
             if let Some(previous) = previous_rewrite {
@@ -53544,13 +53577,32 @@ impl Printer<'_> {
                                 data, index,
                             )?;
                         }
+                        let use_define = self.settings.use_define_for_class_fields == Some(true);
+                        if use_define {
+                            self.writer.write("Object.defineProperty(");
+                        }
                         self.writer.write(name);
                         if !self.has_modifier(method.modifiers.as_ref(), SyntaxKind::StaticKeyword)
                         {
                             self.writer.write(".prototype");
                         }
-                        self.emit_downlevel_member_access(method.name)?;
-                        self.writer.write(" = ");
+                        if use_define {
+                            self.writer.write(", ");
+                            self.emit_downlevel_property_name(method.name)?;
+                            self.writer.write(", {");
+                            self.writer.newline();
+                            self.writer.indent += 1;
+                            self.writer.write("enumerable: false,");
+                            self.writer.newline();
+                            self.writer.write("configurable: true,");
+                            self.writer.newline();
+                            self.writer.write("writable: true,");
+                            self.writer.newline();
+                            self.writer.write("value: ");
+                        } else {
+                            self.emit_downlevel_member_access(method.name)?;
+                            self.writer.write(" = ");
+                        }
                         let is_async = self.has_modifier(
                             method.modifiers.as_ref(),
                             SyntaxKind::AsyncKeyword,
@@ -53580,7 +53632,13 @@ impl Printer<'_> {
                             self.emit_function_body(body)?;
                         }
                         self.downlevel_super_context = previous_super;
-                        self.writer.write(";");
+                        if use_define {
+                            self.writer.newline();
+                            self.writer.indent -= 1;
+                            self.writer.write("});");
+                        } else {
+                            self.writer.write(";");
+                        }
                         self.writer.newline();
                     }
                     NodeData::GetAccessorDeclaration(_) | NodeData::SetAccessorDeclaration(_) => {
@@ -53669,7 +53727,12 @@ impl Printer<'_> {
             self.writer.write(";");
             self.writer.newline();
         }
-        let captures_static_this = class_has_async_static_field(self.arena, data)
+        let legacy_decorated_class = self.settings.experimental_decorators
+            && !self
+                .class_decorator_expressions(data.modifiers.as_ref())
+                .is_empty();
+        let captures_static_this = !legacy_decorated_class
+            && (class_has_async_static_field(self.arena, data)
             || data.members.nodes.iter().any(|member| {
                 let static_context = match self.arena.get(*member).map(|node| &node.data) {
                     Some(NodeData::ClassStaticBlockDeclaration(_)) => true,
@@ -53682,32 +53745,9 @@ impl Printer<'_> {
                     self.node_is_within(candidate, *member)
                         && matches!(node.kind, SyntaxKind::ThisKeyword | SyntaxKind::SuperKeyword)
                 })
-            });
-        let static_this_capture = captures_static_this.then(|| {
-            let class_id = data
-                .name
-                .and_then(|name| self.arena.get(name).and_then(|node| node.parent))
-                .or_else(|| {
-                    data.members
-                        .nodes
-                        .first()
-                        .and_then(|member| self.arena.get(*member))
-                        .and_then(|node| node.parent)
-                });
-            let claimed = class_id.map_or_else(HashSet::new, |class_id| {
-                self.class_expression_temps
-                    .iter()
-                    .filter(|(class_expression, _)| {
-                        self.node_is_within(class_id, **class_expression)
-                    })
-                    .map(|(_, temp)| temp.clone())
-                    .collect::<HashSet<_>>()
-            });
-            class_id.map_or_else(
-                || generated_temp_name(0).unwrap_or_else(|| "_a".to_owned()),
-                |class_id| self.generate_block_temp(class_id, &claimed),
-            )
-        });
+            }));
+        let static_this_capture =
+            captures_static_this.then(|| self.generated_names.generate_temp());
         if let Some(static_this_capture) = static_this_capture.as_deref() {
             self.writer.write("var ");
             self.writer.write(static_this_capture);
@@ -53722,7 +53762,6 @@ impl Printer<'_> {
         let previous_this_alias = self.this_alias.clone();
         let previous_static_this_capture = self.class_static_this_capture.clone();
         if let Some(static_this_capture) = static_this_capture.as_ref() {
-            self.this_alias = Some(static_this_capture.clone());
             self.class_static_this_capture = Some(static_this_capture.clone());
         }
         let previous_static_super = super_capture
@@ -53981,7 +54020,13 @@ impl Printer<'_> {
             NodeData::Identifier(name) => write_quoted(&mut self.writer, &name.text),
             NodeData::StringLiteral(name) => write_quoted(&mut self.writer, &name.text),
             NodeData::NumericLiteral(name) => write_quoted(&mut self.writer, &name.text),
-            NodeData::ComputedPropertyName(name) => self.emit_expression(name.expression, 0)?,
+            NodeData::ComputedPropertyName(computed) => {
+                if let Some(temp) = self.computed_property_temps.get(&name) {
+                    self.writer.write(temp);
+                } else {
+                    self.emit_expression(computed.expression, 0)?;
+                }
+            }
             _ => self.emit_expression(name, 0)?,
         }
         Ok(())
@@ -54165,9 +54210,8 @@ impl Printer<'_> {
 
     fn body_has_downlevel_arrow_this(&self, body: NodeId) -> bool {
         self.arena.iter().any(|(id, node)| {
-            let lexical_this = node.kind == SyntaxKind::ThisKeyword
-                || (node.kind == SyntaxKind::SuperKeyword
-                    && self
+            let lexical_super = node.kind == SyntaxKind::SuperKeyword
+                && self
                         .arena
                         .get(id)
                         .and_then(|node| node.parent)
@@ -54185,7 +54229,8 @@ impl Printer<'_> {
                                 self.arena.get(call).map(|node| &node.data),
                                 Some(NodeData::CallExpression(data)) if data.expression == access
                             )
-                        }));
+                        });
+            let lexical_this = node.kind == SyntaxKind::ThisKeyword || lexical_super;
             if !lexical_this {
                 return false;
             }
@@ -54207,8 +54252,24 @@ impl Printer<'_> {
                         inside_arrow = true;
                         in_static_field_initializer = true;
                     }
+                    Some(NodeData::ClassDeclaration(class))
+                        if self.settings.experimental_decorators
+                            && !self
+                                .class_decorator_expressions(class.modifiers.as_ref())
+                                .is_empty() =>
+                    {
+                        return false;
+                    }
+                    Some(NodeData::ClassExpression(class))
+                        if self.settings.experimental_decorators
+                            && !self
+                                .class_decorator_expressions(class.modifiers.as_ref())
+                                .is_empty() =>
+                    {
+                        return false;
+                    }
                     Some(NodeData::ClassDeclaration(_) | NodeData::ClassExpression(_))
-                        if in_static_field_initializer => {}
+                        if in_static_field_initializer && lexical_super => {}
                     Some(
                         NodeData::FunctionDeclaration(_)
                             | NodeData::FunctionExpression(_)
@@ -66887,6 +66948,36 @@ mod tests {
         .unwrap()
     }
 
+    fn emit_with_legacy_decorators_and_define(
+        source: &str,
+        target: ScriptTarget,
+    ) -> super::EmitResult {
+        let parsed = parse_source_file(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        emit_source_file_with_settings(
+            &parsed.arena,
+            parsed.source_file,
+            "input.ts",
+            source,
+            PrinterSettings {
+                always_strict: false,
+                target,
+                module: ModuleKind::None,
+                jsx: JsxEmit::Preserve,
+                emit_javascript: true,
+                emit_declarations: false,
+                source_map: false,
+                inline_source_map: false,
+                import_helpers: false,
+                no_emit_helpers: false,
+                experimental_decorators: true,
+                remove_comments: false,
+                use_define_for_class_fields: Some(true),
+            },
+        )
+        .unwrap()
+    }
+
     fn emit_metadata_with(source: &str, strict_null_checks: bool) -> super::EmitResult {
         let parsed = parse_source_file(source);
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
@@ -75486,6 +75577,30 @@ class Board {
         assert!(output.contains("static instance = new C_1();"), "{output}");
         assert!(output.contains("use(C_1);"), "{output}");
         assert!(output.contains("C = C_1 = __decorate(["), "{output}");
+    }
+
+    #[test]
+    fn preserves_legacy_decorated_static_this_with_define_semantics() {
+        let source = concat!(
+            "declare const dec: any; ",
+            "@dec class C { static a = 1; static b = this.a; } ",
+            "@dec class D extends C { static c = 2; static d = this.c; ",
+            "static e = super.a + this.c; static foo() { return this.c; } } ",
+            "class CC { static a = 1; static b = this.a; } ",
+            "class DD extends CC { static c = 2; static d = this.c; }",
+        );
+        let es5 = emit_with_legacy_decorators_and_define(source, ScriptTarget::Es5).code;
+        assert!(es5.contains("value: (void 0).c"), "{es5}");
+        assert!(es5.contains("value: _super.a + (void 0).c"), "{es5}");
+        assert!(es5.contains("Object.defineProperty(D, \"foo\", {"), "{es5}");
+        assert!(es5.contains("value: function () { return this.c; }"), "{es5}");
+        assert!(es5.contains("_a = CC;"), "{es5}");
+        assert!(es5.contains("_b = DD;"), "{es5}");
+
+        let es2015 =
+            emit_with_legacy_decorators_and_define(source, ScriptTarget::Es2015).code;
+        assert!(es2015.contains("value: (void 0).c"), "{es2015}");
+        assert!(es2015.contains("value: (void 0).a + (void 0).c"), "{es2015}");
     }
 
     #[test]
