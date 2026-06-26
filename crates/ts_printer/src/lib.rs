@@ -47272,6 +47272,28 @@ impl Printer<'_> {
         {
             return self.emit_es5_async_comma_return(binary, state, case);
         }
+        if let NodeData::ReturnStatement(return_statement) = &node.data
+            && let Some(outer_await) = return_statement.expression
+            && let Some((inner_await, inner_expression)) =
+                self.es5_async_nested_await(outer_await)
+            && let Some(NodeData::AwaitExpression(outer)) =
+                self.arena.get(outer_await).map(|node| &node.data)
+        {
+            let outer_expression = outer.expression;
+            self.emit_es5_async_yield(inner_expression, case, true)?;
+            let previous_inner = self
+                .es5_async_expression_rewrites
+                .insert(inner_await, format!("{state}.sent()"));
+            self.writer.remove_trailing_spaces();
+            self.emit_es5_async_yield(outer_expression, case, true)?;
+            let previous_outer = self
+                .es5_async_expression_rewrites
+                .insert(outer_await, format!("{state}.sent()"));
+            self.emit_es5_generator_return(return_statement.expression)?;
+            self.restore_es5_async_expression_rewrite(outer_await, previous_outer);
+            self.restore_es5_async_expression_rewrite(inner_await, previous_inner);
+            return Ok(());
+        }
         if let NodeData::ExpressionStatement(expression) = &node.data
             && let Some(temps) = self
                 .es5_async_binary_temps
@@ -50735,6 +50757,26 @@ impl Printer<'_> {
             return None;
         };
         Some((await_id, awaited.expression))
+    }
+
+    fn es5_async_nested_await(&self, outer_await: NodeId) -> Option<(NodeId, NodeId)> {
+        let NodeData::AwaitExpression(outer) = &self.arena.get(outer_await)?.data else {
+            return None;
+        };
+        let container = self.nearest_function_like_container(outer_await);
+        self.arena
+            .iter()
+            .filter_map(|(id, node)| {
+                let NodeData::AwaitExpression(awaited) = &node.data else {
+                    return None;
+                };
+                (id != outer_await
+                    && self.node_is_descendant_of(id, outer.expression)
+                    && self.nearest_function_like_container(id) == container)
+                    .then_some((node.range.start, id, awaited.expression))
+            })
+            .min_by_key(|(start, _, _)| *start)
+            .map(|(_, id, expression)| (id, expression))
     }
 
     fn es5_async_conditional_assignment(&self, statement: NodeId) -> Option<(NodeId, NodeId)> {
@@ -64862,9 +64904,21 @@ impl Printer<'_> {
         });
         self.writer.write("Promise.resolve(");
         if !inlineable {
-            self.writer.write("`${");
-            self.emit_expression(argument.expect("non-inlineable import has an argument"), 0)?;
-            self.writer.write("}`");
+            if self.settings.target < ScriptTarget::Es2015 {
+                self.writer.write("\"\".concat(");
+                self.emit_expression(
+                    argument.expect("non-inlineable import has an argument"),
+                    0,
+                )?;
+                self.writer.write(")");
+            } else {
+                self.writer.write("`${");
+                self.emit_expression(
+                    argument.expect("non-inlineable import has an argument"),
+                    0,
+                )?;
+                self.writer.write("}`");
+            }
         }
         self.writer.write(").then(");
         if self.settings.target < ScriptTarget::Es2015 {
