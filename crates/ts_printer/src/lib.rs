@@ -60021,7 +60021,14 @@ impl Printer<'_> {
         self.this_alias = previous_this_alias;
         static_result?;
         self.emit_downlevel_class_decorator_metadata_temps(data);
-        self.emit_class_member_decorators(data)?;
+        let previous_decorator_super = super_capture
+            .as_ref()
+            .and_then(|capture| self.downlevel_super_context.replace((capture.clone(), true)));
+        let member_decorator_result = self.emit_class_member_decorators(data);
+        if super_capture.is_some() {
+            self.downlevel_super_context = previous_decorator_super;
+        }
+        member_decorator_result?;
         let decorators = self.class_decorator_expressions(data.modifiers.as_ref());
         if !decorators.is_empty()
             || self.settings.experimental_decorators
