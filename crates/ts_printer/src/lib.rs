@@ -39448,7 +39448,11 @@ impl Printer<'_> {
             Vec::new()
         };
         class_declarations.sort_by_key(|(start, _, _)| *start);
-        let mut claimed = self.generated_names.used.clone();
+        let mut claimed = if is_function_body {
+            HashSet::new()
+        } else {
+            self.generated_names.used.clone()
+        };
         let mut temps = Vec::new();
         let mut private_receiver_temps = Vec::new();
         let mut declaration_index = 0;
@@ -65576,6 +65580,15 @@ impl Printer<'_> {
                         self.emit_expression(data.argument_expression, 0)?;
                         self.writer.write("]");
                     }
+                } else if data.question_dot_token.is_none()
+                    && self.settings.target < ScriptTarget::Es2020
+                    && self.property_access_chain_has_optional(data.expression)
+                {
+                    self.emit_downlevel_optional_property_chain_with_element(
+                        data.expression,
+                        data.argument_expression,
+                        parent_precedence,
+                    )?;
                 } else if data.question_dot_token.is_some() && self.settings.target < ScriptTarget::Es2020
                 {
                     self.emit_downlevel_optional_element(
@@ -70725,6 +70738,28 @@ impl Printer<'_> {
         expression: NodeId,
         parent_precedence: u8,
     ) -> Result<(), EmitError> {
+        self.emit_downlevel_optional_property_chain_worker(expression, None, parent_precedence)
+    }
+
+    fn emit_downlevel_optional_property_chain_with_element(
+        &mut self,
+        expression: NodeId,
+        argument: NodeId,
+        parent_precedence: u8,
+    ) -> Result<(), EmitError> {
+        self.emit_downlevel_optional_property_chain_worker(
+            expression,
+            Some(argument),
+            parent_precedence,
+        )
+    }
+
+    fn emit_downlevel_optional_property_chain_worker(
+        &mut self,
+        expression: NodeId,
+        trailing_element: Option<NodeId>,
+        parent_precedence: u8,
+    ) -> Result<(), EmitError> {
         let mut optional = expression;
         let receiver;
         let question_dot_token;
@@ -70800,6 +70835,11 @@ impl Printer<'_> {
                 self.emit_binary_comment_trivia(question_dot_range.end.get(), name_start);
             }
             self.emit_expression(name, 18)?;
+        }
+        if let Some(argument) = trailing_element {
+            self.writer.write("[");
+            self.emit_expression(argument, 0)?;
+            self.writer.write("]");
         }
         if wrap {
             self.writer.write(")");
@@ -79696,6 +79736,30 @@ mod tests {
             result.code,
             "var value = source === null || source === void 0 ? void 0 : source[key];\nvar merged = Object.assign({ a: 1 }, extra, { b: 2 });\nvar list = [].concat([], [0], items, [3]);\n"
         );
+    }
+
+    #[test]
+    fn keeps_trailing_element_access_inside_downlevel_optional_chain() {
+        let result = emit_with(
+            "o?.x[b = 1];",
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        );
+        assert_eq!(
+            result.code,
+            "o === null || o === void 0 ? void 0 : o.x[b = 1];\n"
+        );
+    }
+
+    #[test]
+    fn restarts_downlevel_optional_temps_in_function_scopes() {
+        let result = emit_with(
+            "arr[index]?.tag; function f(value) { value.item?.tag; }",
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        );
+        assert_eq!(result.code.matches("var _a;").count(), 2, "{}", result.code);
+        assert!(!result.code.contains("var _b;"), "{}", result.code);
     }
 
     #[test]
