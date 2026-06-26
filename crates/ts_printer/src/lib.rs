@@ -54905,6 +54905,14 @@ impl Printer<'_> {
         let mut previous_was_lowered_field = false;
         for (member_index, member) in data.members.nodes.iter().enumerate() {
             let node = self.node(*member)?.clone();
+            let leading_comment_start = previous_end;
+            let current_is_lowered_auto_accessor = matches!(
+                &node.data,
+                NodeData::PropertyDeclaration(property)
+                    if self.property_is_auto_accessor(property)
+                        && !(self.settings.target >= ScriptTarget::EsNext
+                            && !self.class_requires_assignment_field_lowering(data))
+            );
             let current_is_inline_static_field = lower_fields
                 && self.settings.target >= ScriptTarget::Es2022
                 && self.settings.use_define_for_class_fields == Some(false)
@@ -54978,7 +54986,7 @@ impl Printer<'_> {
                     previous_end,
                     node.range.start.get(),
                     previous_emitted,
-                    current_emitted,
+                    current_emitted && !current_is_lowered_auto_accessor,
                 );
             } else if !current_is_lowered_field && !previous_was_lowered_field {
                 self.discard_source_comments_between(previous_end, node.range.start.get());
@@ -55169,6 +55177,8 @@ impl Printer<'_> {
                     self.emit_native_auto_accessor(
                         data,
                         property,
+                        leading_comment_start,
+                        node.range.start.get(),
                         node.range.end.get(),
                         comment_end,
                     )?;
@@ -55229,6 +55239,13 @@ impl Printer<'_> {
                     {
                         self.writer.write(" = ");
                         self.emit_expression(initializer, 1)?;
+                        let initializer_end = self.node(initializer)?.range.end.get();
+                        self.emit_inline_block_comments_between(
+                            initializer_end,
+                            node.range.end.get(),
+                            true,
+                        );
+                        self.writer.remove_trailing_spaces();
                     }
                     self.writer.write(";");
                     if self.class_private_name_is_duplicate(data, property.name) {
@@ -56702,6 +56719,8 @@ impl Printer<'_> {
         &mut self,
         class: &ts_ast::ClassDeclarationData,
         property: &ts_ast::PropertyDeclarationData,
+        leading_comment_start: u32,
+        leading_comment_end: u32,
         comment_start: u32,
         comment_end: u32,
     ) -> Result<(), EmitError> {
@@ -56728,6 +56747,12 @@ impl Printer<'_> {
             }
             self.writer.write(";");
             self.writer.newline();
+            self.emit_source_comments_between_with_ownership(
+                leading_comment_start,
+                leading_comment_end,
+                true,
+                true,
+            );
             if static_ {
                 self.writer.write("static ");
             }
@@ -56746,7 +56771,12 @@ impl Printer<'_> {
             self.writer.write(&storage);
             self.writer.write("; }");
             let comment_count = self.emitted_source_comments.len();
-            self.emit_source_comments_between_with_trailing(comment_start, comment_end, true);
+            self.emit_source_comments_between_with_ownership(
+                comment_start,
+                comment_end,
+                true,
+                false,
+            );
             if self.emitted_source_comments.len() == comment_count {
                 self.writer.newline();
             }
@@ -56777,6 +56807,12 @@ impl Printer<'_> {
         let capture = static_
             .then(|| self.auto_accessor_class_capture_name(class))
             .flatten();
+        self.emit_source_comments_between_with_ownership(
+            leading_comment_start,
+            leading_comment_end,
+            true,
+            true,
+        );
         if static_ {
             self.writer.write("static ");
         }
@@ -56796,7 +56832,12 @@ impl Printer<'_> {
         }
         self.writer.write("); }");
         let comment_count = self.emitted_source_comments.len();
-        self.emit_source_comments_between_with_trailing(comment_start, comment_end, true);
+        self.emit_source_comments_between_with_ownership(
+            comment_start,
+            comment_end,
+            true,
+            false,
+        );
         if self.emitted_source_comments.len() == comment_count {
             self.writer.newline();
         }
@@ -59590,7 +59631,7 @@ impl Printer<'_> {
                 || self.property_is_auto_accessor(property)
                 || property.initializer.is_some()
                 || self.settings.use_define_for_class_fields == Some(true);
-            if emits_field {
+            if emits_field && !self.property_is_auto_accessor(property) {
                 let leading_start = index
                     .checked_sub(1)
                     .and_then(|previous| data.members.nodes.get(previous))
@@ -77047,6 +77088,56 @@ mod tests {
         )
         .code;
         assert!(!private_only.contains("constructor()"), "{private_only}");
+    }
+
+    #[test]
+    fn places_auto_accessor_leading_comments_after_storage_initialization() {
+        let source = concat!(
+            "class A {\n",
+            "// static storage\n",
+            "static accessor x = 1;\n",
+            "// instance storage\n",
+            "accessor y = 2; }",
+        );
+        let es2022 = emit_with(source, ScriptTarget::Es2022, ModuleKind::None).code;
+        let static_storage = es2022.find("static #x_accessor_storage = 1;").unwrap();
+        let static_comment = es2022.find("// static storage").unwrap();
+        let static_getter = es2022.find("static get x()").unwrap();
+        let instance_storage = es2022.find("#y_accessor_storage = 2;").unwrap();
+        let instance_comment = es2022.find("// instance storage").unwrap();
+        let instance_getter = es2022.find("get y()").unwrap();
+        assert!(
+            static_storage < static_comment
+                && static_comment < static_getter
+                && instance_storage < instance_comment
+                && instance_comment < instance_getter,
+            "{es2022}"
+        );
+
+        let es2017 = emit_with(source, ScriptTarget::Es2017, ModuleKind::None).code;
+        let instance_initializer = es2017
+            .find("_A_y_accessor_storage.set(this, 2);")
+            .unwrap();
+        let instance_comment = es2017.find("// instance storage").unwrap();
+        let instance_getter = es2017.find("get y()").unwrap();
+        assert!(
+            instance_initializer < instance_comment && instance_comment < instance_getter,
+            "{es2017}"
+        );
+    }
+
+    #[test]
+    fn preserves_inline_comments_after_native_class_field_initializers() {
+        let output = emit_with(
+            "class C { value = this.other /* possibly undefined */; }",
+            ScriptTarget::EsNext,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(
+            output.contains("value = this.other /* possibly undefined */;"),
+            "{output}"
+        );
     }
 
     #[test]
