@@ -4334,6 +4334,7 @@ impl<'a> Parser<'a> {
     fn parse_named_imports(&mut self) -> NodeId {
         let start = self.consume().range.start;
         let mut elements = Vec::new();
+        let mut has_trailing_comma = false;
         while self.current.kind != SyntaxKind::CloseBraceToken
             && self.current.kind != SyntaxKind::EndOfFile
         {
@@ -4395,11 +4396,18 @@ impl<'a> Parser<'a> {
                 break;
             }
             self.bump();
+            has_trailing_comma = self.current.kind == SyntaxKind::CloseBraceToken;
         }
-        if self.current.kind == SyntaxKind::Unknown {
-            // A malformed escaped local binding can leave several scanner
-            // tokens behind. Keep them inside the import clause so they do not
-            // become unrelated top-level expression statements.
+        if !matches!(
+            self.current.kind,
+            SyntaxKind::CloseBraceToken | SyntaxKind::EndOfFile
+        ) && !(self.current.kind == SyntaxKind::FromKeyword
+            && self.next_token_kind() == SyntaxKind::StringLiteral)
+        {
+            // A malformed local binding can leave several scanner tokens behind.
+            // Keep them inside the import clause so they do not become unrelated
+            // top-level expression statements, while preserving missing-`}`
+            // recovery immediately before a `from "module"` clause.
             while !matches!(
                 self.current.kind,
                 SyntaxKind::CloseBraceToken | SyntaxKind::EndOfFile
@@ -4420,7 +4428,7 @@ impl<'a> Parser<'a> {
                 elements: NodeList {
                     range: TextRange::new(start, end),
                     nodes: elements.clone(),
-                    has_trailing_comma: false,
+                    has_trailing_comma,
                 },
                 facts: 0,
             })),
@@ -4697,6 +4705,7 @@ impl<'a> Parser<'a> {
     fn parse_named_exports(&mut self) -> NodeId {
         let start = self.consume().range.start;
         let mut elements = Vec::new();
+        let mut has_trailing_comma = false;
         while self.current.kind != SyntaxKind::CloseBraceToken
             && self.current.kind != SyntaxKind::EndOfFile
         {
@@ -4746,6 +4755,7 @@ impl<'a> Parser<'a> {
                 break;
             }
             self.bump();
+            has_trailing_comma = self.current.kind == SyntaxKind::CloseBraceToken;
         }
         let end = if self.current.kind == SyntaxKind::CloseBraceToken {
             self.consume().range.end
@@ -4760,7 +4770,7 @@ impl<'a> Parser<'a> {
                 elements: NodeList {
                     range: TextRange::new(start, end),
                     nodes: elements.clone(),
-                    has_trailing_comma: false,
+                    has_trailing_comma,
                 },
                 facts: 0,
             })),
@@ -7434,6 +7444,14 @@ impl<'a> Parser<'a> {
                 })),
                 &[],
             );
+        }
+        if self.current.kind == SyntaxKind::StringLiteral {
+            self.error_current(message);
+            let name = self.parse_string_literal();
+            if let Some(node) = self.arena.get_mut(name) {
+                node.flags.0 |= NODE_FLAG_HAS_ERROR.0;
+            }
+            return name;
         }
         let position = self.current.range.start;
         self.error_current(message);
@@ -11395,6 +11413,49 @@ mod tests {
             result.arena.get(block.statements.nodes[0]).unwrap().data,
             NodeData::ExportAssignment(_)
         ));
+    }
+
+    #[test]
+    fn parses_quoted_type_only_module_names_without_runtime_bindings() {
+        let result = parse_source_file(concat!(
+            "export type * as \"<C>\" from \"m\";",
+            "import { type \"<C>\" as type_c } from \"m\";",
+        ));
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let statements = source_statements(&result);
+        let NodeData::ExportDeclaration(export) =
+            &result.arena.get(statements[0]).unwrap().data
+        else {
+            panic!("expected export declaration");
+        };
+        assert!(export.is_type_only);
+        let NodeData::ImportDeclaration(import) =
+            &result.arena.get(statements[1]).unwrap().data
+        else {
+            panic!("expected import declaration");
+        };
+        let NodeData::ImportClause(clause) = &result
+            .arena
+            .get(import.import_clause.unwrap())
+            .unwrap()
+            .data
+        else {
+            panic!("expected import clause");
+        };
+        let NodeData::NamedImports(imports) = &result
+            .arena
+            .get(clause.named_bindings.unwrap())
+            .unwrap()
+            .data
+        else {
+            panic!("expected named imports");
+        };
+        let NodeData::ImportSpecifier(specifier) =
+            &result.arena.get(imports.elements.nodes[0]).unwrap().data
+        else {
+            panic!("expected import specifier");
+        };
+        assert!(specifier.is_type_only);
     }
 
     #[test]

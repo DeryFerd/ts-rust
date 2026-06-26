@@ -646,7 +646,7 @@ pub fn emit_source_file_with_context(
             .generated_names
             .used
             .extend(printer.commonjs_default_imports.values().cloned());
-        let (temps, rewrites, text_rewrites) = commonjs_named_imports(
+        let (mut temps, mut rewrites, mut text_rewrites) = commonjs_named_imports(
             arena,
             &data.statements,
             context.bindings,
@@ -656,10 +656,80 @@ pub fn emit_source_file_with_context(
             &printer.commonjs_star_import_temps,
             context.verbatim_module_syntax,
         );
+        let mut source_order_names = GeneratedNames::new(arena);
+        source_order_names
+            .used
+            .extend(printer.commonjs_star_import_temps.values().cloned());
+        source_order_names
+            .used
+            .extend(printer.commonjs_default_imports.values().cloned());
+        let mut temp_renames = Vec::new();
+        for statement in &data.statements.nodes {
+            match arena.get(*statement).map(|node| &node.data) {
+                Some(NodeData::ImportDeclaration(import)) => {
+                    let Some(clause) = import.import_clause else {
+                        continue;
+                    };
+                    let Some(old) = temps.get_mut(&clause) else {
+                        continue;
+                    };
+                    let new = source_order_names
+                        .generate(&commonjs_module_temp_base(arena, import.module_specifier));
+                    if *old != new {
+                        temp_renames.push((old.clone(), new.clone()));
+                        *old = new;
+                    }
+                }
+                Some(NodeData::ExportDeclaration(export)) if !export.is_type_only => {
+                    let Some(module) = export.module_specifier else {
+                        continue;
+                    };
+                    let Some(NodeData::NamedExports(exports)) = export
+                        .export_clause
+                        .and_then(|clause| arena.get(clause))
+                        .map(|node| &node.data)
+                    else {
+                        continue;
+                    };
+                    if exports.elements.nodes.iter().all(|specifier| {
+                        matches!(
+                            arena.get(*specifier).map(|node| &node.data),
+                            Some(NodeData::ExportSpecifier(specifier))
+                                if specifier.is_type_only
+                        )
+                    }) {
+                        continue;
+                    }
+                    let temp = source_order_names
+                        .generate(&commonjs_module_temp_base(arena, module));
+                    printer.commonjs_reexport_temps.insert(*statement, temp);
+                }
+                _ => {}
+            }
+        }
+        temp_renames.sort_by_key(|(old, _)| std::cmp::Reverse(old.len()));
+        for value in rewrites
+            .values_mut()
+            .chain(text_rewrites.values_mut())
+        {
+            if let Some((new, suffix)) = temp_renames.iter().find_map(|(old, new)| {
+                value
+                    .strip_prefix(old)
+                    .map(|suffix| (new.clone(), suffix.to_owned()))
+            }) {
+                *value = format!("{new}{suffix}");
+            }
+        }
         printer
             .generated_names
             .used
             .extend(temps.values().cloned());
+        printer.generated_names.used.extend(
+            printer
+                .commonjs_reexport_temps
+                .values()
+                .cloned(),
+        );
         printer.commonjs_named_import_temps = temps;
         printer.commonjs_named_import_text_rewrites = star_text_rewrites;
         printer
@@ -667,29 +737,6 @@ pub fn emit_source_file_with_context(
             .extend(text_rewrites);
         printer.identifier_rewrites.extend(star_rewrites);
         printer.identifier_rewrites.extend(rewrites);
-        for statement in &data.statements.nodes {
-            let Some(NodeData::ExportDeclaration(export)) =
-                arena.get(*statement).map(|node| &node.data)
-            else {
-                continue;
-            };
-            let Some(module) = export.module_specifier else {
-                continue;
-            };
-            if !matches!(
-                export
-                    .export_clause
-                    .and_then(|clause| arena.get(clause))
-                    .map(|node| &node.data),
-                Some(NodeData::NamedExports(_))
-            ) {
-                continue;
-            }
-            let temp = printer
-                .generated_names
-                .generate(&commonjs_module_temp_base(arena, module));
-            printer.commonjs_reexport_temps.insert(*statement, temp);
-        }
     }
     printer.prepare_es5_block_scoped_rewrites();
     let has_explicit_module_indicator = data.statements.nodes.iter().any(|statement| {
@@ -981,9 +1028,20 @@ pub fn emit_source_file_with_context(
                 | ModuleKind::Preserve
         );
     let has_empty_export = data.statements.nodes.iter().any(|statement| {
-        arena
-            .get(*statement)
-            .is_some_and(|statement| export_declaration_is_empty(arena, statement))
+        let Some(NodeData::ExportDeclaration(export)) =
+            arena.get(*statement).map(|statement| &statement.data)
+        else {
+            return false;
+        };
+        !export.is_type_only
+            && export.module_specifier.is_none()
+            && matches!(
+                export.export_clause.and_then(|clause| arena.get(clause)),
+                Some(Node {
+                    data: NodeData::NamedExports(exports),
+                    ..
+                }) if exports.elements.nodes.is_empty()
+            )
     });
     let has_recovered_module_clause = data.statements.nodes.iter().any(|statement| {
         arena.get(*statement).is_some_and(|node| {
@@ -26836,8 +26894,17 @@ struct SystemDependency {
     storage_exports: Vec<(String, String)>,
     namespace_exports: Vec<String>,
     named_exports: Vec<(String, String)>,
+    setter_operations: Vec<SystemSetterOperation>,
     parameter: String,
     export_star: bool,
+}
+
+enum SystemSetterOperation {
+    Storage(String),
+    StorageExport(String, String),
+    NamespaceExport(String),
+    NamedExports(Vec<(String, String)>),
+    ExportStar,
 }
 
 struct AmdRuntimeDependency {
@@ -27311,6 +27378,7 @@ impl SystemModulePlan {
                 storage_exports: Vec::new(),
                 namespace_exports: Vec::new(),
                 named_exports: Vec::new(),
+                setter_operations: vec![SystemSetterOperation::Storage(storage.clone())],
                 parameter,
                 export_star: false,
             });
@@ -27334,7 +27402,22 @@ impl SystemModulePlan {
                     .map(|node| &node.data)
                 && let Some(exported_name) = declaration_name_text(arena, namespace.name)
             {
-                let parameter = if exported_name == "default" {
+                if let Some(dependency) = dependencies
+                    .iter_mut()
+                    .find(|dependency| dependency.specifier == specifier)
+                {
+                    push_unique(
+                        &mut dependency.namespace_exports,
+                        exported_name,
+                    );
+                    dependency.setter_operations.push(
+                        SystemSetterOperation::NamespaceExport(exported_name.to_owned()),
+                    );
+                    continue;
+                }
+                let parameter = if exported_name == "default"
+                    || !is_identifier_text(exported_name)
+                {
                     let base = names.generate(&module_identifier_base(specifier));
                     names.generate(&base)
                 } else {
@@ -27346,6 +27429,9 @@ impl SystemModulePlan {
                     storage_exports: Vec::new(),
                     namespace_exports: vec![exported_name.to_owned()],
                     named_exports: Vec::new(),
+                    setter_operations: vec![SystemSetterOperation::NamespaceExport(
+                        exported_name.to_owned(),
+                    )],
                     parameter,
                     export_star: false,
                 });
@@ -27388,6 +27474,9 @@ impl SystemModulePlan {
                     .iter_mut()
                     .find(|dependency| dependency.specifier == specifier)
                 {
+                    dependency
+                        .setter_operations
+                        .push(SystemSetterOperation::NamedExports(named_exports.clone()));
                     dependency.named_exports.extend(named_exports);
                 } else {
                     let base = module_identifier_base(specifier);
@@ -27398,6 +27487,9 @@ impl SystemModulePlan {
                         storages: Vec::new(),
                         storage_exports: Vec::new(),
                         namespace_exports: Vec::new(),
+                        setter_operations: vec![SystemSetterOperation::NamedExports(
+                            named_exports.clone(),
+                        )],
                         named_exports,
                         parameter,
                         export_star: false,
@@ -27417,6 +27509,9 @@ impl SystemModulePlan {
                     .find(|dependency| dependency.specifier == specifier)
                 {
                     dependency.export_star = true;
+                    dependency
+                        .setter_operations
+                        .push(SystemSetterOperation::ExportStar);
                 } else {
                     let base = module_identifier_base(specifier);
                     let storage = names.generate(&base);
@@ -27427,6 +27522,7 @@ impl SystemModulePlan {
                         storage_exports: Vec::new(),
                         namespace_exports: Vec::new(),
                         named_exports: Vec::new(),
+                        setter_operations: vec![SystemSetterOperation::ExportStar],
                         parameter,
                         export_star: true,
                     });
@@ -27463,6 +27559,9 @@ impl SystemModulePlan {
                             .find(|dependency| dependency.specifier == specifier)
                         {
                             existing.storages.push(local.to_owned());
+                            existing
+                                .setter_operations
+                                .push(SystemSetterOperation::Storage(local.to_owned()));
                             if declaration_has_modifier(
                                 arena,
                                 node,
@@ -27471,6 +27570,12 @@ impl SystemModulePlan {
                                 existing
                                     .storage_exports
                                     .push((existing.parameter.clone(), local.to_owned()));
+                                existing.setter_operations.push(
+                                    SystemSetterOperation::StorageExport(
+                                        existing.parameter.clone(),
+                                        local.to_owned(),
+                                    ),
+                                );
                             }
                             push_unique(&mut hoisted_names, local);
                             if let Some(symbol) = bindings.node_symbols.get(&import.name) {
@@ -27492,12 +27597,21 @@ impl SystemModulePlan {
                             } else {
                                 Vec::new()
                             };
+                            let mut setter_operations =
+                                vec![SystemSetterOperation::Storage(local.to_owned())];
+                            if let Some((storage, exported)) = storage_exports.first() {
+                                setter_operations.push(SystemSetterOperation::StorageExport(
+                                    storage.clone(),
+                                    exported.clone(),
+                                ));
+                            }
                             dependencies.push(SystemDependency {
                                 specifier: specifier.to_owned(),
                                 storages: vec![local.to_owned()],
                                 storage_exports,
                                 namespace_exports: Vec::new(),
                                 named_exports: Vec::new(),
+                                setter_operations,
                                 parameter,
                                 export_star: false,
                             });
@@ -27524,6 +27638,7 @@ impl SystemModulePlan {
                                 storage_exports: Vec::new(),
                                 namespace_exports: Vec::new(),
                                 named_exports: Vec::new(),
+                                setter_operations: Vec::new(),
                                 parameter: names.generate(""),
                                 export_star: false,
                             });
@@ -27556,6 +27671,9 @@ impl SystemModulePlan {
                         .find(|dependency| dependency.specifier == specifier)
                     {
                         existing.storages.push(storage.clone());
+                        existing
+                            .setter_operations
+                            .push(SystemSetterOperation::Storage(storage.clone()));
                     } else {
                         let parameter = names.generate(&storage);
                         dependencies.push(SystemDependency {
@@ -27564,6 +27682,9 @@ impl SystemModulePlan {
                             storage_exports: Vec::new(),
                             namespace_exports: Vec::new(),
                             named_exports: Vec::new(),
+                            setter_operations: vec![SystemSetterOperation::Storage(
+                                storage.clone(),
+                            )],
                             parameter,
                             export_star: false,
                         });
@@ -27597,7 +27718,7 @@ impl SystemModulePlan {
                                         insert_system_identifier_rewrite(
                                             bindings,
                                             *symbol,
-                                            &format!("{storage}.{imported}"),
+                                            &commonjs_import_access(&storage, imported),
                                             &mut identifier_rewrites,
                                         );
                                     }
@@ -31097,7 +31218,7 @@ impl Printer<'_> {
                                     } else if let Some(symbol) =
                                         self.bindings.node_symbols.get(&specifier.name)
                                     {
-                                        let rewrite = format!("{parameter}.{imported}");
+                                        let rewrite = commonjs_import_access(&parameter, imported);
                                         self.identifier_rewrites.insert(*symbol, rewrite.clone());
                                         if let Some(local) =
                                             declaration_name_text(self.arena, specifier.name)
@@ -31127,7 +31248,9 @@ impl Printer<'_> {
                             initializer.parameter == parameter
                                 && initializer.require_path.is_some()
                         }) {
-                            aliased_import_requires.push((parameter, path.to_owned()));
+                            self.generated_names.used.insert(parameter.clone());
+                            self.commonjs_named_import_temps
+                                .insert(clause_id, parameter);
                         }
                     } else if let Some(alias) = named_dependency_aliases.get(path) {
                         dependencies.push(AmdRuntimeDependency {
@@ -31151,6 +31274,21 @@ impl Printer<'_> {
                     let Some(path) = string_literal_text(self.arena, module) else {
                         continue;
                     };
+                    if export.export_clause.is_some_and(|clause| {
+                        matches!(
+                            self.arena.get(clause).map(|node| &node.data),
+                            Some(NodeData::NamedExports(exports))
+                                if exports.elements.nodes.iter().all(|specifier| {
+                                    matches!(
+                                        self.arena.get(*specifier).map(|node| &node.data),
+                                        Some(NodeData::ExportSpecifier(specifier))
+                                            if specifier.is_type_only
+                                    )
+                                })
+                        )
+                    }) {
+                        continue;
+                    }
                     let dependency_path = amd_import_dependency_path(
                         context
                             .amd_module_specifier_rewrites
@@ -31167,7 +31305,13 @@ impl Printer<'_> {
                             }
                             _ => None,
                         });
-                    let parameter = if namespace_export.is_some_and(|name| name != "default") {
+                    let umd_namespace_export = self.settings.module == ModuleKind::Umd
+                        && namespace_export.is_some();
+                    let parameter = if umd_namespace_export {
+                        String::new()
+                    } else if namespace_export
+                        .is_some_and(|name| name != "default" && is_identifier_text(name))
+                    {
                         namespace_export.unwrap_or("module").to_owned()
                     } else {
                         let base = commonjs_module_temp_base(self.arena, module);
@@ -31180,13 +31324,24 @@ impl Printer<'_> {
                             }
                         }
                     };
-                    let umd_namespace_export =
-                        self.settings.module == ModuleKind::Umd && namespace_export.is_some();
+                    let umd_export = self.settings.module == ModuleKind::Umd;
                     dependencies.push(AmdRuntimeDependency {
                         path: dependency_path,
-                        parameter: (!umd_namespace_export).then(|| parameter.clone()),
+                        parameter: (!umd_export).then(|| parameter.clone()),
                     });
-                    if !umd_namespace_export {
+                    if umd_export
+                        && matches!(
+                            export
+                                .export_clause
+                                .and_then(|clause| self.arena.get(clause))
+                                .map(|node| &node.data),
+                            Some(NodeData::NamedExports(_))
+                        )
+                    {
+                        self.generated_names.used.insert(parameter.clone());
+                        self.commonjs_reexport_temps
+                            .insert(*statement, parameter);
+                    } else if !umd_export {
                         self.amd_export_star_temps.insert(*statement, parameter);
                     }
                 }
@@ -31571,7 +31726,12 @@ impl Printer<'_> {
         for statement in &data.statements.nodes {
             if let Some(node) = self.arena.get(*statement) {
                 let skip_import = match &node.data {
-                    NodeData::ImportDeclaration(_) => true,
+                    NodeData::ImportDeclaration(import) => {
+                        self.settings.module != ModuleKind::Umd
+                            || import.import_clause.is_none_or(|clause| {
+                                !self.commonjs_named_import_temps.contains_key(&clause)
+                            })
+                    }
                     NodeData::ImportEqualsDeclaration(import) => {
                         external_module_reference_text(self.arena, import.module_reference)
                             .is_some()
@@ -31610,7 +31770,12 @@ impl Printer<'_> {
                 previous_emitted = current_owns_source_comments;
             }
             let skip_import = match self.arena.get(*statement).map(|node| &node.data) {
-                Some(NodeData::ImportDeclaration(_)) => true,
+                Some(NodeData::ImportDeclaration(import)) => {
+                    self.settings.module != ModuleKind::Umd
+                        || import.import_clause.is_none_or(|clause| {
+                            !self.commonjs_named_import_temps.contains_key(&clause)
+                        })
+                }
                 Some(NodeData::ImportEqualsDeclaration(import)) => {
                     external_module_reference_text(self.arena, import.module_reference).is_some()
                 }
@@ -31771,6 +31936,7 @@ impl Printer<'_> {
                     storage_exports: Vec::new(),
                     namespace_exports: Vec::new(),
                     named_exports: Vec::new(),
+                    setter_operations: vec![SystemSetterOperation::Storage(namespace.clone())],
                     parameter,
                     export_star: false,
                 },
@@ -31997,6 +32163,40 @@ impl Printer<'_> {
                 self.writer.write(") {");
                 self.writer.newline();
                 self.writer.indent += 1;
+                if !dependency.setter_operations.is_empty() {
+                    for operation in &dependency.setter_operations {
+                        match operation {
+                            SystemSetterOperation::Storage(storage) => self
+                                .emit_system_setter_storage(&dependency.parameter, storage),
+                            SystemSetterOperation::StorageExport(storage, exported) => self
+                                .emit_system_setter_storage_export(
+                                    &plan.export_function,
+                                    storage,
+                                    exported,
+                                ),
+                            SystemSetterOperation::NamespaceExport(exported) => self
+                                .emit_system_setter_namespace_export(
+                                    &plan.export_function,
+                                    &dependency.parameter,
+                                    exported,
+                                ),
+                            SystemSetterOperation::NamedExports(exports) => self
+                                .emit_system_setter_named_exports(
+                                    &plan.export_function,
+                                    &dependency.parameter,
+                                    exports,
+                                ),
+                            SystemSetterOperation::ExportStar => {
+                                if let Some(export_star) = plan.export_star_function.as_deref() {
+                                    self.emit_system_setter_export_star(
+                                        export_star,
+                                        &dependency.parameter,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                } else {
                 for exported_name in &dependency.namespace_exports {
                     self.writer.write(&plan.export_function);
                     self.writer.write("(");
@@ -32064,6 +32264,7 @@ impl Printer<'_> {
                     self.writer.indent -= 1;
                     self.writer.write("});");
                     self.writer.newline();
+                }
                 }
                 self.writer.indent -= 1;
                 self.writer.write("}");
@@ -33917,8 +34118,7 @@ impl Printer<'_> {
     fn emit_commonjs_preinitialized_exports(&mut self, names: &[String]) {
         for chunk in names.chunks(50) {
             for name in chunk.iter().rev() {
-                self.writer.write("exports.");
-                self.writer.write(name);
+                self.writer.write(&commonjs_import_access("exports", name));
                 self.writer.write(" = ");
             }
             self.writer.write("void 0;");
@@ -34197,7 +34397,21 @@ impl Printer<'_> {
                 .elements
                 .nodes
                 .iter()
-                .any(|specifier| self.export_specifier_emits_runtime(export, *specifier))
+                .any(|specifier| {
+                    self.export_specifier_emits_runtime(export, *specifier)
+                        || matches!(
+                            self.arena.get(*specifier).map(|node| &node.data),
+                            Some(NodeData::ExportSpecifier(specifier))
+                                if !export.is_type_only
+                                    && !specifier.is_type_only
+                                    && specifier.property_name.is_some_and(|property| {
+                                        matches!(
+                                            self.arena.get(property).map(|node| &node.data),
+                                            Some(NodeData::StringLiteral(_))
+                                        )
+                                    })
+                        )
+                })
         })
     }
 
@@ -63836,6 +64050,9 @@ impl Printer<'_> {
             self.emit_expression(specifier.name, 0)?;
             emitted = true;
         }
+        if emitted && data.elements.has_trailing_comma {
+            self.writer.write(",");
+        }
         self.writer.write(" }");
         Ok(())
     }
@@ -63897,7 +64114,11 @@ impl Printer<'_> {
                 .map(|node| &node.data)
         {
             let exported = declaration_name_text(self.arena, namespace.name).unwrap_or("module");
-            let local = self.generated_names.generate(exported);
+            let local = if is_identifier_text(exported) {
+                self.generated_names.generate(exported)
+            } else {
+                self.generated_names.generate_temp()
+            };
             self.writer.write("import * as ");
             self.writer.write(&local);
             self.writer.write(" from ");
@@ -63912,7 +64133,7 @@ impl Printer<'_> {
                 self.writer.write("export { ");
                 self.writer.write(&local);
                 self.writer.write(" as ");
-                self.writer.write(exported);
+                self.emit_expression(namespace.name, 0)?;
                 self.writer.write(" };");
             }
             return Ok(());
@@ -63926,7 +64147,21 @@ impl Printer<'_> {
                         .elements
                         .nodes
                         .iter()
-                        .filter(|specifier| self.export_specifier_emits_runtime(data, **specifier))
+                        .filter(|specifier| {
+                            self.export_specifier_emits_runtime(data, **specifier)
+                                || matches!(
+                                    self.arena.get(**specifier).map(|node| &node.data),
+                                    Some(NodeData::ExportSpecifier(specifier))
+                                        if !data.is_type_only
+                                            && !specifier.is_type_only
+                                            && specifier.property_name.is_some_and(|property| {
+                                                matches!(
+                                                    self.arena.get(property).map(|node| &node.data),
+                                                    Some(NodeData::StringLiteral(_))
+                                                )
+                                            })
+                                )
+                        })
                         .copied()
                         .collect::<Vec<_>>();
                     self.writer.write(if elements.is_empty() {
@@ -63947,6 +64182,9 @@ impl Printer<'_> {
                             self.writer.write(" as ");
                         }
                         self.emit_expression(specifier.name, 0)?;
+                    }
+                    if !elements.is_empty() && exports.elements.has_trailing_comma {
+                        self.writer.write(",");
                     }
                     self.writer.write(if elements.is_empty() {
                         "}"
@@ -64075,14 +64313,16 @@ impl Printer<'_> {
                     }
                     self.writer.write(".default");
                 } else {
-                    self.writer.write(module_temp);
-                    self.writer.write(".");
-                    self.emit_expression(imported, 0)?;
+                    let imported = declaration_name_text(self.arena, imported).unwrap_or_default();
+                    self.writer
+                        .write(&commonjs_import_access(module_temp, imported));
                 }
                 self.writer.write("; } });");
             } else {
-                self.writer.write("exports.");
-                self.emit_expression(specifier.name, 0)?;
+                let exported =
+                    declaration_name_text(self.arena, specifier.name).unwrap_or_default();
+                self.writer
+                    .write(&commonjs_import_access("exports", exported));
                 self.writer.write(" = ");
                 self.emit_expression(specifier.property_name.unwrap_or(specifier.name), 0)?;
                 self.writer.write(";");
@@ -64124,8 +64364,9 @@ impl Printer<'_> {
         data: &ts_ast::ExportDeclarationData,
         name: NodeId,
     ) -> Result<(), EmitError> {
-        self.writer.write("exports.");
-        self.emit_expression(name, 0)?;
+        let name = declaration_name_text(self.arena, name).unwrap_or_default();
+        self.writer
+            .write(&commonjs_import_access("exports", name));
         self.writer.write(" = ");
         if self.es_module_interop {
             self.emit_helper_reference("__importStar");
@@ -64216,8 +64457,8 @@ impl Printer<'_> {
                     }
                     self.writer.write("; } });");
                 } else {
-                    self.writer.write("exports.");
-                    self.emit_expression(specifier.name, 0)?;
+                    self.writer
+                        .write(&commonjs_import_access("exports", exported));
                     self.writer.write(" = ");
                     self.emit_expression(local, 0)?;
                     self.writer.write(";");
@@ -64361,8 +64602,10 @@ impl Printer<'_> {
                 let NodeData::ExportSpecifier(specifier) = &node.data else {
                     continue;
                 };
-                self.writer.write("exports.");
-                self.emit_expression(specifier.name, 0)?;
+                let exported = declaration_name_text(self.arena, specifier.name)
+                    .unwrap_or_default();
+                self.writer
+                    .write(&commonjs_import_access("exports", exported));
                 self.writer.write(" = ");
                 self.emit_expression(specifier.property_name.unwrap_or(specifier.name), 0)?;
                 self.writer.write(";");
@@ -65823,6 +66066,79 @@ impl Printer<'_> {
         self.writer.write(", ");
     }
 
+    fn emit_system_setter_storage(&mut self, parameter: &str, storage: &str) {
+        self.writer.write(storage);
+        self.writer.write(" = ");
+        self.writer.write(parameter);
+        self.writer.write(";");
+        self.writer.newline();
+    }
+
+    fn emit_system_setter_storage_export(
+        &mut self,
+        export_function: &str,
+        storage: &str,
+        exported: &str,
+    ) {
+        self.writer.write(export_function);
+        self.writer.write("(");
+        write_quoted(&mut self.writer, exported);
+        self.writer.write(", ");
+        self.writer.write(storage);
+        self.writer.write(");");
+        self.writer.newline();
+    }
+
+    fn emit_system_setter_namespace_export(
+        &mut self,
+        export_function: &str,
+        parameter: &str,
+        exported: &str,
+    ) {
+        self.writer.write(export_function);
+        self.writer.write("(");
+        write_quoted(&mut self.writer, exported);
+        self.writer.write(", ");
+        self.writer.write(parameter);
+        self.writer.write(");");
+        self.writer.newline();
+    }
+
+    fn emit_system_setter_named_exports(
+        &mut self,
+        export_function: &str,
+        parameter: &str,
+        exports: &[(String, String)],
+    ) {
+        self.writer.write(export_function);
+        self.writer.write("({");
+        self.writer.newline();
+        self.writer.indent += 1;
+        for (index, (exported, imported)) in exports.iter().enumerate() {
+            write_quoted(&mut self.writer, exported);
+            self.writer.write(": ");
+            self.writer.write(parameter);
+            self.writer.write("[");
+            write_quoted(&mut self.writer, imported);
+            self.writer.write("]");
+            if index + 1 != exports.len() {
+                self.writer.write(",");
+            }
+            self.writer.newline();
+        }
+        self.writer.indent -= 1;
+        self.writer.write("});");
+        self.writer.newline();
+    }
+
+    fn emit_system_setter_export_star(&mut self, export_star: &str, parameter: &str) {
+        self.writer.write(export_star);
+        self.writer.write("(");
+        self.writer.write(parameter);
+        self.writer.write(");");
+        self.writer.newline();
+    }
+
     fn import_semantically_has_runtime_value(&self, declaration: NodeId) -> bool {
         self.import_runtime_meanings
             .get(&declaration)
@@ -65866,6 +66182,22 @@ impl Printer<'_> {
             return true;
         }
         if clause.phase_modifier == Some(SyntaxKind::TypeKeyword) {
+            return false;
+        }
+        if clause.named_bindings.is_some_and(|bindings| {
+            matches!(
+                self.arena.get(bindings).map(|node| &node.data),
+                Some(NodeData::NamedImports(imports))
+                    if !imports.elements.nodes.is_empty()
+                        && imports.elements.nodes.iter().all(|specifier| {
+                            matches!(
+                                self.arena.get(*specifier).map(|node| &node.data),
+                                Some(NodeData::ImportSpecifier(specifier))
+                                    if specifier.is_type_only
+                            )
+                        })
+            )
+        }) {
             return false;
         }
         if self.verbatim_module_syntax || self.source_is_javascript_input() {
@@ -66223,8 +66555,8 @@ impl Printer<'_> {
             };
             for exported in exported_names {
                 self.writer.newline();
-                self.writer.write("exports.");
-                self.writer.write(&exported);
+                let export_access = commonjs_import_access("exports", &exported);
+                self.writer.write(&export_access);
                 self.writer.write(" = ");
                 self.writer.write(name);
                 self.writer.write(";");
@@ -66240,7 +66572,7 @@ impl Printer<'_> {
                         .is_some_and(|symbol| symbol.flags.intersects(SymbolFlags::VARIABLE))
                 {
                     self.identifier_rewrites
-                        .insert(symbol, format!("exports.{exported}"));
+                        .insert(symbol, export_access);
                 }
             }
         }
@@ -72104,7 +72436,9 @@ impl Printer<'_> {
         self.commonjs_named_exports_for_local(&identifier.text)
             .into_iter()
             .filter(|exported| {
-                rewrite.is_none_or(|rewrite| rewrite != &format!("exports.{exported}"))
+                rewrite.is_none_or(|rewrite| {
+                    rewrite != &commonjs_import_access("exports", exported)
+                })
             })
             .collect()
     }
@@ -72113,8 +72447,8 @@ impl Printer<'_> {
         let mut exported_names = self.commonjs_named_exports_for_assignment_target(target);
         exported_names.reverse();
         for exported in exported_names {
-            self.writer.write("exports.");
-            self.writer.write(&exported);
+            self.writer
+                .write(&commonjs_import_access("exports", &exported));
             self.writer.write(" = ");
         }
     }
