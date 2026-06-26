@@ -47971,6 +47971,17 @@ impl Printer<'_> {
             self.emit_statement(statement)?;
             self.writer.remove_trailing_newline();
             self.writer.write(" }");
+        } else if let Some(statements) = self.compact_function_body_statements(body)? {
+            self.writer.write("{ ");
+            self.emit_compact_body_prelude(body)?;
+            for (index, statement) in statements.iter().enumerate() {
+                self.emit_statement(*statement)?;
+                self.writer.remove_trailing_newline();
+                if index + 1 != statements.len() {
+                    self.writer.write(" ");
+                }
+            }
+            self.writer.write(" }");
         } else {
             self.emit_block(body)?;
         }
@@ -53114,6 +53125,10 @@ impl Printer<'_> {
             self.writer.newline();
             self.writer.indent += 1;
             self.emit_es5_class_field_prelude(&field_object_temps, false);
+            let previous_super_context = super_capture.as_ref().and_then(|capture| {
+                self.downlevel_super_context
+                    .replace((capture.clone(), false))
+            });
             let has_fields = self.has_instance_field_initializers(data);
             if base_is_null {
                 self.emit_es5_instance_fields(data, "this", captures_field_this)?;
@@ -53140,6 +53155,7 @@ impl Printer<'_> {
             if !base_is_null {
                 self.writer.newline();
             }
+            self.downlevel_super_context = previous_super_context;
             self.writer.indent -= 1;
             self.writer.write("}");
             self.writer.newline();
@@ -71437,6 +71453,34 @@ mod tests {
         assert_eq!(
             result.code,
             "class Box {\n    constructor() {\n        this.value = 1;\n    }\n    read() { return this.value; }\n}\n"
+        );
+    }
+
+    #[test]
+    fn keeps_single_line_multi_statement_accessors_compact() {
+        let output = emit_with(
+            "class C { get value() { () => this.x; return null; } }",
+            ScriptTarget::Es2015,
+            ModuleKind::EsNext,
+        )
+        .code;
+        assert!(
+            output.contains("get value() { () => this.x; return null; }"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn downlevels_super_in_synthesized_derived_field_constructor() {
+        let output = emit_with(
+            "class Base {} class Derived extends Base { value = super.foo; }",
+            ScriptTarget::Es5,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(
+            output.contains("_this.value = _super.prototype.foo;"),
+            "{output}"
         );
     }
 

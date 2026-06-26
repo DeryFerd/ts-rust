@@ -7888,6 +7888,8 @@ impl<'a> Parser<'a> {
         let parenthesized_function = self.current.kind == SyntaxKind::OpenParenToken
             && self.is_parenthesized_function_type();
         let mapped_type = self.current.kind == SyntaxKind::OpenBraceToken && self.is_mapped_type();
+        let qualified_this = self.current.kind == SyntaxKind::ThisKeyword
+            && self.next_token_kind() == SyntaxKind::DotToken;
         match self.current.kind {
             SyntaxKind::QuestionToken => self.parse_jsdoc_nullable_type(),
             SyntaxKind::OpenBraceToken if mapped_type => self.parse_mapped_type(),
@@ -7913,6 +7915,9 @@ impl<'a> Parser<'a> {
                     NodeData::KeywordTypeNode(Box::new(KeywordTypeNodeData)),
                     &[],
                 )
+            }
+            SyntaxKind::ThisKeyword if qualified_this => {
+                self.parse_type_reference()
             }
             SyntaxKind::ThisKeyword => {
                 let token = self.consume();
@@ -12193,6 +12198,35 @@ mod tests {
             panic!("expected this identifier");
         };
         assert_eq!(left.text, "this");
+    }
+
+    #[test]
+    fn parses_super_qualified_type_queries_without_orphaned_tokens() {
+        let result = parse_source_file("class C { z: typeof super.foo; a: this.foo; }");
+        let statements = source_statements(&result);
+        assert_eq!(statements.len(), 1, "{:?}", result.diagnostics);
+        let NodeData::ClassDeclaration(class) = &result.arena.get(statements[0]).unwrap().data
+        else {
+            panic!("expected class declaration");
+        };
+        assert_eq!(class.members.nodes.len(), 2, "{:?}", result.diagnostics);
+        let NodeData::PropertyDeclaration(property) =
+            &result.arena.get(class.members.nodes[0]).unwrap().data
+        else {
+            panic!("expected property declaration");
+        };
+        let NodeData::TypeQueryNode(query) =
+            &result.arena.get(property.type_.unwrap()).unwrap().data
+        else {
+            panic!("expected type query");
+        };
+        let NodeData::QualifiedName(name) = &result.arena.get(query.expr_name).unwrap().data else {
+            panic!("expected qualified super name");
+        };
+        let NodeData::Identifier(left) = &result.arena.get(name.left).unwrap().data else {
+            panic!("expected super identifier");
+        };
+        assert_eq!(left.text, "super");
     }
 
     #[test]
