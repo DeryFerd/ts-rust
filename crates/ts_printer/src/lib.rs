@@ -55050,6 +55050,12 @@ impl Printer<'_> {
             NodeData::ParenthesizedTypeNode(parenthesized) => {
                 self.runtime_metadata_type(parenthesized.type_, union_member)
             }
+            NodeData::JsDocNullableType(nullable) => {
+                self.runtime_metadata_type(nullable.type_, union_member)
+            }
+            NodeData::JsDocNonNullableType(non_nullable) => {
+                self.runtime_metadata_type(non_nullable.type_, union_member)
+            }
             NodeData::TypeReferenceNode(reference) => {
                 let symbol = self.resolve_entity_symbol(reference.type_name, &mut HashSet::new());
                 let flags = symbol

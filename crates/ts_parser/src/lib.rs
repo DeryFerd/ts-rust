@@ -17,8 +17,9 @@ use ts_ast::{
     ImportAttributeData, ImportAttributesData, ImportClauseData, ImportDeclarationData,
     ImportEqualsDeclarationData, ImportSpecifierData, ImportTypeNodeData,
     IndexSignatureDeclarationData, IndexedAccessTypeNodeData, InferTypeNodeData,
-    InterfaceDeclarationData, IntersectionTypeNodeData, JsDocData, JsDocNonNullableTypeData,
-    JsDocNullableTypeData, JsDocTextData, JsDocUnknownTagData, JsxAttributeData,
+    InterfaceDeclarationData, IntersectionTypeNodeData, JsDocAllTypeData, JsDocData,
+    JsDocNonNullableTypeData, JsDocNullableTypeData, JsDocTextData, JsDocUnknownTagData,
+    JsxAttributeData,
     JsxAttributesData, JsxClosingElementData,
     JsxClosingFragmentData, JsxElementData, JsxExpressionData, JsxFragmentData,
     JsxNamespacedNameData, JsxOpeningElementData, JsxOpeningFragmentData, JsxSelfClosingElementData,
@@ -8025,6 +8026,15 @@ impl<'a> Parser<'a> {
             }
             SyntaxKind::OpenBracketToken => self.parse_tuple_type(),
             SyntaxKind::TemplateHead => self.parse_template_literal_type(),
+            SyntaxKind::AsteriskToken => {
+                let token = self.consume();
+                self.alloc_node(
+                    SyntaxKind::JsDocAllType,
+                    token.range,
+                    NodeData::JsDocAllType(Box::new(JsDocAllTypeData)),
+                    &[],
+                )
+            }
             SyntaxKind::MinusToken => self.parse_negative_literal_type(),
             SyntaxKind::StringLiteral
             | SyntaxKind::NumericLiteral
