@@ -9054,7 +9054,19 @@ impl<'a> Checker<'a> {
                     return self.result.types.any();
                 }
                 let name = self.property_name(data.name).unwrap_or_default();
-                let mut value = self.property_access_type(node_id, access_receiver, &name);
+                let declared_member = matches!(
+                    self.result
+                        .types
+                        .get(access_receiver)
+                        .map(|type_| &type_.kind),
+                    Some(TypeKind::Any)
+                )
+                .then(|| self.resolve_value_expression_symbol(node_id))
+                .flatten()
+                .and_then(|symbol| self.result.symbol_types.get(&symbol).copied());
+                let mut value = declared_member.unwrap_or_else(|| {
+                    self.property_access_type(node_id, access_receiver, &name)
+                });
                 if data.question_dot_token.is_some() {
                     let undefined = self.result.types.undefined();
                     value = self.result.types.union([value, undefined]);
@@ -26043,6 +26055,32 @@ mod tests {
             "{:?}",
             checked.files[1].diagnostics
         );
+    }
+
+    #[test]
+    fn infers_calls_through_source_ordered_namespace_members() {
+        let parsed = parse_source_file(concat!(
+            "namespace source { export function value() { return 'ok'; } }\n",
+            "export namespace consumer { ",
+            "export function value() { return source.value(); } }",
+        ));
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let consumer = bindings
+            .root_scope()
+            .and_then(|scope| scope.symbols.get("consumer"))
+            .and_then(|symbol| bindings.symbols.get(symbol))
+            .expect("consumer namespace is bound");
+        let value = consumer
+            .members
+            .get("value")
+            .and_then(|symbol| result.type_of_symbol(symbol))
+            .expect("consumer.value has a semantic type");
+        let TypeKind::Function(signature) = &result.types.get(value).unwrap().kind else {
+            panic!("consumer.value should be a function");
+        };
+        assert_eq!(result.types.display(signature.return_type), "string");
     }
 
     #[test]

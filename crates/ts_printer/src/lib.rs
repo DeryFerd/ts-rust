@@ -53722,6 +53722,51 @@ impl Printer<'_> {
         let NodeData::VariableDeclarationList(list) = &list_node.data else {
             return Ok(false);
         };
+        if list.declarations.nodes.len() > 1 {
+            let mut declarations = Vec::with_capacity(list.declarations.nodes.len());
+            for declaration_id in &list.declarations.nodes {
+                let declaration_node = self.node(*declaration_id)?.clone();
+                let NodeData::VariableDeclaration(declaration) = &declaration_node.data else {
+                    return Ok(false);
+                };
+                let Some(name) = declaration_name_text(self.arena, declaration.name) else {
+                    return Ok(false);
+                };
+                if declaration.initializer.is_some_and(|initializer| {
+                    !self.commonjs_export_initializer_can_be_direct(initializer)
+                }) {
+                    return Ok(false);
+                }
+                declarations.push((
+                    name.to_owned(),
+                    declaration.name,
+                    declaration.initializer,
+                ));
+            }
+            for (name, name_id, _) in &declarations {
+                self.install_commonjs_binding_rewrites(*name_id);
+                self.commonjs_export_text_rewrites
+                    .insert(name.clone(), format!("exports.{name}"));
+            }
+            let mut emitted = false;
+            for (name, name_id, initializer) in declarations {
+                let Some(initializer) = initializer else {
+                    continue;
+                };
+                if emitted {
+                    self.writer.write(", ");
+                }
+                self.writer.write("exports.");
+                self.write_source_identifier(name_id, &name);
+                self.writer.write(" = ");
+                self.emit_expression(initializer, 1)?;
+                emitted = true;
+            }
+            if emitted {
+                self.writer.write(";");
+            }
+            return Ok(emitted);
+        }
         let [declaration_id] = list.declarations.nodes.as_slice() else {
             return Ok(false);
         };
@@ -69215,6 +69260,31 @@ class Board {
         .code;
         assert!(output.contains("exports.key = `data-${text}`;"), "{output}");
         assert!(!output.contains("const key ="), "{output}");
+    }
+
+    #[test]
+    fn commonjs_directly_initializes_mixed_export_variable_lists() {
+        let output = emit_with(
+            concat!(
+                "export var a, b = 1; ",
+                "var local; ",
+                "export var c = 2, d, e; ",
+                "export let first = 3, skipped, last = first + 1;",
+            ),
+            ScriptTarget::Es2015,
+            ModuleKind::CommonJs,
+        )
+        .code;
+        assert!(output.contains("exports.b = 1;"), "{output}");
+        assert!(output.contains("var local;"), "{output}");
+        assert!(output.contains("exports.c = 2;"), "{output}");
+        assert!(
+            output.contains("exports.first = 3, exports.last = exports.first + 1;"),
+            "{output}"
+        );
+        for local in ["var a", "var c", "let first"] {
+            assert!(!output.contains(local), "{output}");
+        }
     }
 
     #[test]
