@@ -5140,12 +5140,11 @@ impl<'a> Parser<'a> {
             && self.next_token_kind() == SyntaxKind::FunctionKeyword;
         if self.current.kind == SyntaxKind::AwaitKeyword
             && (self.await_context
-                || (!self.await_identifier_context
-                    && !is_expression_terminator(self.next_token_kind())
-                    && !matches!(
-                        self.next_token_kind(),
-                        SyntaxKind::OpenParenToken | SyntaxKind::EqualsGreaterThanToken
-                    )))
+                || (!matches!(
+                    self.next_token_kind(),
+                    SyntaxKind::OpenParenToken | SyntaxKind::EqualsGreaterThanToken
+                ) && (!is_expression_terminator(self.next_token_kind())
+                    || self.await_identifier_context)))
         {
             return self.parse_await_expression();
         }
