@@ -1099,7 +1099,31 @@ impl<'a> Parser<'a> {
                 self.bump();
                 continue;
             }
-            declarations.push(self.parse_variable_declaration());
+            let declaration = self.parse_variable_declaration();
+            let recover_private_after_invalid_indexed_access = self.current.kind
+                == SyntaxKind::PrivateIdentifier
+                && self
+                    .arena
+                    .get(declaration)
+                    .and_then(|node| match &node.data {
+                        NodeData::VariableDeclaration(declaration) => declaration.type_,
+                        _ => None,
+                    })
+                    .and_then(|type_node| match &self.arena.get(type_node)?.data {
+                        NodeData::IndexedAccessTypeNode(indexed) => Some(indexed.index_type),
+                        _ => None,
+                    })
+                    .and_then(|index_type| match &self.arena.get(index_type)?.data {
+                        NodeData::TypeReferenceNode(reference) => Some(reference.type_name),
+                        _ => None,
+                    })
+                    .is_some_and(|name| {
+                        matches!(
+                            self.arena.get(name).map(|node| &node.data),
+                            Some(NodeData::Identifier(identifier)) if identifier.text.is_empty()
+                        )
+                    });
+            declarations.push(declaration);
             if self.current.kind != SyntaxKind::CommaToken {
                 if self.current.kind == SyntaxKind::ColonToken {
                     self.error_current("Expected ','.");
@@ -1120,7 +1144,8 @@ impl<'a> Parser<'a> {
                     self.bump();
                     continue;
                 }
-                if self.current.kind == SyntaxKind::Identifier
+                if (self.current.kind == SyntaxKind::Identifier
+                    || recover_private_after_invalid_indexed_access)
                     && !self
                         .current
                         .flags
@@ -10689,6 +10714,35 @@ mod tests {
         assert!(matches!(
             result.arena.get(declaration.name).map(|node| &node.data),
             Some(NodeData::PrivateIdentifier(identifier)) if identifier.text == "#foo"
+        ));
+    }
+
+    #[test]
+    fn recovers_a_private_identifier_after_an_invalid_indexed_access_type() {
+        let result = parse_source_file("const badForNow: C[#bar] = 3;");
+        let statements = source_statements(&result);
+        let NodeData::VariableStatement(statement) =
+            &result.arena.get(statements[0]).unwrap().data
+        else {
+            panic!("expected variable statement");
+        };
+        let NodeData::VariableDeclarationList(list) = &result
+            .arena
+            .get(statement.declaration_list)
+            .unwrap()
+            .data
+        else {
+            panic!("expected variable declaration list");
+        };
+        assert_eq!(list.declarations.nodes.len(), 2);
+        let NodeData::VariableDeclaration(declaration) =
+            &result.arena.get(list.declarations.nodes[1]).unwrap().data
+        else {
+            panic!("expected variable declaration");
+        };
+        assert!(matches!(
+            result.arena.get(declaration.name).map(|node| &node.data),
+            Some(NodeData::PrivateIdentifier(identifier)) if identifier.text == "#bar"
         ));
     }
 

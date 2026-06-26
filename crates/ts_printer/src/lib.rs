@@ -1496,7 +1496,12 @@ pub fn emit_source_file_with_context(
     let mut anonymous_private_classes = printer
         .anonymous_private_class_plans
         .iter()
-        .filter(|(_, plan)| plan.scope == source_file)
+        .filter(|(class, plan)| {
+            plan.scope == source_file
+                && printer
+                    .class_expression_instance_field_owner(**class)
+                    .is_none()
+        })
         .map(|(class, _)| *class)
         .collect::<Vec<_>>();
     anonymous_private_classes.sort_by_key(|class| {
@@ -2427,16 +2432,29 @@ fn source_needs_legacy_decorate_helper(arena: &NodeArena) -> bool {
                 class.modifiers.as_ref(),
                 SyntaxKind::Decorator,
             ) || class.members.nodes.iter().any(|member| {
-                arena.get(*member).is_some_and(|member| {
-                    member.kind != SyntaxKind::ClassStaticBlockDeclaration
-                        && declaration_has_modifier(arena, member, SyntaxKind::Decorator)
-                }) || function_like_parameters(arena, *member).is_some_and(|parameters| {
-                    parameters.nodes.iter().any(|parameter| {
-                        arena.get(*parameter).is_some_and(|parameter| {
-                            declaration_has_modifier(arena, parameter, SyntaxKind::Decorator)
-                        })
-                    })
-                })
+                let private_member = type_member_name(arena, *member).is_some_and(|name| {
+                    matches!(
+                        arena.get(name).map(|name| &name.data),
+                        Some(NodeData::PrivateIdentifier(_))
+                    )
+                });
+                !private_member
+                    && (arena.get(*member).is_some_and(|member| {
+                        member.kind != SyntaxKind::ClassStaticBlockDeclaration
+                            && declaration_has_modifier(arena, member, SyntaxKind::Decorator)
+                    }) || function_like_parameters(arena, *member).is_some_and(
+                        |parameters| {
+                            parameters.nodes.iter().any(|parameter| {
+                                arena.get(*parameter).is_some_and(|parameter| {
+                                    declaration_has_modifier(
+                                        arena,
+                                        parameter,
+                                        SyntaxKind::Decorator,
+                                    )
+                                })
+                            })
+                        },
+                    ))
             }))
     })
 }
@@ -27738,12 +27756,26 @@ impl Printer<'_> {
         if self.private_class_plan_is_block_scoped(plan) {
             return;
         }
+        let has_static_field_owner = self.class_expression_static_field_owner(class_id).is_some();
         if let Some(brand) = &plan.brand {
             if !before_class_temp {
                 return;
             }
             declarations.push(brand.clone());
             declarations.extend(plan.fields.iter().map(|field| field.storage.clone()));
+            declarations.extend(
+                plan.methods
+                    .iter()
+                    .map(|method| method.function_name.clone()),
+            );
+        } else if has_static_field_owner && before_class_temp {
+            declarations.extend(plan.fields.iter().map(|field| field.storage.clone()));
+        } else if has_static_field_owner {
+            declarations.extend(
+                plan.static_fields
+                    .iter()
+                    .map(|field| field.storage.clone()),
+            );
             declarations.extend(
                 plan.methods
                     .iter()
@@ -38994,6 +39026,9 @@ impl Printer<'_> {
                 && !self
                     .predeclared_anonymous_private_classes
                     .contains(class_id)
+                && self
+                    .class_expression_instance_field_owner(*class_id)
+                    .is_none()
             {
                 self.append_anonymous_private_class_declarations(
                     *class_id,
@@ -39093,6 +39128,9 @@ impl Printer<'_> {
                 && !self
                     .predeclared_anonymous_private_classes
                     .contains(class_id)
+                && self
+                    .class_expression_instance_field_owner(*class_id)
+                    .is_none()
             {
                 self.append_anonymous_private_class_declarations(
                     *class_id,
@@ -39219,11 +39257,38 @@ impl Printer<'_> {
         None
     }
 
+    fn class_expression_static_field_owner(&self, expression: NodeId) -> Option<NodeId> {
+        let mut current = expression;
+        while let Some(parent) = self.arena.get(current).and_then(|node| node.parent) {
+            match self.arena.get(parent).map(|node| &node.data) {
+                Some(NodeData::PropertyDeclaration(property))
+                    if self.property_is_static(property)
+                        && property.initializer.is_some_and(|initializer| {
+                            self.node_is_within(expression, initializer)
+                        }) =>
+                {
+                    return Some(parent);
+                }
+                Some(
+                    NodeData::FunctionDeclaration(_)
+                    | NodeData::FunctionExpression(_)
+                    | NodeData::ArrowFunction(_)
+                    | NodeData::MethodDeclaration(_)
+                    | NodeData::ConstructorDeclaration(_)
+                    | NodeData::GetAccessorDeclaration(_)
+                    | NodeData::SetAccessorDeclaration(_),
+                ) => return None,
+                _ => current = parent,
+            }
+        }
+        None
+    }
+
     fn emit_instance_field_class_expression_temps(
         &mut self,
         data: &ts_ast::ClassDeclarationData,
     ) {
-        let mut temps = self
+        let mut classes = self
             .class_expression_temps
             .iter()
             .filter_map(|(expression, temp)| {
@@ -39233,23 +39298,45 @@ impl Printer<'_> {
                         self.arena
                             .get(*expression)
                             .map_or(u32::MAX, |node| node.range.start.get()),
+                        *expression,
                         temp.clone(),
                     )
                 })
             })
             .collect::<Vec<_>>();
-        temps.sort_by_key(|(start, _)| *start);
-        if temps.is_empty() {
+        classes.sort_by_key(|(start, _, _)| *start);
+        if classes.is_empty() {
             return;
         }
+        let mut declarations = Vec::new();
+        for (_, class, temp) in classes {
+            if let Some(plan) = self.anonymous_private_class_plans.get(&class) {
+                if let Some(brand) = &plan.brand {
+                    declarations.push(brand.clone());
+                }
+                for field in &plan.fields {
+                    declarations.push(field.storage.clone());
+                }
+                if plan.brand.is_some() {
+                    for method in &plan.methods {
+                        declarations.push(method.function_name.clone());
+                    }
+                }
+            }
+            declarations.push(temp);
+            if let Some(plan) = self.anonymous_private_class_plans.get(&class) {
+                for field in &plan.static_fields {
+                    declarations.push(field.storage.clone());
+                }
+                if plan.brand.is_none() {
+                    for method in &plan.methods {
+                        declarations.push(method.function_name.clone());
+                    }
+                }
+            }
+        }
         self.writer.write("var ");
-        self.writer.write(
-            &temps
-                .into_iter()
-                .map(|(_, temp)| temp)
-                .collect::<Vec<_>>()
-                .join(", "),
-        );
+        self.writer.write(&declarations.join(", "));
         self.writer.write(";");
         self.writer.newline();
     }
@@ -52196,6 +52283,14 @@ impl Printer<'_> {
         let mut emitted_accessors = BTreeSet::new();
         for member_id in &member_ids {
             let member = self.node(*member_id)?.clone();
+            if type_member_name(self.arena, *member_id).is_some_and(|name| {
+                matches!(
+                    self.arena.get(name).map(|name| &name.data),
+                    Some(NodeData::PrivateIdentifier(_))
+                )
+            }) {
+                continue;
+            }
             let accessor_pair = match &member.data {
                 NodeData::GetAccessorDeclaration(accessor) => {
                     let name = type_member_name_text(self.arena, *member_id);
@@ -54820,6 +54915,23 @@ impl Printer<'_> {
         let lowering_indent = 1 + usize::from(self.class_expression_is_nested_in_literal(id));
         self.writer.indent += lowering_indent;
         let comments_before_core = self.emitted_source_comments.clone();
+        let suppressed_member_ranges = self.suppressed_class_empty_element_ranges
+            [suppressed_range_count..]
+            .to_vec();
+        for (start, end) in &suppressed_member_ranges {
+            self.discard_source_comments_between(*start, *end);
+        }
+        let suppressed_member_comments = self
+            .emitted_source_comments
+            .iter()
+            .filter(|range| {
+                !comments_before_core.contains(range)
+                    && suppressed_member_ranges
+                        .iter()
+                        .any(|(start, end)| *start as usize <= range.0 && range.1 <= *end as usize)
+            })
+            .copied()
+            .collect::<Vec<_>>();
         let previous_anonymous_private_class = self.active_anonymous_private_class;
         self.active_anonymous_private_class = anonymous_private_plan.as_ref().map(|_| id);
         let class_result = if let Some(name) = downlevel_name {
@@ -54888,6 +55000,9 @@ impl Printer<'_> {
                     .iter()
                     .any(|(start, end)| *start <= range.0 && range.1 <= *end)
         });
+        for range in suppressed_member_comments {
+            self.emitted_source_comments.remove(&range);
+        }
         self.writer.write(",");
         if let Some(plan) = &anonymous_private_plan {
             for field in &plan.fields {
@@ -57534,6 +57649,33 @@ impl Printer<'_> {
             && !self.property_is_static(property)
             && property.initializer.is_some()
             && self.settings.use_define_for_class_fields == Some(false)
+            && self
+                .arena
+                .get(property.name)
+                .and_then(|name| name.parent)
+                .and_then(|property| self.arena.get(property)?.parent)
+                .and_then(|class| self.arena.get(class))
+                .is_some_and(|class| {
+                    let members = match &class.data {
+                        NodeData::ClassDeclaration(class) => &class.members,
+                        NodeData::ClassExpression(class) => &class.members,
+                        _ => return false,
+                    };
+                    members.nodes.iter().any(|member| {
+                        let Some(NodeData::PropertyDeclaration(member)) =
+                            self.arena.get(*member).map(|node| &node.data)
+                        else {
+                            return false;
+                        };
+                        !self.property_is_static(member)
+                            && !matches!(
+                                self.arena.get(member.name).map(|node| &node.data),
+                                Some(NodeData::PrivateIdentifier(_))
+                            )
+                            && (member.initializer.is_some()
+                                || self.property_is_auto_accessor(member))
+                    })
+                })
     }
 
     fn emit_class_field_definition(
@@ -70797,6 +70939,32 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn private_native_initializers_follow_assignment_field_lowering() {
+        let output = emit_with_class_field_semantics(
+            "class Statics { #value = 1; static field = 2; } class Instances { #value = 1; field = 2; }",
+            ScriptTarget::EsNext,
+            false,
+        )
+        .code;
+        assert!(
+            output.contains("class Statics {\n    #value = 1;\n    static { this.field = 2; }\n}"),
+            "{output}"
+        );
+        assert!(
+            output.contains(concat!(
+                "class Instances {\n",
+                "    constructor() {\n",
+                "        this.#value = 1;\n",
+                "        this.field = 2;\n",
+                "    }\n",
+                "    #value;\n",
+                "}",
+            )),
+            "{output}"
+        );
+    }
+
     fn emit_always_strict(
         source: &str,
         target: ScriptTarget,
@@ -79921,6 +80089,19 @@ class Board {
                 < grouped.find("D, \"value\"").unwrap(),
             "{grouped}"
         );
+    }
+
+    #[test]
+    fn private_legacy_member_decorators_are_erased() {
+        let output = emit_with_decorator_mode(
+            "declare function dec(value: unknown): any; class C { @dec #field = 1; @dec #method() {} }",
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+            true,
+        )
+        .code;
+        assert!(!output.contains("__decorate"), "{output}");
+        assert!(!output.contains("dec("), "{output}");
     }
 
     #[test]
