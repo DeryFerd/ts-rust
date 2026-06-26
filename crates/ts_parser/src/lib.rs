@@ -3609,13 +3609,22 @@ impl<'a> Parser<'a> {
         } else {
             self.parse_identifier_name("Expected a module name.")
         };
+        let mut terminator_end = None;
         let body = if allows_dotted_name && self.current.kind == SyntaxKind::DotToken {
             self.bump();
             Some(self.parse_nested_module_declaration(keyword.kind))
+        } else if self.current.kind == SyntaxKind::SemicolonToken {
+            terminator_end = Some(self.consume().range.end);
+            None
         } else {
             self.parse_module_block()
         };
-        self.alloc_module_declaration(keyword.range.start, keyword.kind, name, body)
+        let declaration =
+            self.alloc_module_declaration(keyword.range.start, keyword.kind, name, body);
+        if let Some(end) = terminator_end {
+            self.arena.get_mut(declaration).unwrap().range.end = end;
+        }
+        declaration
     }
 
     fn parse_nested_module_declaration(&mut self, keyword: SyntaxKind) -> NodeId {
@@ -11253,6 +11262,19 @@ mod tests {
             result.arena.get(block.statements.nodes[0]).unwrap().parent,
             Some(block_id)
         );
+    }
+
+    #[test]
+    fn bodyless_ambient_module_owns_its_semicolon() {
+        let source = "declare module \"foo\";";
+        let result = parse_source_file(source);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let [statement] = source_statements(&result) else {
+            panic!("expected one module declaration");
+        };
+        let node = result.arena.get(*statement).unwrap();
+        assert_eq!(node.kind, SyntaxKind::ModuleDeclaration);
+        assert_eq!(node.range.end.get() as usize, source.len());
     }
 
     #[test]

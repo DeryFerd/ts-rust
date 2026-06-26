@@ -5292,6 +5292,11 @@ impl DeclarationPrinter<'_> {
                     self.emit_name(nested.name)?;
                     body = nested.body;
                 }
+                if body.is_none() {
+                    self.writer.write(";");
+                    self.writer.newline();
+                    return Ok(());
+                }
                 let inline_empty_body = body.is_some_and(|body| {
                     let Some(node) = self.arena.get(body) else {
                         return false;
@@ -62937,6 +62942,14 @@ mod tests {
                 "};",
             )),
             "{rest}"
+        );
+    }
+
+    #[test]
+    fn declaration_emit_preserves_bodyless_ambient_module_shorthand() {
+        assert_eq!(
+            emit_declarations_with_semantics("declare module \"foo\";"),
+            "declare module \"foo\";\n"
         );
     }
 
