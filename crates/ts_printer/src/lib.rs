@@ -831,12 +831,12 @@ pub fn emit_source_file_with_context(
         printer.prepare_exported_object_rest_temps(&data.statements);
     }
     if settings.module == ModuleKind::System && (is_external_module || has_dynamic_import) {
-        return printer.emit_system_source_file(data, context);
+        return printer.emit_system_source_file(source_file, data, context);
     }
     if matches!(settings.module, ModuleKind::Amd | ModuleKind::Umd)
         && (is_external_module || has_dynamic_import)
     {
-        return printer.emit_amd_source_file(data, context);
+        return printer.emit_amd_source_file(source_file, data, context);
     }
     if settings.module == ModuleKind::EsNext
         && context.preserve_dynamic_import
@@ -2057,7 +2057,8 @@ fn source_needs_legacy_decorate_helper(arena: &NodeArena) -> bool {
                 SyntaxKind::Decorator,
             ) || class.members.nodes.iter().any(|member| {
                 arena.get(*member).is_some_and(|member| {
-                    declaration_has_modifier(arena, member, SyntaxKind::Decorator)
+                    member.kind != SyntaxKind::ClassStaticBlockDeclaration
+                        && declaration_has_modifier(arena, member, SyntaxKind::Decorator)
                 }) || function_like_parameters(arena, *member).is_some_and(|parameters| {
                     parameters.nodes.iter().any(|parameter| {
                         arena.get(*parameter).is_some_and(|parameter| {
@@ -2082,7 +2083,8 @@ fn source_needs_standard_decorator_helpers(arena: &NodeArena) -> bool {
                     SyntaxKind::Decorator,
                 ) || class.members.nodes.iter().any(|member| {
                     arena.get(*member).is_some_and(|member| {
-                        declaration_has_modifier(arena, member, SyntaxKind::Decorator)
+                        member.kind != SyntaxKind::ClassStaticBlockDeclaration
+                            && declaration_has_modifier(arena, member, SyntaxKind::Decorator)
                     })
                 })
             }
@@ -2093,7 +2095,8 @@ fn source_needs_standard_decorator_helpers(arena: &NodeArena) -> bool {
                     SyntaxKind::Decorator,
                 ) || class.members.nodes.iter().any(|member| {
                     arena.get(*member).is_some_and(|member| {
-                        declaration_has_modifier(arena, member, SyntaxKind::Decorator)
+                        member.kind != SyntaxKind::ClassStaticBlockDeclaration
+                            && declaration_has_modifier(arena, member, SyntaxKind::Decorator)
                     })
                 })
             }
@@ -27400,6 +27403,7 @@ impl Printer<'_> {
     #[allow(clippy::too_many_lines)]
     fn emit_amd_source_file(
         &mut self,
+        source_file: NodeId,
         data: &ts_ast::SourceFileData,
         context: &EmitContext<'_>,
     ) -> Result<EmitResult, EmitError> {
@@ -27866,6 +27870,14 @@ impl Printer<'_> {
         self.writer.indent += 1;
         self.writer.write("\"use strict\";");
         self.writer.newline();
+        let static_block_temps =
+            self.prepare_source_class_static_block_declaration_plans(source_file);
+        if !static_block_temps.is_empty() {
+            self.writer.write("var ");
+            self.writer.write(&static_block_temps.join(", "));
+            self.writer.write(";");
+            self.writer.newline();
+        }
         if !self.commonjs_empty_binding_hoists.is_empty() {
             self.writer.write("var ");
             self.writer
@@ -28075,6 +28087,7 @@ impl Printer<'_> {
     #[allow(clippy::too_many_lines)]
     fn emit_system_source_file(
         &mut self,
+        source_file: NodeId,
         data: &ts_ast::SourceFileData,
         context: &EmitContext<'_>,
     ) -> Result<EmitResult, EmitError> {
@@ -28128,6 +28141,9 @@ impl Printer<'_> {
             self.const_enum_emit_mode.preserves_declarations(),
             context.amd_generated_name_offsets,
         );
+        for temp in self.prepare_source_class_static_block_declaration_plans(source_file) {
+            push_unique(&mut plan.hoisted_names, &temp);
+        }
         for dependency in &mut plan.dependencies {
             if let Some(rewrite) = context
                 .amd_module_specifier_rewrites
@@ -28758,6 +28774,29 @@ impl Printer<'_> {
                 Ok(())
             }
             NodeData::ClassDeclaration(class) => {
+                let lower_static_blocks = self
+                    .class_static_block_declaration_plans
+                    .contains_key(&statement);
+                let mut class_core = class.clone();
+                if lower_static_blocks {
+                    class_core.members.nodes.retain(|member| {
+                        !matches!(
+                            self.arena.get(*member).map(|node| &node.data),
+                            Some(NodeData::ClassStaticBlockDeclaration(_))
+                        )
+                    });
+                    class_core.members.range.end = class_core
+                        .members
+                        .nodes
+                        .last()
+                        .and_then(|member| self.arena.get(*member))
+                        .map_or(class_core.members.range.start, |member| member.range.end);
+                }
+                let emitted_class = if lower_static_blocks {
+                    &class_core
+                } else {
+                    class
+                };
                 let name = if let Some(name_id) = class.name {
                     self.identifier_text(name_id)?.to_owned()
                 } else if let Some(name) = self.commonjs_anonymous_default_names.get(&statement) {
@@ -28771,11 +28810,11 @@ impl Printer<'_> {
                     && (self.settings.target < ScriptTarget::Es2022
                         || self.settings.use_define_for_class_fields == Some(false));
                 if self.settings.target < ScriptTarget::Es2015 {
-                    self.emit_downlevel_class_value(class, &name, false)?;
+                    self.emit_downlevel_class_value(emitted_class, &name, false)?;
                 } else {
                     let previous_defer_static_fields = self.defer_static_fields;
                     self.defer_static_fields = defer_system_static_fields;
-                    let result = self.emit_class(class);
+                    let result = self.emit_class(emitted_class);
                     self.defer_static_fields = previous_defer_static_fields;
                     result?;
                 }
@@ -28808,8 +28847,21 @@ impl Printer<'_> {
                 }
                 if defer_system_static_fields {
                     self.writer.remove_trailing_newline();
-                    self.emit_native_static_fields(class)?;
+                    self.emit_native_static_fields(emitted_class)?;
                     self.writer.newline();
+                }
+                if lower_static_blocks {
+                    for member in &class.members.nodes {
+                        let Some(NodeData::ClassStaticBlockDeclaration(block)) =
+                            self.arena.get(*member).map(|node| &node.data)
+                        else {
+                            continue;
+                        };
+                        self.writer.write("(() => ");
+                        self.emit_block(block.body)?;
+                        self.writer.write(")();");
+                        self.writer.newline();
+                    }
                 }
                 Ok(())
             }
@@ -36076,6 +36128,7 @@ impl Printer<'_> {
                         | NodeData::ConstructorDeclaration(_)
                         | NodeData::GetAccessorDeclaration(_)
                         | NodeData::SetAccessorDeclaration(_)
+                        | NodeData::ClassStaticBlockDeclaration(_)
                 )
             });
         let block_range = self.arena.get(block_id).map(|node| node.range);
@@ -36115,6 +36168,7 @@ impl Printer<'_> {
                                         | NodeData::ConstructorDeclaration(_)
                                         | NodeData::GetAccessorDeclaration(_)
                                         | NodeData::SetAccessorDeclaration(_)
+                                        | NodeData::ClassStaticBlockDeclaration(_)
                                 )
                             ) {
                                 return None;
@@ -36160,6 +36214,7 @@ impl Printer<'_> {
                                     | NodeData::ConstructorDeclaration(_)
                                     | NodeData::GetAccessorDeclaration(_)
                                     | NodeData::SetAccessorDeclaration(_)
+                                    | NodeData::ClassStaticBlockDeclaration(_)
                             )
                         ) {
                             return None;
@@ -36173,7 +36228,7 @@ impl Printer<'_> {
             Vec::new()
         };
         class_declarations.sort_by_key(|(start, _, _)| *start);
-        let mut claimed = HashSet::new();
+        let mut claimed = self.generated_names.used.clone();
         let mut temps = Vec::new();
         let mut declaration_index = 0;
         for (class_start, class_expression) in class_expressions {
@@ -36269,6 +36324,7 @@ impl Printer<'_> {
                 );
             }
         }
+        self.generated_names.used.extend(temps.iter().cloned());
         if !temps.is_empty() {
             self.writer.write("var ");
             self.writer.write(&temps.join(", "));
@@ -36427,6 +36483,34 @@ impl Printer<'_> {
                 lower_static_fields,
             },
         );
+    }
+
+    fn prepare_source_class_static_block_declaration_plans(
+        &mut self,
+        source_file: NodeId,
+    ) -> Vec<String> {
+        let mut classes = self
+            .arena
+            .iter()
+            .filter_map(|(id, node)| {
+                matches!(node.data, NodeData::ClassDeclaration(_))
+                    .then_some((node.range.start, id))
+            })
+            .filter(|(_, id)| self.class_expression_belongs_to_source_scope(*id, source_file))
+            .collect::<Vec<_>>();
+        classes.sort_by_key(|(start, _)| *start);
+        let mut claimed = self.generated_names.used.clone();
+        let mut declarations = Vec::new();
+        for (_, class_id) in classes {
+            self.prepare_class_static_block_declaration_plan(
+                class_id,
+                source_file,
+                &mut claimed,
+                &mut declarations,
+            );
+        }
+        self.generated_names.used.extend(declarations.iter().cloned());
+        declarations
     }
 
     #[allow(clippy::too_many_lines)]
@@ -36849,9 +36933,10 @@ impl Printer<'_> {
                         | NodeData::FunctionExpression(_)
                         | NodeData::ArrowFunction(_)
                         | NodeData::MethodDeclaration(_)
-                        | NodeData::ConstructorDeclaration(_)
-                        | NodeData::GetAccessorDeclaration(_)
-                        | NodeData::SetAccessorDeclaration(_)
+                                | NodeData::ConstructorDeclaration(_)
+                                | NodeData::GetAccessorDeclaration(_)
+                                | NodeData::SetAccessorDeclaration(_)
+                                | NodeData::ClassStaticBlockDeclaration(_)
                 )
             ) {
                 return false;
@@ -50143,6 +50228,12 @@ impl Printer<'_> {
                 self.class_heritage_base_rewrites.remove(&base);
             }
         }
+        if self.commonjs_class_export_precedes_static_initializers(data)
+            && let Some(name) = data.name
+        {
+            let names = self.declaration_names(&[name]);
+            self.emit_commonjs_declaration_exports(data.modifiers.as_ref(), &names);
+        }
         let class_name = data
             .name
             .and_then(|name| declaration_name_text(self.arena, name))
@@ -50182,13 +50273,28 @@ impl Printer<'_> {
         self.active_private_field_plan = self.private_field_plan(data);
         let previous_private_method_plan = self.active_private_method_plan.clone();
         self.active_private_method_plan = self.private_method_plan(data);
+        let mut previous_static_end = core
+            .members
+            .nodes
+            .last()
+            .and_then(|member| self.arena.get(*member))
+            .map_or(data.members.range.start.get(), |member| member.range.end.get());
         for member in &data.members.nodes {
-            let Some(NodeData::ClassStaticBlockDeclaration(block)) =
-                self.arena.get(*member).map(|node| &node.data)
-            else {
+            let Some(member_node) = self.arena.get(*member) else {
+                continue;
+            };
+            let NodeData::ClassStaticBlockDeclaration(block) = &member_node.data else {
                 continue;
             };
             self.writer.newline();
+            self.emit_source_comments_between_with_trailing(
+                previous_static_end,
+                member_node.range.start.get(),
+                false,
+            );
+            if !self.writer.line_start {
+                self.writer.newline();
+            }
             self.writer.write(if self.settings.target < ScriptTarget::Es2015 {
                 "(function () "
             } else {
@@ -50232,6 +50338,7 @@ impl Printer<'_> {
             }
             block_result?;
             self.writer.write(")();");
+            previous_static_end = member_node.range.end.get();
         }
         self.active_private_method_plan = previous_private_method_plan;
         self.active_private_field_plan = previous_private_field_plan;
@@ -50805,10 +50912,11 @@ impl Printer<'_> {
             && (self.settings.target < ScriptTarget::Es2022
                 || self.settings.use_define_for_class_fields == Some(false))
             && data.members.nodes.iter().any(|member| {
-                let Some(NodeData::PropertyDeclaration(property)) =
-                    self.arena.get(*member).map(|node| &node.data)
-                else {
+                let Some(member) = self.arena.get(*member) else {
                     return false;
+                };
+                let NodeData::PropertyDeclaration(property) = &member.data else {
+                    return matches!(member.data, NodeData::ClassStaticBlockDeclaration(_));
                 };
                 (self.has_modifier(property.modifiers.as_ref(), SyntaxKind::StaticKeyword)
                     && (property.initializer.is_some()
@@ -51672,7 +51780,11 @@ impl Printer<'_> {
             match &node.data {
                 NodeData::ClassStaticBlockDeclaration(block) => {
                     self.writer.newline();
-                    self.writer.write("(() => ");
+                    self.writer.write(if self.settings.target < ScriptTarget::Es2015 {
+                        "(function () "
+                    } else {
+                        "(() => "
+                    });
                     self.emit_block(block.body)?;
                     self.writer.write(")(),");
                 }
@@ -52280,7 +52392,11 @@ impl Printer<'_> {
             match &node.data {
                 NodeData::ClassStaticBlockDeclaration(block) => {
                     self.writer.newline();
-                    self.writer.write("(() => ");
+                    self.writer.write(if self.settings.target < ScriptTarget::Es2015 {
+                        "(function () "
+                    } else {
+                        "(() => "
+                    });
                     self.emit_block(block.body)?;
                     self.writer.write(")();");
                 }

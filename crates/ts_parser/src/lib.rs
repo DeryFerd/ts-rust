@@ -2367,7 +2367,11 @@ impl<'a> Parser<'a> {
         while self.current.kind == SyntaxKind::AtToken {
             modifier_nodes.push(self.parse_decorator());
         }
-        while self.current.kind.is_modifier() && !self.current_modifier_is_member_name() {
+        while self.current.kind.is_modifier()
+            && !self.current_modifier_is_member_name()
+            && !(self.current.kind == SyntaxKind::StaticKeyword
+                && self.next_token_is_open_brace())
+        {
             modifier_nodes.push(self.consume_token_node());
         }
         self.recover_invalid_class_var_modifier(&mut modifier_nodes);
@@ -2379,6 +2383,9 @@ impl<'a> Parser<'a> {
             },
             flags: ts_ast::ModifierFlags::default(),
         });
+        if self.current.kind == SyntaxKind::StaticKeyword && self.next_token_is_open_brace() {
+            return self.parse_class_static_block(start);
+        }
         if self.current.kind == SyntaxKind::OpenBracketToken && self.is_index_signature() {
             let member = self.parse_index_signature(start, modifiers);
             for modifier in modifier_nodes {
@@ -9580,6 +9587,23 @@ mod tests {
             "{:?}",
             result.diagnostics,
         );
+    }
+
+    #[test]
+    fn recovers_modifiers_before_class_static_blocks() {
+        let result = parse_source_file(
+            "class C { @dec static {} async static {} public static {} readonly private static {} }",
+        );
+        let NodeData::ClassDeclaration(class) =
+            &result.arena.get(source_statements(&result)[0]).unwrap().data
+        else {
+            panic!("expected class declaration");
+        };
+        assert_eq!(class.members.nodes.len(), 4, "{:?}", result.diagnostics);
+        assert!(class.members.nodes.iter().all(|member| {
+            result.arena.get(*member).unwrap().kind
+                == SyntaxKind::ClassStaticBlockDeclaration
+        }));
     }
 
     #[test]
