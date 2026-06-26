@@ -54997,6 +54997,7 @@ impl Printer<'_> {
             NodeData::ArrayTypeNode(_) | NodeData::TupleTypeNode(_) => {
                 RuntimeMetadataType::Builtin("Array")
             }
+            NodeData::TemplateLiteralTypeNode(_) => RuntimeMetadataType::Builtin("String"),
             NodeData::FunctionTypeNode(_) | NodeData::ConstructorTypeNode(_) => {
                 RuntimeMetadataType::Builtin("Function")
             }
