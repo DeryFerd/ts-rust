@@ -6269,6 +6269,7 @@ impl DeclarationPrinter<'_> {
                         continue;
                     }
                     if self.class_member_is_overload_implementation(&data.members, member_index)
+                        || self.class_member_is_shadowed_by_accessor(&data.members, member_index)
                         || self
                             .class_member_is_duplicate_private_method(&data.members, member_index)
                         || self.javascript_property_repeats_base_type(data, *member)
@@ -15843,6 +15844,28 @@ impl DeclarationPrinter<'_> {
             .is_some_and(|(left, right)| left == right)
     }
 
+    fn class_setter_parameter_type(&self, member: NodeId, name: NodeId) -> Option<NodeId> {
+        let class = self.arena.get(member)?.parent?;
+        let members = match &self.arena.get(class)?.data {
+            NodeData::ClassDeclaration(class) => &class.members,
+            NodeData::ClassExpression(class) => &class.members,
+            _ => return None,
+        };
+        members.nodes.iter().find_map(|candidate| {
+            let NodeData::SetAccessorDeclaration(setter) = &self.arena.get(*candidate)?.data else {
+                return None;
+            };
+            if !self.declaration_member_names_match(name, setter.name) {
+                return None;
+            }
+            let parameter = setter.parameters.nodes.first()?;
+            let NodeData::ParameterDeclaration(parameter) = &self.arena.get(*parameter)?.data else {
+                return None;
+            };
+            parameter.type_
+        })
+    }
+
     fn computed_enum_setter_parameter_type(
         &self,
         member: NodeId,
@@ -17477,9 +17500,6 @@ impl DeclarationPrinter<'_> {
         if method.body.is_none() {
             return false;
         }
-        let Some(name) = declaration_name_text(self.arena, method.name) else {
-            return false;
-        };
         members.nodes[..member_index].iter().any(|previous| {
             let Some(NodeData::MethodDeclaration(previous)) =
                 self.arena.get(*previous).map(|node| &node.data)
@@ -17487,7 +17507,30 @@ impl DeclarationPrinter<'_> {
                 return false;
             };
             previous.body.is_none()
-                && declaration_name_text(self.arena, previous.name) == Some(name)
+                && self.declaration_member_names_match(previous.name, method.name)
+        })
+    }
+
+    fn class_member_is_shadowed_by_accessor(
+        &self,
+        members: &NodeList,
+        member_index: usize,
+    ) -> bool {
+        let Some(member) = members.nodes.get(member_index).copied() else {
+            return false;
+        };
+        let Some(NodeData::MethodDeclaration(method)) =
+            self.arena.get(member).map(|node| &node.data)
+        else {
+            return false;
+        };
+        members.nodes[member_index + 1..].iter().any(|candidate| {
+            let accessor_name = match self.arena.get(*candidate).map(|node| &node.data) {
+                Some(NodeData::GetAccessorDeclaration(accessor)) => accessor.name,
+                Some(NodeData::SetAccessorDeclaration(accessor)) => accessor.name,
+                _ => return false,
+            };
+            self.declaration_member_names_match(method.name, accessor_name)
         })
     }
 
@@ -18239,6 +18282,11 @@ impl DeclarationPrinter<'_> {
                 {
                     self.writer.write(": ");
                     self.emit_jsdoc_type_hint(&hint);
+                } else if data.type_.is_none()
+                    && let Some(type_) = self.class_setter_parameter_type(id, data.name)
+                {
+                    self.writer.write(": ");
+                    self.emit_type(type_)?;
                 } else if data.type_.is_none()
                     && let Some(type_) = self.computed_enum_setter_parameter_type(id, data.name)
                 {
@@ -23973,6 +24021,9 @@ impl DeclarationPrinter<'_> {
             .const_literal_declaration_initializer(computed.expression)
             .is_some()
         {
+            return true;
+        }
+        if self.computed_method_is_global_symbol_property(name) {
             return true;
         }
         let Some(symbol) = self.resolve_computed_type_key_symbol(computed.expression) else {
