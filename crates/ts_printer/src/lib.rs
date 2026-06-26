@@ -18120,6 +18120,8 @@ impl DeclarationPrinter<'_> {
                     {
                         self.writer.write("typeof ");
                         self.emit_name(class_name)?;
+                    } else if data.type_.is_none() && self.method_returns_this(data) {
+                        self.writer.write("this");
                     } else if data.type_.is_none()
                         && self.member_has_modifier(
                             data.modifiers.as_ref(),
@@ -18534,6 +18536,17 @@ impl DeclarationPrinter<'_> {
             return None;
         };
         class.name
+    }
+
+    fn method_returns_this(&self, method: &ts_ast::MethodDeclarationData) -> bool {
+        method
+            .body
+            .and_then(|body| self.declaration_single_return_expression(body))
+            .is_some_and(|expression| {
+                self.arena
+                    .get(expression)
+                    .is_some_and(|node| node.kind == SyntaxKind::ThisKeyword)
+            })
     }
 
     fn emit_javascript_instance_properties(
@@ -22760,7 +22773,17 @@ impl DeclarationPrinter<'_> {
                 symbol.declarations.iter().any(|declaration| {
                     self.declaration_type_node(*declaration)
                         .and_then(|type_node| self.arena.get(type_node))
-                        .is_some_and(|type_node| type_node.kind == SyntaxKind::SymbolKeyword)
+                        .is_some_and(|type_node| {
+                            type_node.kind == SyntaxKind::SymbolKeyword
+                                || matches!(
+                                    &type_node.data,
+                                    NodeData::TypeQueryNode(query)
+                                        if entity_root_identifier_text(
+                                            self.arena,
+                                            query.expr_name,
+                                        ) == Some("Symbol")
+                                )
+                        })
                         || matches!(
                             self.arena.get(*declaration).map(|node| &node.data),
                             Some(NodeData::VariableDeclaration(variable))
