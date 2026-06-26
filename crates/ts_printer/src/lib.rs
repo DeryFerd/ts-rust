@@ -462,6 +462,48 @@ pub fn emit_source_file_with_context(
     printer
         .synthetic_runtime_identifier_uses
         .extend(decorator_runtime_names);
+    if context.isolated_modules && settings.target < ScriptTarget::Es2015 {
+        let async_promise_constructors = arena
+            .iter()
+            .filter_map(|(_, node)| {
+                let (modifiers, return_type) = match &node.data {
+                    NodeData::ArrowFunction(function) => {
+                        (function.modifiers.as_ref(), function.type_)
+                    }
+                    NodeData::FunctionDeclaration(function) => {
+                        (function.modifiers.as_ref(), function.type_)
+                    }
+                    NodeData::FunctionExpression(function) => {
+                        (function.modifiers.as_ref(), function.type_)
+                    }
+                    NodeData::MethodDeclaration(function) => {
+                        (function.modifiers.as_ref(), function.type_)
+                    }
+                    _ => return None,
+                };
+                if !declaration_has_modifier_in_list(
+                    arena,
+                    modifiers,
+                    SyntaxKind::AsyncKeyword,
+                ) {
+                    return None;
+                }
+                let NodeData::TypeReferenceNode(reference) =
+                    &arena.get(return_type?)?.data
+                else {
+                    return None;
+                };
+                let name = entity_root_identifier_text(arena, reference.type_name)?;
+                (name != "Promise").then(|| name.to_owned())
+            })
+            .collect::<Vec<_>>();
+        printer
+            .runtime_identifier_uses
+            .extend(async_promise_constructors.iter().cloned());
+        printer
+            .synthetic_runtime_identifier_uses
+            .extend(async_promise_constructors);
+    }
     if context.emit_decorator_metadata {
         let metadata_names = printer
             .decorator_metadata_runtime_names()
@@ -37657,6 +37699,8 @@ impl Printer<'_> {
                 "_a",
                 None,
                 None,
+                None,
+                None,
                 false,
             );
         }
@@ -39525,6 +39569,27 @@ impl Printer<'_> {
         Ok(())
     }
 
+    fn es5_async_promise_constructor(&self, body: NodeId) -> Option<String> {
+        if self.settings.target >= ScriptTarget::Es2015 {
+            return None;
+        }
+        let return_type = self.arena.iter().find_map(|(_, node)| match &node.data {
+            NodeData::ArrowFunction(function) if function.body == body => function.type_,
+            NodeData::FunctionDeclaration(function) if function.body == Some(body) => function.type_,
+            NodeData::FunctionExpression(function) if function.body == body => function.type_,
+            NodeData::MethodDeclaration(function) if function.body == Some(body) => function.type_,
+            _ => None,
+        })?;
+        let NodeData::TypeReferenceNode(reference) = &self.arena.get(return_type)?.data else {
+            return None;
+        };
+        let name = entity_root_identifier_text(self.arena, reference.type_name)?;
+        if name == "Promise" {
+            return None;
+        }
+        self.commonjs_named_import_text_rewrites.get(name).cloned()
+    }
+
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn emit_es5_async_function_body(
         &mut self,
@@ -39535,9 +39600,15 @@ impl Printer<'_> {
         requested_state_parameter: &str,
         object_rest: Option<(NodeId, &str, Option<&str>)>,
         parameter_prologue: Option<&NodeList>,
+        async_parameter_plan: Option<(&NodeList, &DownlevelAsyncParameterPlan)>,
+        arguments_capture: Option<&str>,
         compact_outer: bool,
     ) -> Result<(), EmitError> {
-        let compact_outer = compact_outer && parameter_prologue.is_none();
+        let compact_callback = compact_outer;
+        let compact_outer = compact_outer
+            && parameter_prologue.is_none()
+            && async_parameter_plan.is_none()
+            && arguments_capture.is_none();
         let empty_single_line_block = self.arena.get(body).is_some_and(|node| {
             matches!(&node.data, NodeData::Block(block) if block.statements.nodes.is_empty())
                 && usize::try_from(node.range.start.get())
@@ -39550,6 +39621,8 @@ impl Printer<'_> {
             && expression_body.is_none()
             && object_rest.is_none()
             && parameter_prologue.is_none()
+            && async_parameter_plan.is_none()
+            && arguments_capture.is_none()
             && empty_single_line_block
         {
             self.writer.write("{");
@@ -39559,7 +39632,13 @@ impl Printer<'_> {
             self.emit_awaiter_reference();
             self.writer.write("(");
             self.writer.write(this_argument);
-            self.writer.write(", void 0, void 0, function () { return ");
+            self.writer.write(", void 0, ");
+            if let Some(constructor) = self.es5_async_promise_constructor(body) {
+                self.writer.write(&constructor);
+            } else {
+                self.writer.write("void 0");
+            }
+            self.writer.write(", function () { return ");
             self.emit_generator_reference();
             self.writer.write("(");
             self.writer.write(generator_this);
@@ -39700,6 +39779,10 @@ impl Printer<'_> {
             for_in_plans,
             state_parameter: planned_state_parameter,
         } = capture_plan;
+        let object_plan_temp_names = object_plans
+            .values()
+            .map(|plan| plan.temp.clone())
+            .collect::<HashSet<_>>();
         self.es5_async_await_captures = await_captures;
         self.es5_async_conditional_temps = conditional_temps;
         self.es5_async_array_temps = array_temps;
@@ -39726,16 +39809,78 @@ impl Printer<'_> {
         if let Some(parameters) = parameter_prologue {
             self.emit_downlevel_rest_parameter_prologue(parameters)?;
         }
+        if let Some((_, plan)) = async_parameter_plan
+            && let Some(rest) = plan.rest_parameter.as_deref()
+        {
+            self.writer.write("var ");
+            self.writer.write(rest);
+            self.writer.write(" = [];");
+            self.writer.newline();
+            self.writer.write("for (var _i = ");
+            self.writer.write(&plan.overrides.len().to_string());
+            self.writer.write("; _i < arguments.length; _i++) {");
+            self.writer.newline();
+            self.writer.indent += 1;
+            self.writer.write(rest);
+            self.writer.write("[_i");
+            if !plan.overrides.is_empty() {
+                self.writer.write(" - ");
+                self.writer.write(&plan.overrides.len().to_string());
+            }
+            self.writer.write("] = arguments[_i];");
+            self.writer.newline();
+            self.writer.indent -= 1;
+            self.writer.write("}");
+            self.writer.newline();
+        }
+        if let Some(alias) = arguments_capture {
+            self.writer.write("var ");
+            self.writer.write(alias);
+            self.writer.write(" = arguments;");
+            self.writer.newline();
+        }
         if !compact_outer {
             self.writer.write("return ");
         }
         self.emit_awaiter_reference();
         self.writer.write("(");
         self.writer.write(this_argument);
-        self.writer.write(", void 0, void 0, function () {");
-        let callback_is_indented = !compact_outer
+        self.writer.write(", ");
+        if let Some((_, plan)) = async_parameter_plan
+            && let Some(rest) = plan.rest_parameter.as_deref()
+        {
+            self.writer.write("__spreadArray([");
+            for (index, (_, _, temp)) in plan.overrides.iter().enumerate() {
+                if index != 0 {
+                    self.writer.write(", ");
+                }
+                self.writer.write(temp);
+            }
+            self.writer.write("], ");
+            self.writer.write(rest);
+            self.writer.write(", true)");
+        } else {
+            self.writer.write("void 0");
+        }
+        self.writer.write(", ");
+        let promise_constructor = self.es5_async_promise_constructor(body);
+        if let Some(constructor) = promise_constructor {
+            self.writer.write(&constructor);
+        } else {
+            self.writer.write("void 0");
+        }
+        self.writer.write(", function ");
+        if let Some((parameters, _)) = async_parameter_plan {
+            self.emit_parameters_without_initializers(parameters)?;
+        } else {
+            self.writer.write("()");
+        }
+        self.writer.write(" {");
+        let callback_is_indented = !compact_callback
             || object_rest.is_some()
-            || (expression_body.is_none() && self.this_alias.as_deref() != Some("_a"));
+            || (expression_body.is_none()
+                && !empty_single_line_block
+                && self.this_alias.as_deref() != Some("_a"));
         if callback_is_indented {
             self.writer.newline();
         } else {
@@ -39743,6 +39888,52 @@ impl Printer<'_> {
         }
         if callback_is_indented {
             self.writer.indent += 1;
+        }
+
+        let awaited_parameter_defaults = async_parameter_plan
+            .into_iter()
+            .flat_map(|(parameters, _)| parameters.nodes.iter())
+            .filter_map(|parameter| {
+                let NodeData::ParameterDeclaration(parameter) =
+                    &self.arena.get(*parameter)?.data
+                else {
+                    return None;
+                };
+                let initializer = parameter.initializer?;
+                matches!(
+                    self.arena.get(initializer).map(|node| &node.data),
+                    Some(NodeData::AwaitExpression(_))
+                )
+                .then_some(initializer)
+            })
+            .collect::<Vec<_>>();
+        if let Some((parameters, _)) = async_parameter_plan {
+            for parameter in &parameters.nodes {
+                let Some(NodeData::ParameterDeclaration(parameter)) =
+                    self.arena.get(*parameter).map(|node| &node.data)
+                else {
+                    continue;
+                };
+                let Some(initializer) = parameter.initializer else {
+                    continue;
+                };
+                self.writer.write("if (");
+                self.emit_expression(parameter.name, 0)?;
+                self.writer.write(" === void 0) { ");
+                self.emit_expression(parameter.name, 0)?;
+                self.writer.write(" = ");
+                if matches!(
+                    self.arena.get(initializer).map(|node| &node.data),
+                    Some(NodeData::AwaitExpression(_))
+                ) {
+                    self.writer.write(state_parameter);
+                    self.writer.write(".sent()");
+                } else {
+                    self.emit_expression(initializer, 0)?;
+                }
+                self.writer.write("; }");
+                self.writer.newline();
+            }
         }
 
         if let Some((pattern, parameter, expression_temp)) = object_rest {
@@ -39772,13 +39963,17 @@ impl Printer<'_> {
             self.writer.write(";");
             self.writer.newline();
         }
-        if !planned_temps.is_empty()
+        let combined_planned_temps = planned_temps
+            .iter()
+            .filter(|temp| !object_plan_temp_names.contains(*temp))
+            .collect::<Vec<_>>();
+        if !combined_planned_temps.is_empty()
             || (expression_body.is_none()
                 && (!hoisted_names.is_empty() || !try_catch_hoists.is_empty()))
         {
             self.writer.write("var ");
             let mut index = 0;
-            for name in &planned_temps {
+            for name in combined_planned_temps {
                 if index != 0 {
                     self.writer.write(", ");
                 }
@@ -39799,6 +39994,15 @@ impl Printer<'_> {
                 self.writer.write(name);
                 index += 1;
             }
+            self.writer.write(";");
+            self.writer.newline();
+        }
+        for temp in planned_temps
+            .iter()
+            .filter(|temp| object_plan_temp_names.contains(*temp))
+        {
+            self.writer.write("var ");
+            self.writer.write(temp);
             self.writer.write(";");
             self.writer.newline();
         }
@@ -39842,6 +40046,31 @@ impl Printer<'_> {
                 state_parameter,
                 object_rest.and_then(|(_, _, temp)| temp),
             )?;
+        } else if !awaited_parameter_defaults.is_empty()
+            && matches!(
+                self.arena.get(body).map(|node| &node.data),
+                Some(NodeData::Block(block)) if block.statements.nodes.is_empty()
+            )
+        {
+            self.writer.write("switch (");
+            self.writer.write(state_parameter);
+            self.writer.write(".label) {");
+            self.writer.newline();
+            self.writer.indent += 1;
+            self.writer.write("case 0:");
+            self.writer.indent += 1;
+            let mut case = 0;
+            for initializer in awaited_parameter_defaults {
+                let NodeData::AwaitExpression(awaited) = &self.node(initializer)?.data else {
+                    unreachable!();
+                };
+                self.emit_es5_async_yield(awaited.expression, &mut case, true)?;
+            }
+            self.writer.write("return [2 /*return*/];");
+            self.writer.newline();
+            self.writer.indent -= 2;
+            self.writer.write("}");
+            self.writer.newline();
         } else if let Some(loop_info) = self.es5_async_captured_for_loop(body)? {
             self.emit_es5_async_captured_loop_state_machine(&loop_info, state_parameter)?;
         } else {
@@ -39850,21 +40079,17 @@ impl Printer<'_> {
 
         self.writer.indent -= 1;
         self.writer.write("});");
-        if compact_outer && !callback_is_indented {
+        if !callback_is_indented {
             self.writer.write(" });");
         } else {
             self.writer.newline();
-        }
-        if callback_is_indented {
             self.writer.indent -= 1;
+            self.writer.write("});");
         }
         if !compact_outer {
-            self.writer.write("});");
             self.writer.newline();
             self.writer.indent -= 1;
             self.writer.write("}");
-        } else if callback_is_indented {
-            self.writer.write("}); }");
         } else {
             self.writer.write(" }");
         }
@@ -39899,6 +40124,25 @@ impl Printer<'_> {
         call_temp: Option<&str>,
     ) -> Result<(), EmitError> {
         let node = self.node(expression)?.clone();
+        if let NodeData::AwaitExpression(awaited) = &node.data {
+            self.writer.write("switch (");
+            self.writer.write(state);
+            self.writer.write(".label) {");
+            self.writer.newline();
+            self.writer.indent += 1;
+            self.writer.write("case 0:");
+            self.writer.indent += 1;
+            let mut case = 0;
+            self.emit_es5_async_yield(awaited.expression, &mut case, true)?;
+            self.writer.write("return [2 /*return*/, ");
+            self.writer.write(state);
+            self.writer.write(".sent()];");
+            self.writer.newline();
+            self.writer.indent -= 2;
+            self.writer.write("}");
+            self.writer.newline();
+            return Ok(());
+        }
         if let NodeData::CallExpression(call) = &node.data
             && call.arguments.nodes.len() == 1
             && let Some(NodeData::AwaitExpression(awaited)) = self
@@ -40473,20 +40717,12 @@ impl Printer<'_> {
                 objects,
                 Self::collect_es5_async_object_plans,
             ),
-            Some(NodeData::ExpressionStatement(statement)) => {
-                if let Some(NodeData::BinaryExpression(binary)) =
-                    self.arena.get(statement.expression).map(|node| &node.data)
-                    && self
-                        .arena
-                        .get(binary.operator_token)
-                        .is_some_and(|operator| operator.kind == SyntaxKind::EqualsToken)
-                    && matches!(
-                        self.arena.get(binary.right).map(|node| &node.data),
-                        Some(NodeData::ObjectLiteralExpression(_))
-                    )
-                    && self.es5_async_object_await_count(binary.right) != 0
+            Some(NodeData::ExpressionStatement(_) | NodeData::VariableStatement(_)) => {
+                if let Some((_, object)) = self.es5_async_object_assignment(statement)
                 {
-                    objects.push(binary.right);
+                    if self.es5_async_object_await_count(object) != 0 {
+                        objects.push(object);
+                    }
                 }
             }
             Some(NodeData::ReturnStatement(statement)) => {
@@ -41120,16 +41356,16 @@ impl Printer<'_> {
                 case,
             );
         }
-        if let Some((left, object)) = self.es5_async_object_assignment(statement)
-            && let Some(plan) = self.es5_async_object_plans.get(&object).cloned()
-        {
-            return self.emit_es5_async_object_statement(
-                object,
-                &plan,
-                Es5AsyncObjectSink::Assign(left),
-                state,
-                case,
-            );
+        if let Some((left, object)) = self.es5_async_object_assignment(statement) {
+            if let Some(plan) = self.es5_async_object_plans.get(&object).cloned() {
+                return self.emit_es5_async_object_statement(
+                    object,
+                    &plan,
+                    Es5AsyncObjectSink::Assign(left),
+                    state,
+                    case,
+                );
+            }
         }
         if let NodeData::ReturnStatement(return_statement) = &node.data
             && let Some(expression) = return_statement.expression
@@ -42450,25 +42686,30 @@ impl Printer<'_> {
             Es5AsyncObjectSink::Return => self.writer.write("return [2 /*return*/, ("),
         }
         self.emit_es5_async_object_mutation(property, plan, state, sent_key, sent_value)?;
-        self.writer.indent += 1;
-        for property_id in &object.properties.nodes[index + 1..] {
-            let property_node = self.node(*property_id)?.clone();
-            let NodeData::PropertyAssignment(property) = &property_node.data else {
-                return Err(Self::unsupported(*property_id, property_node.kind));
-            };
+        let remaining = &object.properties.nodes[index + 1..];
+        if remaining.is_empty() {
+            self.writer.write(", ");
+        } else {
+            self.writer.indent += 1;
+            for property_id in remaining {
+                let property_node = self.node(*property_id)?.clone();
+                let NodeData::PropertyAssignment(property) = &property_node.data else {
+                    return Err(Self::unsupported(*property_id, property_node.kind));
+                };
+                self.writer.write(",");
+                self.writer.newline();
+                self.emit_es5_async_object_mutation(property, plan, state, false, false)?;
+            }
             self.writer.write(",");
             self.writer.newline();
-            self.emit_es5_async_object_mutation(property, plan, state, false, false)?;
         }
-        self.writer.write(",");
-        self.writer.newline();
         self.writer.write(&plan.temp);
         match sink {
             Es5AsyncObjectSink::Assign(_) => self.writer.write(");"),
             Es5AsyncObjectSink::Return => self.writer.write(")];"),
         }
         self.writer.newline();
-        self.writer.indent -= 1;
+        self.writer.indent -= usize::from(!remaining.is_empty());
         Ok(())
     }
 
@@ -44036,9 +44277,12 @@ impl Printer<'_> {
                 .iter()
                 .map(|statement| self.es5_async_simple_suspension_count(*statement))
                 .sum(),
-            Some(NodeData::VariableStatement(_)) => {
-                usize::from(self.direct_await_binding(statement).is_some())
-            }
+            Some(NodeData::VariableStatement(_)) => self
+                .es5_async_object_assignment(statement)
+                .map_or_else(
+                    || usize::from(self.direct_await_binding(statement).is_some()),
+                    |(_, object)| self.es5_async_object_await_count(object),
+                ),
             Some(NodeData::ExpressionStatement(expression)) => {
                 if let Some((_, object)) = self.es5_async_object_assignment(statement) {
                     self.es5_async_object_await_count(object)
@@ -44483,21 +44727,46 @@ impl Printer<'_> {
     }
 
     fn es5_async_object_assignment(&self, statement: NodeId) -> Option<(NodeId, NodeId)> {
-        let NodeData::ExpressionStatement(statement) = &self.arena.get(statement)?.data else {
-            return None;
-        };
-        let NodeData::BinaryExpression(binary) = &self.arena.get(statement.expression)?.data else {
-            return None;
-        };
-        if self.arena.get(binary.operator_token)?.kind != SyntaxKind::EqualsToken
-            || !matches!(
-                self.arena.get(binary.right).map(|node| &node.data),
-                Some(NodeData::ObjectLiteralExpression(_))
-            )
-        {
-            return None;
+        match &self.arena.get(statement)?.data {
+            NodeData::ExpressionStatement(statement) => {
+                let NodeData::BinaryExpression(binary) =
+                    &self.arena.get(statement.expression)?.data
+                else {
+                    return None;
+                };
+                if self.arena.get(binary.operator_token)?.kind != SyntaxKind::EqualsToken
+                    || !matches!(
+                        self.arena.get(binary.right).map(|node| &node.data),
+                        Some(NodeData::ObjectLiteralExpression(_))
+                    )
+                {
+                    return None;
+                }
+                Some((binary.left, binary.right))
+            }
+            NodeData::VariableStatement(statement) => {
+                let NodeData::VariableDeclarationList(list) =
+                    &self.arena.get(statement.declaration_list)?.data
+                else {
+                    return None;
+                };
+                let [declaration] = list.declarations.nodes.as_slice() else {
+                    return None;
+                };
+                let NodeData::VariableDeclaration(declaration) =
+                    &self.arena.get(*declaration)?.data
+                else {
+                    return None;
+                };
+                let initializer = declaration.initializer?;
+                matches!(
+                    self.arena.get(initializer).map(|node| &node.data),
+                    Some(NodeData::ObjectLiteralExpression(_))
+                )
+                .then_some((declaration.name, initializer))
+            }
+            _ => None,
         }
-        Some((binary.left, binary.right))
     }
 
     fn es5_async_array_awaits(&self, array: NodeId) -> Vec<(usize, NodeId)> {
@@ -51302,7 +51571,11 @@ impl Printer<'_> {
                         }
                         self.emit_downlevel_member_access(method.name)?;
                         self.writer.write(" = ");
-                        if self.has_modifier(method.modifiers.as_ref(), SyntaxKind::AsyncKeyword) {
+                        let is_async = self.has_modifier(
+                            method.modifiers.as_ref(),
+                            SyntaxKind::AsyncKeyword,
+                        );
+                        if is_async && self.settings.target >= ScriptTarget::Es2017 {
                             self.writer.write("async ");
                         }
                         self.writer.write("function");
@@ -51317,7 +51590,9 @@ impl Printer<'_> {
                             super_capture.clone().unwrap_or_else(|| "_super".into()),
                             self.has_modifier(method.modifiers.as_ref(), SyntaxKind::StaticKeyword),
                         ));
-                        if self.settings.target < ScriptTarget::Es2015
+                        if is_async && self.settings.target < ScriptTarget::Es2017 {
+                            self.emit_downlevel_async_function_body(body, "this")?;
+                        } else if self.settings.target < ScriptTarget::Es2015
                             && self.body_has_downlevel_arrow_this(body)
                         {
                             self.emit_function_body_with_this_capture(body)?;
@@ -57352,8 +57627,7 @@ impl Printer<'_> {
                                     method.modifiers.as_ref(),
                                     SyntaxKind::AsyncKeyword,
                                 )
-                                && (ScriptTarget::Es2015..ScriptTarget::Es2017)
-                                    .contains(&self.settings.target);
+                                && self.settings.target < ScriptTarget::Es2017;
                             if self.settings.target < ScriptTarget::Es2015
                                 && method.asterisk_token.is_none()
                             {
@@ -57361,7 +57635,16 @@ impl Printer<'_> {
                                 self.writer.write(": function ");
                                 self.emit_parameters(&method.parameters)?;
                                 self.writer.write(" ");
-                                self.emit_function_body(method.body.expect("body checked above"))?;
+                                if downlevel_async {
+                                    self.emit_downlevel_async_function_body(
+                                        method.body.expect("body checked above"),
+                                        "this",
+                                    )?;
+                                } else {
+                                    self.emit_function_body(
+                                        method.body.expect("body checked above"),
+                                    )?;
+                                }
                             } else {
                                 if !downlevel_async
                                     && self.has_modifier(
@@ -57586,7 +57869,6 @@ impl Printer<'_> {
                     .then(|| self.async_arrow_object_rest_parameter(data))
                     .flatten();
                 let downlevel_async_parameters = (downlevel_async
-                    && self.settings.target >= ScriptTarget::Es2015
                     && object_rest_parameter.is_none())
                     .then(|| self.downlevel_async_parameter_plan(&data.parameters, id))
                     .flatten();
@@ -57600,7 +57882,13 @@ impl Printer<'_> {
                 if object_rest_parameter.is_some() {
                     self.writer.write("(_a)");
                 } else if let Some(plan) = &downlevel_async_parameters {
-                    if let Some(rest) = plan.rest_parameter.as_deref() {
+                    if self.settings.target < ScriptTarget::Es2015 {
+                        self.emit_parameters_with_name_overrides(
+                            &plan.outer_parameters,
+                            false,
+                            &plan.overrides,
+                        )?;
+                    } else if let Some(rest) = plan.rest_parameter.as_deref() {
                         self.writer.write("(");
                         for (index, (_, _, temp)) in plan.overrides.iter().enumerate() {
                             if index != 0 {
@@ -57639,14 +57927,16 @@ impl Printer<'_> {
                 if downlevel_async {
                     let previous_arguments_alias = self.arguments_alias.clone();
                     if let Some(alias) = local_arguments_alias.as_deref() {
-                        self.writer.write("{");
-                        self.writer.newline();
-                        self.writer.indent += 1;
-                        self.writer.write("var ");
-                        self.writer.write(alias);
-                        self.writer.write(" = arguments;");
-                        self.writer.newline();
-                        self.writer.write("return ");
+                        if self.settings.target >= ScriptTarget::Es2015 {
+                            self.writer.write("{");
+                            self.writer.newline();
+                            self.writer.indent += 1;
+                            self.writer.write("var ");
+                            self.writer.write(alias);
+                            self.writer.write(" = arguments;");
+                            self.writer.newline();
+                            self.writer.write("return ");
+                        }
                         self.arguments_alias = Some(alias.to_owned());
                     }
                     let this_argument = if self.settings.target < ScriptTarget::Es2015
@@ -57692,7 +57982,7 @@ impl Printer<'_> {
                                 Some(NodeData::ParameterDeclaration(parameter))
                                     if parameter.dot_dot_dot_token.is_some()
                             )
-                        }).then_some(&data.parameters);
+                        }).then_some(&data.parameters).filter(|_| downlevel_async_parameters.is_none());
                         self.emit_es5_async_function_body(
                             data.body,
                             expression_body,
@@ -57701,6 +57991,10 @@ impl Printer<'_> {
                             state,
                             object_rest,
                             parameter_prologue,
+                            downlevel_async_parameters
+                                .as_ref()
+                                .map(|plan| (&data.parameters, plan)),
+                            local_arguments_alias.as_deref(),
                             true,
                         )?;
                     } else if let Some(pattern) = object_rest_parameter {
@@ -57729,7 +58023,9 @@ impl Printer<'_> {
                                 .then_some(data.body);
                         self.emit_awaiter_call(data.body, expression_body, &this_argument)?;
                     }
-                    if local_arguments_alias.is_some() {
+                    if local_arguments_alias.is_some()
+                        && self.settings.target >= ScriptTarget::Es2015
+                    {
                         self.writer.write(";");
                         self.writer.newline();
                         self.writer.indent -= 1;
@@ -61031,13 +61327,20 @@ impl Printer<'_> {
             NodeData::MethodDeclaration(method) if method.body.is_some() => {
                 let downlevel_async = method.asterisk_token.is_none()
                     && self.has_modifier(method.modifiers.as_ref(), SyntaxKind::AsyncKeyword)
-                    && (ScriptTarget::Es2015..ScriptTarget::Es2017).contains(&self.settings.target);
+                    && self.settings.target < ScriptTarget::Es2017;
                 if self.settings.target < ScriptTarget::Es2015 && method.asterisk_token.is_none() {
                     self.emit_expression(method.name, 0)?;
                     self.writer.write(": function ");
                     self.emit_parameters(&method.parameters)?;
                     self.writer.write(" ");
-                    self.emit_function_body(method.body.expect("body checked above"))?;
+                    if downlevel_async {
+                        self.emit_downlevel_async_function_body(
+                            method.body.expect("body checked above"),
+                            "this",
+                        )?;
+                    } else {
+                        self.emit_function_body(method.body.expect("body checked above"))?;
+                    }
                     return Ok(());
                 }
                 if !downlevel_async
@@ -65233,6 +65536,63 @@ mod tests {
         assert!(
             es5.contains("obj = (_a = {}, _a[\"a\"] = function () { return _this; }, _a);"),
             "{es5}"
+        );
+    }
+
+    #[test]
+    fn lowers_es5_async_arrow_expression_awaits() {
+        let output = emit_with(
+            "const value = async item => await load(item);",
+            ScriptTarget::Es5,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(output.contains("switch (_a.label) {"), "{output}");
+        assert!(
+            output.contains("case 0: return [4 /*yield*/, load(item)];"),
+            "{output}"
+        );
+        assert!(
+            output.contains("case 1: return [2 /*return*/, _a.sent()];"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn lowers_es5_async_arrow_await_parameter_defaults() {
+        let output = emit_with_parse_errors(
+            "const value = async (item = await) => {};",
+            ScriptTarget::Es5,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(output.contains("var args_1 = [];"), "{output}");
+        assert!(
+            output.contains("__awaiter(void 0, __spreadArray([], args_1, true), void 0, function (item)"),
+            "{output}"
+        );
+        assert!(
+            output.contains("if (item === void 0) { item = _a.sent(); }"),
+            "{output}"
+        );
+        assert!(output.contains("case 0: return [4 /*yield*/, ];"), "{output}");
+    }
+
+    #[test]
+    fn lowers_es5_async_object_and_class_methods() {
+        let output = emit_with(
+            "const object = { async method() {} }; class C { async method() {} }",
+            ScriptTarget::Es5,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(
+            output.contains("method: function () {\n    return __awaiter(this"),
+            "{output}"
+        );
+        assert!(
+            output.contains("C.prototype.method = function () {\n        return __awaiter(this"),
+            "{output}"
         );
     }
 

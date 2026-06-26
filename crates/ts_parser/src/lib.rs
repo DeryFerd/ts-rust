@@ -4981,6 +4981,8 @@ impl<'a> Parser<'a> {
     fn parse_async_arrow_function(&mut self) -> NodeId {
         let async_modifier = self.consume_token_node();
         let start = self.node_start(async_modifier);
+        let previous_await_context = self.await_context;
+        self.await_context = true;
         let type_parameters = self.parse_type_parameters();
         let parameters = if self.current.kind == SyntaxKind::OpenParenToken {
             self.parse_parameter_list()
@@ -5007,6 +5009,7 @@ impl<'a> Parser<'a> {
                 has_trailing_comma: false,
             }
         };
+        self.await_context = previous_await_context;
         let return_type = self.parse_optional_type_annotation();
         let arrow =
             self.parse_expected_token_node(SyntaxKind::EqualsGreaterThanToken, "Expected '=>'.");
@@ -14208,6 +14211,31 @@ mod tests {
                 .count()
                 >= 3
         );
+    }
+
+    #[test]
+    fn parses_async_arrow_parameters_in_await_context() {
+        let result = parse_source_file("const fn = async (value = await) => {};");
+        let arrow = result
+            .arena
+            .iter()
+            .find_map(|(_, node)| match &node.data {
+                NodeData::ArrowFunction(arrow) => Some(arrow),
+                _ => None,
+            })
+            .unwrap();
+        let NodeData::ParameterDeclaration(parameter) =
+            &result.arena.get(arrow.parameters.nodes[0]).unwrap().data
+        else {
+            unreachable!();
+        };
+        assert!(matches!(
+            parameter
+                .initializer
+                .and_then(|initializer| result.arena.get(initializer))
+                .map(|node| &node.data),
+            Some(NodeData::AwaitExpression(_))
+        ));
     }
 
     #[test]
