@@ -628,6 +628,11 @@ impl<'a> Parser<'a> {
         let static_starts_recovered_call = self.static_starts_recovered_call_statement();
         let (import_starts_expression, invalid_import_declaration) =
             self.classify_import_statement_start();
+        let import_starts_modified_class = self.current.kind == SyntaxKind::ImportKeyword
+            && self.next_tokens_are(
+                SyntaxKind::AbstractKeyword,
+                SyntaxKind::ClassKeyword,
+            );
         let recovered_bigint_module_clause = match self.current.kind {
             SyntaxKind::ImportKeyword => self.module_clause_has_unquoted_bigint(false),
             SyntaxKind::ExportKeyword => self.module_clause_has_unquoted_bigint(true),
@@ -691,6 +696,13 @@ impl<'a> Parser<'a> {
             }
             SyntaxKind::ImportKeyword if import_starts_expression => {
                 self.parse_expression_statement()
+            }
+            SyntaxKind::ImportKeyword if import_starts_modified_class => {
+                let start = self.current.range.start;
+                let import_modifier = self.consume_token_node();
+                let declaration = self.parse_modified_statement();
+                self.attach_modifiers(declaration, vec![import_modifier], start);
+                declaration
             }
             SyntaxKind::ImportKeyword if invalid_import_declaration => {
                 self.parse_invalid_import_statement()
