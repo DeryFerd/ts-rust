@@ -27245,10 +27245,18 @@ impl Printer<'_> {
 
     fn prepare_private_field_lowerings(&mut self) {
         let mut static_captures_by_scope = HashMap::<NodeId, HashSet<String>>::new();
-        for (class_id, node) in self.arena.iter() {
-            let NodeData::ClassDeclaration(class) = &node.data else {
-                continue;
-            };
+        let mut classes = self
+            .arena
+            .iter()
+            .filter_map(|(id, node)| {
+                let NodeData::ClassDeclaration(class) = &node.data else {
+                    return None;
+                };
+                Some((node.range.start, id, class.clone()))
+            })
+            .collect::<Vec<_>>();
+        classes.sort_by_key(|(start, _, _)| *start);
+        for (_, class_id, class) in classes {
             if node_is_in_ambient_context(self.arena, class_id) {
                 continue;
             }
@@ -54725,6 +54733,7 @@ impl Printer<'_> {
         self.writer.write(" {");
         self.writer.newline();
         self.writer.indent += 1;
+        self.emit_private_field_declarations_for_scope(body_id);
         self.emit_instance_field_class_expression_temps(data);
         let previous_defer_private_update_temps = self.defer_private_update_temps;
         self.defer_private_update_temps = true;
