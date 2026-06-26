@@ -2558,9 +2558,10 @@ fn source_needs_legacy_param_helper(arena: &NodeArena) -> bool {
         }
         function_like_parameters_from_node(node).is_some_and(|parameters| {
             parameters.nodes.iter().any(|parameter| {
-                arena.get(*parameter).is_some_and(|parameter| {
-                    declaration_has_modifier(arena, parameter, SyntaxKind::Decorator)
-                })
+                !parameter_is_this(arena, *parameter)
+                    && arena.get(*parameter).is_some_and(|parameter| {
+                        declaration_has_modifier(arena, parameter, SyntaxKind::Decorator)
+                    })
             })
         })
     })
@@ -3733,9 +3734,10 @@ fn class_member_has_legacy_decorators(arena: &NodeArena, member: NodeId) -> bool
             .is_some_and(|node| declaration_has_modifier(arena, node, SyntaxKind::Decorator)))
         || function_like_parameters(arena, member).is_some_and(|parameters| {
             parameters.nodes.iter().any(|parameter| {
-                arena.get(*parameter).is_some_and(|parameter| {
-                    declaration_has_modifier(arena, parameter, SyntaxKind::Decorator)
-                })
+                !parameter_is_this(arena, *parameter)
+                    && arena.get(*parameter).is_some_and(|parameter| {
+                        declaration_has_modifier(arena, parameter, SyntaxKind::Decorator)
+                    })
             })
         })
 }
@@ -3777,12 +3779,21 @@ fn class_has_legacy_constructor_parameter_decorators(
         class_member_is_constructor(arena, *member)
             && function_like_parameters(arena, *member).is_some_and(|parameters| {
                 parameters.nodes.iter().any(|parameter| {
-                    arena.get(*parameter).is_some_and(|parameter| {
-                        declaration_has_modifier(arena, parameter, SyntaxKind::Decorator)
-                    })
+                    !parameter_is_this(arena, *parameter)
+                        && arena.get(*parameter).is_some_and(|parameter| {
+                            declaration_has_modifier(arena, parameter, SyntaxKind::Decorator)
+                        })
                 })
             })
     })
+}
+
+fn parameter_is_this(arena: &NodeArena, parameter: NodeId) -> bool {
+    matches!(
+        arena.get(parameter).map(|node| &node.data),
+        Some(NodeData::ParameterDeclaration(parameter))
+            if declaration_name_text(arena, parameter.name) == Some("this")
+    )
 }
 
 fn source_needs_legacy_metadata_helper(arena: &NodeArena) -> bool {
@@ -54759,7 +54770,13 @@ impl Printer<'_> {
             let decorators = self.class_decorator_expressions(decorator_modifiers);
             let parameter_decorators = parameters
                 .into_iter()
-                .flat_map(|parameters| parameters.nodes.iter().enumerate())
+                .flat_map(|parameters| {
+                    parameters
+                        .nodes
+                        .iter()
+                        .filter(|parameter| !parameter_is_this(self.arena, **parameter))
+                        .enumerate()
+                })
                 .flat_map(|(index, parameter)| {
                     let modifiers = self.arena.get(*parameter).and_then(declaration_modifiers);
                     self.class_decorator_expressions(modifiers)
