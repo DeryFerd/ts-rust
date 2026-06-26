@@ -357,6 +357,7 @@ struct Parser<'a> {
     amd_module_names: Vec<AmdModuleName>,
     disallow_in: bool,
     await_context: bool,
+    await_identifier_context: bool,
     type_parse_context: TypeParseContext,
 }
 
@@ -392,6 +393,7 @@ impl<'a> Parser<'a> {
             amd_module_names,
             disallow_in: false,
             await_context: false,
+            await_identifier_context: false,
             type_parse_context: TypeParseContext::Normal,
         }
     }
@@ -4749,28 +4751,40 @@ impl<'a> Parser<'a> {
         } else if first.kind == SyntaxKind::OpenParenToken {
             let mut depth = 1_u32;
             let mut token = self.scanner.scan();
+            let mut previous_kind = SyntaxKind::OpenParenToken;
+            let mut await_arrow_in_parameters = false;
             while token.kind != SyntaxKind::EndOfFile && depth > 0 {
+                if previous_kind == SyntaxKind::AwaitKeyword
+                    && token.kind == SyntaxKind::EqualsGreaterThanToken
+                {
+                    await_arrow_in_parameters = true;
+                }
                 match token.kind {
                     SyntaxKind::OpenParenToken => depth += 1,
                     SyntaxKind::CloseParenToken => depth -= 1,
                     _ => {}
                 }
                 if depth > 0 {
+                    previous_kind = token.kind;
                     token = self.scanner.scan();
                 }
             }
-            let mut token = self.scanner.scan();
-            if token.kind == SyntaxKind::ColonToken {
-                while !matches!(
-                    token.kind,
-                    SyntaxKind::EqualsGreaterThanToken
-                        | SyntaxKind::SemicolonToken
-                        | SyntaxKind::EndOfFile
-                ) {
-                    token = self.scanner.scan();
+            if await_arrow_in_parameters {
+                false
+            } else {
+                let mut token = self.scanner.scan();
+                if token.kind == SyntaxKind::ColonToken {
+                    while !matches!(
+                        token.kind,
+                        SyntaxKind::EqualsGreaterThanToken
+                            | SyntaxKind::SemicolonToken
+                            | SyntaxKind::EndOfFile
+                    ) {
+                        token = self.scanner.scan();
+                    }
                 }
+                token.kind == SyntaxKind::EqualsGreaterThanToken
             }
-            token.kind == SyntaxKind::EqualsGreaterThanToken
         } else {
             false
         };
@@ -4978,7 +4992,12 @@ impl<'a> Parser<'a> {
             && !self.next_token_preceded_by_line_break()
             && self.next_token_kind() == SyntaxKind::FunctionKeyword;
         if self.current.kind == SyntaxKind::AwaitKeyword
-            && (self.await_context || self.next_token_kind() != SyntaxKind::OpenParenToken)
+            && (self.await_context
+                || (!self.await_identifier_context
+                    && !matches!(
+                        self.next_token_kind(),
+                        SyntaxKind::OpenParenToken | SyntaxKind::EqualsGreaterThanToken
+                    )))
         {
             return self.parse_await_expression();
         }
@@ -5929,7 +5948,12 @@ impl<'a> Parser<'a> {
             &[name],
         );
         let arrow = self.consume_token_node();
+        let previous_await_identifier_context = self.await_identifier_context;
+        self.await_identifier_context |= self.arena.get(name).is_some_and(|node| {
+            matches!(&node.data, NodeData::Identifier(identifier) if identifier.text == "await")
+        });
         let body = self.parse_arrow_function_body_in_await_context(false);
+        self.await_identifier_context = previous_await_identifier_context;
         self.alloc_node(
             SyntaxKind::ArrowFunction,
             TextRange::new(start, self.node_end(body)),
@@ -13939,6 +13963,36 @@ mod tests {
                 .count()
                 == 2
         );
+    }
+
+    #[test]
+    fn recovers_await_named_arrow_inside_async_call_parameters() {
+        let result = parse_source_file(
+            "var foo = async (a = await => await): Promise<void> => {}",
+        );
+        let arrows = result
+            .arena
+            .iter()
+            .filter_map(|(id, node)| matches!(node.data, NodeData::ArrowFunction(_)).then_some(id))
+            .collect::<Vec<_>>();
+        assert_eq!(arrows.len(), 1);
+        let NodeData::ArrowFunction(arrow) = &result.arena.get(arrows[0]).unwrap().data else {
+            unreachable!();
+        };
+        let parameter = arrow.parameters.nodes[0];
+        let NodeData::ParameterDeclaration(parameter) =
+            &result.arena.get(parameter).unwrap().data
+        else {
+            unreachable!();
+        };
+        assert!(matches!(
+            &result.arena.get(parameter.name).unwrap().data,
+            NodeData::Identifier(identifier) if identifier.text == "await"
+        ));
+        assert!(matches!(
+            &result.arena.get(arrow.body).unwrap().data,
+            NodeData::Identifier(identifier) if identifier.text == "await"
+        ));
     }
 
     #[test]

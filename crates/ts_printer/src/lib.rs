@@ -47341,7 +47341,43 @@ impl Printer<'_> {
         } else if self.source_range_contains_line_comment(previous_end, list_end) {
             self.emit_expression_list_line_comments(previous_end, list_end);
         }
-        self.writer.remove_trailing_spaces();
+        let preserve_missing_await_operand_space = emitted_parameters.last().is_some_and(
+            |parameter| {
+                let Some(parameter_node) = self.arena.get(*parameter) else {
+                    return false;
+                };
+                let NodeData::ParameterDeclaration(parameter) = &parameter_node.data else {
+                    return false;
+                };
+                let is_async_arrow_parameter = parameter_node
+                    .parent
+                    .and_then(|parent| self.arena.get(parent))
+                    .is_some_and(|parent| {
+                        matches!(
+                            &parent.data,
+                            NodeData::ArrowFunction(arrow)
+                                if self.has_modifier(
+                                    arrow.modifiers.as_ref(),
+                                    SyntaxKind::AsyncKeyword,
+                                )
+                        )
+                    });
+                if !is_async_arrow_parameter {
+                    return false;
+                }
+                matches!(
+                    parameter
+                        .initializer
+                        .and_then(|initializer| self.arena.get(initializer))
+                        .map(|node| &node.data),
+                    Some(NodeData::AwaitExpression(awaited))
+                        if node_is_missing_identifier(self.arena, awaited.expression)
+                )
+            },
+        );
+        if !preserve_missing_await_operand_space {
+            self.writer.remove_trailing_spaces();
+        }
         self.writer.write(")");
         Ok(())
     }
@@ -64666,6 +64702,42 @@ mod tests {
             ModuleKind::None,
         );
         assert_eq!(output.code, "promise.then(async (value) => value);\n");
+    }
+
+    #[test]
+    fn emits_invalid_async_arrow_parameter_recovery() {
+        let missing_operand = emit_with_parse_errors(
+            "var foo = async (a = await): Promise<void> => {};",
+            ScriptTarget::Es2017,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(
+            missing_operand.contains("var foo = async (a = await ) =>"),
+            "{missing_operand}"
+        );
+
+        let ordinary_function = emit_with_parse_errors(
+            "function f(await = await) {}",
+            ScriptTarget::Es2017,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(
+            ordinary_function.contains("function f(await = await)"),
+            "{ordinary_function}"
+        );
+
+        let recovered_call = emit_with_parse_errors(
+            "var foo = async (a = await => await): Promise<void> => {};",
+            ScriptTarget::Es2017,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(
+            recovered_call.starts_with("var foo = async(a = await => await), Promise;\n;\n"),
+            "{recovered_call}"
+        );
     }
 
     #[test]
