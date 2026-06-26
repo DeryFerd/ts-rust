@@ -42961,6 +42961,27 @@ impl Printer<'_> {
         self.subtree_uses_lexical_arguments(body, true)
     }
 
+    fn identifier_is_within_arrow(&self, identifier: NodeId) -> bool {
+        let mut current = self.arena.get(identifier).and_then(|node| node.parent);
+        while let Some(id) = current {
+            let Some(node) = self.arena.get(id) else {
+                return false;
+            };
+            match &node.data {
+                NodeData::ArrowFunction(_) => return true,
+                NodeData::FunctionDeclaration(_)
+                | NodeData::FunctionExpression(_)
+                | NodeData::MethodDeclaration(_)
+                | NodeData::ConstructorDeclaration(_)
+                | NodeData::GetAccessorDeclaration(_)
+                | NodeData::SetAccessorDeclaration(_)
+                | NodeData::ClassStaticBlockDeclaration(_) => return false,
+                _ => current = node.parent,
+            }
+        }
+        false
+    }
+
     fn subtree_uses_lexical_arguments(&self, body: NodeId, root_is_arrow: bool) -> bool {
         self.arena.iter().any(|(identifier_id, node)| {
             if !matches!(
@@ -54525,6 +54546,11 @@ impl Printer<'_> {
                 continue;
             };
             let collision = claimed.entry(var_scope).or_default().contains(&name)
+                || (name == "arguments"
+                    && self
+                        .bindings
+                        .scope(var_scope)
+                        .is_some_and(|scope| scope.kind == ScopeKind::Function))
                 || self.block_scoped_binding_collides_with_ancestor(
                     symbol,
                     &name,
@@ -67038,7 +67064,17 @@ impl Printer<'_> {
                 } else {
                     self.bindings.resolve_name_at(id, &data.text)
                 };
-                if let Some(rewrite) = symbol
+                let downlevel_arrow_arguments = data.text == "arguments"
+                    && self.settings.target < ScriptTarget::Es2015
+                    && !is_declaration_name
+                    && identifier_is_unqualified_value_reference(self.arena, id)
+                    && self.identifier_is_within_arrow(id)
+                    && symbol.is_some_and(|symbol| {
+                        self.identifier_rewrites.contains_key(&symbol)
+                    });
+                if downlevel_arrow_arguments {
+                    self.writer.write("arguments");
+                } else if let Some(rewrite) = symbol
                     .filter(|symbol| {
                         !self.identifier_is_qualified_enclosing_namespace_root(id, *symbol)
                             && !self
@@ -78330,6 +78366,39 @@ mod tests {
             )
             .code,
             "const value = new Box(() => { return result; }); // trailing\n"
+        );
+    }
+
+    #[test]
+    fn downlevel_arrows_preserve_lexical_arguments_across_block_scoped_collisions() {
+        let output = emit_with(
+            concat!(
+                "function first() { if (condition) { const arguments = 100; ",
+                "return () => arguments; } } ",
+                "function second() { var arguments = 'outer'; ",
+                "if (condition) { const arguments = 100; return () => arguments; } }",
+            ),
+            ScriptTarget::Es5,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(output.contains("var arguments_1 = 100;"), "{output}");
+        assert!(output.contains("var arguments_2 = 100;"), "{output}");
+        assert_eq!(
+            output.matches("return function () { return arguments; };").count(),
+            2,
+            "{output}",
+        );
+
+        let async_parameter = emit_with(
+            "async function run() { return (arguments) => arguments; }",
+            ScriptTarget::Es5,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(
+            async_parameter.contains("function (arguments) { return arguments; }"),
+            "{async_parameter}",
         );
     }
 
