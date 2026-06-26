@@ -52289,7 +52289,7 @@ impl Printer<'_> {
         &mut self,
         method: &ts_ast::MethodDeclarationData,
         data: &ts_ast::ClassDeclarationData,
-        has_base: bool,
+        _has_base: bool,
     ) -> Result<(), EmitError> {
         let body_id = method.body.expect("constructor body checked");
         let body_node = self.node(body_id)?.clone();
@@ -52354,12 +52354,11 @@ impl Printer<'_> {
             .iter()
             .take_while(|statement| self.statement_is_string_prologue(**statement))
             .count();
-        let initialize_before_body = !has_base
-            || !body
-                .statements
-                .nodes
-                .iter()
-                .any(|statement| self.is_super_call_statement(*statement).unwrap_or(false));
+        let initialize_before_body = !body
+            .statements
+            .nodes
+            .iter()
+            .any(|statement| self.is_super_call_statement(*statement).unwrap_or(false));
         let mut emitted_fields = false;
         let mut emitted_temps = false;
         let mut emitted_binding_parameters = false;
@@ -52423,7 +52422,7 @@ impl Printer<'_> {
                 self.emit_statement(*statement)?;
             }
             recover_property_assignment = false;
-            if has_base && !emitted_fields && self.is_super_call_statement(*statement)? {
+            if !emitted_fields && self.is_super_call_statement(*statement)? {
                 let comment_end = body
                     .statements
                     .nodes
@@ -52714,12 +52713,21 @@ impl Printer<'_> {
             ) {
                 continue;
             }
-            self.writer.write(receiver);
-            self.emit_downlevel_member_access(parameter.name)?;
-            self.writer.write(" = ");
-            self.emit_expression(parameter.name, 0)?;
-            self.writer.write(";");
-            self.writer.newline();
+            if self.settings.use_define_for_class_fields == Some(true) {
+                self.emit_class_field_definition(
+                    receiver,
+                    parameter.name,
+                    Some(parameter.name),
+                )?;
+                self.writer.newline();
+            } else {
+                self.writer.write(receiver);
+                self.emit_downlevel_member_access(parameter.name)?;
+                self.writer.write(" = ");
+                self.emit_expression(parameter.name, 0)?;
+                self.writer.write(";");
+                self.writer.newline();
+            }
         }
         Ok(())
     }
@@ -71488,6 +71496,39 @@ mod tests {
             "{}",
             result.code
         );
+    }
+
+    #[test]
+    fn define_semantics_parameter_properties_follow_super() {
+        let output = emit_with_define(
+            concat!(
+                "class Base {} ",
+                "class Derived extends Base { field = 0; ",
+                "constructor(public p: number) { before(); super(); } }",
+            ),
+            ScriptTarget::Es2015,
+        )
+        .code;
+        let before = output.find("before();").expect("statement emitted");
+        let super_call = output.find("super();").expect("super emitted");
+        let parameter = output
+            .find("Object.defineProperty(this, \"p\", {")
+            .expect("parameter property emitted");
+        let field = output
+            .find("Object.defineProperty(this, \"field\", {")
+            .expect("field emitted");
+        assert!(before < super_call && super_call < parameter && parameter < field, "{output}");
+    }
+
+    #[test]
+    fn invalid_super_without_base_precedes_parameter_properties() {
+        let output = emit_with(
+            "class C<T> { constructor(public value: T) { super(); } }",
+            ScriptTarget::Es2015,
+            ModuleKind::EsNext,
+        )
+        .code;
+        assert!(output.contains("super();\n        this.value = value;"), "{output}");
     }
 
     #[test]
