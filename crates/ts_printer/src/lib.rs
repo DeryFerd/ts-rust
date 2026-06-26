@@ -1230,7 +1230,11 @@ pub fn emit_source_file_with_context(
         printer.writer.newline();
     }
     let auto_accessor_storages = if settings.target < ScriptTarget::Es2022 {
-        runtime_auto_accessor_storage_names(arena, settings.target)
+        runtime_auto_accessor_storage_names(
+            arena,
+            settings.target,
+            settings.experimental_decorators,
+        )
     } else {
         Vec::new()
     };
@@ -2689,6 +2693,7 @@ fn source_needs_set_function_name_helper(arena: &NodeArena) -> bool {
 fn runtime_auto_accessor_storage_names(
     arena: &NodeArena,
     target: ScriptTarget,
+    experimental_decorators: bool,
 ) -> Vec<String> {
     let mut names = Vec::new();
     let mut capture_index = 0;
@@ -2697,6 +2702,15 @@ fn runtime_auto_accessor_storage_names(
             continue;
         };
         if node_is_in_ambient_context(arena, id) {
+            continue;
+        }
+        if !experimental_decorators
+            && class.members.nodes.iter().any(|member| {
+                arena.get(*member).is_some_and(|member| {
+                    declaration_has_modifier(arena, member, SyntaxKind::Decorator)
+                })
+            })
+        {
             continue;
         }
         let Some(class_name) = class
@@ -34738,8 +34752,7 @@ impl Printer<'_> {
                 self.arguments_alias = outer_arguments_alias;
             }
             NodeData::ClassDeclaration(data) => {
-                if self.settings.target >= ScriptTarget::Es2022
-                    && !self.settings.experimental_decorators
+                if !self.settings.experimental_decorators
                     && !declaration_has_modifier(
                         self.arena,
                         &node,
@@ -34748,11 +34761,21 @@ impl Printer<'_> {
                     && let Some(name) = data.name
                 {
                     let expression = Self::class_declaration_as_expression(data);
-                    if let Some(plan) = self.stage3_decorated_class_plan(id, &expression) {
+                    if let Some(plan) = self.stage3_decorated_class_plan(id, &expression)
+                        && (self.settings.target >= ScriptTarget::Es2022
+                            || self.settings.target >= ScriptTarget::Es2015
+                                && plan.members.iter().all(|member| member.is_accessor))
+                    {
                         self.writer.write("let ");
                         self.emit_expression(name, 0)?;
                         self.writer.write(" = ");
-                        self.emit_stage3_decorated_class_expression(&expression, &plan)?;
+                        if self.settings.target >= ScriptTarget::Es2022 {
+                            self.emit_stage3_decorated_class_expression(&expression, &plan)?;
+                        } else if self.settings.target >= ScriptTarget::Es2015
+                            && plan.members.iter().all(|member| member.is_accessor)
+                        {
+                            self.emit_stage3_downlevel_auto_accessor_class(data, &plan)?;
+                        }
                         self.writer.write(";");
                         self.writer.newline();
                         return Ok(());
@@ -56024,6 +56047,289 @@ impl Printer<'_> {
         Ok(())
     }
 
+    fn emit_stage3_downlevel_auto_accessor_class(
+        &mut self,
+        data: &ts_ast::ClassDeclarationData,
+        plan: &Stage3DecoratedClassPlan,
+    ) -> Result<(), EmitError> {
+        let name = data
+            .name
+            .and_then(|name| declaration_name_text(self.arena, name))
+            .unwrap_or("_class")
+            .to_owned();
+        let capture = self
+            .auto_accessor_class_capture_name(data)
+            .unwrap_or_else(|| self.generated_names.generate_temp());
+        let members = plan
+            .members
+            .iter()
+            .filter_map(|member| {
+                let node = self.arena.get(member.member)?;
+                let NodeData::PropertyDeclaration(property) = &node.data else {
+                    return None;
+                };
+                let storage = self.auto_accessor_storage_name(data, property)?;
+                let source_index = data
+                    .members
+                    .nodes
+                    .iter()
+                    .position(|candidate| *candidate == member.member)?;
+                let leading_start = source_index
+                    .checked_sub(1)
+                    .and_then(|previous| data.members.nodes.get(previous))
+                    .and_then(|previous| self.arena.get(*previous))
+                    .map_or(data.members.range.start.get(), |previous| {
+                        previous.range.end.get()
+                    });
+                Some((member, property.as_ref().clone(), storage, leading_start, node.range.start.get()))
+            })
+            .collect::<Vec<_>>();
+
+        self.writer.write("(() => {");
+        self.writer.newline();
+        self.writer.indent += 1;
+        self.writer.write("var ");
+        self.writer.write(&capture);
+        for (_, _, storage, _, _) in &members {
+            self.writer.write(", ");
+            self.writer.write(storage);
+        }
+        self.writer.write(";");
+        self.writer.newline();
+        for is_static in [true, false] {
+            for (member, _, _, _, _) in &members {
+                if member.is_static != is_static {
+                    continue;
+                }
+                self.writer.write("let ");
+                self.writer.write(&member.decorators_name);
+                self.writer.write(";");
+                self.writer.newline();
+                for initializer in [
+                    &member.initializers_name,
+                    &member.extra_initializers_name,
+                ] {
+                    self.writer.write("let ");
+                    self.writer.write(initializer);
+                    self.writer.write(" = [];");
+                    self.writer.newline();
+                }
+            }
+        }
+
+        self.writer.write("return ");
+        self.writer.write(&capture);
+        self.writer.write(" = class ");
+        self.writer.write(&name);
+        self.writer.write(" {");
+        self.writer.newline();
+        self.writer.indent += 2;
+        for (member, _, storage, leading_start, leading_end) in &members {
+            self.emit_source_comments_between_with_ownership(
+                *leading_start,
+                *leading_end,
+                true,
+                true,
+            );
+            if member.is_static {
+                self.writer.write("static ");
+            }
+            self.writer.write("get ");
+            self.writer.write(&member.name);
+            self.writer.write("() { return __classPrivateFieldGet(");
+            if member.is_static {
+                self.writer.write(&capture);
+                self.writer.write(", ");
+                self.writer.write(&capture);
+                self.writer.write(", \"f\", ");
+                self.writer.write(storage);
+            } else {
+                self.writer.write("this, ");
+                self.writer.write(storage);
+                self.writer.write(", \"f\"");
+            }
+            self.writer.write("); }");
+            self.writer.newline();
+            if member.is_static {
+                self.writer.write("static ");
+            }
+            self.writer.write("set ");
+            self.writer.write(&member.name);
+            self.writer.write("(value) { __classPrivateFieldSet(");
+            if member.is_static {
+                self.writer.write(&capture);
+                self.writer.write(", ");
+                self.writer.write(&capture);
+                self.writer.write(", value, \"f\", ");
+                self.writer.write(storage);
+            } else {
+                self.writer.write("this, ");
+                self.writer.write(storage);
+                self.writer.write(", value, \"f\"");
+            }
+            self.writer.write("); }");
+            self.writer.newline();
+        }
+        let instance_members = members
+            .iter()
+            .filter(|(member, _, _, _, _)| !member.is_static)
+            .collect::<Vec<_>>();
+        if !instance_members.is_empty() {
+            self.writer.write("constructor() {");
+            self.writer.newline();
+            self.writer.indent += 1;
+            let mut preceding_extra: Option<&str> = None;
+            for (member, property, storage, _, _) in instance_members {
+                self.writer.write(storage);
+                self.writer.write(".set(this, ");
+                if let Some(extra) = preceding_extra {
+                    self.writer.write("(");
+                    self.emit_helper_reference("__runInitializers");
+                    self.writer.write("(this, ");
+                    self.writer.write(extra);
+                    self.writer.write("), ");
+                }
+                self.emit_helper_reference("__runInitializers");
+                self.writer.write("(this, ");
+                self.writer.write(&member.initializers_name);
+                self.writer.write(", ");
+                self.emit_stage3_initializer(property.initializer)?;
+                self.writer.write(")");
+                if preceding_extra.is_some() {
+                    self.writer.write(")");
+                }
+                self.writer.write(");");
+                self.writer.newline();
+                preceding_extra = Some(&member.extra_initializers_name);
+            }
+            if let Some(extra) = preceding_extra {
+                self.emit_helper_reference("__runInitializers");
+                self.writer.write("(this, ");
+                self.writer.write(extra);
+                self.writer.write(");");
+                self.writer.newline();
+            }
+            self.writer.indent -= 1;
+            self.writer.write("}");
+            self.writer.newline();
+        }
+        self.writer.indent -= 1;
+        self.writer.write("},");
+        self.writer.newline();
+        for (member, _, storage, _, _) in &members {
+            if !member.is_static {
+                self.writer.write(storage);
+                self.writer.write(" = new WeakMap(),");
+                self.writer.newline();
+            }
+        }
+
+        self.writer.write("(() => {");
+        self.writer.newline();
+        self.writer.indent += 1;
+        self.writer.write("const _metadata = typeof Symbol === \"function\" && Symbol.metadata ? Object.create(null) : void 0;");
+        self.writer.newline();
+        for (member, _, _, _, _) in &members {
+            self.writer.write(&member.decorators_name);
+            self.writer.write(" = [");
+            for (index, decorator) in member.decorators.iter().enumerate() {
+                if index != 0 {
+                    self.writer.write(", ");
+                }
+                self.emit_decorator_expression(*decorator)?;
+            }
+            self.writer.write("];");
+            self.writer.newline();
+        }
+        for is_static in [true, false] {
+            for (member, _, _, _, _) in &members {
+                if member.is_static != is_static {
+                    continue;
+                }
+                self.emit_helper_reference("__esDecorate");
+                self.writer.write("(");
+                self.writer.write(&capture);
+                self.writer.write(", null, ");
+                self.writer.write(&member.decorators_name);
+                self.writer.write(", ");
+                self.emit_stage3_context(member);
+                self.writer.write(", ");
+                self.writer.write(&member.initializers_name);
+                self.writer.write(", ");
+                self.writer.write(&member.extra_initializers_name);
+                self.writer.write(");");
+                self.writer.newline();
+            }
+        }
+        self.writer.write("if (_metadata) Object.defineProperty(");
+        self.writer.write(&capture);
+        self.writer.write(", Symbol.metadata, { enumerable: true, configurable: true, writable: true, value: _metadata });");
+        self.writer.newline();
+        self.writer.indent -= 1;
+        self.writer.write("})(),");
+        self.writer.newline();
+
+        let mut preceding_static_extra: Option<&str> = None;
+        for (member, property, storage, leading_start, leading_end) in &members {
+            if !member.is_static {
+                continue;
+            }
+            self.restore_source_comments_between(*leading_start, *leading_end, false);
+            self.emit_source_comments_between_with_ownership(
+                *leading_start,
+                *leading_end,
+                true,
+                true,
+            );
+            self.writer.write(storage);
+            self.writer.write(" = { value: ");
+            if let Some(extra) = preceding_static_extra {
+                self.writer.write("(");
+                self.emit_helper_reference("__runInitializers");
+                self.writer.write("(");
+                self.writer.write(&capture);
+                self.writer.write(", ");
+                self.writer.write(extra);
+                self.writer.write("), ");
+            }
+            self.emit_helper_reference("__runInitializers");
+            self.writer.write("(");
+            self.writer.write(&capture);
+            self.writer.write(", ");
+            self.writer.write(&member.initializers_name);
+            self.writer.write(", ");
+            self.emit_stage3_initializer(property.initializer)?;
+            self.writer.write(")");
+            if preceding_static_extra.is_some() {
+                self.writer.write(")");
+            }
+            self.writer.write(" },");
+            self.writer.newline();
+            preceding_static_extra = Some(&member.extra_initializers_name);
+        }
+        if let Some(extra) = preceding_static_extra {
+            self.writer.write("(() => {");
+            self.writer.newline();
+            self.writer.indent += 1;
+            self.emit_helper_reference("__runInitializers");
+            self.writer.write("(");
+            self.writer.write(&capture);
+            self.writer.write(", ");
+            self.writer.write(extra);
+            self.writer.write(");");
+            self.writer.newline();
+            self.writer.indent -= 1;
+            self.writer.write("})(),");
+            self.writer.newline();
+        }
+        self.writer.write(&capture);
+        self.writer.write(";");
+        self.writer.newline();
+        self.writer.indent -= 2;
+        self.writer.write("})()");
+        Ok(())
+    }
+
     fn emit_stage3_decoration_block(
         &mut self,
         plan: &Stage3DecoratedClassPlan,
@@ -77217,12 +77523,13 @@ mod tests {
     }
 
     #[test]
-    fn lowers_stage3_decorated_auto_accessor_class_declarations_for_es2022() {
+    fn lowers_stage3_decorated_auto_accessor_class_declarations() {
+        let source = concat!(
+            "class A { @dec static accessor x = 1; ",
+            "@dec accessor y = 2; }",
+        );
         let output = emit_with(
-            concat!(
-                "class A { @dec static accessor x = 1; ",
-                "@dec accessor y = 2; }",
-            ),
+            source,
             ScriptTarget::Es2022,
             ModuleKind::None,
         )
@@ -77244,6 +77551,25 @@ mod tests {
             !output.contains("this.#y_accessor_storage = __runInitializers"),
             "{output}"
         );
+
+        let es2017 = emit_with(source, ScriptTarget::Es2017, ModuleKind::None).code;
+        assert!(es2017.contains("let A = (() => {"), "{es2017}");
+        assert!(
+            es2017.contains("var _a, _A_x_accessor_storage, _A_y_accessor_storage;"),
+            "{es2017}"
+        );
+        assert!(
+            es2017.contains(concat!(
+                "_A_y_accessor_storage.set(this, ",
+                "__runInitializers(this, _y_initializers, 2));",
+            )),
+            "{es2017}"
+        );
+        let decoration = es2017.find("__esDecorate(_a").unwrap();
+        let static_storage = es2017
+            .find("_A_x_accessor_storage = { value: __runInitializers")
+            .unwrap();
+        assert!(decoration < static_storage, "{es2017}");
     }
 
     #[test]
