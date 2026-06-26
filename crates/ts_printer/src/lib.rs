@@ -28642,6 +28642,23 @@ impl Printer<'_> {
                 ))
             })
             .filter(|(id, _, _, _, _, _)| {
+                let Some(parent) = self
+                    .arena
+                    .get(*id)
+                    .and_then(|node| node.parent)
+                    .and_then(|parent| self.arena.get(parent))
+                else {
+                    return true;
+                };
+                !matches!(
+                    &parent.data,
+                    NodeData::PropertyAccessExpression(access) if access.expression == *id
+                ) && !matches!(
+                    &parent.data,
+                    NodeData::ElementAccessExpression(access) if access.expression == *id
+                )
+            })
+            .filter(|(id, _, _, _, _, _)| {
                 self.arena.iter().any(|(_, node)| {
                     let NodeData::BinaryExpression(binary) = &node.data else {
                         return false;
@@ -53247,6 +53264,10 @@ impl Printer<'_> {
         {
             self.emit_private_field_initializers(&private_field_plan);
         }
+        let previous_private_field_plan = self.active_private_field_plan.clone();
+        self.active_private_field_plan = self.private_field_plan(data);
+        let previous_private_method_plan = self.active_private_method_plan.clone();
+        self.active_private_method_plan = private_method_plan.clone();
         if let Some(static_private_plan) = &static_private_plan {
             for field in &static_private_plan.fields {
                 let field_name = self
@@ -53321,10 +53342,6 @@ impl Printer<'_> {
         let previous_super = static_super_base
             .as_ref()
             .and_then(|base| self.downlevel_super_context.replace((base.clone(), true)));
-        let previous_private_field_plan = self.active_private_field_plan.clone();
-        self.active_private_field_plan = self.private_field_plan(data);
-        let previous_private_method_plan = self.active_private_method_plan.clone();
-        self.active_private_method_plan = self.private_method_plan(data);
         let mut previous_static_end = core
             .members
             .nodes
@@ -62577,6 +62594,8 @@ impl Printer<'_> {
                 } else if let Some(private_method) = self.active_private_method(data.name).cloned()
                 {
                     self.emit_private_method_get(data.expression, &private_method)?;
+                } else if self.active_private_accessor_exists(data.name) {
+                    self.emit_private_accessor_get(data.expression, data.name)?;
                 } else if self.settings.target < ScriptTarget::Es2022
                     && matches!(
                     self.arena.get(data.name).map(|node| &node.data),
@@ -64816,6 +64835,43 @@ impl Printer<'_> {
         self.emit_private_method_get_with_receiver_temp(receiver, method, None)
     }
 
+    fn emit_private_accessor_get(
+        &mut self,
+        receiver: NodeId,
+        name: NodeId,
+    ) -> Result<(), EmitError> {
+        let getter = self.active_private_getter(name).cloned();
+        let member = getter
+            .as_ref()
+            .or_else(|| self.active_private_setter(name))
+            .cloned();
+        let Some(member) = member else {
+            return Ok(());
+        };
+        let Some(plan) = self
+            .active_private_method_plan_for_member(&member)
+            .cloned()
+        else {
+            return Ok(());
+        };
+        self.emit_helper_reference("__classPrivateFieldGet");
+        self.writer.write("(");
+        self.emit_expression(receiver, 1)?;
+        self.writer.write(", ");
+        self.writer.write(if member.is_static {
+            plan.capture.as_deref().unwrap_or(&plan.brand)
+        } else {
+            &plan.brand
+        });
+        self.writer.write(", \"a\"");
+        if let Some(getter) = getter {
+            self.writer.write(", ");
+            self.writer.write(&getter.function_name);
+        }
+        self.writer.write(")");
+        Ok(())
+    }
+
     fn emit_private_method_get_with_receiver_temp(
         &mut self,
         receiver: NodeId,
@@ -66480,6 +66536,34 @@ impl Printer<'_> {
             return Ok(());
         }
         if self.settings.target < ScriptTarget::Es2018
+            && let Some(NodeData::BinaryExpression(binary)) =
+                self.arena.get(expression).map(|node| &node.data)
+            && self
+                .arena
+                .get(binary.operator_token)
+                .is_some_and(|operator| operator.kind == SyntaxKind::EqualsToken)
+            && let Some((target, path)) =
+                self.nested_object_rest_assignment_target_path(binary.left)
+        {
+            let wrap = parent_precedence > 1;
+            if wrap {
+                self.writer.write("(");
+            }
+            self.emit_expression(target, 2)?;
+            self.writer.write(" = ");
+            self.emit_helper_reference("__rest");
+            self.writer.write("(");
+            self.emit_expression(binary.right, 18)?;
+            for name in path {
+                self.emit_downlevel_member_access(name)?;
+            }
+            self.writer.write(", [])");
+            if wrap {
+                self.writer.write(")");
+            }
+            return Ok(());
+        }
+        if self.settings.target < ScriptTarget::Es2018
             && let Some(temps) = self
                 .nested_object_rest_assignment_temps
                 .get(&expression)
@@ -66508,6 +66592,18 @@ impl Printer<'_> {
             let wrap = parent_precedence > 1;
             if wrap {
                 self.writer.write("(");
+            }
+            let private_target = self.unwrap_erased_expression(rest);
+            if let Some(rewrite) = self
+                .private_destructuring_rewrites
+                .get(&private_target)
+                .cloned()
+                .filter(|rewrite| rewrite.capture_receiver)
+            {
+                self.writer.write(&rewrite.receiver_temp);
+                self.writer.write(" = ");
+                self.emit_expression(rewrite.receiver, 1)?;
+                self.writer.write(", ");
             }
             self.emit_expression(rest, 2)?;
             self.writer.write(" = ");
@@ -67430,6 +67526,30 @@ impl Printer<'_> {
             return None;
         };
         Some(spread.expression)
+    }
+
+    fn nested_object_rest_assignment_target_path(
+        &self,
+        pattern: NodeId,
+    ) -> Option<(NodeId, Vec<NodeId>)> {
+        let mut current = pattern;
+        let mut path = Vec::new();
+        loop {
+            if let Some(target) = self.simple_object_rest_assignment_target(current) {
+                return (!path.is_empty()).then_some((target, path));
+            }
+            let NodeData::ObjectLiteralExpression(object) = &self.arena.get(current)?.data else {
+                return None;
+            };
+            let [property] = object.properties.nodes.as_slice() else {
+                return None;
+            };
+            let NodeData::PropertyAssignment(property) = &self.arena.get(*property)?.data else {
+                return None;
+            };
+            path.push(property.name);
+            current = property.initializer;
+        }
     }
 
     fn emit_nested_simple_object_rest_assignment(
@@ -74078,6 +74198,26 @@ mod tests {
     }
 
     #[test]
+    fn private_method_plan_stays_active_in_static_field_initializers() {
+        let output = emit_with(
+            concat!(
+                "class X { static #field = X.#method(); static #method() { ",
+                "const X = {}; const _a = {}; X.#method(); return 1; } }",
+            ),
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(
+            output.contains(concat!(
+                "_X_field = { value: ",
+                "__classPrivateFieldGet(_b, _b, \"m\", _X_method).call(_b) };",
+            )),
+            "{output}"
+        );
+    }
+
+    #[test]
     fn lowers_static_private_field_writes_with_the_backing_descriptor() {
         let output = emit_with(
             "class A { static #x = 1; static m() { A.#x = 2; A.#x += 3; } }",
@@ -74238,6 +74378,37 @@ mod tests {
             output.contains(concat!(
                 "[({ set value(_a) { ",
                 "__classPrivateFieldSet(value, _A_field, _a, \"f\"); } }).value] = [1];",
+            )),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn private_destructuring_temps_ignore_nested_read_receivers() {
+        let output = emit_with(
+            concat!(
+                "class C { set #x(value: any) {} set #one(value: number) {} ",
+                "set #rest(value: number[]) {} m() { ",
+                "use(this.#x); ",
+                "({ o: this.#x } = { o: 1 }); ({ ...this.#x } = {}); ",
+                "({ foo: this.#x.foo } = { foo: 1 }); ",
+                "({ foo: { ...this.#x.foo } } = { foo: {} }); ",
+                "[this.#one, ...this.#rest] = [1, 2]; } }",
+            ),
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(output.contains("var _a, _b, _c, _d;"), "{output}");
+        assert!(!output.contains("var _a, _b, _c, _d, _e"), "{output}");
+        assert!(
+            output.contains("use(__classPrivateFieldGet(this, _C_instances, \"a\"));"),
+            "{output}"
+        );
+        assert!(
+            output.contains(concat!(
+                "__classPrivateFieldGet(this, _C_instances, \"a\").foo = ",
+                "__rest({ foo: {} }.foo, [])",
             )),
             "{output}"
         );
