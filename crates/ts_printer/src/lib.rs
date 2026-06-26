@@ -1022,22 +1022,20 @@ pub fn emit_source_file_with_context(
         {
             printer.emit_detached_reference_directives_between(0, start);
         }
-        if needs_extends_helper || (settings.module == ModuleKind::CommonJs && is_external_module) {
-            let source_prologues = data
-                .statements
-                .nodes
-                .iter()
-                .take_while(|statement| printer.statement_is_string_prologue(**statement))
-                .copied()
-                .collect::<Vec<_>>();
-            for statement in source_prologues {
-                let statement_start = arena
-                    .get(statement)
-                    .map_or(start, |node| node.range.start.get());
-                printer.emit_leading_source_comments(statement_start);
-                printer.emit_statement(statement)?;
-                printer.preemitted_source_prologues.insert(statement);
-            }
+        let source_prologues = data
+            .statements
+            .nodes
+            .iter()
+            .take_while(|statement| printer.statement_is_string_prologue(**statement))
+            .copied()
+            .collect::<Vec<_>>();
+        for statement in source_prologues {
+            let statement_start = arena
+                .get(statement)
+                .map_or(start, |node| node.range.start.get());
+            printer.emit_leading_source_comments(statement_start);
+            printer.emit_statement(statement)?;
+            printer.preemitted_source_prologues.insert(statement);
         }
         if !defer_commonjs_leading_comments
             && !defer_captured_while_leading_comments
@@ -79571,6 +79569,17 @@ mod tests {
         .code;
         assert!(output.contains("var _a, _b;"), "{output}");
         assert!(output.contains("_a = x, _b = y;"), "{output}");
+    }
+
+    #[test]
+    fn emits_source_directives_before_computed_class_field_temps() {
+        let output = emit_with(
+            "\"use strict\"; const key = 1; class C { [key] = true; }",
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(output.starts_with("\"use strict\";\nvar _a;\n"), "{output}");
     }
 
     #[test]
