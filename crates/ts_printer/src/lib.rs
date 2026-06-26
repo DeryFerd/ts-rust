@@ -36920,10 +36920,6 @@ impl Printer<'_> {
         })
     }
 
-    fn function_body_uses_lexical_arguments_in_arrow(&self, body: NodeId) -> bool {
-        self.subtree_uses_lexical_arguments(body, false)
-    }
-
     fn arrow_body_uses_lexical_arguments(&self, body: NodeId) -> bool {
         if self.arena.get(body).is_some_and(|node| {
             matches!(
@@ -37809,7 +37805,14 @@ impl Printer<'_> {
             } else {
                 "_a"
             };
-            return self.emit_es5_async_function_body(
+            let arguments_alias = self
+                .subtree_uses_lexical_arguments(body, true)
+                .then(|| self.generate_arguments_capture_name());
+            let previous_arguments_alias = self.arguments_alias.clone();
+            if let Some(alias) = arguments_alias.as_ref() {
+                self.arguments_alias = Some(alias.clone());
+            }
+            let result = self.emit_es5_async_function_body(
                 body,
                 None,
                 this_argument,
@@ -37818,18 +37821,20 @@ impl Printer<'_> {
                 None,
                 None,
                 parameters.zip(parameter_plan.as_ref()),
-                None,
+                arguments_alias.as_deref(),
                 false,
                 compact_callback,
                 parameter_plan.is_some(),
             );
+            self.arguments_alias = previous_arguments_alias;
+            return result;
         }
         self.writer.write("{");
         self.writer.newline();
         self.writer.indent += 1;
         self.emit_async_super_prelude();
         let arguments_alias = self
-            .function_body_uses_lexical_arguments_in_arrow(body)
+            .subtree_uses_lexical_arguments(body, true)
             .then(|| self.generate_arguments_capture_name());
         if let Some(alias) = arguments_alias.as_deref() {
             self.writer.write("var ");
@@ -40137,7 +40142,24 @@ impl Printer<'_> {
         {
             self.emit_es5_async_captured_loop_hoists(&loop_info)?;
         }
+        let mut previous_hoisted_function_end = self
+            .arena
+            .get(body)
+            .map_or(0, |body| body.range.start.get().saturating_add(1));
         for function in &hoisted_functions {
+            if let Some((function_start, function_end)) = self
+                .arena
+                .get(*function)
+                .map(|function| (function.range.start.get(), function.range.end.get()))
+            {
+                self.emit_source_comments_between_with_ownership(
+                    previous_hoisted_function_end,
+                    function_start,
+                    false,
+                    true,
+                );
+                previous_hoisted_function_end = function_end;
+            }
             self.es5_async_hoisted_function_declarations
                 .remove(function);
             let result = self.emit_statement(*function);
