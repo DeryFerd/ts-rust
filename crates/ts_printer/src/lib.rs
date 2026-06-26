@@ -34738,6 +34738,26 @@ impl Printer<'_> {
                 self.arguments_alias = outer_arguments_alias;
             }
             NodeData::ClassDeclaration(data) => {
+                if self.settings.target >= ScriptTarget::Es2022
+                    && !self.settings.experimental_decorators
+                    && !declaration_has_modifier(
+                        self.arena,
+                        &node,
+                        SyntaxKind::ExportKeyword,
+                    )
+                    && let Some(name) = data.name
+                {
+                    let expression = Self::class_declaration_as_expression(data);
+                    if let Some(plan) = self.stage3_decorated_class_plan(id, &expression) {
+                        self.writer.write("let ");
+                        self.emit_expression(name, 0)?;
+                        self.writer.write(" = ");
+                        self.emit_stage3_decorated_class_expression(&expression, &plan)?;
+                        self.writer.write(";");
+                        self.writer.newline();
+                        return Ok(());
+                    }
+                }
                 let decorators = self.class_decorator_expressions(data.modifiers.as_ref());
                 let emitted_stage3_class_decorators = !self.settings.experimental_decorators
                     && !decorators.is_empty()
@@ -55911,10 +55931,15 @@ impl Printer<'_> {
                 }
             }
         }
-        self.writer.write("return class {");
+        self.writer.write("return class");
+        if let Some(name) = data.name {
+            self.writer.write(" ");
+            self.emit_expression(name, 0)?;
+        }
+        self.writer.write(" {");
         self.writer.newline();
         self.writer.indent += 1;
-        if let Some(name) = &plan.inferred_name {
+        if data.name.is_none() && let Some(name) = &plan.inferred_name {
             self.writer.write("static { ");
             self.emit_helper_reference("__setFunctionName");
             self.writer.write("(this, ");
@@ -55933,6 +55958,19 @@ impl Printer<'_> {
                 unreachable!();
             };
             if member.is_accessor {
+                let source_index = data
+                    .members
+                    .nodes
+                    .iter()
+                    .position(|candidate| *candidate == member.member)
+                    .unwrap_or_default();
+                let leading_comment_start = source_index
+                    .checked_sub(1)
+                    .and_then(|previous| data.members.nodes.get(previous))
+                    .and_then(|previous| self.arena.get(*previous))
+                    .map_or(data.members.range.start.get(), |previous| {
+                        previous.range.end.get()
+                    });
                 self.emit_stage3_auto_accessor(
                     member,
                     property,
@@ -55941,6 +55979,9 @@ impl Printer<'_> {
                     } else {
                         None
                     },
+                    data.name,
+                    leading_comment_start,
+                    node.range.start.get(),
                 )?;
             } else {
                 self.writer.write("static { this.");
@@ -56065,10 +56106,16 @@ impl Printer<'_> {
         member: &Stage3DecoratedMemberPlan,
         property: &ts_ast::PropertyDeclarationData,
         preceding_extra: Option<&str>,
+        class_name: Option<NodeId>,
+        leading_comment_start: u32,
+        leading_comment_end: u32,
     ) -> Result<(), EmitError> {
         let backing = member.backing_name.as_deref().expect("accessor backing name");
-        if member.is_static {
-            self.writer.write("static #");
+        if member.is_static || self.settings.target >= ScriptTarget::Es2022 {
+            if member.is_static {
+                self.writer.write("static ");
+            }
+            self.writer.write("#");
             self.writer.write(backing);
             self.writer.write(" = ");
             if let Some(extra) = preceding_extra {
@@ -56099,12 +56146,24 @@ impl Printer<'_> {
             self.writer.write(";");
             self.writer.newline();
         }
+        self.emit_source_comments_between_with_ownership(
+            leading_comment_start,
+            leading_comment_end,
+            true,
+            true,
+        );
         if member.is_static {
             self.writer.write("static ");
         }
         self.writer.write("get ");
         self.writer.write(&member.name);
-        self.writer.write("() { return this.#");
+        self.writer.write("() { return ");
+        if member.is_static && let Some(class_name) = class_name {
+            self.emit_expression(class_name, 0)?;
+        } else {
+            self.writer.write("this");
+        }
+        self.writer.write(".#");
         self.writer.write(backing);
         self.writer.write("; }");
         self.writer.newline();
@@ -56113,7 +56172,13 @@ impl Printer<'_> {
         }
         self.writer.write("set ");
         self.writer.write(&member.name);
-        self.writer.write("(value) { this.#");
+        self.writer.write("(value) { ");
+        if member.is_static && let Some(class_name) = class_name {
+            self.emit_expression(class_name, 0)?;
+        } else {
+            self.writer.write("this");
+        }
+        self.writer.write(".#");
         self.writer.write(backing);
         self.writer.write(" = value; }");
         self.writer.newline();
@@ -56133,6 +56198,10 @@ impl Printer<'_> {
             let NodeData::PropertyDeclaration(property) = &node.data else {
                 unreachable!();
             };
+            if member.is_accessor && self.settings.target >= ScriptTarget::Es2022 {
+                preceding_extra = Some(&member.extra_initializers_name);
+                continue;
+            }
             if member.is_accessor {
                 self.writer.write("this.#");
                 self.writer
@@ -56316,6 +56385,23 @@ impl Printer<'_> {
     ) -> ts_ast::ClassDeclarationData {
         ts_ast::ClassDeclarationData {
             flow_node: None,
+            heritage_clauses: data.heritage_clauses.clone(),
+            local_symbol: data.local_symbol,
+            locals: data.locals.clone(),
+            members: data.members.clone(),
+            next_container: data.next_container,
+            symbol: data.symbol,
+            type_parameters: data.type_parameters.clone(),
+            facts: data.facts,
+            modifiers: data.modifiers.clone(),
+            name: data.name,
+        }
+    }
+
+    fn class_declaration_as_expression(
+        data: &ts_ast::ClassDeclarationData,
+    ) -> ts_ast::ClassExpressionData {
+        ts_ast::ClassExpressionData {
             heritage_clauses: data.heritage_clauses.clone(),
             local_symbol: data.local_symbol,
             locals: data.locals.clone(),
@@ -77127,6 +77213,36 @@ mod tests {
         assert!(
             instance_initializer < instance_comment && instance_comment < instance_getter,
             "{es2017}"
+        );
+    }
+
+    #[test]
+    fn lowers_stage3_decorated_auto_accessor_class_declarations_for_es2022() {
+        let output = emit_with(
+            concat!(
+                "class A { @dec static accessor x = 1; ",
+                "@dec accessor y = 2; }",
+            ),
+            ScriptTarget::Es2022,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(output.contains("let A = (() => {"), "{output}");
+        assert!(output.contains("return class A {"), "{output}");
+        assert!(
+            output.contains(concat!(
+                "#y_accessor_storage = __runInitializers(this, ",
+                "_y_initializers, 2);",
+            )),
+            "{output}"
+        );
+        assert!(
+            output.contains("static get x() { return A.#x_accessor_storage; }"),
+            "{output}"
+        );
+        assert!(
+            !output.contains("this.#y_accessor_storage = __runInitializers"),
+            "{output}"
         );
     }
 
