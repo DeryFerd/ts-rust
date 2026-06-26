@@ -27414,14 +27414,17 @@ impl Printer<'_> {
                 })
                 .collect::<Vec<_>>();
             let has_private_methods = !private_methods.is_empty();
-            let inferred_name = self
-                .class_expression_inferred_name(class_id)
-                .unwrap_or_else(|| "class".to_owned());
+            let inferred_name = self.class_expression_inferred_name(class_id);
             let explicit_name = class
                 .name
                 .and_then(|name| declaration_name_text(self.arena, name));
-            let prefix = explicit_name
-                .or_else(|| (!has_private_methods).then_some(inferred_name.as_str()));
+            let prefix = explicit_name.or_else(|| {
+                if has_private_methods {
+                    None
+                } else {
+                    inferred_name.as_deref()
+                }
+            });
             let mut fields = Vec::new();
             let mut static_fields = Vec::new();
             for member in &class.members.nodes {
@@ -27561,7 +27564,7 @@ impl Printer<'_> {
                     .iter()
                     .map(|method| method.function_name.clone()),
             );
-        } else if !before_class_temp {
+        } else if before_class_temp == self.class_expression_inferred_name(class_id).is_none() {
             declarations.extend(
                 plan.static_fields
                     .iter()
