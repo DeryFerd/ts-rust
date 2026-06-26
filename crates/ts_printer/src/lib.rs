@@ -24884,6 +24884,17 @@ struct Es5GeneratorForOf {
 }
 
 #[derive(Clone)]
+struct Es5GeneratorForIn {
+    prelude: Vec<NodeId>,
+    trailing: Vec<NodeId>,
+    loop_variable: NodeId,
+    object: NodeId,
+    before_yield: Vec<NodeId>,
+    yield_expression: NodeId,
+    after_yield: Vec<NodeId>,
+}
+
+#[derive(Clone)]
 struct Es5GeneratorObjectLiteral {
     target: NodeId,
     properties: Vec<NodeId>,
@@ -37398,6 +37409,95 @@ impl Printer<'_> {
         }))
     }
 
+    fn es5_generator_for_in(&self, body: NodeId) -> Result<Option<Es5GeneratorForIn>, EmitError> {
+        let body_node = self.node(body)?;
+        let NodeData::Block(block) = &body_node.data else {
+            return Ok(None);
+        };
+        let Some(loop_index) = block.statements.nodes.iter().position(|statement| {
+            self.arena
+                .get(*statement)
+                .is_some_and(|node| node.kind == SyntaxKind::ForInStatement)
+        }) else {
+            return Ok(None);
+        };
+        if block.statements.nodes[loop_index + 1..].iter().any(|statement| {
+            self.arena
+                .get(*statement)
+                .is_some_and(|node| node.kind == SyntaxKind::ForInStatement)
+        }) {
+            return Ok(None);
+        }
+        let loop_id = block.statements.nodes[loop_index];
+        let loop_node = self.node(loop_id)?;
+        let NodeData::ForInOrOfStatement(for_in) = &loop_node.data else {
+            return Ok(None);
+        };
+        let initializer = self.node(for_in.initializer)?;
+        let NodeData::VariableDeclarationList(declarations) = &initializer.data else {
+            return Ok(None);
+        };
+        let [declaration_id] = declarations.declarations.nodes.as_slice() else {
+            return Ok(None);
+        };
+        let declaration = self.node(*declaration_id)?;
+        let NodeData::VariableDeclaration(declaration) = &declaration.data else {
+            return Ok(None);
+        };
+        if !matches!(
+            self.arena.get(declaration.name).map(|node| &node.data),
+            Some(NodeData::Identifier(_))
+        ) {
+            return Ok(None);
+        }
+        let loop_body = self.node(for_in.statement)?;
+        let NodeData::Block(loop_body) = &loop_body.data else {
+            return Ok(None);
+        };
+        let direct_yields = loop_body
+            .statements
+            .nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, statement)| {
+                let NodeData::ExpressionStatement(statement) =
+                    &self.arena.get(*statement)?.data
+                else {
+                    return None;
+                };
+                matches!(
+                    self.arena.get(statement.expression).map(|node| &node.data),
+                    Some(NodeData::YieldExpression(_))
+                )
+                .then_some((index, statement.expression))
+            })
+            .collect::<Vec<_>>();
+        let [(yield_index, yield_expression)] = direct_yields.as_slice() else {
+            return Ok(None);
+        };
+        let nested_yields = self
+            .arena
+            .iter()
+            .filter(|(id, node)| {
+                matches!(node.data, NodeData::YieldExpression(_))
+                    && self.node_is_within(*id, body)
+            })
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>();
+        if nested_yields.as_slice() != [*yield_expression] {
+            return Ok(None);
+        }
+        Ok(Some(Es5GeneratorForIn {
+            prelude: block.statements.nodes[..loop_index].to_vec(),
+            trailing: block.statements.nodes[loop_index + 1..].to_vec(),
+            loop_variable: declaration.name,
+            object: for_in.expression,
+            before_yield: loop_body.statements.nodes[..*yield_index].to_vec(),
+            yield_expression: *yield_expression,
+            after_yield: loop_body.statements.nodes[*yield_index + 1..].to_vec(),
+        }))
+    }
+
     fn es5_generator_object_literal(&self, body: NodeId) -> Option<Es5GeneratorObjectLiteral> {
         let NodeData::Block(block) = &self.arena.get(body)?.data else {
             return None;
@@ -37479,6 +37579,9 @@ impl Printer<'_> {
     }
 
     fn emit_es5_generator_body(&mut self, body: NodeId) -> Result<(), EmitError> {
+        if let Some(plan) = self.es5_generator_for_in(body)? {
+            return self.emit_es5_generator_for_in_body(body, &plan);
+        }
         if self.es5_generator_for_of(body)?.is_some() {
             return self.emit_es5_generator_for_of_body(body);
         }
@@ -38078,6 +38181,200 @@ impl Printer<'_> {
         }
         self.writer.write("];");
         self.writer.newline();
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn emit_es5_generator_for_in_body(
+        &mut self,
+        _body: NodeId,
+        plan: &Es5GeneratorForIn,
+    ) -> Result<(), EmitError> {
+        let object_temp = self.generated_names.generate_temp();
+        let keys_temp = self.generated_names.generate_temp();
+        let key_temp = self.generated_names.generate_temp();
+        let index_temp = if let Some(index) = self.generated_names.claim("_i") {
+            index
+        } else {
+            self.generated_names.generate_temp()
+        };
+        let state = self.generated_names.generate_temp();
+        let loop_variable = self.identifier_text(plan.loop_variable)?.to_owned();
+        let mut hoisted_names = Vec::new();
+        for statement in plan
+            .prelude
+            .iter()
+            .chain(&plan.before_yield)
+            .chain(&plan.after_yield)
+            .chain(&plan.trailing)
+        {
+            let Some(NodeData::VariableStatement(variable)) =
+                self.arena.get(*statement).map(|node| &node.data)
+            else {
+                continue;
+            };
+            for name in self.variable_declaration_names(variable.declaration_list)? {
+                if !hoisted_names.contains(&name) {
+                    hoisted_names.push(name);
+                }
+            }
+        }
+        for name in [
+            object_temp.as_str(),
+            keys_temp.as_str(),
+            key_temp.as_str(),
+            index_temp.as_str(),
+            loop_variable.as_str(),
+        ] {
+            if !hoisted_names.iter().any(|existing| existing == name) {
+                hoisted_names.push(name.to_owned());
+            }
+        }
+
+        self.writer.write("{");
+        self.writer.newline();
+        self.writer.indent += 1;
+        self.writer.write("var ");
+        self.writer.write(&hoisted_names.join(", "));
+        self.writer.write(";");
+        self.writer.newline();
+        self.writer.write("return ");
+        self.emit_generator_reference();
+        self.writer.write("(this, function (");
+        self.writer.write(&state);
+        self.writer.write(") {");
+        self.writer.newline();
+        self.writer.indent += 1;
+        self.writer.write("switch (");
+        self.writer.write(&state);
+        self.writer.write(".label) {");
+        self.writer.newline();
+        self.writer.indent += 1;
+        self.writer.write("case 0:");
+        self.writer.newline();
+        self.writer.indent += 1;
+        for statement in &plan.prelude {
+            if !self.emit_es5_generator_variable_initializers(*statement)? {
+                self.emit_statement(*statement)?;
+            }
+        }
+        self.writer.write(&object_temp);
+        self.writer.write(" = ");
+        self.emit_expression(plan.object, 1)?;
+        self.writer.write(";");
+        self.writer.newline();
+        self.writer.write(&keys_temp);
+        self.writer.write(" = [];");
+        self.writer.newline();
+        self.writer.write("for (");
+        self.writer.write(&key_temp);
+        self.writer.write(" in ");
+        self.writer.write(&object_temp);
+        self.writer.write(")");
+        self.writer.newline();
+        self.writer.indent += 1;
+        self.writer.write(&keys_temp);
+        self.writer.write(".push(");
+        self.writer.write(&key_temp);
+        self.writer.write(");");
+        self.writer.newline();
+        self.writer.indent -= 1;
+        self.writer.write(&index_temp);
+        self.writer.write(" = 0;");
+        self.writer.newline();
+        self.writer.write(&state);
+        self.writer.write(".label = 1;");
+        self.writer.newline();
+        self.writer.indent -= 1;
+        self.writer.write("case 1:");
+        self.writer.newline();
+        self.writer.indent += 1;
+        self.writer.write("if (!(");
+        self.writer.write(&index_temp);
+        self.writer.write(" < ");
+        self.writer.write(&keys_temp);
+        self.writer.write(".length)) return [3 /*break*/, 4];");
+        self.writer.newline();
+        self.writer.write(&key_temp);
+        self.writer.write(" = ");
+        self.writer.write(&keys_temp);
+        self.writer.write("[");
+        self.writer.write(&index_temp);
+        self.writer.write("];");
+        self.writer.newline();
+        self.writer.write("if (!(");
+        self.writer.write(&key_temp);
+        self.writer.write(" in ");
+        self.writer.write(&object_temp);
+        self.writer.write(")) return [3 /*break*/, 3];");
+        self.writer.newline();
+        self.emit_expression(plan.loop_variable, 1)?;
+        self.writer.write(" = ");
+        self.writer.write(&key_temp);
+        self.writer.write(";");
+        self.writer.newline();
+        for statement in &plan.before_yield {
+            if !self.emit_es5_generator_variable_initializers(*statement)? {
+                self.emit_statement(*statement)?;
+            }
+        }
+        let NodeData::YieldExpression(yielded) =
+            &self.node(plan.yield_expression)?.data
+        else {
+            unreachable!("planned generator suspension must remain a yield expression")
+        };
+        let yielded = yielded.as_ref().clone();
+        self.emit_es5_generator_yield_opcode(&yielded)?;
+        self.writer.newline();
+        self.writer.indent -= 1;
+        self.writer.write("case 2:");
+        self.writer.newline();
+        self.writer.indent += 1;
+        self.writer.write(&state);
+        self.writer.write(".sent();");
+        self.writer.newline();
+        for statement in &plan.after_yield {
+            if !self.emit_es5_generator_variable_initializers(*statement)? {
+                self.emit_statement(*statement)?;
+            }
+        }
+        self.writer.write(&state);
+        self.writer.write(".label = 3;");
+        self.writer.newline();
+        self.writer.indent -= 1;
+        self.writer.write("case 3:");
+        self.writer.newline();
+        self.writer.indent += 1;
+        self.writer.write(&index_temp);
+        self.writer.write("++;");
+        self.writer.newline();
+        self.writer.write("return [3 /*break*/, 1];");
+        self.writer.newline();
+        self.writer.indent -= 1;
+        self.writer.write("case 4:");
+        if plan.trailing.is_empty() {
+            self.writer.write(" return [2 /*return*/];");
+            self.writer.newline();
+        } else {
+            self.writer.newline();
+            self.writer.indent += 1;
+            for statement in &plan.trailing {
+                if !self.emit_es5_generator_variable_initializers(*statement)? {
+                    self.emit_statement(*statement)?;
+                }
+            }
+            self.writer.write("return [2 /*return*/];");
+            self.writer.newline();
+            self.writer.indent -= 1;
+        }
+        self.writer.indent -= 1;
+        self.writer.write("}");
+        self.writer.newline();
+        self.writer.indent -= 1;
+        self.writer.write("});");
+        self.writer.newline();
+        self.writer.indent -= 1;
+        self.writer.write("}");
         Ok(())
     }
 
@@ -63393,6 +63690,40 @@ mod tests {
         assert!(vars.contains("function f() {\n    var x, y;\n"), "{vars}");
         assert!(vars.contains("        x = 1;\n"), "{vars}");
         assert!(!vars.contains("        var x"), "{vars}");
+    }
+
+    #[test]
+    fn downlevels_generator_for_in_with_a_key_snapshot() {
+        let output = emit_with(
+            concat!(
+                "function* gen() { ",
+                "var obj = { foo: 1, bar: 2 }; ",
+                "for (var key in obj) { yield key; delete obj.bar; } }",
+            ),
+            ScriptTarget::Es5,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(
+            output.contains("var obj, _a, _b, _c, _i, key;"),
+            "{output}"
+        );
+        assert!(
+            output.contains(concat!(
+                "_a = obj;\n",
+                "                _b = [];\n",
+                "                for (_c in _a)\n",
+                "                    _b.push(_c);\n",
+                "                _i = 0;",
+            )),
+            "{output}"
+        );
+        assert!(
+            output.contains("if (!(_c in _a)) return [3 /*break*/, 3];"),
+            "{output}"
+        );
+        assert!(output.contains("return [4 /*yield*/, key];"), "{output}");
+        assert!(output.contains("delete obj.bar;"), "{output}");
     }
 
     #[test]
