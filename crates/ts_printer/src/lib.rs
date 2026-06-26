@@ -311,6 +311,7 @@ pub fn emit_source_file_with_context(
         node_esm_require_name: None,
         decorator_metadata_guard_temps: HashMap::new(),
         legacy_decorated_class_captures: HashMap::new(),
+        emitting_decorator_expression: false,
         import_helpers_namespace: None,
         imported_helpers: BTreeSet::new(),
         imported_helper_aliases: BTreeMap::new(),
@@ -472,10 +473,13 @@ pub fn emit_source_file_with_context(
     printer.runtime_identifier_uses = runtime_identifier_uses(arena, source_file);
     let decorator_runtime_names = arena
         .iter()
-        .filter_map(|(_, node)| {
+        .filter_map(|(decorator_id, node)| {
             let NodeData::Decorator(decorator) = &node.data else {
                 return None;
             };
+            if decorator_is_direct_constructor_decorator(arena, decorator_id) {
+                return None;
+            }
             decorator_expression_root_name(arena, decorator.expression).map(str::to_owned)
         })
         .collect::<Vec<_>>();
@@ -2485,10 +2489,12 @@ fn source_needs_legacy_decorate_helper(arena: &NodeArena) -> bool {
                     )
                 });
                 !private_member
-                    && (arena.get(*member).is_some_and(|member| {
-                        member.kind != SyntaxKind::ClassStaticBlockDeclaration
+                    && ((!class_member_is_constructor(arena, *member)
+                        && arena.get(*member).is_some_and(|member| {
+                            member.kind != SyntaxKind::ClassStaticBlockDeclaration
                             && declaration_has_modifier(arena, member, SyntaxKind::Decorator)
-                    }) || function_like_parameters(arena, *member).is_some_and(
+                        }))
+                        || function_like_parameters(arena, *member).is_some_and(
                         |parameters| {
                             parameters.nodes.iter().any(|parameter| {
                                 arena.get(*parameter).is_some_and(|parameter| {
@@ -3707,9 +3713,10 @@ fn decorator_metadata_type_references(arena: &NodeArena) -> Vec<NodeId> {
 }
 
 fn class_member_has_legacy_decorators(arena: &NodeArena, member: NodeId) -> bool {
-    arena
-        .get(member)
-        .is_some_and(|node| declaration_has_modifier(arena, node, SyntaxKind::Decorator))
+    (!class_member_is_constructor(arena, member)
+        && arena
+            .get(member)
+            .is_some_and(|node| declaration_has_modifier(arena, node, SyntaxKind::Decorator)))
         || function_like_parameters(arena, member).is_some_and(|parameters| {
             parameters.nodes.iter().any(|parameter| {
                 arena.get(*parameter).is_some_and(|parameter| {
@@ -3717,6 +3724,51 @@ fn class_member_has_legacy_decorators(arena: &NodeArena, member: NodeId) -> bool
                 })
             })
         })
+}
+
+fn class_member_is_constructor(arena: &NodeArena, member: NodeId) -> bool {
+    matches!(
+        arena.get(member).map(|node| &node.data),
+        Some(NodeData::ConstructorDeclaration(_))
+    ) || matches!(
+        arena.get(member).map(|node| &node.data),
+        Some(NodeData::MethodDeclaration(method))
+            if declaration_name_text(arena, method.name) == Some("constructor")
+    )
+}
+
+fn decorator_is_direct_constructor_decorator(arena: &NodeArena, decorator: NodeId) -> bool {
+    let mut current = decorator;
+    while let Some(parent) = arena.get(current).and_then(|node| node.parent) {
+        match arena.get(parent).map(|node| &node.data) {
+            Some(NodeData::ParameterDeclaration(_)) => return false,
+            Some(NodeData::ConstructorDeclaration(_)) => return true,
+            Some(NodeData::MethodDeclaration(method))
+                if declaration_name_text(arena, method.name) == Some("constructor") =>
+            {
+                return true;
+            }
+            Some(NodeData::ClassDeclaration(_) | NodeData::ClassExpression(_)) => return false,
+            _ => current = parent,
+        }
+    }
+    false
+}
+
+fn class_has_legacy_constructor_parameter_decorators(
+    arena: &NodeArena,
+    class: &ts_ast::ClassDeclarationData,
+) -> bool {
+    class.members.nodes.iter().any(|member| {
+        class_member_is_constructor(arena, *member)
+            && function_like_parameters(arena, *member).is_some_and(|parameters| {
+                parameters.nodes.iter().any(|parameter| {
+                    arena.get(*parameter).is_some_and(|parameter| {
+                        declaration_has_modifier(arena, parameter, SyntaxKind::Decorator)
+                    })
+                })
+            })
+    })
 }
 
 fn source_has_jsx(arena: &NodeArena) -> bool {
@@ -28181,6 +28233,7 @@ struct Printer<'a> {
     node_esm_require_name: Option<String>,
     decorator_metadata_guard_temps: HashMap<NodeId, DecoratorMetadataGuardPlan>,
     legacy_decorated_class_captures: HashMap<NodeId, String>,
+    emitting_decorator_expression: bool,
     import_helpers_namespace: Option<String>,
     imported_helpers: BTreeSet<&'static str>,
     imported_helper_aliases: BTreeMap<&'static str, String>,
@@ -28537,6 +28590,7 @@ impl Printer<'_> {
                 if self
                     .class_decorator_expressions(class.modifiers.as_ref())
                     .is_empty()
+                    && !class_has_legacy_constructor_parameter_decorators(self.arena, class)
                 {
                     return None;
                 }
@@ -32028,7 +32082,10 @@ impl Printer<'_> {
                     self.writer.newline();
                 }
                 let decorators = self.class_decorator_expressions(class.modifiers.as_ref());
-                if !decorators.is_empty() {
+                if !decorators.is_empty()
+                    || self.settings.experimental_decorators
+                        && class_has_legacy_constructor_parameter_decorators(self.arena, class)
+                {
                     self.emit_class_decorator_assignment(class, &decorators, true, None)?;
                     self.writer.newline();
                 }
@@ -35385,10 +35442,16 @@ impl Printer<'_> {
                     }
                 }
                 let decorators = self.class_decorator_expressions(data.modifiers.as_ref());
+                let has_legacy_constructor_parameter_decorators = self
+                    .settings
+                    .experimental_decorators
+                    && class_has_legacy_constructor_parameter_decorators(self.arena, data);
+                let needs_decorated_binding =
+                    !decorators.is_empty() || has_legacy_constructor_parameter_decorators;
                 let emitted_stage3_class_decorators = !self.settings.experimental_decorators
                     && !decorators.is_empty()
                     && self.emit_stage3_empty_class_decorator_binding(data, &decorators)?;
-                let recovered_default_name = (!decorators.is_empty()
+                let recovered_default_name = (needs_decorated_binding
                     && data.name.is_none()
                     && self.has_modifier(data.modifiers.as_ref(), SyntaxKind::DefaultKeyword))
                 .then(|| self.generated_names.generate("default"));
@@ -35410,7 +35473,7 @@ impl Printer<'_> {
                     && self.namespace_containers.is_empty()
                     && self.has_modifier(data.modifiers.as_ref(), SyntaxKind::ExportKeyword)
                     && !self.has_modifier(data.modifiers.as_ref(), SyntaxKind::DefaultKeyword);
-                if !emitted_stage3_class_decorators && decorators.is_empty() {
+                if !emitted_stage3_class_decorators && !needs_decorated_binding {
                     if !lower_preserved_default && !lower_preserved_named {
                         self.emit_runtime_declaration_modifiers(id, data.modifiers.as_ref());
                     }
@@ -35485,7 +35548,8 @@ impl Printer<'_> {
                     self.emit_class_member_decorators(data)?;
                 }
                 if !emitted_stage3_class_decorators
-                    && !decorators.is_empty()
+                    && (!decorators.is_empty()
+                        || has_legacy_constructor_parameter_decorators)
                     && self.settings.target >= ScriptTarget::Es2015
                 {
                     self.emit_class_decorator_assignment(
@@ -54099,12 +54163,18 @@ impl Printer<'_> {
     }
 
     fn emit_decorator_expression(&mut self, decorator: NodeId) -> Result<(), EmitError> {
-        if !self.settings.experimental_decorators {
-            return self.emit_expression(decorator, 1);
-        }
-        let previous_this_alias = self.this_alias.take();
+        let previous_decorator_expression = self.emitting_decorator_expression;
+        self.emitting_decorator_expression = true;
+        let previous_this_alias = self
+            .settings
+            .experimental_decorators
+            .then(|| self.this_alias.take())
+            .flatten();
         let result = self.emit_expression(decorator, 1);
-        self.this_alias = previous_this_alias;
+        if self.settings.experimental_decorators {
+            self.this_alias = previous_this_alias;
+        }
+        self.emitting_decorator_expression = previous_decorator_expression;
         result
     }
 
@@ -56118,6 +56188,7 @@ impl Printer<'_> {
             && self
                 .class_decorator_expressions(data.modifiers.as_ref())
                 .is_empty()
+            && !class_has_legacy_constructor_parameter_decorators(self.arena, data)
             && (self.settings.target < ScriptTarget::Es2022
                 || self.settings.use_define_for_class_fields == Some(false))
             && data.members.nodes.iter().any(|member_id| {
@@ -59683,9 +59754,10 @@ impl Printer<'_> {
         }
         self.emit_es5_auto_accessor_post_class(data, name)?;
         let legacy_decorated_class = self.settings.experimental_decorators
-            && !self
+            && (!self
                 .class_decorator_expressions(data.modifiers.as_ref())
-                .is_empty();
+                .is_empty()
+                || class_has_legacy_constructor_parameter_decorators(self.arena, data));
         let captures_static_this = !legacy_decorated_class
             && (class_has_async_static_field(self.arena, data)
             || data.members.nodes.iter().any(|member| {
@@ -59772,7 +59844,10 @@ impl Printer<'_> {
         self.emit_downlevel_class_decorator_metadata_temps(data);
         self.emit_class_member_decorators(data)?;
         let decorators = self.class_decorator_expressions(data.modifiers.as_ref());
-        if !decorators.is_empty() {
+        if !decorators.is_empty()
+            || self.settings.experimental_decorators
+                && class_has_legacy_constructor_parameter_decorators(self.arena, data)
+        {
             self.emit_class_decorator_assignment(data, &decorators, false, None)?;
         }
         if !self.writer.line_start {
@@ -65475,6 +65550,16 @@ impl Printer<'_> {
                     && let Some(rewrite) = self.reopened_namespace_member_rewrite(id, &data.text)
                 {
                     self.writer.write(&rewrite);
+                } else if self.emitting_decorator_expression
+                    && let Some(rewrite) =
+                        self.commonjs_named_import_text_rewrites.get(&data.text)
+                {
+                    self.writer.write(rewrite);
+                } else if self.emitting_decorator_expression
+                    && let Some(temp) = self.commonjs_default_imports.get(&data.text)
+                {
+                    self.writer.write(temp);
+                    self.writer.write(".default");
                 } else if identifier_is_within_computed_property_name(self.arena, id)
                     && let Some(rewrite) = self.commonjs_named_import_text_rewrites.get(&data.text)
                 {
