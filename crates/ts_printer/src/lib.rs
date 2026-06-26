@@ -346,6 +346,7 @@ pub fn emit_source_file_with_context(
         computed_property_temps: HashMap::new(),
         class_expression_computed_properties: HashSet::new(),
         consumed_class_expression_computed_properties: HashSet::new(),
+        native_class_expression_computed_callbacks: HashMap::new(),
         async_expression_transform: AsyncExpressionTransform::None,
         es5_async_expression_rewrites: HashMap::new(),
         es5_async_await_captures: HashMap::new(),
@@ -26528,6 +26529,7 @@ struct Printer<'a> {
     computed_property_temps: HashMap<NodeId, String>,
     class_expression_computed_properties: HashSet<NodeId>,
     consumed_class_expression_computed_properties: HashSet<NodeId>,
+    native_class_expression_computed_callbacks: HashMap<NodeId, String>,
     async_expression_transform: AsyncExpressionTransform,
     es5_async_expression_rewrites: HashMap<NodeId, String>,
     es5_async_await_captures: HashMap<NodeId, Vec<(NodeId, String)>>,
@@ -36982,7 +36984,9 @@ impl Printer<'_> {
 
     #[allow(clippy::too_many_lines)]
     fn prepare_source_class_expression_temps(&mut self, source_file: NodeId) {
-        if self.settings.target >= ScriptTarget::Es2022 {
+        if self.settings.target >= ScriptTarget::Es2022
+            && self.settings.use_define_for_class_fields != Some(false)
+        {
             let mut claimed = HashSet::new();
             let mut temps = Vec::new();
             self.prepare_commonjs_postfix_export_temps(
@@ -37036,7 +37040,8 @@ impl Printer<'_> {
                     &mut field_temps,
                 );
             }
-            let needs_class_temp = *is_expression
+            let needs_class_temp = self.settings.target < ScriptTarget::Es2022
+                && *is_expression
                 && !self.class_expression_is_in_es5_captured_for_scope(*class_id)
                 && self
                     .arena
@@ -37091,6 +37096,29 @@ impl Printer<'_> {
                 claimed.insert(temp.clone());
                 self.computed_property_temps
                     .insert(property.name, temp.clone());
+                field_temps.push(temp);
+            }
+            if self.settings.target >= ScriptTarget::Es2022
+                && self.settings.use_define_for_class_fields == Some(false)
+                && *is_expression
+                && !members.iter().any(|member| {
+                    self.arena.get(*member).is_some_and(|node| {
+                        declaration_has_modifier(self.arena, node, SyntaxKind::Decorator)
+                    })
+                })
+                && members.iter().any(|member| {
+                    let Some(NodeData::PropertyDeclaration(property)) =
+                        self.arena.get(*member).map(|node| &node.data)
+                    else {
+                        return false;
+                    };
+                    self.computed_property_requires_runtime_evaluation(*member, property)
+                })
+            {
+                let temp = self.generate_block_temp(source_file, &claimed);
+                claimed.insert(temp.clone());
+                self.native_class_expression_computed_callbacks
+                    .insert(*class_id, temp.clone());
                 field_temps.push(temp);
             }
             if *is_expression {
@@ -51044,6 +51072,23 @@ impl Printer<'_> {
         }
         let lower_fields = self.settings.target < ScriptTarget::Es2022
             || self.settings.use_define_for_class_fields == Some(false);
+        let class_id = data
+            .name
+            .and_then(|name| self.arena.get(name).and_then(|node| node.parent))
+            .or_else(|| {
+                data.members
+                    .nodes
+                    .first()
+                    .and_then(|member| self.arena.get(*member))
+                    .and_then(|node| node.parent)
+            });
+        let native_computed_callback = class_id
+            .and_then(|class_id| {
+                self.native_class_expression_computed_callbacks
+                    .get(&class_id)
+            })
+            .cloned();
+        let class_body_indent = if native_computed_callback.is_some() { 2 } else { 1 };
         let base = self.class_base_expression(data)?;
         let has_base = base.is_some();
         let has_constructible_base = base.is_some_and(|base| {
@@ -51108,7 +51153,7 @@ impl Printer<'_> {
             self.writer.write(" {");
         }
         self.writer.newline();
-        self.writer.indent += 1;
+        self.writer.indent += class_body_indent;
         if let Some(capture) = data
             .name
             .and_then(|name| self.arena.get(name)?.parent)
@@ -51138,6 +51183,12 @@ impl Printer<'_> {
             && !has_constructor
         {
             self.emit_synthesized_native_constructor(data, has_constructible_base)?;
+        }
+        if let Some(callback) = &native_computed_callback {
+            self.writer.write("static { ");
+            self.writer.write(callback);
+            self.writer.write("(); }");
+            self.writer.newline();
         }
         let mut previous_end = data.members.range.start.get();
         let mut previous_emitted = false;
@@ -51431,8 +51482,14 @@ impl Printer<'_> {
         if previous_emitted {
             self.emit_class_empty_elements_between(previous_end, data.members.range.end.get());
         }
-        self.writer.indent -= 1;
+        self.writer.indent -= class_body_indent;
+        if native_computed_callback.is_some() {
+            self.writer.indent += 1;
+        }
         self.writer.write("}");
+        if native_computed_callback.is_some() {
+            self.writer.indent -= 1;
+        }
         if self.class_binding_terminator_before_lowering {
             self.writer.write(";");
         }
@@ -51711,6 +51768,54 @@ impl Printer<'_> {
         data: &ts_ast::ClassExpressionData,
         parent_precedence: u8,
     ) -> Result<(), EmitError> {
+        if let Some(callback) = self
+            .native_class_expression_computed_callbacks
+            .get(&id)
+            .cloned()
+        {
+            self.writer.write("(");
+            self.writer.write(&callback);
+            self.writer.write(" = () => { ");
+            let mut emitted = false;
+            for member in &data.members.nodes {
+                let Some(NodeData::PropertyDeclaration(property)) =
+                    self.arena.get(*member).map(|node| &node.data)
+                else {
+                    continue;
+                };
+                if !self
+                    .class_expression_computed_properties
+                    .contains(&property.name)
+                {
+                    continue;
+                }
+                let Some(NodeData::ComputedPropertyName(computed)) =
+                    self.arena.get(property.name).map(|node| &node.data)
+                else {
+                    continue;
+                };
+                if emitted {
+                    self.writer.write(", ");
+                }
+                if let Some(temp) = self.computed_property_temps.get(&property.name).cloned() {
+                    self.writer.write(&temp);
+                    self.writer.write(" = ");
+                }
+                self.emit_expression(computed.expression, 1)?;
+                self.consumed_class_expression_computed_properties
+                    .insert(property.name);
+                emitted = true;
+            }
+            self.writer.write("; },");
+            self.writer.newline();
+            self.writer.indent += 1;
+            let declaration = Self::class_expression_as_declaration(data);
+            let result = self.emit_class(&declaration);
+            self.writer.indent -= 1;
+            result?;
+            self.writer.write(")");
+            return Ok(());
+        }
         if !self.settings.experimental_decorators
             && let Some(plan) = self.stage3_decorated_class_plan(id, data)
         {
@@ -53690,43 +53795,6 @@ impl Printer<'_> {
         if previous_emitted_for_empty {
             self.emit_class_empty_elements_between(previous_end, data.members.range.end.get());
         }
-        let mut class_expression_temps = Vec::new();
-        let mut claimed_class_expression_temps = HashSet::new();
-        for member in &data.members.nodes {
-            let Some(NodeData::PropertyDeclaration(property)) =
-                self.arena.get(*member).map(|node| &node.data)
-            else {
-                continue;
-            };
-            if !self.property_is_static(property) {
-                continue;
-            }
-            let Some(initializer) = property.initializer else {
-                continue;
-            };
-            let Some(NodeData::ClassExpression(class)) =
-                self.arena.get(initializer).map(|node| &node.data)
-            else {
-                continue;
-            };
-            if self.class_expression_temps.contains_key(&initializer)
-                || !self.class_expression_requires_post_class_lowering(
-                    &Self::class_expression_as_declaration(class),
-                )
-            {
-                continue;
-            }
-            let temp = self.generate_block_temp(initializer, &claimed_class_expression_temps);
-            claimed_class_expression_temps.insert(temp.clone());
-            self.class_expression_temps.insert(initializer, temp.clone());
-            class_expression_temps.push(temp);
-        }
-        if !class_expression_temps.is_empty() {
-            self.writer.write("var ");
-            self.writer.write(&class_expression_temps.join(", "));
-            self.writer.write(";");
-            self.writer.newline();
-        }
         let legacy_decorated_class = self.settings.experimental_decorators
             && !self
                 .class_decorator_expressions(data.modifiers.as_ref())
@@ -53748,11 +53816,51 @@ impl Printer<'_> {
             }));
         let static_this_capture =
             captures_static_this.then(|| self.generated_names.generate_temp());
-        if let Some(static_this_capture) = static_this_capture.as_deref() {
+        let mut class_expression_temps = static_this_capture.iter().cloned().collect::<Vec<_>>();
+        let mut claimed_class_expression_temps = self.generated_names.used.clone();
+        for member in &data.members.nodes {
+            let Some(NodeData::PropertyDeclaration(property)) =
+                self.arena.get(*member).map(|node| &node.data)
+            else {
+                continue;
+            };
+            if !self.property_is_static(property) {
+                continue;
+            }
+            let Some(initializer) = property.initializer else {
+                continue;
+            };
+            let Some(NodeData::ClassExpression(class)) =
+                self.arena.get(initializer).map(|node| &node.data)
+            else {
+                continue;
+            };
+            let class_members = class.members.nodes.clone();
+            if self.class_expression_temps.contains_key(&initializer)
+                || !self.class_expression_requires_post_class_lowering(
+                    &Self::class_expression_as_declaration(class),
+                )
+            {
+                continue;
+            }
+            let temp = self.generate_block_temp(initializer, &claimed_class_expression_temps);
+            claimed_class_expression_temps.insert(temp.clone());
+            self.class_expression_temps.insert(initializer, temp.clone());
+            class_expression_temps.push(temp);
+            self.prepare_class_expression_computed_property_temps(
+                &class_members,
+                initializer,
+                &mut claimed_class_expression_temps,
+                &mut class_expression_temps,
+            );
+        }
+        if !class_expression_temps.is_empty() {
             self.writer.write("var ");
-            self.writer.write(static_this_capture);
+            self.writer.write(&class_expression_temps.join(", "));
             self.writer.write(";");
             self.writer.newline();
+        }
+        if let Some(static_this_capture) = static_this_capture.as_deref() {
             self.writer.write(static_this_capture);
             self.writer.write(" = ");
             self.writer.write(name);
@@ -72124,6 +72232,42 @@ mod tests {
         assert_eq!(
             emit_with(source, ScriptTarget::Es2022, ModuleKind::EsNext).code,
             "const Value = class Inner {\n    static value = 1;\n};\n"
+        );
+    }
+
+    #[test]
+    fn captures_nested_class_computed_fields_in_static_initializers() {
+        let source = concat!(
+            "class C { static c = \"foo\"; static bar = class Inner { ",
+            "static [this.c] = 123; [this.c] = 123; } }",
+        );
+        let esnext =
+            emit_with_class_field_semantics(source, ScriptTarget::EsNext, false).code;
+        assert!(esnext.contains("var _a, _b, _c;"), "{esnext}");
+        assert!(
+            esnext.contains("_c = () => { _a = this.c, _b = this.c; }")
+                && esnext.contains("static { _c(); }")
+                && esnext.contains("this[_b] = 123")
+                && esnext.contains("this[_a] = 123"),
+            "{esnext}"
+        );
+
+        let es5 = emit_with_class_field_semantics(source, ScriptTarget::Es5, false).code;
+        assert!(es5.contains("var _a, _b, _c, _d;"), "{es5}");
+        assert!(
+            es5.contains("_a = C;")
+                && es5.contains("_c = _a.c")
+                && es5.contains("_d = _a.c")
+                && es5.contains("_b[_c] = 123"),
+            "{es5}"
+        );
+
+        let define = emit_with_class_field_semantics(source, ScriptTarget::Es5, true).code;
+        assert!(define.contains("var _a, _b, _c, _d;"), "{define}");
+        assert!(
+            define.contains("Object.defineProperty(_b, _c, {")
+                && define.contains("Object.defineProperty(this, _d, {"),
+            "{define}"
         );
     }
 
