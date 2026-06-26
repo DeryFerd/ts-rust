@@ -31109,6 +31109,22 @@ impl Printer<'_> {
         {
             self.emit_import_default_helper();
         }
+        if self.settings.target < ScriptTarget::Es2017
+            && source_needs_awaiter_helper(self.arena)
+            && self.import_helpers_namespace.is_none()
+            && !self.imported_helpers.contains("__awaiter")
+            && !self.settings.no_emit_helpers
+        {
+            self.emit_awaiter_helper();
+        }
+        if self.settings.target < ScriptTarget::Es2015
+            && source_needs_awaiter_helper(self.arena)
+            && self.import_helpers_namespace.is_none()
+            && !self.imported_helpers.contains("__generator")
+            && !self.settings.no_emit_helpers
+        {
+            self.emit_generator_helper();
+        }
         if self.import_helpers_namespace.is_none()
             && source_needs_legacy_decorate_helper(self.arena)
             && !self.settings.no_emit_helpers
@@ -31612,6 +31628,22 @@ impl Printer<'_> {
         self.writer.indent += 1;
         self.writer.write("\"use strict\";");
         self.writer.newline();
+        if self.settings.target < ScriptTarget::Es2017
+            && source_needs_awaiter_helper(self.arena)
+            && self.import_helpers_namespace.is_none()
+            && !self.imported_helpers.contains("__awaiter")
+            && !self.settings.no_emit_helpers
+        {
+            self.emit_awaiter_helper();
+        }
+        if self.settings.target < ScriptTarget::Es2015
+            && source_needs_awaiter_helper(self.arena)
+            && self.import_helpers_namespace.is_none()
+            && !self.imported_helpers.contains("__generator")
+            && !self.settings.no_emit_helpers
+        {
+            self.emit_generator_helper();
+        }
         if self.import_helpers_namespace.is_none()
             && source_needs_legacy_decorate_helper(self.arena)
             && !self.settings.no_emit_helpers
@@ -45514,7 +45546,10 @@ impl Printer<'_> {
         }
         self.writer.write(" {");
         let callback_is_indented =
-            !compact_callback || object_rest.is_some() || !prologue_statements.is_empty();
+            !compact_callback
+                || object_rest.is_some()
+                || !prologue_statements.is_empty()
+                || !hoisted_names.is_empty();
         if callback_is_indented {
             self.writer.newline();
         } else {
@@ -47305,8 +47340,16 @@ impl Printer<'_> {
             self.emit_expression(name, 0)?;
             self.writer.write(" = ");
             self.emit_expression(initializer, 0)?;
-            self.writer.write(";");
+            let emitted_trailing_comment =
+                self.emit_es5_async_await_trailing_line_comment(awaited);
+            if !emitted_trailing_comment {
+                self.writer.write(";");
+            }
             self.writer.newline();
+            if emitted_trailing_comment {
+                self.writer.write(";");
+                self.writer.newline();
+            }
             self.restore_es5_async_expression_rewrite(await_id, previous);
             return Ok(());
         }
@@ -47408,6 +47451,7 @@ impl Printer<'_> {
         self.writer.write("return [4 /*yield*/, ");
         self.emit_expression(awaited, 0)?;
         self.writer.write("];");
+        self.emit_es5_async_await_trailing_line_comment(awaited);
         self.writer.newline();
         *case += 1;
         self.emit_es5_async_case_label(*case, inline_resume);
@@ -47415,6 +47459,32 @@ impl Printer<'_> {
             self.writer.write(" ");
         }
         Ok(())
+    }
+
+    fn emit_es5_async_await_trailing_line_comment(&mut self, awaited: NodeId) -> bool {
+        if self.settings.remove_comments {
+            return false;
+        }
+        let Some(start) = self
+            .arena
+            .get(awaited)
+            .and_then(|node| usize::try_from(node.range.end.get()).ok())
+        else {
+            return false;
+        };
+        let Some(rest) = self.source_text.get(start..) else {
+            return false;
+        };
+        let line_end = rest.find(['\n', '\r']).unwrap_or(rest.len());
+        let line = &rest[..line_end];
+        let Some(comment_start) = line.find("//") else {
+            return false;
+        };
+        let range = (start + comment_start, start + line_end);
+        self.emitted_source_comments.insert(range);
+        self.writer.write(" ");
+        self.writer.write(&line[comment_start..]);
+        true
     }
 
     fn emit_es5_async_while_statement(
@@ -61023,7 +61093,10 @@ impl Printer<'_> {
                 !self.has_modifier(property.modifiers.as_ref(), SyntaxKind::StaticKeyword)
                     && property
                         .initializer
-                        .is_some_and(|initializer| self.expression_has_lexical_this(initializer))
+                        .is_some_and(|initializer| {
+                            self.expression_has_lexical_this(initializer)
+                                || self.body_has_downlevel_async_arrow(initializer)
+                        })
             })
     }
 
@@ -64766,6 +64839,19 @@ impl Printer<'_> {
             self.writer.write("}`");
         }
         self.writer.write(").then(");
+        if self.settings.target < ScriptTarget::Es2015 {
+            if inlineable {
+                self.writer.write("function () { return __importStar(require(");
+                if let Some(argument) = argument {
+                    self.emit_expression(argument, 0)?;
+                }
+            } else {
+                self.writer
+                    .write("function (s) { return __importStar(require(s");
+            }
+            self.writer.write(")); })");
+            return Ok(());
+        }
         if inlineable {
             self.writer.write("() => __importStar(require(");
             if let Some(argument) = argument {
