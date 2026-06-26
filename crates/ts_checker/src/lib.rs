@@ -2925,6 +2925,73 @@ impl<'a> ProgramChecker<'a> {
             if let Some(meaning) = self.import_runtime_meaning(source, *statement) {
                 meanings.insert(*statement, meaning);
             }
+            if let Some(NodeData::ImportDeclaration(import)) =
+                source.arena.get(*statement).map(|node| &node.data)
+                && let Some(specifier) = string_literal_text(source.arena, import.module_specifier)
+                && let Some(target) = self.local_import_target(source, specifier)
+                && let Some(clause_id) = import.import_clause
+                && let Some(NodeData::ImportClause(clause)) =
+                    source.arena.get(clause_id).map(|node| &node.data)
+            {
+                let exports = self.resolved_module_export_symbols(target, specifier);
+                let clause_is_type_only =
+                    clause.phase_modifier == Some(SyntaxKind::TypeKeyword);
+                if clause_is_type_only && clause.name.is_some() {
+                    meanings.insert(
+                        clause_id,
+                        self.module_export_has_runtime_value(
+                            target,
+                            &exports,
+                            "default",
+                            &mut HashSet::new(),
+                        ),
+                    );
+                }
+                if let Some(bindings) = clause.named_bindings {
+                    match source.arena.get(bindings).map(|node| &node.data) {
+                        Some(NodeData::NamespaceImport(_)) if clause_is_type_only => {
+                            let runtime = exports.iter().any(|(name, symbol)| {
+                                !self.module_export_name_is_explicitly_type_only(target, name)
+                                    && self.symbol_has_runtime_value(
+                                        target,
+                                        *symbol,
+                                        &mut HashSet::new(),
+                                    )
+                            }) || self.module_has_runtime_export(target, &mut HashSet::new());
+                            meanings.insert(bindings, runtime);
+                        }
+                        Some(NodeData::NamedImports(imports)) => {
+                            for specifier_id in &imports.elements.nodes {
+                                let Some(NodeData::ImportSpecifier(specifier)) = source
+                                    .arena
+                                    .get(*specifier_id)
+                                    .map(|node| &node.data)
+                                else {
+                                    continue;
+                                };
+                                if !clause_is_type_only && !specifier.is_type_only {
+                                    continue;
+                                }
+                                let imported = specifier.property_name.unwrap_or(specifier.name);
+                                let Some(name) = module_export_name_text(source.arena, imported)
+                                else {
+                                    continue;
+                                };
+                                meanings.insert(
+                                    *specifier_id,
+                                    self.module_export_has_runtime_value(
+                                        target,
+                                        &exports,
+                                        name,
+                                        &mut HashSet::new(),
+                                    ),
+                                );
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
             let Some(NodeData::ExportDeclaration(export)) =
                 source.arena.get(*statement).map(|node| &node.data)
             else {

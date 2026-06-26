@@ -1987,7 +1987,11 @@ impl<'a> Parser<'a> {
         let mut decorators = Vec::new();
         while self.current.kind == SyntaxKind::AtToken {
             let decorator_start = self.consume().range.start;
-            let expression = self.parse_postfix_expression();
+            let expression = if self.decorator_precedes_invalid_empty_arrow() {
+                self.parse_identifier_name("Expected a decorator expression.")
+            } else {
+                self.parse_postfix_expression()
+            };
             decorators.push(self.alloc_node(
                 SyntaxKind::Decorator,
                 TextRange::new(decorator_start, self.node_end(expression)),
@@ -2005,6 +2009,20 @@ impl<'a> Parser<'a> {
         let expression = self.parse_class_expression();
         self.attach_modifiers(expression, decorators, start);
         expression
+    }
+
+    fn decorator_precedes_invalid_empty_arrow(&mut self) -> bool {
+        if self.current.kind != SyntaxKind::Identifier {
+            return false;
+        }
+        let checkpoint = self.scanner.mark();
+        let open = self.scanner.scan().kind;
+        let close = self.scanner.scan().kind;
+        let arrow = self.scanner.scan().kind;
+        self.scanner.rewind(checkpoint);
+        open == SyntaxKind::OpenParenToken
+            && close == SyntaxKind::CloseParenToken
+            && arrow == SyntaxKind::EqualsGreaterThanToken
     }
 
     fn parse_interface_declaration(&mut self) -> NodeId {

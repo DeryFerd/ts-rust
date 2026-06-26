@@ -28494,6 +28494,23 @@ impl Printer<'_> {
         None
     }
 
+    fn decorator_metadata_import_target_runtime_value(&self, name: &str) -> Option<bool> {
+        for (binding, node) in self.arena.iter() {
+            let binding_name = match &node.data {
+                NodeData::ImportClause(import) => import.name,
+                NodeData::ImportSpecifier(import) => Some(import.name),
+                NodeData::NamespaceImport(import) => Some(import.name),
+                _ => None,
+            };
+            if binding_name.and_then(|name| declaration_name_text(self.arena, name)) == Some(name)
+                && let Some(runtime) = self.import_runtime_meanings.get(&binding)
+            {
+                return Some(*runtime);
+            }
+        }
+        None
+    }
+
     fn decorator_metadata_runtime_names(&self) -> HashSet<String> {
         let mut names = HashSet::new();
         let mut roots = HashSet::new();
@@ -55058,6 +55075,11 @@ impl Printer<'_> {
             }
             NodeData::TypeReferenceNode(reference) => {
                 let symbol = self.resolve_entity_symbol(reference.type_name, &mut HashSet::new());
+                let symbol = symbol
+                    .and_then(|symbol| {
+                        self.alias_target_symbol(symbol, &mut HashSet::new())
+                            .or(Some(symbol))
+                    });
                 let flags = symbol
                     .and_then(|symbol| self.bindings.symbols.get(symbol))
                     .map(|symbol| symbol.flags);
@@ -55098,6 +55120,13 @@ impl Printer<'_> {
                 if root_name.is_some_and(|name| {
                     self.decorator_metadata_import_runtime_value(name) == Some(false)
                 }) {
+                    if flags.is_some_and(|flags| flags.intersects(SymbolFlags::CLASS))
+                        || root_name.is_some_and(|name| {
+                            self.decorator_metadata_import_target_runtime_value(name) == Some(true)
+                        })
+                    {
+                        return RuntimeMetadataType::Builtin("Function");
+                    }
                     return RuntimeMetadataType::Object;
                 }
                 RuntimeMetadataType::Reference { entity, type_node }
@@ -66528,6 +66557,15 @@ impl Printer<'_> {
                 }
             }
             NodeData::CallExpression(data) => {
+                if node_is_missing_identifier(self.arena, data.expression)
+                    && data.arguments.nodes.is_empty()
+                    && usize::try_from(node.range.end.get())
+                        .ok()
+                        .and_then(|end| self.source_text.get(end..))
+                        .is_some_and(|source| source.trim_start().starts_with("=>"))
+                {
+                    return Ok(());
+                }
                 let async_super_call = self.is_active_async_super_access(data.expression);
                 let downlevel_constructor_super = self
                     .downlevel_constructor_super_capture
@@ -66819,8 +66857,8 @@ impl Printer<'_> {
                     self.writer.write("(");
                     self.emit_expression(data.expression, 0)?;
                     self.writer.write(")");
-                } else if self.async_expression_transform == AsyncExpressionTransform::AwaitAsYield
-                    || self.settings.target < ScriptTarget::Es2017
+                } else if self.async_expression_transform
+                    == AsyncExpressionTransform::AwaitAsYield
                 {
                     self.writer.write("yield ");
                     self.emit_expression(data.expression, 2)?;
@@ -73096,6 +73134,10 @@ impl Printer<'_> {
             Some(NodeData::TypeAssertion(data)) => self.expression_emits_nothing(data.expression),
             Some(NodeData::NonNullExpression(data)) => {
                 self.expression_emits_nothing(data.expression)
+            }
+            Some(NodeData::CallExpression(data)) => {
+                data.arguments.nodes.is_empty()
+                    && node_is_missing_identifier(self.arena, data.expression)
             }
             _ => false,
         }
