@@ -958,7 +958,11 @@ pub fn emit_source_file_with_context(
             Some(NodeData::StringLiteral(literal)) if literal.text == "use strict"
         )
     });
-    let preserves_external_module_syntax = is_external_module
+    let has_invalid_import_expression_recovery = source_text
+        .split(['\n', '\r'])
+        .any(|line| line.contains("= import {") || line.contains("=import {"));
+    let preserves_external_module_syntax = (is_external_module
+        || has_invalid_import_expression_recovery)
         && matches!(
             settings.module,
             ModuleKind::None
@@ -985,7 +989,7 @@ pub fn emit_source_file_with_context(
         printer.lower_dynamic_import_to_commonjs && source_has_dynamic_import(arena);
     if !has_use_strict
         && (context.force_use_strict
-            || has_invalid_import_recovery
+            || (has_invalid_import_recovery && !preserves_external_module_syntax)
             || (!preserves_external_module_syntax
                 && (settings.always_strict
                     || (settings.module == ModuleKind::CommonJs && is_external_module)
@@ -35293,6 +35297,17 @@ impl Printer<'_> {
             return Ok(());
         }
         match &node.data {
+            NodeData::NotEmittedStatement(_)
+                if node.flags.0 & NODE_FLAG_HAS_ERROR != 0
+                    && usize::try_from(node.range.start.get())
+                        .ok()
+                        .zip(usize::try_from(node.range.end.get()).ok())
+                        .and_then(|(start, end)| self.source_text.get(start..end))
+                        .is_some_and(|source| source.trim() == "import") =>
+            {
+                self.writer.write("import ;");
+                return Ok(());
+            }
             NodeData::NotEmittedStatement(_) => return Ok(()),
             NodeData::ExportDeclaration(export)
                 if !misplaced_module_statement
@@ -40748,6 +40763,10 @@ impl Printer<'_> {
         claimed: &mut HashSet<String>,
         temps: &mut Vec<String>,
     ) {
+        let downlevels_async_container = self.settings.target < ScriptTarget::Es2017
+            && self.arena.get(container).is_some_and(|node| {
+                declaration_has_modifier(self.arena, node, SyntaxKind::AsyncKeyword)
+            });
         let mut calls = self
             .arena
             .iter()
@@ -40762,6 +40781,15 @@ impl Printer<'_> {
                     return None;
                 }
                 let argument = call.arguments.nodes.first().copied()?;
+                let contains_transformed_await = downlevels_async_container
+                    && self.arena.iter().any(|(id, node)| {
+                        matches!(node.data, NodeData::AwaitExpression(_))
+                            && self.nearest_function_like_container(id) == Some(container)
+                            && self.node_is_descendant_of(id, argument)
+                    });
+                if contains_transformed_await {
+                    return None;
+                }
                 (!matches!(
                     self.arena.get(argument).map(|node| &node.data),
                     Some(NodeData::StringLiteral(_) | NodeData::NoSubstitutionTemplateLiteral(_))

@@ -852,6 +852,8 @@ impl<'a> Parser<'a> {
 
     fn classify_import_statement_start(&mut self) -> (bool, bool) {
         let next = (self.current.kind == SyntaxKind::ImportKeyword).then(|| self.next_token_kind());
+        let line_broken_import = next == Some(SyntaxKind::ImportKeyword)
+            && self.next_token_preceded_by_line_break();
         (
             matches!(
                 next,
@@ -860,7 +862,7 @@ impl<'a> Parser<'a> {
             matches!(
                 next,
                 Some(SyntaxKind::NumericLiteral | SyntaxKind::BigIntLiteral)
-            ),
+            ) || line_broken_import,
         )
     }
 
@@ -5237,6 +5239,17 @@ impl<'a> Parser<'a> {
 
     #[allow(clippy::too_many_lines)]
     fn parse_postfix_expression_worker(&mut self, in_decorator_context: bool) -> NodeId {
+        if self.current.kind == SyntaxKind::ImportKeyword
+            && self.next_token_kind() == SyntaxKind::OpenBraceToken
+        {
+            let token = self.consume();
+            self.error_code_at(token.range, 1128, std::iter::empty::<String>());
+            while !matches!(self.current.kind, SyntaxKind::SemicolonToken | SyntaxKind::EndOfFile)
+            {
+                self.bump();
+            }
+            return self.missing_identifier(token.range.end);
+        }
         if self.current.kind == SyntaxKind::LessThanToken
             && self.language_variant != LanguageVariant::Jsx
         {
