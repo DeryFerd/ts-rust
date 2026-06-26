@@ -9730,6 +9730,27 @@ impl<'a> Checker<'a> {
                     self.result.node_types.insert(node_id, module_type);
                     return module_type;
                 }
+                if identifier_text(self.arena, data.expression) == Some("import") {
+                    for argument in &data.arguments.nodes {
+                        self.type_of_expression(*argument);
+                    }
+                    let any = self.result.types.any();
+                    if let Some(promise_descriptor) = self.external_names.get("Promise").cloned() {
+                        let target = self.import_alias(&promise_descriptor, &[any]);
+                        let kind = self.result.types.get(target).unwrap().kind.clone();
+                        let promise = self.result.types.alloc(kind);
+                        self.result.named_type_references.insert(
+                            promise,
+                            NamedTypeReference {
+                                name: "Promise".into(),
+                                type_arguments: vec![any],
+                            },
+                        );
+                        self.result.node_types.insert(node_id, promise);
+                        return promise;
+                    }
+                    return any;
+                }
                 let getter_call = self.property_access_is_getter(data.expression);
                 let callee = self.type_of_expression(data.expression);
                 let callee = if data.question_dot_token.is_some() {
@@ -9923,40 +9944,15 @@ impl<'a> Checker<'a> {
         specifier: &str,
     ) -> TypeId {
         let imported = self.import_type(descriptor);
-        let Some(TypeKind::Object(mut object)) = self
-            .result
-            .types
-            .get(imported)
-            .map(|type_| type_.kind.clone())
-        else {
-            self.result.import_type_references.insert(
-                imported,
-                ImportTypeReference {
-                    module_specifier: specifier.to_owned(),
-                    qualifier: String::new(),
-                    is_typeof: true,
-                },
-            );
-            return imported;
-        };
-        for property in object.properties.values_mut() {
-            let kind = self
-                .result
-                .types
-                .get(*property)
-                .map_or(TypeKind::Unknown, |type_| type_.kind.clone());
-            let referenced = self.result.types.alloc(kind);
-            self.result.import_type_references.insert(
-                referenced,
-                ImportTypeReference {
-                    module_specifier: specifier.to_owned(),
-                    qualifier: String::new(),
-                    is_typeof: true,
-                },
-            );
-            *property = referenced;
-        }
-        self.result.types.alloc(TypeKind::Object(object))
+        self.result.import_type_references.insert(
+            imported,
+            ImportTypeReference {
+                module_specifier: specifier.to_owned(),
+                qualifier: String::new(),
+                is_typeof: true,
+            },
+        );
+        imported
     }
 
     fn jsx_element_type(&mut self) -> TypeId {
