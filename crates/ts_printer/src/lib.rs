@@ -286,6 +286,7 @@ pub fn emit_source_file_with_context(
         source_line_starts: settings.source_map.then(|| line_starts(source_text)),
         automatic_jsx,
         this_alias: None,
+        this_alias_scope: None,
         arguments_alias: None,
         arguments_capture_counter: 0,
         class_static_this_capture: None,
@@ -26417,6 +26418,7 @@ struct Printer<'a> {
     source_line_starts: Option<Vec<usize>>,
     automatic_jsx: AutomaticJsxUsage,
     this_alias: Option<String>,
+    this_alias_scope: Option<NodeId>,
     arguments_alias: Option<String>,
     arguments_capture_counter: u32,
     class_static_this_capture: Option<String>,
@@ -36365,6 +36367,13 @@ impl Printer<'_> {
             }
         }
         if is_function_body {
+            if self.settings.target < ScriptTarget::Es2015 {
+                self.prepare_function_computed_object_literal_temps(
+                    block_id,
+                    &mut claimed,
+                    &mut temps,
+                );
+            }
             self.prepare_downlevel_nullish_temps(block_id, &mut claimed, &mut temps);
             if matches!(self.settings.module, ModuleKind::Amd | ModuleKind::Umd)
                 && let Some(container) = self.arena.get(block_id).and_then(|node| node.parent)
@@ -36383,6 +36392,59 @@ impl Printer<'_> {
             self.writer.write(&temps.join(", "));
             self.writer.write(";");
             self.writer.newline();
+        }
+    }
+
+    fn prepare_function_computed_object_literal_temps(
+        &mut self,
+        body: NodeId,
+        claimed: &mut HashSet<String>,
+        temps: &mut Vec<String>,
+    ) {
+        let Some(container) = self.arena.get(body).and_then(|node| node.parent) else {
+            return;
+        };
+        let mut local_claimed = temps.iter().cloned().collect::<HashSet<_>>();
+        let mut objects = self
+            .arena
+            .iter()
+            .filter_map(|(id, node)| {
+                let NodeData::ObjectLiteralExpression(object) = &node.data else {
+                    return None;
+                };
+                if self.computed_property_temps.contains_key(&id)
+                    || self.nearest_function_like_container(id) != Some(container)
+                    || self.node_has_class_ancestor(id, body)
+                {
+                    return None;
+                }
+                object
+                    .properties
+                    .nodes
+                    .iter()
+                    .any(|property| {
+                        let name = match self.arena.get(*property).map(|node| &node.data) {
+                            Some(NodeData::PropertyAssignment(property)) => property.name,
+                            Some(NodeData::MethodDeclaration(method)) => method.name,
+                            Some(NodeData::GetAccessorDeclaration(accessor)) => accessor.name,
+                            Some(NodeData::SetAccessorDeclaration(accessor)) => accessor.name,
+                            _ => return false,
+                        };
+                        matches!(
+                            self.arena.get(name).map(|node| &node.data),
+                            Some(NodeData::ComputedPropertyName(_))
+                        )
+                    })
+                    .then_some((node.range.start, id))
+            })
+            .collect::<Vec<_>>();
+        objects.sort_by_key(|(start, _)| *start);
+        for (_, object) in objects {
+            let temp = self.generate_block_temp(body, &local_claimed);
+            local_claimed.insert(temp.clone());
+            claimed.insert(temp.clone());
+            self.computed_property_temps.insert(object, temp.clone());
+            temps.push(temp);
         }
     }
 
@@ -49358,7 +49420,7 @@ impl Printer<'_> {
             if index != 0 {
                 self.writer.write(", ");
             }
-            self.emit_expression(*decorator, 1)?;
+            self.emit_decorator_expression(*decorator)?;
         }
         self.writer.write("];");
         self.writer.newline();
@@ -49461,6 +49523,16 @@ impl Printer<'_> {
         Ok(true)
     }
 
+    fn emit_decorator_expression(&mut self, decorator: NodeId) -> Result<(), EmitError> {
+        if !self.settings.experimental_decorators {
+            return self.emit_expression(decorator, 1);
+        }
+        let previous_this_alias = self.this_alias.take();
+        let result = self.emit_expression(decorator, 1);
+        self.this_alias = previous_this_alias;
+        result
+    }
+
     #[allow(clippy::too_many_lines)]
     fn emit_class_decorator_assignment(
         &mut self,
@@ -49555,7 +49627,7 @@ impl Printer<'_> {
             .then_some(constructor_parameters)
             .flatten();
         for (index, decorator) in decorators.iter().enumerate() {
-            self.emit_expression(*decorator, 1)?;
+            self.emit_decorator_expression(*decorator)?;
             self.emit_decorator_trailing_line_comment(*decorator, data.modifiers.as_ref());
             if !parameter_decorators.is_empty()
                 || metadata_parameters.is_some()
@@ -49572,7 +49644,7 @@ impl Printer<'_> {
             self.writer.write("(");
             self.writer.write(&parameter_index.to_string());
             self.writer.write(", ");
-            self.emit_expression(*decorator, 1)?;
+            self.emit_decorator_expression(*decorator)?;
             self.writer.write(")");
             if metadata_parameters.is_some() || index + 1 != parameter_decorators.len() {
                 self.writer.write(",");
@@ -49826,10 +49898,10 @@ impl Printer<'_> {
                     self.writer.write("(");
                     self.writer.write(&parameter_index.to_string());
                     self.writer.write(", ");
-                    self.emit_expression(*decorator, 1)?;
+                    self.emit_decorator_expression(*decorator)?;
                     self.writer.write(")");
                 } else {
-                    self.emit_expression(*decorator, 1)?;
+                    self.emit_decorator_expression(*decorator)?;
                     self.emit_decorator_trailing_line_comment(*decorator, modifiers);
                 }
                 if self.emit_decorator_metadata || index + 1 != entries.len() {
@@ -50736,6 +50808,7 @@ impl Printer<'_> {
                             SyntaxKind::DeclareKeyword,
                         ) && (current_is_inline_static_field
                             || self.property_is_auto_accessor(property)
+                            || self.property_is_recovered_super_call_type(property)
                             || !lower_fields
                             || self.property_is_native_private_field(property))
                     }
@@ -50874,6 +50947,12 @@ impl Printer<'_> {
                 }
                 NodeData::MethodDeclaration(_) | NodeData::IndexSignatureDeclaration(_) => {}
                 NodeData::SemicolonClassElement(_) => {
+                    self.writer.write(";");
+                    self.writer.newline();
+                }
+                NodeData::PropertyDeclaration(property)
+                    if self.property_is_recovered_super_call_type(property) =>
+                {
                     self.writer.write(";");
                     self.writer.newline();
                 }
@@ -51482,7 +51561,7 @@ impl Printer<'_> {
                 if index != 0 {
                     self.writer.write(", ");
                 }
-                self.emit_expression(*decorator, 1)?;
+                self.emit_decorator_expression(*decorator)?;
             }
             self.writer.write("];");
             self.writer.newline();
@@ -52275,7 +52354,12 @@ impl Printer<'_> {
             .iter()
             .take_while(|statement| self.statement_is_string_prologue(**statement))
             .count();
-        let initialize_before_body = !has_base || !self.constructor_body_has_super_call(body_id);
+        let initialize_before_body = !has_base
+            || !body
+                .statements
+                .nodes
+                .iter()
+                .any(|statement| self.is_super_call_statement(*statement).unwrap_or(false));
         let mut emitted_fields = false;
         let mut emitted_temps = false;
         let mut emitted_binding_parameters = false;
@@ -52854,7 +52938,9 @@ impl Printer<'_> {
             }
             let mut emitted_fields = base.is_none();
             let previous_this_alias = self.this_alias.clone();
+            let previous_this_alias_scope = self.this_alias_scope;
             let mut uses_this_alias = false;
+            let mut emitted_synthetic_return = false;
             if let Some(body) = constructor.body {
                 let body_id = body;
                 let body_node = self.node(body)?.clone();
@@ -52873,15 +52959,22 @@ impl Printer<'_> {
                         .is_none_or(|index| index.saturating_add(1) < body.statements.nodes.len());
                 let nested_super_calls = super_statement_index.is_none()
                     && self.constructor_body_has_super_call(body_id);
+                let statements_before_super = super_statement_index.is_some_and(|index| index > 0);
                 let previous_constructor_super_capture =
                     self.downlevel_constructor_super_capture.clone();
-                if nested_super_calls {
+                if nested_super_calls || statements_before_super {
                     self.writer.write("var _this = this;");
                     self.writer.newline();
                     self.this_alias = Some("_this".to_owned());
+                    self.this_alias_scope = Some(body_id);
                     uses_this_alias = true;
                     self.downlevel_constructor_super_capture
                         .clone_from(&super_capture);
+                    if nested_super_calls && !emitted_fields {
+                        self.emit_parameter_properties(&constructor.parameters, "_this")?;
+                        self.emit_es5_instance_fields(data, "_this", captures_field_this)?;
+                        emitted_fields = true;
+                    }
                 }
                 let mut previous_end = body_node.range.start.get().saturating_add(1);
                 if self.body_opening_line_comment_is_unowned(body_id) {
@@ -52926,6 +53019,7 @@ impl Printer<'_> {
                         && self.emit_super_statement(
                             *statement,
                             capture_super_result,
+                            uses_this_alias,
                             super_capture.as_deref().expect("derived class capture"),
                         )?
                     {
@@ -52945,8 +53039,10 @@ impl Printer<'_> {
                         );
                         if capture_super_result {
                             self.this_alias = Some("_this".to_owned());
+                            self.this_alias_scope = Some(body_id);
                             uses_this_alias = true;
                             if !emitted_fields {
+                                self.emit_parameter_properties(&constructor.parameters, "_this")?;
                                 self.emit_es5_instance_fields(data, "_this", captures_field_this)?;
                                 emitted_fields = true;
                             }
@@ -52959,9 +53055,31 @@ impl Printer<'_> {
                     previous_end = statement_node.range.end.get();
                     previous_emitted = statement_emits_javascript(self.arena, &statement_node);
                 }
+                if uses_this_alias && !emitted_fields {
+                    self.emit_parameter_properties(&constructor.parameters, "_this")?;
+                    self.emit_es5_instance_fields(data, "_this", captures_field_this)?;
+                    emitted_fields = true;
+                }
+                let body_close = body_node.range.end.get().saturating_sub(1);
+                let mut trailing_comment_start = previous_end;
+                if uses_this_alias && !constructor_returns_on_all_paths {
+                    let immediate_comment_end =
+                        self.position_after_immediate_line_comment(previous_end, body_close);
+                    if immediate_comment_end > previous_end {
+                        self.emit_source_comments_between_with_trailing(
+                            previous_end,
+                            immediate_comment_end,
+                            previous_emitted,
+                        );
+                        trailing_comment_start = immediate_comment_end;
+                    }
+                    self.writer.write("return _this;");
+                    self.writer.newline();
+                    emitted_synthetic_return = true;
+                }
                 self.emit_source_comments_between_with_trailing(
-                    previous_end,
-                    body_node.range.end.get().saturating_sub(1),
+                    trailing_comment_start,
+                    body_close,
                     previous_emitted,
                 );
                 self.downlevel_constructor_super_capture = previous_constructor_super_capture;
@@ -52969,11 +53087,12 @@ impl Printer<'_> {
             if !emitted_fields {
                 self.emit_es5_instance_fields(data, "this", captures_field_this)?;
             }
-            if uses_this_alias && !constructor_returns_on_all_paths {
+            if uses_this_alias && !constructor_returns_on_all_paths && !emitted_synthetic_return {
                 self.writer.write("return _this;");
                 self.writer.newline();
             }
             self.this_alias = previous_this_alias;
+            self.this_alias_scope = previous_this_alias_scope;
             self.capture_arrow_this = previous_arrow_this_capture;
             if super_capture.is_some() {
                 self.downlevel_super_context = previous_super_context;
@@ -53816,7 +53935,11 @@ impl Printer<'_> {
             let mut inside_arrow = false;
             while let Some(parent) = self.arena.get(current).and_then(|node| node.parent) {
                 if parent == expression {
-                    return inside_arrow;
+                    return inside_arrow
+                        || matches!(
+                            self.arena.get(parent).map(|node| &node.data),
+                            Some(NodeData::ArrowFunction(_))
+                        );
                 }
                 match self.arena.get(parent).map(|node| &node.data) {
                     Some(NodeData::ArrowFunction(_)) => inside_arrow = true,
@@ -53968,6 +54091,19 @@ impl Printer<'_> {
 
     fn property_is_auto_accessor(&self, property: &ts_ast::PropertyDeclarationData) -> bool {
         self.has_modifier(property.modifiers.as_ref(), SyntaxKind::AccessorKeyword)
+    }
+
+    fn property_is_recovered_super_call_type(
+        &self,
+        property: &ts_ast::PropertyDeclarationData,
+    ) -> bool {
+        property.type_.is_some_and(|type_node| {
+            matches!(
+                self.arena.get(type_node).map(|node| &node.data),
+                Some(NodeData::TypeReferenceNode(reference))
+                    if declaration_name_text(self.arena, reference.type_name) == Some("super")
+            )
+        })
     }
 
     fn property_is_static(&self, property: &ts_ast::PropertyDeclarationData) -> bool {
@@ -54208,13 +54344,22 @@ impl Printer<'_> {
         &mut self,
         statement: NodeId,
         capture_result: bool,
+        already_has_capture: bool,
         super_capture: &str,
     ) -> Result<bool, EmitError> {
         let statement_node = self.node(statement)?.clone();
         let NodeData::ExpressionStatement(expression) = &statement_node.data else {
             return Ok(false);
         };
-        let call_node = self.node(expression.expression)?.clone();
+        let mut call_id = expression.expression;
+        let mut parenthesized = false;
+        while let Some(NodeData::ParenthesizedExpression(expression)) =
+            self.arena.get(call_id).map(|node| &node.data)
+        {
+            parenthesized = true;
+            call_id = expression.expression;
+        }
+        let call_node = self.node(call_id)?.clone();
         let NodeData::CallExpression(call) = &call_node.data else {
             return Ok(false);
         };
@@ -54222,18 +54367,33 @@ impl Printer<'_> {
         if callee.kind != SyntaxKind::SuperKeyword {
             return Ok(false);
         }
-        self.writer.write(if capture_result {
-            "var _this = "
+        self.writer.write(if capture_result && already_has_capture {
+            if parenthesized { "(_this = " } else { "_this = " }
+        } else if capture_result {
+            if parenthesized {
+                "var _this = (_this = "
+            } else {
+                "var _this = "
+            }
         } else {
             "return "
         });
         self.writer.write(super_capture);
         self.writer.write(".call(this");
+        let previous_this_alias = self.this_alias.clone();
+        if capture_result {
+            self.this_alias = Some("_this".to_owned());
+        }
         for argument in &call.arguments.nodes {
             self.writer.write(", ");
             self.emit_expression(*argument, 0)?;
         }
-        self.writer.write(") || this;");
+        self.this_alias = previous_this_alias;
+        self.writer.write(") || this");
+        if parenthesized && capture_result {
+            self.writer.write(")");
+        }
+        self.writer.write(";");
         self.writer.newline();
         Ok(true)
     }
@@ -54243,11 +54403,32 @@ impl Printer<'_> {
         let NodeData::ExpressionStatement(expression) = &statement_node.data else {
             return Ok(false);
         };
-        let call_node = self.node(expression.expression)?;
+        let mut call_id = expression.expression;
+        while let Some(NodeData::ParenthesizedExpression(expression)) =
+            self.arena.get(call_id).map(|node| &node.data)
+        {
+            call_id = expression.expression;
+        }
+        let call_node = self.node(call_id)?;
         let NodeData::CallExpression(call) = &call_node.data else {
             return Ok(false);
         };
         Ok(self.node(call.expression)?.kind == SyntaxKind::SuperKeyword)
+    }
+
+    fn expression_is_direct_super_call(&self, mut expression: NodeId) -> bool {
+        while let Some(NodeData::ParenthesizedExpression(parenthesized)) =
+            self.arena.get(expression).map(|node| &node.data)
+        {
+            expression = parenthesized.expression;
+        }
+        matches!(
+            self.arena.get(expression).map(|node| &node.data),
+            Some(NodeData::CallExpression(call))
+                if self.arena.get(call.expression).is_some_and(|callee| {
+                    callee.kind == SyntaxKind::SuperKeyword
+                })
+        )
     }
 
     fn constructor_body_has_super_call(&self, body: NodeId) -> bool {
@@ -57830,6 +58011,46 @@ impl Printer<'_> {
         false
     }
 
+    fn this_uses_lexical_alias(&self, this_id: NodeId) -> bool {
+        let Some(scope) = self.this_alias_scope else {
+            return true;
+        };
+        let mut current = this_id;
+        let mut in_class_heritage = false;
+        let mut in_computed_property_name = false;
+        while let Some(parent) = self.arena.get(current).and_then(|node| node.parent) {
+            if parent == scope {
+                return true;
+            }
+            match self.arena.get(parent).map(|node| &node.data) {
+                Some(NodeData::ArrowFunction(_)) => {}
+                Some(NodeData::ComputedPropertyName(_)) => in_computed_property_name = true,
+                Some(NodeData::HeritageClause(_)) => in_class_heritage = true,
+                Some(NodeData::ClassDeclaration(_) | NodeData::ClassExpression(_))
+                    if in_class_heritage || in_computed_property_name => {}
+                Some(
+                    NodeData::MethodDeclaration(_)
+                    | NodeData::GetAccessorDeclaration(_)
+                    | NodeData::SetAccessorDeclaration(_),
+                ) if in_computed_property_name => {}
+                Some(
+                    NodeData::FunctionDeclaration(_)
+                    | NodeData::FunctionExpression(_)
+                    | NodeData::MethodDeclaration(_)
+                    | NodeData::ConstructorDeclaration(_)
+                    | NodeData::GetAccessorDeclaration(_)
+                    | NodeData::SetAccessorDeclaration(_)
+                    | NodeData::ClassStaticBlockDeclaration(_)
+                    | NodeData::ClassDeclaration(_)
+                    | NodeData::ClassExpression(_),
+                ) => return false,
+                _ => {}
+            }
+            current = parent;
+        }
+        false
+    }
+
     fn break_is_recovered_static_block_await_label(&self, statement: NodeId) -> bool {
         if !matches!(
             self.arena.get(statement).map(|node| &node.data),
@@ -58075,6 +58296,7 @@ impl Printer<'_> {
                     self.writer.write(alias);
                 } else if node.kind == SyntaxKind::ThisKeyword
                     && let Some(alias) = self.this_alias.as_deref()
+                    && self.this_uses_lexical_alias(id)
                 {
                     self.writer.write(alias);
                 } else {
@@ -59094,8 +59316,12 @@ impl Printer<'_> {
                     self.source_has_known_line_break_between(data.condition, data.question_token);
                 let line_break_after_question =
                     self.source_has_known_line_break_between(data.question_token, data.when_true);
-                let line_break_before_colon =
-                    self.source_has_known_line_break_between(data.when_true, data.colon_token);
+                let line_break_before_colon = self
+                    .source_has_known_line_break_between(data.when_true, data.colon_token)
+                    && !(self.settings.target < ScriptTarget::Es2015
+                        && self.downlevel_constructor_super_capture.is_some()
+                        && self.expression_is_direct_super_call(data.when_true)
+                        && self.expression_is_direct_super_call(data.when_false));
                 let line_break_after_colon =
                     self.source_has_known_line_break_between(data.colon_token, data.when_false);
                 let missing_when_true = self.arena.get(data.when_true).is_some_and(|node| {
@@ -59673,8 +59899,10 @@ impl Printer<'_> {
                     });
                     self.writer.write(" ");
                     let previous_this_alias = self.this_alias.clone();
+                    let previous_this_alias_scope = self.this_alias_scope;
                     if let Some(alias) = self.capture_arrow_this.clone() {
                         self.this_alias = Some(alias);
+                        self.this_alias_scope = Some(id);
                     }
                     let body_is_block = matches!(&self.node(data.body)?.data, NodeData::Block(_));
                     let body_result = if body_is_block
@@ -59726,6 +59954,7 @@ impl Printer<'_> {
                         result
                     };
                     self.this_alias = previous_this_alias;
+                    self.this_alias_scope = previous_this_alias_scope;
                     body_result?;
                     if wrap {
                         self.writer.write(")");
@@ -62909,13 +63138,64 @@ impl Printer<'_> {
         temp: &str,
     ) -> Result<(), EmitError> {
         let multiline = self.node_source_is_multiline(object);
+        let ordinary_prefix_len = data
+            .properties
+            .nodes
+            .iter()
+            .take_while(|property| {
+                let name = match self.arena.get(**property).map(|node| &node.data) {
+                    Some(NodeData::PropertyAssignment(property)) => property.name,
+                    Some(NodeData::ShorthandPropertyAssignment(property)) => property.name,
+                    Some(NodeData::MethodDeclaration(method)) => method.name,
+                    Some(NodeData::GetAccessorDeclaration(accessor)) => accessor.name,
+                    Some(NodeData::SetAccessorDeclaration(accessor)) => accessor.name,
+                    _ => return false,
+                };
+                !matches!(
+                    self.arena.get(name).map(|node| &node.data),
+                    Some(NodeData::ComputedPropertyName(_))
+                )
+            })
+            .count();
         self.writer.write("(");
         self.writer.write(temp);
-        self.writer.write(" = {},");
+        self.writer.write(" = {");
         if multiline {
             self.writer.indent += 1;
         }
-        for property_id in &data.properties.nodes {
+        if ordinary_prefix_len == 0 {
+            self.writer.write("},");
+        } else {
+            if multiline {
+                self.writer.indent += 1;
+                self.writer.newline();
+            } else {
+                self.writer.write(" ");
+            }
+            for (index, property_id) in data.properties.nodes[..ordinary_prefix_len]
+                .iter()
+                .enumerate()
+            {
+                if index != 0 {
+                    self.writer.write(",");
+                    if multiline {
+                        self.writer.newline();
+                    } else {
+                        self.writer.write(" ");
+                    }
+                }
+                let property_node = self.node(*property_id)?.clone();
+                self.emit_object_property(*property_id, &property_node)?;
+            }
+            if multiline {
+                self.writer.indent -= 1;
+                self.writer.newline();
+            } else {
+                self.writer.write(" ");
+            }
+            self.writer.write("},");
+        }
+        for property_id in &data.properties.nodes[ordinary_prefix_len..] {
             let property_node = self.node(*property_id)?.clone();
             if multiline {
                 self.writer.newline();
@@ -70813,11 +71093,36 @@ mod tests {
         )
         .code;
         assert!(
-            output.contains("var _this = _super.call(this) || this;"),
+            output.contains("var _this = this;"),
             "{output}"
         );
+        assert!(output.contains("_this = _super.call(this) || this;"), "{output}");
         assert!(output.contains("after(_this);"), "{output}");
         assert!(output.contains("return _this;"), "{output}");
+    }
+
+    #[test]
+    fn hoists_computed_object_temp_before_pre_super_this_capture() {
+        let output = emit_with(
+            concat!(
+                "class Base {} ",
+                "class Derived extends Base { propName = 'prop'; constructor() { ",
+                "const obj = { _prop: 'prop', get [this.propName]() { return true; } }; ",
+                "super(); } }",
+            ),
+            ScriptTarget::Es5,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(
+            output.contains("var _a;\n        var _this = this;"),
+            "{output}"
+        );
+        assert!(output.contains("var obj = (_a = {"), "{output}");
+        assert!(
+            output.contains("Object.defineProperty(_a, _this.propName, {"),
+            "{output}"
+        );
     }
 
     #[test]

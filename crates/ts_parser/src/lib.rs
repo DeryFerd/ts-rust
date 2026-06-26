@@ -2492,6 +2492,35 @@ impl<'a> Parser<'a> {
             )
         } else {
             let type_node = self.parse_optional_type_annotation();
+            if type_node.is_some_and(|type_node| {
+                matches!(
+                    self.arena.get(type_node).map(|node| &node.data),
+                    Some(NodeData::TypeReferenceNode(reference))
+                        if matches!(
+                            self.arena.get(reference.type_name).map(|node| &node.data),
+                            Some(NodeData::Identifier(identifier)) if identifier.text == "super"
+                        )
+                )
+            }) && self.current.kind == SyntaxKind::OpenParenToken
+            {
+                let mut depth = 0_u32;
+                loop {
+                    match self.current.kind {
+                        SyntaxKind::OpenParenToken => depth += 1,
+                        SyntaxKind::CloseParenToken => {
+                            depth = depth.saturating_sub(1);
+                            self.bump();
+                            if depth == 0 {
+                                break;
+                            }
+                            continue;
+                        }
+                        SyntaxKind::EndOfFile => break,
+                        _ => {}
+                    }
+                    self.bump();
+                }
+            }
             let initializer = if !signature_only && self.current.kind == SyntaxKind::EqualsToken {
                 self.bump();
                 Some(self.parse_binary_expression(2))
