@@ -729,7 +729,9 @@ pub fn emit_source_file_with_context(
             helpers.insert("__classPrivateFieldIn");
             helpers.insert("__classPrivateFieldSet");
         } else if !printer.private_method_plans.is_empty() {
-            helpers.insert("__classPrivateFieldGet");
+            if source_needs_private_field_get_helper(arena) {
+                helpers.insert("__classPrivateFieldGet");
+            }
             if printer.private_accessors_need_set_helper() {
                 helpers.insert("__classPrivateFieldSet");
             }
@@ -1220,6 +1222,7 @@ pub fn emit_source_file_with_context(
         }
     } else if !printer.private_method_plans.is_empty()
         && !emitted_private_get_helper
+        && source_needs_private_field_get_helper(arena)
         && !settings.no_emit_helpers
         && !printer.imported_helpers.contains("__classPrivateFieldGet")
     {
@@ -27745,6 +27748,14 @@ impl Printer<'_> {
             })
     }
 
+    fn private_name_is_reserved_constructor(&self, name: NodeId) -> bool {
+        matches!(
+            self.arena.get(name).map(|node| &node.data),
+            Some(NodeData::PrivateIdentifier(identifier))
+                if identifier.text.trim_start_matches('#') == "constructor"
+        )
+    }
+
     fn active_private_setter(&self, name: NodeId) -> Option<&PrivateMethodInfo> {
         let NodeData::PrivateIdentifier(name) = &self.arena.get(name)?.data else {
             return None;
@@ -51802,7 +51813,7 @@ impl Printer<'_> {
                                 && matches!(
                                     self.arena.get(method.name).map(|name| &name.data),
                                     Some(NodeData::PrivateIdentifier(_))
-                                ))
+                                ) && !self.private_name_is_reserved_constructor(method.name))
                     }
                     NodeData::PropertyDeclaration(property) => {
                         !self.has_modifier(
@@ -51871,6 +51882,7 @@ impl Printer<'_> {
                             self.arena.get(method.name).map(|name| &name.data),
                             Some(NodeData::PrivateIdentifier(_))
                         )
+                        && !self.private_name_is_reserved_constructor(method.name)
                     {
                         continue;
                     }
@@ -53100,6 +53112,9 @@ impl Printer<'_> {
                 self.writer.write(" = new WeakSet(),");
             }
             for private_method in &plan.methods {
+                if private_method.private_name == "constructor" {
+                    continue;
+                }
                 let node = self.node(private_method.method)?.clone();
                 let (parameters, body, is_async, generator) = match &node.data {
                     NodeData::MethodDeclaration(method) => (
@@ -53839,6 +53854,9 @@ impl Printer<'_> {
             else {
                 continue;
             };
+            if private_method.private_name == "constructor" {
+                continue;
+            }
             let node = self.node(*member)?.clone();
             let (parameters, body, is_async, generator) = match &node.data {
                 NodeData::MethodDeclaration(method) => (
@@ -70598,6 +70616,21 @@ mod tests {
             ),
             "{output}"
         );
+    }
+
+    #[test]
+    fn preserves_reserved_private_constructor_recovery_without_get_helper() {
+        let output = emit_with(
+            "class A { #constructor() {} }",
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(output.contains("var _A_instances, _A_constructor;"), "{output}");
+        assert!(output.contains("    #constructor() { }"), "{output}");
+        assert!(output.ends_with("_A_instances = new WeakSet();\n"), "{output}");
+        assert!(!output.contains("__classPrivateFieldGet"), "{output}");
+        assert!(!output.contains("_A_constructor = function"), "{output}");
     }
 
     #[test]
