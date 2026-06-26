@@ -6551,6 +6551,12 @@ impl<'a> Parser<'a> {
                 None
             };
             let name = self.parse_property_name("Expected a property name.");
+            let recovered_object_index_signature = self.current.kind == SyntaxKind::ColonToken
+                && matches!(
+                    self.arena.get(name).map(|node| &node.data),
+                    Some(NodeData::ComputedPropertyName(computed))
+                        if self.node_end(name) == self.node_end(computed.expression)
+                );
             let postfix_token = if self.current.kind == SyntaxKind::QuestionToken {
                 Some(self.consume_token_node())
             } else {
@@ -6685,6 +6691,33 @@ impl<'a> Parser<'a> {
                     )),
                     &children,
                 ));
+            }
+            if recovered_object_index_signature
+                && self.current.kind == SyntaxKind::CloseBracketToken
+            {
+                self.bump();
+                if self.current.kind == SyntaxKind::ColonToken {
+                    self.bump();
+                    let recovered_start = self.current.range.start;
+                    let recovered_name = self.parse_property_name("Expected a property name.");
+                    properties.push(self.alloc_node(
+                        SyntaxKind::ShorthandPropertyAssignment,
+                        TextRange::new(recovered_start, self.node_end(recovered_name)),
+                        NodeData::ShorthandPropertyAssignment(Box::new(
+                            ShorthandPropertyAssignmentData {
+                                equals_token: None,
+                                object_assignment_initializer: None,
+                                postfix_token: None,
+                                symbol: None,
+                                type_: recovered_name,
+                                facts: 0,
+                                modifiers: None,
+                                name: recovered_name,
+                            },
+                        )),
+                        &[recovered_name],
+                    ));
+                }
             }
             if !matches!(
                 self.current.kind,
@@ -14689,6 +14722,37 @@ mod tests {
                 .iter()
                 .any(|diagnostic| diagnostic.code == Some(17012))
         );
+    }
+
+    #[test]
+    fn recovers_object_literal_index_signature_as_two_properties() {
+        let result = parse_source_file("const value = { private [x: string]: string; };");
+        let object = find_descendant_kind(
+            &result,
+            result.source_file,
+            SyntaxKind::ObjectLiteralExpression,
+        )
+        .expect("object literal");
+        let NodeData::ObjectLiteralExpression(object) = &result.arena.get(object).unwrap().data
+        else {
+            panic!("expected object literal");
+        };
+        assert_eq!(object.properties.nodes.len(), 2);
+        assert!(matches!(
+            result.arena.get(object.properties.nodes[0]).map(|node| &node.data),
+            Some(NodeData::PropertyAssignment(_))
+        ));
+        let Some(NodeData::ShorthandPropertyAssignment(property)) = result
+            .arena
+            .get(object.properties.nodes[1])
+            .map(|node| &node.data)
+        else {
+            panic!("expected recovered shorthand property");
+        };
+        assert!(matches!(
+            result.arena.get(property.name).map(|node| &node.data),
+            Some(NodeData::Identifier(identifier)) if identifier.text == "string"
+        ));
     }
 
     #[test]
