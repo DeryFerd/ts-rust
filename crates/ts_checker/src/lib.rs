@@ -1850,6 +1850,9 @@ impl<'a> ProgramChecker<'a> {
         if !visited_modules.insert(target) {
             return false;
         }
+        if self.module_export_is_const_enum_import_namespace_merge(target, name) {
+            return true;
+        }
         let exports = self.resolved_module_export_symbols(target, "");
         if self.module_export_has_runtime_value(target, &exports, name, &mut HashSet::new()) {
             return true;
@@ -1862,6 +1865,118 @@ impl<'a> ProgramChecker<'a> {
                     &mut visited_modules.clone(),
                 )
             })
+    }
+
+    fn module_export_is_const_enum_import_namespace_merge(
+        &self,
+        target: usize,
+        name: &str,
+    ) -> bool {
+        let Some(source) = self.sources.get(target) else {
+            return false;
+        };
+        let Some(NodeData::SourceFile(file)) =
+            source.arena.get(source.source_file).map(|node| &node.data)
+        else {
+            return false;
+        };
+        let has_namespace = file.statements.nodes.iter().any(|statement| {
+            matches!(
+                source.arena.get(*statement).map(|node| &node.data),
+                Some(NodeData::ModuleDeclaration(module))
+                    if module_export_name_text(source.arena, module.name) == Some(name)
+            )
+        });
+        let has_local_export = file.statements.nodes.iter().any(|statement| {
+            let Some(NodeData::ExportDeclaration(export)) =
+                source.arena.get(*statement).map(|node| &node.data)
+            else {
+                return false;
+            };
+            if export.is_type_only || export.module_specifier.is_some() {
+                return false;
+            }
+            let Some(NodeData::NamedExports(exports)) = export
+                .export_clause
+                .and_then(|clause| source.arena.get(clause))
+                .map(|node| &node.data)
+            else {
+                return false;
+            };
+            exports.elements.nodes.iter().any(|specifier| {
+                matches!(
+                    source.arena.get(*specifier).map(|node| &node.data),
+                    Some(NodeData::ExportSpecifier(specifier))
+                        if !specifier.is_type_only
+                            && module_export_name_text(source.arena, specifier.name) == Some(name)
+                            && module_export_name_text(
+                                source.arena,
+                                specifier.property_name.unwrap_or(specifier.name),
+                            ) == Some(name)
+                )
+            })
+        });
+        if !has_namespace || !has_local_export {
+            return false;
+        }
+        file.statements.nodes.iter().any(|statement| {
+            let Some(NodeData::ImportDeclaration(import)) =
+                source.arena.get(*statement).map(|node| &node.data)
+            else {
+                return false;
+            };
+            let Some(module) = string_literal_text(source.arena, import.module_specifier) else {
+                return false;
+            };
+            let Some(import_target) = source.resolved_modules.get(module).copied() else {
+                return false;
+            };
+            let Some(NodeData::ImportClause(clause)) = import
+                .import_clause
+                .and_then(|clause| source.arena.get(clause))
+                .map(|node| &node.data)
+            else {
+                return false;
+            };
+            let Some(NodeData::NamedImports(imports)) = clause
+                .named_bindings
+                .and_then(|bindings| source.arena.get(bindings))
+                .map(|node| &node.data)
+            else {
+                return false;
+            };
+            imports.elements.nodes.iter().any(|specifier| {
+                let Some(NodeData::ImportSpecifier(specifier)) =
+                    source.arena.get(*specifier).map(|node| &node.data)
+                else {
+                    return false;
+                };
+                if specifier.is_type_only
+                    || module_export_name_text(source.arena, specifier.name) != Some(name)
+                {
+                    return false;
+                }
+                let imported = specifier.property_name.unwrap_or(specifier.name);
+                let Some(imported) = module_export_name_text(source.arena, imported) else {
+                    return false;
+                };
+                self.resolved_module_export_symbols(import_target, module)
+                    .get(imported)
+                    .and_then(|symbol| {
+                        let imported_source = self.sources.get(import_target)?;
+                        let symbol = imported_source.bindings.symbols.get(*symbol)?;
+                        Some(
+                            symbol.flags.contains(ts_binder::SymbolFlags::CONST_ENUM)
+                                || symbol.target.and_then(|target| {
+                                    imported_source.bindings.symbols.get(target)
+                                }).is_some_and(|target| {
+                                    target.flags.contains(ts_binder::SymbolFlags::CONST_ENUM)
+                                }),
+                        )
+                    })
+                    .unwrap_or(false)
+            })
+        })
     }
 
     fn module_export_name_is_explicitly_type_only(&self, target: usize, name: &str) -> bool {
@@ -2755,12 +2870,24 @@ impl<'a> ProgramChecker<'a> {
             else {
                 continue;
             };
+            let mut preinitializes_erased_merge = false;
             for specifier in &exports.elements.nodes {
                 if let Some(meaning) =
                     self.export_specifier_runtime_meaning(source_index, source, export, *specifier)
                 {
                     meanings.insert(*specifier, meaning);
                 }
+                if export.module_specifier.is_none()
+                    && let Some(NodeData::ExportSpecifier(specifier)) =
+                        source.arena.get(*specifier).map(|node| &node.data)
+                    && let Some(name) = module_export_name_text(source.arena, specifier.name)
+                    && self.module_export_is_const_enum_import_namespace_merge(source_index, name)
+                {
+                    preinitializes_erased_merge = true;
+                }
+            }
+            if preinitializes_erased_merge {
+                meanings.insert(*statement, true);
             }
         }
         meanings
@@ -27060,6 +27187,81 @@ mod tests {
                 .import_runtime_meanings
                 .get(&source.statements.nodes[0]),
             Some(&false)
+        );
+    }
+
+    #[test]
+    fn const_enum_import_namespace_merge_exposes_runtime_placeholder() {
+        let enumeration = parse_source_file("export const enum Enum { One = 1 }");
+        let merge = parse_source_file(concat!(
+            "import { Enum } from './enum';\n",
+            "namespace Enum { export type Foo = number; }\n",
+            "export { Enum };",
+        ));
+        let consumer = parse_source_file("import { Enum } from './merge'; Enum.One;");
+        let enumeration_bindings =
+            bind_source_file(&enumeration.arena, enumeration.source_file);
+        let merge_bindings = bind_source_file(&merge.arena, merge.source_file);
+        let consumer_bindings = bind_source_file(&consumer.arena, consumer.source_file);
+        let no_modules = BTreeMap::new();
+        let merge_modules = BTreeMap::from([("./enum".into(), 0)]);
+        let consumer_modules = BTreeMap::from([("./merge".into(), 1)]);
+        let checked = check_program(&[
+            ProgramSource {
+                arena: &enumeration.arena,
+                source_file: enumeration.source_file,
+                bindings: &enumeration_bindings,
+                resolved_modules: &no_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+            ProgramSource {
+                arena: &merge.arena,
+                source_file: merge.source_file,
+                bindings: &merge_bindings,
+                resolved_modules: &merge_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+            ProgramSource {
+                arena: &consumer.arena,
+                source_file: consumer.source_file,
+                bindings: &consumer_bindings,
+                resolved_modules: &consumer_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+        ]);
+        let NodeData::SourceFile(merge_file) =
+            &merge.arena.get(merge.source_file).unwrap().data
+        else {
+            panic!("expected merge source file");
+        };
+        let NodeData::SourceFile(consumer_file) =
+            &consumer.arena.get(consumer.source_file).unwrap().data
+        else {
+            panic!("expected consumer source file");
+        };
+        assert_eq!(
+            checked.files[1]
+                .import_runtime_meanings
+                .get(&merge_file.statements.nodes[0]),
+            Some(&false)
+        );
+        assert_eq!(
+            checked.files[1]
+                .import_runtime_meanings
+                .get(&merge_file.statements.nodes[2]),
+            Some(&true)
+        );
+        assert_eq!(
+            checked.files[2]
+                .import_runtime_meanings
+                .get(&consumer_file.statements.nodes[0]),
+            Some(&true)
         );
     }
 

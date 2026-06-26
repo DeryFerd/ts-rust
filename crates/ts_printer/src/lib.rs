@@ -15045,7 +15045,9 @@ impl DeclarationPrinter<'_> {
                             Some(NodeData::Block(_))
                         )
                     });
-                let preserve_source = !optional
+                let preserve_source = parameter.question_token.is_some()
+                    || self.declaration_signature_has_no_body(declaration)
+                    || !optional
                     || self.source_type_semantically_includes_undefined(type_);
                 let result = if !preserve_source {
                     self.emit_type(type_)?;
@@ -15117,6 +15119,17 @@ impl DeclarationPrinter<'_> {
         }
         self.writer.write(")");
         Ok(())
+    }
+
+    fn declaration_signature_has_no_body(&self, declaration: NodeId) -> bool {
+        match self.arena.get(declaration).map(|node| &node.data) {
+            Some(NodeData::FunctionDeclaration(function)) => function.body.is_none(),
+            Some(NodeData::MethodDeclaration(method)) => method.body.is_none(),
+            Some(NodeData::ConstructorDeclaration(constructor)) => constructor.body.is_none(),
+            Some(NodeData::GetAccessorDeclaration(accessor)) => accessor.body.is_none(),
+            Some(NodeData::SetAccessorDeclaration(accessor)) => accessor.body.is_none(),
+            _ => false,
+        }
     }
 
     fn parameter_property_semantic_type(
@@ -32905,6 +32918,8 @@ impl Printer<'_> {
                     }
                 }
                 NodeData::ExportDeclaration(export) => {
+                    let preinitialize_erased_merge = export.module_specifier.is_none()
+                        && self.import_runtime_meanings.get(statement) == Some(&true);
                     let Some(clause) = export
                         .export_clause
                         .and_then(|clause| self.arena.get(clause))
@@ -32928,7 +32943,8 @@ impl Printer<'_> {
                         else {
                             continue;
                         };
-                        if !self.export_specifier_emits_runtime(export, *element)
+                        if (!self.export_specifier_emits_runtime(export, *element)
+                            && !preinitialize_erased_merge)
                             || self
                                 .commonjs_export_function_declaration(*element)
                                 .is_some()
@@ -35717,6 +35733,16 @@ impl Printer<'_> {
         default_space: bool,
     ) {
         if !self.settings.remove_comments && self.trivia_has_block_comment(start, end) {
+            let trivia = usize::try_from(start)
+                .ok()
+                .zip(usize::try_from(end).ok())
+                .and_then(|(start, end)| self.source_text.get(start..end));
+            let jsdoc_cast_starts_gap = trivia.is_some_and(|trivia| {
+                trivia.starts_with("/**") && trivia.contains("@type")
+            });
+            if jsdoc_cast_starts_gap && !self.writer.line_start {
+                self.writer.write(" ");
+            }
             self.emit_block_comment_trivia(start, end, terminal_space);
         } else if default_space {
             self.writer.write(" ");
@@ -73479,6 +73505,29 @@ mod tests {
     }
 
     #[test]
+    fn declaration_ambient_optional_parameters_preserve_source_type() {
+        let declarations = emit_declarations_with_semantics(concat!(
+            "namespace Debug { ",
+            "export declare function assert(value: unknown, message?: string): asserts value; ",
+            "}",
+        ));
+        assert!(
+            declarations.contains(
+                "function assert(value: unknown, message?: string): asserts value;"
+            ),
+            "{declarations}"
+        );
+        let implementation = emit_declarations_with_semantics(
+            "function f(value?: { kind: 'a' } | { kind: 'b' }) {}",
+        );
+        assert!(
+            implementation.contains("}): void;")
+                && !implementation.contains("} | undefined): void;"),
+            "{implementation}"
+        );
+    }
+
+    #[test]
     fn declaration_emit_uses_semantic_parameter_property_types() {
         let output = emit_declarations_with_semantics(concat!(
             "export class Optional { constructor(public value?: string) {} }\n",
@@ -74106,15 +74155,29 @@ mod tests {
         statement_index: usize,
         verbatim_module_syntax: bool,
     ) -> super::EmitResult {
+        emit_commonjs_with_runtime_meanings(
+            source,
+            &[(statement_index, false)],
+            verbatim_module_syntax,
+        )
+    }
+
+    fn emit_commonjs_with_runtime_meanings(
+        source: &str,
+        statement_meanings: &[(usize, bool)],
+        verbatim_module_syntax: bool,
+    ) -> super::EmitResult {
         let parsed = parse_source_file(source);
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         let NodeData::SourceFile(file) = &parsed.arena.get(parsed.source_file).unwrap().data else {
             panic!("expected source file");
         };
-        let statement = file.statements.nodes[statement_index];
         let bindings = bind_source_file(&parsed.arena, parsed.source_file);
         let enum_values = BTreeMap::new();
-        let import_meanings = BTreeMap::from([(statement, false)]);
+        let import_meanings = statement_meanings
+            .iter()
+            .map(|(index, meaning)| (file.statements.nodes[*index], *meaning))
+            .collect::<BTreeMap<_, _>>();
         emit_source_file_with_context(
             &parsed.arena,
             parsed.source_file,
@@ -76025,6 +76088,20 @@ mod tests {
                 "Test.member = function (x) { return __awaiter(void 0, void 0, void 0, function () { return __generator(_a, function (_b) {"
             ),
             "{output}"
+        );
+    }
+
+    #[test]
+    fn preserves_space_after_jsdoc_cast_in_condition() {
+        let output = emit_javascript_with(
+            "if (/** @type { B } */ (a).y !== 0) throw TypeError();",
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert_eq!(
+            output,
+            "if ( /** @type { B } */(a).y !== 0)\n    throw TypeError();\n"
         );
     }
 
@@ -81455,6 +81532,28 @@ class Board {
             !forward_type_only.code.contains("void 0;"),
             "{}",
             forward_type_only.code
+        );
+    }
+
+    #[test]
+    fn preinitializes_erased_import_merged_with_type_only_namespace() {
+        let output = emit_commonjs_with_runtime_meanings(
+            concat!(
+                "import { Enum } from './enum';\n",
+                "namespace Enum { export type Foo = number; }\n",
+                "export { Enum };",
+            ),
+            &[(0, false), (2, true)],
+            false,
+        )
+        .code;
+        assert_eq!(
+            output,
+            concat!(
+                "\"use strict\";\n",
+                "Object.defineProperty(exports, \"__esModule\", { value: true });\n",
+                "exports.Enum = void 0;\n",
+            )
         );
     }
 
