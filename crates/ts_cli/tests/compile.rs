@@ -54,6 +54,56 @@ fn assert_matches_oracle(directory: &Path, arguments: &[&str]) {
     assert_eq!(actual.stderr, expected.stderr);
 }
 
+fn oracle_path() -> Option<PathBuf> {
+    std::env::var_os("TS_GO_ORACLE")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .or_else(|| {
+            Path::new(FALLBACK_ORACLE)
+                .is_file()
+                .then(|| FALLBACK_ORACLE.into())
+        })
+}
+
+fn write_minimal_emit_corpus(directory: &Path) {
+    fs::create_dir_all(directory.join("src")).unwrap();
+    fs::write(
+        directory.join("src/dep.ts"),
+        concat!(
+            "export interface User { name: string }\n",
+            "export const makeUser = (user: User): User => user;\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        directory.join("src/main.ts"),
+        concat!(
+            "import { type User, makeUser } from './dep.js';\n",
+            "export interface Result<T> { value: T }\n",
+            "export const result = makeUser({ name: 'Ada' } satisfies User);\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        directory.join("src/view.tsx"),
+        concat!(
+            "type Props = { label: string };\n",
+            "export const View = ({ label }: Props) => <section>{label}</section>;\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        directory.join("src/legacy.js"),
+        "export const doubled = [1, 2].map((value) => value * 2);\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.join("src/widget.jsx"),
+        "export const Widget = () => <div data-ok />;\n",
+    )
+    .unwrap();
+}
+
 #[test]
 fn direct_file_no_emit_matches_oracle() {
     let directory = TestDirectory::new("direct");
@@ -363,6 +413,121 @@ fn no_check_skips_semantic_diagnostics_and_emits() {
         ],
     );
     assert!(directory.0.join("main.js").is_file());
+}
+
+#[test]
+fn minimal_no_check_emit_matches_oracle_bytes_for_all_four_source_kinds() {
+    let Some(oracle) = oracle_path() else {
+        return;
+    };
+    let actual_directory = TestDirectory::new("minimal-emit-actual");
+    let oracle_directory = TestDirectory::new("minimal-emit-oracle");
+    write_minimal_emit_corpus(&actual_directory.0);
+    write_minimal_emit_corpus(&oracle_directory.0);
+    let arguments = [
+        "src/dep.ts",
+        "src/main.ts",
+        "src/view.tsx",
+        "src/legacy.js",
+        "src/widget.jsx",
+        "--ignoreConfig",
+        "--noCheck",
+        "--target",
+        "esnext",
+        "--module",
+        "esnext",
+        "--jsx",
+        "preserve",
+        "--allowJs",
+        "--outDir",
+        "out",
+        "--pretty",
+        "false",
+    ];
+    let actual = run(env!("CARGO_BIN_EXE_tsgo"), &actual_directory.0, &arguments);
+    let expected = run(&oracle.to_string_lossy(), &oracle_directory.0, &arguments);
+    assert_eq!(actual.status.code(), expected.status.code());
+    assert_eq!(actual.stdout, expected.stdout);
+    assert_eq!(actual.stderr, expected.stderr);
+    for relative in [
+        "out/dep.js",
+        "out/main.js",
+        "out/view.jsx",
+        "out/legacy.js",
+        "out/widget.jsx",
+    ] {
+        assert_eq!(
+            fs::read(actual_directory.0.join(relative)).unwrap(),
+            fs::read(oracle_directory.0.join(relative)).unwrap(),
+            "emit mismatch for {relative}",
+        );
+    }
+}
+
+#[test]
+fn minimal_syntax_diagnostics_match_oracle_for_all_four_source_kinds() {
+    let directory = TestDirectory::new("minimal-syntax");
+    fs::write(directory.0.join("bad.ts"), "const value: number = ;\n").unwrap();
+    fs::write(
+        directory.0.join("bad.tsx"),
+        "const view = <section></article>;\n",
+    )
+    .unwrap();
+    fs::write(directory.0.join("bad.js"), "const value = ;\n").unwrap();
+    fs::write(
+        directory.0.join("bad.jsx"),
+        "const view = <section></article>;\n",
+    )
+    .unwrap();
+    assert_matches_oracle(
+        &directory.0,
+        &[
+            "bad.ts",
+            "bad.tsx",
+            "bad.js",
+            "bad.jsx",
+            "--ignoreConfig",
+            "--noCheck",
+            "--noEmit",
+            "--allowJs",
+            "--jsx",
+            "preserve",
+            "--pretty",
+            "false",
+        ],
+    );
+}
+
+#[test]
+fn minimal_no_check_emit_runs_in_node() {
+    let directory = TestDirectory::new("minimal-runtime");
+    fs::write(
+        directory.0.join("runtime.ts"),
+        concat!(
+            "const values: number[] = [1, 2, 3];\n",
+            "console.log(values.map((value) => value * 2).join(','));\n",
+        ),
+    )
+    .unwrap();
+    let output = run(
+        env!("CARGO_BIN_EXE_tsgo"),
+        &directory.0,
+        &[
+            "runtime.ts",
+            "--ignoreConfig",
+            "--noCheck",
+            "--target",
+            "esnext",
+            "--module",
+            "esnext",
+            "--pretty",
+            "false",
+        ],
+    );
+    assert!(output.status.success(), "{output:?}");
+    let runtime = run("node", &directory.0, &["runtime.js"]);
+    assert!(runtime.status.success(), "{runtime:?}");
+    assert_eq!(runtime.stdout, b"2,4,6\n");
 }
 
 #[test]

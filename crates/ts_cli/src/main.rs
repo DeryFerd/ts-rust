@@ -555,8 +555,19 @@ fn print_diagnostics(
     current_directory: &str,
     pretty: bool,
 ) {
-    let diagnostics: Vec<_> = program_diagnostics
-        .iter()
+    let mut ordered = program_diagnostics.iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| {
+        left.file_name
+            .cmp(&right.file_name)
+            .then_with(|| {
+                left.range
+                    .map(|range| range.start)
+                    .cmp(&right.range.map(|range| range.start))
+            })
+            .then_with(|| left.code.cmp(&right.code))
+    });
+    let diagnostics: Vec<_> = ordered
+        .into_iter()
         .map(|diagnostic| {
             let source_text = diagnostic
                 .file_name

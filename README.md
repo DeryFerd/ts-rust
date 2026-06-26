@@ -4,6 +4,11 @@ This repository is a Rust port of
 [`microsoft/typescript-go`](https://github.com/microsoft/typescript-go). It is
 under active development and is not yet a replacement for `tsgo` or `tsc`.
 
+The current sellable experiment is the deliberately narrow
+[minimal working v0](docs/minimal-working-v0.md): `--noCheck`, ESNext,
+preserved ESM, type erasure, and preserved JSX with explicit parity and
+performance gates.
+
 The implementation is split into compiler layers so each layer can be tested
 against the upstream TypeScript fixtures independently:
 

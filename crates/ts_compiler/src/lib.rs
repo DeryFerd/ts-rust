@@ -539,9 +539,11 @@ impl Program {
         {
             program.options.no_lib = true;
         }
-        program.load_default_libraries();
         let resolution_options = program.options.module_resolution_options();
-        program.load_automatic_type_directives(file_system, &resolution_options);
+        if !program.options.no_check {
+            program.load_default_libraries();
+            program.load_automatic_type_directives(file_system, &resolution_options);
+        }
         program.load_module_graph(file_system, resolution_options);
         program.check_program();
         program
@@ -7422,10 +7424,11 @@ export function create() { return new M.Value(); }"#,
             &["type-error.ts".to_owned()],
             CompilerOptions {
                 no_check: true,
-                no_lib: true,
                 ..CompilerOptions::default()
             },
         );
+        assert_eq!(program.source_files().len(), 1);
+        assert!(!program.source_files()[0].is_default_library);
         assert!(
             !program
                 .diagnostics()

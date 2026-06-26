@@ -7097,6 +7097,17 @@ impl<'a> Parser<'a> {
             self.error_current("Expected a JSX closing tag.");
         }
         let closing_name = self.parse_jsx_tag_name("Expected a JSX closing tag name.");
+        let source_text = self.arena.source_text();
+        let tag_text = |node: NodeId| {
+            let range = self.arena.get(node)?.range;
+            source_text?.get(range.start.get() as usize..range.end.get() as usize)
+        };
+        if tag_text(tag_name) != tag_text(closing_name)
+            && let Some(opening_name) = tag_text(tag_name).map(str::to_owned)
+        {
+            let range = self.arena.get(closing_name).unwrap().range;
+            self.error_code_at(range, 17002, [opening_name]);
+        }
         let end = self.finish_jsx_tag(resume_jsx);
         let closing = self.alloc_node(
             SyntaxKind::JsxClosingElement,
