@@ -31886,6 +31886,10 @@ impl Printer<'_> {
             }
             NodeData::FunctionDeclaration(data) => {
                 let outer_arguments_alias = self.arguments_alias.take();
+                let previous_static_capture = self.class_static_this_capture.take();
+                let suspend_super_context = self.settings.target >= ScriptTarget::Es2015;
+                let previous_super_context =
+                    suspend_super_context.then(|| self.downlevel_super_context.take()).flatten();
                 let commonjs_default_name = self.commonjs_anonymous_default_names.get(&id).cloned();
                 let namespace_default_name = (self.node_is_direct_namespace_member(id)
                     && data.name.is_none()
@@ -32048,6 +32052,10 @@ impl Printer<'_> {
                     self.writer.write(";");
                 }
                 self.generated_names.used = outer_generated_names;
+                self.class_static_this_capture = previous_static_capture;
+                if suspend_super_context {
+                    self.downlevel_super_context = previous_super_context;
+                }
                 self.arguments_alias = outer_arguments_alias;
             }
             NodeData::ClassDeclaration(data) => {
@@ -51042,8 +51050,37 @@ impl Printer<'_> {
         self.emit_class_with_name(data, None)
     }
 
-    #[allow(clippy::too_many_lines)]
     fn emit_class_with_name(
+        &mut self,
+        data: &ts_ast::ClassDeclarationData,
+        emitted_name: Option<&str>,
+    ) -> Result<(), EmitError> {
+        let previous_static_capture = self.class_static_this_capture.clone();
+        let previous_super_context = self.downlevel_super_context.clone();
+        let crosses_static_boundary = previous_static_capture.is_some()
+            || previous_super_context
+                .as_ref()
+                .is_some_and(|(_, is_static)| *is_static);
+        if crosses_static_boundary {
+            self.class_static_this_capture = None;
+            self.downlevel_super_context = if self.settings.target < ScriptTarget::Es2015 {
+                previous_super_context
+                    .as_ref()
+                    .map(|(base, _)| (base.clone(), false))
+            } else {
+                None
+            };
+        }
+        let result = self.emit_class_with_name_worker(data, emitted_name);
+        if crosses_static_boundary {
+            self.class_static_this_capture = previous_static_capture;
+            self.downlevel_super_context = previous_super_context;
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn emit_class_with_name_worker(
         &mut self,
         data: &ts_ast::ClassDeclarationData,
         emitted_name: Option<&str>,
@@ -51154,6 +51191,9 @@ impl Printer<'_> {
         }
         self.writer.newline();
         self.writer.indent += class_body_indent;
+        if !lower_fields {
+            self.emit_native_parameter_property_declarations(data)?;
+        }
         if let Some(capture) = data
             .name
             .and_then(|name| self.arena.get(name)?.parent)
@@ -51281,7 +51321,9 @@ impl Printer<'_> {
                     {
                         continue;
                     }
-                    if lower_fields && self.is_constructor_name(method.name) {
+                    if (lower_fields || self.has_parameter_properties(&method.parameters))
+                        && self.is_constructor_name(method.name)
+                    {
                         self.emit_native_constructor(method, data, has_base)?;
                         continue;
                     }
@@ -51816,6 +51858,36 @@ impl Printer<'_> {
             self.writer.write(")");
             return Ok(());
         }
+        let previous_static_capture = self.class_static_this_capture.clone();
+        let previous_super_context = self.downlevel_super_context.clone();
+        let crosses_static_boundary = previous_static_capture.is_some()
+            || previous_super_context
+                .as_ref()
+                .is_some_and(|(_, is_static)| *is_static);
+        if crosses_static_boundary {
+            self.class_static_this_capture = None;
+            self.downlevel_super_context = if self.settings.target < ScriptTarget::Es2015 {
+                previous_super_context
+                    .as_ref()
+                    .map(|(base, _)| (base.clone(), false))
+            } else {
+                None
+            };
+        }
+        let result = self.emit_class_expression_worker(id, data, parent_precedence);
+        if crosses_static_boundary {
+            self.class_static_this_capture = previous_static_capture;
+            self.downlevel_super_context = previous_super_context;
+        }
+        result
+    }
+
+    fn emit_class_expression_worker(
+        &mut self,
+        id: NodeId,
+        data: &ts_ast::ClassExpressionData,
+        parent_precedence: u8,
+    ) -> Result<(), EmitError> {
         if !self.settings.experimental_decorators
             && let Some(plan) = self.stage3_decorated_class_plan(id, data)
         {
@@ -52737,6 +52809,41 @@ impl Printer<'_> {
         Ok(())
     }
 
+    fn emit_native_parameter_property_declarations(
+        &mut self,
+        data: &ts_ast::ClassDeclarationData,
+    ) -> Result<(), EmitError> {
+        let parameters = data.members.nodes.iter().find_map(|member| {
+            let NodeData::MethodDeclaration(method) = &self.arena.get(*member)?.data else {
+                return None;
+            };
+            (method.body.is_some() && self.is_constructor_name(method.name))
+                .then(|| method.parameters.clone())
+        });
+        let Some(parameters) = parameters else {
+            return Ok(());
+        };
+        for parameter in &parameters.nodes {
+            let Some(NodeData::ParameterDeclaration(parameter)) =
+                self.arena.get(*parameter).map(|node| &node.data)
+            else {
+                continue;
+            };
+            if !self.parameter_is_property(parameter)
+                || matches!(
+                    self.arena.get(parameter.name).map(|node| &node.data),
+                    Some(NodeData::BindingPattern(_))
+                )
+            {
+                continue;
+            }
+            self.emit_expression(parameter.name, 0)?;
+            self.writer.write(";");
+            self.writer.newline();
+        }
+        Ok(())
+    }
+
     fn emit_synthesized_native_constructor(
         &mut self,
         data: &ts_ast::ClassDeclarationData,
@@ -52773,6 +52880,8 @@ impl Printer<'_> {
         let NodeData::Block(body) = &body_node.data else {
             return Err(Self::unsupported(body_id, body_node.kind));
         };
+        let lower_instance_fields = self.settings.target < ScriptTarget::Es2022
+            || self.settings.use_define_for_class_fields == Some(false);
         let downlevel_binding_parameters = if self.settings.target < ScriptTarget::Es2018 {
             self.downlevel_binding_parameters(&method.parameters, body_id)
         } else {
@@ -52847,7 +52956,9 @@ impl Printer<'_> {
             if initialize_before_body {
                 self.emit_private_brand_initializer("this");
                 self.emit_parameter_properties(&method.parameters, "this")?;
-                self.emit_instance_fields(data, "this")?;
+                if lower_instance_fields {
+                    self.emit_instance_fields(data, "this")?;
+                }
                 emitted_fields = true;
             }
             if let Some(first_statement) = body.statements.nodes.first()
@@ -52878,7 +52989,9 @@ impl Printer<'_> {
                 if initialize_before_body {
                     self.emit_private_brand_initializer("this");
                     self.emit_parameter_properties(&method.parameters, "this")?;
-                    self.emit_instance_fields(data, "this")?;
+                    if lower_instance_fields {
+                        self.emit_instance_fields(data, "this")?;
+                    }
                     emitted_fields = true;
                 }
             }
@@ -52914,7 +53027,9 @@ impl Printer<'_> {
                 );
                 self.emit_private_brand_initializer("this");
                 self.emit_parameter_properties(&method.parameters, "this")?;
-                self.emit_instance_fields(data, "this")?;
+                if lower_instance_fields {
+                    self.emit_instance_fields(data, "this")?;
+                }
                 emitted_fields = true;
             }
             previous_end = statement_node.range.end.get();
@@ -52934,7 +53049,9 @@ impl Printer<'_> {
             }
             self.emit_private_brand_initializer("this");
             self.emit_parameter_properties(&method.parameters, "this")?;
-            self.emit_instance_fields(data, "this")?;
+            if lower_instance_fields {
+                self.emit_instance_fields(data, "this")?;
+            }
         }
         self.private_destructuring_rewrites.clear();
         self.writer.indent -= 1;
@@ -53811,7 +53928,7 @@ impl Printer<'_> {
                 };
                 static_context && self.arena.iter().any(|(candidate, node)| {
                     self.node_is_within(candidate, *member)
-                        && matches!(node.kind, SyntaxKind::ThisKeyword | SyntaxKind::SuperKeyword)
+                        && node.kind == SyntaxKind::ThisKeyword
                 })
             }));
         let static_this_capture =
@@ -60885,6 +61002,9 @@ impl Printer<'_> {
             NodeData::FunctionExpression(data) => {
                 let outer_arguments_alias = self.arguments_alias.take();
                 let previous_static_capture = self.class_static_this_capture.take();
+                let suspend_super_context = self.settings.target >= ScriptTarget::Es2015;
+                let previous_super_context =
+                    suspend_super_context.then(|| self.downlevel_super_context.take()).flatten();
                 let wrap = parent_precedence > 18;
                 if wrap {
                     self.writer.write("(");
@@ -60951,6 +61071,9 @@ impl Printer<'_> {
                     self.writer.write(")");
                 }
                 self.class_static_this_capture = previous_static_capture;
+                if suspend_super_context {
+                    self.downlevel_super_context = previous_super_context;
+                }
                 self.arguments_alias = outer_arguments_alias;
             }
             NodeData::ClassExpression(data) => {
@@ -72430,6 +72553,65 @@ mod tests {
         )
         .code;
         assert!(output.contains("static { super.read(); }"), "{output}");
+    }
+
+    #[test]
+    fn native_parameter_property_declarations_precede_static_fields() {
+        let output = emit_with(
+            "class C { static create = () => new this(); constructor(private value: string) {} }",
+            ScriptTarget::EsNext,
+            ModuleKind::None,
+        )
+        .code;
+        let property = output.find("    value;").expect("parameter property");
+        let static_field = output.find("    static create").expect("static field");
+        assert!(property < static_field, "{output}");
+        assert!(output.contains("this.value = value;"), "{output}");
+    }
+
+    #[test]
+    fn static_captures_stop_at_function_and_class_boundaries() {
+        let this_source = concat!(
+            "class C { static f = 1; static arrow = () => this.f; ",
+            "static ordinary = function () { return this.f; }; ",
+            "static nested = class { value = this.f; }; }",
+        );
+        let this_output = emit_with(
+            this_source,
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(this_output.contains("C.arrow = () => _a.f;"), "{this_output}");
+        assert!(
+            this_output.contains("function () { return this.f; }")
+                && this_output.contains("this.value = this.f;"),
+            "{this_output}"
+        );
+
+        let super_source = concat!(
+            "class B { static f = 1; } class D extends B { ",
+            "static arrow = () => super.f; ",
+            "static ordinary = function () { return super.f; }; ",
+            "static nested = class { value = super.f; }; }",
+        );
+        let es2015 = emit_with(
+            super_source,
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(es2015.contains("Reflect.get(_b, \"f\", _a)"), "{es2015}");
+        assert!(
+            es2015.contains("function () { return super.f; }")
+                && es2015.contains("this.value = super.f;"),
+            "{es2015}"
+        );
+
+        let es5 = emit_with(super_source, ScriptTarget::Es5, ModuleKind::None).code;
+        assert!(!es5.contains("    var _a;"), "{es5}");
+        assert!(es5.contains("return _super.f;"), "{es5}");
+        assert!(es5.contains("this.value = _super.prototype.f;"), "{es5}");
     }
 
     #[test]
