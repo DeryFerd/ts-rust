@@ -54904,6 +54904,7 @@ impl Printer<'_> {
         }
         let mut previous_end = data.members.range.start.get();
         let mut previous_emitted = false;
+        let mut previous_was_lowered_field = false;
         for (member_index, member) in data.members.nodes.iter().enumerate() {
             let node = self.node(*member)?.clone();
             let current_is_inline_static_field = lower_fields
@@ -54981,7 +54982,7 @@ impl Printer<'_> {
                     previous_emitted,
                     current_emitted,
                 );
-            } else if !current_is_lowered_field {
+            } else if !current_is_lowered_field && !previous_was_lowered_field {
                 self.discard_source_comments_between(previous_end, node.range.start.get());
             }
             if previous_emitted {
@@ -54989,6 +54990,7 @@ impl Printer<'_> {
             }
             previous_end = node.range.end.get();
             previous_emitted = current_emitted;
+            previous_was_lowered_field = current_is_lowered_field;
             if self.class_member_is_erased_abstract(&node) {
                 continue;
             }
@@ -58007,6 +58009,7 @@ impl Printer<'_> {
         self.writer.write(" = ");
         self.emit_downlevel_class_value(data, &name, false)?;
         self.writer.write(";");
+        self.emit_unconsumed_class_declaration_computed_properties(data)?;
         Ok(())
     }
 
@@ -77046,6 +77049,27 @@ mod tests {
         )
         .code;
         assert!(!private_only.contains("constructor()"), "{private_only}");
+    }
+
+    #[test]
+    fn preserves_lowered_field_comments_and_computed_key_initializers() {
+        let commented = emit_with_class_field_semantics(
+            "class C { value = local; // error\n typeOnly: typeof local; constructor() {} }",
+            ScriptTarget::Es2015,
+            false,
+        )
+        .code;
+        assert!(commented.contains("this.value = local; // error"), "{commented}");
+
+        let computed = emit_with_define(
+            "let key = 'x'; class C { [key] = 1; method() {} } class D {}",
+            ScriptTarget::Es5,
+        )
+        .code;
+        let class = computed.find("var C =").unwrap();
+        let key = computed.find("_a = key;").unwrap();
+        let following = computed.find("var D =").unwrap();
+        assert!(class < key && key < following, "{computed}");
     }
 
     #[test]
