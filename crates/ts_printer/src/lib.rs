@@ -397,6 +397,7 @@ pub fn emit_source_file_with_context(
         anonymous_private_class_plans: HashMap::new(),
         active_anonymous_private_class: None,
         private_destructuring_rewrites: HashMap::new(),
+        private_compound_assignment_receiver_temps: HashMap::new(),
         preemitted_source_prologues: HashSet::new(),
         preemitted_captured_while_loops: HashMap::new(),
         captured_loop_body: None,
@@ -2406,6 +2407,7 @@ fn source_needs_set_function_name_helper(arena: &NodeArena, use_define: bool) ->
         let inferred_initializer = match &parent.data {
             NodeData::VariableDeclaration(declaration) => declaration.initializer == Some(id),
             NodeData::ParameterDeclaration(declaration) => declaration.initializer == Some(id),
+            NodeData::PropertyDeclaration(declaration) => declaration.initializer == Some(id),
             _ => false,
         };
         inferred_initializer
@@ -26743,6 +26745,7 @@ struct Printer<'a> {
     anonymous_private_class_plans: HashMap<NodeId, AnonymousPrivateClassPlan>,
     active_anonymous_private_class: Option<NodeId>,
     private_destructuring_rewrites: HashMap<NodeId, PrivateDestructuringRewrite>,
+    private_compound_assignment_receiver_temps: HashMap<NodeId, String>,
     preemitted_source_prologues: HashSet<NodeId>,
     preemitted_captured_while_loops: HashMap<NodeId, String>,
     captured_loop_body: Option<NodeId>,
@@ -37102,6 +37105,7 @@ impl Printer<'_> {
         class_declarations.sort_by_key(|(start, _, _)| *start);
         let mut claimed = self.generated_names.used.clone();
         let mut temps = Vec::new();
+        let mut private_tagged_temps = Vec::new();
         let mut declaration_index = 0;
         for (class_start, class_expression) in class_expressions {
             while class_declarations
@@ -37202,13 +37206,21 @@ impl Printer<'_> {
                     &mut temps,
                 );
             }
-            self.prepare_private_tagged_template_receiver_temps(
+            self.prepare_private_compound_assignment_receiver_temps(
                 block_id,
                 &mut claimed,
                 &mut temps,
             );
+            self.prepare_private_tagged_template_receiver_temps(
+                block_id,
+                &mut claimed,
+                &mut private_tagged_temps,
+            );
         }
         self.generated_names.used.extend(temps.iter().cloned());
+        self.generated_names
+            .used
+            .extend(private_tagged_temps.iter().cloned());
         let block_scoped_private_declarations =
             self.block_scoped_private_class_declarations(block_id);
         if !block_scoped_private_declarations.is_empty() {
@@ -37221,6 +37233,12 @@ impl Printer<'_> {
         if !temps.is_empty() {
             self.writer.write("var ");
             self.writer.write(&temps.join(", "));
+            self.writer.write(";");
+            self.writer.newline();
+        }
+        if !private_tagged_temps.is_empty() {
+            self.writer.write("var ");
+            self.writer.write(&private_tagged_temps.join(", "));
             self.writer.write(";");
             self.writer.newline();
         }
@@ -37244,7 +37262,8 @@ impl Printer<'_> {
                 else {
                     return None;
                 };
-                if !self.active_private_accessor_exists(access.name)
+                if !(self.active_private_accessor_exists(access.name)
+                    || self.active_private_field(access.name).is_some())
                     || matches!(
                         self.arena.get(access.expression).map(|node| node.kind),
                         Some(SyntaxKind::Identifier | SyntaxKind::ThisKeyword)
@@ -37284,6 +37303,76 @@ impl Printer<'_> {
             claimed.insert(temp.clone());
             self.private_tagged_template_receiver_temps
                 .insert(tagged, temp.clone());
+            temps.push(temp);
+        }
+    }
+
+    fn prepare_private_compound_assignment_receiver_temps(
+        &mut self,
+        body: NodeId,
+        claimed: &mut HashSet<String>,
+        temps: &mut Vec<String>,
+    ) {
+        let mut assignments = self
+            .arena
+            .iter()
+            .filter_map(|(id, node)| {
+                let NodeData::BinaryExpression(binary) = &node.data else {
+                    return None;
+                };
+                if !self
+                    .arena
+                    .get(binary.operator_token)
+                    .is_some_and(|operator| operator.kind.is_compound_assignment_operator())
+                {
+                    return None;
+                }
+                let NodeData::PropertyAccessExpression(access) =
+                    &self.arena.get(binary.left)?.data
+                else {
+                    return None;
+                };
+                if !(self.active_private_field(access.name).is_some()
+                    || self.active_private_accessor_exists(access.name))
+                    || matches!(
+                        self.arena.get(access.expression).map(|node| node.kind),
+                        Some(SyntaxKind::Identifier | SyntaxKind::ThisKeyword)
+                    )
+                {
+                    return None;
+                }
+                let mut current = id;
+                while let Some(parent) = self.arena.get(current).and_then(|node| node.parent) {
+                    if parent == body {
+                        return Some((node.range.start, id));
+                    }
+                    if matches!(
+                        self.arena.get(parent).map(|node| &node.data),
+                        Some(
+                            NodeData::FunctionDeclaration(_)
+                                | NodeData::FunctionExpression(_)
+                                | NodeData::ArrowFunction(_)
+                                | NodeData::MethodDeclaration(_)
+                                | NodeData::ConstructorDeclaration(_)
+                                | NodeData::GetAccessorDeclaration(_)
+                                | NodeData::SetAccessorDeclaration(_)
+                                | NodeData::ClassDeclaration(_)
+                                | NodeData::ClassExpression(_)
+                        )
+                    ) {
+                        return None;
+                    }
+                    current = parent;
+                }
+                None
+            })
+            .collect::<Vec<_>>();
+        assignments.sort_by_key(|(start, _)| *start);
+        for (_, assignment) in assignments {
+            let temp = self.generate_block_temp(body, claimed);
+            claimed.insert(temp.clone());
+            self.private_compound_assignment_receiver_temps
+                .insert(assignment, temp.clone());
             temps.push(temp);
         }
     }
@@ -37903,7 +37992,12 @@ impl Printer<'_> {
                 let temp = self.generate_block_temp(source_file, &claimed);
                 claimed.insert(temp.clone());
                 self.class_expression_temps.insert(*class_id, temp.clone());
-                field_temps.push(temp);
+                if self
+                    .class_expression_instance_field_owner(*class_id)
+                    .is_none()
+                {
+                    field_temps.push(temp);
+                }
             }
             if !*is_expression {
                 self.prepare_class_static_block_declaration_plan(
@@ -38022,6 +38116,68 @@ impl Printer<'_> {
             self.writer.write(";");
             self.writer.newline();
         }
+    }
+
+    fn class_expression_instance_field_owner(&self, expression: NodeId) -> Option<NodeId> {
+        let mut current = expression;
+        while let Some(parent) = self.arena.get(current).and_then(|node| node.parent) {
+            match self.arena.get(parent).map(|node| &node.data) {
+                Some(NodeData::PropertyDeclaration(property))
+                    if !self.property_is_static(property)
+                        && property.initializer.is_some_and(|initializer| {
+                            self.node_is_within(expression, initializer)
+                        }) =>
+                {
+                    return Some(parent);
+                }
+                Some(
+                    NodeData::FunctionDeclaration(_)
+                    | NodeData::FunctionExpression(_)
+                    | NodeData::ArrowFunction(_)
+                    | NodeData::MethodDeclaration(_)
+                    | NodeData::ConstructorDeclaration(_)
+                    | NodeData::GetAccessorDeclaration(_)
+                    | NodeData::SetAccessorDeclaration(_),
+                ) => return None,
+                _ => current = parent,
+            }
+        }
+        None
+    }
+
+    fn emit_instance_field_class_expression_temps(
+        &mut self,
+        data: &ts_ast::ClassDeclarationData,
+    ) {
+        let mut temps = self
+            .class_expression_temps
+            .iter()
+            .filter_map(|(expression, temp)| {
+                let owner = self.class_expression_instance_field_owner(*expression)?;
+                data.members.nodes.contains(&owner).then(|| {
+                    (
+                        self.arena
+                            .get(*expression)
+                            .map_or(u32::MAX, |node| node.range.start.get()),
+                        temp.clone(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        temps.sort_by_key(|(start, _)| *start);
+        if temps.is_empty() {
+            return;
+        }
+        self.writer.write("var ");
+        self.writer.write(
+            &temps
+                .into_iter()
+                .map(|(_, temp)| temp)
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        self.writer.write(";");
+        self.writer.newline();
     }
 
     fn prepare_source_nested_object_rest_temps(&mut self, source_file: NodeId) -> Vec<String> {
@@ -53363,12 +53519,24 @@ impl Printer<'_> {
 
     fn class_expression_inferred_name(&self, id: NodeId) -> Option<String> {
         let parent = self.arena.get(id)?.parent?;
-        match &self.arena.get(parent)?.data {
+        let direct = match &self.arena.get(parent)?.data {
             NodeData::VariableDeclaration(declaration) if declaration.initializer == Some(id) => {
                 declaration_name_text(self.arena, declaration.name).map(str::to_owned)
             }
             NodeData::ParameterDeclaration(declaration) if declaration.initializer == Some(id) => {
                 declaration_name_text(self.arena, declaration.name).map(str::to_owned)
+            }
+            NodeData::PropertyDeclaration(declaration) if declaration.initializer == Some(id) => {
+                declaration_name_text(self.arena, declaration.name)
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        let NodeData::PrivateIdentifier(name) =
+                            &self.arena.get(declaration.name)?.data
+                        else {
+                            return None;
+                        };
+                        Some(name.text.clone())
+                    })
             }
             NodeData::BindingElement(element) if element.initializer == Some(id) => element
                 .name
@@ -53393,7 +53561,22 @@ impl Printer<'_> {
                 declaration_name_text(self.arena, property.name).map(str::to_owned)
             }
             _ => None,
-        }
+        };
+        direct.or_else(|| {
+            let owner = self.class_expression_instance_field_owner(id)?;
+            let NodeData::PropertyDeclaration(property) = &self.arena.get(owner)?.data else {
+                return None;
+            };
+            declaration_name_text(self.arena, property.name)
+                .map(str::to_owned)
+                .or_else(|| {
+                    let NodeData::PrivateIdentifier(name) = &self.arena.get(property.name)?.data
+                    else {
+                        return None;
+                    };
+                    Some(name.text.clone())
+                })
+        })
     }
 
     fn class_expression_as_declaration(
@@ -53569,7 +53752,6 @@ impl Printer<'_> {
             }
         }
         if data.name.is_none()
-            && self.class_expression_needs_inferred_name_restore(data)
             && let Some(name) = self.class_expression_inferred_name(id)
         {
             self.writer.newline();
@@ -53776,22 +53958,6 @@ impl Printer<'_> {
             })
     }
 
-    fn class_expression_needs_inferred_name_restore(
-        &self,
-        data: &ts_ast::ClassDeclarationData,
-    ) -> bool {
-        data.members.nodes.iter().any(|member| {
-            match self.arena.get(*member).map(|node| &node.data) {
-                Some(NodeData::ClassStaticBlockDeclaration(_)) => true,
-                Some(NodeData::PropertyDeclaration(property)) => {
-                    self.class_field_emits_runtime_value(property)
-                        && self.has_modifier(property.modifiers.as_ref(), SyntaxKind::StaticKeyword)
-                }
-                _ => false,
-            }
-        })
-    }
-
     fn class_field_emits_runtime_value(&self, property: &ts_ast::PropertyDeclarationData) -> bool {
         !self.has_modifier(
             property.modifiers.as_ref(),
@@ -53916,6 +54082,7 @@ impl Printer<'_> {
             self.writer.newline();
             self.writer.indent += 1;
         }
+        self.emit_instance_field_class_expression_temps(data);
         self.emit_private_brand_initializer("this");
         self.emit_instance_fields(data, "this")?;
         self.writer.indent -= 1;
@@ -53982,6 +54149,7 @@ impl Printer<'_> {
         self.writer.write(" {");
         self.writer.newline();
         self.writer.indent += 1;
+        self.emit_instance_field_class_expression_temps(data);
         self.prepare_class_expression_temps(body_id, body);
         let mut generated_temps = self.prepare_private_destructuring_rewrites(body_id);
         let mut claimed_temps = generated_temps.iter().cloned().collect::<HashSet<_>>();
@@ -61032,7 +61200,10 @@ impl Printer<'_> {
                         self.emit_argument_list(&data.arguments)?;
                     }
                     self.writer.write(")");
-                } else if let Some(receiver) = private_field_call {
+                } else if let Some(receiver) = private_field_call
+                    && (data.question_dot_token.is_none()
+                        || self.settings.target >= ScriptTarget::Es2020)
+                {
                     self.emit_expression(data.expression, 18)?;
                     self.writer.write(".call(");
                     self.emit_expression(receiver, 1)?;
@@ -62532,6 +62703,13 @@ impl Printer<'_> {
                 .map(|member| (access.expression, member)),
             _ => None,
         });
+        let private_field = self.arena.get(data.tag).and_then(|tag| match &tag.data {
+            NodeData::PropertyAccessExpression(access) => self
+                .active_private_field(access.name)
+                .cloned()
+                .map(|field| (access.expression, field)),
+            _ => None,
+        });
         let static_super = self
             .direct_super_access(data.tag)
             .zip(self.downlevel_super_context.clone())
@@ -62541,7 +62719,32 @@ impl Printer<'_> {
                     .clone()
                     .map(|receiver| (base, property, is_element, receiver))
             });
-        if let Some((receiver, accessor)) = private_accessor {
+        if let Some((receiver, field)) = private_field {
+            let receiver_temp = self
+                .private_tagged_template_receiver_temps
+                .get(&id)
+                .cloned();
+            self.emit_helper_reference("__classPrivateFieldGet");
+            self.writer.write("(");
+            if let Some(temp) = &receiver_temp {
+                self.writer.write("(");
+                self.writer.write(temp);
+                self.writer.write(" = ");
+                self.emit_expression(receiver, 1)?;
+                self.writer.write(")");
+            } else {
+                self.emit_expression(receiver, 1)?;
+            }
+            self.writer.write(", ");
+            self.writer.write(&field.storage);
+            self.writer.write(", \"f\").bind(");
+            if let Some(temp) = receiver_temp {
+                self.writer.write(&temp);
+            } else {
+                self.emit_expression(receiver, 1)?;
+            }
+            self.writer.write(")");
+        } else if let Some((receiver, accessor)) = private_accessor {
             let Some(plan) = self.active_private_method_plan.clone() else {
                 return Err(Self::unsupported(data.tag, SyntaxKind::PropertyAccessExpression));
             };
@@ -64441,25 +64644,51 @@ impl Printer<'_> {
                 self.arena.get(binary.left).map(|node| &node.data)
             && let Some(field) = self.active_private_field(access.name).cloned()
         {
+            let receiver_temp = self
+                .private_compound_assignment_receiver_temps
+                .get(&expression)
+                .cloned();
             self.emit_helper_reference("__classPrivateFieldSet");
             self.writer.write("(");
+            if let Some(temp) = &receiver_temp {
+                self.writer.write(temp);
+                self.writer.write(" = ");
+            }
             self.emit_expression(access.expression, 1)?;
             self.writer.write(", ");
             self.writer.write(&field.storage);
             self.writer.write(", ");
+            if operator == SyntaxKind::AsteriskAsteriskEqualsToken
+                && self.settings.target < ScriptTarget::Es2016
+            {
+                self.writer.write("Math.pow(");
+            }
             self.emit_helper_reference("__classPrivateFieldGet");
             self.writer.write("(");
-            self.emit_expression(access.expression, 1)?;
+            if let Some(temp) = &receiver_temp {
+                self.writer.write(temp);
+            } else {
+                self.emit_expression(access.expression, 1)?;
+            }
             self.writer.write(", ");
             self.writer.write(&field.storage);
-            self.writer.write(", \"f\") ");
-            self.writer.write(
-                operator_text(operator)
-                    .unwrap_or("+=")
-                    .trim_end_matches('='),
-            );
-            self.writer.write(" ");
-            self.emit_expression(binary.right, 1)?;
+            self.writer.write(", \"f\")");
+            if operator == SyntaxKind::AsteriskAsteriskEqualsToken
+                && self.settings.target < ScriptTarget::Es2016
+            {
+                self.writer.write(", ");
+                self.emit_expression(binary.right, 1)?;
+                self.writer.write(")");
+            } else {
+                self.writer.write(" ");
+                self.writer.write(
+                    operator_text(operator)
+                        .unwrap_or("+=")
+                        .trim_end_matches('='),
+                );
+                self.writer.write(" ");
+                self.emit_expression(binary.right, 1)?;
+            }
             self.writer.write(", \"f\")");
             return Ok(());
         }
@@ -71330,7 +71559,10 @@ mod tests {
     #[test]
     fn lowers_private_field_compound_assignments_through_helpers() {
         let output = emit_with(
-            "class A { #value = 1; add(next: number) { this.#value += next; } }",
+            concat!(
+                "class A { #value = 1; add(next: number) { this.#value += next; ",
+                "this.get().#value **= 2; } get() { return this; } }",
+            ),
             ScriptTarget::Es2015,
             ModuleKind::None,
         )
@@ -71342,6 +71574,44 @@ mod tests {
             )),
             "{output}"
         );
+        assert!(output.contains("var _a;"), "{output}");
+        assert!(
+            output.contains(concat!(
+                "__classPrivateFieldSet(_a = this.get(), _A_value, ",
+                "Math.pow(__classPrivateFieldGet(_a, _A_value, \"f\"), 2), \"f\")",
+            )),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn binds_private_field_tagged_templates_to_the_receiver_once() {
+        let output = emit_with(
+            "class A { #tag = String.raw; test() { this.get().#tag`value`; } get() { return this; } }",
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(output.contains("var _a;"), "{output}");
+        assert!(
+            output.contains(concat!(
+                "__classPrivateFieldGet((_a = this.get()), _A_tag, \"f\")",
+                ".bind(_a) `value`",
+            )),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn restores_private_field_class_expression_inferred_names() {
+        let output = emit_with(
+            "class B { #value = class { static item = 1; }; }",
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(output.contains("constructor() {\n        var _a;"), "{output}");
+        assert!(output.contains("__setFunctionName(_a, \"#value\")"), "{output}");
     }
 
     #[test]
