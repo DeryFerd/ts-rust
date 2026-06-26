@@ -64886,7 +64886,8 @@ impl Printer<'_> {
         let reject = format!("reject_{suffix}");
         let argument = call.arguments.nodes.first().copied();
         let temp = self.amd_dynamic_import_temps.get(&call_id).cloned();
-        let wrap = temp.is_some() && parent_precedence > 0;
+        let wrap = (temp.is_some() && parent_precedence > 0)
+            || (self.settings.module == ModuleKind::Umd && parent_precedence > 1);
         if wrap {
             self.writer.write("(");
         }
