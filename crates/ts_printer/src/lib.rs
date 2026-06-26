@@ -985,6 +985,12 @@ pub fn emit_source_file_with_context(
     });
     let needs_async_generator_helper =
         settings.target < ScriptTarget::Es2018 && source_needs_async_generator_helper(arena);
+    let needs_async_delegator_helper =
+        settings.target < ScriptTarget::Es2018 && source_needs_async_delegator_helper(arena);
+    let needs_async_values_helper = settings.target < ScriptTarget::Es2018
+        && (needs_async_delegator_helper || source_needs_for_await_values_helper(arena));
+    let async_values_first =
+        needs_async_delegator_helper && source_async_delegation_values_first(arena);
     let needs_dynamic_import_helpers =
         printer.lower_dynamic_import_to_commonjs && source_has_dynamic_import(arena);
     if !has_use_strict
@@ -1211,12 +1217,34 @@ pub fn emit_source_file_with_context(
     {
         printer.emit_set_function_name_helper();
     }
-    if needs_async_generator_helper && !settings.no_emit_helpers {
-        if !printer.imported_helpers.contains("__await") {
-            printer.emit_await_helper();
+    if (needs_async_generator_helper || needs_async_values_helper) && !settings.no_emit_helpers {
+        if async_values_first && !printer.imported_helpers.contains("__asyncValues") {
+            printer.emit_async_values_helper();
         }
-        if !printer.imported_helpers.contains("__asyncGenerator") {
-            printer.emit_async_generator_helper();
+        if needs_async_generator_helper {
+            if !printer.imported_helpers.contains("__await") {
+                printer.emit_await_helper();
+            }
+            if async_values_first
+                && !printer.imported_helpers.contains("__asyncDelegator")
+            {
+                printer.emit_async_delegator_helper();
+            }
+            if !printer.imported_helpers.contains("__asyncGenerator") {
+                printer.emit_async_generator_helper();
+            }
+        }
+        if needs_async_values_helper
+            && !async_values_first
+            && !printer.imported_helpers.contains("__asyncValues")
+        {
+            printer.emit_async_values_helper();
+        }
+        if needs_async_delegator_helper
+            && !async_values_first
+            && !printer.imported_helpers.contains("__asyncDelegator")
+        {
+            printer.emit_async_delegator_helper();
         }
     }
     if settings.target < ScriptTarget::Es2015
@@ -2114,6 +2142,105 @@ fn source_needs_async_generator_helper(arena: &NodeArena) -> bool {
         }
         _ => false,
     })
+}
+
+fn source_needs_async_delegator_helper(arena: &NodeArena) -> bool {
+    arena.iter().any(|(id, node)| {
+        matches!(&node.data, NodeData::YieldExpression(yielded) if yielded.asterisk_token.is_some())
+            && node_is_in_async_generator(arena, id)
+    })
+}
+
+fn source_needs_for_await_values_helper(arena: &NodeArena) -> bool {
+    arena.iter().any(|(_, node)| {
+        matches!(&node.data, NodeData::ForInOrOfStatement(statement) if statement.await_modifier.is_some())
+    })
+}
+
+fn source_async_delegation_values_first(arena: &NodeArena) -> bool {
+    arena.iter().any(|(id, node)| {
+        let NodeData::YieldExpression(yielded) = &node.data else {
+            return false;
+        };
+        let Some(expression) = yielded.expression else {
+            return false;
+        };
+        if yielded.asterisk_token.is_none() || !node_is_in_async_generator(arena, id) {
+            return false;
+        }
+        let Some(range) = arena.get(expression).map(|node| node.range) else {
+            return false;
+        };
+        !arena.iter().any(|(_, candidate)| {
+            range.start <= candidate.range.start
+                && candidate.range.end <= range.end
+                && match &candidate.data {
+                    NodeData::FunctionDeclaration(function) => {
+                        function.asterisk_token.is_some()
+                            && declaration_has_modifier(
+                                arena,
+                                candidate,
+                                SyntaxKind::AsyncKeyword,
+                            )
+                    }
+                    NodeData::FunctionExpression(function) => {
+                        function.asterisk_token.is_some()
+                            && declaration_has_modifier_in_list(
+                                arena,
+                                function.modifiers.as_ref(),
+                                SyntaxKind::AsyncKeyword,
+                            )
+                    }
+                    NodeData::MethodDeclaration(method) => {
+                        method.asterisk_token.is_some()
+                            && declaration_has_modifier_in_list(
+                                arena,
+                                method.modifiers.as_ref(),
+                                SyntaxKind::AsyncKeyword,
+                            )
+                    }
+                    _ => false,
+                }
+        })
+    })
+}
+
+fn node_is_in_async_generator(arena: &NodeArena, id: NodeId) -> bool {
+    let mut current = arena.get(id).and_then(|node| node.parent);
+    while let Some(node_id) = current {
+        let Some(node) = arena.get(node_id) else {
+            return false;
+        };
+        let is_async_generator = match &node.data {
+            NodeData::FunctionDeclaration(function) => {
+                function.asterisk_token.is_some()
+                    && declaration_has_modifier(arena, node, SyntaxKind::AsyncKeyword)
+            }
+            NodeData::FunctionExpression(function) => {
+                function.asterisk_token.is_some()
+                    && declaration_has_modifier_in_list(
+                        arena,
+                        function.modifiers.as_ref(),
+                        SyntaxKind::AsyncKeyword,
+                    )
+            }
+            NodeData::MethodDeclaration(method) => {
+                method.asterisk_token.is_some()
+                    && declaration_has_modifier_in_list(
+                        arena,
+                        method.modifiers.as_ref(),
+                        SyntaxKind::AsyncKeyword,
+                    )
+            }
+            NodeData::ArrowFunction(_) => false,
+            _ => {
+                current = node.parent;
+                continue;
+            }
+        };
+        return is_async_generator;
+    }
+    false
 }
 
 fn source_has_dynamic_import(arena: &NodeArena) -> bool {
@@ -33184,6 +33311,34 @@ impl Printer<'_> {
         self.writer.newline();
     }
 
+    fn emit_async_delegator_helper(&mut self) {
+        for line in [
+            "var __asyncDelegator = (this && this.__asyncDelegator) || function (o) {",
+            "    var i, p;",
+            "    return i = {}, verb(\"next\"), verb(\"throw\", function (e) { throw e; }), verb(\"return\"), i[Symbol.iterator] = function () { return this; }, i;",
+            "    function verb(n, f) { i[n] = o[n] ? function (v) { return (p = !p) ? { value: __await(o[n](v)), done: false } : f ? f(v) : v; } : f; }",
+            "};",
+        ] {
+            self.writer.write(line);
+            self.writer.newline();
+        }
+    }
+
+    fn emit_async_values_helper(&mut self) {
+        for line in [
+            "var __asyncValues = (this && this.__asyncValues) || function (o) {",
+            "    if (!Symbol.asyncIterator) throw new TypeError(\"Symbol.asyncIterator is not defined.\");",
+            "    var m = o[Symbol.asyncIterator], i;",
+            "    return m ? m.call(o) : (o = typeof __values === \"function\" ? __values(o) : o[Symbol.iterator](), i = {}, verb(\"next\"), verb(\"throw\"), verb(\"return\"), i[Symbol.asyncIterator] = function () { return this; }, i);",
+            "    function verb(n) { i[n] = o[n] && function (v) { return new Promise(function (resolve, reject) { v = o[n](v), settle(resolve, reject, v.done, v.value); }); }; }",
+            "    function settle(resolve, reject, d, v) { Promise.resolve(v).then(function(v) { resolve({ value: v, done: d }); }, reject); }",
+            "};",
+        ] {
+            self.writer.write(line);
+            self.writer.newline();
+        }
+    }
+
     fn emit_async_generator_helper(&mut self) {
         for line in [
             "var __asyncGenerator = (this && this.__asyncGenerator) || function (thisArg, _arguments, generator) {",
@@ -44619,7 +44774,8 @@ impl Printer<'_> {
         self.writer.write(".label) {");
         self.writer.newline();
         self.writer.indent += 1;
-        self.writer.write("case 0: ");
+        self.writer.write("case 0:");
+        self.writer.newline();
         self.writer.indent += 1;
         let mut case = 0;
         for statement in statements {
@@ -68383,9 +68539,10 @@ impl Printer<'_> {
                 if downlevel_async {
                     self.emit_downlevel_async_function_body(data.body, "this")?;
                 } else if downlevel_async_generator {
-                    let inner_name = self
-                        .generated_names
-                        .generate(function_name.as_deref().unwrap_or("_default"));
+                    let inner_name = function_name
+                        .as_deref()
+                        .map(|name| self.generated_names.generate(name))
+                        .unwrap_or_default();
                     if self.settings.target < ScriptTarget::Es2015 {
                         self.emit_es5_downlevel_async_generator_body(data.body, &inner_name)?;
                     } else {
