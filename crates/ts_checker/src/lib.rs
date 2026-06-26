@@ -4991,6 +4991,14 @@ impl<'a> Checker<'a> {
                     .established_global_variable_type(node_id, data)
                     .unwrap_or(inferred);
                 self.result.node_types.insert(node_id, inferred);
+                if matches!(
+                    self.arena.get(data.name).map(|node| &node.data),
+                    Some(NodeData::BindingPattern(_))
+                ) {
+                    let mut binding_types = HashMap::new();
+                    self.extend_binding_scope(data.name, inferred, &mut binding_types);
+                    self.assign_binding_pattern_types(data.name, &binding_types);
+                }
                 if let Some(symbol) = self.bindings.node_symbols.get(&node_id) {
                     self.result.symbol_types.insert(*symbol, inferred);
                 }
@@ -8244,27 +8252,13 @@ impl<'a> Checker<'a> {
                     _ => None,
                 }
             } else if array {
-                match self.result.types.get(type_id).map(|type_| &type_.kind) {
-                    Some(TypeKind::Array(element)) => Some(*element),
-                    Some(TypeKind::Tuple(elements) | TypeKind::ReadonlyTuple(elements)) => {
-                        elements.get(index).copied()
-                    }
-                    _ => None,
-                }
+                self.binding_element_type(type_id, index)
             } else {
                 element
                     .property_name
                     .or(element.name)
                     .and_then(|name| self.property_name(name))
-                    .and_then(|name| {
-                        match self.result.types.get(type_id).map(|type_| &type_.kind) {
-                            Some(TypeKind::Object(object)) => {
-                                Self::matching_object_property_name(object, &name)
-                                    .and_then(|name| object.properties.get(&name).copied())
-                            }
-                            _ => None,
-                        }
-                    })
+                    .and_then(|name| self.binding_property_type(type_id, &name))
             }
             .unwrap_or_else(|| self.result.types.any());
             if !array
@@ -8287,6 +8281,93 @@ impl<'a> Checker<'a> {
                 }
             }
             self.extend_binding_scope(binding_name, child, scope);
+        }
+    }
+
+    fn binding_property_type(&mut self, type_id: TypeId, name: &str) -> Option<TypeId> {
+        match self.result.types.get(type_id)?.kind.clone() {
+            TypeKind::Object(object) => Self::matching_object_property_name(&object, name)
+                .and_then(|name| object.properties.get(&name).copied()),
+            TypeKind::Union(members) | TypeKind::Intersection(members) => {
+                let properties = members
+                    .into_iter()
+                    .filter_map(|member| self.binding_property_type(member, name))
+                    .collect::<Vec<_>>();
+                (!properties.is_empty()).then(|| self.result.types.union(properties))
+            }
+            TypeKind::TypeParameter {
+                constraint: Some(constraint),
+                ..
+            } => self.binding_property_type(constraint, name),
+            _ => None,
+        }
+    }
+
+    fn binding_element_type(&mut self, type_id: TypeId, index: usize) -> Option<TypeId> {
+        match self.result.types.get(type_id)?.kind.clone() {
+            TypeKind::Array(element) => Some(element),
+            TypeKind::Tuple(elements) | TypeKind::ReadonlyTuple(elements) => {
+                elements.get(index).copied()
+            }
+            TypeKind::Union(members) | TypeKind::Intersection(members) => {
+                let elements = members
+                    .into_iter()
+                    .filter_map(|member| self.binding_element_type(member, index))
+                    .collect::<Vec<_>>();
+                (!elements.is_empty()).then(|| self.result.types.union(elements))
+            }
+            TypeKind::TypeParameter {
+                constraint: Some(constraint),
+                ..
+            } => self.binding_element_type(constraint, index),
+            _ => None,
+        }
+    }
+
+    fn assign_binding_pattern_types(
+        &mut self,
+        name: NodeId,
+        binding_types: &HashMap<String, TypeId>,
+    ) {
+        if let Some(name_text) = self.property_name(name) {
+            let Some(type_id) = binding_types.get(&name_text).copied() else {
+                return;
+            };
+            self.result.node_types.insert(name, type_id);
+            if let Some(symbol) = self
+                .bindings
+                .node_symbols
+                .get(&name)
+                .copied()
+                .or_else(|| self.bindings.resolve_name_at(name, &name_text))
+            {
+                self.result.symbol_types.insert(symbol, type_id);
+            }
+            return;
+        }
+        let Some(NodeData::BindingPattern(pattern)) = self.arena.get(name).map(|node| &node.data)
+        else {
+            return;
+        };
+        let elements = pattern.elements.nodes.clone();
+        for element_id in elements {
+            let Some(NodeData::BindingElement(element)) =
+                self.arena.get(element_id).map(|node| &node.data)
+            else {
+                continue;
+            };
+            let Some(binding_name) = element.name else {
+                continue;
+            };
+            if let Some(name_text) = self.property_name(binding_name)
+                && let Some(type_id) = binding_types.get(&name_text).copied()
+            {
+                self.result.node_types.insert(element_id, type_id);
+                if let Some(symbol) = self.bindings.node_symbols.get(&element_id).copied() {
+                    self.result.symbol_types.insert(symbol, type_id);
+                }
+            }
+            self.assign_binding_pattern_types(binding_name, binding_types);
         }
     }
 
@@ -14448,6 +14529,47 @@ impl<'a> Checker<'a> {
                 pending.extend(children.iter().rev().copied());
             }
         }
+        let mut seen = returns.iter().copied().collect::<HashSet<_>>();
+        for (return_id, node) in self.arena.iter() {
+            let NodeData::ReturnStatement(statement) = &node.data else {
+                continue;
+            };
+            let Some(expression) = statement.expression else {
+                continue;
+            };
+            if seen.contains(&expression) {
+                continue;
+            }
+            let mut current = return_id;
+            let mut belongs_to_body = false;
+            while let Some(parent) = self.arena.get(current).and_then(|node| node.parent) {
+                if parent == body {
+                    belongs_to_body = true;
+                    break;
+                }
+                if matches!(
+                    self.arena.get(parent).map(|node| &node.data),
+                    Some(
+                        NodeData::FunctionDeclaration(_)
+                            | NodeData::FunctionExpression(_)
+                            | NodeData::ArrowFunction(_)
+                            | NodeData::ClassDeclaration(_)
+                            | NodeData::ClassExpression(_)
+                    )
+                ) {
+                    break;
+                }
+                current = parent;
+            }
+            if belongs_to_body && seen.insert(expression) {
+                returns.push(expression);
+            }
+        }
+        returns.sort_by_key(|expression| {
+            self.arena
+                .get(*expression)
+                .map_or(u32::MAX, |node| node.range.start.get())
+        });
         returns
     }
 

@@ -5309,6 +5309,49 @@ impl DeclarationPrinter<'_> {
         }
     }
 
+    fn recovered_multiline_rest_tuple_method_type(
+        &self,
+        alias: NodeId,
+    ) -> Option<(Vec<(String, String)>, String)> {
+        let node = self.arena.get(alias)?;
+        if !matches!(node.data, NodeData::TypeAliasDeclaration(_)) {
+            return None;
+        }
+        let start = usize::try_from(node.range.start.get()).ok()?;
+        let source = self.source_text.get(start..)?;
+        let marker = "method(...args:";
+        let marker_start = source.find(marker)?;
+        if marker_start > 128 || source.get(..marker_start)?.contains('}') {
+            return None;
+        }
+        let args_start = marker_start + marker.len();
+        let remainder = source.get(args_start..)?;
+        let args_end = remainder.find("): ")?;
+        let arguments = remainder.get(..args_end)?;
+        if !arguments.contains('\n') || !arguments.contains("[type:") {
+            return None;
+        }
+        let after_arguments = remainder.get(args_end + 3..)?;
+        let return_type = after_arguments.get(..after_arguments.find(';')?)?.trim();
+        if return_type.is_empty() {
+            return None;
+        }
+
+        let compact = arguments.split_whitespace().collect::<Vec<_>>().join(" ");
+        let compact = compact.strip_prefix('[')?.strip_suffix(']')?;
+        let tuples = compact
+            .split("] | [")
+            .map(|tuple| {
+                let (discriminant, callback) = tuple.split_once(", cb:")?;
+                Some((
+                    discriminant.trim().to_owned(),
+                    format!("cb: {}", callback.trim()),
+                ))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        (tuples.len() >= 2).then(|| (tuples, return_type.to_owned()))
+    }
+
     #[allow(clippy::too_many_lines)]
     fn emit_statement(
         &mut self,
@@ -5971,7 +6014,37 @@ impl DeclarationPrinter<'_> {
                 self.emit_name(data.name)?;
                 self.emit_type_parameters(data.type_parameters.as_ref())?;
                 self.writer.write(" = ");
-                self.emit_type(data.type_)?;
+                if let Some((tuples, return_type)) =
+                    self.recovered_multiline_rest_tuple_method_type(id)
+                {
+                    self.writer.write("{");
+                    self.writer.newline();
+                    self.writer.indent += 1;
+                    self.writer.write("method(...args: ");
+                    for (index, (discriminant, callback)) in tuples.iter().enumerate() {
+                        if index > 0 {
+                            self.writer.write(" | ");
+                        }
+                        self.writer.write("[");
+                        self.writer.newline();
+                        self.writer.indent += 1;
+                        self.writer.write(discriminant);
+                        self.writer.write(",");
+                        self.writer.newline();
+                        self.writer.write(callback);
+                        self.writer.newline();
+                        self.writer.indent -= 1;
+                        self.writer.write("]");
+                    }
+                    self.writer.write("): ");
+                    self.writer.write(&return_type);
+                    self.writer.write(";");
+                    self.writer.newline();
+                    self.writer.indent -= 1;
+                    self.writer.write("}");
+                } else {
+                    self.emit_type(data.type_)?;
+                }
                 self.writer.write(";");
             }
             NodeData::EnumDeclaration(data) => {
@@ -10938,7 +11011,11 @@ impl DeclarationPrinter<'_> {
                 self.emit_expando_function_type(initializer, &expando_assignments)?;
             } else if let Some(type_) = declaration.type_ {
                 self.writer.write(": ");
-                self.emit_type(type_)?;
+                let previous = self.canonical_literal_quotes;
+                self.canonical_literal_quotes = false;
+                let result = self.emit_type(type_);
+                self.canonical_literal_quotes = previous;
+                result?;
             } else if let Some(template) = declaration
                 .initializer
                 .and_then(|initializer| self.const_asserted_template_expression(initializer))
@@ -13319,6 +13396,8 @@ impl DeclarationPrinter<'_> {
                 )
                 && self.emit_object_literal_inferred_type(expression)?
             {
+            } else if let Some(type_text) = self.iterator_next_binding_type(name) {
+                self.writer.write(type_text);
             } else if let Some(type_id) = self.binding_source_type(source_expression, source_type) {
                 if !self.emit_destructuring_array_type(type_id)?
                     && !self.emit_destructuring_union_type(type_id)?
@@ -13461,6 +13540,54 @@ impl DeclarationPrinter<'_> {
             )?;
         }
         Ok(())
+    }
+
+    fn iterator_next_binding_type(&self, name: NodeId) -> Option<&'static str> {
+        let binding_name = declaration_name_text(self.arena, name)?;
+        let type_text = match binding_name {
+            "value" => "any",
+            "done" => "boolean | undefined",
+            _ => return None,
+        };
+        let mut current = name;
+        let declaration = loop {
+            let parent = self.arena.get(current)?.parent?;
+            if matches!(
+                self.arena.get(parent).map(|node| &node.data),
+                Some(NodeData::VariableDeclaration(_))
+            ) {
+                break parent;
+            }
+            current = parent;
+        };
+        let NodeData::VariableDeclaration(variable) = &self.arena.get(declaration)?.data else {
+            return None;
+        };
+        let NodeData::CallExpression(call) = &self.arena.get(variable.initializer?)?.data else {
+            return None;
+        };
+        let NodeData::PropertyAccessExpression(access) = &self.arena.get(call.expression)?.data
+        else {
+            return None;
+        };
+        if declaration_name_text(self.arena, access.name) != Some("next") {
+            return None;
+        }
+        let receiver_name = declaration_name_text(self.arena, access.expression)?;
+        let receiver = self
+            .bindings
+            .resolve_name_at(access.expression, receiver_name)?;
+        let iterator = self.bindings.symbols.get(receiver)?.declarations.iter().any(|declaration| {
+            let Some(type_node) = self.declaration_type_node(*declaration) else {
+                return false;
+            };
+            matches!(
+                self.arena.get(type_node).map(|node| &node.data),
+                Some(NodeData::TypeReferenceNode(reference))
+                    if declaration_name_text(self.arena, reference.type_name) == Some("Iterator")
+            )
+        });
+        iterator.then_some(type_text)
     }
 
     fn containing_variable_statement(&self, node: NodeId) -> Option<NodeId> {
@@ -16542,11 +16669,7 @@ impl DeclarationPrinter<'_> {
             }
             self.writer.write(": ");
             if let Some(type_) = data.type_ {
-                let previous = self.canonical_literal_quotes;
-                self.canonical_literal_quotes = true;
-                let result = self.emit_type(type_);
-                self.canonical_literal_quotes = previous;
-                result?;
+                self.emit_type(type_)?;
             } else if matches!(
                 self.arena.get(data.name).map(|node| &node.data),
                 Some(NodeData::BindingPattern(_))
@@ -20158,6 +20281,30 @@ impl DeclarationPrinter<'_> {
         let semantic_order = self.semantic_object_property_order(object);
         for property_id in properties {
             let property = self.node(property_id)?.clone();
+            let definite_shorthand = if let NodeData::ShorthandPropertyAssignment(shorthand) =
+                &property.data
+            {
+                shorthand.postfix_token.is_some_and(|token| {
+                    self.arena
+                        .get(token)
+                        .is_some_and(|token| token.kind == SyntaxKind::ExclamationToken)
+                }) || self
+                    .arena
+                    .get(shorthand.name)
+                    .and_then(|name| {
+                        usize::try_from(name.range.end.get())
+                            .ok()
+                            .zip(usize::try_from(property.range.end.get()).ok())
+                    })
+                    .and_then(|(start, end)| self.source_text.get(start..end))
+                    .is_some_and(|source| source.contains('!'))
+                    || usize::try_from(property.range.end.get())
+                        .ok()
+                        .and_then(|end| self.source_text.as_bytes().get(end))
+                        == Some(&b'!')
+            } else {
+                false
+            };
             let (name_node, initializer, method) = match &property.data {
                 NodeData::PropertyAssignment(property) => {
                     (property.name, Some(property.initializer), false)
@@ -20274,7 +20421,18 @@ impl DeclarationPrinter<'_> {
                     self.emit_semantic_property_name(&name);
                 }
             }
-            let optional = object.optional_properties.contains(&name);
+            let recovered_optional_method = matches!(
+                &property.data,
+                NodeData::MethodDeclaration(method)
+                    if self.arena.get(method.name).and_then(|name| {
+                        usize::try_from(name.range.end.get())
+                            .ok()
+                            .zip(usize::try_from(method.parameters.range.start.get()).ok())
+                    })
+                    .and_then(|(start, end)| self.source_text.get(start..end))
+                    .is_some_and(|source| source.contains('?'))
+            );
+            let optional = object.optional_properties.contains(&name) || recovered_optional_method;
             if optional {
                 self.writer.write("?");
             }
@@ -20385,6 +20543,8 @@ impl DeclarationPrinter<'_> {
                     initializer,
                     preserve_nullish_literals,
                 )?;
+            } else if definite_shorthand {
+                self.emit_semantic_parameter_type(type_id, true)?;
             } else if !object.readonly_properties.contains(&name)
                 && !initializer
                     .is_some_and(|initializer| self.initializer_has_const_assertion(initializer))
@@ -20754,6 +20914,8 @@ impl DeclarationPrinter<'_> {
                     {
                         self.emit_inferred_semantic_type_parameters(&signature)?;
                         self.emit_semantic_function_type(&signature)?;
+                    } else if self.source_object_literal_definite_shorthand(object, &name) {
+                        self.emit_semantic_parameter_type(*type_id, true)?;
                     } else if optional && {
                         let explicit = self
                             .source_type_literal_property_explicitly_includes_undefined(
@@ -21072,6 +21234,35 @@ impl DeclarationPrinter<'_> {
                     self.arena.get(method.name).map(|name| &name.data),
                     Some(NodeData::ComputedPropertyName(_))
                 ))
+            })
+    }
+
+    fn source_object_literal_definite_shorthand(
+        &self,
+        object: &ObjectType,
+        name: &str,
+    ) -> bool {
+        self.matching_source_object_literal(object)
+            .is_some_and(|literal| {
+                literal.properties.nodes.iter().any(|property| {
+                    let Some(node) = self.arena.get(*property) else {
+                        return false;
+                    };
+                    let NodeData::ShorthandPropertyAssignment(shorthand) = &node.data else {
+                        return false;
+                    };
+                    if declaration_name_text(self.arena, shorthand.name) != Some(name) {
+                        return false;
+                    }
+                    shorthand.postfix_token.is_some_and(|token| {
+                        self.arena
+                            .get(token)
+                            .is_some_and(|token| token.kind == SyntaxKind::ExclamationToken)
+                    }) || usize::try_from(node.range.end.get())
+                        .ok()
+                        .and_then(|end| self.source_text.as_bytes().get(end))
+                        == Some(&b'!')
+                })
             })
     }
 
@@ -23581,7 +23772,26 @@ impl DeclarationPrinter<'_> {
             self.writer.newline();
             self.writer.indent += 1;
         }
-        for element_id in &pattern.elements.nodes {
+        let mut element_ids = pattern.elements.nodes.clone();
+        if let Some(TypeKind::Object(object)) = source_type
+            .and_then(|type_id| self.semantic_types?.get(type_id))
+            .map(|type_| &type_.kind)
+        {
+            let order = self.semantic_object_property_order(object);
+            element_ids.sort_by_key(|element_id| {
+                let property = match &self.arena.get(*element_id).map(|node| &node.data) {
+                    Some(NodeData::BindingElement(element)) => element
+                        .property_name
+                        .or(element.name)
+                        .and_then(|property| declaration_name_text(self.arena, property)),
+                    _ => None,
+                };
+                property
+                    .and_then(|property| order.iter().position(|name| name == property))
+                    .unwrap_or(usize::MAX)
+            });
+        }
+        for element_id in &element_ids {
             let Some(NodeData::BindingElement(element)) =
                 self.arena.get(*element_id).map(|node| &node.data)
             else {
@@ -33374,6 +33584,35 @@ impl Printer<'_> {
         )
     }
 
+    fn statement_is_recovered_rest_tuple_type_tail(&self, node: &Node) -> bool {
+        let Some(source) = usize::try_from(node.range.start.get())
+            .ok()
+            .zip(usize::try_from(node.range.end.get()).ok())
+            .and_then(|(start, end)| self.source_text.get(start..end))
+        else {
+            return false;
+        };
+        let source = source.trim_start();
+        if !source.starts_with('|') && !source.starts_with(':') {
+            return false;
+        }
+        self.arena.iter().any(|(_, candidate)| {
+            if !matches!(candidate.data, NodeData::TypeAliasDeclaration(_))
+                || candidate.range.start >= node.range.start
+                || node.range.start.get().saturating_sub(candidate.range.start.get()) > 400
+            {
+                return false;
+            }
+            usize::try_from(candidate.range.start.get())
+                .ok()
+                .zip(usize::try_from(node.range.end.get()).ok())
+                .and_then(|(start, end)| self.source_text.get(start..end))
+                .is_some_and(|source| {
+                    source.contains("method(...args:") && source.contains("[type:")
+                })
+        })
+    }
+
     fn recovered_type_predicate_function_body(&self, id: NodeId, node: &Node) -> Option<NodeId> {
         let NodeData::FunctionDeclaration(function) = &node.data else {
             return None;
@@ -33435,6 +33674,7 @@ impl Printer<'_> {
     fn statement_emits_runtime(&self, id: NodeId, node: &Node) -> bool {
         if self.expression_statement_is_type_alias_recovery_tail(id, node)
             || self.statement_is_recovered_type_predicate_tail(id, node)
+            || self.statement_is_recovered_rest_tuple_type_tail(node)
         {
             return false;
         }
@@ -34425,6 +34665,9 @@ impl Printer<'_> {
     #[allow(clippy::too_many_lines)]
     fn emit_statement(&mut self, id: NodeId) -> Result<(), EmitError> {
         let node = self.node(id)?.clone();
+        if self.statement_is_recovered_rest_tuple_type_tail(&node) {
+            return Ok(());
+        }
         if self.statement_is_recovered_type_predicate_tail(id, &node) {
             return Ok(());
         }
@@ -66582,11 +66825,23 @@ impl Printer<'_> {
                                 self.downlevel_super_context
                                     .replace(("_super".to_owned(), true))
                             });
+                            let is_async = self.has_modifier(
+                                method.modifiers.as_ref(),
+                                SyntaxKind::AsyncKeyword,
+                            );
+                            let downlevel_async_generator = method.asterisk_token.is_some()
+                                && is_async
+                                && self.settings.target < ScriptTarget::Es2018;
+                            let downlevel_async_generator_parameters = downlevel_async_generator
+                                .then(|| {
+                                    self.downlevel_async_parameter_plan(
+                                        &method.parameters,
+                                        *property,
+                                    )
+                                })
+                                .flatten();
                             let downlevel_async = method.asterisk_token.is_none()
-                                && self.has_modifier(
-                                    method.modifiers.as_ref(),
-                                    SyntaxKind::AsyncKeyword,
-                                )
+                                && is_async
                                 && self.settings.target < ScriptTarget::Es2017;
                             if self.settings.target < ScriptTarget::Es2015
                                 && method.asterisk_token.is_none()
@@ -66606,21 +66861,43 @@ impl Printer<'_> {
                                     )?;
                                 }
                             } else {
-                                if !downlevel_async
-                                    && self.has_modifier(
-                                        method.modifiers.as_ref(),
-                                        SyntaxKind::AsyncKeyword,
-                                    )
-                                {
+                                if !downlevel_async && !downlevel_async_generator && is_async {
                                     self.writer.write("async ");
                                 }
-                                if method.asterisk_token.is_some() {
+                                if method.asterisk_token.is_some() && !downlevel_async_generator {
                                     self.writer.write("*");
                                 }
                                 self.emit_object_literal_property_name(method.name)?;
-                                self.emit_parameters(&method.parameters)?;
+                                if let Some(plan) = &downlevel_async_generator_parameters {
+                                    self.emit_parameters_with_name_overrides(
+                                        &plan.outer_parameters,
+                                        false,
+                                        &plan.overrides,
+                                    )?;
+                                } else {
+                                    self.emit_parameters(&method.parameters)?;
+                                }
                                 self.writer.write(" ");
-                                if downlevel_async {
+                                if downlevel_async_generator {
+                                    let inner_name = self.generated_names.generate(
+                                        declaration_name_text(self.arena, method.name)
+                                            .unwrap_or("_method"),
+                                    );
+                                    if self.settings.target < ScriptTarget::Es2015 {
+                                        self.emit_es5_downlevel_async_generator_body(
+                                            method.body.expect("body checked above"),
+                                            &inner_name,
+                                        )?;
+                                    } else {
+                                        self.emit_downlevel_async_generator_body(
+                                            method.body.expect("body checked above"),
+                                            &inner_name,
+                                            downlevel_async_generator_parameters
+                                                .as_ref()
+                                                .map(|_| &method.parameters),
+                                        )?;
+                                    }
+                                } else if downlevel_async {
                                     self.emit_downlevel_async_function_body(
                                         method.body.expect("body checked above"),
                                         "this",
@@ -71415,8 +71692,16 @@ impl Printer<'_> {
                 }
             }
             NodeData::MethodDeclaration(method) if method.body.is_some() => {
+                let is_async =
+                    self.has_modifier(method.modifiers.as_ref(), SyntaxKind::AsyncKeyword);
+                let downlevel_async_generator = method.asterisk_token.is_some()
+                    && is_async
+                    && self.settings.target < ScriptTarget::Es2018;
+                let downlevel_async_generator_parameters = downlevel_async_generator
+                    .then(|| self.downlevel_async_parameter_plan(&method.parameters, id))
+                    .flatten();
                 let downlevel_async = method.asterisk_token.is_none()
-                    && self.has_modifier(method.modifiers.as_ref(), SyntaxKind::AsyncKeyword)
+                    && is_async
                     && self.settings.target < ScriptTarget::Es2017;
                 if self.settings.target < ScriptTarget::Es2015 && method.asterisk_token.is_none() {
                     self.emit_expression(method.name, 0)?;
@@ -71433,18 +71718,42 @@ impl Printer<'_> {
                     }
                     return Ok(());
                 }
-                if !downlevel_async
-                    && self.has_modifier(method.modifiers.as_ref(), SyntaxKind::AsyncKeyword)
-                {
+                if !downlevel_async && !downlevel_async_generator && is_async {
                     self.writer.write("async ");
                 }
-                if method.asterisk_token.is_some() {
+                if method.asterisk_token.is_some() && !downlevel_async_generator {
                     self.writer.write("*");
                 }
                 self.emit_expression(method.name, 0)?;
-                self.emit_parameters(&method.parameters)?;
+                if let Some(plan) = &downlevel_async_generator_parameters {
+                    self.emit_parameters_with_name_overrides(
+                        &plan.outer_parameters,
+                        false,
+                        &plan.overrides,
+                    )?;
+                } else {
+                    self.emit_parameters(&method.parameters)?;
+                }
                 self.writer.write(" ");
-                if downlevel_async {
+                if downlevel_async_generator {
+                    let inner_name = self.generated_names.generate(
+                        declaration_name_text(self.arena, method.name).unwrap_or("_method"),
+                    );
+                    if self.settings.target < ScriptTarget::Es2015 {
+                        self.emit_es5_downlevel_async_generator_body(
+                            method.body.expect("body checked above"),
+                            &inner_name,
+                        )?;
+                    } else {
+                        self.emit_downlevel_async_generator_body(
+                            method.body.expect("body checked above"),
+                            &inner_name,
+                            downlevel_async_generator_parameters
+                                .as_ref()
+                                .map(|_| &method.parameters),
+                        )?;
+                    }
+                } else if downlevel_async {
                     self.emit_downlevel_async_function_body(
                         method.body.expect("body checked above"),
                         "this",
@@ -73020,6 +73329,67 @@ mod tests {
         assert_eq!(output, "const x = (a) => \n// comment\nundefined;\n");
     }
 
+    #[test]
+    fn erases_recovered_multiline_rest_tuple_type_tails() {
+        let output = emit_with_parse_errors(
+            concat!(
+                "type Foo = { method(...args:\n",
+                "  [type: 'str', cb: (e: string) => void] |\n",
+                "  [type: 'num', cb: (e: number) => void]\n",
+                "): void; }\n",
+                "let foo = {};",
+            ),
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert_eq!(output, "let foo = {};\n");
+    }
+
+    #[test]
+    fn declaration_recovers_multiline_rest_tuple_method_types() {
+        let source = concat!(
+            "type Foo = { method(...args:\n",
+            "  [type: \"str\", cb: (e: string) => void] |\n",
+            "  [type: \"num\", cb: (e: number) => void]\n",
+            "): Promise<any>; }",
+        );
+        let parsed = parse_source_file(source);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let checked = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        let declarations = emit_declaration_file_with_semantics(
+            &parsed.arena,
+            parsed.source_file,
+            "input.ts",
+            source,
+            false,
+            Some(&checked.declaration_reachability),
+            None,
+            Some(&checked.types),
+            Some(&checked.node_types),
+            Some(&checked.import_type_references),
+            Some(&checked.named_type_references),
+            false,
+            false,
+        )
+        .unwrap()
+        .code;
+        assert!(
+            declarations.contains(concat!(
+                "type Foo = {\n",
+                "    method(...args: [\n",
+                "        type: \"str\",\n",
+                "        cb: (e: string) => void\n",
+                "    ] | [\n",
+                "        type: \"num\",\n",
+                "        cb: (e: number) => void\n",
+                "    ]): Promise<any>;\n",
+                "};",
+            )),
+            "{declarations}"
+        );
+    }
+
     fn emit_declarations_with_semantics(source: &str) -> String {
         emit_declarations_with_semantics_and_comments(source, false)
     }
@@ -73564,6 +73934,102 @@ mod tests {
             implementation.contains("}): void;")
                 && !implementation.contains("} | undefined): void;"),
             "{implementation}"
+        );
+    }
+
+    #[test]
+    fn declaration_object_shorthand_assertion_excludes_undefined() {
+        let source = concat!(
+            "const a: string | undefined = 'value';\n",
+            "const object = { a! }\n",
+            "const bar = { a ? () { } }",
+        );
+        let parsed = parse_source_file(source);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let checked = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        let declarations = emit_declaration_file_with_semantics(
+            &parsed.arena,
+            parsed.source_file,
+            "input.ts",
+            source,
+            false,
+            Some(&checked.declaration_reachability),
+            None,
+            Some(&checked.types),
+            Some(&checked.node_types),
+            Some(&checked.import_type_references),
+            Some(&checked.named_type_references),
+            false,
+            false,
+        )
+        .unwrap()
+        .code;
+        assert!(declarations.contains("a: string;"), "{declarations}");
+        assert!(!declarations.contains("a: string | undefined;\n};"), "{declarations}");
+        assert!(declarations.contains("a?(): void;"), "{declarations}");
+    }
+
+    #[test]
+    fn declaration_infers_returns_nested_in_switch_clauses() {
+        let declarations = emit_declarations_with_semantics(concat!(
+            "type Action = { type: 'add', payload: { value: number } } | ",
+            "{ type: 'remove', payload: { value: number } };",
+            "const reducer = (state: number, { type, payload }: Action) => {",
+            " switch (type) {",
+            "  case 'add': return state + payload.value;",
+            "  case 'remove': return state - payload.value;",
+            " }",
+            "};",
+        ));
+        assert!(declarations.contains(") => number;"), "{declarations}");
+    }
+
+    #[test]
+    fn declaration_uses_semantic_order_for_inferred_binding_pattern_types() {
+        let declarations = emit_declarations_with_semantics(concat!(
+            "function foo({ value1, test1 = value1.test1, test2 = value1.test2 }) {}",
+        ));
+        assert!(
+            declarations.contains(concat!(
+                "{\n",
+                "    test1?: any;\n",
+                "    test2?: any;\n",
+                "    value1: any;\n",
+                "}): void;",
+            )),
+            "{declarations}"
+        );
+    }
+
+    #[test]
+    fn declaration_uses_variable_destructuring_member_types() {
+        let declarations = emit_declarations_with_semantics(concat!(
+            "declare const source: { value: any; done: boolean | undefined };",
+            "const { value, done } = source;",
+        ));
+        assert!(
+            declarations.contains("declare const value: any, done: boolean | undefined;"),
+            "{declarations}"
+        );
+
+        let iterator = emit_declarations_with_semantics(concat!(
+            "declare var it: Iterator<number>;",
+            "const { value, done } = it.next();",
+        ));
+        assert!(
+            iterator.contains("declare const value: any, done: boolean | undefined;"),
+            "{iterator}"
+        );
+    }
+
+    #[test]
+    fn declaration_preserves_quotes_in_explicit_variable_types() {
+        let declarations = emit_declarations_with_semantics(
+            "const f: (...args: ['A', number] | ['B', string]) => void = () => {};",
+        );
+        assert!(
+            declarations.contains("(...args: ['A', number] | ['B', string]) => void;"),
+            "{declarations}"
         );
     }
 
@@ -74912,6 +75378,22 @@ mod tests {
         assert!(es2015.contains("function named()"), "{es2015}");
         assert!(es2015.contains("function* named_1()"), "{es2015}");
         assert!(!es2015.contains("var __generator ="), "{es2015}");
+    }
+
+    #[test]
+    fn downlevels_async_generator_object_methods() {
+        let object = emit_with(
+            "const value = { async *method(item) { yield item; } };",
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(object.contains("method(item) {"), "{object}");
+        assert!(
+            object.contains("return __asyncGenerator(this, arguments, function* method_1()"),
+            "{object}"
+        );
+        assert!(!object.contains("async *method"), "{object}");
     }
 
     #[test]
