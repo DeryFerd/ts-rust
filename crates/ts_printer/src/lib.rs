@@ -40427,33 +40427,6 @@ impl Printer<'_> {
                     &mut field_temps,
                 );
             }
-            let needs_class_temp = self.settings.target < ScriptTarget::Es2022
-                && *is_expression
-                && !self.class_expression_temps.contains_key(class_id)
-                && !self.class_expression_is_in_es5_captured_for_scope(*class_id)
-                && self
-                    .arena
-                    .get(*class_id)
-                    .and_then(|node| match &node.data {
-                        NodeData::ClassExpression(class) => {
-                            Some(self.class_expression_requires_post_class_lowering(
-                                &Self::class_expression_as_declaration(class),
-                            ))
-                        }
-                        _ => None,
-                    })
-                    .unwrap_or(false);
-            if needs_class_temp {
-                let temp = self.generate_block_temp(source_file, &claimed);
-                claimed.insert(temp.clone());
-                self.class_expression_temps.insert(*class_id, temp.clone());
-                if self
-                    .class_expression_instance_field_owner(*class_id)
-                    .is_none()
-                {
-                    field_temps.push(temp);
-                }
-            }
             if !*is_expression {
                 self.prepare_class_static_block_declaration_plan(
                     *class_id,
@@ -40492,6 +40465,33 @@ impl Printer<'_> {
                 self.computed_property_temps
                     .insert(property.name, temp.clone());
                 field_temps.push(temp);
+            }
+            let needs_class_temp = self.settings.target < ScriptTarget::Es2022
+                && *is_expression
+                && !self.class_expression_temps.contains_key(class_id)
+                && !self.class_expression_is_in_es5_captured_for_scope(*class_id)
+                && self
+                    .arena
+                    .get(*class_id)
+                    .and_then(|node| match &node.data {
+                        NodeData::ClassExpression(class) => {
+                            Some(self.class_expression_requires_post_class_lowering(
+                                &Self::class_expression_as_declaration(class),
+                            ))
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or(false);
+            if needs_class_temp {
+                let temp = self.generate_block_temp(source_file, &claimed);
+                claimed.insert(temp.clone());
+                self.class_expression_temps.insert(*class_id, temp.clone());
+                if self
+                    .class_expression_instance_field_owner(*class_id)
+                    .is_none()
+                {
+                    field_temps.push(temp);
+                }
             }
             if self.settings.target >= ScriptTarget::Es2022
                 && self.settings.use_define_for_class_fields == Some(false)
@@ -55491,8 +55491,8 @@ impl Printer<'_> {
                 .is_empty()
             && (self.settings.target < ScriptTarget::Es2022
                 || self.settings.use_define_for_class_fields == Some(false))
-            && data.members.nodes.iter().any(|member| {
-                let Some(member) = self.arena.get(*member) else {
+            && data.members.nodes.iter().any(|member_id| {
+                let Some(member) = self.arena.get(*member_id) else {
                     return false;
                 };
                 let NodeData::PropertyDeclaration(property) = &member.data else {
@@ -55511,6 +55511,13 @@ impl Printer<'_> {
                             self.arena.get(property.name).map(|node| &node.data),
                             Some(NodeData::ComputedPropertyName(_))
                         ))
+                    || (matches!(
+                        self.arena.get(property.name).map(|node| &node.data),
+                        Some(NodeData::ComputedPropertyName(_))
+                    ) && self.computed_property_requires_runtime_evaluation(
+                        *member_id,
+                        property,
+                    ))
             })
     }
 
@@ -56795,6 +56802,27 @@ impl Printer<'_> {
         let suppressed_member_ranges = self.suppressed_class_empty_element_ranges
             [suppressed_range_count..]
             .to_vec();
+        for (index, member) in data.members.nodes.iter().enumerate() {
+            let Some(node) = self.arena.get(*member) else {
+                continue;
+            };
+            let NodeData::PropertyDeclaration(property) = &node.data else {
+                continue;
+            };
+            if !self.property_is_static(property)
+                || property.initializer.is_some()
+                || !self.class_static_field_name_conflicts_with_function(property.name)
+            {
+                continue;
+            }
+            let comment_end = data
+                .members
+                .nodes
+                .get(index + 1)
+                .and_then(|next| self.arena.get(*next))
+                .map_or(data.members.range.end.get(), |next| next.range.start.get());
+            self.discard_source_comments_between(node.range.end.get(), comment_end);
+        }
         for (start, end) in &suppressed_member_ranges {
             self.discard_source_comments_between(*start, *end);
         }
@@ -57004,7 +57032,7 @@ impl Printer<'_> {
                     self.writer.write(")(),");
                 }
                 NodeData::PropertyDeclaration(property)
-                    if self.class_field_emits_runtime_value(property)
+                    if self.class_static_field_emits_runtime_value(property)
                         && self.has_modifier(
                             property.modifiers.as_ref(),
                             SyntaxKind::StaticKeyword,
@@ -57356,7 +57384,7 @@ impl Printer<'_> {
                         ) {
                             return true;
                         }
-                        if self.class_field_emits_runtime_value(property)
+                        if self.class_static_field_emits_runtime_value(property)
                             && self.has_modifier(
                                 property.modifiers.as_ref(),
                                 SyntaxKind::StaticKeyword,
@@ -57396,6 +57424,41 @@ impl Printer<'_> {
             SyntaxKind::DeclareKeyword,
         ) && (property.initializer.is_some()
             || self.settings.use_define_for_class_fields == Some(true))
+    }
+
+    fn class_static_field_emits_runtime_value(
+        &self,
+        property: &ts_ast::PropertyDeclarationData,
+    ) -> bool {
+        self.class_field_emits_runtime_value(property)
+            && !(self.property_is_static(property)
+                && property.initializer.is_none()
+                && self.class_static_field_name_conflicts_with_function(property.name))
+    }
+
+    fn class_static_field_name_conflicts_with_function(&self, name: NodeId) -> bool {
+        let conflicts = |text: &str| {
+            matches!(
+                text,
+                "name" | "length" | "prototype" | "caller" | "arguments"
+            )
+        };
+        match self.arena.get(name).map(|node| &node.data) {
+            Some(NodeData::Identifier(identifier)) => conflicts(&identifier.text),
+            Some(NodeData::StringLiteral(literal)) => conflicts(&literal.text),
+            Some(NodeData::ComputedPropertyName(computed)) => {
+                let expression = self.unwrap_erased_expression(computed.expression);
+                match self.arena.get(expression).map(|node| &node.data) {
+                    Some(NodeData::PropertyAccessExpression(access)) =>
+                        declaration_name_text(self.arena, access.name).is_some_and(conflicts),
+                    Some(NodeData::ElementAccessExpression(access)) => self
+                        .constant_property_name(access.argument_expression)
+                        .as_deref().is_some_and(conflicts),
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
     }
 
     fn computed_property_requires_runtime_evaluation(
@@ -58377,6 +58440,11 @@ impl Printer<'_> {
             return Ok(());
         }
         let initializer = property.initializer;
+        if initializer.is_none()
+            && self.class_static_field_name_conflicts_with_function(property.name)
+        {
+            return Ok(());
+        }
         if initializer.is_none() && self.settings.use_define_for_class_fields != Some(true) {
             return Ok(());
         }
@@ -58444,6 +58512,12 @@ impl Printer<'_> {
         self.writer.write(" = ");
         self.emit_downlevel_class_value(data, &name, false)?;
         self.writer.write(";");
+        if self.commonjs_class_export_precedes_static_initializers(data)
+            && let Some(name) = data.name
+        {
+            let names = self.declaration_names(&[name]);
+            self.emit_commonjs_declaration_exports(data.modifiers.as_ref(), &names);
+        }
         self.emit_unconsumed_class_declaration_computed_properties(data)?;
         Ok(())
     }
@@ -60184,7 +60258,13 @@ impl Printer<'_> {
                 .nodes
                 .get(index + 1)
                 .and_then(|next| self.arena.get(*next).map(|node| node.range.start.get()))
+                .or_else(|| {
+                    node.parent
+                        .and_then(|class| self.arena.get(class))
+                        .map(|class| class.range.end.get().saturating_sub(1))
+                })
                 .unwrap_or(data.members.range.end.get());
+            self.restore_source_comments_between(node.range.end.get(), comment_end, true);
             let comment_count = self.emitted_source_comments.len();
             self.emit_source_comments_between_with_ownership(
                 node.range.end.get(),
@@ -60746,6 +60826,11 @@ impl Printer<'_> {
                 continue;
             }
             let initializer = property.initializer;
+            if initializer.is_none()
+                && self.class_static_field_name_conflicts_with_function(property.name)
+            {
+                continue;
+            }
             if initializer.is_none() && self.settings.use_define_for_class_fields != Some(true) {
                 continue;
             }
@@ -80072,6 +80157,35 @@ mod tests {
                 "{output}"
             );
         }
+    }
+
+    #[test]
+    fn skips_conflicting_static_function_fields_and_exports_before_key_effects() {
+        let define = emit_with_define(
+            "class C { static name; name; } const Value = class { static length; length; };",
+            ScriptTarget::Es2015,
+        )
+        .code;
+        assert_eq!(define.matches("Object.defineProperty(this, \"name\"").count(), 1);
+        assert_eq!(
+            define
+                .matches("Object.defineProperty(this, \"length\"")
+                .count(),
+            1
+        );
+        assert!(!define.contains("Object.defineProperty(C, \"name\""), "{define}");
+
+        let commonjs = emit_with(
+            "declare const holder: any; export class C { static [holder.key]: number; [holder.key]: string; }",
+            ScriptTarget::Es5,
+            ModuleKind::CommonJs,
+        )
+        .code;
+        let export = commonjs.find("exports.C = C;").unwrap();
+        let key_effects = commonjs
+            .find("holder.key, holder.key;")
+            .unwrap_or_else(|| panic!("{commonjs}"));
+        assert!(export < key_effects, "{commonjs}");
     }
 
     #[test]
