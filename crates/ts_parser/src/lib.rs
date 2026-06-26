@@ -614,6 +614,14 @@ impl<'a> Parser<'a> {
         let async_starts_function = self.current.kind == SyntaxKind::AsyncKeyword
             && !self.next_token_preceded_by_line_break()
             && self.next_token_kind() == SyntaxKind::FunctionKeyword;
+        let async_starts_declaration = self.current.kind == SyntaxKind::AsyncKeyword
+            && !self.next_token_preceded_by_line_break()
+            && matches!(
+                self.next_token_kind(),
+                SyntaxKind::ClassKeyword
+                    | SyntaxKind::EnumKeyword
+                    | SyntaxKind::InterfaceKeyword
+            );
         let let_starts_declaration = self.is_let_declaration();
         let static_starts_recovered_call = self.static_starts_recovered_call_statement();
         let (import_starts_expression, invalid_import_declaration) =
@@ -667,7 +675,11 @@ impl<'a> Parser<'a> {
             SyntaxKind::DeclareKeyword if declare_starts_expression => {
                 self.parse_expression_statement()
             }
-            SyntaxKind::AsyncKeyword if !async_starts_function => self.parse_expression_statement(),
+            SyntaxKind::AsyncKeyword
+                if !async_starts_function && !async_starts_declaration =>
+            {
+                self.parse_expression_statement()
+            }
             SyntaxKind::StaticKeyword if static_starts_recovered_call => {
                 self.bump();
                 self.parse_expression_statement()
