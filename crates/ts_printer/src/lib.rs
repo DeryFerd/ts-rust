@@ -26430,6 +26430,23 @@ fn identifier_is_unqualified_value_reference(arena: &NodeArena, identifier: Node
     )
 }
 
+fn identifier_is_in_erased_type_context(arena: &NodeArena, identifier: NodeId) -> bool {
+    let mut current = identifier;
+    while let Some(parent) = arena.get(current).and_then(|node| node.parent) {
+        let Some(parent_node) = arena.get(parent) else {
+            return false;
+        };
+        if node_is_erased_type_context(parent_node) {
+            return true;
+        }
+        if matches!(parent_node.data, NodeData::SourceFile(_)) {
+            return false;
+        }
+        current = parent;
+    }
+    false
+}
+
 const fn variable_list_is_block_scoped(node: &Node) -> bool {
     node.flags.0 & 3 != 0
 }
@@ -27998,6 +28015,7 @@ impl Printer<'_> {
                             NodeData::Identifier(identifier) if identifier.text == class_text
                         )
                         && identifier_is_unqualified_value_reference(self.arena, candidate)
+                        && !identifier_is_in_erased_type_context(self.arena, candidate)
                         && self.bindings.resolve_name_at(candidate, class_text)
                             == Some(class_symbol)
                 })
@@ -28401,6 +28419,20 @@ impl Printer<'_> {
     }
 
     fn active_static_private_field(&self, name: NodeId) -> Option<&StaticPrivateFieldInfo> {
+        let field = self.nearest_active_static_private_field(name)?;
+        if let Some(instance) = self.nearest_active_private_field(name)
+            && self.private_member_class_distance(name, instance.member)
+                < self.private_member_class_distance(name, field.member)
+        {
+            return None;
+        }
+        Some(field)
+    }
+
+    fn nearest_active_static_private_field(
+        &self,
+        name: NodeId,
+    ) -> Option<&StaticPrivateFieldInfo> {
         let NodeData::PrivateIdentifier(name) = &self.arena.get(name)?.data else {
             return None;
         };
@@ -28414,6 +28446,19 @@ impl Printer<'_> {
                     .rev()
                     .find(|field| field.private_name == private_name)
             })
+    }
+
+    fn current_static_private_field(&self, name: NodeId) -> Option<&StaticPrivateFieldInfo> {
+        let NodeData::PrivateIdentifier(name) = &self.arena.get(name)?.data else {
+            return None;
+        };
+        let private_name = name.text.trim_start_matches('#');
+        self.active_static_private_field_plan
+            .as_ref()?
+            .fields
+            .iter()
+            .rev()
+            .find(|field| field.private_name == private_name)
     }
 
     fn active_static_private_field_plan_for_member(
@@ -28431,6 +28476,17 @@ impl Printer<'_> {
     }
 
     fn active_private_field(&self, name: NodeId) -> Option<&PrivateFieldInfo> {
+        let field = self.nearest_active_private_field(name)?;
+        if let Some(static_field) = self.nearest_active_static_private_field(name)
+            && self.private_member_class_distance(name, static_field.member)
+                < self.private_member_class_distance(name, field.member)
+        {
+            return None;
+        }
+        Some(field)
+    }
+
+    fn nearest_active_private_field(&self, name: NodeId) -> Option<&PrivateFieldInfo> {
         let NodeData::PrivateIdentifier(name) = &self.arena.get(name)?.data else {
             return None;
         };
@@ -28444,6 +28500,40 @@ impl Printer<'_> {
                     .rev()
                     .find(|field| field.private_name == private_name)
             })
+    }
+
+    fn private_member_class_distance(&self, name: NodeId, member: NodeId) -> usize {
+        let Some(target_class) = self.arena.get(member).and_then(|member| member.parent) else {
+            return usize::MAX;
+        };
+        let mut current = name;
+        let mut distance = 0_usize;
+        while let Some(parent) = self.arena.get(current).and_then(|node| node.parent) {
+            if parent == target_class {
+                return distance;
+            }
+            if matches!(
+                self.arena.get(parent).map(|node| &node.data),
+                Some(NodeData::ClassDeclaration(_) | NodeData::ClassExpression(_))
+            ) {
+                distance += 1;
+            }
+            current = parent;
+        }
+        usize::MAX
+    }
+
+    fn current_private_field(&self, name: NodeId) -> Option<&PrivateFieldInfo> {
+        let NodeData::PrivateIdentifier(name) = &self.arena.get(name)?.data else {
+            return None;
+        };
+        let private_name = name.text.trim_start_matches('#');
+        self.active_private_field_plan
+            .as_ref()?
+            .fields
+            .iter()
+            .rev()
+            .find(|field| field.private_name == private_name)
     }
 
     fn active_private_in_state(&self, name: NodeId) -> Option<String> {
@@ -53392,6 +53482,8 @@ impl Printer<'_> {
             }
             return result;
         }
+        let defer_static_fields_for_class = self.defer_static_fields;
+        self.defer_static_fields = false;
         let private_plan = self.private_method_plan(data);
         let previous_private_plan = self.active_private_method_plan.clone();
         if let Some(previous) = &previous_private_plan {
@@ -53569,7 +53661,7 @@ impl Printer<'_> {
                             SyntaxKind::DeclareKeyword,
                         ) && !self.property_is_native_private_field(property)
                             && !self.class_private_name_is_duplicate(data, property.name)
-                            && self.active_static_private_field(property.name).is_none()
+                            && self.current_static_private_field(property.name).is_none()
                             && (property.initializer.is_some()
                                 || self.settings.use_define_for_class_fields == Some(true))
                 );
@@ -53592,7 +53684,7 @@ impl Printer<'_> {
                             || self.property_is_auto_accessor(property)
                             || self.property_is_recovered_super_call_type(property)
                             || self.class_private_name_is_duplicate(data, property.name)
-                            || self.active_static_private_field(property.name).is_some()
+                            || self.current_static_private_field(property.name).is_some()
                             || !lower_fields
                             || self.property_is_native_private_field(property))
                     }
@@ -53804,7 +53896,7 @@ impl Printer<'_> {
                     if lower_fields
                         && !self.property_is_native_private_field(property)
                         && !self.class_private_name_is_duplicate(data, property.name)
-                        && self.active_static_private_field(property.name).is_none() => {}
+                        && self.current_static_private_field(property.name).is_none() => {}
                 NodeData::PropertyDeclaration(property) => {
                     if self.has_modifier(property.modifiers.as_ref(), SyntaxKind::StaticKeyword) {
                         self.writer.write("static ");
@@ -53915,10 +54007,10 @@ impl Printer<'_> {
             if self.active_anonymous_private_class.is_none() {
                 if let Some(plan) = &private_plan {
                     self.emit_private_method_initializers(data, plan)?;
-                    if !self.defer_static_fields {
+                    if !defer_static_fields_for_class {
                         self.emit_private_lowered_static_elements(data, plan)?;
                     }
-                } else if !self.defer_static_fields {
+                } else if !defer_static_fields_for_class {
                     if let Some(plan) = &private_field_plan {
                         self.emit_private_field_initializers(plan);
                     }
@@ -53949,6 +54041,7 @@ impl Printer<'_> {
         if self.active_static_private_field_plan.is_some() {
             self.enclosing_static_private_field_plans.pop();
         }
+        self.defer_static_fields = defer_static_fields_for_class;
         Ok(())
     }
 
@@ -56093,7 +56186,7 @@ impl Printer<'_> {
             || (self.settings.target >= ScriptTarget::Es2022
                 && self.settings.use_define_for_class_fields == Some(false))
             || self.property_is_native_private_field(property)
-            || self.active_static_private_field(property.name).is_some()
+            || self.current_static_private_field(property.name).is_some()
         {
             return Ok(());
         }
@@ -57495,7 +57588,7 @@ impl Printer<'_> {
                 continue;
             }
             let static_duplicate_field = self
-                .active_static_private_field(property.name)
+                .current_static_private_field(property.name)
                 .cloned()
                 .or_else(|| {
                     let NodeData::PrivateIdentifier(name) =
@@ -57524,7 +57617,7 @@ impl Printer<'_> {
                 self.writer.newline();
                 continue;
             }
-            if let Some(field) = self.active_private_field(property.name).cloned() {
+            if let Some(field) = self.current_private_field(property.name).cloned() {
                 self.writer.write(&field.storage);
                 self.writer.write(".set(");
                 self.writer.write(receiver);
@@ -57535,7 +57628,22 @@ impl Printer<'_> {
                     self.writer.write("void 0");
                 }
                 self.writer.write(");");
-                self.writer.newline();
+                let comment_end = data
+                    .members
+                    .nodes
+                    .get(index + 1)
+                    .and_then(|next| self.arena.get(*next).map(|node| node.range.start.get()))
+                    .unwrap_or(data.members.range.end.get());
+                let comment_count = self.emitted_source_comments.len();
+                self.emit_source_comments_between_with_ownership(
+                    node.range.end.get(),
+                    comment_end,
+                    true,
+                    false,
+                );
+                if self.emitted_source_comments.len() == comment_count {
+                    self.writer.newline();
+                }
                 continue;
             }
             let emits_field = self.property_is_auto_accessor(property)
@@ -57809,7 +57917,7 @@ impl Printer<'_> {
             if !self.property_is_static(property) {
                 continue;
             }
-            if self.active_static_private_field(property.name).is_some() {
+            if self.current_static_private_field(property.name).is_some() {
                 continue;
             }
             let initializer = property.initializer;
@@ -73387,6 +73495,19 @@ mod tests {
     }
 
     #[test]
+    fn private_method_planning_ignores_generic_type_references_to_the_class() {
+        let output = emit_with(
+            "class C<T> { #method(): T { throw 0; } call(value: C<T>) { return value.#method(); } }",
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(output.contains("var _C_instances, _C_method;"), "{output}");
+        assert!(!output.contains("var _C_instances, _a"), "{output}");
+        assert!(!output.contains("_a = C"), "{output}");
+    }
+
+    #[test]
     fn preserves_reserved_private_constructor_recovery_without_get_helper() {
         let output = emit_with(
             "class A { #constructor() {} }",
@@ -73442,6 +73563,26 @@ mod tests {
             output.contains(
                 "__classPrivateFieldGet(new _b(), _D_instances, \"m\", _D_bar)"
             ),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn nested_instance_private_field_shadows_an_outer_static_field() {
+        let output = emit_with(
+            concat!(
+                "class A { static #x = 5; constructor() { class B { #x = 5; ",
+                "constructor() { class C { read() { return A.#x; } } } } } }",
+            ),
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(output.contains("_B_x.set(this, 5);"), "{output}");
+        assert!(output.contains("_B_x = new WeakMap();"), "{output}");
+        assert!(!output.contains("            #x = 5;"), "{output}");
+        assert!(
+            output.contains("__classPrivateFieldGet(_a, _B_x, \"f\")"),
             "{output}"
         );
     }
@@ -73919,6 +74060,29 @@ mod tests {
         let initializer = output.find("_C_value = new WeakMap();").expect("initializer");
         let class_return = output.find("return C;").expect("class return");
         assert!(declaration < initializer && initializer < class_return, "{output}");
+    }
+
+    #[test]
+    fn preserves_private_field_trailing_comments_in_a_synthesized_constructor() {
+        let output = emit_with(
+            concat!(
+                "class Parent {} class Child extends Parent { ",
+                "#foo = \"foo\"; // first\n",
+                "#bar = \"bar\"; // second\n",
+                "}",
+            ),
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(
+            output.contains("_Child_foo.set(this, \"foo\"); // first"),
+            "{output}"
+        );
+        assert!(
+            output.contains("_Child_bar.set(this, \"bar\"); // second"),
+            "{output}"
+        );
     }
 
     #[test]
