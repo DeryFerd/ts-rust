@@ -54453,7 +54453,18 @@ impl Printer<'_> {
                 ),
                 _ => continue,
             };
-            let decorators = self.class_decorator_expressions(modifiers);
+            let decorator_modifiers = if class_member_has_legacy_decorators(
+                self.arena,
+                *member_id,
+            ) {
+                modifiers
+            } else {
+                accessor_pair
+                    .and_then(|pair| self.arena.get(pair))
+                    .and_then(declaration_modifiers)
+                    .or(modifiers)
+            };
+            let decorators = self.class_decorator_expressions(decorator_modifiers);
             let parameter_decorators = parameters
                 .into_iter()
                 .flat_map(|parameters| parameters.nodes.iter().enumerate())
@@ -54489,7 +54500,7 @@ impl Printer<'_> {
                     self.writer.write(")");
                 } else {
                     self.emit_decorator_expression(*decorator)?;
-                    self.emit_decorator_trailing_line_comment(*decorator, modifiers);
+                    self.emit_decorator_trailing_line_comment(*decorator, decorator_modifiers);
                 }
                 if self.emit_decorator_metadata || index + 1 != entries.len() {
                     self.writer.write(",");
