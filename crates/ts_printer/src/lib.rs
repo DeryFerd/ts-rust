@@ -1870,6 +1870,16 @@ pub fn emit_source_file_with_context(
             );
         } else if !is_external_module {
             printer.emit_reference_directives_between(0, source_end);
+        } else if data.statements.nodes.iter().any(|statement| {
+            arena.get(*statement).is_some_and(|node| {
+                declaration_has_modifier(arena, node, SyntaxKind::ExportKeyword)
+                    && !matches!(
+                        node.data,
+                        NodeData::ExportDeclaration(_) | NodeData::ExportAssignment(_)
+                    )
+            })
+        }) {
+            printer.emit_preserved_lib_reference_directives_between(0, source_end);
         }
     }
     let needs_synthesized_empty_export = preserves_external_module_syntax
@@ -15559,15 +15569,24 @@ impl DeclarationPrinter<'_> {
         let Some(trivia) = self.source_text.get(start..end) else {
             return;
         };
-        let mut cursor = trivia_comma_offset(trivia).map_or(0, |comma| comma + 1);
+        let comma = trivia_comma_offset(trivia);
+        let mut cursor = comma.map_or(0, |comma| comma + 1);
         let initial_cursor = cursor;
+        let mut last_comment_started_inline = false;
+        let mut emitted_comment = false;
         while let Some(relative_start) = trivia[cursor..].find("/*") {
             let comment_start = cursor + relative_start;
             let Some(relative_end) = trivia[comment_start + 2..].find("*/") else {
                 break;
             };
             let comment_end = comment_start + 2 + relative_end + 2;
-            if trivia[cursor..comment_start].contains(['\n', '\r']) && !self.writer.line_start {
+            if comma.is_some() && !trivia[comment_start..comment_end].starts_with("/**") {
+                cursor = comment_end;
+                continue;
+            }
+            emitted_comment = true;
+            last_comment_started_inline = !trivia[cursor..comment_start].contains(['\n', '\r']);
+            if !last_comment_started_inline && !self.writer.line_start {
                 self.writer.newline_preserving_trailing_spaces();
             }
             let absolute_start = start + comment_start;
@@ -15590,9 +15609,11 @@ impl DeclarationPrinter<'_> {
             }
             cursor = comment_end;
         }
-        if cursor != initial_cursor {
+        if emitted_comment && cursor != initial_cursor {
             if trivia[cursor..].contains(['\n', '\r']) {
-                if !self.writer.line_start {
+                if last_comment_started_inline && !self.writer.line_start {
+                    self.writer.write(" ");
+                } else if !self.writer.line_start {
                     self.writer.newline_preserving_trailing_spaces();
                 }
             } else if !self.writer.line_start {
@@ -16605,8 +16626,7 @@ impl DeclarationPrinter<'_> {
                 if self.source_text[start..position].contains("@internal") {
                     return true;
                 }
-                position = start;
-                continue;
+                break;
             }
             let line_start = self.source_text[..position]
                 .rfind(['\n', '\r'])
@@ -16618,7 +16638,7 @@ impl DeclarationPrinter<'_> {
             if line.contains("@internal") {
                 return true;
             }
-            position = line_start;
+            break;
         }
         false
     }
@@ -18341,6 +18361,9 @@ impl DeclarationPrinter<'_> {
             let NodeData::ParameterDeclaration(parameter) = &parameter_node.data else {
                 continue;
             };
+            if self.has_internal_annotation(*parameter_id) {
+                continue;
+            }
             let is_parameter_property = parameter.modifiers.as_ref().is_some_and(|modifiers| {
                 modifiers.list.nodes.iter().any(|modifier| {
                     self.arena.get(*modifier).is_some_and(|modifier| {
@@ -31973,6 +31996,45 @@ impl Printer<'_> {
         self.emit_reference_directives_between_with_ownership(start, end, false, true);
     }
 
+    fn emit_preserved_lib_reference_directives_between(&mut self, start: u32, end: u32) {
+        if self.settings.remove_comments {
+            return;
+        }
+        let start = usize::try_from(start).unwrap_or(usize::MAX);
+        let end = usize::try_from(end).unwrap_or(usize::MAX);
+        let Some(trivia) = self.source_text.get(start..end) else {
+            return;
+        };
+        let bytes = trivia.as_bytes();
+        let mut index = 0;
+        while index < bytes.len() {
+            if !bytes[index..].starts_with(b"//") {
+                index += 1;
+                continue;
+            }
+            let comment_end = bytes[index..]
+                .iter()
+                .position(|byte| matches!(*byte, b'\n' | b'\r'))
+                .map_or(bytes.len(), |offset| index + offset);
+            let comment = &trivia[index..comment_end];
+            let comment_range = (start + index, start + comment_end);
+            let line_start = trivia[..index]
+                .rfind(['\n', '\r'])
+                .map_or(0, |line_break| line_break + 1);
+            if trivia[line_start..index].trim().is_empty()
+                && is_reference_directive(comment)
+                && comment.contains("<reference lib=")
+                && (comment.contains("preserve=\"true\"")
+                    || comment.contains("preserve='true'"))
+                && self.emitted_source_comments.insert(comment_range)
+            {
+                self.writer.write(comment);
+                self.writer.newline_preserving_trailing_spaces();
+            }
+            index = comment_end.max(index + 2);
+        }
+    }
+
     fn emit_reference_directives_between_with_ownership(
         &mut self,
         start: u32,
@@ -32303,7 +32365,8 @@ impl Printer<'_> {
                         &trivia[index..comment_end],
                         comment_range.0,
                         !inline_after,
-                        terminal_comment && !immediate_trailing,
+                        (terminal_comment && !immediate_trailing)
+                            || (immediate_trailing && !inline_after),
                     );
                     if inline_after {
                         self.writer.write(" ");
@@ -76863,6 +76926,17 @@ mod tests {
     }
 
     #[test]
+    fn preserves_space_after_inline_block_comment_before_newline() {
+        let output = emit_with(
+            "class C { constructor(first, /** retained */\n// next\nsecond) {} }",
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(output.contains("/** retained */ \n"), "{output}");
+    }
+
+    #[test]
     fn separates_a_final_block_comment_from_the_synthesized_newline() {
         assert_eq!(
             emit_with(
@@ -81793,6 +81867,30 @@ class Board {
             emit_with(source, ScriptTarget::Es2015, ModuleKind::None).code,
             "/// <reference lib=\"dom\" />\n",
         );
+    }
+
+    #[test]
+    fn preserves_lib_reference_in_external_module_with_erased_runtime() {
+        let source = concat!(
+            "/// <reference lib=\"dom\" preserve=\"true\" />\n",
+            "export declare const element: HTMLElement;\n",
+        );
+        assert_eq!(
+            emit_with(source, ScriptTarget::EsNext, ModuleKind::CommonJs).code,
+            concat!(
+                "\"use strict\";\n",
+                "Object.defineProperty(exports, \"__esModule\", { value: true });\n",
+                "/// <reference lib=\"dom\" preserve=\"true\" />\n",
+            )
+        );
+        let empty_export = concat!(
+            "/// <reference lib=\"dom\" preserve=\"true\" />\n",
+            "export {};\n",
+            "declare const element: HTMLElement;\n",
+        );
+        assert!(!emit_with(empty_export, ScriptTarget::EsNext, ModuleKind::CommonJs)
+            .code
+            .contains("<reference"));
     }
 
     #[test]
