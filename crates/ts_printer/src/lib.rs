@@ -32821,7 +32821,7 @@ impl Printer<'_> {
                 }
                 if defer_system_static_fields {
                     self.writer.remove_trailing_newline();
-                    self.emit_native_static_fields(emitted_class)?;
+                    self.emit_native_static_fields(emitted_class, Some(&name))?;
                     self.writer.newline();
                 }
                 if let Some(symbol) = class_symbol {
@@ -36262,6 +36262,19 @@ impl Printer<'_> {
                     && self.has_modifier(data.modifiers.as_ref(), SyntaxKind::ExportKeyword)
                     )
                 .then(|| self.generated_names.generate("default"));
+                let preserved_default_name = (!self.commonjs_module_transform
+                    && self.system_export_function.is_none()
+                    && self.namespace_containers.is_empty()
+                    && data.name.is_none()
+                    && self.has_modifier(data.modifiers.as_ref(), SyntaxKind::ExportKeyword)
+                    && self.has_modifier(data.modifiers.as_ref(), SyntaxKind::DefaultKeyword)
+                    && (self.settings.target < ScriptTarget::Es2022
+                        || self.settings.use_define_for_class_fields == Some(false))
+                    && self.class_expression_requires_post_class_lowering(data))
+                .then(|| self.generated_names.generate("default"));
+                let emitted_default_name = commonjs_default_name
+                    .as_deref()
+                    .or(preserved_default_name.as_deref());
                 let lower_preserved_default = self.settings.target < ScriptTarget::Es2015
                     && !self.commonjs_module_transform
                     && self.system_export_function.is_none()
@@ -36276,14 +36289,16 @@ impl Printer<'_> {
                     && !self.has_modifier(data.modifiers.as_ref(), SyntaxKind::DefaultKeyword);
                 if !emitted_stage3_class_decorators && !needs_decorated_binding {
                     if !lower_preserved_default && !lower_preserved_named {
-                        self.emit_runtime_declaration_modifiers(id, data.modifiers.as_ref());
+                        if preserved_default_name.is_none() {
+                            self.emit_runtime_declaration_modifiers(id, data.modifiers.as_ref());
+                        }
                     }
                     if !self.emit_class_declaration_static_blocks(
                         id,
                         data,
-                        commonjs_default_name.as_deref(),
+                        emitted_default_name,
                     )? {
-                        self.emit_class_with_name(data, commonjs_default_name.as_deref())?;
+                        self.emit_class_with_name(data, emitted_default_name)?;
                     }
                 } else if !emitted_stage3_class_decorators
                     && let Some(name) = recovered_default_name.as_deref()
@@ -36297,7 +36312,12 @@ impl Printer<'_> {
                     self.emit_decorated_class_binding(data)?;
                 }
                 self.emit_auto_accessor_storage_initializers(data)?;
-                if lower_preserved_default && let Some(name) = data.name {
+                if let Some(name) = preserved_default_name.as_deref() {
+                    self.writer.newline();
+                    self.writer.write("export default ");
+                    self.writer.write(name);
+                    self.writer.write(";");
+                } else if lower_preserved_default && let Some(name) = data.name {
                     self.writer.newline();
                     self.writer.write("export default ");
                     self.emit_expression(name, 0)?;
@@ -56593,7 +56613,7 @@ impl Printer<'_> {
                 continue;
             };
             if matches!(member_node.data, NodeData::PropertyDeclaration(_)) {
-                self.emit_native_static_field(data, index, *member)?;
+                self.emit_native_static_field(data, emitted_name, index, *member)?;
                 previous_static_end = member_node.range.end.get();
                 continue;
             }
@@ -57471,7 +57491,7 @@ impl Printer<'_> {
                     if let Some(plan) = &private_field_plan {
                         self.emit_private_field_initializers(plan);
                     }
-                    self.emit_native_static_fields(data)?;
+                    self.emit_native_static_fields(data, emitted_name)?;
                 }
             }
         }
@@ -60425,9 +60445,10 @@ impl Printer<'_> {
     fn emit_native_static_fields(
         &mut self,
         data: &ts_ast::ClassDeclarationData,
+        emitted_name: Option<&str>,
     ) -> Result<(), EmitError> {
         for (index, member) in data.members.nodes.iter().enumerate() {
-            self.emit_native_static_field(data, index, *member)?;
+            self.emit_native_static_field(data, emitted_name, index, *member)?;
         }
         Ok(())
     }
@@ -60435,10 +60456,16 @@ impl Printer<'_> {
     fn emit_native_static_field(
         &mut self,
         data: &ts_ast::ClassDeclarationData,
+        emitted_name: Option<&str>,
         index: usize,
         member: NodeId,
     ) -> Result<(), EmitError> {
-        let Some(name) = data.name else {
+        let Some(receiver) = data
+            .name
+            .and_then(|name| declaration_name_text(self.arena, name))
+            .or(emitted_name)
+            .map(str::to_owned)
+        else {
             return Ok(());
         };
         let node = self.node(member)?.clone();
@@ -60467,9 +60494,6 @@ impl Printer<'_> {
         if initializer.is_none() && self.settings.use_define_for_class_fields != Some(true) {
             return Ok(());
         }
-        let receiver = declaration_name_text(self.arena, name)
-            .unwrap_or("_class")
-            .to_owned();
         self.writer.newline();
         let leading_start = index
             .checked_sub(1)
@@ -60485,7 +60509,11 @@ impl Printer<'_> {
         if self.settings.use_define_for_class_fields == Some(true) {
             self.emit_class_field_definition(&receiver, property.name, initializer)?;
         } else {
-            self.emit_expression(name, 0)?;
+            if let Some(name) = data.name {
+                self.emit_expression(name, 0)?;
+            } else {
+                self.writer.write(&receiver);
+            }
             self.emit_downlevel_member_access(property.name)?;
             self.writer.write(" = ");
             self.emit_expression(
@@ -82801,6 +82829,47 @@ mod tests {
             "{preserved}"
         );
         assert!(!preserved.contains("export default var"), "{preserved}");
+    }
+
+    #[test]
+    fn names_preserved_anonymous_default_classes_with_post_class_initializers() {
+        assert_eq!(
+            emit_with_parse_errors(
+                "export default class { static z: string = 'value'; }",
+                ScriptTarget::Es2015,
+                ModuleKind::EsNext,
+            )
+            .code,
+            "class default_1 {\n}\ndefault_1.z = 'value';\nexport default default_1;\n",
+        );
+        assert_eq!(
+            emit_with_parse_errors(
+                "export default class { method() {} }",
+                ScriptTarget::Es2015,
+                ModuleKind::EsNext,
+            )
+            .code,
+            "export default class {\n    method() { }\n}\n",
+        );
+        assert_eq!(
+            emit_with_parse_errors(
+                "export default class { static z = 'value'; }",
+                ScriptTarget::Es2022,
+                ModuleKind::EsNext,
+            )
+            .code,
+            "export default class {\n    static z = 'value';\n}\n",
+        );
+
+        let commonjs = emit_with_parse_errors(
+            "export default class { static z = 'value'; }",
+            ScriptTarget::Es2015,
+            ModuleKind::CommonJs,
+        )
+        .code;
+        assert!(commonjs.contains("class default_1 {"), "{commonjs}");
+        assert!(commonjs.contains("default_1.z = 'value';"), "{commonjs}");
+        assert!(commonjs.contains("exports.default = default_1;"), "{commonjs}");
     }
 
     #[test]
