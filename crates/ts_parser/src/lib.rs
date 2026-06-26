@@ -3145,6 +3145,11 @@ impl<'a> Parser<'a> {
         while self.current.kind != SyntaxKind::CloseBraceToken
             && self.current.kind != SyntaxKind::EndOfFile
         {
+            if self.current.kind == SyntaxKind::AtToken {
+                self.bump();
+                self.parse_postfix_expression();
+                break;
+            }
             let entry_start = self.current.range.start;
             let member_name = self.parse_enum_member_name();
             let initializer = if self.current.kind == SyntaxKind::EqualsToken {
