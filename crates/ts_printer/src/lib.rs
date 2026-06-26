@@ -5230,8 +5230,31 @@ impl DeclarationPrinter<'_> {
                         )
                     });
                 }
+                let private_name_members = data
+                    .members
+                    .nodes
+                    .iter()
+                    .copied()
+                    .filter(|member| {
+                        type_member_name(self.arena, *member).is_some_and(|name| {
+                            matches!(
+                                self.arena.get(name).map(|node| &node.data),
+                                Some(NodeData::PrivateIdentifier(_))
+                            )
+                        })
+                    })
+                    .collect::<HashSet<_>>();
+                let mut emitted_private_brand = false;
                 for member_index in member_order {
                     let member = &data.members.nodes[member_index];
+                    if private_name_members.contains(member) {
+                        if !self.javascript_source && !emitted_private_brand {
+                            self.writer.write("#private;");
+                            self.writer.newline();
+                            emitted_private_brand = true;
+                        }
+                        continue;
+                    }
                     if self.class_member_is_overload_implementation(&data.members, member_index)
                         || self
                             .class_member_is_duplicate_private_method(&data.members, member_index)
@@ -5258,6 +5281,13 @@ impl DeclarationPrinter<'_> {
                 }
                 if let Some(name) = data.name {
                     self.emit_javascript_prototype_jsdoc_properties(name);
+                }
+                if self.javascript_source
+                    && !private_name_members.is_empty()
+                    && !emitted_private_brand
+                {
+                    self.writer.write("#private;");
+                    self.writer.newline();
                 }
                 if self.class_has_recovered_constructor(data) {
                     self.writer.write("constructor();");
@@ -13972,11 +14002,15 @@ impl DeclarationPrinter<'_> {
             let NodeData::GetAccessorDeclaration(getter) = &self.arena.get(*candidate)?.data else {
                 return None;
             };
-            (declaration_name_text(self.arena, getter.name) == Some(expected_name))
-                .then_some(getter.body)
-                .flatten()
-                .and_then(|body| self.declaration_single_return_expression(body))
-                .and_then(|expression| self.jsdoc_type_hint(expression))
+            if declaration_name_text(self.arena, getter.name) != Some(expected_name) {
+                return None;
+            }
+            self.jsdoc_type_hint(*candidate).or_else(|| {
+                getter
+                    .body
+                    .and_then(|body| self.declaration_single_return_expression(body))
+                    .and_then(|expression| self.jsdoc_type_hint(expression))
+            })
         })
     }
 
@@ -16290,6 +16324,11 @@ impl DeclarationPrinter<'_> {
                 }
                 self.emit_parameters(&data.parameters)?;
                 if data.type_.is_none()
+                    && let Some(hint) = self.jsdoc_type_hint(id)
+                {
+                    self.writer.write(": ");
+                    self.emit_jsdoc_type_hint(&hint);
+                } else if data.type_.is_none()
                     && let Some(hint) = data
                         .body
                         .and_then(|body| self.declaration_single_return_expression(body))
@@ -65692,6 +65731,33 @@ mod tests {
             declarations.contains("static set visible(v: any);"),
             "{declarations}"
         );
+    }
+
+    #[test]
+    fn javascript_accessor_jsdoc_types_survive_private_brand_elision() {
+        let declarations = emit_javascript_declarations_with_semantics(concat!(
+            "/** @template T */ class Box {\n",
+            "    #value;\n",
+            "    /** @type {T} */ get value() { return this.#value; }\n",
+            "    set value(value) { this.#value = value; }\n",
+            "}",
+        ));
+        assert!(declarations.contains("set value(value: T);"), "{declarations}");
+        assert!(declarations.contains("get value(): T;"), "{declarations}");
+        assert!(declarations.contains("#private;"), "{declarations}");
+        assert!(!declarations.contains("#value"), "{declarations}");
+    }
+
+    #[test]
+    fn declaration_private_names_collapse_at_their_source_position() {
+        let declarations = emit_declarations_with_semantics(
+            "class Box { #value: string; visible: number; }",
+        );
+        assert!(
+            declarations.contains("#private;\n    visible: number;"),
+            "{declarations}"
+        );
+        assert!(!declarations.contains("#value"), "{declarations}");
     }
 
     #[test]
