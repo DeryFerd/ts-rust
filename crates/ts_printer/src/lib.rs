@@ -696,7 +696,14 @@ pub fn emit_source_file_with_context(
             .get(*statement)
             .is_some_and(|statement| declaration_is_module_indicator(arena, statement))
     });
+    let has_import_meta = arena.iter().any(|(_, node)| {
+        matches!(
+            &node.data,
+            NodeData::MetaProperty(meta) if meta.keyword_token == SyntaxKind::ImportKeyword
+        )
+    });
     let is_external_module = has_explicit_module_indicator
+        || has_import_meta
         || source_name_implies_external_module(source_name)
         || context.module_detection == ModuleDetectionKind::Force
         || (context.module_detection == ModuleDetectionKind::Auto && automatic_jsx.any());
@@ -27608,6 +27615,23 @@ impl SystemModulePlan {
                         node,
                         SyntaxKind::ExportKeyword,
                     );
+                    if let Some(NodeData::VariableDeclarationList(list)) =
+                        arena.get(statement.declaration_list).map(|node| &node.data)
+                    {
+                        for declaration in &list.declarations.nodes {
+                            let Some(NodeData::VariableDeclaration(declaration)) =
+                                arena.get(*declaration).map(|node| &node.data)
+                            else {
+                                continue;
+                            };
+                            if declaration.initializer.is_some()
+                                && binding_pattern_has_multiple_leaves(arena, declaration.name)
+                            {
+                                let temp = names.generate_temp();
+                                push_unique(&mut hoisted_names, &temp);
+                            }
+                        }
+                    }
                     if exported
                         && let Some(NodeData::VariableDeclarationList(list)) =
                             arena.get(statement.declaration_list).map(|node| &node.data)
@@ -27618,10 +27642,6 @@ impl SystemModulePlan {
                             else {
                                 continue;
                             };
-                            if binding_pattern_has_multiple_leaves(arena, declaration.name) {
-                                let temp = names.generate_temp();
-                                push_unique(&mut hoisted_names, &temp);
-                            }
                             let mut declaration_names = Vec::new();
                             collect_binding_names(
                                 arena,
@@ -65082,6 +65102,7 @@ impl Printer<'_> {
         match self.arena.get(initializer).map(|node| &node.data) {
             Some(
                 NodeData::Identifier(_)
+                | NodeData::MetaProperty(_)
                 | NodeData::BinaryExpression(_)
                 | NodeData::PropertyAccessExpression(_)
                 | NodeData::ElementAccessExpression(_)
@@ -66328,6 +66349,13 @@ impl Printer<'_> {
         }
         match &node.data {
             NodeData::MetaProperty(data) => {
+                if data.keyword_token == SyntaxKind::ImportKeyword
+                    && let Some(context) = self.system_context_object.clone()
+                {
+                    self.writer.write(&context);
+                    self.writer.write(".meta");
+                    return Ok(());
+                }
                 self.writer.write(match data.keyword_token {
                     SyntaxKind::ImportKeyword => "import",
                     _ => "new",

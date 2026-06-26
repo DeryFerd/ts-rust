@@ -1054,6 +1054,16 @@ impl<'a> Parser<'a> {
         matches
     }
 
+    fn import_meta_follows(&mut self) -> bool {
+        let checkpoint = self.scanner.mark();
+        let dot = self.scanner.scan();
+        let name = self.scanner.scan();
+        self.scanner.rewind(checkpoint);
+        dot.kind == SyntaxKind::DotToken
+            && name.kind == SyntaxKind::Identifier
+            && name.text == "meta"
+    }
+
     fn declare_precedes_invalid_namespace_name(&mut self) -> bool {
         let checkpoint = self.scanner.mark();
         let namespace = self.scanner.scan().kind;
@@ -4954,6 +4964,7 @@ impl<'a> Parser<'a> {
         };
         match &node.data {
             NodeData::Identifier(_)
+            | NodeData::MetaProperty(_)
             | NodeData::PropertyAccessExpression(_)
             | NodeData::ElementAccessExpression(_)
             | NodeData::CallExpression(_)
@@ -5892,6 +5903,23 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn parse_import_meta_property(&mut self) -> NodeId {
+        let start = self.consume().range.start;
+        self.expect_and_bump(SyntaxKind::DotToken, "Expected '.'.");
+        let name = self.parse_identifier_name("Expected 'meta'.");
+        self.alloc_node(
+            SyntaxKind::MetaProperty,
+            TextRange::new(start, self.node_end(name)),
+            NodeData::MetaProperty(Box::new(MetaPropertyData {
+                flow_node: None,
+                keyword_token: SyntaxKind::ImportKeyword,
+                facts: 0,
+                name,
+            })),
+            &[name],
+        )
+    }
+
     fn parse_new_meta_property(&mut self, keyword_range: TextRange) -> NodeId {
         self.bump();
         let name = self.parse_property_name_after_dot();
@@ -6423,7 +6451,13 @@ impl<'a> Parser<'a> {
             SyntaxKind::NumericLiteral => self.parse_numeric_literal(),
             SyntaxKind::BigIntLiteral => self.parse_bigint_literal(),
             SyntaxKind::StringLiteral => self.parse_string_literal(),
-            SyntaxKind::ImportKeyword => self.parse_identifier_name("Expected an expression."),
+            SyntaxKind::ImportKeyword => {
+                if self.import_meta_follows() {
+                    self.parse_import_meta_property()
+                } else {
+                    self.parse_identifier_name("Expected an expression.")
+                }
+            }
             SyntaxKind::SlashToken | SyntaxKind::SlashEqualsToken => {
                 self.parse_regular_expression_literal()
             }
@@ -15042,6 +15076,34 @@ mod tests {
                 .iter()
                 .any(|diagnostic| diagnostic.code == Some(17012))
         );
+    }
+
+    #[test]
+    fn parses_import_meta_without_reclassifying_longer_properties() {
+        let result = parse_source_file(
+            "const meta = import.meta; import.meta = meta; const longer = import.metal;",
+        );
+        let import_meta = result
+            .arena
+            .iter()
+            .filter(|(_, node)| {
+                matches!(
+                    &node.data,
+                    NodeData::MetaProperty(meta)
+                        if meta.keyword_token == SyntaxKind::ImportKeyword
+                )
+            })
+            .count();
+        assert_eq!(import_meta, 2);
+        assert!(result.arena.iter().any(|(_, node)| {
+            let NodeData::PropertyAccessExpression(access) = &node.data else {
+                return false;
+            };
+            matches!(
+                result.arena.get(access.name).map(|node| &node.data),
+                Some(NodeData::Identifier(identifier)) if identifier.text == "metal"
+            )
+        }));
     }
 
     #[test]
