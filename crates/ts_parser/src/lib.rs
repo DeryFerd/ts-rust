@@ -3026,6 +3026,7 @@ impl<'a> Parser<'a> {
             None
         };
         self.expect_and_bump(SyntaxKind::OpenParenToken, "Expected '('.");
+        let mut recovered_block_as_for_initializer = false;
         let initializer = if self.current.kind == SyntaxKind::SemicolonToken {
             None
         } else if matches!(
@@ -3071,6 +3072,17 @@ impl<'a> Parser<'a> {
                         continue;
                     }
                     break;
+                }
+                if self.current.kind == SyntaxKind::CloseParenToken
+                    && self.next_token_kind() == SyntaxKind::OpenBraceToken
+                {
+                    self.error_current("Expected ','.");
+                    self.bump();
+                    let diagnostics_len = self.diagnostics.len();
+                    declarations.push(self.parse_variable_declaration());
+                    self.diagnostics.truncate(diagnostics_len);
+                    self.error_current("Expected ','.");
+                    recovered_block_as_for_initializer = true;
                 }
             }
             self.disallow_in = previous_disallow_in;
@@ -3134,14 +3146,21 @@ impl<'a> Parser<'a> {
                     .collect::<Vec<_>>(),
             );
         }
-        self.expect_and_bump(SyntaxKind::SemicolonToken, "Expected ';'.");
+        if !recovered_block_as_for_initializer {
+            self.expect_and_bump(SyntaxKind::SemicolonToken, "Expected ';'.");
+        }
         let condition = if self.current.kind == SyntaxKind::SemicolonToken {
             None
         } else {
             Some(self.parse_binary_expression(0))
         };
         self.expect_and_bump(SyntaxKind::SemicolonToken, "Expected ';'.");
-        let incrementor = if matches!(
+        let recovered_close_brace = recovered_block_as_for_initializer
+            && self.current.kind == SyntaxKind::CloseBraceToken;
+        let incrementor = if recovered_close_brace {
+            self.error_current("Expected an expression.");
+            None
+        } else if matches!(
             self.current.kind,
             SyntaxKind::CloseParenToken | SyntaxKind::CloseBracketToken
         ) {
@@ -3149,8 +3168,18 @@ impl<'a> Parser<'a> {
         } else {
             Some(self.parse_binary_expression(0))
         };
-        self.expect_and_bump(SyntaxKind::CloseParenToken, "Expected ')'.");
-        let statement = self.parse_statement();
+        let statement = if recovered_close_brace {
+            let range = self.consume().range;
+            self.alloc_node(
+                SyntaxKind::EmptyStatement,
+                range,
+                NodeData::EmptyStatement(Box::new(EmptyStatementData { flow_node: None })),
+                &[],
+            )
+        } else {
+            self.expect_and_bump(SyntaxKind::CloseParenToken, "Expected ')'.");
+            self.parse_statement()
+        };
         let mut children = vec![statement];
         children.extend(initializer);
         children.extend(condition);
@@ -9238,6 +9267,46 @@ mod tests {
         assert_eq!(
             result.arena.get(statements[1]).unwrap().kind,
             SyntaxKind::FunctionDeclaration
+        );
+    }
+
+    #[test]
+    fn recovers_a_closed_for_header_as_a_continued_declaration_list() {
+        let result = parse_source_file("for (let x: y) { z(x); }");
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .filter_map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [1005, 1005, 1109]
+        );
+        let NodeData::ForStatement(for_) =
+            &result.arena.get(source_statements(&result)[0]).unwrap().data
+        else {
+            panic!("expected for statement");
+        };
+        let NodeData::VariableDeclarationList(list) = &result
+            .arena
+            .get(for_.initializer.unwrap())
+            .unwrap()
+            .data
+        else {
+            panic!("expected variable declaration list");
+        };
+        assert_eq!(list.declarations.nodes.len(), 2);
+        let NodeData::VariableDeclaration(second) =
+            &result.arena.get(list.declarations.nodes[1]).unwrap().data
+        else {
+            panic!("expected variable declaration");
+        };
+        assert_eq!(
+            result.arena.get(second.name).unwrap().kind,
+            SyntaxKind::ObjectBindingPattern
+        );
+        assert_eq!(
+            result.arena.get(for_.statement).unwrap().kind,
+            SyntaxKind::EmptyStatement
         );
     }
 

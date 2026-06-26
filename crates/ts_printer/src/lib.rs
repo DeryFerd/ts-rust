@@ -32389,7 +32389,8 @@ impl Printer<'_> {
                 || (data.incrementor.is_none()
                     && data.condition.is_some()
                     && source_second_semicolon.is_none()
-                ),
+                )
+                || (data.incrementor.is_none() && close == statement_start),
         );
         if let Some(incrementor) = data.incrementor {
             self.emit_expression(incrementor, 0)?;
@@ -45730,12 +45731,12 @@ impl Printer<'_> {
                 continue;
             };
             if binding.dot_dot_dot_token.is_some() {
-                rest = binding.name;
+                rest = binding.name.map(|name| (*element, name));
             } else {
                 ordinary.push(*element);
             }
         }
-        let Some(rest) = rest else {
+        let Some((rest_element, rest)) = rest else {
             return self.emit_nested_object_rest_variable_declarators(
                 pattern,
                 initializer,
@@ -45812,6 +45813,14 @@ impl Printer<'_> {
             self.emit_downlevel_binding_value(&ordinary_value)?;
         }
         self.emit_downlevel_declarator_start(emitted);
+        if let Some(last) = ordinary.last() {
+            self.emit_source_comments_between_with_ownership(
+                self.node(*last)?.range.end.get(),
+                self.node(rest_element)?.range.start.get(),
+                true,
+                true,
+            );
+        }
         self.emit_expression(rest, 0)?;
         self.writer.write(" = ");
         self.emit_helper_reference("__rest");
@@ -63116,6 +63125,34 @@ mod tests {
             ),
             "{output}"
         );
+    }
+
+    #[test]
+    fn preserves_comments_before_downleveled_object_rest_declarators() {
+        let output = emit_with(
+            concat!(
+                "declare let props: any;\n",
+                "const { children, active: renamed, // keep\n...rest } = props;",
+            ),
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(
+            output.contains("active: renamed } = props, // keep\nrest = __rest"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn preserves_missing_for_header_delimiter_spacing() {
+        let output = emit_with_parse_errors(
+            "for (let x: y) { z(x); }",
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert_eq!(output, "for (let x, { z }; (x); )\n    ;\n");
     }
 
     #[test]
