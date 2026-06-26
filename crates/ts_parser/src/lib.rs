@@ -4468,6 +4468,7 @@ impl<'a> Parser<'a> {
                 | SyntaxKind::DeclareKeyword
                 | SyntaxKind::AbstractKeyword
                 | SyntaxKind::AsyncKeyword
+                | SyntaxKind::AtToken
         ) {
             let declaration = self.parse_statement();
             self.attach_modifiers(declaration, vec![export_modifier], start);

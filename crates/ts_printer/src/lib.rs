@@ -471,7 +471,7 @@ pub fn emit_source_file_with_context(
     }
     let source_end = node.range.end.get();
     printer.runtime_identifier_uses = runtime_identifier_uses(arena, source_file);
-    let decorator_runtime_names = arena
+    let decorator_expressions = arena
         .iter()
         .filter_map(|(decorator_id, node)| {
             let NodeData::Decorator(decorator) = &node.data else {
@@ -480,9 +480,25 @@ pub fn emit_source_file_with_context(
             if decorator_is_direct_constructor_decorator(arena, decorator_id) {
                 return None;
             }
-            decorator_expression_root_name(arena, decorator.expression).map(str::to_owned)
+            Some(decorator.expression)
         })
         .collect::<Vec<_>>();
+    let decorator_runtime_names = arena
+        .iter()
+        .filter_map(|(identifier_id, node)| {
+            let NodeData::Identifier(identifier) = &node.data else {
+                return None;
+            };
+            (decorator_expressions
+                .iter()
+                .any(|expression| printer.node_is_within(identifier_id, *expression))
+                && identifier_is_runtime_use(arena, identifier_id, source_file))
+            .then(|| identifier.text.clone())
+        })
+        .chain(decorator_expressions.iter().filter_map(|expression| {
+            decorator_expression_root_name(arena, *expression).map(str::to_owned)
+        }))
+        .collect::<HashSet<_>>();
     printer
         .runtime_identifier_uses
         .extend(decorator_runtime_names.iter().cloned());
