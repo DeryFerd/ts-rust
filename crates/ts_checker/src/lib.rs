@@ -7633,6 +7633,8 @@ impl<'a> Checker<'a> {
             && let Some(base_signature) = base_type.and_then(|base| self.construct_signature(base))
         {
             signature.parameters = base_signature.parameters;
+            signature.parameter_names = base_signature.parameter_names;
+            signature.rest_parameter = base_signature.rest_parameter;
             signature.parameters_optional = base_signature.parameters_optional;
         }
         let constructor_type = self
@@ -10062,6 +10064,11 @@ impl<'a> Checker<'a> {
             .flatten()
             .unwrap_or(left);
         if operator == SyntaxKind::EqualsToken
+            && let Some(name) = self.readonly_assignment_name(data.left)
+        {
+            self.error(node_id, 2540, [name]);
+            right
+        } else if operator == SyntaxKind::EqualsToken
             && let Some(symbol) = self.narrowing_subject(data.left)
         {
             let declared = self
@@ -10074,11 +10081,6 @@ impl<'a> Checker<'a> {
                 self.assignability_error(node_id, right, declared);
             }
             self.flow_types.insert(symbol, right);
-            right
-        } else if operator == SyntaxKind::EqualsToken
-            && let Some(name) = self.readonly_assignment_name(data.left)
-        {
-            self.error(node_id, 2540, [name]);
             right
         } else if operator == SyntaxKind::EqualsToken
             && !self.is_assignable(right, assignment_target)
@@ -10466,13 +10468,30 @@ impl<'a> Checker<'a> {
         };
         let name = self.property_name(access.name)?;
         let receiver = self.type_of_expression(access.expression);
-        let readonly = self.union_members(receiver).iter().any(|member| {
-            matches!(
-                &self.result.types.get(*member).unwrap().kind,
-                TypeKind::Object(object) if object.readonly_properties.contains(&name)
-            )
-        });
+        let readonly = self.type_has_readonly_property(receiver, &name, &mut HashSet::new());
         readonly.then_some(name)
+    }
+
+    fn type_has_readonly_property(
+        &self,
+        type_id: TypeId,
+        name: &str,
+        visited: &mut HashSet<TypeId>,
+    ) -> bool {
+        if !visited.insert(type_id) {
+            return false;
+        }
+        match self.result.types.get(type_id).map(|type_| &type_.kind) {
+            Some(TypeKind::Object(object)) => object.readonly_properties.contains(name),
+            Some(TypeKind::Union(members) | TypeKind::Intersection(members)) => members
+                .iter()
+                .any(|member| self.type_has_readonly_property(*member, name, visited)),
+            Some(TypeKind::TypeParameter {
+                constraint: Some(constraint),
+                ..
+            }) => self.type_has_readonly_property(*constraint, name, visited),
+            _ => false,
+        }
     }
 
     fn leading_jsdoc_comment(&self, node: NodeId) -> Option<&str> {
@@ -16665,7 +16684,9 @@ impl<'a> Checker<'a> {
                 constraint.is_none_or(|constraint| self.is_assignable(source, constraint))
             }
             (TypeKind::Function(source), TypeKind::Function(target)) => {
-                source.parameters.len() <= target.parameters.len()
+                (source.parameters_optional
+                    || source.parameters.len() <= target.parameters.len()
+                    || target.rest_parameter.is_some())
                     && (source.parameters_optional
                         || source
                             .parameters
@@ -24150,11 +24171,14 @@ mod tests {
                 )
             })
             .unwrap();
-        assert_eq!(timestamped_constructor.parameters.len(), 1);
+        assert!(timestamped_constructor.parameters.is_empty());
+        let timestamped_rest = timestamped_constructor
+            .rest_parameter
+            .expect("expected inherited constructor rest parameter");
         assert!(matches!(
             checked.files[1]
                 .types
-                .get(timestamped_constructor.parameters[0])
+                .get(timestamped_rest)
                 .unwrap()
                 .kind,
             TypeKind::Array(element) if element == checked.files[1].types.any()
