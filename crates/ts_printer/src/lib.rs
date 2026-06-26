@@ -48008,6 +48008,7 @@ impl Printer<'_> {
                     }
                     NodeData::GetAccessorDeclaration(accessor) => accessor.body.is_some(),
                     NodeData::SetAccessorDeclaration(accessor) => accessor.body.is_some(),
+                    NodeData::SemicolonClassElement(_) => true,
                     NodeData::ClassStaticBlockDeclaration(_) => {
                         !(lower_fields && private_plan.is_some())
                     }
@@ -48087,6 +48088,10 @@ impl Printer<'_> {
                     self.writer.newline();
                 }
                 NodeData::MethodDeclaration(_) | NodeData::IndexSignatureDeclaration(_) => {}
+                NodeData::SemicolonClassElement(_) => {
+                    self.writer.write(";");
+                    self.writer.newline();
+                }
                 NodeData::PropertyDeclaration(property)
                     if self.property_is_auto_accessor(property) =>
                 {
@@ -66429,6 +66434,11 @@ mod tests {
                 "}\n",
             )
         );
+    }
+
+    #[test]
+    fn preserves_semicolon_class_elements_in_javascript() {
+        assert_eq!(emit("class C { ; }"), "class C {\n    ;\n}\n");
     }
 
     #[test]

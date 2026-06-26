@@ -35,8 +35,9 @@ use ts_ast::{
     PostfixUnaryExpressionData, PrefixUnaryExpressionData, PrivateIdentifierData,
     PropertyAccessExpressionData, PropertyAssignmentData, PropertyDeclarationData,
     QualifiedNameData, RegularExpressionLiteralData, RestTypeNodeData, ReturnStatementData,
-    SatisfiesExpressionData, SetAccessorDeclarationData, ShorthandPropertyAssignmentData,
-    SourceFileData, SpreadAssignmentData, SpreadElementData, StringLiteralData,
+    SatisfiesExpressionData, SemicolonClassElementData, SetAccessorDeclarationData,
+    ShorthandPropertyAssignmentData, SourceFileData, SpreadAssignmentData, SpreadElementData,
+    StringLiteralData,
     SwitchStatementData, SymbolTable, SyntaxKind, TaggedTemplateExpressionData,
     TemplateExpressionData, TemplateHeadData, TemplateLiteralTypeNodeData,
     TemplateLiteralTypeSpanData, TemplateMiddleData, TemplateSpanData, TemplateTailData,
@@ -2072,10 +2073,21 @@ impl<'a> Parser<'a> {
                 break;
             }
             let before = (self.current.kind, self.current.range);
-            if matches!(
-                self.current.kind,
-                SyntaxKind::SemicolonToken | SyntaxKind::CommaToken
-            ) {
+            if self.current.kind == SyntaxKind::SemicolonToken {
+                let range = self.consume().range;
+                if !signature_only {
+                    members.push(self.alloc_node(
+                        SyntaxKind::SemicolonClassElement,
+                        range,
+                        NodeData::SemicolonClassElement(Box::new(SemicolonClassElementData {
+                            symbol: None,
+                        })),
+                        &[],
+                    ));
+                }
+                continue;
+            }
+            if self.current.kind == SyntaxKind::CommaToken {
                 self.bump();
                 continue;
             }
@@ -9307,6 +9319,30 @@ mod tests {
         assert_eq!(
             result.arena.get(for_.statement).unwrap().kind,
             SyntaxKind::EmptyStatement
+        );
+    }
+
+    #[test]
+    fn preserves_semicolon_class_elements() {
+        let result = parse_source_file("class C { ; value = 1; ; }");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let NodeData::ClassDeclaration(class) =
+            &result.arena.get(source_statements(&result)[0]).unwrap().data
+        else {
+            panic!("expected class declaration");
+        };
+        assert_eq!(
+            class
+                .members
+                .nodes
+                .iter()
+                .map(|member| result.arena.get(*member).unwrap().kind)
+                .collect::<Vec<_>>(),
+            [
+                SyntaxKind::SemicolonClassElement,
+                SyntaxKind::PropertyDeclaration,
+                SyntaxKind::SemicolonClassElement,
+            ]
         );
     }
 
