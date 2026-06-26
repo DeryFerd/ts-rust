@@ -5514,7 +5514,15 @@ impl DeclarationPrinter<'_> {
                     self.writer.write("const ");
                     self.writer.write(name);
                     self.writer.write(": ");
-                    if let Some(return_type) =
+                    if let Some((return_type, parameter, argument)) =
+                        self.explicit_generic_factory_call(*expression)
+                    {
+                        self.emit_type_with_value_substitution(
+                            return_type,
+                            &parameter,
+                            argument,
+                        )?;
+                    } else if let Some(return_type) =
                         self.heritage_factory_explicit_return_type(*expression)
                     {
                         self.emit_type(return_type)?;
@@ -7552,6 +7560,9 @@ impl DeclarationPrinter<'_> {
                 else {
                     return None;
                 };
+                if function.type_.is_some() {
+                    return None;
+                }
                 let NodeData::Block(body) = &self.arena.get(function.body?)?.data else {
                     return None;
                 };
@@ -7574,6 +7585,101 @@ impl DeclarationPrinter<'_> {
                     .then_some((*statement, *argument))
                 })
             })
+    }
+
+    fn explicit_generic_factory_call(
+        &self,
+        expression: NodeId,
+    ) -> Option<(NodeId, String, NodeId)> {
+        let NodeData::CallExpression(call) = &self.arena.get(expression)?.data else {
+            return None;
+        };
+        let [argument] = call.arguments.nodes.as_slice() else {
+            return None;
+        };
+        if !matches!(
+            self.arena.get(*argument).map(|node| &node.data),
+            Some(NodeData::Identifier(_) | NodeData::PropertyAccessExpression(_))
+        ) {
+            return None;
+        }
+        let name = declaration_name_text(self.arena, call.expression)?;
+        let symbol = self.bindings.resolve_name_at(call.expression, name)?;
+        self.bindings
+            .symbols
+            .get(symbol)?
+            .declarations
+            .iter()
+            .find_map(|declaration| {
+                let NodeData::FunctionDeclaration(function) = &self.arena.get(*declaration)?.data
+                else {
+                    return None;
+                };
+                let [type_parameter] = function.type_parameters.as_ref()?.nodes.as_slice() else {
+                    return None;
+                };
+                let NodeData::TypeParameterDeclaration(type_parameter) =
+                    &self.arena.get(*type_parameter)?.data
+                else {
+                    return None;
+                };
+                let parameter_name = declaration_name_text(self.arena, type_parameter.name)?;
+                let [parameter] = function.parameters.nodes.as_slice() else {
+                    return None;
+                };
+                let NodeData::ParameterDeclaration(parameter) = &self.arena.get(*parameter)?.data
+                else {
+                    return None;
+                };
+                let NodeData::TypeReferenceNode(parameter_type) =
+                    &self.arena.get(parameter.type_?)?.data
+                else {
+                    return None;
+                };
+                if declaration_name_text(self.arena, parameter_type.type_name)
+                    != Some(parameter_name)
+                {
+                    return None;
+                }
+                Some((function.type_?, parameter_name.to_owned(), *argument))
+            })
+    }
+
+    fn emit_type_with_value_substitution(
+        &mut self,
+        type_id: NodeId,
+        parameter: &str,
+        argument: NodeId,
+    ) -> Result<(), EmitError> {
+        let node = self.node(type_id)?.clone();
+        match &node.data {
+            NodeData::TypeReferenceNode(reference)
+                if declaration_name_text(self.arena, reference.type_name) == Some(parameter) =>
+            {
+                self.writer.write("typeof ");
+                self.emit_name(argument)
+            }
+            NodeData::ParenthesizedTypeNode(parenthesized) => {
+                self.writer.write("(");
+                self.emit_type_with_value_substitution(
+                    parenthesized.type_,
+                    parameter,
+                    argument,
+                )?;
+                self.writer.write(")");
+                Ok(())
+            }
+            NodeData::IntersectionTypeNode(intersection) => {
+                for (index, member) in intersection.types.nodes.iter().enumerate() {
+                    if index != 0 {
+                        self.writer.write(" & ");
+                    }
+                    self.emit_type_with_value_substitution(*member, parameter, argument)?;
+                }
+                Ok(())
+            }
+            _ => self.emit_type(type_id),
+        }
     }
 
     fn emit_local_class_mixin_constructor_type(
@@ -7628,62 +7734,232 @@ impl DeclarationPrinter<'_> {
 
     fn emit_local_class_heritage_mixin_type(
         &mut self,
-        class: NodeId,
+        class_id: NodeId,
         argument: NodeId,
     ) -> Result<(), EmitError> {
-        let class_node = self.node(class)?.clone();
+        let class_node = self.node(class_id)?.clone();
         let NodeData::ClassDeclaration(class) = &class_node.data else {
-            return Err(Self::unsupported(class, class_node.kind));
+            return Err(Self::unsupported(class_id, class_node.kind));
         };
-        self.writer.write("(");
+        let has_static_members = class.members.nodes.iter().any(|member| {
+            let modifiers = match self.arena.get(*member).map(|node| &node.data) {
+                Some(NodeData::MethodDeclaration(method)) => method.modifiers.as_ref(),
+                Some(NodeData::PropertyDeclaration(property)) => property.modifiers.as_ref(),
+                _ => return false,
+            };
+            self.member_has_modifier(modifiers, SyntaxKind::StaticKeyword)
+                && !self.member_has_modifier(modifiers, SyntaxKind::PrivateKeyword)
+                && !self.member_has_modifier(modifiers, SyntaxKind::ProtectedKeyword)
+        });
+        let include_any_index = class_node
+            .parent
+            .and_then(|body| self.arena.get(body)?.parent)
+            .and_then(|function| match &self.arena.get(function)?.data {
+                NodeData::FunctionDeclaration(function) => {
+                    self.returned_local_class_mixin(function)
+                }
+                _ => None,
+            })
+            .is_some_and(|(returned, _, include)| returned == class_id && include);
+        self.writer.write(if has_static_members { "((" } else { "(" });
         if declaration_has_modifier(self.arena, &class_node, SyntaxKind::AbstractKeyword) {
             self.writer.write("abstract ");
         }
         self.writer.write("new (...args: any[]) => {");
         self.writer.newline();
         self.writer.indent += 1;
-        for member in &class.members.nodes {
-            let Some(member_node) = self.arena.get(*member) else {
+        if include_any_index {
+            self.writer.write("[x: string]: any;");
+            self.writer.newline();
+        }
+        self.emit_local_class_mixin_members(&class.members.nodes, false)?;
+        self.writer.indent -= 1;
+        self.writer.write("})");
+        if has_static_members {
+            self.writer.write(" & {");
+            self.writer.newline();
+            self.writer.indent += 1;
+            self.emit_local_class_mixin_members(&class.members.nodes, true)?;
+            self.writer.indent -= 1;
+            self.writer.write("})");
+        }
+        self.writer.write(" & typeof ");
+        self.emit_name(argument)
+    }
+
+    fn returned_local_class_mixin(
+        &self,
+        function: &ts_ast::FunctionDeclarationData,
+    ) -> Option<(NodeId, NodeId, bool)> {
+        let NodeData::Block(body) = &self.arena.get(function.body?)?.data else {
+            return None;
+        };
+        let returned = body.statements.nodes.iter().find_map(|statement| {
+            let NodeData::ReturnStatement(return_) = &self.arena.get(*statement)?.data else {
+                return None;
+            };
+            declaration_name_text(self.arena, return_.expression?)
+        })?;
+        let class_id = body.statements.nodes.iter().find_map(|statement| {
+            let NodeData::ClassDeclaration(class) = &self.arena.get(*statement)?.data else {
+                return None;
+            };
+            (class
+                .name
+                .and_then(|name| declaration_name_text(self.arena, name))
+                == Some(returned))
+            .then_some(*statement)
+        })?;
+        let NodeData::ClassDeclaration(class) = &self.arena.get(class_id)?.data else {
+            return None;
+        };
+        let base_name = class.heritage_clauses.as_ref()?.nodes.iter().find_map(|clause| {
+            let NodeData::HeritageClause(clause) = &self.arena.get(*clause)?.data else {
+                return None;
+            };
+            if clause.token != SyntaxKind::ExtendsKeyword {
+                return None;
+            }
+            let NodeData::ExpressionWithTypeArguments(heritage) =
+                &self.arena.get(*clause.types.nodes.first()?)?.data
+            else {
+                return None;
+            };
+            declaration_name_text(self.arena, heritage.expression)
+        })?;
+        let base_type = function.parameters.nodes.iter().find_map(|parameter| {
+            let NodeData::ParameterDeclaration(parameter) = &self.arena.get(*parameter)?.data
+            else {
+                return None;
+            };
+            (declaration_name_text(self.arena, parameter.name) == Some(base_name))
+                .then_some(parameter.type_)
+                .flatten()
+        })?;
+        if !matches!(
+            self.arena.get(base_type).map(|node| &node.data),
+            Some(NodeData::TypeReferenceNode(_))
+        ) {
+            return None;
+        }
+        let base_type_name = match &self.arena.get(base_type)?.data {
+            NodeData::TypeReferenceNode(reference) => {
+                declaration_name_text(self.arena, reference.type_name)
+            }
+            _ => None,
+        }?;
+        let include_any_index = function
+            .type_parameters
+            .as_ref()
+            .into_iter()
+            .flat_map(|parameters| &parameters.nodes)
+            .any(|parameter| {
+                let Some(NodeData::TypeParameterDeclaration(parameter)) =
+                    self.arena.get(*parameter).map(|node| &node.data)
+                else {
+                    return false;
+                };
+                if declaration_name_text(self.arena, parameter.name) != Some(base_type_name) {
+                    return false;
+                }
+                let Some(NodeData::ConstructorTypeNode(constructor)) = parameter
+                    .constraint
+                    .and_then(|constraint| self.arena.get(constraint))
+                    .map(|node| &node.data)
+                else {
+                    return false;
+                };
+                constructor
+                    .type_
+                    .and_then(|type_| self.arena.get(type_))
+                    .is_some_and(|type_| type_.kind == SyntaxKind::AnyKeyword)
+            });
+        Some((class_id, base_type, include_any_index))
+    }
+
+    fn emit_inferred_local_class_mixin_type(
+        &mut self,
+        class_id: NodeId,
+        base_type: NodeId,
+        include_any_index: bool,
+    ) -> Result<(), EmitError> {
+        let class_node = self.node(class_id)?.clone();
+        let NodeData::ClassDeclaration(class) = &class_node.data else {
+            return Err(Self::unsupported(class_id, class_node.kind));
+        };
+        self.writer.write("((");
+        if declaration_has_modifier(self.arena, &class_node, SyntaxKind::AbstractKeyword) {
+            self.writer.write("abstract ");
+        }
+        self.writer.write("new (...args: any[]) => {");
+        self.writer.newline();
+        self.writer.indent += 1;
+        if include_any_index {
+            self.writer.write("[x: string]: any;");
+            self.writer.newline();
+        }
+        self.emit_local_class_mixin_members(&class.members.nodes, false)?;
+        self.writer.indent -= 1;
+        self.writer.write("})");
+        let has_static_members = class.members.nodes.iter().any(|member| {
+            let modifiers = match self.arena.get(*member).map(|node| &node.data) {
+                Some(NodeData::MethodDeclaration(method)) => method.modifiers.as_ref(),
+                Some(NodeData::PropertyDeclaration(property)) => property.modifiers.as_ref(),
+                _ => return false,
+            };
+            self.member_has_modifier(modifiers, SyntaxKind::StaticKeyword)
+                && !self.member_has_modifier(modifiers, SyntaxKind::PrivateKeyword)
+                && !self.member_has_modifier(modifiers, SyntaxKind::ProtectedKeyword)
+        });
+        if has_static_members {
+            self.writer.write(" & {");
+            self.writer.newline();
+            self.writer.indent += 1;
+            self.emit_local_class_mixin_members(&class.members.nodes, true)?;
+            self.writer.indent -= 1;
+            self.writer.write("}");
+        }
+        self.writer.write(") & ");
+        self.emit_type(base_type)
+    }
+
+    fn emit_local_class_mixin_members(
+        &mut self,
+        members: &[NodeId],
+        static_: bool,
+    ) -> Result<(), EmitError> {
+        for member in members {
+            let Some(member_node) = self.arena.get(*member).cloned() else {
                 continue;
             };
+            let modifiers = match &member_node.data {
+                NodeData::MethodDeclaration(method) => method.modifiers.as_ref(),
+                NodeData::PropertyDeclaration(property) => property.modifiers.as_ref(),
+                _ => continue,
+            };
+            if self.member_has_modifier(modifiers, SyntaxKind::StaticKeyword) != static_
+                || self.member_has_modifier(modifiers, SyntaxKind::PrivateKeyword)
+                || self.member_has_modifier(modifiers, SyntaxKind::ProtectedKeyword)
+            {
+                continue;
+            }
             match &member_node.data {
-                NodeData::MethodDeclaration(method)
-                    if !self.member_has_modifier(
-                        method.modifiers.as_ref(),
-                        SyntaxKind::PrivateKeyword,
-                    ) && !self.member_has_modifier(
-                        method.modifiers.as_ref(),
-                        SyntaxKind::ProtectedKeyword,
-                    ) =>
-                {
+                NodeData::MethodDeclaration(method) => {
                     self.emit_name(method.name)?;
                     self.emit_parameters(&method.parameters)?;
+                    self.writer.write(": ");
                     if let Some(type_) = method.type_ {
-                        self.writer.write(": ");
                         self.emit_type(type_)?;
                     } else if method
                         .body
                         .is_some_and(|body| !self.block_has_value_return(body))
                     {
-                        self.writer.write(": void");
+                        self.writer.write("void");
                     } else {
-                        self.writer.write(": any");
+                        self.writer.write("any");
                     }
-                    self.writer.write(";");
-                    self.writer.newline();
                 }
-                NodeData::PropertyDeclaration(property)
-                    if !self.member_has_modifier(
-                        property.modifiers.as_ref(),
-                        SyntaxKind::StaticKeyword,
-                    ) && !self.member_has_modifier(
-                        property.modifiers.as_ref(),
-                        SyntaxKind::PrivateKeyword,
-                    ) && !self.member_has_modifier(
-                        property.modifiers.as_ref(),
-                        SyntaxKind::ProtectedKeyword,
-                    ) =>
-                {
+                NodeData::PropertyDeclaration(property) => {
                     self.emit_name(property.name)?;
                     self.writer.write(": ");
                     if let Some(type_) = property.type_ {
@@ -7695,15 +7971,13 @@ impl DeclarationPrinter<'_> {
                     } else {
                         self.writer.write("any");
                     }
-                    self.writer.write(";");
-                    self.writer.newline();
                 }
-                _ => {}
+                _ => continue,
             }
+            self.writer.write(";");
+            self.writer.newline();
         }
-        self.writer.indent -= 1;
-        self.writer.write("}) & typeof ");
-        self.emit_name(argument)
+        Ok(())
     }
 
     fn heritage_factory_returned_class_name(&self, expression: NodeId) -> Option<String> {
@@ -9106,6 +9380,12 @@ impl DeclarationPrinter<'_> {
         if self.emit_returned_augmented_function_type(function)? {
             return Ok(());
         }
+        if let Some((class, base_type, include_any_index)) =
+            self.returned_local_class_mixin(function)
+        {
+            self.emit_inferred_local_class_mixin_type(class, base_type, include_any_index)?;
+            return Ok(());
+        }
         if self.javascript_source
             && function
                 .body
@@ -10366,6 +10646,12 @@ impl DeclarationPrinter<'_> {
                     self.emit_semantic_type_argument_list(arguments)?;
                     self.writer.write(">");
                 }
+            } else if let Some((return_type, parameter, argument)) = declaration
+                .initializer
+                .and_then(|initializer| self.explicit_generic_factory_call(initializer))
+            {
+                self.writer.write(": ");
+                self.emit_type_with_value_substitution(return_type, &parameter, argument)?;
             } else if let Some((local_class, argument)) = declaration
                 .initializer
                 .and_then(|initializer| self.local_class_factory_call(initializer))
@@ -22089,6 +22375,13 @@ impl DeclarationPrinter<'_> {
                 }
             }
             NodeData::ConstructorTypeNode(data) => {
+                if declaration_has_modifier_in_list(
+                    self.arena,
+                    data.modifiers.as_ref(),
+                    SyntaxKind::AbstractKeyword,
+                ) {
+                    self.writer.write("abstract ");
+                }
                 self.writer.write("new ");
                 self.emit_type_parameters(data.type_parameters.as_ref())?;
                 self.emit_parameters(&data.parameters)?;
@@ -79907,6 +80200,55 @@ class Board {
                 "    match(path: string): boolean;\n",
                 "    thing: number;\n",
                 "}) & typeof Unmixed;",
+            )),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn declaration_emit_preserves_explicit_abstract_mixin_return_types() {
+        let output = emit_declarations_with_semantics(concat!(
+            "interface Mixin { mixinMethod(): void; }\n",
+            "function MixinFactory<TBaseClass extends abstract new (...args: any) => any>(\n",
+            "    baseClass: TBaseClass\n",
+            "): TBaseClass & (abstract new (...args: any) => Mixin) {\n",
+            "    abstract class MixinClass extends baseClass implements Mixin {\n",
+            "        mixinMethod() {}\n",
+            "    }\n",
+            "    return MixinClass;\n",
+            "}\n",
+            "abstract class AbstractBase { abstract abstractBaseMethod(): void; }\n",
+            "const MixedBase = MixinFactory(AbstractBase);\n",
+        ));
+        assert!(
+            output.contains(
+                "declare const MixedBase: typeof AbstractBase & (abstract new (...args: any) => Mixin);"
+            ),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn declaration_emit_preserves_inferred_abstract_mixin_intersections() {
+        let output = emit_declarations_with_semantics(concat!(
+            "interface Mixin { mixinMethod(): void; }\n",
+            "abstract class AbstractBase { abstract abstractBaseMethod(): void; }\n",
+            "function MixinFactory<TBase extends abstract new (...args: any[]) => any>(baseClass: TBase) {\n",
+            "    abstract class MixinClass extends baseClass implements Mixin {\n",
+            "        mixinMethod(): void {}\n",
+            "        static staticMixinMethod(): void {}\n",
+            "    }\n",
+            "    return MixinClass;\n",
+            "}\n",
+        ));
+        assert!(
+            output.contains(concat!(
+                "declare function MixinFactory<TBase extends abstract new (...args: any[]) => any>(baseClass: TBase): ((abstract new (...args: any[]) => {\n",
+                "    [x: string]: any;\n",
+                "    mixinMethod(): void;\n",
+                "}) & {\n",
+                "    staticMixinMethod(): void;\n",
+                "}) & TBase;",
             )),
             "{output}"
         );
