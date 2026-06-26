@@ -482,6 +482,20 @@ impl<'a> Parser<'a> {
                 continue;
             }
             if self.current.kind == SyntaxKind::Unknown
+                && self.next_token_kind() == SyntaxKind::EqualsToken
+            {
+                // Keep the right-hand expression after an invalid identifier
+                // continuation (`var a₁ = "value"`) available as the next
+                // statement, matching TypeScript's declaration recovery.
+                self.bump();
+                self.error_current("Expected a variable name.");
+                self.bump();
+                if self.current.kind == SyntaxKind::StringLiteral {
+                    self.error_current("Expected a variable name.");
+                }
+                continue;
+            }
+            if self.current.kind == SyntaxKind::Unknown
                 || (self.current.kind == SyntaxKind::AtToken
                     && self.next_token_kind() == SyntaxKind::Unknown)
             {
@@ -509,6 +523,14 @@ impl<'a> Parser<'a> {
                     | SyntaxKind::EqualsGreaterThanToken
             ) {
                 self.error_current("Declaration or statement expected.");
+                self.bump();
+                continue;
+            }
+            if self.current.kind == SyntaxKind::CaseKeyword {
+                // A `case` token terminates a switch clause list, but outside a
+                // switch it is an unexpected statement-list terminator. Drop
+                // only that token so a declaration on the next line survives.
+                self.error_code_at(self.current.range, 1128, std::iter::empty::<String>());
                 self.bump();
                 continue;
             }
@@ -1071,7 +1093,13 @@ impl<'a> Parser<'a> {
             })),
             &declarations,
         );
-        let end = self.parse_semicolon(declarations_end);
+        let end = if self.current.kind == SyntaxKind::Unknown
+            && self.next_token_kind() == SyntaxKind::EqualsToken
+        {
+            declarations_end
+        } else {
+            self.parse_semicolon(declarations_end)
+        };
         self.alloc_node(
             SyntaxKind::VariableStatement,
             TextRange::new(statement_start, end),
@@ -4012,6 +4040,17 @@ impl<'a> Parser<'a> {
             }
             self.bump();
         }
+        if self.current.kind == SyntaxKind::Unknown {
+            // A malformed escaped local binding can leave several scanner
+            // tokens behind. Keep them inside the import clause so they do not
+            // become unrelated top-level expression statements.
+            while !matches!(
+                self.current.kind,
+                SyntaxKind::CloseBraceToken | SyntaxKind::EndOfFile
+            ) {
+                self.bump();
+            }
+        }
         let end = if self.current.kind == SyntaxKind::CloseBraceToken {
             self.consume().range.end
         } else {
@@ -4304,6 +4343,14 @@ impl<'a> Parser<'a> {
         while self.current.kind != SyntaxKind::CloseBraceToken
             && self.current.kind != SyntaxKind::EndOfFile
         {
+            // Recover a missing `}` before the `from` clause without turning
+            // `from` into another exported name. A closed clause can still
+            // legitimately export a binding named `from`.
+            if self.current.kind == SyntaxKind::FromKeyword
+                && self.next_token_kind() == SyntaxKind::StringLiteral
+            {
+                break;
+            }
             let specifier_start = self.current.range.start;
             let is_type_only = self.current.kind == SyntaxKind::TypeKeyword
                 && !matches!(
@@ -5183,7 +5230,12 @@ impl<'a> Parser<'a> {
                         &[expression, argument_expression],
                     );
                 }
-                SyntaxKind::PlusPlusToken | SyntaxKind::MinusMinusToken => {
+                SyntaxKind::PlusPlusToken | SyntaxKind::MinusMinusToken
+                    if !self
+                        .current
+                        .flags
+                        .contains(ScannerTokenFlags::PRECEDING_LINE_BREAK) =>
+                {
                     let operator = self.consume().kind;
                     expression = self.alloc_node(
                         SyntaxKind::PostfixUnaryExpression,
@@ -5505,6 +5557,14 @@ impl<'a> Parser<'a> {
             }
             let argument = self.parse_spread_element_or_expression();
             arguments.push(argument);
+            if self.current.kind == SyntaxKind::Unknown
+                && self.next_token_kind() == SyntaxKind::CloseParenToken
+            {
+                // An invalid identifier continuation belongs to the preceding
+                // argument for recovery purposes; retain the valid argument and
+                // let the scanner's invalid-character diagnostic stand alone.
+                self.bump();
+            }
             if self.current.kind == SyntaxKind::CloseBraceToken
                 && self.next_token_kind() == SyntaxKind::CloseParenToken
                 && matches!(
@@ -9163,6 +9223,25 @@ mod tests {
     }
 
     #[test]
+    fn unexpected_case_token_does_not_consume_the_next_declaration() {
+        let result = parse_source_file("class Before {}\ncase\nfunction after() {}");
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .filter_map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [1128]
+        );
+        let statements = source_statements(&result);
+        assert_eq!(statements.len(), 2);
+        assert_eq!(
+            result.arena.get(statements[1]).unwrap().kind,
+            SyntaxKind::FunctionDeclaration
+        );
+    }
+
+    #[test]
     fn parses_arrow_postfix_aggregate_and_template_expressions() {
         let source = r"
             const f = (x: number): number => x + 1;
@@ -9271,6 +9350,23 @@ mod tests {
         assert_eq!(
             result.arena.get(tagged.tag).unwrap().kind,
             SyntaxKind::Identifier
+        );
+    }
+
+    #[test]
+    fn does_not_parse_postfix_increment_across_a_line_break() {
+        let result = parse_source_file("\"use strict\"\n++eval;");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let statements = source_statements(&result);
+        assert_eq!(statements.len(), 2);
+        let NodeData::ExpressionStatement(statement) =
+            &result.arena.get(statements[1]).unwrap().data
+        else {
+            panic!("expected expression statement");
+        };
+        assert_eq!(
+            result.arena.get(statement.expression).unwrap().kind,
+            SyntaxKind::PrefixUnaryExpression
         );
     }
 
@@ -10725,6 +10821,65 @@ mod tests {
                 (SyntaxKind::StringLiteral, SyntaxKind::Identifier),
             ]
         );
+    }
+
+    #[test]
+    fn malformed_escaped_import_binding_stays_inside_the_import() {
+        let result = parse_source_file(
+            "import { value as \\uD800\\uDEA7 } from \"./mod.js\";",
+        );
+        let statements = source_statements(&result);
+        assert_eq!(statements.len(), 1);
+        assert_eq!(
+            result.arena.get(statements[0]).unwrap().kind,
+            SyntaxKind::ImportDeclaration
+        );
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Some(1127))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn recovers_missing_export_clause_brace_before_from() {
+        let result = parse_source_file("export { value, from \"./mod\"");
+        assert_eq!(result.diagnostics.len(), 1, "{:?}", result.diagnostics);
+        let NodeData::ExportDeclaration(declaration) =
+            &result.arena.get(source_statements(&result)[0]).unwrap().data
+        else {
+            panic!("expected export declaration");
+        };
+        assert!(declaration.module_specifier.is_some());
+        let NodeData::NamedExports(exports) = &result
+            .arena
+            .get(declaration.export_clause.unwrap())
+            .unwrap()
+            .data
+        else {
+            panic!("expected named exports");
+        };
+        assert_eq!(exports.elements.nodes.len(), 1);
+
+        let valid = parse_source_file("export { from } from \"./mod\";");
+        assert!(valid.diagnostics.is_empty(), "{:?}", valid.diagnostics);
+        let NodeData::ExportDeclaration(declaration) =
+            &valid.arena.get(source_statements(&valid)[0]).unwrap().data
+        else {
+            panic!("expected export declaration");
+        };
+        let NodeData::NamedExports(exports) = &valid
+            .arena
+            .get(declaration.export_clause.unwrap())
+            .unwrap()
+            .data
+        else {
+            panic!("expected named exports");
+        };
+        assert_eq!(exports.elements.nodes.len(), 1);
     }
 
     #[test]
@@ -13504,6 +13659,31 @@ mod tests {
                 SyntaxKind::ExpressionStatement,
                 SyntaxKind::VariableStatement,
                 SyntaxKind::ExpressionStatement,
+                SyntaxKind::ExpressionStatement,
+                SyntaxKind::ExpressionStatement,
+            ]
+        );
+    }
+
+    #[test]
+    fn recovers_expressions_after_invalid_identifier_continuations() {
+        let result = parse_source_file("var a₁ = \"hello\"; alert(a₁)");
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .filter_map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [1134, 1134, 1127, 1127]
+        );
+        let kinds = source_statements(&result)
+            .iter()
+            .map(|statement| result.arena.get(*statement).unwrap().kind)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            [
+                SyntaxKind::VariableStatement,
                 SyntaxKind::ExpressionStatement,
                 SyntaxKind::ExpressionStatement,
             ]

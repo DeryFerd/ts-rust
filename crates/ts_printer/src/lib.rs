@@ -1116,7 +1116,7 @@ pub fn emit_source_file_with_context(
         && !settings.no_emit_helpers
         && !printer.imported_helpers.contains("__classPrivateFieldGet")
     {
-        printer.emit_private_field_helpers();
+        printer.emit_private_field_helpers(source_needs_private_field_get_helper(arena));
     }
     if !auto_accessor_storages.is_empty() {
         printer.emit_auto_accessor_helpers();
@@ -1772,6 +1772,30 @@ fn source_has_private_field_access(arena: &NodeArena) -> bool {
         matches!(
             arena.get(access.name).map(|node| &node.data),
             Some(NodeData::PrivateIdentifier(_))
+        )
+    })
+}
+
+fn source_needs_private_field_get_helper(arena: &NodeArena) -> bool {
+    arena.iter().any(|(id, node)| {
+        let NodeData::PropertyAccessExpression(access) = &node.data else {
+            return false;
+        };
+        if !matches!(
+            arena.get(access.name).map(|node| &node.data),
+            Some(NodeData::PrivateIdentifier(_))
+        ) {
+            return false;
+        }
+        !matches!(
+            node.parent
+                .and_then(|parent| arena.get(parent))
+                .map(|parent| &parent.data),
+            Some(NodeData::BinaryExpression(binary))
+                if binary.left == id
+                    && arena.get(binary.operator_token).is_some_and(|operator| {
+                        operator.kind == SyntaxKind::EqualsToken
+                    })
         )
     })
 }
@@ -21693,7 +21717,7 @@ impl DeclarationPrinter<'_> {
                 self.writer.write(":");
                 self.emit_name(data.name)?;
             }
-            NodeData::PrivateIdentifier(data) => self.writer.write(&data.text),
+            NodeData::PrivateIdentifier(data) => self.write_source_identifier(id, &data.text),
             NodeData::StringLiteral(data) => {
                 let quote = if self.canonical_literal_quotes {
                     '"'
@@ -29385,7 +29409,7 @@ impl Printer<'_> {
         }
     }
 
-    fn emit_private_field_helpers(&mut self) {
+    fn emit_private_field_helpers(&mut self, emit_get: bool) {
         for line in [
             "var __classPrivateFieldSet = (this && this.__classPrivateFieldSet) || function (receiver, state, value, kind, f) {",
             "    if (kind === \"m\") throw new TypeError(\"Private method is not writable\");",
@@ -29393,6 +29417,14 @@ impl Printer<'_> {
             "    if (typeof state === \"function\" ? receiver !== state || !f : !state.has(receiver)) throw new TypeError(\"Cannot write private member to an object whose class did not declare it\");",
             "    return (kind === \"a\" ? f.call(receiver, value) : f ? f.value = value : state.set(receiver, value)), value;",
             "};",
+        ] {
+            self.writer.write(line);
+            self.writer.newline();
+        }
+        if !emit_get {
+            return;
+        }
+        for line in [
             "var __classPrivateFieldGet = (this && this.__classPrivateFieldGet) || function (receiver, state, kind, f) {",
             "    if (kind === \"a\" && !f) throw new TypeError(\"Private accessor was defined without a getter\");",
             "    if (typeof state === \"function\" ? receiver !== state || !f : !state.has(receiver)) throw new TypeError(\"Cannot read private member from an object whose class did not declare it\");",
@@ -53317,7 +53349,7 @@ impl Printer<'_> {
         self.commonjs_export_text_rewrites
             .insert(name.to_owned(), format!("exports.{name}"));
         self.writer.write("exports.");
-        self.writer.write(name);
+        self.write_source_identifier(declaration.name, name);
         self.writer.write(" = ");
         self.emit_expression(initializer, 1)?;
         self.writer.write(";");
@@ -54564,7 +54596,11 @@ impl Printer<'_> {
                 .ok()
                 .zip(usize::try_from(node.range.end.get()).ok())
                 .and_then(|(start, end)| self.source_text.get(start..end))
-                .filter(|source| source.contains("\\u"))
+                .filter(|source| {
+                    source.contains("\\u")
+                        && (self.settings.target >= ScriptTarget::Es2015
+                            || !source.contains("\\u{"))
+                })
                 .map(str::to_owned)
         });
         self.writer.write(source.as_deref().unwrap_or(text));
@@ -54705,7 +54741,7 @@ impl Printer<'_> {
                 self.emit_expression(data.name, 0)?;
             }
             NodeData::QualifiedName(data) => self.emit_qualified_name(data)?,
-            NodeData::PrivateIdentifier(data) => self.writer.write(&data.text),
+            NodeData::PrivateIdentifier(data) => self.write_source_identifier(id, &data.text),
             NodeData::NumericLiteral(data) => self.write_numeric_literal(data),
             NodeData::BigIntLiteral(data) => {
                 self.writer.write(&canonical_bigint_literal(&data.text));
@@ -55181,7 +55217,9 @@ impl Printer<'_> {
                         NodeData::Identifier(name) => {
                             self.write_source_identifier(data.name, &name.text);
                         }
-                        NodeData::PrivateIdentifier(name) => self.writer.write(&name.text),
+                        NodeData::PrivateIdentifier(name) => {
+                            self.write_source_identifier(data.name, &name.text);
+                        }
                         _ => self.emit_expression(data.name, 18)?,
                     }
                     self.record_mapping_at(name.range.end.get());
@@ -64413,6 +64451,38 @@ mod tests {
             "{output}"
         );
         assert!(output.ends_with("_A_value = new WeakMap();\n"), "{output}");
+    }
+
+    #[test]
+    fn emits_only_the_private_set_helper_for_write_only_fields() {
+        let output = emit_with(
+            "class A { #value: string; write() { this.#value = 'ok'; } }",
+            ScriptTarget::Es2015,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(output.contains("var __classPrivateFieldSet"), "{output}");
+        assert!(!output.contains("var __classPrivateFieldGet"), "{output}");
+    }
+
+    #[test]
+    fn preserves_supported_unicode_escapes_in_runtime_names() {
+        let commonjs = emit_with(
+            r"export let \u0078 = 10;",
+            ScriptTarget::Es5,
+            ModuleKind::CommonJs,
+        )
+        .code;
+        assert!(commonjs.contains(r"exports.\u0078 = 10;"), "{commonjs}");
+
+        let private = emit_with(
+            r"class A { #\u0078: number; write() { this.#\u0078 = 1; } }",
+            ScriptTarget::EsNext,
+            ModuleKind::None,
+        )
+        .code;
+        assert!(private.contains(r"#\u0078;"), "{private}");
+        assert!(private.contains(r"this.#\u0078 = 1;"), "{private}");
     }
 
     #[test]
