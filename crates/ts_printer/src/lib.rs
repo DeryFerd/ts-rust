@@ -1026,7 +1026,8 @@ pub fn emit_source_file_with_context(
             &node.data,
             NodeData::TaggedTemplateExpression(tagged)
                 if settings.target < ScriptTarget::Es2015
-                    || template_has_invalid_escape(arena, tagged.template)
+                    || (settings.target < ScriptTarget::Es2018
+                        && template_has_invalid_escape(arena, tagged.template))
         )
     })
         && !settings.no_emit_helpers;
@@ -68730,7 +68731,8 @@ impl Printer<'_> {
             }
             NodeData::TaggedTemplateExpression(data) => {
                 if self.settings.target < ScriptTarget::Es2015
-                    || template_has_invalid_escape(self.arena, data.template)
+                    || (self.settings.target < ScriptTarget::Es2018
+                        && template_has_invalid_escape(self.arena, data.template))
                 {
                     self.emit_downlevel_tagged_template(id, data)?;
                 } else if let Some(source) = self
@@ -69100,7 +69102,7 @@ impl Printer<'_> {
                 self.writer.write(", ");
             }
             if let Some(text) = text {
-                write_quoted(&mut self.writer, text);
+                write_template_cooked_quoted(&mut self.writer, text);
             } else {
                 self.writer.write("void 0");
             }
@@ -73026,6 +73028,60 @@ impl Printer<'_> {
         let NodeData::TemplateHead(head) = &head.data else {
             return Err(Self::unsupported(data.head, head.kind));
         };
+        let invalid_escape = template_raw_has_invalid_escape(&head.raw_text)
+            || data.template_spans.nodes.iter().any(|span| {
+                let Some(NodeData::TemplateSpan(span)) =
+                    self.arena.get(*span).map(|node| &node.data)
+                else {
+                    return false;
+                };
+                match self.arena.get(span.literal).map(|node| &node.data) {
+                    Some(NodeData::TemplateMiddle(literal)) => {
+                        template_raw_has_invalid_escape(&literal.raw_text)
+                    }
+                    Some(NodeData::TemplateTail(literal)) => {
+                        template_raw_has_invalid_escape(&literal.raw_text)
+                    }
+                    _ => false,
+                }
+            });
+        if invalid_escape {
+            let head_text = head
+                .raw_text
+                .strip_prefix('`')
+                .and_then(|raw| raw.strip_suffix("${"))
+                .unwrap_or(&head.raw_text);
+            write_quoted(&mut self.writer, head_text);
+            for span_id in &data.template_spans.nodes {
+                let Some(NodeData::TemplateSpan(span)) =
+                    self.arena.get(*span_id).map(|node| &node.data)
+                else {
+                    continue;
+                };
+                self.writer.write(".concat(");
+                self.emit_expression(span.expression, 1)?;
+                self.writer.write(", ");
+                let raw = match self.arena.get(span.literal).map(|node| &node.data) {
+                    Some(NodeData::TemplateMiddle(literal)) => literal
+                        .raw_text
+                        .strip_prefix('}')
+                        .and_then(|raw| raw.strip_suffix("${"))
+                        .unwrap_or(&literal.raw_text),
+                    Some(NodeData::TemplateTail(literal)) => literal
+                        .raw_text
+                        .strip_prefix('}')
+                        .and_then(|raw| raw.strip_suffix('`'))
+                        .unwrap_or(&literal.raw_text),
+                    _ => "",
+                };
+                write_quoted(&mut self.writer, raw);
+                self.writer.write(")");
+            }
+            if wrap {
+                self.writer.write(")");
+            }
+            return Ok(());
+        }
         write_quoted(&mut self.writer, &head.text);
         for span_id in &data.template_spans.nodes {
             let node = self.node(*span_id)?.clone();
@@ -74305,6 +74361,32 @@ fn write_quoted_with(writer: &mut Writer, text: &str, quote: char) {
         }
     }
     writer.write(&quote.to_string());
+}
+
+fn write_template_cooked_quoted(writer: &mut Writer, text: &str) {
+    writer.write("\"");
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\0' if chars.peek().is_none_or(|next| !next.is_ascii_digit()) => {
+                writer.write("\\0");
+            }
+            '\\' => writer.write("\\\\"),
+            '"' => writer.write("\\\""),
+            '\n' => writer.write("\\n"),
+            '\r' => writer.write("\\r"),
+            '\t' => writer.write("\\t"),
+            ch if ch.is_control() => writer.write(&format!("\\u{:04x}", u32::from(ch))),
+            ch if u32::from(ch) > 0xffff => {
+                let value = u32::from(ch) - 0x1_0000;
+                let high = 0xd800 + (value >> 10);
+                let low = 0xdc00 + (value & 0x3ff);
+                writer.write(&format!("\\u{high:04X}\\u{low:04X}"));
+            }
+            ch => writer.write(&ch.to_string()),
+        }
+    }
+    writer.write("\"");
 }
 
 fn write_template_text(writer: &mut Writer, text: &str) {
