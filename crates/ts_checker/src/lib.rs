@@ -869,6 +869,25 @@ impl<'a> ProgramChecker<'a> {
             .collect()
     }
 
+    fn resolved_module_is_bodyless_ambient(&self, target: usize, specifier: &str) -> bool {
+        let Some(source) = self.sources.get(target) else {
+            return false;
+        };
+        source
+            .bindings
+            .root_scope()
+            .and_then(|scope| scope.symbols.get(specifier))
+            .and_then(|symbol| source.bindings.symbols.get(symbol))
+            .is_some_and(|symbol| {
+                symbol.declarations.iter().any(|declaration| {
+                    matches!(
+                        source.arena.get(*declaration).map(|node| &node.data),
+                        Some(NodeData::ModuleDeclaration(module)) if module.body.is_none()
+                    )
+                })
+            })
+    }
+
     fn resolved_module_exports(
         &self,
         target: usize,
@@ -1625,6 +1644,25 @@ impl<'a> ProgramChecker<'a> {
                 if clause.phase_modifier == Some(SyntaxKind::TypeKeyword) {
                     return Some(false);
                 }
+                if self.resolved_module_is_bodyless_ambient(target, specifier) {
+                    let has_runtime_binding = clause.name.is_some()
+                        || clause.named_bindings.is_some_and(|bindings| {
+                            match source.arena.get(bindings).map(|node| &node.data) {
+                                Some(NodeData::NamespaceImport(_)) => true,
+                                Some(NodeData::NamedImports(imports)) => {
+                                    imports.elements.nodes.iter().any(|specifier| {
+                                        matches!(
+                                            source.arena.get(*specifier).map(|node| &node.data),
+                                            Some(NodeData::ImportSpecifier(specifier))
+                                                if !specifier.is_type_only
+                                        )
+                                    })
+                                }
+                                _ => false,
+                            }
+                        });
+                    return Some(has_runtime_binding);
+                }
                 let mut has_unresolved_binding = false;
                 let mut has_value = clause.name.is_some_and(|_| {
                     self.module_export_has_runtime_value(
@@ -1695,6 +1733,9 @@ impl<'a> ProgramChecker<'a> {
                     Self::external_module_reference_text(source.arena, import.module_reference)
                 {
                     let target = source.resolved_modules.get(specifier).copied()?;
+                    if self.resolved_module_is_bodyless_ambient(target, specifier) {
+                        return Some(true);
+                    }
                     let exports = self.resolved_module_export_symbols(target, specifier);
                     let symbol = exports.get("export=").copied();
                     return Some(symbol.map_or_else(
@@ -1725,6 +1766,14 @@ impl<'a> ProgramChecker<'a> {
                 let NodeData::NamedExports(named) = &source.arena.get(clause)?.data else {
                     return Some(true);
                 };
+                if self.resolved_module_is_bodyless_ambient(target, specifier) {
+                    return Some(named.elements.nodes.iter().any(|specifier| {
+                        matches!(
+                            source.arena.get(*specifier).map(|node| &node.data),
+                            Some(NodeData::ExportSpecifier(specifier)) if !specifier.is_type_only
+                        )
+                    }));
+                }
                 Some(named.elements.nodes.iter().any(|specifier| {
                     let Some(NodeData::ExportSpecifier(specifier)) =
                         source.arena.get(*specifier).map(|node| &node.data)
@@ -1975,6 +2024,31 @@ impl<'a> ProgramChecker<'a> {
             return true;
         }
         for declaration in &symbol.declarations {
+            if matches!(
+                source.arena.get(*declaration).map(|node| &node.data),
+                Some(NodeData::ExportSpecifier(_))
+            ) && source
+                .arena
+                .get(*declaration)
+                .and_then(|node| node.parent)
+                .and_then(|named| source.arena.get(named)?.parent)
+                .and_then(|export_id| {
+                    let NodeData::ExportDeclaration(export) =
+                        &source.arena.get(export_id)?.data
+                    else {
+                        return None;
+                    };
+                    self.export_specifier_runtime_meaning(
+                        source_index,
+                        source,
+                        export,
+                        *declaration,
+                    )
+                })
+                == Some(true)
+            {
+                return true;
+            }
             if let Some(has_value) =
                 self.imported_alias_has_runtime_value(source_index, *declaration, visited)
                 && has_value
@@ -2750,6 +2824,9 @@ impl<'a> ProgramChecker<'a> {
         }
         let module = string_literal_text(source.arena, export.module_specifier?)?;
         let target = source.resolved_modules.get(module).copied()?;
+        if self.resolved_module_is_bodyless_ambient(target, module) {
+            return Some(true);
+        }
         let imported = specifier.property_name.unwrap_or(specifier.name);
         let name = module_export_name_text(source.arena, imported)?;
         let runtime = self.module_export_name_has_runtime_value(target, name, &mut HashSet::new());
@@ -26678,6 +26755,86 @@ mod tests {
             assert_eq!(meanings.get(statement), Some(&false), "{statement:?}");
         }
         assert!(!meanings.contains_key(&source.statements.nodes[5]));
+    }
+
+    #[test]
+    fn bodyless_ambient_modules_keep_direct_and_reexported_runtime_imports() {
+        let ambient = parse_source_file("declare module \"jquery\";");
+        let reexport = parse_source_file("export { x } from \"jquery\";");
+        let consumer = parse_source_file(concat!(
+            "import { x } from './reexport';\n",
+            "import boom = require('jquery');\n",
+            "import { type T } from 'jquery';\n",
+            "x(boom);",
+        ));
+        let ambient_bindings = bind_source_file(&ambient.arena, ambient.source_file);
+        let reexport_bindings = bind_source_file(&reexport.arena, reexport.source_file);
+        let consumer_bindings = bind_source_file(&consumer.arena, consumer.source_file);
+        let no_modules = BTreeMap::new();
+        let reexport_modules = BTreeMap::from([("jquery".into(), 0)]);
+        let consumer_modules =
+            BTreeMap::from([("./reexport".into(), 1), ("jquery".into(), 0)]);
+        let checked = check_program(&[
+            ProgramSource {
+                arena: &ambient.arena,
+                source_file: ambient.source_file,
+                bindings: &ambient_bindings,
+                resolved_modules: &no_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions {
+                    is_declaration_file: true,
+                    ..CheckerOptions::default()
+                },
+            },
+            ProgramSource {
+                arena: &reexport.arena,
+                source_file: reexport.source_file,
+                bindings: &reexport_bindings,
+                resolved_modules: &reexport_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+            ProgramSource {
+                arena: &consumer.arena,
+                source_file: consumer.source_file,
+                bindings: &consumer_bindings,
+                resolved_modules: &consumer_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+        ]);
+        let NodeData::SourceFile(reexport_source) =
+            &reexport.arena.get(reexport.source_file).unwrap().data
+        else {
+            panic!("expected reexport source file");
+        };
+        let NodeData::SourceFile(consumer_source) =
+            &consumer.arena.get(consumer.source_file).unwrap().data
+        else {
+            panic!("expected consumer source file");
+        };
+        assert_eq!(
+            checked.files[1]
+                .import_runtime_meanings
+                .get(&reexport_source.statements.nodes[0]),
+            Some(&true)
+        );
+        for statement in &consumer_source.statements.nodes[..2] {
+            assert_eq!(
+                checked.files[2].import_runtime_meanings.get(statement),
+                Some(&true),
+                "{statement:?}"
+            );
+        }
+        assert_eq!(
+            checked.files[2]
+                .import_runtime_meanings
+                .get(&consumer_source.statements.nodes[2]),
+            Some(&false)
+        );
     }
 
     #[test]
