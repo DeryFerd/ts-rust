@@ -7601,7 +7601,7 @@ impl DeclarationPrinter<'_> {
                 !matches!(
                     self.arena.get(*argument).map(|node| &node.data),
                     Some(NodeData::Identifier(_) | NodeData::PropertyAccessExpression(_))
-                )
+                ) && self.explicit_generic_factory_call(*argument).is_none()
             })
         {
             return None;
@@ -7614,19 +7614,39 @@ impl DeclarationPrinter<'_> {
             .declarations
             .iter()
             .find_map(|declaration| {
-                let NodeData::FunctionDeclaration(function) = &self.arena.get(*declaration)?.data
-                else {
-                    return None;
-                };
-                let type_parameters = &function.type_parameters.as_ref()?.nodes;
+                let (type_parameters, parameters, return_type) =
+                    match &self.arena.get(*declaration)?.data {
+                        NodeData::FunctionDeclaration(function) => (
+                            function.type_parameters.as_ref(),
+                            &function.parameters,
+                            function.type_,
+                        ),
+                        NodeData::VariableDeclaration(variable) => {
+                            match &self.arena.get(variable.initializer?)?.data {
+                                NodeData::ArrowFunction(function) => (
+                                    function.type_parameters.as_ref(),
+                                    &function.parameters,
+                                    function.type_,
+                                ),
+                                NodeData::FunctionExpression(function) => (
+                                    function.type_parameters.as_ref(),
+                                    &function.parameters,
+                                    function.type_,
+                                ),
+                                _ => return None,
+                            }
+                        }
+                        _ => return None,
+                    };
+                let type_parameters = &type_parameters?.nodes;
                 if type_parameters.len() != call.arguments.nodes.len()
-                    || function.parameters.nodes.len() != call.arguments.nodes.len()
+                    || parameters.nodes.len() != call.arguments.nodes.len()
                 {
                     return None;
                 }
                 let substitutions = type_parameters
                     .iter()
-                    .zip(&function.parameters.nodes)
+                    .zip(&parameters.nodes)
                     .zip(&call.arguments.nodes)
                     .map(|((type_parameter, parameter), argument)| {
                         let NodeData::TypeParameterDeclaration(type_parameter) =
@@ -7649,7 +7669,7 @@ impl DeclarationPrinter<'_> {
                             .then(|| (name.to_owned(), *argument))
                     })
                     .collect::<Option<Vec<_>>>()?;
-                Some((function.type_?, substitutions))
+                Some((return_type?, substitutions))
             })
     }
 
@@ -7668,8 +7688,7 @@ impl DeclarationPrinter<'_> {
                 else {
                     return self.emit_type(type_id);
                 };
-                self.writer.write("typeof ");
-                self.emit_name(*argument)
+                self.emit_factory_argument_type(*argument)
             }
             NodeData::ParenthesizedTypeNode(parenthesized) => {
                 self.writer.write("(");
@@ -7688,6 +7707,22 @@ impl DeclarationPrinter<'_> {
             }
             _ => self.emit_type(type_id),
         }
+    }
+
+    fn emit_factory_argument_type(&mut self, argument: NodeId) -> Result<(), EmitError> {
+        if matches!(
+            self.arena.get(argument).map(|node| &node.data),
+            Some(NodeData::Identifier(_) | NodeData::PropertyAccessExpression(_))
+        ) {
+            self.writer.write("typeof ");
+            return self.emit_name(argument);
+        }
+        let Some((return_type, substitutions)) = self.explicit_generic_factory_call(argument)
+        else {
+            self.writer.write("any");
+            return Ok(());
+        };
+        self.emit_type_with_value_substitution(return_type, &substitutions)
     }
 
     fn emit_local_class_mixin_constructor_type(
@@ -64714,6 +64749,20 @@ impl Printer<'_> {
                     let result = self.emit_expression(data.body, 1);
                     self.downlevel_optional_temps.remove(&data.body);
                     result?;
+                    self.writer.write("; }");
+                } else if self.settings.target < ScriptTarget::Es2022
+                    && let Some(NodeData::ClassExpression(class)) =
+                        self.arena.get(data.body).map(|node| &node.data)
+                    && self.class_expression_requires_post_class_lowering(
+                        &Self::class_expression_as_declaration(class),
+                    )
+                {
+                    let temp = self.generate_block_temp(id, &HashSet::new());
+                    self.class_expression_temps.insert(data.body, temp.clone());
+                    self.writer.write("{ var ");
+                    self.writer.write(&temp);
+                    self.writer.write("; return ");
+                    self.emit_expression(data.body, 0)?;
                     self.writer.write("; }");
                 } else {
                     self.emit_arrow_body_line_comments(id, data.body);
