@@ -103,6 +103,24 @@ fn unique_parameter_name(
     }
 }
 
+fn edit_distance(left: &str, right: &str) -> usize {
+    let right = right.chars().collect::<Vec<_>>();
+    let mut previous = (0..=right.len()).collect::<Vec<_>>();
+    for (left_index, left_char) in left.chars().enumerate() {
+        let mut current = Vec::with_capacity(right.len() + 1);
+        current.push(left_index + 1);
+        for (right_index, right_char) in right.iter().enumerate() {
+            current.push(
+                (previous[right_index + 1] + 1)
+                    .min(current[right_index] + 1)
+                    .min(previous[right_index] + usize::from(left_char != *right_char)),
+            );
+        }
+        previous = current;
+    }
+    previous[right.len()]
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ImportTypeReference {
     pub module_specifier: String,
@@ -255,8 +273,8 @@ impl TypeArena {
                 TypeKind::BigIntLiteral(_) if has_bigint
             )
         });
-        flattened.sort_unstable();
-        flattened.dedup();
+        let mut seen = HashSet::new();
+        flattened.retain(|member| seen.insert(*member));
         let mut structurally_unique: Vec<TypeId> = Vec::with_capacity(flattened.len());
         for member in flattened {
             if structurally_unique.iter().any(|existing| {
@@ -341,15 +359,19 @@ impl TypeArena {
                 .map(|member| self.display(*member))
                 .collect::<Vec<_>>()
                 .join(" & "),
-            TypeKind::Object(object) => format!(
-                "{{ {} }}",
-                object
+            TypeKind::Object(object) => {
+                let properties = object
                     .properties
                     .iter()
                     .map(|(name, value)| format!("{name}: {}", self.display(*value)))
                     .collect::<Vec<_>>()
-                    .join("; ")
-            ),
+                    .join("; ");
+                if properties.is_empty() {
+                    "{  }".into()
+                } else {
+                    format!("{{ {properties}; }}")
+                }
+            }
             TypeKind::Function(function) => format!(
                 "({}) => {}",
                 self.display_signature_parameters(function),
@@ -3947,6 +3969,7 @@ struct Checker<'a> {
     active_defaulted_type_parameters: HashSet<TypeId>,
     mapped_return_templates: HashMap<TypeId, (NodeId, HashMap<String, TypeId>)>,
     reverse_mapped_type_parameters: HashMap<TypeId, Vec<TypeId>>,
+    diagnostic_type_names: HashMap<TypeId, String>,
     non_widening_types: HashSet<TypeId>,
     local_scopes: Vec<HashMap<String, TypeId>>,
     narrowings: Vec<HashMap<SymbolId, TypeId>>,
@@ -4039,6 +4062,7 @@ impl<'a> Checker<'a> {
             active_defaulted_type_parameters: HashSet::new(),
             mapped_return_templates: HashMap::new(),
             reverse_mapped_type_parameters: HashMap::new(),
+            diagnostic_type_names: HashMap::new(),
             non_widening_types: HashSet::new(),
             local_scopes: Vec::new(),
             narrowings: Vec::new(),
@@ -7187,17 +7211,43 @@ impl<'a> Checker<'a> {
                         .unwrap_or_else(|| name.clone());
                     let expected = contextual_object
                         .as_ref()
-                        .and_then(|object| object.properties.get(&contextual_name))
-                        .copied();
-                    if expected.is_none() && contextual_object.is_some() {
+                        .and_then(|object| {
+                            object
+                                .properties
+                                .get(&contextual_name)
+                                .copied()
+                                .or_else(|| {
+                                    (name.parse::<f64>().is_ok())
+                                        .then_some(object.number_index_type)
+                                        .flatten()
+                                })
+                                .or(object.string_index_type)
+                        });
+                    if expected.is_none()
+                        && contextual_object
+                            .as_ref()
+                            .is_some_and(|object| !object.properties.is_empty())
+                    {
+                        let contextual_type =
+                            contextual_type.expect("contextual object has a type");
+                        let contextual_type = match self
+                            .result
+                            .types
+                            .get(contextual_type)
+                            .map(|type_| &type_.kind)
+                        {
+                            Some(TypeKind::TypeParameter {
+                                constraint: Some(constraint),
+                                ..
+                            }) => *constraint,
+                            _ => contextual_type,
+                        };
                         self.error(
                             *property,
                             2353,
                             [
                                 name.clone(),
-                                self.result.types.display(
-                                    contextual_type.expect("contextual object has a type"),
-                                ),
+                                self.diagnostic_type_display(contextual_type),
                             ],
                         );
                     }
@@ -7347,6 +7397,10 @@ impl<'a> Checker<'a> {
             TypeKind::Object(object) => Some(object),
             TypeKind::Union(members) => self.combine_contextual_objects(members, false),
             TypeKind::Intersection(members) => self.combine_contextual_objects(members, true),
+            TypeKind::TypeParameter {
+                constraint: Some(constraint),
+                ..
+            } => self.contextual_object_type(constraint),
             _ => None,
         }
     }
@@ -7875,6 +7929,19 @@ impl<'a> Checker<'a> {
             })
     }
 
+    fn class_is_abstract(&self, symbol: SymbolId) -> bool {
+        self.bindings.symbols.get(symbol).is_some_and(|symbol| {
+            symbol.declarations.iter().any(|declaration| {
+                let Some(NodeData::ClassDeclaration(class)) =
+                    self.arena.get(*declaration).map(|node| &node.data)
+                else {
+                    return false;
+                };
+                self.has_ast_modifier(class.modifiers.as_ref(), SyntaxKind::AbstractKeyword)
+            })
+        })
+    }
+
     fn class_constructor_signature(
         &mut self,
         members: &[NodeId],
@@ -8106,13 +8173,37 @@ impl<'a> Checker<'a> {
             };
             if !self.is_assignable(actual, expected) {
                 let location = self.class_member_name_node(*member).unwrap_or(*member);
-                self.error(
-                    location,
-                    2416,
+                let message = message_by_code(2416).expect("TS2416 is in the catalog");
+                let diagnostic = Diagnostic::with_arguments(
+                    message,
                     [name, class_name.to_owned(), base_name.to_owned()],
-                );
+                )
+                .with_details(self.base_member_type_details(actual, expected));
+                self.result
+                    .diagnostics
+                    .push(CheckDiagnostic { node: location, diagnostic });
             }
         }
+    }
+
+    fn base_member_type_details(&self, actual: TypeId, expected: TypeId) -> Vec<String> {
+        let mut details = vec![format!(
+            "  Type '{}' is not assignable to type '{}'.",
+            self.diagnostic_type_display(actual),
+            self.diagnostic_type_display(expected)
+        )];
+        if let (Some(TypeKind::Function(actual)), Some(TypeKind::Function(expected))) = (
+            self.result.types.get(actual).map(|type_| &type_.kind),
+            self.result.types.get(expected).map(|type_| &type_.kind),
+        ) && !self.is_assignable(actual.return_type, expected.return_type)
+        {
+            details.push(format!(
+                "    Type '{}' is not assignable to type '{}'.",
+                self.diagnostic_type_display(actual.return_type),
+                self.diagnostic_type_display(expected.return_type)
+            ));
+        }
+        details
     }
 
     fn class_member_types(&mut self, members: &[NodeId]) -> BTreeMap<String, TypeId> {
@@ -8142,13 +8233,20 @@ impl<'a> Checker<'a> {
                 }
                 NodeData::MethodDeclaration(method) => {
                     if let Some(name) = self.property_name(method.name) {
-                        let type_id = self.declaration_signature_type(
-                            *member,
-                            &method.parameters.nodes,
-                            method.type_,
-                            method.type_parameters.as_ref(),
-                            method.body,
-                        );
+                        let type_id = self
+                            .result
+                            .node_types
+                            .get(member)
+                            .copied()
+                            .unwrap_or_else(|| {
+                                self.declaration_signature_type(
+                                    *member,
+                                    &method.parameters.nodes,
+                                    method.type_,
+                                    method.type_parameters.as_ref(),
+                                    method.body,
+                                )
+                            });
                         properties.insert(name, type_id);
                     }
                 }
@@ -9734,7 +9832,7 @@ impl<'a> Checker<'a> {
                 .flatten()
                 .and_then(|symbol| self.result.symbol_types.get(&symbol).copied());
                 let mut value = declared_member.unwrap_or_else(|| {
-                    self.property_access_type(node_id, access_receiver, &name)
+                    self.property_access_type(node_id, data.name, access_receiver, &name)
                 });
                 if data.question_dot_token.is_some() {
                     let undefined = self.result.types.undefined();
@@ -9776,7 +9874,7 @@ impl<'a> Checker<'a> {
                     return self.result.types.any();
                 }
                 let index = self.type_of_expression(data.argument_expression);
-                let value = self.element_access_type(node_id, receiver, index);
+                let value = self.element_access_type(data.argument_expression, receiver, index);
                 self.record_const_enum_access(node_id, receiver, value);
                 value
             }
@@ -9976,6 +10074,9 @@ impl<'a> Checker<'a> {
                     .unwrap_or_default();
                 let declared_class_symbol =
                     self.resolve_value_expression_symbol(data.expression);
+                if declared_class_symbol.is_some_and(|symbol| self.class_is_abstract(symbol)) {
+                    self.error(node_id, 2511, std::iter::empty());
+                }
                 let inaccessible_constructor = declared_class_symbol.is_some_and(|symbol| {
                     self.class_constructor_is_inaccessible_from(symbol, node_id)
                 });
@@ -10128,9 +10229,9 @@ impl<'a> Checker<'a> {
             .flatten()
             .unwrap_or(left);
         if operator == SyntaxKind::EqualsToken
-            && let Some(name) = self.readonly_assignment_name(data.left)
+            && let Some((name, name_node)) = self.readonly_assignment_name(data.left)
         {
-            self.error(node_id, 2540, [name]);
+            self.error(name_node, 2540, [name]);
             right
         } else if operator == SyntaxKind::EqualsToken
             && let Some(symbol) = self.narrowing_subject(data.left)
@@ -10524,7 +10625,7 @@ impl<'a> Checker<'a> {
             )
     }
 
-    fn readonly_assignment_name(&mut self, left: NodeId) -> Option<String> {
+    fn readonly_assignment_name(&mut self, left: NodeId) -> Option<(String, NodeId)> {
         let NodeData::PropertyAccessExpression(access) =
             self.arena.get(left).map(|node| node.data.clone())?
         else {
@@ -10533,7 +10634,7 @@ impl<'a> Checker<'a> {
         let name = self.property_name(access.name)?;
         let receiver = self.type_of_expression(access.expression);
         let readonly = self.type_has_readonly_property(receiver, &name, &mut HashSet::new());
-        readonly.then_some(name)
+        readonly.then_some((name, access.name))
     }
 
     fn type_has_readonly_property(
@@ -11133,7 +11234,13 @@ impl<'a> Checker<'a> {
         function
     }
 
-    fn property_access_type(&mut self, node: NodeId, receiver: TypeId, name: &str) -> TypeId {
+    fn property_access_type(
+        &mut self,
+        node: NodeId,
+        name_node: NodeId,
+        receiver: TypeId,
+        name: &str,
+    ) -> TypeId {
         if let Some(property) = self.lookup_property_type(receiver, name) {
             let property = if name == "flat"
                 && let Some(flat) = self.array_flat_property_type(receiver, property)
@@ -11148,7 +11255,7 @@ impl<'a> Checker<'a> {
             property
         } else if let Some(property) = self.partial_union_property_type(receiver, name) {
             self.error(
-                node,
+                name_node,
                 2339,
                 [name.to_owned(), self.property_receiver_display(receiver)],
             );
@@ -11164,11 +11271,16 @@ impl<'a> Checker<'a> {
             }
             property
         } else {
-            self.error(
-                node,
-                2339,
-                [name.to_owned(), self.property_receiver_display(receiver)],
-            );
+            let receiver_display = self.property_receiver_display(receiver);
+            if let Some(suggestion) = self.property_name_suggestion(receiver, name) {
+                self.error(
+                    name_node,
+                    2551,
+                    [name.to_owned(), receiver_display, suggestion],
+                );
+            } else {
+                self.error(name_node, 2339, [name.to_owned(), receiver_display]);
+            }
             self.result.types.any()
         }
     }
@@ -11182,6 +11294,55 @@ impl<'a> Checker<'a> {
             .filter_map(|member| self.lookup_property_type(member, name))
             .collect::<Vec<_>>();
         (!properties.is_empty()).then(|| self.result.types.union(properties))
+    }
+
+    fn property_name_suggestion(&mut self, receiver: TypeId, wanted: &str) -> Option<String> {
+        let kind = self.result.types.get(receiver)?.kind.clone();
+        let object = match kind {
+            TypeKind::Object(object) => Some(object),
+            TypeKind::String | TypeKind::StringLiteral(_) => self
+                .external_names
+                .get("String")
+                .cloned()
+                .and_then(|descriptor| {
+                    let type_id = self.import_alias(&descriptor, &[]);
+                    let TypeKind::Object(object) = self.result.types.get(type_id)?.kind.clone()
+                    else {
+                        return None;
+                    };
+                    Some(object)
+                }),
+            TypeKind::Number | TypeKind::NumberLiteral(_) => self
+                .external_names
+                .get("Number")
+                .cloned()
+                .and_then(|descriptor| {
+                    let type_id = self.import_alias(&descriptor, &[]);
+                    let TypeKind::Object(object) = self.result.types.get(type_id)?.kind.clone()
+                    else {
+                        return None;
+                    };
+                    Some(object)
+                }),
+            TypeKind::TypeParameter {
+                constraint: Some(constraint),
+                ..
+            } => return self.property_name_suggestion(constraint, wanted),
+            _ => None,
+        }?;
+        let wanted_lower = wanted.to_lowercase();
+        let (distance, suggestion) = object
+            .properties
+            .keys()
+            .map(|candidate| {
+                (
+                    edit_distance(&wanted_lower, &candidate.to_lowercase()),
+                    candidate,
+                )
+            })
+            .min_by(|left, right| left.cmp(right))?;
+        let threshold = 2.max(wanted.chars().count() / 3);
+        (distance <= threshold).then(|| suggestion.clone())
     }
 
     fn array_flat_property_type(&mut self, receiver: TypeId, property: TypeId) -> Option<TypeId> {
@@ -11296,6 +11457,12 @@ impl<'a> Checker<'a> {
     }
 
     fn property_receiver_display(&self, receiver: TypeId) -> String {
+        if let Some(reference) = self.result.named_type_references.get(&receiver)
+            && reference.name == "__readonly_array"
+            && let [element] = reference.type_arguments.as_slice()
+        {
+            return format!("readonly {}[]", self.diagnostic_type_display(*element));
+        }
         let Some(TypeKind::Object(object)) =
             self.result.types.get(receiver).map(|type_| &type_.kind)
         else {
@@ -11323,6 +11490,26 @@ impl<'a> Checker<'a> {
     }
 
     fn lookup_property_type(&mut self, receiver: TypeId, name: &str) -> Option<TypeId> {
+        if self
+            .result
+            .named_type_references
+            .get(&receiver)
+            .is_some_and(|reference| reference.name == "__readonly_array")
+            && matches!(
+                name,
+                "copyWithin"
+                    | "fill"
+                    | "pop"
+                    | "push"
+                    | "reverse"
+                    | "shift"
+                    | "sort"
+                    | "splice"
+                    | "unshift"
+            )
+        {
+            return None;
+        }
         match self.result.types.get(receiver)?.kind.clone() {
             TypeKind::Any => Some(self.result.types.any()),
             TypeKind::Object(object) => self.object_property_type(&object, name, true),
@@ -12256,6 +12443,35 @@ impl<'a> Checker<'a> {
                 self.active_defaulted_type_parameters.clear();
                 return result;
             }
+            if let Some(signature) = signatures.last()
+                && let Some((index, actual, expected)) = actuals
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .find_map(|(index, actual)| {
+                        let expected = self.signature_parameter_at(signature, index)?;
+                        (!self.is_assignable(actual, expected))
+                            .then_some((index, actual, expected))
+                    })
+            {
+                let displayed_actual = self.diagnostic_source_type(actual, expected);
+                let diagnostic = Diagnostic::new(
+                    message_by_code(2769).expect("TS2769 is in the diagnostic catalog"),
+                )
+                .with_details([
+                    "  The last overload gave the following error.".to_owned(),
+                    format!(
+                        "    Argument of type '{}' is not assignable to parameter of type '{}'.",
+                        self.diagnostic_type_display(displayed_actual),
+                        self.diagnostic_type_display(expected)
+                    ),
+                ]);
+                self.result.diagnostics.push(CheckDiagnostic {
+                    node: arguments.get(index).copied().unwrap_or(node),
+                    diagnostic,
+                });
+                return signature.return_type;
+            }
         }
         let Some(signature) = signatures.first() else {
             self.error(
@@ -12330,11 +12546,12 @@ impl<'a> Checker<'a> {
                 } else {
                     2345
                 };
+                let displayed_actual = self.diagnostic_source_type(checked_actual, expected);
                 self.error(
                     *argument,
                     code,
                     [
-                        self.result.types.display(checked_actual),
+                        self.result.types.display(displayed_actual),
                         self.result.types.display(expected),
                     ],
                 );
@@ -15787,6 +16004,22 @@ impl<'a> Checker<'a> {
                 } else {
                     self.unresolved_type_name(data.type_name, name.clone())
                 };
+                let diagnostic_name = if arguments.is_empty() {
+                    name.clone()
+                } else {
+                    format!(
+                        "{}<{}>",
+                        name,
+                        arguments
+                            .iter()
+                            .map(|argument| self.diagnostic_type_display(*argument))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                };
+                self.diagnostic_type_names
+                    .entry(type_id)
+                    .or_insert(diagnostic_name);
                 if homomorphic_mapped_alias && !arguments.is_empty() {
                     self.reverse_mapped_type_parameters
                         .insert(type_id, arguments.clone());
@@ -15892,7 +16125,29 @@ impl<'a> Checker<'a> {
             NodeData::TypeOperatorNode(data) => {
                 let operand = self.type_from_type_node(data.type_);
                 if data.operator == SyntaxKind::KeyOfKeyword {
-                    self.keyof_type(operand)
+                    let keyed = self.keyof_type(operand);
+                    let kind = self.result.types.get(keyed).unwrap().kind.clone();
+                    let keyed = self.result.types.alloc(kind);
+                    let operand = self.diagnostic_type_display(operand);
+                    self.diagnostic_type_names
+                        .insert(keyed, format!("keyof {operand}"));
+                    keyed
+                } else if data.operator == SyntaxKind::ReadonlyKeyword
+                    && let Some(TypeKind::Array(element)) = self
+                        .result
+                        .types
+                        .get(operand)
+                        .map(|type_| type_.kind.clone())
+                {
+                    let readonly = self.result.types.alloc(TypeKind::Array(element));
+                    self.result.named_type_references.insert(
+                        readonly,
+                        NamedTypeReference {
+                            name: "__readonly_array".into(),
+                            type_arguments: vec![element],
+                        },
+                    );
+                    readonly
                 } else {
                     operand
                 }
@@ -18166,33 +18421,31 @@ impl<'a> Checker<'a> {
     }
 
     fn assignability_error(&mut self, node: NodeId, actual: TypeId, expected: TypeId) {
+        if let Some(property) = self.single_missing_required_property(actual, expected) {
+            let displayed_actual = self.diagnostic_source_type(actual, expected);
+            self.error(
+                node,
+                2741,
+                [
+                    property,
+                    self.diagnostic_type_display(displayed_actual),
+                    self.diagnostic_type_display(expected),
+                ],
+            );
+            return;
+        }
         let code = if self.exact_optional_property_mismatch(actual, expected) {
             2375
         } else {
             2322
         };
-        let call_result = matches!(
-            self.arena.get(node).map(|node| &node.data),
-            Some(NodeData::CallExpression(_))
-        ) || matches!(
-            self.arena.get(node).map(|node| &node.data),
-            Some(NodeData::VariableDeclaration(variable))
-                if variable.initializer.is_some_and(|initializer| matches!(
-                    self.arena.get(initializer).map(|node| &node.data),
-                    Some(NodeData::CallExpression(_))
-                ))
-        );
-        let displayed_actual = if call_result {
-            self.widen_literal(actual)
-        } else {
-            actual
-        };
+        let displayed_actual = self.diagnostic_source_type(actual, expected);
         let message = message_by_code(code).expect("checker diagnostic is in catalog");
         let diagnostic = Diagnostic::with_arguments(
             message,
             [
-                self.result.types.display(displayed_actual),
-                self.result.types.display(expected),
+                self.diagnostic_type_display(displayed_actual),
+                self.diagnostic_type_display(expected),
             ],
         )
         .with_details(self.assignability_details(actual, expected));
@@ -18201,7 +18454,107 @@ impl<'a> Checker<'a> {
             .push(CheckDiagnostic { node, diagnostic });
     }
 
+    fn single_missing_required_property(
+        &self,
+        actual: TypeId,
+        expected: TypeId,
+    ) -> Option<String> {
+        let TypeKind::Object(target) = &self.result.types.get(expected)?.kind else {
+            return None;
+        };
+        let missing = target
+            .properties
+            .keys()
+            .filter(|name| {
+                !target.optional_properties.contains(*name)
+                    && self.property_types(actual, name).is_empty()
+            })
+            .collect::<Vec<_>>();
+        (missing.len() == 1).then(|| missing[0].clone())
+    }
+
+    fn diagnostic_source_type(&mut self, actual: TypeId, expected: TypeId) -> TypeId {
+        if self.target_preserves_literal_diagnostics(expected) {
+            return actual;
+        }
+        match self.result.types.get(actual).map(|type_| &type_.kind) {
+            Some(
+                TypeKind::BooleanLiteral(_)
+                | TypeKind::NumberLiteral(_)
+                | TypeKind::StringLiteral(_)
+                | TypeKind::BigIntLiteral(_),
+            ) => self.widen_literal(actual),
+            Some(TypeKind::Union(members))
+                if members.iter().all(|member| {
+                    matches!(
+                        self.result.types.get(*member).map(|type_| &type_.kind),
+                        Some(
+                            TypeKind::BooleanLiteral(_)
+                                | TypeKind::NumberLiteral(_)
+                                | TypeKind::StringLiteral(_)
+                                | TypeKind::BigIntLiteral(_)
+                        )
+                    )
+                }) =>
+            {
+                self.widen_literal(actual)
+            }
+            _ => actual,
+        }
+    }
+
+    fn target_preserves_literal_diagnostics(&self, type_id: TypeId) -> bool {
+        match self.result.types.get(type_id).map(|type_| &type_.kind) {
+            Some(
+                TypeKind::Never
+                | TypeKind::BooleanLiteral(_)
+                | TypeKind::NumberLiteral(_)
+                | TypeKind::StringLiteral(_)
+                | TypeKind::BigIntLiteral(_),
+            ) => true,
+            Some(TypeKind::Union(members)) => members
+                .iter()
+                .all(|member| self.target_preserves_literal_diagnostics(*member)),
+            _ => false,
+        }
+    }
+
     fn assignability_details(&self, actual: TypeId, expected: TypeId) -> Vec<String> {
+        if let (
+            Some(TypeKind::Object(source)),
+            Some(TypeKind::Object(target)),
+        ) = (
+            self.result.types.get(actual).map(|type_| &type_.kind),
+            self.result.types.get(expected).map(|type_| &type_.kind),
+        ) {
+            for (name, target_type) in &target.properties {
+                let Some(source_type) = source.properties.get(name).copied() else {
+                    continue;
+                };
+                if self.is_assignable(source_type, *target_type) {
+                    continue;
+                }
+                let source_display = self.parameter_relation_display(source_type);
+                let target_display = self.diagnostic_type_display(*target_type);
+                let mut details = vec![
+                    format!("  Types of property '{name}' are incompatible."),
+                    format!(
+                        "    Type '{source_display}' is not assignable to type '{target_display}'."
+                    ),
+                ];
+                if let TypeKind::Union(members) = &self.result.types.get(source_type).unwrap().kind
+                    && let Some(member) = members
+                        .iter()
+                        .find(|member| !self.is_assignable(**member, *target_type))
+                {
+                    details.push(format!(
+                        "      Type '{}' is not assignable to type '{target_display}'.",
+                        self.diagnostic_type_display(*member)
+                    ));
+                }
+                return details;
+            }
+        }
         let Some(TypeKind::Function(source)) = self.result.types.get(actual).map(|type_| &type_.kind)
         else {
             return Vec::new();
@@ -18243,11 +18596,15 @@ impl<'a> Checker<'a> {
                 ),
             ];
             if let TypeKind::Union(members) = &self.result.types.get(target_type).unwrap().kind
-                && let Some(member) = members
-                    .iter()
-                    .find(|member| {
-                        !self.signature_parameter_is_assignable(**member, source_type)
+                && let Some(member) = if members.contains(&self.result.types.undefined())
+                    && !self.type_includes_undefined(source_type)
+                {
+                    Some(self.result.types.undefined())
+                } else {
+                    members.iter().copied().find(|member| {
+                        !self.signature_parameter_is_assignable(*member, source_type)
                     })
+                }
             {
                 let nested_source = self
                     .result
@@ -18256,7 +18613,7 @@ impl<'a> Checker<'a> {
                     .1;
                 details.push(format!(
                     "      Type '{}' is not assignable to type '{nested_source}'.",
-                    self.result.types.display(*member)
+                    self.result.types.display(member)
                 ));
             }
             return details;
@@ -18294,6 +18651,35 @@ impl<'a> Checker<'a> {
             .map(|member| self.result.types.display(*member))
             .collect::<Vec<_>>()
             .join(" | ")
+    }
+
+    fn diagnostic_type_display(&self, type_id: TypeId) -> String {
+        if let Some(name) = self.diagnostic_type_names.get(&type_id) {
+            return name.clone();
+        }
+        if let Some(reference) = self.result.named_type_references.get(&type_id) {
+            if reference.name == "__keyof"
+                && let [target] = reference.type_arguments.as_slice()
+            {
+                return format!("keyof {}", self.diagnostic_type_display(*target));
+            }
+            if !reference.name.starts_with("__") {
+                if reference.type_arguments.is_empty() {
+                    return reference.name.clone();
+                }
+                return format!(
+                    "{}<{}>",
+                    reference.name,
+                    reference
+                        .type_arguments
+                        .iter()
+                        .map(|argument| self.diagnostic_type_display(*argument))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+        }
+        self.result.types.display(type_id)
     }
 
     fn operator_error(&mut self, node: NodeId, operator: SyntaxKind, left: TypeId, right: TypeId) {
@@ -23321,7 +23707,7 @@ mod tests {
         );
         assert_eq!(
             result.diagnostics[0].diagnostic.render().unwrap(),
-            "Type '\"wrong\"' is not assignable to type 'number'."
+            "Type 'string' is not assignable to type 'number'."
         );
         assert_eq!(
             result.diagnostics[1].diagnostic.render().unwrap(),
@@ -23365,7 +23751,7 @@ mod tests {
         assert_eq!(result.diagnostics[0].diagnostic.code(), 2322);
         assert_eq!(
             result.diagnostics[0].diagnostic.render().unwrap(),
-            "Type '\"bad\"' is not assignable to type 'number'."
+            "Type 'string' is not assignable to type 'number'."
         );
         assert_eq!(result.diagnostics[1].diagnostic.code(), 2355);
         assert_eq!(
@@ -23689,7 +24075,7 @@ mod tests {
         );
         assert_eq!(
             result.diagnostics[0].diagnostic.render().unwrap(),
-            "Property 'missing' does not exist on type '{ x: number }'."
+            "Property 'missing' does not exist on type '{ x: number; }'."
         );
         assert_eq!(
             result.diagnostics[1].diagnostic.render().unwrap(),
@@ -23697,7 +24083,7 @@ mod tests {
         );
         assert_eq!(
             result.diagnostics[2].diagnostic.render().unwrap(),
-            "Argument of type '\"x\"' is not assignable to parameter of type 'number'."
+            "Argument of type 'string' is not assignable to parameter of type 'number'."
         );
     }
 
@@ -25053,7 +25439,7 @@ mod tests {
                 .iter()
                 .map(|diagnostic| diagnostic.diagnostic.code())
                 .collect::<Vec<_>>(),
-            [2339]
+            [2551]
         );
     }
 
@@ -26388,7 +26774,7 @@ mod tests {
                 .iter()
                 .map(|diagnostic| diagnostic.diagnostic.code())
                 .collect::<Vec<_>>(),
-            [2322, 2322, 2322, 2322, 2322, 2353, 2322, 2322, 2322],
+            [2322, 2322, 2322, 2322, 2741, 2353, 2322, 2322, 2322],
             "{:?}",
             result
                 .diagnostics
@@ -26420,7 +26806,7 @@ mod tests {
                 .iter()
                 .map(|diagnostic| diagnostic.diagnostic.code())
                 .collect::<Vec<_>>(),
-            [2322, 2345]
+            [2322, 2769]
         );
     }
 
@@ -26615,7 +27001,7 @@ mod tests {
         let result_type = checked.files[1]
             .type_of_symbol(root.symbols.get("result").unwrap())
             .unwrap();
-        assert_eq!(checked.files[1].types.display(result_type), "{ b: number }");
+        assert_eq!(checked.files[1].types.display(result_type), "{ b: number; }");
     }
 
     #[test]
@@ -26647,7 +27033,10 @@ mod tests {
         ]);
         let y = client_bindings.root_scope().unwrap().symbols.get("y").unwrap();
         let y_type = checked.files[1].type_of_symbol(y).unwrap();
-        assert_eq!(checked.files[1].types.display(y_type), "{ a: number; b: number }");
+        assert_eq!(
+            checked.files[1].types.display(y_type),
+            "{ a: number; b: number; }"
+        );
     }
 
     #[test]
@@ -26942,11 +27331,11 @@ mod tests {
                 .iter()
                 .map(|diagnostic| diagnostic.diagnostic.code())
                 .collect::<Vec<_>>(),
-            [2322, 2353, 2540, 2322]
+            [2741, 2353, 2540, 2322]
         );
         assert_eq!(
             result.diagnostics[1].diagnostic.render().unwrap(),
-            "Object literal may only specify known properties, and 'extra' does not exist in type '{ id: number; label: undefined | string; value: string }'."
+            "Object literal may only specify known properties, and 'extra' does not exist in type 'Child'."
         );
     }
 
@@ -30244,13 +30633,13 @@ mod tests {
             .unwrap();
         assert_eq!(
             result.types.display(result.type_of_symbol(value).unwrap()),
-            "{ _type: { prop1: { _type: \"hello\" } } }"
+            "{ _type: { prop1: { _type: \"hello\"; }; }; }"
         );
         assert_eq!(
             result
                 .types
                 .display(result.type_of_symbol(unwrapped).unwrap()),
-            "{ prop1: \"hello\" }"
+            "{ prop1: \"hello\"; }"
         );
         assert!(
             result.diagnostics.is_empty(),
