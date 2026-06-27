@@ -688,6 +688,51 @@ impl<'a> Binder<'a> {
                     data.body,
                 );
             }
+            NodeData::FunctionTypeNode(data) => {
+                self.bind_signature_type(
+                    node_id,
+                    scope,
+                    parent_symbol,
+                    data.type_parameters.as_ref(),
+                    &data.parameters.nodes,
+                    data.type_,
+                );
+            }
+            NodeData::ConstructorTypeNode(data) => {
+                self.bind_signature_type(
+                    node_id,
+                    scope,
+                    parent_symbol,
+                    data.type_parameters.as_ref(),
+                    &data.parameters.nodes,
+                    data.type_,
+                );
+            }
+            NodeData::CallSignatureDeclaration(data) => {
+                self.bind_signature_type(
+                    node_id,
+                    scope,
+                    parent_symbol,
+                    data.type_parameters.as_ref(),
+                    &data.parameters.nodes,
+                    data.type_,
+                );
+            }
+            NodeData::ConstructSignatureDeclaration(data) => {
+                self.bind_signature_type(
+                    node_id,
+                    scope,
+                    parent_symbol,
+                    data.type_parameters.as_ref(),
+                    &data.parameters.nodes,
+                    data.type_,
+                );
+            }
+            NodeData::TypeLiteralNode(_) => {
+                let type_scope = self.create_scope(ScopeKind::Interface, node_id, Some(scope));
+                self.result.node_scopes.insert(node_id, type_scope);
+                self.bind_children(node_id, type_scope, node_id, parent_symbol);
+            }
             NodeData::ArrowFunction(data) => {
                 self.bind_function_like(
                     node_id,
@@ -969,6 +1014,29 @@ impl<'a> Binder<'a> {
         }
         if let Some(body) = body {
             self.bind_node(body, function_scope, node_id, parent_symbol);
+        }
+    }
+
+    fn bind_signature_type(
+        &mut self,
+        node_id: NodeId,
+        parent_scope: ScopeId,
+        parent_symbol: Option<SymbolId>,
+        type_parameters: Option<&ts_ast::NodeList>,
+        parameters: &[NodeId],
+        return_type: Option<NodeId>,
+    ) {
+        self.bind_function_like(
+            node_id,
+            parent_scope,
+            parent_symbol,
+            type_parameters,
+            parameters,
+            None,
+        );
+        if let Some(return_type) = return_type {
+            let function_scope = self.result.node_scopes[&node_id];
+            self.bind_node(return_type, function_scope, node_id, parent_symbol);
         }
     }
 
@@ -1435,6 +1503,7 @@ fn can_merge(existing: SymbolFlags, new: SymbolFlags) -> bool {
     (existing.contains(SymbolFlags::FUNCTION_SCOPED_VARIABLE)
         && new == SymbolFlags::FUNCTION_SCOPED_VARIABLE)
         || (existing.contains(SymbolFlags::FUNCTION) && new == SymbolFlags::FUNCTION)
+        || (existing.contains(SymbolFlags::METHOD) && new == SymbolFlags::METHOD)
         || (existing.contains(SymbolFlags::INTERFACE) && new == SymbolFlags::INTERFACE)
         || (existing.intersects(SymbolFlags::INTERFACE | SymbolFlags::TYPE_ALIAS)
             && new.intersects(SymbolFlags::VARIABLE))
@@ -1991,6 +2060,19 @@ mod tests {
             result.diagnostics[0].diagnostic.render().unwrap(),
             "Duplicate identifier 'Conflict'."
         );
+    }
+
+    #[test]
+    fn isolates_type_literal_and_signature_type_scopes() {
+        let parsed = parse_source_file(concat!(
+            "declare let first: { value: string; call<T>(input: T): T }; ",
+            "declare let second: { value: number; call<T>(input: T): T }; ",
+            "declare let generic: <T>(input: T) => T; ",
+            "declare let other: <T>(input: T) => T;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let result = bind_source_file(&parsed.arena, parsed.source_file);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
     }
 
     #[test]

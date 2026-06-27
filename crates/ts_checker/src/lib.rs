@@ -2385,6 +2385,12 @@ impl<'a> ProgramChecker<'a> {
                 let Some(symbol) = source.bindings.symbols.get(symbol_id) else {
                     continue;
                 };
+                if symbol
+                    .flags
+                    .contains(ts_binder::SymbolFlags::TYPE_PARAMETER)
+                {
+                    continue;
+                }
                 let value_descriptor = (source.is_default_library
                     && referenced_names.contains(name))
                 .then(|| Self::describe_default_library_value_symbol(source, symbol_id))
@@ -18564,6 +18570,13 @@ impl<'a> Checker<'a> {
         else {
             return Vec::new();
         };
+        let source_minimum = self.minimum_parameter_count(source);
+        if target.rest_parameter.is_none() && source_minimum > target.parameters.len() {
+            return vec![format!(
+                "  Target signature provides too few arguments. Expected {source_minimum} or more, but got {}.",
+                target.parameters.len()
+            )];
+        }
         let compared_parameters = source.parameters.len().max(target.parameters.len())
             + usize::from(source.rest_parameter.is_some() || target.rest_parameter.is_some());
         for index in 0..compared_parameters {
