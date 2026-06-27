@@ -13,6 +13,7 @@ use std::{
 };
 
 use ts_core::SourceText;
+use ts_diagnostic_writer::{Diagnostic, DiagnosticCategory, FormattingOptions, format_diagnostics};
 use ts_vfs::{FileSystem, MemoryFileSystem, decode_utf16_bom};
 
 /// A parsed compiler test case.
@@ -117,6 +118,8 @@ impl Case {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Compilation {
     pub diagnostics: Vec<CompilationDiagnostic>,
+    /// Non-pretty diagnostic header text in the same form as TypeScript error baselines.
+    pub diagnostic_text: String,
     pub outputs: BTreeMap<String, String>,
 }
 
@@ -171,6 +174,8 @@ pub struct RunnerOptions {
     pub filter: Option<String>,
     pub skip: usize,
     pub limit: Option<usize>,
+    /// Compare compiler diagnostics with upstream `.errors.txt` baselines instead of emit.
+    pub diagnostics: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -298,6 +303,126 @@ pub fn run_upstream_baselines(
     Ok(summary)
 }
 
+/// Discovers upstream cases/reference baselines and compares compiler diagnostics.
+///
+/// The comparison uses the canonical header before the annotated source sections in
+/// TypeScript's `.errors.txt` files. A missing error baseline means that the variant is
+/// expected to produce no diagnostics.
+///
+/// # Errors
+///
+/// Returns an error when a case or baseline cannot be read, or when more than one error
+/// baseline matches the same case variant.
+#[allow(clippy::too_many_lines)]
+pub fn run_upstream_diagnostic_baselines(
+    repository: &Path,
+    options: &RunnerOptions,
+    writer: &mut impl Write,
+) -> io::Result<RunnerSummary> {
+    let layouts = upstream_layouts(repository);
+    if layouts.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "no TypeScript cases/reference baseline layout below {}",
+                repository.display()
+            ),
+        ));
+    }
+    let mut cases = Vec::new();
+    let mut baseline_sets = Vec::new();
+    for (case_root, baseline_root) in &layouts {
+        let baselines = collect_files(baseline_root, is_error_baseline_file)?;
+        let baseline_index = baseline_sets.len();
+        baseline_sets.push(index_baselines_with(baselines, error_baseline_base));
+        for case_path in collect_files(case_root, is_case_file)? {
+            cases.push((case_path, baseline_index));
+        }
+    }
+    cases.sort_by(|left, right| left.0.cmp(&right.0));
+    cases.dedup_by(|left, right| left.0 == right.0);
+    let filter = options.filter.as_deref().map(str::to_ascii_lowercase);
+    let cases = cases
+        .into_iter()
+        .filter(|(path, _)| {
+            filter
+                .as_ref()
+                .is_none_or(|filter| path.to_string_lossy().to_ascii_lowercase().contains(filter))
+        })
+        .skip(options.skip)
+        .take(options.limit.unwrap_or(usize::MAX));
+
+    let mut summary = RunnerSummary::default();
+    for (case_path, baseline_index) in cases {
+        let baseline_files = &baseline_sets[baseline_index];
+        let source = fs::read(&case_path)?;
+        let case = Case::parse(&case_path, source)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let axes = matrix_axes(&case);
+        let case_name = case_path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        let candidates = baseline_files
+            .get(case_name)
+            .map_or_else(Vec::new, |paths| paths.iter().collect::<Vec<_>>());
+        for (variant, compilation) in compile_case_matrix(&case)? {
+            let selected = select_variant_baselines_with(
+                &candidates,
+                case_name,
+                &variant,
+                &axes,
+                error_baseline_base,
+            );
+            if selected.len() > 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "multiple error baselines match {}{}: {}",
+                        case_path.display(),
+                        variant_label(&variant, &axes),
+                        selected
+                            .iter()
+                            .map(|path| path.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                ));
+            }
+            let expected = selected
+                .first()
+                .map(|path| fs::read_to_string(path))
+                .transpose()?
+                .map_or_else(String::new, |baseline| {
+                    parse_error_baseline_header(&baseline)
+                });
+            let actual = normalize_diagnostic_header(&compilation.diagnostic_text);
+            if actual == expected {
+                summary.matched += 1;
+                continue;
+            }
+            summary.mismatched += 1;
+            summary.diagnostic_failures += 1;
+            let display_path = case_path
+                .strip_prefix(repository)
+                .unwrap_or(&case_path)
+                .display();
+            let label = variant_label(&variant, &axes);
+            let (line, expected_line, actual_line) = first_different_line(&expected, &actual);
+            writeln!(
+                writer,
+                "MISMATCH {display_path}{label}: diagnostics differ at line {line}; expected {expected_line:?}, actual {actual_line:?}"
+            )?;
+        }
+    }
+    writeln!(
+        writer,
+        "summary: matched={} mismatched={} diagnostics={}",
+        summary.matched, summary.mismatched, summary.diagnostic_failures,
+    )?;
+    Ok(summary)
+}
+
 fn read_baseline_files(paths: &[&PathBuf]) -> io::Result<String> {
     let mut baseline = String::new();
     for path in paths {
@@ -308,6 +433,27 @@ fn read_baseline_files(paths: &[&PathBuf]) -> io::Result<String> {
         baseline.push_str(&text);
     }
     Ok(baseline)
+}
+
+/// Returns the canonical, non-pretty diagnostics at the start of a TypeScript
+/// `.errors.txt` baseline. Annotated source and related-information sections are
+/// deliberately outside this first-pass comparison.
+#[must_use]
+pub fn parse_error_baseline_header(baseline: &str) -> String {
+    let normalized = baseline
+        .trim_start_matches('\u{feff}')
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
+    let header_end = normalized.find("\n\n").unwrap_or(normalized.len());
+    normalized[..header_end].trim_end_matches('\n').to_owned()
+}
+
+fn normalize_diagnostic_header(diagnostics: &str) -> String {
+    diagnostics
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .trim_end_matches('\n')
+        .to_owned()
 }
 
 /// Parses TypeScript's `//// [file]` baseline sections, preserving section
@@ -830,6 +976,8 @@ fn compile_case_variant(case: &Case, variant: &OptionVariant) -> std::io::Result
         compiler_options,
     );
     let emit = program.emit();
+    let diagnostic_text =
+        format_compilation_diagnostics(&program, &emit.diagnostics, current_directory);
     let diagnostics = emit
         .diagnostics
         .iter()
@@ -847,8 +995,64 @@ fn compile_case_variant(case: &Case, variant: &OptionVariant) -> std::io::Result
         .collect();
     Ok(Compilation {
         diagnostics,
+        diagnostic_text,
         outputs,
     })
+}
+
+fn format_compilation_diagnostics(
+    program: &ts_compiler::Program,
+    emit_diagnostics: &[ts_compiler::ProgramDiagnostic],
+    current_directory: &str,
+) -> String {
+    let mut output = format_program_diagnostics(program, program.diagnostics(), current_directory);
+    output.push_str(&format_program_diagnostics(
+        program,
+        emit_diagnostics,
+        current_directory,
+    ));
+    output
+}
+
+fn format_program_diagnostics(
+    program: &ts_compiler::Program,
+    program_diagnostics: &[ts_compiler::ProgramDiagnostic],
+    current_directory: &str,
+) -> String {
+    let mut ordered = program_diagnostics.iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| {
+        left.file_name
+            .cmp(&right.file_name)
+            .then_with(|| {
+                left.range
+                    .map(|range| range.start)
+                    .cmp(&right.range.map(|range| range.start))
+            })
+            .then_with(|| left.code.cmp(&right.code))
+    });
+    let diagnostics = ordered
+        .into_iter()
+        .map(|diagnostic| Diagnostic {
+            file_name: diagnostic.file_name.as_deref(),
+            source_text: diagnostic
+                .file_name
+                .as_deref()
+                .and_then(|file_name| program.source_file(file_name))
+                .map(|source_file| source_file.source_text.as_str()),
+            range: diagnostic.range,
+            code: diagnostic.code,
+            category: DiagnosticCategory::Error,
+            message: &diagnostic.message,
+        })
+        .collect::<Vec<_>>();
+    format_diagnostics(
+        &diagnostics,
+        FormattingOptions {
+            current_directory,
+            pretty: false,
+            ..FormattingOptions::default()
+        },
+    )
 }
 
 fn virtual_harness_path(path: &str) -> String {
@@ -1151,13 +1355,27 @@ fn is_emit_baseline_file(path: &Path) -> bool {
         .is_some_and(is_emitted_section)
 }
 
+fn is_error_baseline_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(error_baseline_base)
+        .is_some()
+}
+
 fn index_baselines(paths: Vec<PathBuf>) -> BTreeMap<String, Vec<PathBuf>> {
+    index_baselines_with(paths, emitted_baseline_base)
+}
+
+fn index_baselines_with(
+    paths: Vec<PathBuf>,
+    baseline_base: fn(&str) -> Option<&str>,
+) -> BTreeMap<String, Vec<PathBuf>> {
     let mut index = BTreeMap::<String, Vec<PathBuf>>::new();
     for path in paths {
         let Some(base) = path
             .file_name()
             .and_then(|name| name.to_str())
-            .and_then(emitted_baseline_base)
+            .and_then(baseline_base)
         else {
             continue;
         };
@@ -1171,6 +1389,10 @@ fn emitted_baseline_base(file_name: &str) -> Option<&str> {
     [".d.mts", ".d.cts", ".d.ts", ".jsx", ".mjs", ".cjs", ".js"]
         .into_iter()
         .find_map(|extension| file_name.strip_suffix(extension))
+}
+
+fn error_baseline_base(file_name: &str) -> Option<&str> {
+    file_name.strip_suffix(".errors.txt")
 }
 
 fn matrix_axes(case: &Case) -> Vec<String> {
@@ -1197,6 +1419,16 @@ fn select_variant_baselines<'a>(
     case_name: &str,
     variant: &OptionVariant,
     axes: &[String],
+) -> Vec<&'a PathBuf> {
+    select_variant_baselines_with(candidates, case_name, variant, axes, emitted_baseline_base)
+}
+
+fn select_variant_baselines_with<'a>(
+    candidates: &[&'a PathBuf],
+    case_name: &str,
+    variant: &OptionVariant,
+    axes: &[String],
+    baseline_base: fn(&str) -> Option<&str>,
 ) -> Vec<&'a PathBuf> {
     if axes.is_empty() {
         return candidates.to_vec();
@@ -1231,7 +1463,7 @@ fn select_variant_baselines<'a>(
             .filter(|path| {
                 path.file_name()
                     .and_then(|name| name.to_str())
-                    .and_then(emitted_baseline_base)
+                    .and_then(baseline_base)
                     == Some(case_name)
             })
             .collect()
@@ -1528,8 +1760,8 @@ mod tests {
         Case, OptionVariant, OutputDifferenceKind, ParseError,
         compare_case_emitted_output_sections, compare_emitted_output_sections, compile_case,
         compile_case_matrix, expand_option_matrix, first_different_line, fixture_compiler_options,
-        matrix_axes, parse_baseline_sections, run_case_against_baseline,
-        select_variant_baselines, virtual_unit_path,
+        matrix_axes, parse_baseline_sections, parse_error_baseline_header,
+        run_case_against_baseline, select_variant_baselines, virtual_unit_path,
     };
 
     #[test]
@@ -1958,6 +2190,28 @@ mod tests {
         assert_eq!(sections.len(), 2);
         assert_eq!(sections["input.ts"], "const value: number = 1;\n");
         assert_eq!(sections["input.js"], "const value = 1;\n");
+    }
+
+    #[test]
+    fn parses_multiline_error_baseline_header_and_normalizes_line_endings() {
+        let baseline = concat!(
+            "\u{feff}input.ts(3,6): error TS2322: Type 'string | number' is not assignable to type 'string'.\r\n",
+            "  Type 'number' is not assignable to type 'string'.\r\n",
+            "\r\n",
+            "\r\n",
+            "!!! error TS2318: An annotated global diagnostic outside the header.\r\n",
+            "==== input.ts (1 errors) ====\r\n",
+            "    const value = source;\r\n",
+            "          ~~~~~\r\n",
+            "!!! error TS2322: Type 'string | number' is not assignable to type 'string'.\r\n",
+        );
+        assert_eq!(
+            parse_error_baseline_header(baseline),
+            concat!(
+                "input.ts(3,6): error TS2322: Type 'string | number' is not assignable to type 'string'.\n",
+                "  Type 'number' is not assignable to type 'string'.",
+            )
+        );
     }
 
     #[test]

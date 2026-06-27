@@ -1,6 +1,6 @@
 use std::{env, io, path::PathBuf, process::ExitCode};
 
-use ts_fixture::{RunnerOptions, run_upstream_baselines};
+use ts_fixture::{RunnerOptions, run_upstream_baselines, run_upstream_diagnostic_baselines};
 
 fn main() -> ExitCode {
     let arguments = env::args().skip(1).collect::<Vec<_>>();
@@ -19,7 +19,12 @@ fn main() -> ExitCode {
         eprintln!("error: TS_GO_REPO is not set");
         return ExitCode::from(2);
     };
-    match run_upstream_baselines(&repository, &options, &mut io::stdout().lock()) {
+    let result = if options.diagnostics {
+        run_upstream_diagnostic_baselines(&repository, &options, &mut io::stdout().lock())
+    } else {
+        run_upstream_baselines(&repository, &options, &mut io::stdout().lock())
+    };
+    match result {
         Ok(summary) if summary.is_success() => ExitCode::SUCCESS,
         Ok(_) => ExitCode::from(1),
         Err(error) => {
@@ -35,6 +40,7 @@ fn parse_arguments(arguments: &[String]) -> Result<Option<RunnerOptions>, String
     while index < arguments.len() {
         match arguments[index].as_str() {
             "--help" | "-h" => return Ok(None),
+            "--diagnostics" => options.diagnostics = true,
             "--filter" => {
                 index += 1;
                 options.filter = Some(required_value(arguments, index, "--filter")?);
@@ -71,7 +77,9 @@ fn required_value(arguments: &[String], index: usize, option: &str) -> Result<St
 }
 
 fn print_help() {
-    println!("Usage: ts_fixture_baseline [--filter TEXT] [--skip COUNT] [--limit COUNT]");
+    println!(
+        "Usage: ts_fixture_baseline [--diagnostics] [--filter TEXT] [--skip COUNT] [--limit COUNT]"
+    );
     println!("Reads cases and reference baselines below TS_GO_REPO.");
 }
 
@@ -88,12 +96,14 @@ mod tests {
             "10".into(),
             "--limit".into(),
             "25".into(),
+            "--diagnostics".into(),
         ])
         .unwrap()
         .unwrap();
         assert_eq!(options.filter.as_deref(), Some("modules"));
         assert_eq!(options.skip, 10);
         assert_eq!(options.limit, Some(25));
+        assert!(options.diagnostics);
     }
 
     #[test]

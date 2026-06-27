@@ -7439,6 +7439,33 @@ export function create() { return new M.Value(); }"#,
     }
 
     #[test]
+    fn checks_large_class_graphs_instead_of_failing_open() {
+        let fs = MemoryFileSystem::new(true);
+        let mut source = format!("/*{}*/\n", "x".repeat(100_000));
+        for index in 0..100 {
+            source.push_str(&format!("class C{index} {{}}\n"));
+        }
+        source.push_str("const value: string = 1;\n");
+        fs.write_file("/large.ts", &source).unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/",
+            &["large.ts".to_owned()],
+            CompilerOptions {
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        assert!(
+            program
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code == Some(2322)),
+            "large programs must receive semantic diagnostics"
+        );
+    }
+
+    #[test]
     fn check_js_controls_javascript_semantic_diagnostics() {
         let fs = MemoryFileSystem::new(true);
         fs.write_file("/input.js", "const value = true; value.missing;")

@@ -148,6 +148,7 @@ impl Message {
 pub struct Diagnostic {
     pub message: &'static Message,
     pub arguments: Vec<String>,
+    pub details: Vec<String>,
 }
 
 impl Diagnostic {
@@ -156,6 +157,7 @@ impl Diagnostic {
         Self {
             message,
             arguments: Vec::new(),
+            details: Vec::new(),
         }
     }
 
@@ -167,7 +169,14 @@ impl Diagnostic {
         Self {
             message,
             arguments: arguments.into_iter().map(Into::into).collect(),
+            details: Vec::new(),
         }
+    }
+
+    #[must_use]
+    pub fn with_details(mut self, details: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.details = details.into_iter().map(Into::into).collect();
+        self
     }
 
     #[must_use]
@@ -186,7 +195,12 @@ impl Diagnostic {
     ///
     /// Returns an error when a required formatting argument is absent.
     pub fn render(&self) -> Result<String, FormatError> {
-        self.message.format(&self.arguments)
+        let mut rendered = self.message.format(&self.arguments)?;
+        for detail in &self.details {
+            rendered.push('\n');
+            rendered.push_str(detail);
+        }
+        Ok(rendered)
     }
 }
 
@@ -270,6 +284,20 @@ mod tests {
             "The parser expected to find a '}' to match the '{' token here."
         );
         assert_eq!(diagnostic.code(), 1007);
+    }
+
+    #[test]
+    fn diagnostics_render_indented_message_details() {
+        let message = message_by_code(2322).unwrap();
+        let diagnostic = Diagnostic::with_arguments(message, ["source", "target"])
+            .with_details(["  Types of parameters are incompatible."]);
+        assert_eq!(
+            diagnostic.render().unwrap(),
+            concat!(
+                "Type 'source' is not assignable to type 'target'.\n",
+                "  Types of parameters are incompatible.",
+            )
+        );
     }
 
     #[test]

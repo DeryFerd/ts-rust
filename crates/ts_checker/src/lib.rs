@@ -74,11 +74,14 @@ pub struct ObjectType {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct FunctionType {
+    pub type_parameters: Vec<TypeId>,
     pub parameters: Vec<TypeId>,
     pub parameter_names: Vec<String>,
     pub rest_parameter: Option<TypeId>,
     pub return_type: TypeId,
     pub parameters_optional: bool,
+    pub parameters_untyped: bool,
+    pub preserve_optional_parameter_undefined: bool,
 }
 
 fn unique_parameter_name(
@@ -349,24 +352,12 @@ impl TypeArena {
             ),
             TypeKind::Function(function) => format!(
                 "({}) => {}",
-                function
-                    .parameters
-                    .iter()
-                    .enumerate()
-                    .map(|(index, value)| format!("arg{index}: {}", self.display(*value)))
-                    .collect::<Vec<_>>()
-                    .join(", "),
+                self.display_signature_parameters(function),
                 self.display(function.return_type)
             ),
             TypeKind::Constructor(constructor) => format!(
                 "new ({}) => {}",
-                constructor
-                    .parameters
-                    .iter()
-                    .enumerate()
-                    .map(|(index, value)| format!("arg{index}: {}", self.display(*value)))
-                    .collect::<Vec<_>>()
-                    .join(", "),
+                self.display_signature_parameters(constructor),
                 self.display(constructor.return_type)
             ),
             TypeKind::Overload(signatures) => signatures
@@ -374,21 +365,85 @@ impl TypeArena {
                 .map(|signature| {
                     format!(
                         "({}) => {}",
-                        signature
-                            .parameters
-                            .iter()
-                            .enumerate()
-                            .map(|(index, value)| {
-                                format!("arg{index}: {}", self.display(*value))
-                            })
-                            .collect::<Vec<_>>()
-                            .join(", "),
+                        self.display_signature_parameters(signature),
                         self.display(signature.return_type)
                     )
                 })
                 .collect::<Vec<_>>()
                 .join(" | "),
         }
+    }
+
+    fn display_signature_parameters(&self, signature: &FunctionType) -> String {
+        let mut parameters = signature
+            .parameters
+            .iter()
+            .enumerate()
+            .map(|(index, type_id)| {
+                let name = signature
+                    .parameter_names
+                    .get(index)
+                    .cloned()
+                    .unwrap_or_else(|| format!("arg{index}"));
+                let (optional, displayed_type) = self.display_optional_parameter_type(*type_id);
+                let displayed_type = if optional
+                    && signature.preserve_optional_parameter_undefined
+                {
+                    self.display_union_with_undefined_last(*type_id)
+                } else {
+                    displayed_type
+                };
+                format!("{name}{}: {displayed_type}", if optional { "?" } else { "" })
+            })
+            .collect::<Vec<_>>();
+        if let Some(rest) = signature.rest_parameter {
+            let index = signature.parameters.len();
+            let name = signature
+                .parameter_names
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| format!("arg{index}"));
+            parameters.push(format!("...{name}: {}", self.display(rest)));
+        }
+        parameters.join(", ")
+    }
+
+    fn display_optional_parameter_type(&self, type_id: TypeId) -> (bool, String) {
+        let TypeKind::Union(members) = &self.types[type_id.index()].kind else {
+            return (false, self.display(type_id));
+        };
+        let present = members
+            .iter()
+            .copied()
+            .filter(|member| *member != self.undefined())
+            .collect::<Vec<_>>();
+        if present.len() == members.len() {
+            return (false, self.display(type_id));
+        }
+        let displayed = match present.as_slice() {
+            [] => "undefined".to_owned(),
+            [single] => self.display(*single),
+            _ => present
+                .iter()
+                .map(|member| self.display(*member))
+                .collect::<Vec<_>>()
+                .join(" | "),
+        };
+        (true, displayed)
+    }
+
+    fn display_union_with_undefined_last(&self, type_id: TypeId) -> String {
+        let TypeKind::Union(members) = &self.types[type_id.index()].kind else {
+            return self.display(type_id);
+        };
+        members
+            .iter()
+            .copied()
+            .filter(|member| *member != self.undefined())
+            .chain(members.contains(&self.undefined()).then_some(self.undefined()))
+            .map(|member| self.display(member))
+            .collect::<Vec<_>>()
+            .join(" | ")
     }
 }
 
@@ -597,17 +652,23 @@ enum TypeDescriptor {
         getter_properties: BTreeSet<String>,
     },
     Function {
+        type_parameters: Vec<Self>,
         parameters: Vec<Self>,
         parameter_names: Vec<String>,
         rest_parameter: Option<Box<Self>>,
         return_type: Box<Self>,
         parameters_optional: bool,
+        parameters_untyped: bool,
+        preserve_optional_parameter_undefined: bool,
     },
     Constructor {
+        type_parameters: Vec<Self>,
         parameters: Vec<Self>,
         rest_parameter: Option<Box<Self>>,
         return_type: Box<Self>,
         parameters_optional: bool,
+        parameters_untyped: bool,
+        preserve_optional_parameter_undefined: bool,
     },
     Overload(Vec<Self>),
 }
@@ -615,20 +676,6 @@ enum TypeDescriptor {
 struct ProgramChecker<'a> {
     sources: &'a [ProgramSource<'a>],
     source_paths: Option<&'a [String]>,
-}
-
-fn source_exceeds_class_graph_budget(source: &ProgramSource<'_>) -> bool {
-    source
-        .arena
-        .source_text()
-        .is_some_and(|text| text.len() >= 100_000)
-        && source
-            .arena
-            .iter()
-            .filter(|(_, node)| matches!(node.data, NodeData::ClassDeclaration(_)))
-            .take(100)
-            .count()
-            == 100
 }
 
 type DuplicateGlobal = (usize, NodeId, u32, String);
@@ -684,7 +731,7 @@ impl<'a> ProgramChecker<'a> {
             .sources
             .iter()
             .map(|source| {
-                if source.is_default_library || source_exceeds_class_graph_budget(source) {
+                if source.is_default_library {
                     empty_check_result()
                 } else {
                     check_source_file_with_options(
@@ -734,7 +781,7 @@ impl<'a> ProgramChecker<'a> {
                 import_runtime_meanings,
             ) = self.imports(file_index, source, &preliminary, &files);
             let mut result =
-                if source.is_default_library || source_exceeds_class_graph_budget(source) {
+                if source.is_default_library {
                     preliminary[file_index].clone()
                 } else {
                     let mut external_names = globals.clone();
@@ -2308,8 +2355,7 @@ impl<'a> ProgramChecker<'a> {
                 continue;
             }
             let shallow_globals = !source.is_default_library
-                && (source.arena.len() > MAX_DEEPLY_DESCRIBED_GLOBAL_SOURCE_NODES
-                    || source_exceeds_class_graph_budget(source));
+                && source.arena.len() > MAX_DEEPLY_DESCRIBED_GLOBAL_SOURCE_NODES;
             let Some(root) = source.bindings.root_scope() else {
                 continue;
             };
@@ -3703,11 +3749,15 @@ fn add_implicit_undefined_to_optional_properties(descriptor: &mut TypeDescriptor
 fn name_constructor_return(descriptor: TypeDescriptor, name: &str) -> TypeDescriptor {
     match descriptor {
         TypeDescriptor::Constructor {
+            type_parameters,
             parameters,
             rest_parameter,
             return_type,
             parameters_optional,
+            parameters_untyped,
+            preserve_optional_parameter_undefined,
         } => TypeDescriptor::Constructor {
+            type_parameters,
             parameters,
             rest_parameter,
             return_type: Box::new(TypeDescriptor::Named {
@@ -3716,6 +3766,8 @@ fn name_constructor_return(descriptor: TypeDescriptor, name: &str) -> TypeDescri
                 target: return_type,
             }),
             parameters_optional,
+            parameters_untyped,
+            preserve_optional_parameter_undefined,
         },
         TypeDescriptor::Intersection(members) => TypeDescriptor::Intersection(
             members
@@ -6955,6 +7007,9 @@ impl<'a> Checker<'a> {
             signature.parameter_names = base_signature.parameter_names;
             signature.rest_parameter = base_signature.rest_parameter;
             signature.parameters_optional = base_signature.parameters_optional;
+            signature.parameters_untyped = base_signature.parameters_untyped;
+            signature.preserve_optional_parameter_undefined =
+                base_signature.preserve_optional_parameter_undefined;
             let return_type = self
                 .result
                 .types
@@ -7636,6 +7691,9 @@ impl<'a> Checker<'a> {
             signature.parameter_names = base_signature.parameter_names;
             signature.rest_parameter = base_signature.rest_parameter;
             signature.parameters_optional = base_signature.parameters_optional;
+            signature.parameters_untyped = base_signature.parameters_untyped;
+            signature.preserve_optional_parameter_undefined =
+                base_signature.preserve_optional_parameter_undefined;
         }
         let constructor_type = self
             .result
@@ -7854,11 +7912,14 @@ impl<'a> Checker<'a> {
             return signature;
         }
         FunctionType {
+            type_parameters: Vec::new(),
             parameters: Vec::new(),
             parameter_names: Vec::new(),
             rest_parameter: None,
             return_type: instance_type,
             parameters_optional: false,
+            parameters_untyped: false,
+            preserve_optional_parameter_undefined: false,
         }
     }
 
@@ -8785,11 +8846,14 @@ impl<'a> Checker<'a> {
             NarrowingComparison::Function => {
                 let any = self.result.types.any();
                 self.result.types.alloc(TypeKind::Function(FunctionType {
+                    type_parameters: Vec::new(),
                     parameters: Vec::new(),
                     parameter_names: Vec::new(),
                     rest_parameter: Some(any),
                     return_type: any,
                     parameters_optional: true,
+                    parameters_untyped: true,
+                    preserve_optional_parameter_undefined: false,
                 }))
             }
             NarrowingComparison::Object => self
@@ -10723,6 +10787,14 @@ impl<'a> Checker<'a> {
             } else {
                 parameter_type
             };
+            let parameter_type = if parameter_data.question_token.is_some()
+                || parameter_data.initializer.is_some()
+            {
+                let undefined = self.result.types.undefined();
+                self.result.types.union([parameter_type, undefined])
+            } else {
+                parameter_type
+            };
             if let Some(type_node) = parameter_data.type_
                 && matches!(
                     self.arena.get(type_node).map(|node| &node.data),
@@ -10815,11 +10887,14 @@ impl<'a> Checker<'a> {
             };
             if let Some(returned) = returned {
                 let signature = FunctionType {
+                    type_parameters: Vec::new(),
                     parameters: parameters.clone(),
                     parameter_names: Vec::new(),
                     rest_parameter: None,
                     return_type,
                     parameters_optional: false,
+                    parameters_untyped: false,
+                    preserve_optional_parameter_undefined: false,
                 };
                 if let Some(predicate) = self.inferred_type_predicate(
                     &data.parameters.nodes,
@@ -10846,22 +10921,13 @@ impl<'a> Checker<'a> {
             self.mapped_return_templates.insert(return_type, template);
         }
         self.local_scopes.pop();
+        let (parameters, parameter_names, rest_parameter) =
+            self.callable_signature_parameters(&data.parameters.nodes, parameters);
         let function = self.result.types.alloc(TypeKind::Function(FunctionType {
+            type_parameters: Vec::new(),
             parameters,
-            parameter_names: data
-                .parameters
-                .nodes
-                .iter()
-                .filter_map(|parameter| {
-                    let NodeData::ParameterDeclaration(parameter) =
-                        &self.arena.get(*parameter)?.data
-                    else {
-                        return None;
-                    };
-                    self.property_name(parameter.name)
-                })
-                .collect(),
-            rest_parameter: None,
+            parameter_names,
+            rest_parameter,
             return_type,
             parameters_optional: self.options.is_javascript_file
                 || (!data.parameters.nodes.is_empty()
@@ -10873,6 +10939,8 @@ impl<'a> Checker<'a> {
                                     || parameter.initializer.is_some()
                         )
                     })),
+            parameters_untyped: self.options.is_javascript_file,
+            preserve_optional_parameter_undefined: false,
         }));
         if !generic_parameters.is_empty() {
             let mut encoded = Vec::with_capacity(generic_parameters.len());
@@ -10980,6 +11048,14 @@ impl<'a> Checker<'a> {
             } else {
                 parameter_type
             };
+            let parameter_type = if parameter_data.question_token.is_some()
+                || parameter_data.initializer.is_some()
+            {
+                let undefined = self.result.types.undefined();
+                self.result.types.union([parameter_type, undefined])
+            } else {
+                parameter_type
+            };
             self.extend_binding_scope(parameter_data.name, parameter_type, &mut local_scope);
             parameters.push(parameter_type);
         }
@@ -11013,6 +11089,7 @@ impl<'a> Checker<'a> {
         let (parameters, parameter_names, rest_parameter) =
             self.callable_signature_parameters(&data.parameters.nodes, parameters);
         let function = self.result.types.alloc(TypeKind::Function(FunctionType {
+            type_parameters: Vec::new(),
             parameters,
             parameter_names,
             rest_parameter,
@@ -11027,6 +11104,8 @@ impl<'a> Checker<'a> {
                                     || parameter.initializer.is_some()
                         )
                     })),
+            parameters_untyped: self.options.is_javascript_file,
+            preserve_optional_parameter_undefined: false,
         }));
         if !generic_parameters.is_empty() {
             let mut encoded = Vec::with_capacity(generic_parameters.len());
@@ -11604,13 +11683,87 @@ impl<'a> Checker<'a> {
             .iter()
             .map(|argument| self.type_from_type_node(*argument))
             .collect::<Vec<_>>();
+        let overloads = match self.result.types.get(callee).map(|type_| &type_.kind) {
+            Some(TypeKind::Overload(signatures)) => Some(signatures.clone()),
+            _ => None,
+        };
+        if let Some(signatures) = overloads {
+            let matching = signatures
+                .iter()
+                .filter(|signature| {
+                    let minimum = self.minimum_type_argument_count(&signature.type_parameters);
+                    argument_nodes.len() >= minimum
+                        && argument_nodes.len() <= signature.type_parameters.len()
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if matching.is_empty() {
+                self.report_overload_type_argument_arity(
+                    expression,
+                    argument_nodes,
+                    &signatures,
+                );
+                return callee;
+            }
+            let mut instantiated = Vec::with_capacity(matching.len());
+            for (index, signature) in matching.into_iter().enumerate() {
+                let substitutions = self.explicit_type_argument_substitutions(
+                    &signature.type_parameters,
+                    &arguments,
+                );
+                if index == 0 {
+                    self.check_explicit_type_argument_constraints(
+                        argument_nodes,
+                        &arguments,
+                        signature.type_parameters.iter().map(std::slice::from_ref),
+                        &substitutions,
+                    );
+                }
+                instantiated.push(self.substitute_signature(signature, &substitutions));
+            }
+            return self.result.types.alloc(TypeKind::Overload(instantiated));
+        }
+        let direct_parameters = match self.result.types.get(callee).map(|type_| &type_.kind) {
+            Some(TypeKind::Function(signature) | TypeKind::Constructor(signature)) => {
+                signature.type_parameters.clone()
+            }
+            _ => Vec::new(),
+        };
+        if !direct_parameters.is_empty() {
+            self.check_explicit_type_argument_count(
+                argument_nodes.first().copied().unwrap_or(expression),
+                &direct_parameters,
+                argument_nodes.len(),
+            );
+            let substitutions =
+                self.explicit_type_argument_substitutions(&direct_parameters, &arguments);
+            self.check_explicit_type_argument_constraints(
+                argument_nodes,
+                &arguments,
+                direct_parameters.iter().map(std::slice::from_ref),
+                &substitutions,
+            );
+            return self.substitute_type(callee, &substitutions);
+        }
         if parameter_names.is_empty() {
             let mut parameters = Vec::new();
             self.collect_type_parameters_in_order(callee, &mut parameters, &mut HashSet::new());
+            self.check_explicit_type_argument_count(
+                argument_nodes.first().copied().unwrap_or(expression),
+                parameters.as_slice(),
+                argument_nodes.len(),
+            );
             let substitutions = parameters
-                .into_iter()
-                .zip(arguments)
+                .iter()
+                .copied()
+                .zip(arguments.iter().copied())
                 .collect::<HashMap<_, _>>();
+            self.check_explicit_type_argument_constraints(
+                argument_nodes,
+                &arguments,
+                parameters.iter().map(std::slice::from_ref),
+                &substitutions,
+            );
             return if substitutions.is_empty() {
                 callee
             } else {
@@ -11620,8 +11773,21 @@ impl<'a> Checker<'a> {
         let wanted = parameter_names.iter().cloned().collect::<HashSet<_>>();
         let mut parameters = HashMap::<String, Vec<TypeId>>::new();
         self.collect_named_type_parameters(callee, &wanted, &mut parameters, &mut HashSet::new());
+        let ordered_parameters = parameter_names
+            .iter()
+            .map(|name| parameters.get(name).map_or(&[][..], Vec::as_slice))
+            .collect::<Vec<_>>();
+        let representative_parameters = ordered_parameters
+            .iter()
+            .filter_map(|parameters| parameters.first().copied())
+            .collect::<Vec<_>>();
+        self.check_explicit_type_argument_count(
+            argument_nodes.first().copied().unwrap_or(expression),
+            &representative_parameters,
+            argument_nodes.len(),
+        );
         let mut substitutions = HashMap::new();
-        for (name, argument) in parameter_names.iter().zip(arguments) {
+        for (name, argument) in parameter_names.iter().zip(arguments.iter().copied()) {
             if let Some(type_parameters) = parameters.get(name) {
                 substitutions.extend(
                     type_parameters
@@ -11630,10 +11796,152 @@ impl<'a> Checker<'a> {
                 );
             }
         }
+        self.check_explicit_type_argument_constraints(
+            argument_nodes,
+            &arguments,
+            ordered_parameters.into_iter(),
+            &substitutions,
+        );
         if substitutions.is_empty() {
             callee
         } else {
             self.substitute_type(callee, &substitutions)
+        }
+    }
+
+    fn check_explicit_type_argument_count(
+        &mut self,
+        expression: NodeId,
+        parameters: &[TypeId],
+        argument_count: usize,
+    ) {
+        let minimum = self.minimum_type_argument_count(parameters);
+        let maximum = parameters.len();
+        if argument_count >= minimum && argument_count <= maximum {
+            return;
+        }
+        let expected = if minimum == maximum {
+            maximum.to_string()
+        } else {
+            format!("{minimum}-{maximum}")
+        };
+        self.error(expression, 2558, [expected, argument_count.to_string()]);
+    }
+
+    fn minimum_type_argument_count(&self, parameters: &[TypeId]) -> usize {
+        parameters
+            .iter()
+            .rposition(|parameter| !self.type_parameter_defaults.contains_key(parameter))
+            .map_or(0, |index| index + 1)
+    }
+
+    fn explicit_type_argument_substitutions(
+        &mut self,
+        parameters: &[TypeId],
+        arguments: &[TypeId],
+    ) -> HashMap<TypeId, TypeId> {
+        let mut substitutions = parameters
+            .iter()
+            .copied()
+            .zip(arguments.iter().copied())
+            .collect::<HashMap<_, _>>();
+        for parameter in parameters.iter().skip(arguments.len()) {
+            let Some(default_type) = self.type_parameter_defaults.get(parameter).copied() else {
+                continue;
+            };
+            let default_type = self.substitute_type(default_type, &substitutions);
+            substitutions.insert(*parameter, default_type);
+        }
+        substitutions
+    }
+
+    fn report_overload_type_argument_arity(
+        &mut self,
+        expression: NodeId,
+        argument_nodes: &[NodeId],
+        signatures: &[FunctionType],
+    ) {
+        let argument_count = argument_nodes.len();
+        let ranges = signatures
+            .iter()
+            .map(|signature| {
+                (
+                    self.minimum_type_argument_count(&signature.type_parameters),
+                    signature.type_parameters.len(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let lower = ranges
+            .iter()
+            .filter_map(|(_, maximum)| (*maximum < argument_count).then_some(*maximum))
+            .max();
+        let upper = ranges
+            .iter()
+            .filter_map(|(minimum, _)| (*minimum > argument_count).then_some(*minimum))
+            .min();
+        let node = argument_nodes.first().copied().unwrap_or(expression);
+        if let (Some(lower), Some(upper)) = (lower, upper) {
+            self.error(
+                node,
+                2743,
+                [
+                    argument_count.to_string(),
+                    lower.to_string(),
+                    upper.to_string(),
+                ],
+            );
+            return;
+        }
+        let expected = if argument_count > ranges.iter().map(|(_, max)| *max).max().unwrap_or(0) {
+            ranges.iter().map(|(_, max)| *max).max().unwrap_or(0)
+        } else {
+            ranges.iter().map(|(min, _)| *min).min().unwrap_or(0)
+        };
+        self.error(
+            node,
+            2558,
+            [expected.to_string(), argument_count.to_string()],
+        );
+    }
+
+    fn check_explicit_type_argument_constraints<'b>(
+        &mut self,
+        argument_nodes: &[NodeId],
+        arguments: &[TypeId],
+        parameter_groups: impl IntoIterator<Item = &'b [TypeId]>,
+        substitutions: &HashMap<TypeId, TypeId>,
+    ) {
+        let checks = argument_nodes
+            .iter()
+            .copied()
+            .zip(arguments.iter().copied())
+            .zip(parameter_groups)
+            .filter_map(|((node, argument), parameters)| {
+                let constraint = parameters.iter().find_map(|parameter| {
+                    let TypeKind::TypeParameter {
+                        constraint: Some(constraint),
+                        ..
+                    } = &self.result.types.get(*parameter)?.kind
+                    else {
+                        return None;
+                    };
+                    Some(*constraint)
+                })?;
+                Some((node, argument, constraint))
+            })
+            .collect::<Vec<_>>();
+        for (node, argument, constraint) in checks {
+            let constraint = self.substitute_type(constraint, substitutions);
+            if !self.is_assignable(argument, constraint) {
+                self.error(
+                    node,
+                    2344,
+                    [
+                        self.result.types.display(argument),
+                        self.result.types.display(constraint),
+                    ],
+                );
+            }
         }
     }
 
@@ -11708,9 +12016,10 @@ impl<'a> Checker<'a> {
         visited: &mut HashSet<TypeId>,
     ) {
         for type_id in signature
-            .parameters
+            .type_parameters
             .iter()
             .copied()
+            .chain(signature.parameters.iter().copied())
             .chain(signature.rest_parameter)
             .chain(std::iter::once(signature.return_type))
         {
@@ -12209,9 +12518,10 @@ impl<'a> Checker<'a> {
 
     fn signature_contains_type(&self, signature: &FunctionType, wanted: TypeId) -> bool {
         signature
-            .parameters
+            .type_parameters
             .iter()
             .copied()
+            .chain(signature.parameters.iter().copied())
             .chain(signature.rest_parameter)
             .chain(std::iter::once(signature.return_type))
             .any(|type_id| self.type_contains_id(type_id, wanted, &mut HashSet::new()))
@@ -12299,6 +12609,43 @@ impl<'a> Checker<'a> {
             .iter()
             .rposition(|parameter| !self.type_includes_undefined(*parameter))
             .map_or(0, |index| index + 1)
+    }
+
+    fn signature_is_assignable(&self, source: &FunctionType, target: &FunctionType) -> bool {
+        let source_minimum = self.minimum_parameter_count(source);
+        let target_minimum = self.minimum_parameter_count(target);
+        if source_minimum > target_minimum && target.rest_parameter.is_none() {
+            return false;
+        }
+
+        if !source.parameters_untyped {
+            let compared_parameters = source.parameters.len().max(target.parameters.len())
+                + usize::from(source.rest_parameter.is_some() || target.rest_parameter.is_some());
+            for index in 0..compared_parameters {
+                match (
+                    self.signature_parameter_at(source, index),
+                    self.signature_parameter_at(target, index),
+                ) {
+                    (Some(source), Some(target)) => {
+                        if !self.signature_parameter_is_assignable(target, source) {
+                            return false;
+                        }
+                    }
+                    (Some(_), None) if index < source_minimum => return false,
+                    _ => {}
+                }
+            }
+        }
+
+        target.return_type == self.result.types.void()
+            || self.is_assignable(source.return_type, target.return_type)
+    }
+
+    fn signature_parameter_is_assignable(&self, source: TypeId, target: TypeId) -> bool {
+        if self.type_includes_undefined(source) && !self.type_includes_undefined(target) {
+            return false;
+        }
+        self.is_assignable(source, target)
     }
 
     fn type_includes_undefined(&self, type_id: TypeId) -> bool {
@@ -13279,11 +13626,19 @@ impl<'a> Checker<'a> {
                     .rest_parameter
                     .map(|parameter| self.substitute_type(parameter, inference));
                 self.result.types.alloc(TypeKind::Function(FunctionType {
+                    type_parameters: signature
+                        .type_parameters
+                        .into_iter()
+                        .filter(|parameter| !inference.contains_key(parameter))
+                        .collect(),
                     parameters,
                     parameter_names: signature.parameter_names,
                     rest_parameter,
                     return_type,
                     parameters_optional: signature.parameters_optional,
+                    parameters_untyped: signature.parameters_untyped,
+                    preserve_optional_parameter_undefined: signature
+                        .preserve_optional_parameter_undefined,
                 }))
             }
             TypeKind::Constructor(signature) => {
@@ -13297,11 +13652,19 @@ impl<'a> Checker<'a> {
                     .rest_parameter
                     .map(|parameter| self.substitute_type(parameter, inference));
                 self.result.types.alloc(TypeKind::Constructor(FunctionType {
+                    type_parameters: signature
+                        .type_parameters
+                        .into_iter()
+                        .filter(|parameter| !inference.contains_key(parameter))
+                        .collect(),
                     parameters,
                     parameter_names: signature.parameter_names,
                     rest_parameter,
                     return_type,
                     parameters_optional: signature.parameters_optional,
+                    parameters_untyped: signature.parameters_untyped,
+                    preserve_optional_parameter_undefined: signature
+                        .preserve_optional_parameter_undefined,
                 }))
             }
             TypeKind::Tuple(elements) => {
@@ -13421,6 +13784,11 @@ impl<'a> Checker<'a> {
         inference: &HashMap<TypeId, TypeId>,
     ) -> FunctionType {
         FunctionType {
+            type_parameters: signature
+                .type_parameters
+                .into_iter()
+                .filter(|parameter| !inference.contains_key(parameter))
+                .collect(),
             parameters: signature
                 .parameters
                 .into_iter()
@@ -13432,6 +13800,9 @@ impl<'a> Checker<'a> {
                 .map(|parameter| self.substitute_type(parameter, inference)),
             return_type: self.substitute_type(signature.return_type, inference),
             parameters_optional: signature.parameters_optional,
+            parameters_untyped: signature.parameters_untyped,
+            preserve_optional_parameter_undefined: signature
+                .preserve_optional_parameter_undefined,
         }
     }
 
@@ -14942,6 +15313,7 @@ impl<'a> Checker<'a> {
         type_parameters: Option<&ts_ast::NodeList>,
     ) -> TypeId {
         self.type_parameter_scopes.push(HashMap::new());
+        let mut signature_type_parameters = Vec::new();
         if let Some(type_parameters) = type_parameters {
             for type_parameter in &type_parameters.nodes {
                 let Some(NodeData::TypeParameterDeclaration(data)) =
@@ -14959,6 +15331,7 @@ impl<'a> Checker<'a> {
                     name: name.clone(),
                     constraint,
                 });
+                signature_type_parameters.push(semantic_type);
                 if let Some(default_type) = data.default_type {
                     let default_type = self.type_from_type_node(default_type);
                     self.type_parameter_defaults
@@ -15078,6 +15451,7 @@ impl<'a> Checker<'a> {
                 .insert(return_type, (return_annotation, return_type_parameters));
         }
         self.result.types.alloc(TypeKind::Function(FunctionType {
+            type_parameters: signature_type_parameters,
             parameters: parameter_types,
             parameter_names,
             rest_parameter,
@@ -15092,6 +15466,8 @@ impl<'a> Checker<'a> {
                                     || parameter.initializer.is_some()
                         )
                     })),
+            parameters_untyped: self.options.is_javascript_file,
+            preserve_optional_parameter_undefined: true,
         }))
     }
 
@@ -16684,59 +17060,24 @@ impl<'a> Checker<'a> {
                 constraint.is_none_or(|constraint| self.is_assignable(source, constraint))
             }
             (TypeKind::Function(source), TypeKind::Function(target)) => {
-                (source.parameters_optional
-                    || source.parameters.len() <= target.parameters.len()
-                    || target.rest_parameter.is_some())
-                    && (source.parameters_optional
-                        || source
-                            .parameters
-                            .iter()
-                            .zip(&target.parameters)
-                            .all(|(source, target)| self.is_assignable(*target, *source)))
-                    && self.is_assignable(source.return_type, target.return_type)
+                self.signature_is_assignable(source, target)
             }
             (TypeKind::Constructor(source), TypeKind::Constructor(target)) => {
-                source.parameters.len() <= target.parameters.len()
-                    && source
-                        .parameters
-                        .iter()
-                        .zip(&target.parameters)
-                        .all(|(source, target)| self.is_assignable(*target, *source))
-                    && self.is_assignable(source.return_type, target.return_type)
+                self.signature_is_assignable(source, target)
             }
-            (TypeKind::Function(source), TypeKind::Overload(targets)) => {
-                targets.iter().any(|target| {
-                    source.parameters.len() == target.parameters.len()
-                        && source
-                            .parameters
-                            .iter()
-                            .zip(&target.parameters)
-                            .all(|(source, target)| self.is_assignable(*target, *source))
-                        && self.is_assignable(source.return_type, target.return_type)
-                })
-            }
+            (TypeKind::Function(source), TypeKind::Overload(targets)) => targets
+                .iter()
+                .all(|target| self.signature_is_assignable(source, target)),
             (TypeKind::Overload(sources), TypeKind::Function(target)) => {
-                sources.iter().any(|source| {
-                    source.parameters.len() == target.parameters.len()
-                        && source
-                            .parameters
-                            .iter()
-                            .zip(&target.parameters)
-                            .all(|(source, target)| self.is_assignable(*target, *source))
-                        && self.is_assignable(source.return_type, target.return_type)
-                })
+                sources
+                    .iter()
+                    .any(|source| self.signature_is_assignable(source, target))
             }
             (TypeKind::Overload(sources), TypeKind::Overload(targets)) => {
                 targets.iter().all(|target| {
-                    sources.iter().any(|source| {
-                        source.parameters.len() == target.parameters.len()
-                            && source
-                                .parameters
-                                .iter()
-                                .zip(&target.parameters)
-                                .all(|(source, target)| self.is_assignable(*target, *source))
-                            && self.is_assignable(source.return_type, target.return_type)
-                    })
+                    sources
+                        .iter()
+                        .any(|source| self.signature_is_assignable(source, target))
                 })
             }
             _ => false,
@@ -16988,11 +17329,14 @@ impl<'a> Checker<'a> {
                 }))
             }
             TypeDescriptor::Function {
+                type_parameters: _,
                 parameters,
                 parameter_names,
                 rest_parameter,
                 return_type,
                 parameters_optional,
+                parameters_untyped,
+                preserve_optional_parameter_undefined,
             } => {
                 let parameters = parameters
                     .iter()
@@ -17003,18 +17347,25 @@ impl<'a> Checker<'a> {
                     .as_deref()
                     .map(|parameter| self.import_type(parameter));
                 self.result.types.alloc(TypeKind::Function(FunctionType {
+                    type_parameters: Vec::new(),
                     parameters,
                     parameter_names: parameter_names.clone(),
                     rest_parameter,
                     return_type,
                     parameters_optional: *parameters_optional,
+                    parameters_untyped: *parameters_untyped,
+                    preserve_optional_parameter_undefined:
+                        *preserve_optional_parameter_undefined,
                 }))
             }
             TypeDescriptor::Constructor {
+                type_parameters: _,
                 parameters,
                 rest_parameter,
                 return_type,
                 parameters_optional,
+                parameters_untyped,
+                preserve_optional_parameter_undefined,
             } => {
                 let parameters = parameters
                     .iter()
@@ -17025,11 +17376,15 @@ impl<'a> Checker<'a> {
                     .as_deref()
                     .map(|parameter| self.import_type(parameter));
                 self.result.types.alloc(TypeKind::Constructor(FunctionType {
+                    type_parameters: Vec::new(),
                     parameters,
                     parameter_names: Vec::new(),
                     rest_parameter,
                     return_type,
                     parameters_optional: *parameters_optional,
+                    parameters_untyped: *parameters_untyped,
+                    preserve_optional_parameter_undefined:
+                        *preserve_optional_parameter_undefined,
                 }))
             }
             TypeDescriptor::Overload(signatures) => {
@@ -17037,16 +17392,20 @@ impl<'a> Checker<'a> {
                     .iter()
                     .filter_map(|signature| {
                         let TypeDescriptor::Function {
+                            type_parameters: _,
                             parameters,
                             parameter_names,
                             rest_parameter,
                             return_type,
                             parameters_optional,
+                            parameters_untyped,
+                            preserve_optional_parameter_undefined,
                         } = signature
                         else {
                             return None;
                         };
                         Some(FunctionType {
+                            type_parameters: Vec::new(),
                             parameters: parameters
                                 .iter()
                                 .map(|parameter| self.import_type(parameter))
@@ -17057,6 +17416,9 @@ impl<'a> Checker<'a> {
                                 .map(|parameter| self.import_type(parameter)),
                             return_type: self.import_type(return_type),
                             parameters_optional: *parameters_optional,
+                            parameters_untyped: *parameters_untyped,
+                            preserve_optional_parameter_undefined:
+                                *preserve_optional_parameter_undefined,
                         })
                     })
                     .collect();
@@ -17825,14 +18187,113 @@ impl<'a> Checker<'a> {
         } else {
             actual
         };
-        self.error(
-            node,
-            code,
+        let message = message_by_code(code).expect("checker diagnostic is in catalog");
+        let diagnostic = Diagnostic::with_arguments(
+            message,
             [
                 self.result.types.display(displayed_actual),
                 self.result.types.display(expected),
             ],
-        );
+        )
+        .with_details(self.assignability_details(actual, expected));
+        self.result
+            .diagnostics
+            .push(CheckDiagnostic { node, diagnostic });
+    }
+
+    fn assignability_details(&self, actual: TypeId, expected: TypeId) -> Vec<String> {
+        let Some(TypeKind::Function(source)) = self.result.types.get(actual).map(|type_| &type_.kind)
+        else {
+            return Vec::new();
+        };
+        let Some(TypeKind::Function(target)) =
+            self.result.types.get(expected).map(|type_| &type_.kind)
+        else {
+            return Vec::new();
+        };
+        let compared_parameters = source.parameters.len().max(target.parameters.len())
+            + usize::from(source.rest_parameter.is_some() || target.rest_parameter.is_some());
+        for index in 0..compared_parameters {
+            let (Some(source_type), Some(target_type)) = (
+                self.signature_parameter_at(source, index),
+                self.signature_parameter_at(target, index),
+            ) else {
+                continue;
+            };
+            if self.signature_parameter_is_assignable(target_type, source_type) {
+                continue;
+            }
+            let source_name = self.signature_parameter_name(source, index);
+            let target_name = self.signature_parameter_name(target, index);
+            let source_display = if self.type_includes_undefined(target_type) {
+                self.parameter_relation_display(source_type)
+            } else {
+                self.result
+                    .types
+                    .display_optional_parameter_type(source_type)
+                    .1
+            };
+            let target_display = self.parameter_relation_display(target_type);
+            let mut details = vec![
+                format!(
+                    "  Types of parameters '{source_name}' and '{target_name}' are incompatible."
+                ),
+                format!(
+                    "    Type '{target_display}' is not assignable to type '{source_display}'."
+                ),
+            ];
+            if let TypeKind::Union(members) = &self.result.types.get(target_type).unwrap().kind
+                && let Some(member) = members
+                    .iter()
+                    .find(|member| {
+                        !self.signature_parameter_is_assignable(**member, source_type)
+                    })
+            {
+                let nested_source = self
+                    .result
+                    .types
+                    .display_optional_parameter_type(source_type)
+                    .1;
+                details.push(format!(
+                    "      Type '{}' is not assignable to type '{nested_source}'.",
+                    self.result.types.display(*member)
+                ));
+            }
+            return details;
+        }
+        Vec::new()
+    }
+
+    fn signature_parameter_name(&self, signature: &FunctionType, index: usize) -> String {
+        let name_index = if index < signature.parameters.len() {
+            index
+        } else {
+            signature.parameters.len()
+        };
+        signature
+            .parameter_names
+            .get(name_index)
+            .cloned()
+            .unwrap_or_else(|| format!("arg{name_index}"))
+    }
+
+    fn parameter_relation_display(&self, type_id: TypeId) -> String {
+        let TypeKind::Union(members) = &self.result.types.get(type_id).unwrap().kind else {
+            return self.result.types.display(type_id);
+        };
+        let mut ordered = members
+            .iter()
+            .copied()
+            .filter(|member| *member != self.result.types.undefined())
+            .collect::<Vec<_>>();
+        if members.contains(&self.result.types.undefined()) {
+            ordered.push(self.result.types.undefined());
+        }
+        ordered
+            .iter()
+            .map(|member| self.result.types.display(*member))
+            .collect::<Vec<_>>()
+            .join(" | ")
     }
 
     fn operator_error(&mut self, node: NodeId, operator: SyntaxKind, left: TypeId, right: TypeId) {
@@ -20164,11 +20625,14 @@ fn describe_type_node_syntax(
         }
         NodeData::FunctionTypeNode(function) => {
             let TypeDescriptor::Function {
+                type_parameters,
                 mut parameters,
                 parameter_names,
                 rest_parameter,
                 mut return_type,
                 parameters_optional,
+                parameters_untyped,
+                preserve_optional_parameter_undefined,
             } = semantic_target.clone()
             else {
                 return semantic_target;
@@ -20197,11 +20661,14 @@ fn describe_type_node_syntax(
                 ));
             }
             TypeDescriptor::Function {
+                type_parameters,
                 parameters,
                 parameter_names,
                 rest_parameter,
                 return_type,
                 parameters_optional,
+                parameters_untyped,
+                preserve_optional_parameter_undefined,
             }
         }
         NodeData::TemplateLiteralTypeNode(template) => {
@@ -21556,6 +22023,11 @@ fn describe_type_with_imports_inner(
                 .call_signatures
                 .iter()
                 .map(|signature| TypeDescriptor::Function {
+                    type_parameters: signature
+                        .type_parameters
+                        .iter()
+                        .map(|parameter| describe(*parameter))
+                        .collect(),
                     parameters: signature
                         .parameters
                         .iter()
@@ -21567,12 +22039,20 @@ fn describe_type_with_imports_inner(
                         .map(|parameter| Box::new(describe(parameter))),
                     return_type: Box::new(describe(signature.return_type)),
                     parameters_optional: signature.parameters_optional,
+                    parameters_untyped: signature.parameters_untyped,
+                    preserve_optional_parameter_undefined: signature
+                        .preserve_optional_parameter_undefined,
                 })
                 .collect(),
             construct_signatures: object
                 .construct_signatures
                 .iter()
                 .map(|signature| TypeDescriptor::Constructor {
+                    type_parameters: signature
+                        .type_parameters
+                        .iter()
+                        .map(|parameter| describe(*parameter))
+                        .collect(),
                     parameters: signature
                         .parameters
                         .iter()
@@ -21583,6 +22063,9 @@ fn describe_type_with_imports_inner(
                         .map(|parameter| Box::new(describe(parameter))),
                     return_type: Box::new(describe(signature.return_type)),
                     parameters_optional: signature.parameters_optional,
+                    parameters_untyped: signature.parameters_untyped,
+                    preserve_optional_parameter_undefined: signature
+                        .preserve_optional_parameter_undefined,
                 })
                 .collect(),
             optional_properties: object.optional_properties.clone(),
@@ -21590,6 +22073,11 @@ fn describe_type_with_imports_inner(
             getter_properties: object.getter_properties.clone(),
         },
         TypeKind::Function(function) => TypeDescriptor::Function {
+            type_parameters: function
+                .type_parameters
+                .iter()
+                .map(|parameter| describe(*parameter))
+                .collect(),
             parameters: function
                 .parameters
                 .iter()
@@ -21601,8 +22089,16 @@ fn describe_type_with_imports_inner(
                 .map(|parameter| Box::new(describe(parameter))),
             return_type: Box::new(describe(function.return_type)),
             parameters_optional: function.parameters_optional,
+            parameters_untyped: function.parameters_untyped,
+            preserve_optional_parameter_undefined: function
+                .preserve_optional_parameter_undefined,
         },
         TypeKind::Constructor(constructor) => TypeDescriptor::Constructor {
+            type_parameters: constructor
+                .type_parameters
+                .iter()
+                .map(|parameter| describe(*parameter))
+                .collect(),
             parameters: constructor
                 .parameters
                 .iter()
@@ -21613,11 +22109,19 @@ fn describe_type_with_imports_inner(
                 .map(|parameter| Box::new(describe(parameter))),
             return_type: Box::new(describe(constructor.return_type)),
             parameters_optional: constructor.parameters_optional,
+            parameters_untyped: constructor.parameters_untyped,
+            preserve_optional_parameter_undefined: constructor
+                .preserve_optional_parameter_undefined,
         },
         TypeKind::Overload(signatures) => TypeDescriptor::Overload(
             signatures
                 .iter()
                 .map(|signature| TypeDescriptor::Function {
+                    type_parameters: signature
+                        .type_parameters
+                        .iter()
+                        .map(|parameter| describe(*parameter))
+                        .collect(),
                     parameters: signature
                         .parameters
                         .iter()
@@ -21629,6 +22133,9 @@ fn describe_type_with_imports_inner(
                         .map(|parameter| Box::new(describe(parameter))),
                     return_type: Box::new(describe(signature.return_type)),
                     parameters_optional: signature.parameters_optional,
+                    parameters_untyped: signature.parameters_untyped,
+                    preserve_optional_parameter_undefined: signature
+                        .preserve_optional_parameter_undefined,
                 })
                 .collect(),
         ),
@@ -21745,12 +22252,19 @@ fn substitute_descriptor(
             getter_properties: getter_properties.clone(),
         },
         TypeDescriptor::Function {
+            type_parameters,
             parameters,
             parameter_names,
             rest_parameter,
             return_type,
             parameters_optional,
+            parameters_untyped,
+            preserve_optional_parameter_undefined,
         } => TypeDescriptor::Function {
+            type_parameters: type_parameters
+                .iter()
+                .map(|parameter| substitute_descriptor(parameter, substitutions))
+                .collect(),
             parameters: parameters
                 .iter()
                 .map(|parameter| substitute_descriptor(parameter, substitutions))
@@ -21761,13 +22275,22 @@ fn substitute_descriptor(
                 .map(|parameter| Box::new(substitute_descriptor(parameter, substitutions))),
             return_type: Box::new(substitute_descriptor(return_type, substitutions)),
             parameters_optional: *parameters_optional,
+            parameters_untyped: *parameters_untyped,
+            preserve_optional_parameter_undefined: *preserve_optional_parameter_undefined,
         },
         TypeDescriptor::Constructor {
+            type_parameters,
             parameters,
             rest_parameter,
             return_type,
             parameters_optional,
+            parameters_untyped,
+            preserve_optional_parameter_undefined,
         } => TypeDescriptor::Constructor {
+            type_parameters: type_parameters
+                .iter()
+                .map(|parameter| substitute_descriptor(parameter, substitutions))
+                .collect(),
             parameters: parameters
                 .iter()
                 .map(|parameter| substitute_descriptor(parameter, substitutions))
@@ -21777,6 +22300,8 @@ fn substitute_descriptor(
                 .map(|parameter| Box::new(substitute_descriptor(parameter, substitutions))),
             return_type: Box::new(substitute_descriptor(return_type, substitutions)),
             parameters_optional: *parameters_optional,
+            parameters_untyped: *parameters_untyped,
+            preserve_optional_parameter_undefined: *preserve_optional_parameter_undefined,
         },
         TypeDescriptor::Overload(signatures) => TypeDescriptor::Overload(
             signatures
@@ -24909,11 +25434,14 @@ mod tests {
         let number = checker.result.types.number();
         let return_type = checker.result.types.alloc(TypeKind::Array(number));
         let property = checker.result.types.alloc(TypeKind::Function(FunctionType {
+            type_parameters: Vec::new(),
             parameters: vec![number],
             parameter_names: vec!["depth".into()],
             rest_parameter: None,
             return_type,
             parameters_optional: false,
+            parameters_untyped: false,
+            preserve_optional_parameter_undefined: false,
         }));
         let flat = checker
             .array_flat_property_type(receiver, property)
@@ -29855,5 +30383,97 @@ mod tests {
             checked.files[2].types.get(default_type).unwrap().kind,
             TypeKind::Function(_)
         ));
+    }
+
+    #[test]
+    fn checks_explicit_call_type_argument_constraints_and_arity() {
+        let parsed = parse_source_file(concat!(
+            "declare function constrained<T extends { id: number }>(value: T): void; ",
+            "declare function dependent<T, U extends T>(): void; ",
+            "constrained<string>('x'); ",
+            "dependent<string, number>(); ",
+            "dependent<string, string, boolean>();",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2344, 2344, 2558]
+        );
+    }
+
+    #[test]
+    fn function_assignment_allows_ignored_return_values() {
+        let parsed = parse_source_file(concat!(
+            "let consume: (value: string) => void; ",
+            "let produce: (value: string) => number; ",
+            "produce = consume; ",
+            "consume = produce;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2322]
+        );
+    }
+
+    #[test]
+    fn function_assignment_checks_optional_and_rest_parameters() {
+        let parsed = parse_source_file(concat!(
+            "declare let one: (x: number) => number; ",
+            "declare let optional: (x: number, y?: string) => number; ",
+            "declare let optionalTarget: (x: number, y?: number) => number; ",
+            "declare let requiredSource: (x: number, y: number) => number; ",
+            "declare let numberRest: (x: number, ...values: number[]) => number; ",
+            "declare let stringRest: (x: number, ...values: string[]) => number; ",
+            "one = optional; ",
+            "optionalTarget = requiredSource; ",
+            "numberRest = stringRest;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2322, 2322]
+        );
+    }
+
+    #[test]
+    fn function_assignment_requires_every_target_overload() {
+        let parsed = parse_source_file(concat!(
+            "declare function broad(x: 'foo'): number; ",
+            "declare function broad(x: string): number; ",
+            "declare function narrow(x: 'foo'): number; ",
+            "let target = broad; ",
+            "let source = narrow; ",
+            "target = source;",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2322]
+        );
     }
 }

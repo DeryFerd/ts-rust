@@ -80,6 +80,64 @@ fn filters_limits_and_reports_matches() {
 }
 
 #[test]
+fn compares_diagnostic_headers_without_changing_emit_mode() {
+    let repository = TestRepository::new();
+    repository.write_case(
+        "diagnosticParity",
+        concat!(
+            "// @noLib: true\n",
+            "// @noEmit: true\n",
+            "const value: string = 1;\n",
+        ),
+        None,
+    );
+    repository.write_baseline(
+        "diagnosticParity.errors.txt",
+        concat!(
+            "diagnosticParity.ts(1,7): error TS2322: Type '1' is not assignable to type 'string'.\r\n",
+            "\r\n",
+            "\r\n",
+            "==== diagnosticParity.ts (1 errors) ====\r\n",
+        ),
+    );
+
+    let output = run(
+        &repository.0,
+        &["--diagnostics", "--filter", "diagnosticParity"],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "summary: matched=1 mismatched=0 diagnostics=0\n"
+    );
+}
+
+#[test]
+fn diagnostics_mode_treats_a_missing_error_baseline_as_no_expected_errors() {
+    let repository = TestRepository::new();
+    repository.write_case(
+        "unexpectedDiagnostic",
+        "// @noLib: true\nconst value: string = 1;\n",
+        None,
+    );
+
+    let output = run(
+        &repository.0,
+        &["--diagnostics", "--filter", "unexpectedDiagnostic"],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("MISMATCH tests/cases/compiler/unexpectedDiagnostic.ts"));
+    assert!(stdout.contains("expected \"\""));
+    assert!(stdout.contains("actual \"unexpectedDiagnostic.ts(1,7): error TS2322"));
+    assert!(stdout.contains("summary: matched=0 mismatched=1 diagnostics=1"));
+}
+
+#[test]
 fn reports_the_first_actionable_mismatch() {
     let repository = TestRepository::new();
     repository.write_case(
