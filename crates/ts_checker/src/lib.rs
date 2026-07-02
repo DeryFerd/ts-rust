@@ -42,6 +42,12 @@ pub enum TypeKind {
     NumberLiteral(String),
     StringLiteral(String),
     BigIntLiteral(String),
+    /// A template literal type: `parts` holds the fixed text around each
+    /// placeholder, so `parts.len() == placeholders.len() + 1`.
+    TemplateLiteral {
+        parts: Vec<String>,
+        placeholders: Vec<TypeId>,
+    },
     TypeParameter {
         name: String,
         constraint: Option<TypeId>,
@@ -334,8 +340,39 @@ impl TypeArena {
             TypeKind::BooleanLiteral(value) => value.to_string(),
             TypeKind::NumberLiteral(value) | TypeKind::BigIntLiteral(value) => value.clone(),
             TypeKind::StringLiteral(value) => format!("{value:?}"),
+            TypeKind::TemplateLiteral {
+                parts,
+                placeholders,
+            } => {
+                let mut display = String::from("`");
+                display.push_str(&parts[0]);
+                for (placeholder, part) in placeholders.iter().zip(&parts[1..]) {
+                    display.push_str("${");
+                    display.push_str(&self.display(*placeholder));
+                    display.push('}');
+                    display.push_str(part);
+                }
+                display.push('`');
+                display
+            }
             TypeKind::TypeParameter { name, .. } => name.clone(),
-            TypeKind::Array(element) => format!("{}[]", self.display(*element)),
+            TypeKind::Array(element) => {
+                let display = self.display(*element);
+                // Union, intersection, and function elements parenthesize.
+                if matches!(
+                    self.get(*element).map(|element| &element.kind),
+                    Some(
+                        TypeKind::Union(_)
+                            | TypeKind::Intersection(_)
+                            | TypeKind::Function(_)
+                            | TypeKind::Constructor(_)
+                    )
+                ) {
+                    format!("({display})[]")
+                } else {
+                    format!("{display}[]")
+                }
+            }
             TypeKind::Tuple(elements) => format!(
                 "[{}]",
                 elements
@@ -9869,6 +9906,13 @@ impl<'a> Checker<'a> {
             return TypeTruthiness::Maybe;
         };
         match kind {
+            TypeKind::TemplateLiteral { parts, .. } => {
+                if parts.iter().any(|part| !part.is_empty()) {
+                    TypeTruthiness::Always
+                } else {
+                    TypeTruthiness::Maybe
+                }
+            }
             TypeKind::Void
             | TypeKind::Undefined
             | TypeKind::Null
@@ -15211,8 +15255,8 @@ impl<'a> Checker<'a> {
         })
     }
 
-    /// Aliases of `keyof` operators display as their resolved key union, not
-    /// by alias name, matching the oracle.
+    /// Aliases of `keyof` operators and of template literal patterns display
+    /// as their resolved type, not by alias name, matching the oracle.
     fn type_alias_is_keyof(&self, symbol: SymbolId) -> bool {
         self.bindings.symbols.get(symbol).is_some_and(|symbol| {
             symbol.declarations.iter().any(|declaration| {
@@ -15221,11 +15265,13 @@ impl<'a> Checker<'a> {
                 else {
                     return false;
                 };
-                matches!(
-                    self.arena.get(alias.type_).map(|node| &node.data),
-                    Some(NodeData::TypeOperatorNode(operator))
-                        if operator.operator == SyntaxKind::KeyOfKeyword
-                )
+                match self.arena.get(alias.type_).map(|node| &node.data) {
+                    Some(NodeData::TypeOperatorNode(operator)) => {
+                        operator.operator == SyntaxKind::KeyOfKeyword
+                    }
+                    Some(NodeData::TemplateLiteralTypeNode(_)) => true,
+                    _ => false,
+                }
             })
         })
     }
@@ -18016,6 +18062,34 @@ impl<'a> Checker<'a> {
                     .collect::<Vec<_>>();
                 self.result.types.intersection(members)
             }
+            NodeData::TemplateLiteralTypeNode(data) => {
+                let Some(NodeData::TemplateHead(head)) =
+                    self.arena.get(data.head).map(|node| &node.data)
+                else {
+                    return self.result.types.string();
+                };
+                let mut parts = vec![head.text.clone()];
+                let mut placeholders = Vec::new();
+                for span in &data.template_spans.nodes {
+                    let Some(NodeData::TemplateLiteralTypeSpan(span)) =
+                        self.arena.get(*span).map(|node| &node.data)
+                    else {
+                        return self.result.types.string();
+                    };
+                    let text = match self.arena.get(span.literal).map(|node| &node.data) {
+                        Some(NodeData::TemplateMiddle(literal)) => literal.text.clone(),
+                        Some(NodeData::TemplateTail(literal)) => literal.text.clone(),
+                        _ => return self.result.types.string(),
+                    };
+                    let type_ = span.type_;
+                    placeholders.push(self.type_from_type_node(type_));
+                    parts.push(text);
+                }
+                self.result.types.alloc(TypeKind::TemplateLiteral {
+                    parts,
+                    placeholders,
+                })
+            }
             NodeData::TypeOperatorNode(data) => {
                 let operand = self.type_from_type_node(data.type_);
                 if data.operator == SyntaxKind::KeyOfKeyword {
@@ -19069,6 +19143,70 @@ impl<'a> Checker<'a> {
     }
 
     #[allow(clippy::too_many_lines)]
+    /// Whether `text` matches the template pattern: fixed parts must appear
+    /// in order and the segments between them must satisfy the placeholder
+    /// types (any text for string, numeric text for number).
+    fn text_matches_template(
+        &self,
+        text: &str,
+        parts: &[String],
+        placeholders: &[TypeId],
+    ) -> bool {
+        let Some(rest) = text.strip_prefix(parts[0].as_str()) else {
+            return false;
+        };
+        if placeholders.is_empty() {
+            return rest.is_empty();
+        }
+        let placeholder_matches = |placeholder: TypeId, segment: &str| -> bool {
+            match self.result.types.get(placeholder).map(|type_| &type_.kind) {
+                Some(TypeKind::Any | TypeKind::String) => true,
+                Some(TypeKind::Number) => segment.parse::<f64>().is_ok(),
+                Some(TypeKind::BigInt) => segment.parse::<i128>().is_ok(),
+                Some(TypeKind::Boolean) => segment == "true" || segment == "false",
+                Some(TypeKind::StringLiteral(literal)) => segment == literal,
+                Some(TypeKind::NumberLiteral(literal) | TypeKind::BigIntLiteral(literal)) => {
+                    segment == literal
+                }
+                Some(TypeKind::BooleanLiteral(literal)) => segment == literal.to_string(),
+                Some(TypeKind::Union(members)) => members.iter().any(|member| {
+                    self.text_matches_template(
+                        segment,
+                        &[String::new(), String::new()],
+                        std::slice::from_ref(member),
+                    )
+                }),
+                _ => false,
+            }
+        };
+        // Greedy left-to-right: each following fixed part anchors the next
+        // segment; the final part must anchor at the end.
+        let mut remaining = rest;
+        for (index, placeholder) in placeholders.iter().enumerate() {
+            let part = parts[index + 1].as_str();
+            if index + 1 == parts.len() - 1 {
+                let Some(segment) = remaining.strip_suffix(part) else {
+                    return false;
+                };
+                return placeholder_matches(*placeholder, segment);
+            }
+            if part.is_empty() {
+                // An empty separator cannot anchor; give the rest to this
+                // placeholder only if everything after also has empty parts.
+                return placeholder_matches(*placeholder, remaining)
+                    && parts[index + 1..].iter().all(String::is_empty);
+            }
+            let Some(position) = remaining.find(part) else {
+                return false;
+            };
+            if !placeholder_matches(*placeholder, &remaining[..position]) {
+                return false;
+            }
+            remaining = &remaining[position + part.len()..];
+        }
+        false
+    }
+
     #[allow(clippy::match_same_arms)] // Arm order documents the relation.
     fn is_assignable(&self, source: TypeId, target: TypeId) -> bool {
         if source == target || source == self.result.types.never() {
@@ -19088,6 +19226,48 @@ impl<'a> Checker<'a> {
         }
         if self.enum_types.contains(&target) {
             return false;
+        }
+        {
+            let source_kind = &self.result.types.get(source).unwrap().kind;
+            let target_kind = &self.result.types.get(target).unwrap().kind;
+            match (source_kind, target_kind) {
+                (
+                    TypeKind::StringLiteral(text),
+                    TypeKind::TemplateLiteral {
+                        parts,
+                        placeholders,
+                    },
+                ) => {
+                    return self.text_matches_template(text, parts, placeholders);
+                }
+                (TypeKind::TemplateLiteral { .. }, TypeKind::String) => return true,
+                (
+                    TypeKind::TemplateLiteral {
+                        parts: source_parts,
+                        placeholders: source_placeholders,
+                    },
+                    TypeKind::TemplateLiteral {
+                        parts: target_parts,
+                        placeholders: target_placeholders,
+                    },
+                ) => {
+                    return source_parts == target_parts
+                        && source_placeholders.len() == target_placeholders.len()
+                        && source_placeholders
+                            .iter()
+                            .zip(target_placeholders)
+                            .all(|(source, target)| self.is_assignable(*source, *target));
+                }
+                (_, TypeKind::TemplateLiteral { .. })
+                | (TypeKind::TemplateLiteral { .. }, _) => {
+                    if !matches!(target_kind, TypeKind::Union(_) | TypeKind::Any | TypeKind::Unknown)
+                        && !matches!(source_kind, TypeKind::Union(_) | TypeKind::Never | TypeKind::Any)
+                    {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
         }
         // Promise-family types relate covariantly by their value argument;
         // separately constructed instantiations are not structurally
@@ -20646,7 +20826,8 @@ impl<'a> Checker<'a> {
                 | TypeKind::BooleanLiteral(_)
                 | TypeKind::NumberLiteral(_)
                 | TypeKind::StringLiteral(_)
-                | TypeKind::BigIntLiteral(_),
+                | TypeKind::BigIntLiteral(_)
+                | TypeKind::TemplateLiteral { .. },
             ) => true,
             Some(TypeKind::Union(members)) => members
                 .iter()
@@ -21521,7 +21702,22 @@ impl<'a> Checker<'a> {
             }
         }
         match &self.result.types.get(type_id).unwrap().kind {
-            TypeKind::Array(element) => format!("{}[]", self.diagnostic_type_display(*element)),
+            TypeKind::Array(element) => {
+                let display = self.diagnostic_type_display(*element);
+                if matches!(
+                    self.result.types.get(*element).map(|element| &element.kind),
+                    Some(
+                        TypeKind::Union(_)
+                            | TypeKind::Intersection(_)
+                            | TypeKind::Function(_)
+                            | TypeKind::Constructor(_)
+                    )
+                ) {
+                    format!("({display})[]")
+                } else {
+                    format!("{display}[]")
+                }
+            }
             TypeKind::Tuple(elements) => format!(
                 "[{}]",
                 elements
@@ -25462,6 +25658,9 @@ fn describe_type_with_imports_inner(
         TypeKind::Void => TypeDescriptor::Void,
         TypeKind::Undefined => TypeDescriptor::Undefined,
         TypeKind::Null => TypeDescriptor::Null,
+        // Template literal patterns degrade to string across the descriptor
+        // boundary.
+        TypeKind::TemplateLiteral { .. } => TypeDescriptor::String,
         TypeKind::Boolean => TypeDescriptor::Boolean,
         TypeKind::Number => TypeDescriptor::Number,
         TypeKind::String => TypeDescriptor::String,

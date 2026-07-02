@@ -19839,6 +19839,20 @@ impl DeclarationPrinter<'_> {
             TypeKind::NumberLiteral(value) => self.write_semantic_number_literal(&value),
             TypeKind::BigIntLiteral(value) => self.writer.write(&value),
             TypeKind::StringLiteral(value) => write_quoted(&mut self.writer, &value),
+            TypeKind::TemplateLiteral {
+                parts,
+                placeholders,
+            } => {
+                self.writer.write("`");
+                self.writer.write(&parts[0]);
+                for (placeholder, part) in placeholders.iter().zip(&parts[1..]) {
+                    self.writer.write("${");
+                    self.emit_semantic_type(*placeholder)?;
+                    self.writer.write("}");
+                    self.writer.write(part);
+                }
+                self.writer.write("`");
+            }
             TypeKind::Object(object) => {
                 if let Some(signature) = Self::compact_construct_signature(&object) {
                     self.writer.write("new (");
