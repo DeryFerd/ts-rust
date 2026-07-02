@@ -190,6 +190,7 @@ fn compiler_boolean_name(argument: &str) -> Option<&'static str> {
         "--sourcemap" => "sourcemap",
         "--strict" => "strict",
         "--strictnullchecks" => "strictnullchecks",
+        "--strictpropertyinitialization" => "strictpropertyinitialization",
         "--useunknownincatchvariables" => "useunknownincatchvariables",
         "--verbatimmodulesyntax" => "verbatimmodulesyntax",
         _ => return None,

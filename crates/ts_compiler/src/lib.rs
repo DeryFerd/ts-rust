@@ -2060,6 +2060,9 @@ impl Program {
                         is_javascript_file: is_javascript_file_name(&source_file.file_name),
                         no_fallthrough_cases_in_switch: self.options.no_fallthrough_cases_in_switch,
                         strict_null_checks: self.options.strict_null_checks,
+                        strict_property_initialization: self
+                            .options
+                            .strict_property_initialization,
                         no_implicit_any: self.options.no_implicit_any,
                         no_implicit_returns: self.options.no_implicit_returns,
                         no_unused_locals: self.options.no_unused_locals,

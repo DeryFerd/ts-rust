@@ -1294,6 +1294,7 @@ const SCALAR_OPTION_NAMES: &[&str] = &[
     "strict",
     "strictBuiltinIteratorReturn",
     "strictNullChecks",
+    "strictPropertyInitialization",
     "target",
     "tsBuildInfoFile",
     "useDefineForClassFields",

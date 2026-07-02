@@ -109,6 +109,9 @@ pub struct CompilerOptions {
     pub remove_comments: bool,
     pub rewrite_relative_import_extensions: bool,
     pub no_implicit_any: bool,
+    /// Whether `noImplicitAny` was explicitly supplied rather than inherited
+    /// from `strict`.
+    pub no_implicit_any_specified: bool,
     pub no_implicit_returns: bool,
     pub no_lib: bool,
     pub no_fallthrough_cases_in_switch: bool,
@@ -119,9 +122,21 @@ pub struct CompilerOptions {
     pub skip_lib_check: bool,
     pub strip_internal: bool,
     pub strict: bool,
+    /// Whether `strict` was explicitly supplied.
+    pub strict_specified: bool,
     pub strict_null_checks: bool,
+    /// Whether `strictNullChecks` was explicitly supplied rather than inherited
+    /// from `strict`.
+    pub strict_null_checks_specified: bool,
+    pub strict_property_initialization: bool,
+    /// Whether `strictPropertyInitialization` was explicitly supplied rather
+    /// than inherited from `strict`.
+    pub strict_property_initialization_specified: bool,
     pub use_define_for_class_fields: Option<bool>,
     pub use_unknown_in_catch_variables: bool,
+    /// Whether `useUnknownInCatchVariables` was explicitly supplied rather than
+    /// inherited from `strict`.
+    pub use_unknown_in_catch_variables_specified: bool,
     pub verbatim_module_syntax: bool,
     pub lib: Option<Vec<String>>,
     pub module: ModuleKind,
@@ -183,7 +198,8 @@ impl Default for CompilerOptions {
             no_emit_on_error: false,
             remove_comments: false,
             rewrite_relative_import_extensions: false,
-            no_implicit_any: false,
+            no_implicit_any: true,
+            no_implicit_any_specified: false,
             no_implicit_returns: false,
             no_lib: false,
             no_fallthrough_cases_in_switch: false,
@@ -193,10 +209,15 @@ impl Default for CompilerOptions {
             preserve_const_enums: false,
             skip_lib_check: false,
             strip_internal: false,
-            strict: false,
-            strict_null_checks: false,
+            strict: true,
+            strict_specified: false,
+            strict_null_checks: true,
+            strict_null_checks_specified: false,
+            strict_property_initialization: true,
+            strict_property_initialization_specified: false,
             use_define_for_class_fields: None,
-            use_unknown_in_catch_variables: false,
+            use_unknown_in_catch_variables: true,
+            use_unknown_in_catch_variables_specified: false,
             verbatim_module_syntax: false,
             lib: None,
             module: ModuleKind::default(),
@@ -342,7 +363,10 @@ impl CompilerOptions {
                     self.rewrite_relative_import_extensions =
                         overrides.rewrite_relative_import_extensions;
                 }
-                "noimplicitany" => self.no_implicit_any = overrides.no_implicit_any,
+                "noimplicitany" => {
+                    self.no_implicit_any = overrides.no_implicit_any;
+                    self.no_implicit_any_specified = true;
+                }
                 "noimplicitreturns" => self.no_implicit_returns = overrides.no_implicit_returns,
                 "nolib" => self.no_lib = overrides.no_lib,
                 "nofallthroughcasesinswitch" => {
@@ -369,24 +393,43 @@ impl CompilerOptions {
                 "sourceroot" => self.source_root.clone_from(&overrides.source_root),
                 "strict" => {
                     self.strict = overrides.strict;
-                    if !names.contains("noimplicitany") {
+                    self.strict_specified = true;
+                    if !names.contains("noimplicitany") && !self.no_implicit_any_specified {
                         self.no_implicit_any = overrides.no_implicit_any;
                     }
-                    if !names.contains("strictnullchecks") {
+                    if !names.contains("strictnullchecks")
+                        && !self.strict_null_checks_specified
+                    {
                         self.strict_null_checks = overrides.strict_null_checks;
                     }
-                    if !names.contains("useunknownincatchvariables") {
+                    if !names.contains("strictpropertyinitialization")
+                        && !self.strict_property_initialization_specified
+                    {
+                        self.strict_property_initialization =
+                            overrides.strict_property_initialization;
+                    }
+                    if !names.contains("useunknownincatchvariables")
+                        && !self.use_unknown_in_catch_variables_specified
+                    {
                         self.use_unknown_in_catch_variables =
                             overrides.use_unknown_in_catch_variables;
                     }
                 }
-                "strictnullchecks" => self.strict_null_checks = overrides.strict_null_checks,
+                "strictnullchecks" => {
+                    self.strict_null_checks = overrides.strict_null_checks;
+                    self.strict_null_checks_specified = true;
+                }
+                "strictpropertyinitialization" => {
+                    self.strict_property_initialization = overrides.strict_property_initialization;
+                    self.strict_property_initialization_specified = true;
+                }
                 "target" => self.target = overrides.target,
                 "usedefineforclassfields" => {
                     self.use_define_for_class_fields = overrides.use_define_for_class_fields;
                 }
                 "useunknownincatchvariables" => {
                     self.use_unknown_in_catch_variables = overrides.use_unknown_in_catch_variables;
+                    self.use_unknown_in_catch_variables_specified = true;
                 }
                 "verbatimmodulesyntax" => {
                     self.verbatim_module_syntax = overrides.verbatim_module_syntax;
@@ -616,6 +659,10 @@ pub fn parse_compiler_options_map(options: &BTreeMap<String, JsonValue>) -> Pars
             "strictnullchecks" => {
                 parsed.strict_null_checks = boolean(original_name, value, &mut diagnostics);
             }
+            "strictpropertyinitialization" => {
+                parsed.strict_property_initialization =
+                    boolean(original_name, value, &mut diagnostics);
+            }
             "usedefineforclassfields" => {
                 parsed.use_define_for_class_fields =
                     boolean(original_name, value, &mut diagnostics);
@@ -725,6 +772,7 @@ struct PartialOptions {
     strip_internal: Option<bool>,
     strict: Option<bool>,
     strict_null_checks: Option<bool>,
+    strict_property_initialization: Option<bool>,
     use_define_for_class_fields: Option<bool>,
     use_unknown_in_catch_variables: Option<bool>,
     verbatim_module_syntax: Option<bool>,
@@ -759,7 +807,17 @@ struct PartialOptions {
 impl PartialOptions {
     fn normalize(self) -> CompilerOptions {
         let check_js = self.check_js.unwrap_or(false);
-        let strict = self.strict.unwrap_or(false);
+        let no_implicit_any_specified = self.no_implicit_any.is_some();
+        let strict_specified = self.strict.is_some();
+        let strict_null_checks_specified = self.strict_null_checks.is_some();
+        let strict_property_initialization_specified =
+            self.strict_property_initialization.is_some();
+        let use_unknown_in_catch_variables_specified =
+            self.use_unknown_in_catch_variables.is_some();
+        // The current TypeScript/ts-go command-line contract enables the strict
+        // family unless `strict` is explicitly disabled. Individual strict
+        // options remain independently overridable.
+        let strict = self.strict.unwrap_or(true);
         let emit_declaration_only = self.emit_declaration_only.unwrap_or(false);
         let composite = self.composite.unwrap_or(false);
         let module_specified = self.module.is_some();
@@ -809,6 +867,7 @@ impl PartialOptions {
                 .rewrite_relative_import_extensions
                 .unwrap_or(false),
             no_implicit_any: self.no_implicit_any.unwrap_or(strict),
+            no_implicit_any_specified,
             no_implicit_returns: self.no_implicit_returns.unwrap_or(false),
             no_lib: self.no_lib.unwrap_or(false),
             no_fallthrough_cases_in_switch: self.no_fallthrough_cases_in_switch.unwrap_or(false),
@@ -821,9 +880,16 @@ impl PartialOptions {
             skip_lib_check: self.skip_lib_check.unwrap_or(false),
             strip_internal: self.strip_internal.unwrap_or(false),
             strict,
+            strict_specified,
             strict_null_checks: self.strict_null_checks.unwrap_or(strict),
+            strict_null_checks_specified,
+            strict_property_initialization: self
+                .strict_property_initialization
+                .unwrap_or(strict),
+            strict_property_initialization_specified,
             use_define_for_class_fields: self.use_define_for_class_fields,
             use_unknown_in_catch_variables: self.use_unknown_in_catch_variables.unwrap_or(strict),
+            use_unknown_in_catch_variables_specified,
             verbatim_module_syntax: self.verbatim_module_syntax.unwrap_or(false),
             lib: self.lib,
             module,
@@ -890,7 +956,7 @@ fn validate_options(options: &PartialOptions, diagnostics: &mut Vec<Diagnostic>)
     if options.exact_optional_property_types == Some(true)
         && !options
             .strict_null_checks
-            .unwrap_or(options.strict.unwrap_or(false))
+            .unwrap_or(options.strict.unwrap_or(true))
     {
         diagnostics.push(diagnostic(
             5052,
@@ -1337,10 +1403,16 @@ mod tests {
             implied_by_strict.diagnostics
         );
 
-        let invalid = parse_compiler_options(&object([(
+        let defaults = parse_compiler_options(&object([(
             "exactOptionalPropertyTypes",
             JsonValue::Bool(true),
         )]));
+        assert!(defaults.is_ok(), "{:?}", defaults.diagnostics);
+
+        let invalid = parse_compiler_options(&object([
+            ("strict", JsonValue::Bool(false)),
+            ("exactOptionalPropertyTypes", JsonValue::Bool(true)),
+        ]));
         assert_eq!(
             invalid
                 .diagnostics
@@ -1363,6 +1435,46 @@ mod tests {
                 .collect::<Vec<_>>(),
             [5052]
         );
+    }
+
+    #[test]
+    fn preserves_strict_option_provenance_across_overrides() {
+        let defaults = parse_compiler_options(&object([])).options;
+        assert!(defaults.strict);
+        assert!(defaults.no_implicit_any);
+        assert!(defaults.strict_null_checks);
+        assert!(defaults.strict_property_initialization);
+        assert!(defaults.use_unknown_in_catch_variables);
+        assert!(!defaults.strict_specified);
+        assert!(!defaults.no_implicit_any_specified);
+        assert!(!defaults.strict_null_checks_specified);
+        assert!(!defaults.strict_property_initialization_specified);
+        assert!(!defaults.use_unknown_in_catch_variables_specified);
+
+        let disabled = parse_compiler_options(&object([("strict", JsonValue::Bool(false))]))
+            .options;
+        assert!(!disabled.strict);
+        assert!(!disabled.no_implicit_any);
+        assert!(!disabled.strict_null_checks);
+        assert!(!disabled.strict_property_initialization);
+        assert!(!disabled.use_unknown_in_catch_variables);
+
+        let mut inherited = parse_compiler_options(&object([
+            ("strictNullChecks", JsonValue::Bool(true)),
+            ("strictPropertyInitialization", JsonValue::Bool(true)),
+        ]))
+        .options;
+        inherited.apply_overrides(&disabled, &BTreeSet::from(["strict".to_owned()]));
+        assert!(!inherited.strict);
+        assert!(inherited.strict_null_checks);
+        assert!(inherited.strict_property_initialization);
+
+        let mut implied = defaults;
+        implied.apply_overrides(&disabled, &BTreeSet::from(["strict".to_owned()]));
+        assert!(!implied.no_implicit_any);
+        assert!(!implied.strict_null_checks);
+        assert!(!implied.strict_property_initialization);
+        assert!(!implied.use_unknown_in_catch_variables);
     }
 
     #[test]

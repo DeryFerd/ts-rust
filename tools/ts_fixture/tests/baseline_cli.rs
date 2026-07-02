@@ -94,7 +94,7 @@ fn compares_diagnostic_headers_without_changing_emit_mode() {
     repository.write_baseline(
         "diagnosticParity.errors.txt",
         concat!(
-            "diagnosticParity.ts(1,7): error TS2322: Type '1' is not assignable to type 'string'.\r\n",
+            "diagnosticParity.ts(1,7): error TS2322: Type 'number' is not assignable to type 'string'.\r\n",
             "\r\n",
             "\r\n",
             "==== diagnosticParity.ts (1 errors) ====\r\n",
@@ -242,7 +242,7 @@ fn reports_compilation_diagnostic_for_missing_emitted_section() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("MISMATCH tests/cases/compiler/diagnostic.ts: diagnostic TS2322"));
     assert!(stdout.contains("/case/diagnostic.ts"));
-    assert!(stdout.contains("Type '1' is not assignable to type 'string'."));
+    assert!(stdout.contains("Type 'number' is not assignable to type 'string'."));
     assert!(stdout.contains(
         "summary: matched=0 mismatched=1 missing=0 content=0 missing_sections=0 unexpected_sections=0 diagnostics=1"
     ));
