@@ -549,7 +549,11 @@ fn semantic_parity_corpus_matches_oracle() {
     let mut names = fs::read_dir(&corpus)
         .unwrap()
         .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-        .filter(|name| name.ends_with(".ts"))
+        .filter(|name| {
+            Path::new(name)
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("ts"))
+        })
         .collect::<Vec<_>>();
     names.sort();
     assert!(!names.is_empty());

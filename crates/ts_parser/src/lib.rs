@@ -347,6 +347,7 @@ enum TypeParseContext {
     TupleElement,
 }
 
+#[allow(clippy::struct_excessive_bools)] // Parser flags are independent modes.
 struct Parser<'a> {
     scanner: Scanner<'a>,
     current: Token<'a>,
@@ -461,6 +462,7 @@ impl<'a> Parser<'a> {
         self.parse_statement_list_with_class_member_recovery(terminator, false)
     }
 
+    #[allow(clippy::too_many_lines)] // Statement recovery is one dispatch.
     fn parse_statement_list_with_class_member_recovery(
         &mut self,
         terminator: SyntaxKind,
@@ -614,6 +616,7 @@ impl<'a> Parser<'a> {
             .push(TextRange::new(start, end));
     }
 
+    #[allow(clippy::too_many_lines)] // Grammar dispatch over statement kinds.
     fn parse_statement(&mut self) -> NodeId {
         let is_labeled_statement = self.current.kind == SyntaxKind::Identifier
             && self.next_token_kind() == SyntaxKind::ColonToken;
@@ -1097,6 +1100,7 @@ impl<'a> Parser<'a> {
             )
     }
 
+    #[allow(clippy::too_many_lines)] // Declaration-list recovery is one unit.
     fn parse_variable_statement_tail(
         &mut self,
         statement_start: TextPos,
@@ -1445,6 +1449,7 @@ impl<'a> Parser<'a> {
         }
     }
 
+    #[allow(clippy::too_many_lines)] // Parameter grammar has many forms.
     fn parse_parameter(&mut self) -> NodeId {
         let start = self.current.range.start;
         let mut modifier_nodes = Vec::new();
@@ -4399,11 +4404,11 @@ impl<'a> Parser<'a> {
             self.bump();
             has_trailing_comma = self.current.kind == SyntaxKind::CloseBraceToken;
         }
-        if !matches!(
+        if !(matches!(
             self.current.kind,
             SyntaxKind::CloseBraceToken | SyntaxKind::EndOfFile
-        ) && !(self.current.kind == SyntaxKind::FromKeyword
-            && self.next_token_kind() == SyntaxKind::StringLiteral)
+        ) || (self.current.kind == SyntaxKind::FromKeyword
+            && self.next_token_kind() == SyntaxKind::StringLiteral))
         {
             // A malformed local binding can leave several scanner tokens behind.
             // Keep them inside the import clause so they do not become unrelated
@@ -7894,6 +7899,7 @@ impl<'a> Parser<'a> {
         )
     }
 
+    #[allow(clippy::too_many_lines)] // Type operator grammar is one dispatch.
     fn parse_type_operator_or_postfix(&mut self) -> NodeId {
         if self.current.kind == SyntaxKind::ExclamationToken {
             let start = self.consume().range.start;

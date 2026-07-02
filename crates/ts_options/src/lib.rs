@@ -805,6 +805,7 @@ struct PartialOptions {
 }
 
 impl PartialOptions {
+    #[allow(clippy::too_many_lines)] // Flat field-by-field option mapping.
     fn normalize(self) -> CompilerOptions {
         let check_js = self.check_js.unwrap_or(false);
         let no_implicit_any_specified = self.no_implicit_any.is_some();
