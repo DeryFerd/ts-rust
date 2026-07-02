@@ -29326,9 +29326,9 @@ mod tests {
                 const falseResult = false || "fallback";
                 const zeroResult = 0 || "fallback";
                 const emptyResult = "" || 1;
-                let maybe: (() => number) | null;
+                declare let maybe: (() => number) | null;
                 const mixed = maybe || "fallback";
-                let booleanValue: boolean;
+                declare let booleanValue: boolean;
                 const booleanResult: true | string = booleanValue || "fallback";
             "#,
         );
@@ -33007,8 +33007,8 @@ mod tests {
     #[test]
     fn function_assignment_allows_ignored_return_values() {
         let parsed = parse_source_file(concat!(
-            "let consume: (value: string) => void; ",
-            "let produce: (value: string) => number; ",
+            "declare let consume: (value: string) => void; ",
+            "declare let produce: (value: string) => number; ",
             "produce = consume; ",
             "consume = produce;",
         ));
