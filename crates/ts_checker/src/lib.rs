@@ -9622,12 +9622,20 @@ impl<'a> Checker<'a> {
         };
         let original = self.current_symbol_type(subject);
         let narrowed = if let Some(asserted_type) = asserted_type {
-            let members = self
-                .union_members(original)
-                .into_iter()
-                .filter(|member| self.is_assignable(*member, asserted_type))
-                .collect::<Vec<_>>();
-            self.result.types.union(members)
+            // Asserting a type over any/unknown replaces it outright.
+            if matches!(
+                self.result.types.get(original).map(|type_| &type_.kind),
+                Some(TypeKind::Any | TypeKind::Unknown)
+            ) {
+                asserted_type
+            } else {
+                let members = self
+                    .union_members(original)
+                    .into_iter()
+                    .filter(|member| self.is_assignable(*member, asserted_type))
+                    .collect::<Vec<_>>();
+                self.result.types.union(members)
+            }
         } else {
             self.narrow_truthiness(original, true)
         };
