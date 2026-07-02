@@ -6509,16 +6509,16 @@ mod tests {
                 ..CompilerOptions::default()
             },
         );
-        // No TS2391 for ambient declarations, but default-on noImplicitAny
-        // still reports implicit-any returns (oracle-verified; the oracle
-        // additionally emits TS1046, which is not implemented yet).
+        // No TS2391 for ambient declarations; the missing modifier reports
+        // TS1046 and default-on noImplicitAny reports implicit-any returns
+        // (oracle-verified).
         assert_eq!(
             ambient
                 .diagnostics()
                 .iter()
                 .filter_map(|diagnostic| diagnostic.code)
                 .collect::<Vec<_>>(),
-            [7010, 7010]
+            [1046, 7010, 7010]
         );
     }
 

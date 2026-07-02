@@ -4293,6 +4293,7 @@ impl<'a> Checker<'a> {
             self.result.symbol_types.insert(symbol, type_id);
         }
         self.seed_symbol_types();
+        self.check_declaration_file_top_level_modifiers(source_file);
         let mut saw_return = false;
         self.check_node(source_file, None, &mut saw_return);
         self.check_unused_symbols();
@@ -4305,6 +4306,39 @@ impl<'a> Checker<'a> {
             &inferred_type_names,
         );
         self.result
+    }
+
+    /// TS1046: the first top-level runtime declaration in a .d.ts file
+    /// without a 'declare' or 'export' modifier, reported once per file.
+    fn check_declaration_file_top_level_modifiers(&mut self, source_file: NodeId) {
+        if !self.options.is_declaration_file {
+            return;
+        }
+        let Some(NodeData::SourceFile(file)) =
+            self.arena.get(source_file).map(|node| &node.data)
+        else {
+            return;
+        };
+        let statements = file.statements.nodes.clone();
+        for statement in statements {
+            let Some(node) = self.arena.get(statement) else {
+                continue;
+            };
+            let modifiers = match &node.data {
+                NodeData::FunctionDeclaration(data) => data.modifiers.clone(),
+                NodeData::ClassDeclaration(data) => data.modifiers.clone(),
+                NodeData::EnumDeclaration(data) => data.modifiers.clone(),
+                NodeData::ModuleDeclaration(data) => data.modifiers.clone(),
+                NodeData::VariableStatement(data) => data.modifiers.clone(),
+                _ => continue,
+            };
+            if !self.has_ast_modifier(modifiers.as_ref(), SyntaxKind::DeclareKeyword)
+                && !self.has_ast_modifier(modifiers.as_ref(), SyntaxKind::ExportKeyword)
+            {
+                self.error(statement, 1046, std::iter::empty());
+                return;
+            }
+        }
     }
 
     #[allow(clippy::too_many_lines)]
