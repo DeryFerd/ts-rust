@@ -318,6 +318,7 @@ impl TypeArena {
     }
 
     #[must_use]
+    #[allow(clippy::too_many_lines)] // Display dispatches over every type kind.
     pub fn display(&self, id: TypeId) -> String {
         match &self.types[id.index()].kind {
             TypeKind::Any => "any".into(),
@@ -2017,6 +2018,7 @@ impl<'a> ProgramChecker<'a> {
             })
     }
 
+    #[allow(clippy::too_many_lines)] // One resolution walk.
     fn module_export_is_const_enum_import_namespace_merge(
         &self,
         target: usize,
@@ -3071,6 +3073,7 @@ impl<'a> ProgramChecker<'a> {
         Some((paths.get(source)?.as_str(), paths.get(target)?.as_str()))
     }
 
+    #[allow(clippy::too_many_lines)] // One resolution walk.
     fn collect_import_runtime_meanings(
         &self,
         source_index: usize,
@@ -6549,6 +6552,7 @@ impl<'a> Checker<'a> {
         assignments
     }
 
+    #[allow(clippy::too_many_lines)] // One member walk.
     fn static_block_assignment_types(&mut self, members: &[NodeId]) -> BTreeMap<String, TypeId> {
         let class_members = members.iter().find_map(|member| {
             let parent = self.arena.get(*member)?.parent?;
@@ -7971,6 +7975,7 @@ impl<'a> Checker<'a> {
         }
     }
 
+    #[allow(clippy::too_many_lines)] // Class members are one unit.
     fn class_expression_type(&mut self, class: &ts_ast::ClassExpressionData) -> TypeId {
         let instance_members = class
             .members
@@ -8760,6 +8765,7 @@ impl<'a> Checker<'a> {
         Some(definitely_assigned)
     }
 
+    #[allow(clippy::too_many_lines)] // Statement dispatch.
     fn constructor_statement_states(
         &self,
         statement: NodeId,
@@ -11183,6 +11189,7 @@ impl<'a> Checker<'a> {
         }
     }
 
+    #[allow(clippy::too_many_lines)] // Scope resolution order is one unit.
     fn identifier_type(&mut self, node: NodeId, name: &str) -> TypeId {
         if name == "undefined" {
             return self.result.types.undefined();
@@ -12165,7 +12172,7 @@ impl<'a> Checker<'a> {
                     candidate,
                 )
             })
-            .min_by(|left, right| left.cmp(right))?;
+            .min_by(std::cmp::Ord::cmp)?;
         let threshold = 2.max(wanted.chars().count() / 3);
         (distance <= threshold).then(|| suggestion.clone())
     }
@@ -12674,6 +12681,7 @@ impl<'a> Checker<'a> {
             .find_map(|member| self.constructed_import_reference(*member))
     }
 
+    #[allow(clippy::too_many_lines)] // Explicit-argument forms are one unit.
     fn instantiate_explicit_call_signature(
         &mut self,
         expression: NodeId,
@@ -12825,7 +12833,7 @@ impl<'a> Checker<'a> {
         self.check_explicit_type_argument_constraints(
             argument_nodes,
             &arguments,
-            ordered_parameters.into_iter(),
+            ordered_parameters,
             &substitutions,
         );
         if substitutions.is_empty() {
@@ -13926,6 +13934,7 @@ impl<'a> Checker<'a> {
             })
     }
 
+    #[allow(clippy::too_many_lines)] // One inference walk.
     fn infer_signature_context_type(
         &self,
         pattern: TypeId,
@@ -14065,6 +14074,7 @@ impl<'a> Checker<'a> {
         result
     }
 
+    #[allow(clippy::too_many_lines)] // Relation dispatch.
     fn is_assignable_with_mapping_worker(
         &self,
         source: TypeId,
@@ -18674,6 +18684,7 @@ impl<'a> Checker<'a> {
     }
 
     #[allow(clippy::too_many_lines)]
+    #[allow(clippy::match_same_arms)] // Arm order documents the relation.
     fn is_assignable(&self, source: TypeId, target: TypeId) -> bool {
         if source == target || source == self.result.types.never() {
             return true;
@@ -20248,6 +20259,7 @@ impl<'a> Checker<'a> {
         }
     }
 
+    #[allow(clippy::too_many_lines)] // Elaboration dispatch.
     fn assignability_details(&self, actual: TypeId, expected: TypeId) -> Vec<String> {
         if let (
             Some(TypeKind::Object(source)),
@@ -20359,6 +20371,7 @@ impl<'a> Checker<'a> {
         Vec::new()
     }
 
+    #[allow(clippy::unused_self)] // Kept as a method beside its callers.
     fn type_not_assignable_detail(
         &self,
         indent: usize,
@@ -20379,6 +20392,7 @@ impl<'a> Checker<'a> {
         )
     }
 
+    #[allow(clippy::too_many_lines)] // Elaboration dispatch.
     fn signature_assignability_details(
         &self,
         source: &FunctionType,
@@ -20618,6 +20632,7 @@ impl<'a> Checker<'a> {
         Vec::new()
     }
 
+    #[allow(clippy::too_many_lines)] // Elaboration dispatch.
     fn signature_assignability_details_with_mapping(
         &self,
         source: &FunctionType,
@@ -20735,6 +20750,7 @@ impl<'a> Checker<'a> {
         Vec::new()
     }
 
+    #[allow(clippy::too_many_lines)] // Elaboration dispatch.
     fn assignability_details_with_mapping(
         &self,
         source: TypeId,
@@ -20969,6 +20985,7 @@ impl<'a> Checker<'a> {
         Vec::new()
     }
 
+    #[allow(clippy::match_same_arms)] // Arm order documents the walk.
     fn type_parameter_terminal_constraint(&self, type_id: TypeId) -> Option<TypeId> {
         let mut current = type_id;
         let mut visited = HashSet::new();
@@ -21024,6 +21041,7 @@ impl<'a> Checker<'a> {
             .join(" | ")
     }
 
+    #[allow(clippy::unused_self)] // Kept as a method beside its callers.
     fn signature_parameter_name(&self, signature: &FunctionType, index: usize) -> String {
         let name_index = if index < signature.parameters.len() {
             index
