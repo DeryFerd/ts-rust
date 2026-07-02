@@ -1746,8 +1746,8 @@ pub fn emit_source_file_with_context(
         printer.emit_reference_directives_between(0, start);
         printer.emit_leading_source_comments(start);
     }
-    if !(settings.module == ModuleKind::CommonJs && is_external_module)
-        && !preemit_class_expression_temps
+    if !(preemit_class_expression_temps
+        || settings.module == ModuleKind::CommonJs && is_external_module)
     {
         printer.prepare_source_class_expression_temps(source_file);
     }
@@ -2925,6 +2925,7 @@ fn source_needs_set_function_name_helper(arena: &NodeArena) -> bool {
     })
 }
 
+#[allow(clippy::too_many_lines)] // Auto-accessor scan stays in one pass.
 fn runtime_auto_accessor_storage_names(
     arena: &NodeArena,
     target: ScriptTarget,
@@ -3952,6 +3953,7 @@ fn class_member_is_constructor(arena: &NodeArena, member: NodeId) -> bool {
     )
 }
 
+#[allow(clippy::match_same_arms)] // Separate parents document decorator stops.
 fn decorator_is_direct_constructor_decorator(arena: &NodeArena, decorator: NodeId) -> bool {
     let mut current = decorator;
     while let Some(parent) = arena.get(current).and_then(|node| node.parent) {
@@ -6055,7 +6057,7 @@ impl DeclarationPrinter<'_> {
                         if index != 0 {
                             self.writer.write(", ");
                         }
-                        self.writer.write(&alias);
+                        self.writer.write(alias);
                         self.writer.write(" as ");
                         self.emit_name(*property)?;
                     }
@@ -8850,6 +8852,7 @@ impl DeclarationPrinter<'_> {
             })
     }
 
+    #[allow(clippy::too_many_lines)] // Constructor shape emission is one unit.
     fn emit_local_class_constructor_type(&mut self, class: NodeId) -> Result<(), EmitError> {
         let class_node = self.node(class)?.clone();
         let members = match &class_node.data {
@@ -8996,6 +8999,7 @@ impl DeclarationPrinter<'_> {
         }
     }
 
+    #[allow(clippy::too_many_lines)] // Synthetic base cases share state.
     fn emit_synthetic_base_type(
         &mut self,
         type_id: TypeId,
@@ -10976,6 +10980,7 @@ impl DeclarationPrinter<'_> {
         })
     }
 
+    #[allow(clippy::too_many_lines)] // Constraint search is one walk.
     fn returned_class_base_constraint_parameters(
         &self,
         function: &ts_ast::FunctionDeclarationData,
@@ -11079,23 +11084,25 @@ impl DeclarationPrinter<'_> {
                 let declarations = self
                     .resolve_entity_expression_symbol(query.expr_name)
                     .and_then(|symbol| self.bindings.symbols.get(symbol))
-                    .map(|symbol| symbol.declarations.clone())
-                    .unwrap_or_else(|| {
-                        let name = declaration_name_text(self.arena, query.expr_name);
-                        self.arena
-                            .iter()
-                            .filter_map(|(id, node)| {
-                                let NodeData::ClassDeclaration(class) = &node.data else {
-                                    return None;
-                                };
-                                (class
-                                    .name
-                                    .and_then(|name| declaration_name_text(self.arena, name))
-                                    == name)
-                                .then_some(id)
-                            })
-                            .collect()
-                    });
+                    .map_or_else(
+                        || {
+                            let name = declaration_name_text(self.arena, query.expr_name);
+                            self.arena
+                                .iter()
+                                .filter_map(|(id, node)| {
+                                    let NodeData::ClassDeclaration(class) = &node.data else {
+                                        return None;
+                                    };
+                                    (class
+                                        .name
+                                        .and_then(|name| declaration_name_text(self.arena, name))
+                                        == name)
+                                    .then_some(id)
+                                })
+                                .collect()
+                        },
+                        |symbol| symbol.declarations.clone(),
+                    );
                 declarations.iter().find_map(|declaration| {
                     let NodeData::ClassDeclaration(class) =
                         &self.arena.get(*declaration)?.data
@@ -13336,6 +13343,7 @@ impl DeclarationPrinter<'_> {
             .map(|_| expression)
     }
 
+    #[allow(clippy::too_many_lines)] // New-expression inference is one flow.
     fn local_class_new_expression_type(
         &self,
         initializer: NodeId,
@@ -15875,9 +15883,7 @@ impl DeclarationPrinter<'_> {
         let NodeData::ComputedPropertyName(computed) = &self.arena.get(name)?.data else {
             return None;
         };
-        if self.enum_member_type_expression(computed.expression).is_none() {
-            return None;
-        }
+        self.enum_member_type_expression(computed.expression)?;
         let symbol = self.resolve_entity_expression_symbol(computed.expression)?;
         let class = self.arena.get(member)?.parent?;
         let members = match &self.arena.get(class)?.data {
@@ -17031,6 +17037,7 @@ impl DeclarationPrinter<'_> {
         comments
     }
 
+    #[allow(clippy::never_loop)] // TODO: possible latent bug, verify against oracle
     fn has_internal_annotation(&self, node: NodeId) -> bool {
         if !self.strip_internal {
             return false;
@@ -21189,6 +21196,8 @@ impl DeclarationPrinter<'_> {
     }
 
     #[allow(clippy::too_many_lines)]
+    #[allow(clippy::similar_names)] // Accessor flags intentionally parallel.
+    #[allow(clippy::if_same_then_else)] // TODO: possible latent bug, verify against oracle
     fn emit_semantic_object_type_with_methods_and_order(
         &mut self,
         object: &ObjectType,
@@ -29228,6 +29237,7 @@ impl Printer<'_> {
         self.writer.write(helper);
     }
 
+    #[allow(clippy::too_many_lines)] // Private field planning is one pass.
     fn prepare_private_field_lowerings(&mut self) {
         let mut static_captures_by_scope = HashMap::<NodeId, HashSet<String>>::new();
         let mut classes = self
@@ -29505,7 +29515,7 @@ impl Printer<'_> {
                 .and_then(|name| declaration_name_text(self.arena, name));
             let use_inferred_prefix = !has_private_methods
                 || !self.class_expression_is_in_exported_declaration(class_id);
-            let prefix = explicit_name.or_else(|| {
+            let prefix = explicit_name.or({
                 if use_inferred_prefix {
                     inferred_name.as_deref()
                 } else {
@@ -30192,6 +30202,7 @@ impl Printer<'_> {
         self.normalize_private_capture_names();
     }
 
+    #[allow(clippy::too_many_lines)] // Capture renaming must see all plans.
     fn normalize_private_capture_names(&mut self) {
         let mut scopes = self
             .static_private_field_plans
@@ -30574,6 +30585,7 @@ impl Printer<'_> {
         Some((state, "m", Some(method.function_name.clone()), None))
     }
 
+    #[allow(clippy::too_many_lines)] // Destructuring rewrite scan is one walk.
     fn prepare_private_destructuring_rewrites(&mut self, body: NodeId) -> Vec<String> {
         self.private_destructuring_rewrites.clear();
         let mut candidates = self
@@ -31967,6 +31979,7 @@ impl Printer<'_> {
     }
 
     #[allow(clippy::too_many_lines)]
+    #[allow(clippy::if_not_else)] // Preserve generated setter branch order.
     fn emit_system_source_file(
         &mut self,
         source_file: NodeId,
@@ -36290,10 +36303,11 @@ impl Printer<'_> {
                     && self.has_modifier(data.modifiers.as_ref(), SyntaxKind::ExportKeyword)
                     && !self.has_modifier(data.modifiers.as_ref(), SyntaxKind::DefaultKeyword);
                 if !emitted_stage3_class_decorators && !needs_decorated_binding {
-                    if !lower_preserved_default && !lower_preserved_named {
-                        if preserved_default_name.is_none() {
-                            self.emit_runtime_declaration_modifiers(id, data.modifiers.as_ref());
-                        }
+                    if !lower_preserved_default
+                        && !lower_preserved_named
+                        && preserved_default_name.is_none()
+                    {
+                        self.emit_runtime_declaration_modifiers(id, data.modifiers.as_ref());
                     }
                     if !self.emit_class_declaration_static_blocks(
                         id,
@@ -36992,6 +37006,7 @@ impl Printer<'_> {
             == Some(statement)
     }
 
+    #[allow(clippy::similar_names)] // `last` and `list` mirror AST links.
     fn recovered_object_generator_parts(
         &self,
         binary: NodeId,
@@ -41215,6 +41230,7 @@ impl Printer<'_> {
         }
     }
 
+    #[allow(clippy::too_many_lines)] // Update-temp discovery is one walk.
     fn prepare_private_update_temps(
         &mut self,
         body: NodeId,
@@ -41271,9 +41287,7 @@ impl Printer<'_> {
                 else {
                     return None;
                 };
-                if self.active_private_update_state(access.name).is_none() {
-                    return None;
-                }
+                self.active_private_update_state(access.name)?;
                 let mut current = id;
                 while let Some(parent) = self.arena.get(current).and_then(|node| node.parent) {
                     if parent == body {
@@ -41439,6 +41453,7 @@ impl Printer<'_> {
         }
     }
 
+    #[allow(clippy::too_many_lines)] // Static-block planning is one pass.
     fn prepare_class_static_block_declaration_plan(
         &mut self,
         class_id: NodeId,
@@ -44938,6 +44953,7 @@ impl Printer<'_> {
     }
 
     #[allow(clippy::too_many_lines)]
+    #[allow(clippy::similar_names)] // Temp names reflect generated loop roles.
     fn emit_es5_generator_for_in_body(
         &mut self,
         _body: NodeId,
@@ -46724,19 +46740,19 @@ impl Printer<'_> {
 
         self.writer.indent -= 1;
         self.writer.write("});");
-        if !callback_is_indented {
-            self.writer.write(" });");
-        } else {
+        if callback_is_indented {
             self.writer.newline();
             self.writer.indent -= 1;
             self.writer.write("});");
+        } else {
+            self.writer.write(" });");
         }
-        if !compact_outer {
+        if compact_outer {
+            self.writer.write(" }");
+        } else {
             self.writer.newline();
             self.writer.indent -= 1;
             self.writer.write("}");
-        } else {
-            self.writer.write(" }");
         }
         self.es5_async_await_captures = previous_await_captures;
         self.es5_async_conditional_temps = previous_conditional_temps;
@@ -47410,10 +47426,9 @@ impl Printer<'_> {
             ),
             Some(NodeData::ExpressionStatement(_) | NodeData::VariableStatement(_)) => {
                 if let Some((_, object)) = self.es5_async_object_assignment(statement)
+                    && self.es5_async_object_await_count(object) != 0
                 {
-                    if self.es5_async_object_await_count(object) != 0 {
-                        objects.push(object);
-                    }
+                    objects.push(object);
                 }
             }
             Some(NodeData::ReturnStatement(statement)) => {
@@ -48196,16 +48211,16 @@ impl Printer<'_> {
                 case,
             );
         }
-        if let Some((left, object)) = self.es5_async_object_assignment(statement) {
-            if let Some(plan) = self.es5_async_object_plans.get(&object).cloned() {
-                return self.emit_es5_async_object_statement(
-                    object,
-                    &plan,
-                    Es5AsyncObjectSink::Assign(left),
-                    state,
-                    case,
-                );
-            }
+        if let Some((left, object)) = self.es5_async_object_assignment(statement)
+            && let Some(plan) = self.es5_async_object_plans.get(&object).cloned()
+        {
+            return self.emit_es5_async_object_statement(
+                object,
+                &plan,
+                Es5AsyncObjectSink::Assign(left),
+                state,
+                case,
+            );
         }
         if let NodeData::ReturnStatement(return_statement) = &node.data
             && let Some(expression) = return_statement.expression
@@ -53257,6 +53272,7 @@ impl Printer<'_> {
         self.emit_awaiter_call_with_parameters(body, expression_body, this_argument, None)
     }
 
+    #[allow(clippy::too_many_lines)] // Awaiter call emission is one template.
     fn emit_awaiter_call_with_parameters(
         &mut self,
         body: NodeId,
@@ -56439,6 +56455,7 @@ impl Printer<'_> {
         })
     }
 
+    #[allow(clippy::too_many_lines)] // Static block lowering is one sequence.
     fn emit_class_declaration_static_blocks(
         &mut self,
         class_id: NodeId,
@@ -56514,7 +56531,8 @@ impl Printer<'_> {
         let previous_defer_static_fields = self.defer_static_fields;
         self.defer_static_fields = true;
         let previous_static_private_field_plan = self.active_static_private_field_plan.clone();
-        self.active_static_private_field_plan = static_private_plan.clone();
+        self.active_static_private_field_plan
+            .clone_from(&static_private_plan);
         let class_name = data
             .name
             .and_then(|name| declaration_name_text(self.arena, name))
@@ -56580,7 +56598,8 @@ impl Printer<'_> {
         let previous_private_field_plan = self.active_private_field_plan.clone();
         self.active_private_field_plan = self.private_field_plan(data);
         let previous_private_method_plan = self.active_private_method_plan.clone();
-        self.active_private_method_plan = private_method_plan.clone();
+        self.active_private_method_plan
+            .clone_from(&private_method_plan);
         if let Some(static_private_plan) = &static_private_plan {
             for field in &static_private_plan.fields {
                 let field_name = self
@@ -56838,6 +56857,7 @@ impl Printer<'_> {
     }
 
     #[allow(clippy::too_many_lines)]
+    #[allow(clippy::if_same_then_else)] // TODO: possible latent bug, verify against oracle
     fn emit_class_with_name_worker(
         &mut self,
         data: &ts_ast::ClassDeclarationData,
@@ -57041,9 +57061,9 @@ impl Printer<'_> {
             let current_is_lowered_auto_accessor = matches!(
                 &node.data,
                 NodeData::PropertyDeclaration(property)
-                    if self.property_is_auto_accessor(property)
-                        && !(self.settings.target >= ScriptTarget::EsNext
-                            && !self.class_requires_assignment_field_lowering(data))
+                    if (self.class_requires_assignment_field_lowering(data)
+                        || self.settings.target < ScriptTarget::EsNext)
+                        && self.property_is_auto_accessor(property)
             );
             let current_is_inline_static_field = lower_fields
                 && self.settings.target >= ScriptTarget::Es2022
@@ -57071,13 +57091,14 @@ impl Printer<'_> {
             let current_emitted = !self.class_member_is_erased_abstract(&node)
                 && match &node.data {
                     NodeData::MethodDeclaration(method) => {
-                        method.body.is_some()
-                            && !(private_plan.is_some()
-                                && matches!(
-                                    self.arena.get(method.name).map(|name| &name.data),
-                                    Some(NodeData::PrivateIdentifier(_))
-                                ) && !self.private_name_is_reserved_constructor(method.name)
-                                    && !self.class_private_name_is_duplicate(data, method.name))
+                        (self.class_private_name_is_duplicate(data, method.name)
+                            || self.private_name_is_reserved_constructor(method.name)
+                            || !matches!(
+                                self.arena.get(method.name).map(|name| &name.data),
+                                Some(NodeData::PrivateIdentifier(_))
+                            )
+                            || private_plan.is_none())
+                            && method.body.is_some()
                     }
                     NodeData::PropertyDeclaration(property) => {
                         !self.has_modifier(
@@ -57617,6 +57638,7 @@ impl Printer<'_> {
             })
     }
 
+    #[allow(clippy::too_many_lines)] // Class member names need recovery cases.
     fn emit_class_member_name(
         &mut self,
         class: &ts_ast::ClassDeclarationData,
@@ -58151,6 +58173,7 @@ impl Printer<'_> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)] // Stage-3 accessor lowering is one template.
     fn emit_stage3_downlevel_auto_accessor_class(
         &mut self,
         data: &ts_ast::ClassDeclarationData,
@@ -59236,6 +59259,7 @@ impl Printer<'_> {
         false
     }
 
+    #[allow(clippy::too_many_lines)] // Native accessor emission keeps paired accessors together.
     fn emit_native_auto_accessor(
         &mut self,
         class: &ts_ast::ClassDeclarationData,
@@ -59580,16 +59604,16 @@ impl Printer<'_> {
 
     fn computed_property_expression_may_have_side_effects(&self, expression: NodeId) -> bool {
         let expression = self.unwrap_erased_expression(expression);
-        match self.arena.get(expression).map(|node| &node.data) {
+        !matches!(
+            self.arena.get(expression).map(|node| &node.data),
             Some(
                 NodeData::Identifier(_)
-                | NodeData::StringLiteral(_)
-                | NodeData::NumericLiteral(_)
-                | NodeData::NoSubstitutionTemplateLiteral(_)
-                | NodeData::KeywordExpression(_),
-            ) => false,
-            _ => true,
-        }
+                    | NodeData::StringLiteral(_)
+                    | NodeData::NumericLiteral(_)
+                    | NodeData::NoSubstitutionTemplateLiteral(_)
+                    | NodeData::KeywordExpression(_),
+            )
+        )
     }
 
     fn emit_unconsumed_class_expression_computed_property(
@@ -60120,6 +60144,7 @@ impl Printer<'_> {
         declarations
     }
 
+    #[allow(clippy::too_many_lines)] // Private method initializer order is one sequence.
     fn emit_private_method_initializers(
         &mut self,
         data: &ts_ast::ClassDeclarationData,
@@ -61488,26 +61513,25 @@ impl Printer<'_> {
                 ))
             .then_some(candidate.name)
         }) == Some(property.name);
-        let storages = (initialize && first_computed)
-            .then(|| {
-                class
-                    .members
-                    .nodes
-                    .iter()
-                    .filter_map(|member| {
-                        let NodeData::PropertyDeclaration(candidate) =
-                            &self.arena.get(*member)?.data
-                        else {
-                            return None;
-                        };
-                        (self.property_is_auto_accessor(candidate)
-                            && !self.property_is_static(candidate))
+        let storages = if initialize && first_computed {
+            class
+                .members
+                .nodes
+                .iter()
+                .filter_map(|member| {
+                    let NodeData::PropertyDeclaration(candidate) =
+                        &self.arena.get(*member)?.data
+                    else {
+                        return None;
+                    };
+                    (self.property_is_auto_accessor(candidate) && !self.property_is_static(candidate))
                         .then(|| self.auto_accessor_storage_name(class, candidate))
                         .flatten()
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::default()
+        };
         if !storages.is_empty() {
             self.writer.write("(");
             for storage in &storages {
@@ -62240,6 +62264,7 @@ impl Printer<'_> {
         result
     }
 
+    #[allow(clippy::too_many_lines)] // Instance field emission is one ordered template.
     fn emit_instance_fields(
         &mut self,
         data: &ts_ast::ClassDeclarationData,
@@ -64438,6 +64463,7 @@ impl Printer<'_> {
         })
     }
 
+    #[allow(clippy::too_many_lines)] // Export forms share writer state.
     fn emit_export(&mut self, data: &ts_ast::ExportDeclarationData) -> Result<(), EmitError> {
         if self.commonjs_module_transform {
             return self.emit_commonjs_export(data);
@@ -65455,6 +65481,7 @@ impl Printer<'_> {
             })
     }
 
+    #[allow(clippy::too_many_lines)] // CommonJS export initializer is one flow.
     fn emit_commonjs_export_variable_initializer(
         &mut self,
         statement: &ts_ast::VariableStatementData,
@@ -66984,11 +67011,7 @@ impl Printer<'_> {
         while let Some(parent) = self.arena.get(current).and_then(|node| node.parent) {
             match self.arena.get(parent).map(|node| &node.data) {
                 Some(NodeData::ClassStaticBlockDeclaration(_)) => return true,
-                Some(NodeData::ComputedPropertyName(_)) => {
-                    in_computed_property_name = true;
-                    current = parent;
-                    continue;
-                }
+                Some(NodeData::ComputedPropertyName(_)) => in_computed_property_name = true,
                 Some(NodeData::ClassDeclaration(_) | NodeData::ClassExpression(_))
                     if !in_computed_property_name =>
                 {
@@ -67008,6 +67031,7 @@ impl Printer<'_> {
         false
     }
 
+    #[allow(clippy::match_same_arms)] // Empty arms document transparent scopes.
     fn this_uses_lexical_alias(&self, this_id: NodeId) -> bool {
         let Some(scope) = self.this_alias_scope else {
             return true;
@@ -67077,10 +67101,9 @@ impl Printer<'_> {
         let Some(index) = block.statements.nodes.iter().position(|candidate| *candidate == statement) else {
             return false;
         };
-        let result = block.statements.nodes.get(index + 1).is_some_and(|next| {
+        block.statements.nodes.get(index + 1).is_some_and(|next| {
             self.break_is_recovered_static_block_await_label(*next)
-        });
-        result
+        })
     }
 
     fn statement_is_recovered_static_block_await_expression(&self, statement: NodeId) -> bool {
@@ -69115,15 +69138,16 @@ impl Printer<'_> {
                     }
                     self.writer.write("function ");
                     let downlevel_bindings = self.emit_es5_arrow_parameters(&data.parameters)?;
-                    let parameter_class_temps = self
+                    let parameter_class_temps = if self
                         .parameters_require_class_expression_temps(&data.parameters)
-                        .then(|| {
-                            self.prepare_parameter_class_expression_temps(
-                                &data.parameters,
-                                data.body,
-                            )
-                        })
-                        .unwrap_or_default();
+                    {
+                        self.prepare_parameter_class_expression_temps(
+                            &data.parameters,
+                            data.body,
+                        )
+                    } else {
+                        Vec::default()
+                    };
                     let downlevel_parameter_defaults = data.parameters.nodes.iter().any(|parameter| {
                         matches!(
                             self.arena.get(*parameter).map(|node| &node.data),
@@ -69234,14 +69258,11 @@ impl Printer<'_> {
                 for (_, _, temp) in &parameter_binding_overrides {
                     self.generated_names.used.insert(temp.clone());
                 }
-                let parameter_class_temps = parameter_classes_need_lowering
-                    .then(|| {
-                        self.prepare_parameter_class_expression_temps(
-                            &data.parameters,
-                            data.body,
-                        )
-                    })
-                    .unwrap_or_default();
+                let parameter_class_temps = if parameter_classes_need_lowering {
+                    self.prepare_parameter_class_expression_temps(&data.parameters, data.body)
+                } else {
+                    Vec::default()
+                };
                 let moved_parameter_defaults = parameter_classes_need_lowering
                     && data.parameters.nodes.iter().any(|parameter| {
                         matches!(
@@ -69653,6 +69674,7 @@ impl Printer<'_> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)] // Tagged-template emission includes all downlevel cases.
     fn emit_native_tagged_template(
         &mut self,
         id: NodeId,
@@ -71424,8 +71446,7 @@ impl Printer<'_> {
         let operator = self
             .arena
             .get(binary.operator_token)
-            .map(|operator| operator.kind)
-            .unwrap_or(SyntaxKind::EqualsToken);
+            .map_or(SyntaxKind::EqualsToken, |operator| operator.kind);
         if operator == SyntaxKind::EqualsToken
             && self.expression_value_is_discarded(expression)
             && let Some((property, is_element)) = self.direct_super_access(binary.left)
@@ -73461,6 +73482,7 @@ impl Printer<'_> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)] // Computed object literal lowering is one template.
     fn emit_es5_computed_object_literal(
         &mut self,
         object: NodeId,
@@ -73932,6 +73954,7 @@ impl Printer<'_> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)] // Object property emission dispatches by node kind.
     fn emit_object_property(&mut self, id: NodeId, node: &Node) -> Result<(), EmitError> {
         match &node.data {
             NodeData::PropertyAssignment(property) => {
@@ -76390,9 +76413,9 @@ mod tests {
 
     #[test]
     fn declaration_uses_semantic_order_for_inferred_binding_pattern_types() {
-        let declarations = emit_declarations_with_semantics(concat!(
+        let declarations = emit_declarations_with_semantics(
             "function foo({ value1, test1 = value1.test1, test2 = value1.test2 }) {}",
-        ));
+        );
         assert!(
             declarations.contains(concat!(
                 "{\n",
@@ -85887,6 +85910,7 @@ class Board {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // One fixture walk.
     fn declaration_emit_preserves_internal_namespace_export_context() {
         let visibility = emit_declarations_with_semantics(concat!(
             "namespace m {\n",

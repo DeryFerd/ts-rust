@@ -27588,6 +27588,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // One fixture walk.
     fn infers_auto_accessor_types_from_owning_class_writes() {
         let parsed = parse_source_file(
             r"
@@ -28370,7 +28371,7 @@ mod tests {
     #[test]
     fn infers_strict_function_variance_and_empty_readonly_arrays() {
         let parsed = parse_source_file(
-            r#"
+            r"
                 interface ReadonlyArray<T> { readonly [index: number]: T; }
                 declare function choose<T>(left: (x: T) => void, right: (x: T) => void): T;
                 declare function read<T>(values: ReadonlyArray<T>): T;
@@ -28378,7 +28379,7 @@ mod tests {
                 declare function string(x: string): void;
                 const selected = choose(object, string);
                 const empty = read([]);
-            "#,
+            ",
         );
         let bindings = bind_source_file(&parsed.arena, parsed.source_file);
         let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
@@ -28754,8 +28755,8 @@ mod tests {
         };
         let result = Checker::new(&parsed.arena, &bindings)
             .with_environment(
-                Default::default(),
-                Default::default(),
+                crate::HashMap::default(),
+                crate::HashMap::default(),
                 BTreeMap::from([("Omit".into(), omit)]),
             )
             .with_options(CheckerOptions {
@@ -31663,6 +31664,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // One fixture walk.
     fn imported_generic_static_method_substitutes_explicit_type_argument() {
         let value_promise =
             parse_source_file("export type Constructor<T> = (...args: any[]) => T;\n");
@@ -32369,12 +32371,12 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn preserves_reexported_constructor_reference_through_generic_intersection() {
         let generated = parse_source_file(
-            r#"
+            r"
                 export interface PrismaClientOptions { rejectOnNotFound?: any; }
                 export class PrismaClient<T extends PrismaClientOptions = PrismaClientOptions> {
                     private fetcher;
                 }
-            "#,
+            ",
         );
         let package = parse_source_file(r#"export * from ".prisma/client";"#);
         let consumer = parse_source_file(
@@ -33458,12 +33460,12 @@ mod tests {
     #[test]
     fn publishes_recursive_mapped_alias_descriptors_without_recursing() {
         let parsed = parse_source_file(
-            r#"
+            r"
                 interface A { a: A }
                 declare let a: A;
                 type Deep<T> = { [K in keyof T]: Deep<T[K]> };
                 declare function foo<T>(deep: Deep<T>): T;
-            "#,
+            ",
         );
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         let bindings = bind_source_file(&parsed.arena, parsed.source_file);

@@ -7449,10 +7449,11 @@ export function create() { return new M.Value(); }"#,
 
     #[test]
     fn checks_large_class_graphs_instead_of_failing_open() {
+        use std::fmt::Write as _;
         let fs = MemoryFileSystem::new(true);
         let mut source = format!("/*{}*/\n", "x".repeat(100_000));
         for index in 0..100 {
-            source.push_str(&format!("class C{index} {{}}\n"));
+            writeln!(source, "class C{index} {{}}").unwrap();
         }
         source.push_str("const value: string = 1;\n");
         fs.write_file("/large.ts", &source).unwrap();

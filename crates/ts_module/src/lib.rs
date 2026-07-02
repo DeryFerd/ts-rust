@@ -1239,12 +1239,12 @@ mod tests {
             ("/app/node_modules/pkg/types/index.d.ts", ""),
         ]);
         let resolver = Resolver::new(&fs, ResolutionOptions::default());
-        let resolved = resolver
+        let resolution = resolver
             .resolve("pkg", "/app/src/main.ts")
             .resolved
             .unwrap();
         assert_eq!(
-            resolved.resolved_file_name,
+            resolution.resolved_file_name,
             "/app/node_modules/pkg/types/index.d.ts"
         );
         assert_eq!(

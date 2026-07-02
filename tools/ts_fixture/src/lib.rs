@@ -391,7 +391,7 @@ pub fn run_upstream_diagnostic_baselines(
             }
             let expected = selected
                 .first()
-                .map(|path| fs::read_to_string(path))
+                .map(fs::read_to_string)
                 .transpose()?
                 .map_or_else(String::new, |baseline| {
                     parse_error_baseline_header(&baseline)

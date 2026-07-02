@@ -9933,6 +9933,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // One fixture walk.
     fn parses_arrow_postfix_aggregate_and_template_expressions() {
         let source = r"
             const f = (x: number): number => x + 1;
