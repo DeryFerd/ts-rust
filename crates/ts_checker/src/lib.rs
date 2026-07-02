@@ -5475,6 +5475,7 @@ impl<'a> Checker<'a> {
             }
             NodeData::IfStatement(data) => {
                 self.type_of_expression(data.expression);
+                self.check_constant_condition_expression(data.expression);
                 let before = self.flow_types.clone();
                 let then_narrowing = self.condition_narrowing(data.expression, true);
                 self.narrowings.push(then_narrowing);
@@ -10948,6 +10949,20 @@ impl<'a> Checker<'a> {
             .arena
             .get(data.operator_token)
             .map_or(SyntaxKind::Unknown, |node| node.kind);
+        if matches!(
+            operator,
+            SyntaxKind::BarBarToken | SyntaxKind::AmpersandAmpersandToken
+        ) {
+            self.check_constant_condition_expression(data.left);
+        }
+        if operator == SyntaxKind::QuestionQuestionToken
+            && matches!(
+                self.result.types.get(left).map(|type_| &type_.kind),
+                Some(TypeKind::Null | TypeKind::Undefined)
+            )
+        {
+            self.error(data.left, 2871, std::iter::empty());
+        }
         let assignment_target = (operator == SyntaxKind::EqualsToken)
             .then(|| self.assignment_target_type(data.left))
             .flatten()
@@ -14322,6 +14337,40 @@ impl<'a> Checker<'a> {
             &self.result.types.get(type_id).unwrap().kind,
             TypeKind::Union(members) if members.iter().any(|member| self.type_includes_undefined(*member))
         )
+    }
+
+    /// Reports TS2872/TS2873 for expressions whose syntactic kind fixes their
+    /// truthiness: literal objects, arrays, functions, and string literals.
+    /// Numeric and boolean literals stay exempt as common idioms.
+    fn check_constant_condition_expression(&mut self, expression: NodeId) {
+        let mut inner = expression;
+        while let Some(NodeData::ParenthesizedExpression(parenthesized)) =
+            self.arena.get(inner).map(|node| &node.data)
+        {
+            inner = parenthesized.expression;
+        }
+        let Some(node) = self.arena.get(inner) else {
+            return;
+        };
+        match &node.data {
+            NodeData::ObjectLiteralExpression(_)
+            | NodeData::ArrayLiteralExpression(_)
+            | NodeData::ArrowFunction(_)
+            | NodeData::FunctionExpression(_)
+            | NodeData::ClassExpression(_)
+            | NodeData::TemplateExpression(_)
+            | NodeData::RegularExpressionLiteral(_) => {
+                self.error(expression, 2872, std::iter::empty());
+            }
+            NodeData::StringLiteral(literal) => {
+                if literal.text.is_empty() {
+                    self.error(expression, 2873, std::iter::empty());
+                } else {
+                    self.error(expression, 2872, std::iter::empty());
+                }
+            }
+            _ => {}
+        }
     }
 
     fn type_without_undefined(&mut self, type_id: TypeId) -> TypeId {
@@ -30085,7 +30134,17 @@ mod tests {
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         let bindings = bind_source_file(&parsed.arena, parsed.source_file);
         let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
-        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        // Oracle-verified: the literal operands are always truthy or falsy.
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2872, 2872, 2873],
+            "{:?}",
+            result.diagnostics
+        );
         let root = bindings.root_scope().unwrap();
         let kind = |name: &str| {
             let symbol = root.symbols.get(name).unwrap();
