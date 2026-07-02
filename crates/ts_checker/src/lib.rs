@@ -10523,7 +10523,31 @@ impl<'a> Checker<'a> {
                 let receiver = if data.question_dot_token.is_some() {
                     self.non_nullish_type(receiver)
                 } else {
-                    receiver
+                    let (includes_null, includes_undefined) =
+                        self.type_includes_null_or_undefined(receiver);
+                    if self.options.strict_null_checks && (includes_null || includes_undefined) {
+                        let code_offset = match (includes_null, includes_undefined) {
+                            (true, false) => 0,
+                            (false, true) => 1,
+                            _ => 2,
+                        };
+                        if let Some(entity) = self.value_expression_text(data.expression) {
+                            self.error(data.expression, 18047 + code_offset, [entity]);
+                        } else {
+                            self.error(data.expression, 2531 + code_offset, std::iter::empty());
+                        }
+                        let remainder = self.non_nullish_type(receiver);
+                        if matches!(
+                            self.result.types.get(remainder).map(|type_| &type_.kind),
+                            Some(TypeKind::Never)
+                        ) {
+                            self.type_of_expression(data.argument_expression);
+                            return self.result.types.any();
+                        }
+                        remainder
+                    } else {
+                        receiver
+                    }
                 };
                 let canonical =
                     self.canonical_computed_key(data.argument_expression, &mut HashSet::new());
