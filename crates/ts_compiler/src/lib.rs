@@ -6509,10 +6509,16 @@ mod tests {
                 ..CompilerOptions::default()
             },
         );
-        assert!(
-            ambient.diagnostics().is_empty(),
-            "{:?}",
-            ambient.diagnostics()
+        // No TS2391 for ambient declarations, but default-on noImplicitAny
+        // still reports implicit-any returns (oracle-verified; the oracle
+        // additionally emits TS1046, which is not implemented yet).
+        assert_eq!(
+            ambient
+                .diagnostics()
+                .iter()
+                .filter_map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [7010, 7010]
         );
     }
 
@@ -9070,7 +9076,9 @@ export function create() { return new M.Value(); }"#,
                 .iter()
                 .filter_map(|diagnostic| diagnostic.code)
                 .collect::<Vec<_>>(),
-            [2322, 2345, 2322, 2345]
+            // Oracle-verified under default-on strict: the unassigned
+            // `promise` read adds TS2454.
+            [2322, 2345, 2322, 2454, 2345]
         );
     }
 
@@ -9176,7 +9184,11 @@ export function create() { return new M.Value(); }"#,
             "/project/tsconfig.json",
             r#"{
                 "files": ["main.ts"],
-                "compilerOptions": { "noLib": true, "exactOptionalPropertyTypes": true }
+                "compilerOptions": {
+                    "noLib": true,
+                    "strict": false,
+                    "exactOptionalPropertyTypes": true
+                }
             }"#,
         )
         .unwrap();
@@ -9464,7 +9476,9 @@ export function create() { return new M.Value(); }"#,
                 .iter()
                 .filter_map(|diagnostic| diagnostic.code)
                 .collect::<Vec<_>>(),
-            [2322, 2353, 2540, 2322]
+            // Oracle-verified: a single missing property reports TS2741
+            // rather than plain TS2322.
+            [2741, 2353, 2540, 2322]
         );
     }
 

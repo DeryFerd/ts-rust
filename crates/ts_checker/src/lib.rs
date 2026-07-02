@@ -11499,14 +11499,27 @@ impl<'a> Checker<'a> {
                     Some(TypeKind::Unknown)
                 )
             });
+        // A contextual return type still containing the callee's type
+        // parameters is an inference site: returns flow into inference
+        // instead of being checked, and the actual return type is inferred
+        // from the body. Explicit annotations are always checked.
+        let contextual_return_is_generic = data.type_.is_none()
+            && expected_return
+                .is_some_and(|expected| self.type_contains_type_parameter(expected));
         let mut return_type = if matches!(
             self.arena.get(data.body).map(|node| node.kind),
             Some(SyntaxKind::Block)
         ) {
             let mut saw_return = false;
-            self.check_node(data.body, expected_return, &mut saw_return);
+            let checked_return = if contextual_return_is_generic {
+                None
+            } else {
+                expected_return
+            };
+            self.check_node(data.body, checked_return, &mut saw_return);
             if let Some(expected_return) = expected_return
                 && !contextual_return_is_unknown
+                && !contextual_return_is_generic
             {
                 expected_return
             } else if saw_return {
@@ -11530,7 +11543,12 @@ impl<'a> Checker<'a> {
             let return_context = expected_return
                 .filter(|expected| !self.type_contains_type_parameter(*expected));
             let actual = self.type_of_expression_context(data.body, return_context);
-            if let Some(expected) = expected_return
+            let checked_return = if contextual_return_is_generic {
+                None
+            } else {
+                expected_return
+            };
+            if let Some(expected) = checked_return
                 && !self.is_assignable(actual, expected)
             {
                 self.assignability_error(data.body, actual, expected);
@@ -11746,6 +11764,9 @@ impl<'a> Checker<'a> {
                 contextual_signature
                     .as_ref()
                     .map(|signature| signature.return_type)
+                    // An uninferred type parameter in the contextual return is
+                    // an inference site; infer from the body instead.
+                    .filter(|return_type| !self.type_contains_type_parameter(*return_type))
             })
             .or_else(|| {
                 let returns = self
