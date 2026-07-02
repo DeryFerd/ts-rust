@@ -4050,6 +4050,12 @@ fn rewrite_named_descriptor_qualifier_matching(
     }
 }
 
+/// A literal property value used to discriminate a union context.
+enum DiscriminantValue {
+    String(String),
+    Number(String),
+}
+
 struct Checker<'a> {
     arena: &'a NodeArena,
     bindings: &'a BindResult,
@@ -4093,6 +4099,9 @@ struct Checker<'a> {
     /// enclosing assignability checks are suppressed for them, mirroring
     /// TypeScript's elaboration.
     reported_object_literals: HashSet<NodeId>,
+    /// Whether the function body currently being checked is async; return
+    /// expressions in async bodies are awaited before the return-type check.
+    async_bodies: Vec<bool>,
     this_types: Vec<TypeId>,
     super_types: Vec<TypeId>,
     class_value_stack: Vec<SymbolId>,
@@ -4192,6 +4201,7 @@ impl<'a> Checker<'a> {
             checked_overload_symbols: HashSet::new(),
             reported_unresolved_type_names: HashSet::new(),
             reported_object_literals: HashSet::new(),
+            async_bodies: Vec::new(),
             this_types: Vec::new(),
             super_types: Vec::new(),
             class_value_stack: Vec::new(),
@@ -5525,6 +5535,13 @@ impl<'a> Checker<'a> {
                         Some(expression) => self.type_of_expression(expression),
                         None => self.result.types.undefined(),
                     };
+                    // Async bodies may return either the value or a promise
+                    // of it; both sides of the check are already awaited.
+                    let actual = if self.async_bodies.last().copied().unwrap_or(false) {
+                        self.awaited_type(actual)
+                    } else {
+                        actual
+                    };
                     if !self.is_assignable(actual, expected) {
                         self.assignability_error(node_id, actual, expected);
                     }
@@ -5846,9 +5863,17 @@ impl<'a> Checker<'a> {
         let outer_definitely_assigned =
             std::mem::take(&mut self.definitely_assigned_symbols);
         self.local_scopes.push(local_scope);
+        let is_async = self.has_ast_modifier(data.modifiers.as_ref(), SyntaxKind::AsyncKeyword);
+        let checked_return = if is_async {
+            self.awaited_type(return_type)
+        } else {
+            return_type
+        };
         let mut saw_return = false;
         if let Some(body) = data.body {
-            self.check_node(body, Some(return_type), &mut saw_return);
+            self.async_bodies.push(is_async);
+            self.check_node(body, Some(checked_return), &mut saw_return);
+            self.async_bodies.pop();
         }
         self.local_scopes.pop();
         self.type_parameter_scopes.pop();
@@ -5859,7 +5884,7 @@ impl<'a> Checker<'a> {
             .is_some_and(|body| !self.statement_definitely_terminates(body));
         let requires_value_return = data.type_.is_some()
             && !matches!(
-                self.result.types.get(return_type).map(|value| &value.kind),
+                self.result.types.get(checked_return).map(|value| &value.kind),
                 Some(TypeKind::Any | TypeKind::Void | TypeKind::Undefined)
             );
         if has_implicit_return && requires_value_return {
@@ -7406,6 +7431,13 @@ impl<'a> Checker<'a> {
         object: &ts_ast::ObjectLiteralExpressionData,
         contextual_type: Option<TypeId>,
     ) -> ObjectType {
+        // A union context narrows to the member matched by the literal's
+        // discriminant properties, so excess-property and per-property checks
+        // run against the intended member.
+        let contextual_type = contextual_type.map(|type_id| {
+            self.discriminated_union_member(type_id, object)
+                .unwrap_or(type_id)
+        });
         let contextual_object =
             contextual_type.and_then(|type_id| self.contextual_object_type(type_id));
         let mut properties = BTreeMap::new();
@@ -8964,11 +8996,20 @@ impl<'a> Checker<'a> {
                         Some(node) => self.type_from_type_node(node),
                         None => self.result.types.any(),
                     };
+                    let is_async =
+                        self.has_ast_modifier(data.modifiers.as_ref(), SyntaxKind::AsyncKeyword);
+                    let return_type = if is_async {
+                        self.awaited_type(return_type)
+                    } else {
+                        return_type
+                    };
                     let local_scope = self.parameter_scope(&data.parameters.nodes);
                     self.local_scopes.push(local_scope);
                     let mut saw_return = false;
                     if let Some(body) = data.body {
+                        self.async_bodies.push(is_async);
                         self.check_node(body, Some(return_type), &mut saw_return);
+                        self.async_bodies.pop();
                     }
                     self.local_scopes.pop();
                 }
@@ -10453,12 +10494,21 @@ impl<'a> Checker<'a> {
             }
             NodeData::ElementAccessExpression(data) => {
                 let receiver = self.type_of_expression(data.expression);
+                let receiver = if data.question_dot_token.is_some() {
+                    self.non_nullish_type(receiver)
+                } else {
+                    receiver
+                };
                 let canonical =
                     self.canonical_computed_key(data.argument_expression, &mut HashSet::new());
                 if let Some((property, false)) = canonical
                     && let Some(value) = self.lookup_property_type(receiver, &property)
                 {
                     self.record_const_enum_access(node_id, receiver, value);
+                    if data.question_dot_token.is_some() {
+                        let undefined = self.result.types.undefined();
+                        return self.result.types.union([value, undefined]);
+                    }
                     return value;
                 }
                 if self.result.const_enum_types.contains(&receiver)
@@ -10476,6 +10526,10 @@ impl<'a> Checker<'a> {
                 let index = self.type_of_expression(data.argument_expression);
                 let value = self.element_access_type(data.argument_expression, receiver, index);
                 self.record_const_enum_access(node_id, receiver, value);
+                if data.question_dot_token.is_some() {
+                    let undefined = self.result.types.undefined();
+                    return self.result.types.union([value, undefined]);
+                }
                 value
             }
             NodeData::CallExpression(data) => {
@@ -10715,11 +10769,20 @@ impl<'a> Checker<'a> {
     }
 
     fn awaited_type(&mut self, type_id: TypeId) -> TypeId {
+        self.awaited_type_depth(type_id, 0)
+    }
+
+    fn awaited_type_depth(&mut self, type_id: TypeId, depth: usize) -> TypeId {
+        if depth > 16 {
+            return type_id;
+        }
+        // `Awaited<T>` instantiations that were not reduced structurally
+        // unwrap like promises: awaiting a non-thenable yields the value.
         if let Some(reference) = self.result.named_type_references.get(&type_id)
-            && reference.name == "Promise"
-            && let Some(awaited) = reference.type_arguments.first()
+            && matches!(reference.name.as_str(), "Promise" | "Awaited")
+            && let Some(awaited) = reference.type_arguments.first().copied()
         {
-            return *awaited;
+            return self.awaited_type_depth(awaited, depth + 1);
         }
         let Some(TypeKind::Union(members)) = self
             .result
@@ -10731,9 +10794,30 @@ impl<'a> Checker<'a> {
         };
         let awaited = members
             .into_iter()
-            .map(|member| self.awaited_type(member))
+            .map(|member| self.awaited_type_depth(member, depth + 1))
             .collect::<Vec<_>>();
         self.result.types.union(awaited)
+    }
+
+    /// Constructs `Promise<value>`, or returns the value unchanged when the
+    /// global Promise type is unavailable (for example without libraries).
+    fn promise_type(&mut self, value: TypeId) -> TypeId {
+        let Some(descriptor) = self.external_names.get("Promise").cloned() else {
+            return value;
+        };
+        let target = self.import_alias(&descriptor, &[value]);
+        let Some(kind) = self.result.types.get(target).map(|type_| type_.kind.clone()) else {
+            return value;
+        };
+        let promise = self.result.types.alloc(kind);
+        self.result.named_type_references.insert(
+            promise,
+            NamedTypeReference {
+                name: "Promise".into(),
+                type_arguments: vec![value],
+            },
+        );
+        promise
     }
 
     fn dynamic_import_module_type(
@@ -11584,6 +11668,7 @@ impl<'a> Checker<'a> {
         let contextual_return_is_generic = data.type_.is_none()
             && expected_return
                 .is_some_and(|expected| self.type_contains_type_parameter(expected));
+        let is_async = self.has_ast_modifier(data.modifiers.as_ref(), SyntaxKind::AsyncKeyword);
         let mut return_type = if matches!(
             self.arena.get(data.body).map(|node| node.kind),
             Some(SyntaxKind::Block)
@@ -11591,10 +11676,14 @@ impl<'a> Checker<'a> {
             let mut saw_return = false;
             let checked_return = if contextual_return_is_generic {
                 None
+            } else if is_async {
+                expected_return.map(|expected| self.awaited_type(expected))
             } else {
                 expected_return
             };
+            self.async_bodies.push(is_async);
             self.check_node(data.body, checked_return, &mut saw_return);
+            self.async_bodies.pop();
             if let Some(expected_return) = expected_return
                 && !contextual_return_is_unknown
                 && !contextual_return_is_generic
@@ -11609,27 +11698,50 @@ impl<'a> Checker<'a> {
                         self.widen_literal(type_id)
                     })
                     .collect::<Vec<_>>();
-                if return_types.is_empty() {
+                let inferred = if return_types.is_empty() {
                     self.result.types.any()
                 } else {
                     self.result.types.union(return_types)
+                };
+                if is_async {
+                    let awaited = self.awaited_type(inferred);
+                    self.promise_type(awaited)
+                } else {
+                    inferred
                 }
+            } else if is_async {
+                let void = self.result.types.void();
+                self.promise_type(void)
             } else {
                 self.result.types.void()
             }
         } else {
             let return_context = expected_return
-                .filter(|expected| !self.type_contains_type_parameter(*expected));
+                .filter(|expected| !self.type_contains_type_parameter(*expected))
+                .map(|expected| {
+                    if is_async {
+                        self.awaited_type(expected)
+                    } else {
+                        expected
+                    }
+                });
             let actual = self.type_of_expression_context(data.body, return_context);
+            let checked_actual = if is_async {
+                self.awaited_type(actual)
+            } else {
+                actual
+            };
             let checked_return = if contextual_return_is_generic {
                 None
+            } else if is_async {
+                expected_return.map(|expected| self.awaited_type(expected))
             } else {
                 expected_return
             };
             if let Some(expected) = checked_return
-                && !self.is_assignable(actual, expected)
+                && !self.is_assignable(checked_actual, expected)
             {
-                self.assignability_error(data.body, actual, expected);
+                self.assignability_error(data.body, checked_actual, expected);
             }
             if data.type_.is_none()
                 && (expected_return
@@ -11637,8 +11749,16 @@ impl<'a> Checker<'a> {
                     || contextual_return_is_unknown)
             {
                 self.widen_literal(actual)
+            } else if let Some(expected_return) = expected_return {
+                expected_return
             } else {
-                expected_return.unwrap_or_else(|| self.widen_literal(actual))
+                let widened = self.widen_literal(actual);
+                if is_async {
+                    let awaited = self.awaited_type(widened);
+                    self.promise_type(awaited)
+                } else {
+                    widened
+                }
             }
         };
         if data.type_.is_none() && expected_return.is_none() {
@@ -11835,6 +11955,7 @@ impl<'a> Checker<'a> {
         let outer_definitely_assigned =
             std::mem::take(&mut self.definitely_assigned_symbols);
         self.local_scopes.push(local_scope);
+        let is_async = self.has_ast_modifier(data.modifiers.as_ref(), SyntaxKind::AsyncKeyword);
         let return_type = data
             .type_
             .map(|node| self.type_from_type_node(node))
@@ -11859,17 +11980,35 @@ impl<'a> Checker<'a> {
                         }
                     })
                     .collect::<Vec<_>>();
-                (!returns.is_empty()).then(|| self.result.types.union(returns))
+                (!returns.is_empty()).then(|| {
+                    let inferred = self.result.types.union(returns);
+                    if is_async {
+                        let awaited = self.awaited_type(inferred);
+                        self.promise_type(awaited)
+                    } else {
+                        inferred
+                    }
+                })
             })
             .unwrap_or_else(|| {
                 if self.function_body_has_return(data.body) {
                     self.result.types.any()
+                } else if is_async {
+                    let void = self.result.types.void();
+                    self.promise_type(void)
                 } else {
                     self.result.types.void()
                 }
             });
+        let checked_return = if is_async {
+            self.awaited_type(return_type)
+        } else {
+            return_type
+        };
         let mut saw_return = false;
-        self.check_node(data.body, Some(return_type), &mut saw_return);
+        self.async_bodies.push(is_async);
+        self.check_node(data.body, Some(checked_return), &mut saw_return);
+        self.async_bodies.pop();
         self.local_scopes.pop();
         self.tracked_uninitialized_symbols = outer_tracked_uninitialized;
         self.definitely_assigned_symbols = outer_definitely_assigned;
@@ -15695,6 +15834,14 @@ impl<'a> Checker<'a> {
                         .unwrap_or_else(|| "function".into());
                     self.error(name_node, 5088, [name]);
                 }
+                let inferred = if self
+                    .has_ast_modifier(data.modifiers.as_ref(), SyntaxKind::AsyncKeyword)
+                {
+                    let awaited = self.awaited_type(inferred);
+                    self.promise_type(awaited)
+                } else {
+                    inferred
+                };
                 if let TypeKind::Function(signature) =
                     &mut self.result.types.types[function.index()].kind
                 {
@@ -18546,6 +18693,23 @@ impl<'a> Checker<'a> {
         if self.enum_types.contains(&target) {
             return false;
         }
+        // Promise-family types relate covariantly by their value argument;
+        // separately constructed instantiations are not structurally
+        // identical, so compare by name.
+        if let (Some(source_reference), Some(target_reference)) = (
+            self.result.named_type_references.get(&source),
+            self.result.named_type_references.get(&target),
+        ) && matches!(source_reference.name.as_str(), "Promise" | "PromiseLike")
+            && matches!(target_reference.name.as_str(), "Promise" | "PromiseLike")
+            && !(source_reference.name == "PromiseLike" && target_reference.name == "Promise")
+            && source_reference.type_arguments.len() == 1
+            && target_reference.type_arguments.len() == 1
+        {
+            return self.is_assignable(
+                source_reference.type_arguments[0],
+                target_reference.type_arguments[0],
+            );
+        }
         let source_kind = &self.result.types.get(source).unwrap().kind;
         let target_kind = &self.result.types.get(target).unwrap().kind;
         if matches!(
@@ -19624,6 +19788,99 @@ impl<'a> Checker<'a> {
             }
             _ => None,
         }
+    }
+
+    /// Selects the union member matched by the literal's literal-valued
+    /// discriminant properties, when exactly one member matches them all.
+    #[allow(clippy::too_many_lines)]
+    fn discriminated_union_member(
+        &mut self,
+        contextual_type: TypeId,
+        object: &ts_ast::ObjectLiteralExpressionData,
+    ) -> Option<TypeId> {
+        let TypeKind::Union(members) = self.result.types.get(contextual_type)?.kind.clone() else {
+            return None;
+        };
+        let mut discriminants = Vec::new();
+        for property in &object.properties.nodes {
+            let Some(NodeData::PropertyAssignment(data)) =
+                self.arena.get(*property).map(|node| &node.data)
+            else {
+                continue;
+            };
+            let initializer = match self.arena.get(data.initializer).map(|node| &node.data) {
+                Some(NodeData::StringLiteral(literal)) => {
+                    DiscriminantValue::String(literal.text.clone())
+                }
+                Some(NodeData::NumericLiteral(literal)) => {
+                    DiscriminantValue::Number(literal.text.clone())
+                }
+                _ => continue,
+            };
+            let name = data.name;
+            let Some(name) = self.object_literal_property_name(name) else {
+                continue;
+            };
+            discriminants.push((name, initializer));
+        }
+        // Only properties that some member types as a literal discriminate
+        // the union; other literal-valued properties are ordinary data.
+        discriminants.retain(|(name, _)| {
+            members.iter().any(|member| {
+                let Some(TypeKind::Object(member_object)) =
+                    self.result.types.get(*member).map(|type_| &type_.kind)
+                else {
+                    return false;
+                };
+                member_object.properties.get(name).is_some_and(|property| {
+                    matches!(
+                        self.result.types.get(*property).map(|type_| &type_.kind),
+                        Some(
+                            TypeKind::StringLiteral(_)
+                                | TypeKind::NumberLiteral(_)
+                                | TypeKind::BooleanLiteral(_)
+                        )
+                    )
+                })
+            })
+        });
+        if discriminants.is_empty() {
+            return None;
+        }
+        let mut matched = None;
+        for member in members {
+            let Some(TypeKind::Object(member_object)) =
+                self.result.types.get(member).map(|type_| &type_.kind)
+            else {
+                continue;
+            };
+            let matches_all = discriminants.iter().all(|(name, value)| {
+                member_object.properties.get(name).is_some_and(|property| {
+                    match (self.result.types.get(*property).map(|type_| &type_.kind), value) {
+                        (
+                            Some(TypeKind::StringLiteral(text)),
+                            DiscriminantValue::String(expected),
+                        ) => text == expected,
+                        (
+                            Some(TypeKind::NumberLiteral(number)),
+                            DiscriminantValue::Number(expected),
+                        ) => {
+                            expected.parse::<f64>().ok().is_some_and(|expected| {
+                                number.parse::<f64>().ok() == Some(expected)
+                            })
+                        }
+                        _ => false,
+                    }
+                })
+            });
+            if matches_all {
+                if matched.is_some() {
+                    return None;
+                }
+                matched = Some(member);
+            }
+        }
+        matched
     }
 
     fn object_literal_property_name(&mut self, node: NodeId) -> Option<String> {
