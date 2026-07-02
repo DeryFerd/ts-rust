@@ -7537,7 +7537,18 @@ impl<'a> Checker<'a> {
                             .reported_object_literals
                             .contains(&data.initializer)
                         {
-                            self.assignability_error(*property, actual, expected);
+                            // Optional properties report their declared type
+                            // without the optionality-injected undefined.
+                            let displayed_expected = if contextual_object
+                                .as_ref()
+                                .is_some_and(|object| {
+                                    object.optional_properties.contains(&contextual_name)
+                                }) {
+                                self.type_without_undefined(expected)
+                            } else {
+                                expected
+                            };
+                            self.assignability_error(*property, actual, displayed_expected);
                         }
                     }
                     if !properties.contains_key(&contextual_name) {
@@ -14313,6 +14324,28 @@ impl<'a> Checker<'a> {
         )
     }
 
+    fn type_without_undefined(&mut self, type_id: TypeId) -> TypeId {
+        let Some(TypeKind::Union(members)) =
+            self.result.types.get(type_id).map(|type_| type_.kind.clone())
+        else {
+            return type_id;
+        };
+        let remaining = members
+            .into_iter()
+            .filter(|member| {
+                !matches!(
+                    self.result.types.get(*member).map(|type_| &type_.kind),
+                    Some(TypeKind::Undefined)
+                )
+            })
+            .collect::<Vec<_>>();
+        if remaining.is_empty() {
+            type_id
+        } else {
+            self.result.types.union(remaining)
+        }
+    }
+
     fn type_includes_null_or_undefined(&self, type_id: TypeId) -> (bool, bool) {
         match self.result.types.get(type_id).map(|type_| &type_.kind) {
             Some(TypeKind::Null) => (true, false),
@@ -14996,6 +15029,25 @@ impl<'a> Checker<'a> {
                 matches!(
                     self.arena.get(alias.type_).map(|node| &node.data),
                     Some(NodeData::IndexedAccessTypeNode(_))
+                )
+            })
+        })
+    }
+
+    /// Aliases of `keyof` operators display as their resolved key union, not
+    /// by alias name, matching the oracle.
+    fn type_alias_is_keyof(&self, symbol: SymbolId) -> bool {
+        self.bindings.symbols.get(symbol).is_some_and(|symbol| {
+            symbol.declarations.iter().any(|declaration| {
+                let Some(NodeData::TypeAliasDeclaration(alias)) =
+                    self.arena.get(*declaration).map(|node| &node.data)
+                else {
+                    return false;
+                };
+                matches!(
+                    self.arena.get(alias.type_).map(|node| &node.data),
+                    Some(NodeData::TypeOperatorNode(operator))
+                        if operator.operator == SyntaxKind::KeyOfKeyword
                 )
             })
         })
@@ -17561,6 +17613,7 @@ impl<'a> Checker<'a> {
                 });
                 let indexed_mapped_alias =
                     symbol.is_some_and(|symbol| self.type_alias_is_indexed_access(symbol));
+                let keyof_alias = symbol.is_some_and(|symbol| self.type_alias_is_keyof(symbol));
                 let homomorphic_mapped_alias =
                     symbol.is_some_and(|symbol| self.type_alias_is_homomorphic_mapped(symbol));
                 let structurally_serialized_alias = symbol.is_some_and(|symbol| {
@@ -17674,7 +17727,8 @@ impl<'a> Checker<'a> {
                             | TypeKind::String
                             | TypeKind::BigInt
                     )
-                ) {
+                ) && !keyof_alias
+                {
                     self.diagnostic_type_names
                         .entry(type_id)
                         .or_insert(diagnostic_name.clone());
@@ -17685,6 +17739,7 @@ impl<'a> Checker<'a> {
                 }
                 if !conditional_alias
                     && !indexed_mapped_alias
+                    && !keyof_alias
                     && !structurally_serialized_alias
                     && !semantic_core_utility
                     && self.named_type_arguments_are_resolved_or_in_scope(&arguments)
@@ -17790,9 +17845,19 @@ impl<'a> Checker<'a> {
                     let keyed = self.keyof_type(operand);
                     let kind = self.result.types.get(keyed).unwrap().kind.clone();
                     let keyed = self.result.types.alloc(kind);
-                    let operand = self.diagnostic_type_display(operand);
-                    self.diagnostic_type_names
-                        .insert(keyed, format!("keyof {operand}"));
+                    // keyof over a named operand displays symbolically; over
+                    // an anonymous operand the resolved key union displays.
+                    let operand_is_named = self.diagnostic_type_names.contains_key(&operand)
+                        || self
+                            .result
+                            .named_type_references
+                            .get(&operand)
+                            .is_some_and(|reference| !reference.name.starts_with("__"));
+                    if operand_is_named {
+                        let operand = self.diagnostic_type_display(operand);
+                        self.diagnostic_type_names
+                            .insert(keyed, format!("keyof {operand}"));
+                    }
                     keyed
                 } else if data.operator == SyntaxKind::ReadonlyKeyword
                     && let Some(TypeKind::Array(element)) = self
@@ -20387,6 +20452,17 @@ impl<'a> Checker<'a> {
     }
 
     fn target_preserves_literal_diagnostics(&self, type_id: TypeId) -> bool {
+        // Enum targets report the literal source ('5' is not assignable to
+        // 'Level'), like literal targets. Named-reference clones share the
+        // kind but not the id, so compare kinds like enum assignability does.
+        if self.enum_types.contains(&type_id)
+            || self.enum_types.iter().any(|enum_type| {
+                self.result.types.get(*enum_type).map(|type_| &type_.kind)
+                    == self.result.types.get(type_id).map(|type_| &type_.kind)
+            })
+        {
+            return true;
+        }
         match self.result.types.get(type_id).map(|type_| &type_.kind) {
             Some(
                 TypeKind::Never
@@ -21222,8 +21298,16 @@ impl<'a> Checker<'a> {
             return name.clone();
         }
         if let Some(reference) = self.result.named_type_references.get(&type_id) {
+            // keyof over a named target displays symbolically (keyof Model);
+            // over an anonymous target the resolved key union displays.
             if reference.name == "__keyof"
                 && let [target] = reference.type_arguments.as_slice()
+                && (self.diagnostic_type_names.contains_key(target)
+                    || self
+                        .result
+                        .named_type_references
+                        .get(target)
+                        .is_some_and(|target| !target.name.starts_with("__")))
             {
                 return format!("keyof {}", self.diagnostic_type_display(*target));
             }
