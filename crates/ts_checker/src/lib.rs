@@ -12453,7 +12453,13 @@ impl<'a> Checker<'a> {
         name: &str,
         read: bool,
     ) -> Option<TypeId> {
-        let property = object.properties.get(name).copied()?;
+        let Some(property) = object.properties.get(name).copied() else {
+            // Index signatures cover names without a declared property.
+            return (name.parse::<f64>().is_ok())
+                .then_some(object.number_index_type)
+                .flatten()
+                .or(object.string_index_type);
+        };
         if read && object.optional_properties.contains(name) {
             let undefined = self.result.types.undefined();
             Some(self.result.types.union([property, undefined]))
@@ -15550,6 +15556,23 @@ impl<'a> Checker<'a> {
         name: &str,
         arguments: &[TypeId],
     ) -> Option<TypeId> {
+        if name == "Record" {
+            let [keys, value] = arguments else {
+                return None;
+            };
+            let literal_keys = self.literal_keys(*keys);
+            if literal_keys.is_empty() {
+                return self.instantiate_keyword_domain_mapped_type("__record_key", *keys, *value);
+            }
+            let mut object = ObjectType::default();
+            for (key, _) in literal_keys {
+                if !object.properties.contains_key(&key) {
+                    object.property_order.push(key.clone());
+                }
+                object.properties.insert(key, *value);
+            }
+            return Some(self.result.types.alloc(TypeKind::Object(object)));
+        }
         if name == "Pick" {
             let [source, selected] = arguments else {
                 return None;
@@ -15712,6 +15735,61 @@ impl<'a> Checker<'a> {
         Some(self.result.types.alloc(TypeKind::Object(object)))
     }
 
+    /// A keyword key domain produces an index signature instead of
+    /// enumerated properties: `{ [P in string]: V }` has a string index.
+    fn instantiate_keyword_domain_mapped_type(
+        &mut self,
+        parameter_name: &str,
+        constraint: TypeId,
+        value: TypeId,
+    ) -> Option<TypeId> {
+        let (string_domain, number_domain) =
+            match self.result.types.get(constraint).map(|type_| &type_.kind) {
+                Some(TypeKind::String) => (true, false),
+                Some(TypeKind::Number) => (false, true),
+                Some(TypeKind::Union(members)) => {
+                    let mut domains = (false, false);
+                    for member in members {
+                        match self.result.types.get(*member).map(|type_| &type_.kind) {
+                            Some(TypeKind::String) => domains.0 = true,
+                            Some(TypeKind::Number) => domains.1 = true,
+                            _ => {}
+                        }
+                    }
+                    domains
+                }
+                _ => (false, false),
+            };
+        if !string_domain && !number_domain {
+            return None;
+        }
+        let wanted = HashSet::from([parameter_name.to_owned()]);
+        let mut parameters = HashMap::<String, Vec<TypeId>>::new();
+        self.collect_named_type_parameters(value, &wanted, &mut parameters, &mut HashSet::new());
+        let mut object = ObjectType::default();
+        if string_domain {
+            let key = self.result.types.string();
+            let substitutions = parameters
+                .get(parameter_name)
+                .into_iter()
+                .flatten()
+                .map(|parameter| (*parameter, key))
+                .collect::<HashMap<_, _>>();
+            object.string_index_type = Some(self.substitute_type(value, &substitutions));
+        }
+        if number_domain {
+            let key = self.result.types.number();
+            let substitutions = parameters
+                .get(parameter_name)
+                .into_iter()
+                .flatten()
+                .map(|parameter| (*parameter, key))
+                .collect::<HashMap<_, _>>();
+            object.number_index_type = Some(self.substitute_type(value, &substitutions));
+        }
+        Some(self.result.types.alloc(TypeKind::Object(object)))
+    }
+
     fn instantiate_synthetic_mapped_type(
         &mut self,
         encoded: &str,
@@ -15726,7 +15804,11 @@ impl<'a> Checker<'a> {
         let name_type = arguments.get(2).copied();
         let mut keys = self.literal_keys(constraint);
         if keys.is_empty() {
-            return None;
+            return self.instantiate_keyword_domain_mapped_type(
+                parameter_name,
+                constraint,
+                value,
+            );
         }
         keys.sort_by(|(left, _), (right, _)| left.cmp(right));
         let wanted = HashSet::from([(*parameter_name).to_owned()]);
