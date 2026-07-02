@@ -20627,6 +20627,22 @@ impl<'a> Checker<'a> {
                 2,
             );
         }
+        // A failing union source elaborates its last failing member,
+        // which puts the blame on undefined/null tails as the oracle does.
+        if let Some(TypeKind::Union(members)) =
+            self.result.types.get(actual).map(|type_| &type_.kind)
+            && let Some(member) = members
+                .iter()
+                .rev()
+                .copied()
+                .find(|member| !self.is_assignable(*member, expected))
+        {
+            return vec![format!(
+                "  Type '{}' is not assignable to type '{}'.",
+                self.diagnostic_type_display(member),
+                self.diagnostic_type_display(expected)
+            )];
+        }
         let source_kind = self.result.types.get(actual).map(|type_| type_.kind.clone());
         let target_kind = self
             .result
