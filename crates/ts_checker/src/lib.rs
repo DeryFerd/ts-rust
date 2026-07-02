@@ -10324,6 +10324,29 @@ impl<'a> Checker<'a> {
             }
             NodeData::ClassExpression(data) => self.class_expression_type(data),
             NodeData::ArrayLiteralExpression(data) => {
+                // A union context (for example `[K, V][] | null | undefined`)
+                // contributes its single array-like member.
+                let contextual_type = contextual_type.map(|type_id| {
+                    let TypeKind::Union(members) =
+                        &self.result.types.get(type_id).expect("type exists").kind
+                    else {
+                        return type_id;
+                    };
+                    let mut array_like = members.iter().copied().filter(|member| {
+                        matches!(
+                            self.result.types.get(*member).map(|type_| &type_.kind),
+                            Some(
+                                TypeKind::Array(_)
+                                    | TypeKind::Tuple(_)
+                                    | TypeKind::ReadonlyTuple(_)
+                            )
+                        )
+                    });
+                    match (array_like.next(), array_like.next()) {
+                        (Some(member), None) => member,
+                        _ => type_id,
+                    }
+                });
                 let expected_tuple = contextual_type.and_then(|type_id| {
                     match &self.result.types.get(type_id)?.kind {
                         TypeKind::Tuple(elements) | TypeKind::ReadonlyTuple(elements) => {
@@ -10349,7 +10372,10 @@ impl<'a> Checker<'a> {
                         .copied()
                         .or(expected_element);
                     let actual = self.type_of_expression_context(*element, expected);
+                    // Contexts still carrying uninferred type parameters are
+                    // inference sites, not checks.
                     if let Some(expected) = expected
+                        && !self.type_contains_type_parameter(expected)
                         && !self.is_assignable(actual, expected)
                     {
                         self.assignability_error(*element, actual, expected);
@@ -10367,13 +10393,21 @@ impl<'a> Checker<'a> {
                     });
                 }
                 if let Some(expected) = expected_tuple {
-                    if expected.len() == element_types.len() {
+                    // Contexts still carrying uninferred type parameters are
+                    // inference sites; the literal keeps its element types.
+                    if expected.len() == element_types.len()
+                        && !expected
+                            .iter()
+                            .any(|element| self.type_contains_type_parameter(*element))
+                    {
                         self.result.types.alloc(TypeKind::Tuple(expected))
                     } else {
                         self.result.types.alloc(TypeKind::Tuple(element_types))
                     }
                 } else {
-                    let element = expected_element.unwrap_or_else(|| {
+                    let element = expected_element
+                        .filter(|element| !self.type_contains_type_parameter(*element))
+                        .unwrap_or_else(|| {
                         if element_types.is_empty() {
                             if self.options.strict_null_checks {
                                 self.result.types.never()
@@ -12761,41 +12795,79 @@ impl<'a> Checker<'a> {
     }
 
     /// Substitutes explicit type arguments through a constructor value's
-    /// generic construct signature; other shapes defer to the call path.
+    /// generic construct signatures. Signatures whose type-parameter arity
+    /// cannot accept the arguments (such as the non-generic `new ()`
+    /// overloads that precede generic ones in the libraries) are dropped so
+    /// overload selection cannot pick them; other shapes defer to the call
+    /// path.
     fn instantiate_explicit_construct_signature(
         &mut self,
         expression: NodeId,
         callee: TypeId,
         argument_nodes: &[NodeId],
     ) -> TypeId {
-        let construct_parameters = match self.result.types.get(callee).map(|type_| &type_.kind) {
-            Some(TypeKind::Object(object)) => object
-                .construct_signatures
-                .iter()
-                .map(|signature| signature.type_parameters.clone())
-                .find(|parameters| !parameters.is_empty()),
-            _ => None,
-        };
-        let Some(parameters) = construct_parameters else {
-            return self.instantiate_explicit_call_signature(expression, callee, argument_nodes);
+        let object = match self.result.types.get(callee).map(|type_| &type_.kind) {
+            Some(TypeKind::Object(object))
+                if object
+                    .construct_signatures
+                    .iter()
+                    .any(|signature| !signature.type_parameters.is_empty()) =>
+            {
+                object.clone()
+            }
+            _ => {
+                return self.instantiate_explicit_call_signature(
+                    expression,
+                    callee,
+                    argument_nodes,
+                );
+            }
         };
         let arguments = argument_nodes
             .iter()
             .map(|argument| self.type_from_type_node(*argument))
             .collect::<Vec<_>>();
-        self.check_explicit_type_argument_count(
-            argument_nodes.first().copied().unwrap_or(expression),
-            &parameters,
-            argument_nodes.len(),
-        );
-        let substitutions = self.explicit_type_argument_substitutions(&parameters, &arguments);
-        self.check_explicit_type_argument_constraints(
-            argument_nodes,
-            &arguments,
-            parameters.iter().map(std::slice::from_ref),
-            &substitutions,
-        );
-        self.substitute_type(callee, &substitutions)
+        let matching = object
+            .construct_signatures
+            .iter()
+            .filter(|signature| {
+                let minimum = self.minimum_type_argument_count(&signature.type_parameters);
+                argument_nodes.len() >= minimum
+                    && argument_nodes.len() <= signature.type_parameters.len()
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if matching.is_empty() {
+            let parameters = object
+                .construct_signatures
+                .iter()
+                .map(|signature| signature.type_parameters.clone())
+                .max_by_key(Vec::len)
+                .unwrap_or_default();
+            self.check_explicit_type_argument_count(
+                argument_nodes.first().copied().unwrap_or(expression),
+                &parameters,
+                argument_nodes.len(),
+            );
+            return callee;
+        }
+        let mut instantiated = Vec::with_capacity(matching.len());
+        for (index, signature) in matching.into_iter().enumerate() {
+            let substitutions = self
+                .explicit_type_argument_substitutions(&signature.type_parameters, &arguments);
+            if index == 0 {
+                self.check_explicit_type_argument_constraints(
+                    argument_nodes,
+                    &arguments,
+                    signature.type_parameters.iter().map(std::slice::from_ref),
+                    &substitutions,
+                );
+            }
+            instantiated.push(self.substitute_signature(signature, &substitutions));
+        }
+        let mut object = object;
+        object.construct_signatures = instantiated;
+        self.result.types.alloc(TypeKind::Object(object))
     }
 
     #[allow(clippy::too_many_lines)] // Explicit-argument forms are one unit.
@@ -13385,9 +13457,41 @@ impl<'a> Checker<'a> {
                         InferenceVariance::Covariant,
                     );
                     let expected = self.substitute_type(parameter, &inference);
+                    let mut actual = *actual;
+                    // Literal arguments retype under this candidate's
+                    // parameter context (shaping array literals into
+                    // tuples for inference); failed candidates roll their
+                    // diagnostics back.
+                    if self.type_contains_type_parameter(expected)
+                        && matches!(
+                            arguments.get(index).and_then(|argument| {
+                                self.arena.get(*argument).map(|node| &node.data)
+                            }),
+                            Some(
+                                NodeData::ArrayLiteralExpression(_)
+                                    | NodeData::ObjectLiteralExpression(_)
+                            )
+                        )
+                        && let Some(argument) = arguments.get(index).copied()
+                    {
+                        let diagnostics_before = self.result.diagnostics.len();
+                        self.clear_cached_expression_types(argument);
+                        let retyped =
+                            self.type_of_expression_context(argument, Some(expected));
+                        self.result.diagnostics.truncate(diagnostics_before);
+                        self.infer_type_parameters(
+                            parameter,
+                            retyped,
+                            &mut inference,
+                            &mut inference_context,
+                            InferenceVariance::Covariant,
+                        );
+                        actual = retyped;
+                    }
+                    let expected = self.substitute_type(parameter, &inference);
                     if (self.function_type_requires_predicate(expected)
-                        && !self.function_type_returns_predicate(*actual))
-                        || !self.is_assignable(*actual, expected)
+                        && !self.function_type_returns_predicate(actual))
+                        || !self.is_assignable(actual, expected)
                     {
                         return None;
                     }
