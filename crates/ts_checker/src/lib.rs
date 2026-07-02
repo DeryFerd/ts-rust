@@ -10750,7 +10750,24 @@ impl<'a> Checker<'a> {
                 let callee = if data.question_dot_token.is_some() {
                     self.non_nullish_type(callee)
                 } else {
-                    callee
+                    let (includes_null, includes_undefined) =
+                        self.type_includes_null_or_undefined(callee);
+                    if self.options.strict_null_checks && (includes_null || includes_undefined) {
+                        let remainder = self.non_nullish_type(callee);
+                        if self.type_is_callable(remainder) {
+                            let code = match (includes_null, includes_undefined) {
+                                (true, false) => 2721,
+                                (false, true) => 2722,
+                                _ => 2723,
+                            };
+                            self.error(data.expression, code, std::iter::empty());
+                            remainder
+                        } else {
+                            callee
+                        }
+                    } else {
+                        callee
+                    }
                 };
                 let callee = data.type_arguments.as_ref().map_or(callee, |arguments| {
                     self.instantiate_explicit_call_signature(
