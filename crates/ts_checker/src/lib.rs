@@ -5358,7 +5358,24 @@ impl<'a> Checker<'a> {
                         .initializer
                         .is_none_or(|node| !self.reported_object_literals.contains(&node))
                 {
-                    self.assignability_error(node_id, actual, expected);
+                    let fresh_const_array = data
+                        .initializer
+                        .is_some_and(|node| self.expression_is_fresh_const_array(node));
+                    if fresh_const_array
+                        && self.readonly_to_mutable_mismatch(actual, expected)
+                    {
+                        // Fresh as-const arrays assign to mutable targets.
+                    } else if fresh_const_array
+                        && data.initializer.is_some_and(|node| {
+                            self.report_fresh_const_array_element_mismatches(
+                                node, actual, expected,
+                            )
+                        })
+                    {
+                        // Element-level diagnostics are the elaboration.
+                    } else {
+                        self.assignability_error(node_id, actual, expected);
+                    }
                 }
                 // The initializer starts the control-flow type for wider
                 // declarations, matching assignment narrowing.
@@ -11084,7 +11101,10 @@ impl<'a> Checker<'a> {
                 .get(&symbol)
                 .copied()
                 .unwrap_or(left);
-            if !self.is_assignable(right, declared) {
+            if !self.is_assignable(right, declared)
+                && !(self.expression_is_fresh_const_array(data.right)
+                    && self.readonly_to_mutable_mismatch(right, declared))
+            {
                 self.assignability_error(node_id, right, declared);
             }
             if matches!(
@@ -13662,6 +13682,8 @@ impl<'a> Checker<'a> {
             if !deferred_active_class_value
                 && !self.reported_object_literals.contains(argument)
                 && !self.is_assignable(checked_actual, expected)
+                && !(self.expression_is_fresh_const_array(*argument)
+                    && self.readonly_to_mutable_mismatch(checked_actual, expected))
             {
                 // A fresh object literal reports property-level diagnostics
                 // against the instantiated parameter type; re-type it when
@@ -13680,7 +13702,11 @@ impl<'a> Checker<'a> {
                     reported_in_literal = self.result.diagnostics.len() > diagnostics_before;
                 }
                 if !reported_in_literal {
-                    if self
+                    if self.readonly_to_mutable_mismatch(checked_actual, expected) {
+                        let actual_display = self.diagnostic_type_display(checked_actual);
+                        let expected_display = self.diagnostic_type_display(expected);
+                        self.error(*argument, 4104, [actual_display, expected_display]);
+                    } else if self
                         .single_missing_required_property(checked_actual, expected)
                         .is_some()
                     {
@@ -17795,7 +17821,17 @@ impl<'a> Checker<'a> {
                         .and_then(|arguments| arguments.nodes.first())
                 {
                     let element = self.type_from_type_node(*argument);
-                    return self.result.types.alloc(TypeKind::Array(element));
+                    let array = self.result.types.alloc(TypeKind::Array(element));
+                    if name == "ReadonlyArray" {
+                        self.result.named_type_references.insert(
+                            array,
+                            NamedTypeReference {
+                                name: "__readonly_array".into(),
+                                type_arguments: vec![element],
+                            },
+                        );
+                    }
+                    return array;
                 }
                 let arguments = data
                     .type_arguments
@@ -19207,6 +19243,131 @@ impl<'a> Checker<'a> {
         false
     }
 
+    /// A fresh `[...] as const` expression assigns to mutable array targets;
+    /// only readonly values that flowed through a binding are rejected.
+    fn expression_is_fresh_const_array(&self, node: NodeId) -> bool {
+        let Some(NodeData::AsExpression(as_expression)) =
+            self.arena.get(node).map(|node| &node.data)
+        else {
+            return false;
+        };
+        matches!(
+            self.arena.get(as_expression.expression).map(|node| &node.data),
+            Some(NodeData::ArrayLiteralExpression(_))
+        ) && self.type_node_is_const_reference(as_expression.type_)
+    }
+
+    /// Reports element-level mismatches inside a fresh `as const` array
+    /// against an array-like target, as the oracle elaborates; returns
+    /// whether anything was reported.
+    fn report_fresh_const_array_element_mismatches(
+        &mut self,
+        initializer: NodeId,
+        actual: TypeId,
+        expected: TypeId,
+    ) -> bool {
+        let Some(NodeData::AsExpression(as_expression)) =
+            self.arena.get(initializer).map(|node| &node.data)
+        else {
+            return false;
+        };
+        let Some(NodeData::ArrayLiteralExpression(array)) =
+            self.arena.get(as_expression.expression).map(|node| &node.data)
+        else {
+            return false;
+        };
+        let element_nodes = array.elements.nodes.clone();
+        let Some(TypeKind::Tuple(elements) | TypeKind::ReadonlyTuple(elements)) = self
+            .result
+            .types
+            .get(actual)
+            .map(|type_| type_.kind.clone())
+        else {
+            return false;
+        };
+        let expected_kind = self
+            .result
+            .types
+            .get(expected)
+            .map(|type_| type_.kind.clone());
+        let mut reported = false;
+        for (index, node) in element_nodes.iter().enumerate() {
+            let Some(actual_element) = elements.get(index).copied() else {
+                continue;
+            };
+            let expected_element = match &expected_kind {
+                Some(TypeKind::Array(element)) => Some(*element),
+                Some(TypeKind::Tuple(elements) | TypeKind::ReadonlyTuple(elements)) => {
+                    elements.get(index).copied()
+                }
+                _ => None,
+            };
+            let Some(expected_element) = expected_element else {
+                continue;
+            };
+            if !self.is_assignable(actual_element, expected_element) {
+                // Const-context literals stay non-widening for checking, but
+                // the report shows the base type like the oracle.
+                let displayed = match self
+                    .result
+                    .types
+                    .get(actual_element)
+                    .map(|type_| &type_.kind)
+                {
+                    Some(TypeKind::NumberLiteral(_)) => self.result.types.number(),
+                    Some(TypeKind::StringLiteral(_)) => self.result.types.string(),
+                    Some(TypeKind::BooleanLiteral(_)) => self.result.types.boolean(),
+                    Some(TypeKind::BigIntLiteral(_)) => self.result.types.bigint(),
+                    _ => actual_element,
+                };
+                self.assignability_error(*node, displayed, expected_element);
+                reported = true;
+            }
+        }
+        reported
+    }
+
+    fn is_readonly_array(&self, type_id: TypeId) -> bool {
+        self.result
+            .named_type_references
+            .get(&type_id)
+            .is_some_and(|reference| reference.name == "__readonly_array")
+    }
+
+    /// The element domain of an array-like: arrays yield their element,
+    /// tuples the union view of their members.
+    fn array_like_elements(&self, type_id: TypeId) -> Option<Vec<TypeId>> {
+        match self.result.types.get(type_id).map(|type_| &type_.kind) {
+            Some(TypeKind::Array(element)) => Some(vec![*element]),
+            Some(TypeKind::Tuple(elements) | TypeKind::ReadonlyTuple(elements)) => {
+                Some(elements.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// A readonly source assigned to a mutable array target reports TS4104
+    /// when the elements are otherwise compatible.
+    fn readonly_to_mutable_mismatch(&self, source: TypeId, target: TypeId) -> bool {
+        let source_readonly = matches!(
+            self.result.types.get(source).map(|type_| &type_.kind),
+            Some(TypeKind::ReadonlyTuple(_))
+        ) || self.is_readonly_array(source);
+        if !source_readonly || self.is_readonly_array(target) {
+            return false;
+        }
+        let Some(TypeKind::Array(target_element)) =
+            self.result.types.get(target).map(|type_| &type_.kind)
+        else {
+            return false;
+        };
+        self.array_like_elements(source).is_some_and(|elements| {
+            elements
+                .iter()
+                .all(|element| self.is_assignable(*element, *target_element))
+        })
+    }
+
     #[allow(clippy::match_same_arms)] // Arm order documents the relation.
     fn is_assignable(&self, source: TypeId, target: TypeId) -> bool {
         if source == target || source == self.result.types.never() {
@@ -19267,6 +19428,23 @@ impl<'a> Checker<'a> {
                     }
                 }
                 _ => {}
+            }
+        }
+        // Readonly array targets accept any array-like with assignable
+        // elements; mutable array targets reject readonly sources.
+        if let Some(TypeKind::Array(target_element)) =
+            self.result.types.get(target).map(|type_| &type_.kind)
+        {
+            let target_element = *target_element;
+            if self.is_readonly_array(target)
+                && let Some(elements) = self.array_like_elements(source)
+            {
+                return elements
+                    .iter()
+                    .all(|element| self.is_assignable(*element, target_element));
+            }
+            if !self.is_readonly_array(target) && self.is_readonly_array(source) {
+                return false;
             }
         }
         // Promise-family types relate covariantly by their value argument;
@@ -20705,6 +20883,12 @@ impl<'a> Checker<'a> {
     }
 
     fn assignability_error(&mut self, node: NodeId, actual: TypeId, expected: TypeId) {
+        if self.readonly_to_mutable_mismatch(actual, expected) {
+            let actual_display = self.diagnostic_type_display(actual);
+            let expected_display = self.diagnostic_type_display(expected);
+            self.error(node, 4104, [actual_display, expected_display]);
+            return;
+        }
         if let Some(property) = self.single_missing_required_property(actual, expected) {
             let displayed_actual = self.diagnostic_source_type(actual, expected);
             self.error(
@@ -21672,6 +21856,11 @@ impl<'a> Checker<'a> {
             return name.clone();
         }
         if let Some(reference) = self.result.named_type_references.get(&type_id) {
+            if reference.name == "__readonly_array"
+                && let [element] = reference.type_arguments.as_slice()
+            {
+                return format!("readonly {}[]", self.diagnostic_type_display(*element));
+            }
             // keyof over a named target displays symbolically (keyof Model);
             // over an anonymous target the resolved key union displays.
             if reference.name == "__keyof"
