@@ -542,3 +542,30 @@ fn pretty_formats_diagnostics() {
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.windows(2).any(|bytes| bytes == b"\x1b["));
 }
+
+#[test]
+fn semantic_parity_corpus_matches_oracle() {
+    let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/semantic-parity");
+    let mut names = fs::read_dir(&corpus)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.ends_with(".ts"))
+        .collect::<Vec<_>>();
+    names.sort();
+    assert!(!names.is_empty());
+    let directory = TestDirectory::new("semantic-parity");
+    for name in names {
+        fs::copy(corpus.join(&name), directory.0.join(&name)).unwrap();
+        assert_matches_oracle(
+            &directory.0,
+            &[
+                &name,
+                "--ignoreConfig",
+                "--noEmit",
+                "--strict",
+                "--pretty",
+                "false",
+            ],
+        );
+    }
+}

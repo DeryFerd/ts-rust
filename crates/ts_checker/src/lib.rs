@@ -425,7 +425,7 @@ impl TypeArena {
                 {
                     self.display_function_signature(signature, true)
                 } else if members.is_empty() {
-                    "{  }".into()
+                    "{}".into()
                 } else {
                     format!("{{ {}; }}", members.join("; "))
                 }
@@ -4089,6 +4089,10 @@ struct Checker<'a> {
     enum_types: BTreeSet<TypeId>,
     checked_overload_symbols: HashSet<SymbolId>,
     reported_unresolved_type_names: HashSet<NodeId>,
+    /// Object literals whose contextual typing already reported diagnostics;
+    /// enclosing assignability checks are suppressed for them, mirroring
+    /// TypeScript's elaboration.
+    reported_object_literals: HashSet<NodeId>,
     this_types: Vec<TypeId>,
     super_types: Vec<TypeId>,
     class_value_stack: Vec<SymbolId>,
@@ -4187,6 +4191,7 @@ impl<'a> Checker<'a> {
             enum_types: BTreeSet::new(),
             checked_overload_symbols: HashSet::new(),
             reported_unresolved_type_names: HashSet::new(),
+            reported_object_literals: HashSet::new(),
             this_types: Vec::new(),
             super_types: Vec::new(),
             class_value_stack: Vec::new(),
@@ -5299,8 +5304,27 @@ impl<'a> Checker<'a> {
                     .map(|node| self.type_of_expression_context(node, annotation));
                 if let (Some(actual), Some(expected)) = (initializer, annotation)
                     && !self.is_assignable(actual, expected)
+                    && data
+                        .initializer
+                        .is_none_or(|node| !self.reported_object_literals.contains(&node))
                 {
                     self.assignability_error(node_id, actual, expected);
+                }
+                // The initializer starts the control-flow type for wider
+                // declarations, matching assignment narrowing.
+                if let (Some(actual), Some(declared)) = (initializer, annotation)
+                    && matches!(
+                        self.result.types.get(declared).map(|type_| &type_.kind),
+                        Some(TypeKind::Any | TypeKind::Unknown | TypeKind::Union(_))
+                    )
+                    && let Some(symbol) = self
+                        .bindings
+                        .node_symbols
+                        .get(&node_id)
+                        .or_else(|| self.bindings.node_symbols.get(&data.name))
+                        .copied()
+                {
+                    self.flow_types.insert(symbol, actual);
                 }
                 let unique_symbol = (annotation.is_none())
                     .then(|| self.unique_symbol_type_for_variable(node_id, data))
@@ -7395,6 +7419,10 @@ impl<'a> Checker<'a> {
         let mut setter_property_types = BTreeMap::new();
         let mut string_index_type: Option<TypeId> = None;
         let mut number_index_type: Option<TypeId> = None;
+        // TypeScript reports at most one excess property per object literal,
+        // and only when no property-level mismatch was reported.
+        let mut deferred_excess_property: Option<(NodeId, String, TypeId)> = None;
+        let mut reported_property_mismatch = false;
         for property in &object.properties.nodes {
             let Some(node) = self.arena.get(*property).cloned() else {
                 continue;
@@ -7423,6 +7451,7 @@ impl<'a> Checker<'a> {
                                 .or(object.string_index_type)
                         });
                     if expected.is_none()
+                        && deferred_excess_property.is_none()
                         && contextual_object
                             .as_ref()
                             .is_some_and(|object| !object.properties.is_empty())
@@ -7441,14 +7470,8 @@ impl<'a> Checker<'a> {
                             }) => *constraint,
                             _ => contextual_type,
                         };
-                        self.error(
-                            *property,
-                            2353,
-                            [
-                                name.clone(),
-                                self.diagnostic_type_display(contextual_type),
-                            ],
-                        );
+                        deferred_excess_property =
+                            Some((*property, name.clone(), contextual_type));
                     }
                     let actual = self.type_of_expression_context(data.initializer, expected);
                     let actual = if expected.is_none()
@@ -7471,7 +7494,15 @@ impl<'a> Checker<'a> {
                                     && self.type_includes_undefined(actual)
                             }))
                     {
-                        self.assignability_error(*property, actual, expected);
+                        reported_property_mismatch = true;
+                        // The initializer's own contextual typing reporting is
+                        // the more precise elaboration.
+                        if !self
+                            .reported_object_literals
+                            .contains(&data.initializer)
+                        {
+                            self.assignability_error(*property, actual, expected);
+                        }
                     }
                     if !properties.contains_key(&contextual_name) {
                         property_order.push(contextual_name.clone());
@@ -7573,6 +7604,15 @@ impl<'a> Checker<'a> {
                 }
                 _ => {}
             }
+        }
+        if !reported_property_mismatch
+            && let Some((property, name, contextual_type)) = deferred_excess_property
+        {
+            self.error(
+                property,
+                2353,
+                [name, self.diagnostic_type_display(contextual_type)],
+            );
         }
         ObjectType {
             properties,
@@ -10208,7 +10248,12 @@ impl<'a> Checker<'a> {
                 self.result.types.union([when_true, when_false])
             }
             NodeData::ObjectLiteralExpression(data) => {
-                self.object_literal_type(data, contextual_type)
+                let diagnostics_before = self.result.diagnostics.len();
+                let type_id = self.object_literal_type(data, contextual_type);
+                if self.result.diagnostics.len() > diagnostics_before {
+                    self.reported_object_literals.insert(node_id);
+                }
+                type_id
             }
             NodeData::ClassExpression(data) => self.class_expression_type(data),
             NodeData::ArrayLiteralExpression(data) => {
@@ -10342,6 +10387,39 @@ impl<'a> Checker<'a> {
                     self.error(data.expression, 18046, [name]);
                     return self.result.types.any();
                 }
+                let access_receiver = if self.options.strict_null_checks
+                    && data.question_dot_token.is_none()
+                {
+                    let (includes_null, includes_undefined) =
+                        self.type_includes_null_or_undefined(access_receiver);
+                    if includes_null || includes_undefined {
+                        let code_offset = match (includes_null, includes_undefined) {
+                            (true, false) => 0,
+                            (false, true) => 1,
+                            _ => 2,
+                        };
+                        if let Some(entity) = self.value_expression_text(data.expression) {
+                            self.error(data.expression, 18047 + code_offset, [entity]);
+                        } else {
+                            self.error(data.expression, 2531 + code_offset, std::iter::empty());
+                        }
+                        let remainder = self.non_nullish_type(access_receiver);
+                        // An entirely nullish receiver has no remainder to
+                        // check a property against; the nullability error is
+                        // the only diagnostic.
+                        if matches!(
+                            self.result.types.get(remainder).map(|type_| &type_.kind),
+                            Some(TypeKind::Never)
+                        ) {
+                            return self.result.types.any();
+                        }
+                        remainder
+                    } else {
+                        access_receiver
+                    }
+                } else {
+                    access_receiver
+                };
                 let name = self.property_name(data.name).unwrap_or_default();
                 let declared_member = matches!(
                     self.result
@@ -13128,11 +13206,14 @@ impl<'a> Checker<'a> {
                     &mut inference,
                     &mut inference_context,
                 );
-            let actual = if self.mapped_return_templates.contains_key(&parameter) {
-                self.type_of_expression(*argument)
+            let argument_context = if self.mapped_return_templates.contains_key(&parameter) {
+                None
             } else {
-                let contextual_parameter = self.substitute_type(parameter, &inference);
-                self.type_of_expression_context(*argument, Some(contextual_parameter))
+                Some(self.substitute_type(parameter, &inference))
+            };
+            let actual = match argument_context {
+                None => self.type_of_expression(*argument),
+                Some(context) => self.type_of_expression_context(*argument, Some(context)),
             };
             let preserve_literal_inference = self.preserve_literal_inference;
             self.preserve_literal_inference = (self.preserve_literal_inference
@@ -13161,25 +13242,60 @@ impl<'a> Checker<'a> {
             }
             self.preserve_literal_inference = preserve_literal_inference;
             self.infer_named_type_parameters_from_argument(parameter, *argument, &mut inference);
+            self.clamp_inference_to_constraints(signature, &mut inference);
             let expected = self.substitute_type(parameter, &inference);
             let deferred_active_class_value = self
                 .resolve_value_expression_symbol(*argument)
                 .is_some_and(|symbol| self.class_value_stack.contains(&symbol));
-            if !deferred_active_class_value && !self.is_assignable(checked_actual, expected) {
-                let code = if self.exact_optional_property_mismatch(checked_actual, expected) {
-                    2379
-                } else {
-                    2345
-                };
-                let displayed_actual = self.diagnostic_source_type(checked_actual, expected);
-                self.error(
-                    *argument,
-                    code,
-                    [
-                        self.result.types.display(displayed_actual),
-                        self.result.types.display(expected),
-                    ],
-                );
+            if !deferred_active_class_value
+                && !self.reported_object_literals.contains(argument)
+                && !self.is_assignable(checked_actual, expected)
+            {
+                // A fresh object literal reports property-level diagnostics
+                // against the instantiated parameter type; re-type it when
+                // inference changed the expected type after the argument was
+                // first typed.
+                let mut reported_in_literal = false;
+                if Some(expected) != argument_context
+                    && matches!(
+                        self.arena.get(*argument).map(|node| &node.data),
+                        Some(NodeData::ObjectLiteralExpression(_))
+                    )
+                {
+                    let diagnostics_before = self.result.diagnostics.len();
+                    self.clear_cached_expression_types(*argument);
+                    self.type_of_expression_context(*argument, Some(expected));
+                    reported_in_literal = self.result.diagnostics.len() > diagnostics_before;
+                }
+                if !reported_in_literal {
+                    if self
+                        .single_missing_required_property(checked_actual, expected)
+                        .is_some()
+                    {
+                        self.assignability_error(*argument, checked_actual, expected);
+                    } else {
+                        let code =
+                            if self.exact_optional_property_mismatch(checked_actual, expected) {
+                                2379
+                            } else {
+                                2345
+                            };
+                        let displayed_actual =
+                            self.diagnostic_source_type(checked_actual, expected);
+                        let message =
+                            message_by_code(code).expect("checker diagnostic is in catalog");
+                        let details = self.assignability_details(checked_actual, expected);
+                        let diagnostic = Diagnostic::with_arguments(
+                            message,
+                            [
+                                self.result.types.display(displayed_actual),
+                                self.result.types.display(expected),
+                            ],
+                        )
+                        .with_details(details);
+                        self.push_diagnostic(*argument, diagnostic);
+                    }
+                }
             }
         }
         self.apply_type_parameter_defaults(signature, &mut inference);
@@ -13429,6 +13545,49 @@ impl<'a> Checker<'a> {
                 ..
             }) => self.type_contains_id(*constraint, wanted, visited),
             _ => false,
+        }
+    }
+
+    /// TypeScript falls back to the constraint itself when an inferred type
+    /// argument does not satisfy it; argument diagnostics then flow from the
+    /// ordinary checks against the constraint-instantiated parameter.
+    fn clamp_inference_to_constraints(
+        &mut self,
+        signature: &FunctionType,
+        inference: &mut HashMap<TypeId, TypeId>,
+    ) {
+        for type_parameter in &signature.type_parameters {
+            let Some(TypeKind::TypeParameter {
+                constraint: Some(constraint),
+                ..
+            }) = self
+                .result
+                .types
+                .get(*type_parameter)
+                .map(|type_| &type_.kind)
+            else {
+                continue;
+            };
+            // Judge against the constraint as instantiated by the inferences
+            // made so far; a constraint still mentioning uninferred type
+            // parameters cannot be judged yet. Only object constraints are
+            // clamped: other constraint kinds (notably array-likes) hit
+            // assignability gaps such as the missing readonly-array model.
+            let constraint = self.substitute_type(*constraint, inference);
+            if self.type_contains_type_parameter(constraint)
+                || !matches!(
+                    self.result.types.get(constraint).map(|type_| &type_.kind),
+                    Some(TypeKind::Object(_))
+                )
+            {
+                continue;
+            }
+            if let Some(&inferred) = inference.get(type_parameter)
+                && inferred != constraint
+                && !self.is_assignable(inferred, constraint)
+            {
+                inference.insert(*type_parameter, constraint);
+            }
         }
     }
 
@@ -13936,6 +14095,25 @@ impl<'a> Checker<'a> {
             &self.result.types.get(type_id).unwrap().kind,
             TypeKind::Union(members) if members.iter().any(|member| self.type_includes_undefined(*member))
         )
+    }
+
+    fn type_includes_null_or_undefined(&self, type_id: TypeId) -> (bool, bool) {
+        match self.result.types.get(type_id).map(|type_| &type_.kind) {
+            Some(TypeKind::Null) => (true, false),
+            Some(TypeKind::Undefined) => (false, true),
+            Some(TypeKind::Union(members)) => {
+                let mut includes = (false, false);
+                for member in members {
+                    match self.result.types.get(*member).map(|type_| &type_.kind) {
+                        Some(TypeKind::Null) => includes.0 = true,
+                        Some(TypeKind::Undefined) => includes.1 = true,
+                        _ => {}
+                    }
+                }
+                includes
+            }
+            _ => (false, false),
+        }
     }
 
     fn non_nullish_type(&mut self, type_id: TypeId) -> TypeId {
@@ -14474,6 +14652,12 @@ impl<'a> Checker<'a> {
             let Some(expected) = object_context.properties.get(&name).copied() else {
                 continue;
             };
+            // A concrete expected property type (for example one that came
+            // from a bare type parameter's constraint) has nothing to infer;
+            // reporting it as inferred would skip whole-type inference.
+            if !self.type_contains_type_parameter(expected) {
+                continue;
+            }
             let initializer = property.initializer;
             let contextual = self.substitute_type(expected, inference);
             self.clear_cached_expression_types(initializer);
@@ -19852,6 +20036,25 @@ impl<'a> Checker<'a> {
                 return details;
             }
         }
+        if let (Some(TypeKind::Array(source_element)), Some(TypeKind::Array(target_element))) = (
+            self.result.types.get(actual).map(|type_| &type_.kind),
+            self.result.types.get(expected).map(|type_| &type_.kind),
+        ) {
+            let (source_element, target_element) = (*source_element, *target_element);
+            if !self.is_assignable(source_element, target_element) {
+                let mut details = vec![format!(
+                    "  Type '{}' is not assignable to type '{}'.",
+                    self.diagnostic_type_display(source_element),
+                    self.diagnostic_type_display(target_element)
+                )];
+                details.extend(
+                    self.assignability_details(source_element, target_element)
+                        .into_iter()
+                        .map(|detail| format!("  {detail}")),
+                );
+                return details;
+            }
+        }
         if matches!(
             self.result.types.get(expected).map(|type_| &type_.kind),
             Some(TypeKind::TypeParameter { .. })
@@ -20304,6 +20507,14 @@ impl<'a> Checker<'a> {
                     "{padding}'{source_display}' is assignable to the constraint of type '{name}', but '{name}' could be instantiated with a different subtype of constraint '{constraint_display}'."
                 )];
             }
+            // Literal sources display widened, matching the parent message.
+            let source_display = match self.result.types.get(source).map(|type_| &type_.kind) {
+                Some(TypeKind::NumberLiteral(_)) => "number".to_owned(),
+                Some(TypeKind::StringLiteral(_)) => "string".to_owned(),
+                Some(TypeKind::BooleanLiteral(_)) => "boolean".to_owned(),
+                Some(TypeKind::BigIntLiteral(_)) => "bigint".to_owned(),
+                _ => source_display,
+            };
             return vec![format!(
                 "{padding}'{target_display}' could be instantiated with an arbitrary type which could be unrelated to '{source_display}'."
             )];
@@ -20857,7 +21068,7 @@ impl<'a> Checker<'a> {
             format!("{head}: {return_type}")
         }));
         if members.is_empty() {
-            "{  }".into()
+            "{}".into()
         } else {
             format!("{{ {}; }}", members.join("; "))
         }
@@ -25992,11 +26203,18 @@ mod tests {
 
         let bindings = bind_source_file(&builder.arena, source);
         let result = check_source_file(&builder.arena, source, &bindings);
-        assert_eq!(result.diagnostics.len(), 1);
+        // Oracle-verified: the null initializer starts control flow, so the
+        // then-branch is `never` and the else-branch access is possibly null.
+        assert_eq!(result.diagnostics.len(), 2, "{:?}", result.diagnostics);
         assert_eq!(result.diagnostics[0].diagnostic.code(), 2339);
         assert_eq!(
             result.diagnostics[0].diagnostic.render().unwrap(),
-            "Property 'length' does not exist on type 'null'."
+            "Property 'length' does not exist on type 'never'."
+        );
+        assert_eq!(result.diagnostics[1].diagnostic.code(), 18047);
+        assert_eq!(
+            result.diagnostics[1].diagnostic.render().unwrap(),
+            "'value' is possibly 'null'."
         );
     }
 
@@ -26102,11 +26320,12 @@ mod tests {
         let bindings = bind_source_file(&parsed.arena, parsed.source_file);
         let result = check_source_file(&parsed.arena, parsed.source_file, &bindings);
         assert_eq!(result.diagnostics.len(), 2, "{:?}", result.diagnostics);
+        // Oracle-verified: both unguarded accesses are possibly undefined.
         assert!(
             result
                 .diagnostics
                 .iter()
-                .all(|diagnostic| diagnostic.diagnostic.code() == 2339),
+                .all(|diagnostic| diagnostic.diagnostic.code() == 18048),
             "{:?}",
             result.diagnostics
         );
@@ -26138,7 +26357,14 @@ mod tests {
 
         let bindings = bind_source_file(&builder.arena, source);
         let result = check_source_file(&builder.arena, source, &bindings);
-        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        // Oracle-verified: flow starts at the numeric initializer, so the
+        // string typeof guard leaves `never` inside the branch.
+        assert_eq!(result.diagnostics.len(), 1, "{:?}", result.diagnostics);
+        assert_eq!(result.diagnostics[0].diagnostic.code(), 2339);
+        assert_eq!(
+            result.diagnostics[0].diagnostic.render().unwrap(),
+            "Property 'length' does not exist on type 'never'."
+        );
     }
 
     #[test]
