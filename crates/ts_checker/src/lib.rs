@@ -10745,6 +10745,21 @@ impl<'a> Checker<'a> {
                     });
                 let callee = declared_class_value
                     .unwrap_or_else(|| self.type_of_expression(data.expression));
+                // Constructor values that are not declared classes (for
+                // example generic constructor interfaces) substitute explicit
+                // type arguments against their construct signature.
+                let callee = match data.type_arguments.as_ref() {
+                    Some(arguments)
+                        if declared_class_value.is_none() && !arguments.nodes.is_empty() =>
+                    {
+                        self.instantiate_explicit_construct_signature(
+                            data.expression,
+                            callee,
+                            &arguments.nodes,
+                        )
+                    }
+                    _ => callee,
+                };
                 let arguments = data.arguments.as_ref().map_or(&[][..], |list| &list.nodes);
                 let previous = self.preserve_literal_inference;
                 self.preserve_literal_inference = false;
@@ -12679,6 +12694,44 @@ impl<'a> Checker<'a> {
         members
             .iter()
             .find_map(|member| self.constructed_import_reference(*member))
+    }
+
+    /// Substitutes explicit type arguments through a constructor value's
+    /// generic construct signature; other shapes defer to the call path.
+    fn instantiate_explicit_construct_signature(
+        &mut self,
+        expression: NodeId,
+        callee: TypeId,
+        argument_nodes: &[NodeId],
+    ) -> TypeId {
+        let construct_parameters = match self.result.types.get(callee).map(|type_| &type_.kind) {
+            Some(TypeKind::Object(object)) => object
+                .construct_signatures
+                .iter()
+                .map(|signature| signature.type_parameters.clone())
+                .find(|parameters| !parameters.is_empty()),
+            _ => None,
+        };
+        let Some(parameters) = construct_parameters else {
+            return self.instantiate_explicit_call_signature(expression, callee, argument_nodes);
+        };
+        let arguments = argument_nodes
+            .iter()
+            .map(|argument| self.type_from_type_node(*argument))
+            .collect::<Vec<_>>();
+        self.check_explicit_type_argument_count(
+            argument_nodes.first().copied().unwrap_or(expression),
+            &parameters,
+            argument_nodes.len(),
+        );
+        let substitutions = self.explicit_type_argument_substitutions(&parameters, &arguments);
+        self.check_explicit_type_argument_constraints(
+            argument_nodes,
+            &arguments,
+            parameters.iter().map(std::slice::from_ref),
+            &substitutions,
+        );
+        self.substitute_type(callee, &substitutions)
     }
 
     #[allow(clippy::too_many_lines)] // Explicit-argument forms are one unit.
