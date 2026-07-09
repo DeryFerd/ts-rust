@@ -139,4 +139,6 @@ tsgo <files> --ignoreConfig --noCheck --target esnext --module esnext \
 
 The port is pinned to the upstream revision recorded in [UPSTREAM.md](UPSTREAM.md).
 The broader completion criteria and missing upstream gates are described in
-[docs/PORTING.md](docs/PORTING.md).
+[docs/PORTING.md](docs/PORTING.md). A crate-by-crate architecture map, broad
+CLI surface, and development commands are preserved in
+[docs/breakdown.md](docs/breakdown.md).
