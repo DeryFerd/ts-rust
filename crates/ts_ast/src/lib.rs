@@ -6,11 +6,14 @@ mod syntax_kind;
 pub use ast_generated::*;
 pub use syntax_kind::SyntaxKind;
 
-/// Stable identifier for one source-file arena within a compiler Program.
+/// Stable identifier for one source-file arena during the lifetime of one
+/// compiler `Program`.
 ///
 /// `NodeId` is intentionally dense and file-local. Pair it with `FileId` before
-/// storing a node identity in program-wide semantic state.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+/// storing a node identity in program-wide semantic state. File IDs are not
+/// persistent identities: rebuilding a Program may assign a different ID to
+/// the same path.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct FileId(u32);
 
 impl FileId {

@@ -2389,6 +2389,27 @@ impl Program {
         diagnostics
     }
 
+    fn insert_source_file(&mut self, canonical: String, source_file: SourceFile) {
+        let index = self.source_files.len();
+        let expected_id = FileId::new(
+            u32::try_from(index).expect("Program exceeds u32::MAX source files"),
+        );
+        assert_eq!(
+            source_file.id, expected_id,
+            "SourceFile identity does not match its Program slot"
+        );
+        assert_eq!(
+            source_file.binding.file_id,
+            Some(source_file.id),
+            "binding provenance does not match its owning SourceFile"
+        );
+        assert!(
+            self.file_index.insert(canonical, index).is_none(),
+            "canonical source file inserted more than once"
+        );
+        self.source_files.push(source_file);
+    }
+
     fn load_file(&mut self, file_system: &dyn FileSystem, file_name: &str, report_missing: bool) {
         let canonical = canonicalize(file_name, &self.current_directory, self.case_sensitivity);
         if self.file_index.contains_key(&canonical) {
@@ -2468,8 +2489,7 @@ impl Program {
             }
         }
         let checking = empty_check_result();
-        self.file_index.insert(canonical, index);
-        self.source_files.push(SourceFile {
+        self.insert_source_file(canonical, SourceFile {
             id: file_id,
             file_name: file_name.to_owned(),
             source_text,
@@ -2592,8 +2612,7 @@ impl Program {
         );
         let binding = bind_source_file_in_file(&parse.arena, parse.source_file, file_id);
         let checking = empty_check_result();
-        self.file_index.insert(canonical, index);
-        self.source_files.push(SourceFile {
+        self.insert_source_file(canonical, SourceFile {
             id: file_id,
             file_name,
             source_text,
@@ -5545,14 +5564,15 @@ fn config_diagnostic(diagnostic: &ConfigDiagnostic) -> ProgramDiagnostic {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::time::{Duration, Instant};
 
     use ts_options::{CompilerOptions, ModuleKind, ScriptTarget};
     use ts_vfs::{FileSystem, MemoryFileSystem};
 
     use super::{
-        Program, SyntaxKind, defer_export_only_bundle_imports, percent_encode_source_map_url,
+        FileId, Program, SyntaxKind, defer_export_only_bundle_imports,
+        percent_encode_source_map_url,
     };
 
     #[test]
@@ -5591,8 +5611,8 @@ mod tests {
 
         assert_eq!(first.parse.source_file, second.parse.source_file);
         assert_ne!(first.id, second.id);
-        assert_eq!(first.binding.file_id, first.id);
-        assert_eq!(second.binding.file_id, second.id);
+        assert_eq!(first.binding.file_id, Some(first.id));
+        assert_eq!(second.binding.file_id, Some(second.id));
 
         let first_ref = first.node_ref(first.parse.source_file).unwrap();
         let second_ref = second.node_ref(second.parse.source_file).unwrap();
@@ -5606,18 +5626,94 @@ mod tests {
         let fs = MemoryFileSystem::new(false);
         fs.write_file("/project/Main.ts", "const value = 1;")
             .unwrap();
+        fs.write_file("/project/other.ts", "const other = 2;")
+            .unwrap();
         let program = Program::new(
             &fs,
             "/project",
             &[
                 "Main.ts".to_owned(),
                 "main.ts".to_owned(),
+                "other.ts".to_owned(),
                 "missing.ts".to_owned(),
             ],
         );
-        assert_eq!(program.source_files().len(), 1);
+        assert_eq!(program.source_files().len(), 2);
         assert_eq!(program.diagnostics().len(), 1);
         assert_eq!(program.diagnostics()[0].code, Some(6053));
+        assert_eq!(program.source_file("main.ts").unwrap().id, FileId::new(0));
+        assert_eq!(program.source_file("other.ts").unwrap().id, FileId::new(1));
+    }
+
+    #[test]
+    fn assigns_unique_ids_to_transitive_and_bundled_sources() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file(
+            "/project/main.ts",
+            "import { value } from './dependency'; export const result = value;",
+        )
+        .unwrap();
+        fs.write_file("/project/dependency.ts", "export const value = 1;")
+            .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["main.ts".to_owned()],
+            CompilerOptions::default(),
+        );
+
+        assert!(program.source_file("/project/dependency.ts").is_some());
+        assert!(
+            program
+                .source_files()
+                .iter()
+                .any(|source| source.is_default_library)
+        );
+        let ids = program
+            .source_files()
+            .iter()
+            .map(|source| source.id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(ids.len(), program.source_files().len());
+        for (index, source) in program.source_files().iter().enumerate() {
+            let expected = FileId::new(u32::try_from(index).unwrap());
+            assert_eq!(source.id, expected);
+            assert_eq!(source.binding.file_id, Some(expected));
+            assert_eq!(
+                program.source_file_by_id(expected).unwrap().file_name,
+                source.file_name
+            );
+        }
+    }
+
+    #[test]
+    fn file_ids_are_stable_only_within_one_program_lifetime() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/first.ts", "export const first = 1;")
+            .unwrap();
+        fs.write_file("/project/second.ts", "export const second = 2;")
+            .unwrap();
+        let first_program = Program::new(
+            &fs,
+            "/project",
+            &["first.ts".to_owned(), "second.ts".to_owned()],
+        );
+        let rebuilt_program = Program::new(
+            &fs,
+            "/project",
+            &["second.ts".to_owned(), "first.ts".to_owned()],
+        );
+
+        let first_id = first_program.source_file("first.ts").unwrap().id;
+        assert_eq!(
+            first_program.source_file("first.ts").unwrap().id,
+            first_id
+        );
+        assert_eq!(first_id, FileId::new(0));
+        assert_eq!(
+            rebuilt_program.source_file("first.ts").unwrap().id,
+            FileId::new(1)
+        );
     }
 
     #[test]

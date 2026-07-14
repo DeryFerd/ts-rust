@@ -5,7 +5,7 @@ pub mod semantic;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
-use ts_ast::{NodeArena, NodeData, NodeId, SymbolId, SyntaxKind};
+use ts_ast::{FileId, NodeArena, NodeData, NodeId, NodeRef, SymbolId, SyntaxKind};
 use ts_binder::BindResult;
 use ts_diagnostics::{Diagnostic, message_by_code};
 use ts_evaluator::{Evaluation, EvaluationOutcome, UnknownReason, Value, evaluate_with};
@@ -720,8 +720,28 @@ pub struct ProgramSource<'a> {
     pub checker_options: CheckerOptions,
 }
 
+impl ProgramSource<'_> {
+    /// Returns the Program identity recorded by binding, when this source was
+    /// produced by a compiler Program rather than a standalone test/tool.
+    #[must_use]
+    pub const fn file_id(&self) -> Option<FileId> {
+        self.bindings.file_id
+    }
+
+    /// Validates a node and pairs it with the identity assigned at the checker
+    /// boundary. Detached sources receive a deterministic identity there.
+    #[must_use]
+    pub fn node_ref(&self, file_id: FileId, node: NodeId) -> Option<NodeRef> {
+        self.arena
+            .get(node)
+            .map(|_| NodeRef::new(file_id, node))
+    }
+}
+
 #[derive(Debug)]
 pub struct ProgramCheckResult {
+    /// File identities used by program-wide semantic state, parallel to `files`.
+    pub file_ids: Vec<FileId>,
     pub files: Vec<CheckResult>,
 }
 
@@ -816,6 +836,7 @@ enum TypeDescriptor {
 struct ProgramChecker<'a> {
     sources: &'a [ProgramSource<'a>],
     source_paths: Option<&'a [String]>,
+    file_ids: Vec<FileId>,
 }
 
 type DuplicateGlobal = (usize, NodeId, u32, String);
@@ -832,18 +853,46 @@ type ImportCollection = (
 );
 
 impl<'a> ProgramChecker<'a> {
-    const fn new(sources: &'a [ProgramSource<'a>]) -> Self {
+    fn new(sources: &'a [ProgramSource<'a>]) -> Self {
         Self {
             sources,
             source_paths: None,
+            file_ids: Self::file_ids(sources),
         }
     }
 
-    const fn new_with_paths(sources: &'a [ProgramSource<'a>], source_paths: &'a [String]) -> Self {
+    fn new_with_paths(sources: &'a [ProgramSource<'a>], source_paths: &'a [String]) -> Self {
         Self {
             sources,
             source_paths: Some(source_paths),
+            file_ids: Self::file_ids(sources),
         }
+    }
+
+    fn file_ids(sources: &[ProgramSource<'_>]) -> Vec<FileId> {
+        let assigned = sources
+            .iter()
+            .filter(|source| source.file_id().is_some())
+            .count();
+        assert!(
+            assigned == 0 || assigned == sources.len(),
+            "program checker sources must be either all Program-bound or all detached"
+        );
+        sources
+            .iter()
+            .enumerate()
+            .map(|(index, source)| {
+                let index = u32::try_from(index).expect("Program exceeds u32::MAX source files");
+                let expected = FileId::new(index);
+                if let Some(actual) = source.file_id() {
+                    assert_eq!(
+                        actual, expected,
+                        "ProgramSource binding provenance does not match source order"
+                    );
+                }
+                expected
+            })
+            .collect()
     }
 
     #[allow(clippy::too_many_lines)]
@@ -975,7 +1024,10 @@ impl<'a> ProgramChecker<'a> {
                 diagnostic: Diagnostic::with_arguments(message, [name]),
             });
         }
-        ProgramCheckResult { files }
+        ProgramCheckResult {
+            file_ids: self.file_ids,
+            files,
+        }
     }
 
     fn retain_module_augmentation_imports(
@@ -26827,15 +26879,15 @@ mod tests {
 
     use ts_ast::{
         ArrayLiteralExpressionData, BlockData, ElementAccessExpressionData,
-        ExpressionStatementData, FunctionDeclarationData, IdentifierData, IfStatementData,
-        IndexedAccessTypeNodeData, KeywordExpressionData, KeywordTypeNodeData, LiteralTypeNodeData,
-        Node, NodeArena, NodeData, NodeFlags, NodeId, NodeList, NumericLiteralData,
-        PropertyAccessExpressionData, ReturnStatementData, SourceFileData, StringLiteralData,
-        SymbolTable as AstSymbolTable, SyntaxKind, TokenData, TokenFlags, TupleTypeNodeData,
-        TypeOfExpressionData, UnionTypeNodeData, VariableDeclarationData,
+        ExpressionStatementData, FileId, FunctionDeclarationData, IdentifierData,
+        IfStatementData, IndexedAccessTypeNodeData, KeywordExpressionData, KeywordTypeNodeData,
+        LiteralTypeNodeData, Node, NodeArena, NodeData, NodeFlags, NodeId, NodeList,
+        NumericLiteralData, PropertyAccessExpressionData, ReturnStatementData, SourceFileData,
+        StringLiteralData, SymbolTable as AstSymbolTable, SyntaxKind, TokenData, TokenFlags,
+        TupleTypeNodeData, TypeOfExpressionData, UnionTypeNodeData, VariableDeclarationData,
         VariableDeclarationListData, VariableStatementData,
     };
-    use ts_binder::{BindResult, bind_source_file};
+    use ts_binder::{BindResult, bind_source_file, bind_source_file_in_file};
     use ts_core::TextRange;
     use ts_parser::parse_source_file;
 
@@ -34551,5 +34603,75 @@ mod tests {
             },
         );
         assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    }
+
+    #[test]
+    fn checker_assigns_distinct_ids_to_detached_multi_file_inputs() {
+        let first = parse_source_file("export const first = 1;");
+        let second = parse_source_file("export const second = 2;");
+        let first_bindings = bind_source_file(&first.arena, first.source_file);
+        let second_bindings = bind_source_file(&second.arena, second.source_file);
+        let no_modules = BTreeMap::new();
+        let sources = [
+            ProgramSource {
+                arena: &first.arena,
+                source_file: first.source_file,
+                bindings: &first_bindings,
+                resolved_modules: &no_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+            ProgramSource {
+                arena: &second.arena,
+                source_file: second.source_file,
+                bindings: &second_bindings,
+                resolved_modules: &no_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+        ];
+
+        let checked = check_program(&sources);
+        assert_eq!(checked.file_ids, [FileId::new(0), FileId::new(1)]);
+        let first_ref = sources[0]
+            .node_ref(checked.file_ids[0], first.source_file)
+            .unwrap();
+        let second_ref = sources[1]
+            .node_ref(checked.file_ids[1], second.source_file)
+            .unwrap();
+        assert_ne!(first_ref, second_ref);
+    }
+
+    #[test]
+    #[should_panic(expected = "either all Program-bound or all detached")]
+    fn checker_rejects_mixed_binding_provenance() {
+        let first = parse_source_file("export const first = 1;");
+        let second = parse_source_file("export const second = 2;");
+        let first_bindings =
+            bind_source_file_in_file(&first.arena, first.source_file, FileId::new(0));
+        let second_bindings = bind_source_file(&second.arena, second.source_file);
+        let no_modules = BTreeMap::new();
+        let _ = check_program(&[
+            ProgramSource {
+                arena: &first.arena,
+                source_file: first.source_file,
+                bindings: &first_bindings,
+                resolved_modules: &no_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+            ProgramSource {
+                arena: &second.arena,
+                source_file: second.source_file,
+                bindings: &second_bindings,
+                resolved_modules: &no_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+        ]);
     }
 }

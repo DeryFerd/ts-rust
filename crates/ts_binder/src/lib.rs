@@ -209,7 +209,9 @@ pub struct BindDiagnostic {
 /// Complete binding output for one source-file arena.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct BindResult {
-    pub file_id: FileId,
+    /// Program provenance when this file was bound as part of a Program.
+    /// Standalone bindings deliberately remain unassigned.
+    pub file_id: Option<FileId>,
     pub symbols: SymbolArena,
     pub scopes: Vec<Scope>,
     pub node_symbols: BTreeMap<NodeId, SymbolId>,
@@ -222,8 +224,8 @@ pub struct BindResult {
 impl BindResult {
     /// Converts a file-local node ID into a program-wide identity.
     #[must_use]
-    pub const fn node_ref(&self, node: NodeId) -> NodeRef {
-        NodeRef::new(self.file_id, node)
+    pub fn node_ref(&self, node: NodeId) -> Option<NodeRef> {
+        self.file_id.map(|file| NodeRef::new(file, node))
     }
 
     #[must_use]
@@ -274,7 +276,7 @@ impl BindResult {
 /// Binds declarations reachable from one source-file node.
 #[must_use]
 pub fn bind_source_file(arena: &NodeArena, source_file: NodeId) -> BindResult {
-    bind_source_file_in_file(arena, source_file, FileId::default())
+    Binder::new(arena, None).bind(source_file)
 }
 
 /// Binds one source file using its stable identity in a compiler Program.
@@ -284,7 +286,7 @@ pub fn bind_source_file_in_file(
     source_file: NodeId,
     file_id: FileId,
 ) -> BindResult {
-    Binder::new(arena, file_id).bind(source_file)
+    Binder::new(arena, Some(file_id)).bind(source_file)
 }
 
 struct Binder<'a> {
@@ -295,7 +297,7 @@ struct Binder<'a> {
 }
 
 impl<'a> Binder<'a> {
-    fn new(arena: &'a NodeArena, file_id: FileId) -> Self {
+    fn new(arena: &'a NodeArena, file_id: Option<FileId>) -> Self {
         let mut children = HashMap::<NodeId, Vec<NodeId>>::new();
         for (id, node) in arena.iter() {
             if let Some(parent) = node.parent {
@@ -1572,7 +1574,7 @@ fn is_value(flags: SymbolFlags) -> bool {
 #[cfg(test)]
 mod tests {
     use ts_ast::{
-        BlockData, ClassDeclarationData, EnumDeclarationData, EnumMemberData,
+        BlockData, ClassDeclarationData, EnumDeclarationData, EnumMemberData, FileId,
         FunctionDeclarationData, IdentifierData, InterfaceDeclarationData, Node, NodeArena,
         NodeData, NodeFlags, NodeId, NodeList, SourceFileData, SymbolTable as AstSymbolTable,
         SyntaxKind, TokenData, TypeAliasDeclarationData, VariableDeclarationData,
@@ -1581,10 +1583,26 @@ mod tests {
     use ts_core::TextRange;
     use ts_parser::parse_source_file;
 
-    use super::{ScopeKind, SymbolFlags, bind_source_file};
+    use super::{ScopeKind, SymbolFlags, bind_source_file, bind_source_file_in_file};
 
     struct AstBuilder {
         arena: NodeArena,
+    }
+
+    #[test]
+    fn standalone_binding_does_not_claim_program_identity() {
+        let parsed = parse_source_file("const value = 1;");
+        let detached = bind_source_file(&parsed.arena, parsed.source_file);
+        assert_eq!(detached.file_id, None);
+        assert_eq!(detached.node_ref(parsed.source_file), None);
+
+        let file_id = FileId::new(7);
+        let assigned = bind_source_file_in_file(&parsed.arena, parsed.source_file, file_id);
+        assert_eq!(assigned.file_id, Some(file_id));
+        assert_eq!(
+            assigned.node_ref(parsed.source_file),
+            Some(ts_ast::NodeRef::new(file_id, parsed.source_file))
+        );
     }
 
     impl AstBuilder {
