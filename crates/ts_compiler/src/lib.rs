@@ -2112,11 +2112,9 @@ impl Program {
         } else {
             vec![Vec::new(); self.source_files.len()]
         };
+        let checked_files = checked.into_files();
         for (index, (source_file, mut checking)) in
-            self.source_files
-                .iter_mut()
-                .zip(checked.into_files())
-                .enumerate()
+            self.source_files.iter_mut().zip(checked_files).enumerate()
         {
             if check_declaration_portability {
                 add_nonportable_inferred_type_diagnostics(source_file, &mut checking);
