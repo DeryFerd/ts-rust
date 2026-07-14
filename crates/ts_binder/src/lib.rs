@@ -5,7 +5,9 @@ use std::{
     ops::{BitOr, BitOrAssign},
 };
 
-use ts_ast::{NodeArena, NodeData, NodeFlags, NodeId, SymbolId, SyntaxKind};
+use ts_ast::{
+    FileId, NodeArena, NodeData, NodeFlags, NodeId, NodeRef, SymbolId, SyntaxKind,
+};
 use ts_diagnostics::{Diagnostic, message_by_code};
 
 /// TypeScript symbol meanings. Bit positions match the upstream compiler.
@@ -207,6 +209,7 @@ pub struct BindDiagnostic {
 /// Complete binding output for one source-file arena.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct BindResult {
+    pub file_id: FileId,
     pub symbols: SymbolArena,
     pub scopes: Vec<Scope>,
     pub node_symbols: BTreeMap<NodeId, SymbolId>,
@@ -217,6 +220,12 @@ pub struct BindResult {
 }
 
 impl BindResult {
+    /// Converts a file-local node ID into a program-wide identity.
+    #[must_use]
+    pub const fn node_ref(&self, node: NodeId) -> NodeRef {
+        NodeRef::new(self.file_id, node)
+    }
+
     #[must_use]
     pub fn root_scope(&self) -> Option<&Scope> {
         self.scopes.first()
@@ -265,7 +274,17 @@ impl BindResult {
 /// Binds declarations reachable from one source-file node.
 #[must_use]
 pub fn bind_source_file(arena: &NodeArena, source_file: NodeId) -> BindResult {
-    Binder::new(arena).bind(source_file)
+    bind_source_file_in_file(arena, source_file, FileId::default())
+}
+
+/// Binds one source file using its stable identity in a compiler Program.
+#[must_use]
+pub fn bind_source_file_in_file(
+    arena: &NodeArena,
+    source_file: NodeId,
+    file_id: FileId,
+) -> BindResult {
+    Binder::new(arena, file_id).bind(source_file)
 }
 
 struct Binder<'a> {
@@ -276,7 +295,7 @@ struct Binder<'a> {
 }
 
 impl<'a> Binder<'a> {
-    fn new(arena: &'a NodeArena) -> Self {
+    fn new(arena: &'a NodeArena, file_id: FileId) -> Self {
         let mut children = HashMap::<NodeId, Vec<NodeId>>::new();
         for (id, node) in arena.iter() {
             if let Some(parent) = node.parent {
@@ -285,7 +304,10 @@ impl<'a> Binder<'a> {
         }
         Self {
             arena,
-            result: BindResult::default(),
+            result: BindResult {
+                file_id,
+                ..BindResult::default()
+            },
             children,
             implicit_export_depth: 0,
         }

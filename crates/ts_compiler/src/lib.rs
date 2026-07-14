@@ -5,8 +5,8 @@ use std::{
     path::Path,
 };
 
-use ts_ast::{NodeData, NodeId, SyntaxKind};
-use ts_binder::{BindResult, SymbolFlags, bind_source_file};
+use ts_ast::{FileId, Node, NodeData, NodeId, NodeRef, SyntaxKind};
+use ts_binder::{BindResult, SymbolFlags, bind_source_file_in_file};
 use ts_checker::{
     CheckDiagnostic, CheckResult, CheckerOptions, EnumConstantValue as CheckerConstantValue,
     ProgramSource, TypeId, TypeKind, check_program_with_paths, empty_check_result,
@@ -38,6 +38,7 @@ use ts_vfs::FileSystem;
 /// One parsed source file owned by a Program.
 #[derive(Debug)]
 pub struct SourceFile {
+    pub id: FileId,
     pub file_name: String,
     pub source_text: String,
     pub parse: ParseResult,
@@ -45,6 +46,17 @@ pub struct SourceFile {
     pub checking: CheckResult,
     pub is_default_library: bool,
     implied_node_format: ModuleKind,
+}
+
+impl SourceFile {
+    /// Returns a program-wide identity when `node` belongs to this file's arena.
+    #[must_use]
+    pub fn node_ref(&self, node: NodeId) -> Option<NodeRef> {
+        self.parse
+            .arena
+            .get(node)
+            .map(|_| NodeRef::new(self.id, node))
+    }
 }
 
 fn bundle_namespace_path(source: &SourceFile, declaration: NodeId) -> Option<Vec<String>> {
@@ -680,6 +692,20 @@ impl Program {
         self.file_index
             .get(&canonical)
             .and_then(|index| self.source_files.get(*index))
+    }
+
+    /// Looks up a source file by its stable program identity.
+    #[must_use]
+    pub fn source_file_by_id(&self, id: FileId) -> Option<&SourceFile> {
+        self.source_files
+            .get(id.index())
+            .filter(|source| source.id == id)
+    }
+
+    /// Looks up a node using its unambiguous program-wide identity.
+    #[must_use]
+    pub fn node(&self, node: NodeRef) -> Option<&Node> {
+        self.source_file_by_id(node.file)?.parse.arena.get(node.node)
     }
 
     /// Emits modern JavaScript for all implementation source files currently
@@ -2397,7 +2423,11 @@ impl Program {
                 message: diagnostic.message.clone(),
             });
         }
-        let binding = bind_source_file(&parse.arena, parse.source_file);
+        let index = self.source_files.len();
+        let file_id = FileId::new(
+            u32::try_from(index).expect("Program exceeds u32::MAX source files"),
+        );
+        let binding = bind_source_file_in_file(&parse.arena, parse.source_file, file_id);
         for diagnostic in &binding.diagnostics {
             let range = parse.arena.get(diagnostic.node).map(|node| node.range);
             self.diagnostics.push(ProgramDiagnostic {
@@ -2438,9 +2468,9 @@ impl Program {
             }
         }
         let checking = empty_check_result();
-        let index = self.source_files.len();
         self.file_index.insert(canonical, index);
         self.source_files.push(SourceFile {
+            id: file_id,
             file_name: file_name.to_owned(),
             source_text,
             parse,
@@ -2556,11 +2586,15 @@ impl Program {
         };
         let source_text = source.to_owned();
         let parse = parse_source_file(&source_text);
-        let binding = bind_source_file(&parse.arena, parse.source_file);
-        let checking = empty_check_result();
         let index = self.source_files.len();
+        let file_id = FileId::new(
+            u32::try_from(index).expect("Program exceeds u32::MAX source files"),
+        );
+        let binding = bind_source_file_in_file(&parse.arena, parse.source_file, file_id);
+        let checking = empty_check_result();
         self.file_index.insert(canonical, index);
         self.source_files.push(SourceFile {
+            id: file_id,
             file_name,
             source_text,
             parse,
@@ -5517,7 +5551,9 @@ mod tests {
     use ts_options::{CompilerOptions, ModuleKind, ScriptTarget};
     use ts_vfs::{FileSystem, MemoryFileSystem};
 
-    use super::{Program, defer_export_only_bundle_imports, percent_encode_source_map_url};
+    use super::{
+        Program, SyntaxKind, defer_export_only_bundle_imports, percent_encode_source_map_url,
+    };
 
     #[test]
     fn parses_and_indexes_explicit_roots() {
@@ -5532,6 +5568,37 @@ mod tests {
         );
         assert_eq!(program.source_files().len(), 1);
         assert!(program.source_file("/project/main.ts").is_some());
+    }
+
+    #[test]
+    fn program_node_refs_disambiguate_identical_file_local_ids() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/first.ts", "export const value = 1;")
+            .unwrap();
+        fs.write_file("/project/second.ts", "export const value = 2;")
+            .unwrap();
+        let program = Program::new_with_options(
+            &fs,
+            "/project",
+            &["first.ts".to_owned(), "second.ts".to_owned()],
+            CompilerOptions {
+                no_lib: true,
+                ..CompilerOptions::default()
+            },
+        );
+        let first = program.source_file("/project/first.ts").unwrap();
+        let second = program.source_file("/project/second.ts").unwrap();
+
+        assert_eq!(first.parse.source_file, second.parse.source_file);
+        assert_ne!(first.id, second.id);
+        assert_eq!(first.binding.file_id, first.id);
+        assert_eq!(second.binding.file_id, second.id);
+
+        let first_ref = first.node_ref(first.parse.source_file).unwrap();
+        let second_ref = second.node_ref(second.parse.source_file).unwrap();
+        assert_ne!(first_ref, second_ref);
+        assert_eq!(program.node(first_ref).unwrap().kind, SyntaxKind::SourceFile);
+        assert_eq!(program.node(second_ref).unwrap().kind, SyntaxKind::SourceFile);
     }
 
     #[test]
