@@ -1,6 +1,6 @@
 # Goal: typescript-go core typechecking parity in Rust
 
-- Status: proposed for review
+- Status: active
 - Audit date: 2026-07-14
 - Local branch: `july-ultra`
 - Audited upstream pin: `dc37b5249ab60e2bbce936f71b883e6c8136167e`
@@ -42,7 +42,30 @@ source maps, watch/build mode, fourslash, and language-service parity remain
 follow-on goals except where a checker API or artifact is required to validate
 semantic parity.
 
-If approved, this document should be the checker-specific execution goal.
+## Execution progress
+
+Work began on 2026-07-14 after this goal was approved. The integration branch
+records small, dependency-closed commits; `docs/typechecker-port-map.tsv`
+remains the cluster-level source of truth.
+
+- Cargo invocations are serialized across linked worktrees.
+- Upstream corpus discovery is fail-closed and records all 12,750 discovered
+  cases, including the pinned runner's 45 explicit skips.
+- Diagnostic scorecards distinguish header-only evidence from exact parity.
+- Complete non-pretty `.errors.txt` rendering is implemented on a review branch,
+  but remains unmerged until exact option-matrix expansion cannot manufacture
+  clean variants.
+- Canonical `TypeFlags`, `ObjectFlags`, signature flags, tuple/index flags, and
+  relation ternary values are pinned to the audited upstream commit.
+- Program-wide node identity, complete symbol masks, and a typed flow substrate
+  are implemented in separate worktrees and are being integrated in dependency
+  order after provenance review.
+
+No percentage in this section is a whole-corpus parity claim. A score is
+publishable only when its variant manifest and complete artifact comparison are
+both exact.
+
+This document is the checker-specific execution goal.
 `docs/PORTING.md` remains the broad compiler dependency spine, and its
 syntax-only/no-check gate remains a regression test, but it is no longer the
 typechecking critical path. Earlier fixture-oriented recovery plans remain
