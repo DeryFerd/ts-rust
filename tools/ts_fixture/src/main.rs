@@ -112,6 +112,9 @@ fn print_help() {
     println!(
         "Reads the pinned typescript-go compiler/conformance corpus and actual baselines below TS_GO_REPO."
     );
+    println!(
+        "--diagnostics compares complete non-pretty .errors.txt artifacts byte for byte; a missing baseline expects no diagnostics."
+    );
 }
 
 #[cfg(test)]

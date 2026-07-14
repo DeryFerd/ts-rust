@@ -5,8 +5,10 @@
 //! as name/value metadata for the compiler harness.
 
 use std::{
+    cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
-    fmt, fs,
+    fmt::{self, Write as _},
+    fs,
     io::{self, Write},
     ops::Range,
     path::{Path, PathBuf},
@@ -14,7 +16,6 @@ use std::{
 
 use serde::Serialize;
 use ts_core::{SourceText, TextRange};
-use ts_diagnostic_writer::{Diagnostic, DiagnosticCategory, FormattingOptions, format_diagnostics};
 use ts_vfs::{FileSystem, MemoryFileSystem, decode_utf16_bom};
 
 mod oracle;
@@ -135,9 +136,23 @@ pub struct Compilation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompilationDiagnostic {
     pub file_name: Option<String>,
+    /// Source used to translate the diagnostic's UTF-8 byte range to a baseline location.
+    pub source_text: Option<SourceText>,
     pub range: Option<TextRange>,
     pub code: Option<u32>,
     pub category: Option<CompilationDiagnosticCategory>,
+    pub message: String,
+    /// `None` means the checker did not expose whether related information exists.
+    pub related_information: Option<Vec<CompilationRelatedInformation>>,
+}
+
+/// Related diagnostic detail retained when the checker exposes it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompilationRelatedInformation {
+    pub file_name: Option<String>,
+    pub source_text: Option<SourceText>,
+    pub range: Option<TextRange>,
+    pub code: Option<u32>,
     pub message: String,
 }
 
@@ -207,17 +222,38 @@ pub struct RunnerOptions {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiagnosticComparisonScope {
-    /// Only the unannotated diagnostic header of `.errors.txt` was compared.
-    HeaderOnly,
+    /// The complete, non-pretty `.errors.txt` artifact was compared byte for byte.
+    FullArtifact,
 }
 
 /// Deterministic outcome category for one diagnostic fixture variant.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiagnosticVariantStatus {
-    /// The diagnostic headers match, but full `.errors.txt` parity was not checked.
+    ExactMatch,
+    /// The normalized headers match, but the complete artifacts do not.
     HeaderOnlyMatch,
+    CodeMismatch,
+    SpanMismatch,
+    MessageMismatch,
+    OrderMismatch,
+    UnsupportedDetail,
     HeaderMismatch,
+    ArtifactMismatch,
+}
+
+/// Structured reason why two complete diagnostic artifacts differ.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticArtifactMismatchKind {
+    HeaderOnly,
+    Code,
+    Span,
+    Message,
+    Order,
+    UnsupportedDetail,
+    Header,
+    Artifact,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
@@ -227,10 +263,16 @@ pub struct DiagnosticScorecardSummary {
     pub upstream_skipped_cases: usize,
     pub selected_cases: usize,
     pub executed_variants: usize,
-    /// Full diagnostic artifact matches. This remains zero for a header-only run.
+    /// Byte-for-byte full diagnostic artifact matches.
     pub exact_matches: usize,
     pub header_only_matches: usize,
+    pub code_mismatches: usize,
+    pub span_mismatches: usize,
+    pub message_mismatches: usize,
+    pub order_mismatches: usize,
+    pub unsupported_details: usize,
     pub header_mismatches: usize,
+    pub artifact_mismatches: usize,
     pub actual_diagnostics: usize,
 }
 
@@ -276,7 +318,19 @@ pub struct DiagnosticVariantResult {
     pub status: DiagnosticVariantStatus,
     pub expected_header: String,
     pub actual_header: String,
+    pub mismatch_kinds: Vec<DiagnosticArtifactMismatchKind>,
+    pub first_difference: Option<DiagnosticArtifactDifference>,
+    pub unsupported_details: Vec<String>,
     pub diagnostics: Vec<DiagnosticScorecardDiagnostic>,
+}
+
+/// First byte-significant line difference for a diagnostic artifact mismatch.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticArtifactDifference {
+    pub line: usize,
+    pub expected: String,
+    pub actual: String,
 }
 
 /// Machine-readable results for a diagnostic baseline run.
@@ -438,9 +492,9 @@ pub fn run_upstream_baselines(
 
 /// Discovers upstream cases/reference baselines and compares compiler diagnostics.
 ///
-/// The comparison uses the canonical header before the annotated source sections in
-/// TypeScript's `.errors.txt` files. A missing error baseline means that the variant is
-/// expected to produce no diagnostics.
+/// The comparison renders and compares the complete non-pretty TypeScript `.errors.txt`
+/// artifact. A missing error baseline means that the variant is expected to produce no
+/// diagnostics.
 ///
 /// # Errors
 ///
@@ -485,9 +539,9 @@ pub fn run_upstream_diagnostic_baselines(
         ..RunnerSummary::default()
     };
     let mut scorecard = DiagnosticScorecard {
-        schema_version: 1,
-        comparison_scope: DiagnosticComparisonScope::HeaderOnly,
-        full_artifact_comparison: false,
+        schema_version: 2,
+        comparison_scope: DiagnosticComparisonScope::FullArtifact,
+        full_artifact_comparison: true,
         summary: DiagnosticScorecardSummary {
             discovered_cases: summary.discovered_cases,
             upstream_skipped_cases: summary.upstream_skipped_cases,
@@ -540,41 +594,79 @@ pub fn run_upstream_diagnostic_baselines(
                 .first()
                 .map(fs::read_to_string)
                 .transpose()?
-                .map_or_else(String::new, |baseline| {
-                    parse_error_baseline_header(&baseline)
-                });
-            let actual = normalize_diagnostic_header(&compilation.diagnostic_text);
-            let is_header_match = actual == expected;
-            let status = if is_header_match {
+                .unwrap_or_default();
+            let actual = render_error_baseline(&case, &compilation.diagnostics);
+            let comparison =
+                compare_diagnostic_artifacts(&expected, &actual, &compilation.diagnostics);
+            let status = comparison.status();
+            if comparison.is_exact() {
                 summary.matched += 1;
-                scorecard.summary.header_only_matches += 1;
-                DiagnosticVariantStatus::HeaderOnlyMatch
+                scorecard.summary.exact_matches += 1;
             } else {
                 summary.mismatched += 1;
                 summary.diagnostic_failures += 1;
-                scorecard.summary.header_mismatches += 1;
+                if parse_error_baseline_header(&expected)
+                    != parse_error_baseline_header(&actual.text)
+                {
+                    scorecard.summary.header_mismatches += 1;
+                }
+                match status {
+                    DiagnosticVariantStatus::ExactMatch => unreachable!(),
+                    DiagnosticVariantStatus::HeaderOnlyMatch => {
+                        scorecard.summary.header_only_matches += 1;
+                    }
+                    DiagnosticVariantStatus::CodeMismatch => {
+                        scorecard.summary.code_mismatches += 1;
+                    }
+                    DiagnosticVariantStatus::SpanMismatch => {
+                        scorecard.summary.span_mismatches += 1;
+                    }
+                    DiagnosticVariantStatus::MessageMismatch => {
+                        scorecard.summary.message_mismatches += 1;
+                    }
+                    DiagnosticVariantStatus::OrderMismatch => {
+                        scorecard.summary.order_mismatches += 1;
+                    }
+                    DiagnosticVariantStatus::UnsupportedDetail => {
+                        scorecard.summary.unsupported_details += 1;
+                    }
+                    DiagnosticVariantStatus::HeaderMismatch => {}
+                    DiagnosticVariantStatus::ArtifactMismatch => {
+                        scorecard.summary.artifact_mismatches += 1;
+                    }
+                }
                 let display_path = case_path
                     .strip_prefix(repository)
                     .unwrap_or(&case_path)
                     .display();
                 let label = variant_label(&variant, &axes);
-                let (line, expected_line, actual_line) = first_different_line(&expected, &actual);
-                writeln!(
-                    writer,
-                    "MISMATCH {display_path}{label}: diagnostics differ at line {line}; expected {expected_line:?}, actual {actual_line:?}"
-                )?;
-                DiagnosticVariantStatus::HeaderMismatch
-            };
+                if let Some(difference) = comparison.first_difference.as_ref() {
+                    writeln!(
+                        writer,
+                        "MISMATCH {display_path}{label}: {status:?} at artifact line {}; expected {:?}, actual {:?}",
+                        difference.line, difference.expected, difference.actual
+                    )?;
+                } else {
+                    writeln!(
+                        writer,
+                        "MISMATCH {display_path}{label}: {status:?}: {}",
+                        comparison.unsupported_details.join("; ")
+                    )?;
+                }
+            }
             scorecard.summary.executed_variants += 1;
             scorecard.summary.actual_diagnostics += compilation.diagnostics.len();
             scorecard.variants.push(DiagnosticVariantResult {
                 case: relative_scorecard_path(repository, &case_path),
                 options: variant.values,
                 expected_baseline,
-                comparison_scope: DiagnosticComparisonScope::HeaderOnly,
+                comparison_scope: DiagnosticComparisonScope::FullArtifact,
                 status,
-                expected_header: expected,
-                actual_header: actual,
+                expected_header: parse_error_baseline_header(&expected),
+                actual_header: parse_error_baseline_header(&actual.text),
+                mismatch_kinds: comparison.mismatch_kinds,
+                first_difference: comparison.first_difference,
+                unsupported_details: comparison.unsupported_details,
                 diagnostics: compilation
                     .diagnostics
                     .iter()
@@ -588,10 +680,16 @@ pub fn run_upstream_diagnostic_baselines(
     }
     writeln!(
         writer,
-        "{summary} diagnostic_comparison=header-only exact_matches={} header_only_matches={} header_mismatches={}",
+        "{summary} diagnostic_comparison=full-artifact exact_matches={} header_only_matches={} code_mismatches={} span_mismatches={} message_mismatches={} order_mismatches={} unsupported_details={} header_mismatches={} artifact_mismatches={}",
         scorecard.summary.exact_matches,
         scorecard.summary.header_only_matches,
+        scorecard.summary.code_mismatches,
+        scorecard.summary.span_mismatches,
+        scorecard.summary.message_mismatches,
+        scorecard.summary.order_mismatches,
+        scorecard.summary.unsupported_details,
         scorecard.summary.header_mismatches,
+        scorecard.summary.artifact_mismatches,
     )?;
     Ok(summary)
 }
@@ -628,12 +726,789 @@ pub fn parse_error_baseline_header(baseline: &str) -> String {
     normalized[..header_end].trim_end_matches('\n').to_owned()
 }
 
-fn normalize_diagnostic_header(diagnostics: &str) -> String {
-    diagnostics
-        .replace("\r\n", "\n")
+const HARNESS_NEW_LINE: &str = "\r\n";
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct RenderedDiagnosticArtifact {
+    text: String,
+    unsupported_details: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ParsedDiagnosticHeader {
+    location: Option<String>,
+    category: String,
+    code: Option<u32>,
+    message: String,
+}
+
+fn render_error_baseline(
+    case: &Case,
+    diagnostics: &[CompilationDiagnostic],
+) -> RenderedDiagnosticArtifact {
+    if diagnostics.is_empty() {
+        return RenderedDiagnosticArtifact::default();
+    }
+
+    let mut ordered = diagnostics.iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| compare_compilation_diagnostics(left, right));
+    let mut artifact = RenderedDiagnosticArtifact::default();
+    for (index, pair) in ordered.windows(2).enumerate() {
+        if diagnostic_primary_order_key(pair[0]) == diagnostic_primary_order_key(pair[1]) {
+            artifact.unsupported_details.push(format!(
+                "diagnostics {index} and {} have the same path/range/code ordering key; the checker does not expose message arguments, message chains, or related-information sort keys",
+                index + 1
+            ));
+        }
+    }
+    artifact.text = render_diagnostic_header(case, &ordered, &mut artifact.unsupported_details);
+    artifact.text.push_str(HARNESS_NEW_LINE);
+    artifact.text.push_str(HARNESS_NEW_LINE);
+
+    let mut annotations = String::new();
+    let mut first_annotation_line = true;
+    for (index, diagnostic) in ordered.iter().enumerate() {
+        if diagnostic.file_name.is_none() {
+            append_annotated_diagnostic(
+                &mut annotations,
+                &mut first_annotation_line,
+                diagnostic,
+                index,
+                case,
+                &mut artifact.unsupported_details,
+            );
+        }
+    }
+
+    for (unit_index, unit) in case.units.iter().enumerate() {
+        let file_diagnostics = ordered
+            .iter()
+            .enumerate()
+            .filter(|(_, diagnostic)| diagnostic_belongs_to_unit(case, diagnostic, unit_index))
+            .collect::<Vec<_>>();
+        append_annotation_line(
+            &mut annotations,
+            &mut first_annotation_line,
+            &format!(
+                "==== {} ({} errors) ====",
+                baseline_unit_name(case, unit, unit_index),
+                file_diagnostics.len()
+            ),
+        );
+        annotate_source_unit(
+            case,
+            unit,
+            unit_index,
+            &file_diagnostics,
+            &mut annotations,
+            &mut first_annotation_line,
+            &mut artifact.unsupported_details,
+        );
+    }
+
+    for (index, diagnostic) in ordered.iter().enumerate() {
+        if let Some(file_name) = diagnostic.file_name.as_deref()
+            && !case
+                .units
+                .iter()
+                .enumerate()
+                .any(|(unit_index, _)| diagnostic_belongs_to_unit(case, diagnostic, unit_index))
+            && !is_default_library_file(file_name)
+            && !is_tsconfig_file(file_name)
+        {
+            artifact.unsupported_details.push(format!(
+                "diagnostic {index} refers to non-input file {file_name:?}; no annotated source section can be rendered"
+            ));
+        }
+    }
+
+    artifact.text.push_str(&annotations);
+    artifact.unsupported_details.sort();
+    artifact.unsupported_details.dedup();
+    artifact
+}
+
+fn render_diagnostic_header(
+    case: &Case,
+    diagnostics: &[&CompilationDiagnostic],
+    unsupported_details: &mut Vec<String>,
+) -> String {
+    let mut output = String::new();
+    for (index, diagnostic) in diagnostics.iter().enumerate() {
+        if let Some(file_name) = diagnostic.file_name.as_deref() {
+            match (diagnostic.source_text.as_ref(), diagnostic.range) {
+                (Some(source), Some(range)) => {
+                    let position = range.start.get() as usize;
+                    if position > source.len()
+                        || !source.as_scannable_str().is_char_boundary(position.min(source.len()))
+                    {
+                        unsupported_details.push(format!(
+                            "diagnostic {index} has an invalid source position {position} for {file_name:?}"
+                        ));
+                    } else {
+                        let display_name = baseline_diagnostic_file_name(case, file_name);
+                        if is_default_library_file(&display_name) {
+                            let _ = write!(output, "{display_name}(--,--): ");
+                        } else {
+                            let (line, column) = line_and_utf16_column(
+                                source.as_scannable_str(),
+                                position,
+                            );
+                            let _ = write!(output, "{display_name}({line},{column}): ");
+                        }
+                    }
+                }
+                _ => unsupported_details.push(format!(
+                    "diagnostic {index} for {file_name:?} lacks source text or a range required for its header location"
+                )),
+            }
+        }
+        output.push_str(diagnostic_category_name(
+            diagnostic.category,
+            index,
+            unsupported_details,
+        ));
+        if let Some(code) = diagnostic.code {
+            let _ = write!(output, " TS{code}: ");
+        } else {
+            output.push_str(": ");
+            unsupported_details.push(format!(
+                "diagnostic {index} lacks the code required by an error baseline"
+            ));
+        }
+        output.push_str(&normalize_to_crlf(&remove_test_path_prefixes(
+            &diagnostic.message,
+        )));
+        output.push_str(HARNESS_NEW_LINE);
+    }
+    output
+}
+
+#[allow(clippy::too_many_lines)]
+fn annotate_source_unit(
+    case: &Case,
+    unit: &Unit,
+    unit_index: usize,
+    diagnostics: &[(usize, &&CompilationDiagnostic)],
+    output: &mut String,
+    first_line: &mut bool,
+    unsupported_details: &mut Vec<String>,
+) {
+    let source = unit.source_text.as_scannable_str();
+    let mut line_starts = vec![0];
+    line_starts.extend(
+        source
+            .bytes()
+            .enumerate()
+            .filter_map(|(index, byte)| (byte == b'\n').then_some(index + 1)),
+    );
+    let lines = source.split('\n').collect::<Vec<_>>();
+    let mut marked = vec![false; diagnostics.len()];
+
+    for (line_index, raw_line) in lines.iter().enumerate() {
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        append_annotation_line(output, first_line, &format!("    {line}"));
+        let this_line_start = line_starts[line_index];
+        let next_line_start = if line_index + 1 == lines.len() {
+            source.len()
+        } else {
+            line_starts[line_index + 1]
+        };
+
+        for (file_diagnostic_index, (diagnostic_index, diagnostic)) in
+            diagnostics.iter().enumerate()
+        {
+            let Some(range) = diagnostic.range else {
+                unsupported_details.push(format!(
+                    "diagnostic {diagnostic_index} for {} lacks a source range",
+                    baseline_unit_name(case, unit, unit_index)
+                ));
+                continue;
+            };
+            let start = range.start.get() as usize;
+            let end = range.end.get() as usize;
+            if start > end || start > source.len() || end > source.len() {
+                unsupported_details.push(format!(
+                    "diagnostic {diagnostic_index} has range {start}..{end} outside {} ({} bytes)",
+                    baseline_unit_name(case, unit, unit_index),
+                    source.len()
+                ));
+                continue;
+            }
+            if end >= this_line_start && (start < next_line_start || line_index + 1 == lines.len())
+            {
+                let consumed_before_line = this_line_start.saturating_sub(start);
+                let length = end
+                    .saturating_sub(start)
+                    .saturating_sub(consumed_before_line);
+                let squiggle_start = start.saturating_sub(this_line_start);
+                if squiggle_start > line.len()
+                    || !line.is_char_boundary(squiggle_start.min(line.len()))
+                {
+                    unsupported_details.push(format!(
+                        "diagnostic {diagnostic_index} starts at a non-renderable byte offset on line {} of {}",
+                        line_index + 1,
+                        baseline_unit_name(case, unit, unit_index)
+                    ));
+                    continue;
+                }
+                let squiggle_end = squiggle_start
+                    .saturating_add(length)
+                    .min(line.len())
+                    .max(squiggle_start);
+                if !line.is_char_boundary(squiggle_end) {
+                    unsupported_details.push(format!(
+                        "diagnostic {diagnostic_index} ends at a non-renderable byte offset on line {} of {}",
+                        line_index + 1,
+                        baseline_unit_name(case, unit, unit_index)
+                    ));
+                    continue;
+                }
+                let prefix = line[..squiggle_start]
+                    .chars()
+                    .map(|character| {
+                        if matches!(character, ' ' | '\t' | '\u{000b}' | '\u{000c}') {
+                            character
+                        } else {
+                            ' '
+                        }
+                    })
+                    .collect::<String>();
+                let squiggles = "~".repeat(line[squiggle_start..squiggle_end].chars().count());
+                append_annotation_line(output, first_line, &format!("    {prefix}{squiggles}"));
+                if line_index + 1 == lines.len() || next_line_start > end {
+                    append_annotated_diagnostic(
+                        output,
+                        first_line,
+                        diagnostic,
+                        *diagnostic_index,
+                        case,
+                        unsupported_details,
+                    );
+                    marked[file_diagnostic_index] = true;
+                }
+            }
+        }
+    }
+
+    for ((diagnostic_index, _), was_marked) in diagnostics.iter().zip(marked) {
+        if !was_marked {
+            unsupported_details.push(format!(
+                "diagnostic {diagnostic_index} could not be annotated in {}",
+                baseline_unit_name(case, unit, unit_index)
+            ));
+        }
+    }
+}
+
+fn append_annotated_diagnostic(
+    output: &mut String,
+    first_line: &mut bool,
+    diagnostic: &CompilationDiagnostic,
+    diagnostic_index: usize,
+    case: &Case,
+    unsupported_details: &mut Vec<String>,
+) {
+    let category =
+        diagnostic_category_name(diagnostic.category, diagnostic_index, unsupported_details);
+    let code = diagnostic.code.map_or_else(
+        || {
+            unsupported_details.push(format!(
+                "diagnostic {diagnostic_index} lacks the code required by an annotated error"
+            ));
+            String::new()
+        },
+        |code| format!(" TS{code}"),
+    );
+    for line in
+        normalize_to_crlf(&remove_test_path_prefixes(&diagnostic.message)).split(HARNESS_NEW_LINE)
+    {
+        if !line.is_empty() {
+            append_annotation_line(output, first_line, &format!("!!! {category}{code}: {line}"));
+        }
+    }
+
+    if let Some(related_information) = diagnostic.related_information.as_ref() {
+        for (related_index, related) in related_information.iter().enumerate() {
+            let location = match (
+                related.file_name.as_deref(),
+                related.source_text.as_ref(),
+                related.range,
+            ) {
+                (Some(file_name), Some(source), Some(range)) => {
+                    let display_name = baseline_diagnostic_file_name(case, file_name);
+                    if is_default_library_file(&display_name) {
+                        format!(" {display_name}:--:--")
+                    } else {
+                        let position = range.start.get() as usize;
+                        if position > source.len()
+                            || !source
+                                .as_scannable_str()
+                                .is_char_boundary(position.min(source.len()))
+                        {
+                            unsupported_details.push(format!(
+                                "related diagnostic {diagnostic_index}.{related_index} has an invalid source position"
+                            ));
+                            String::new()
+                        } else {
+                            let (line, column) =
+                                line_and_utf16_column(source.as_scannable_str(), position);
+                            format!(" {display_name}:{line}:{column}")
+                        }
+                    }
+                }
+                (None, _, _) => String::new(),
+                _ => {
+                    unsupported_details.push(format!(
+                        "related diagnostic {diagnostic_index}.{related_index} lacks source text or a range for its location"
+                    ));
+                    String::new()
+                }
+            };
+            let code = related.code.map_or_else(
+                || {
+                    unsupported_details.push(format!(
+                        "related diagnostic {diagnostic_index}.{related_index} lacks a code"
+                    ));
+                    String::new()
+                },
+                |code| format!(" TS{code}"),
+            );
+            append_annotation_line(
+                output,
+                first_line,
+                &format!(
+                    "!!! related{code}{location}: {}",
+                    normalize_to_crlf(&remove_test_path_prefixes(&related.message))
+                ),
+            );
+        }
+    }
+}
+
+fn append_annotation_line(output: &mut String, first_line: &mut bool, line: &str) {
+    if *first_line {
+        *first_line = false;
+    } else {
+        output.push_str(HARNESS_NEW_LINE);
+    }
+    output.push_str(line);
+}
+
+fn compare_compilation_diagnostics(
+    left: &CompilationDiagnostic,
+    right: &CompilationDiagnostic,
+) -> Ordering {
+    left.file_name
+        .as_deref()
+        .unwrap_or_default()
+        .cmp(right.file_name.as_deref().unwrap_or_default())
+        .then_with(|| {
+            left.range
+                .map(|range| range.start)
+                .cmp(&right.range.map(|range| range.start))
+        })
+        .then_with(|| {
+            left.range
+                .map(|range| range.end)
+                .cmp(&right.range.map(|range| range.end))
+        })
+        .then_with(|| left.code.cmp(&right.code))
+        .then_with(|| left.message.cmp(&right.message))
+}
+
+fn diagnostic_primary_order_key(
+    diagnostic: &CompilationDiagnostic,
+) -> (&str, Option<TextRange>, Option<u32>) {
+    (
+        diagnostic.file_name.as_deref().unwrap_or_default(),
+        diagnostic.range,
+        diagnostic.code,
+    )
+}
+
+fn diagnostic_belongs_to_unit(
+    case: &Case,
+    diagnostic: &CompilationDiagnostic,
+    unit_index: usize,
+) -> bool {
+    let Some(file_name) = diagnostic.file_name.as_deref() else {
+        return false;
+    };
+    let unit = &case.units[unit_index];
+    let virtual_path = virtual_unit_path(case, unit, unit_index);
+    normalize_comparison_path(file_name)
+        .eq_ignore_ascii_case(&normalize_comparison_path(&virtual_path))
+        || baseline_diagnostic_file_name(case, file_name)
+            .eq_ignore_ascii_case(&baseline_unit_name(case, unit, unit_index))
+}
+
+fn normalize_comparison_path(path: &str) -> String {
+    ts_path::normalize_path(&path.replace('\\', "/"))
+}
+
+fn baseline_unit_name(case: &Case, unit: &Unit, unit_index: usize) -> String {
+    let name = if unit.path == case.path {
+        unit.path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map_or_else(|| format!("unit{unit_index}.ts"), str::to_owned)
+    } else {
+        unit.path.to_string_lossy().replace('\\', "/")
+    };
+    remove_test_path_prefixes(&name)
+}
+
+fn baseline_diagnostic_file_name(case: &Case, file_name: &str) -> String {
+    if let Some((unit_index, unit)) = case.units.iter().enumerate().find(|(unit_index, _)| {
+        normalize_comparison_path(file_name).eq_ignore_ascii_case(&normalize_comparison_path(
+            &virtual_unit_path(case, &case.units[*unit_index], *unit_index),
+        ))
+    }) {
+        return baseline_unit_name(case, unit, unit_index);
+    }
+    let name = remove_test_path_prefixes(&file_name.replace('\\', "/"));
+    name.strip_prefix("/case/").unwrap_or(&name).to_owned()
+}
+
+fn remove_test_path_prefixes(text: &str) -> String {
+    [
+        ("/.ts/", ""),
+        ("/.lib/", ""),
+        ("/.src/", ""),
+        ("bundled:///libs/", ""),
+        ("file:///./ts/", "file:///"),
+        ("file:///./lib/", "file:///"),
+        ("file:///./src/", "file:///"),
+    ]
+    .into_iter()
+    .fold(text.to_owned(), |text, (prefix, replacement)| {
+        text.replace(prefix, replacement)
+    })
+}
+
+fn is_default_library_file(file_name: &str) -> bool {
+    file_name
+        .rsplit(['/', '\\'])
+        .next()
+        .is_some_and(|base| base.starts_with("lib.") && base.ends_with(".d.ts"))
+}
+
+fn is_tsconfig_file(file_name: &str) -> bool {
+    let lower = file_name.to_ascii_lowercase();
+    lower.contains("tsconfig") && lower.contains("json")
+}
+
+fn diagnostic_category_name(
+    category: Option<CompilationDiagnosticCategory>,
+    diagnostic_index: usize,
+    unsupported_details: &mut Vec<String>,
+) -> &'static str {
+    match category {
+        Some(CompilationDiagnosticCategory::Error) => "error",
+        Some(CompilationDiagnosticCategory::Warning) => "warning",
+        Some(CompilationDiagnosticCategory::Suggestion) => "suggestion",
+        Some(CompilationDiagnosticCategory::Message) => "message",
+        None => {
+            unsupported_details.push(format!(
+                "diagnostic {diagnostic_index} lacks a category required by an error baseline"
+            ));
+            "unknown"
+        }
+    }
+}
+
+fn line_and_utf16_column(source: &str, byte_position: usize) -> (usize, usize) {
+    let position = byte_position.min(source.len());
+    let prefix = &source[..position];
+    let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let line_start = prefix.rfind('\n').map_or(0, |index| index + 1);
+    let column = prefix[line_start..].encode_utf16().count() + 1;
+    (line, column)
+}
+
+fn normalize_to_crlf(text: &str) -> String {
+    text.replace("\r\n", "\n")
         .replace('\r', "\n")
-        .trim_end_matches('\n')
-        .to_owned()
+        .replace('\n', HARNESS_NEW_LINE)
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct DiagnosticArtifactComparison {
+    mismatch_kinds: Vec<DiagnosticArtifactMismatchKind>,
+    first_difference: Option<DiagnosticArtifactDifference>,
+    unsupported_details: Vec<String>,
+}
+
+impl DiagnosticArtifactComparison {
+    fn is_exact(&self) -> bool {
+        self.mismatch_kinds.is_empty() && self.unsupported_details.is_empty()
+    }
+
+    fn status(&self) -> DiagnosticVariantStatus {
+        if self.is_exact() {
+            return DiagnosticVariantStatus::ExactMatch;
+        }
+        if !self.unsupported_details.is_empty()
+            || self
+                .mismatch_kinds
+                .contains(&DiagnosticArtifactMismatchKind::UnsupportedDetail)
+        {
+            return DiagnosticVariantStatus::UnsupportedDetail;
+        }
+        for (kind, status) in [
+            (
+                DiagnosticArtifactMismatchKind::Order,
+                DiagnosticVariantStatus::OrderMismatch,
+            ),
+            (
+                DiagnosticArtifactMismatchKind::Code,
+                DiagnosticVariantStatus::CodeMismatch,
+            ),
+            (
+                DiagnosticArtifactMismatchKind::Span,
+                DiagnosticVariantStatus::SpanMismatch,
+            ),
+            (
+                DiagnosticArtifactMismatchKind::Message,
+                DiagnosticVariantStatus::MessageMismatch,
+            ),
+            (
+                DiagnosticArtifactMismatchKind::HeaderOnly,
+                DiagnosticVariantStatus::HeaderOnlyMatch,
+            ),
+            (
+                DiagnosticArtifactMismatchKind::Header,
+                DiagnosticVariantStatus::HeaderMismatch,
+            ),
+        ] {
+            if self.mismatch_kinds.contains(&kind) {
+                return status;
+            }
+        }
+        DiagnosticVariantStatus::ArtifactMismatch
+    }
+}
+
+fn compare_diagnostic_artifacts(
+    expected: &str,
+    actual: &RenderedDiagnosticArtifact,
+    diagnostics: &[CompilationDiagnostic],
+) -> DiagnosticArtifactComparison {
+    let mut comparison = DiagnosticArtifactComparison {
+        unsupported_details: actual.unsupported_details.clone(),
+        ..DiagnosticArtifactComparison::default()
+    };
+    if expected.contains("!!! related TS")
+        && !actual.text.contains("!!! related TS")
+        && diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.related_information.is_none())
+    {
+        comparison.unsupported_details.push(
+            "the expected artifact contains related information, but the checker did not expose related diagnostics"
+                .to_owned(),
+        );
+    }
+    comparison.unsupported_details.sort();
+    comparison.unsupported_details.dedup();
+
+    if expected == actual.text && comparison.unsupported_details.is_empty() {
+        return comparison;
+    }
+    if !comparison.unsupported_details.is_empty() {
+        comparison
+            .mismatch_kinds
+            .push(DiagnosticArtifactMismatchKind::UnsupportedDetail);
+    }
+    if expected != actual.text {
+        let (line, expected_line, actual_line) = first_different_line(expected, &actual.text);
+        comparison.first_difference = Some(DiagnosticArtifactDifference {
+            line,
+            expected: expected_line.to_owned(),
+            actual: actual_line.to_owned(),
+        });
+    }
+
+    let expected_header = parse_error_baseline_header(expected);
+    let actual_header = parse_error_baseline_header(&actual.text);
+    if expected_header == actual_header {
+        let expected_squiggles = annotated_squiggles(expected);
+        let actual_squiggles = annotated_squiggles(&actual.text);
+        if expected_squiggles == actual_squiggles {
+            let expected_annotations = annotated_diagnostic_lines(expected);
+            let actual_annotations = annotated_diagnostic_lines(&actual.text);
+            if same_annotated_diagnostics_except(&expected_annotations, &actual_annotations, "code")
+            {
+                comparison
+                    .mismatch_kinds
+                    .push(DiagnosticArtifactMismatchKind::Code);
+            } else if same_annotated_diagnostics_except(
+                &expected_annotations,
+                &actual_annotations,
+                "message",
+            ) {
+                comparison
+                    .mismatch_kinds
+                    .push(DiagnosticArtifactMismatchKind::Message);
+            } else {
+                comparison
+                    .mismatch_kinds
+                    .push(DiagnosticArtifactMismatchKind::HeaderOnly);
+            }
+        } else {
+            comparison
+                .mismatch_kinds
+                .push(DiagnosticArtifactMismatchKind::Span);
+        }
+    } else {
+        let expected_records = parse_diagnostic_headers(&expected_header);
+        let actual_records = parse_diagnostic_headers(&actual_header);
+        if expected_records.len() == actual_records.len()
+            && !expected_records.is_empty()
+            && sorted_headers(&expected_records) == sorted_headers(&actual_records)
+        {
+            comparison
+                .mismatch_kinds
+                .push(DiagnosticArtifactMismatchKind::Order);
+        } else if headers_equal_except(&expected_records, &actual_records, "code") {
+            comparison
+                .mismatch_kinds
+                .push(DiagnosticArtifactMismatchKind::Code);
+        } else if headers_equal_except(&expected_records, &actual_records, "location") {
+            comparison
+                .mismatch_kinds
+                .push(DiagnosticArtifactMismatchKind::Span);
+        } else if headers_equal_except(&expected_records, &actual_records, "message") {
+            comparison
+                .mismatch_kinds
+                .push(DiagnosticArtifactMismatchKind::Message);
+        } else {
+            comparison
+                .mismatch_kinds
+                .push(DiagnosticArtifactMismatchKind::Header);
+        }
+    }
+    if comparison.mismatch_kinds.is_empty() {
+        comparison
+            .mismatch_kinds
+            .push(DiagnosticArtifactMismatchKind::Artifact);
+    }
+    comparison.mismatch_kinds.sort_by_key(|kind| *kind as u8);
+    comparison.mismatch_kinds.dedup();
+    comparison
+}
+
+fn parse_diagnostic_headers(header: &str) -> Vec<ParsedDiagnosticHeader> {
+    let mut records = Vec::<ParsedDiagnosticHeader>::new();
+    for line in header.lines() {
+        if let Some(record) = parse_diagnostic_header_line(line) {
+            records.push(record);
+        } else if let Some(record) = records.last_mut() {
+            record.message.push('\n');
+            record.message.push_str(line);
+        }
+    }
+    records
+}
+
+fn parse_diagnostic_header_line(line: &str) -> Option<ParsedDiagnosticHeader> {
+    let code_marker = line.rfind(" TS")?;
+    let after_marker = &line[code_marker + 3..];
+    let (code, message) = after_marker.split_once(": ")?;
+    let code = code.parse().ok()?;
+    let prefix = &line[..code_marker];
+    let (location, category) = prefix.rsplit_once(": ").map_or_else(
+        || (None, prefix),
+        |(location, category)| (Some(location.to_owned()), category),
+    );
+    Some(ParsedDiagnosticHeader {
+        location,
+        category: category.to_owned(),
+        code: Some(code),
+        message: message.to_owned(),
+    })
+}
+
+fn sorted_headers(headers: &[ParsedDiagnosticHeader]) -> Vec<ParsedDiagnosticHeader> {
+    let mut headers = headers.to_vec();
+    headers.sort();
+    headers
+}
+
+fn headers_equal_except(
+    expected: &[ParsedDiagnosticHeader],
+    actual: &[ParsedDiagnosticHeader],
+    excluded: &str,
+) -> bool {
+    expected.len() == actual.len()
+        && !expected.is_empty()
+        && expected.iter().zip(actual).all(|(expected, actual)| {
+            (excluded == "location" || expected.location == actual.location)
+                && (excluded == "code" || expected.code == actual.code)
+                && expected.category == actual.category
+                && (excluded == "message" || expected.message == actual.message)
+        })
+        && expected != actual
+}
+
+fn annotated_squiggles(artifact: &str) -> Vec<String> {
+    normalize_diagnostic_header_newlines(artifact)
+        .lines()
+        .filter(|line| {
+            line.contains('~')
+                && line
+                    .chars()
+                    .all(|character| matches!(character, ' ' | '\t' | '~'))
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
+fn annotated_diagnostic_lines(artifact: &str) -> Vec<String> {
+    normalize_diagnostic_header_newlines(artifact)
+        .lines()
+        .filter(|line| line.starts_with("!!! "))
+        .map(str::to_owned)
+        .collect()
+}
+
+fn same_annotated_diagnostics_except(
+    expected: &[String],
+    actual: &[String],
+    excluded: &str,
+) -> bool {
+    if expected.len() != actual.len() || expected.is_empty() || expected == actual {
+        return false;
+    }
+    expected.iter().zip(actual).all(|(expected, actual)| {
+        let expected = parse_annotated_diagnostic(expected);
+        let actual = parse_annotated_diagnostic(actual);
+        match (expected, actual) {
+            (Some(expected), Some(actual)) => {
+                expected.0 == actual.0
+                    && (excluded == "code" || expected.1 == actual.1)
+                    && (excluded == "message" || expected.2 == actual.2)
+            }
+            _ => false,
+        }
+    })
+}
+
+fn parse_annotated_diagnostic(line: &str) -> Option<(&str, Option<u32>, &str)> {
+    let content = line.strip_prefix("!!! ")?;
+    let code_marker = content.find(" TS")?;
+    let label = &content[..code_marker];
+    let (code_and_location, message) = content[code_marker + 3..].split_once(": ")?;
+    let code = code_and_location
+        .split([' ', ':'])
+        .next()
+        .and_then(|code| code.parse().ok());
+    Some((label, code, message))
+}
+
+fn normalize_diagnostic_header_newlines(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 /// Parses TypeScript's `//// [file]` baseline sections, preserving section
@@ -1156,22 +2031,31 @@ fn compile_case_variant(case: &Case, variant: &OptionVariant) -> std::io::Result
         compiler_options,
     );
     let emit = program.emit();
-    let diagnostic_text =
-        format_compilation_diagnostics(&program, &emit.diagnostics, current_directory);
-    let diagnostics = emit
+    let mut diagnostics = emit
         .diagnostics
         .iter()
         .chain(program.diagnostics())
         .map(|diagnostic| CompilationDiagnostic {
             file_name: diagnostic.file_name.clone(),
+            source_text: diagnostic
+                .file_name
+                .as_deref()
+                .and_then(|file_name| program.source_file(file_name))
+                .map(|source_file| SourceText::from(source_file.source_text.clone())),
             range: diagnostic.range,
             code: diagnostic.code,
             // ProgramDiagnostic currently has no category field. The fixture
             // formatter renders this diagnostic stream as errors.
             category: Some(CompilationDiagnosticCategory::Error),
             message: diagnostic.message.clone(),
+            // ProgramDiagnostic does not currently transport related information.
+            related_information: None,
         })
-        .collect();
+        .collect::<Vec<_>>();
+    diagnostics.sort_by(compare_compilation_diagnostics);
+    let ordered = diagnostics.iter().collect::<Vec<_>>();
+    let mut unsupported_details = Vec::new();
+    let diagnostic_text = render_diagnostic_header(case, &ordered, &mut unsupported_details);
     let outputs = emit
         .files
         .into_iter()
@@ -1182,61 +2066,6 @@ fn compile_case_variant(case: &Case, variant: &OptionVariant) -> std::io::Result
         diagnostic_text,
         outputs,
     })
-}
-
-fn format_compilation_diagnostics(
-    program: &ts_compiler::Program,
-    emit_diagnostics: &[ts_compiler::ProgramDiagnostic],
-    current_directory: &str,
-) -> String {
-    let mut output = format_program_diagnostics(program, program.diagnostics(), current_directory);
-    output.push_str(&format_program_diagnostics(
-        program,
-        emit_diagnostics,
-        current_directory,
-    ));
-    output
-}
-
-fn format_program_diagnostics(
-    program: &ts_compiler::Program,
-    program_diagnostics: &[ts_compiler::ProgramDiagnostic],
-    current_directory: &str,
-) -> String {
-    let mut ordered = program_diagnostics.iter().collect::<Vec<_>>();
-    ordered.sort_by(|left, right| {
-        left.file_name
-            .cmp(&right.file_name)
-            .then_with(|| {
-                left.range
-                    .map(|range| range.start)
-                    .cmp(&right.range.map(|range| range.start))
-            })
-            .then_with(|| left.code.cmp(&right.code))
-    });
-    let diagnostics = ordered
-        .into_iter()
-        .map(|diagnostic| Diagnostic {
-            file_name: diagnostic.file_name.as_deref(),
-            source_text: diagnostic
-                .file_name
-                .as_deref()
-                .and_then(|file_name| program.source_file(file_name))
-                .map(|source_file| source_file.source_text.as_str()),
-            range: diagnostic.range,
-            code: diagnostic.code,
-            category: DiagnosticCategory::Error,
-            message: &diagnostic.message,
-        })
-        .collect::<Vec<_>>();
-    format_diagnostics(
-        &diagnostics,
-        FormattingOptions {
-            current_directory,
-            pretty: false,
-            ..FormattingOptions::default()
-        },
-    )
 }
 
 fn virtual_harness_path(path: &str) -> String {
@@ -1916,12 +2745,16 @@ mod tests {
         path::{Path, PathBuf},
     };
 
+    use ts_core::{TextPos, TextRange};
+
     use super::{
-        Case, OptionVariant, OutputDifferenceKind, ParseError,
-        compare_case_emitted_output_sections, compare_emitted_output_sections, compile_case,
-        compile_case_matrix, expand_option_matrix, first_different_line, fixture_compiler_options,
-        matrix_axes, parse_baseline_sections, parse_error_baseline_header,
-        run_case_against_baseline, select_variant_baselines, virtual_unit_path,
+        Case, CompilationDiagnostic, CompilationDiagnosticCategory, CompilationRelatedInformation,
+        DiagnosticArtifactMismatchKind, OptionVariant, OutputDifferenceKind, ParseError,
+        compare_case_emitted_output_sections, compare_diagnostic_artifacts,
+        compare_emitted_output_sections, compile_case, compile_case_matrix, expand_option_matrix,
+        first_different_line, fixture_compiler_options, matrix_axes, parse_baseline_sections,
+        parse_error_baseline_header, render_error_baseline, run_case_against_baseline,
+        select_variant_baselines, virtual_unit_path,
     };
 
     #[test]
@@ -2374,6 +3207,245 @@ mod tests {
                 "input.ts(3,6): error TS2322: Type 'string | number' is not assignable to type 'string'.\n",
                 "  Type 'number' is not assignable to type 'string'.",
             )
+        );
+    }
+
+    #[test]
+    fn renders_global_related_crlf_and_utf8_diagnostic_artifacts_exactly() {
+        let case = Case::parse("global.ts", "const café = 1;\r\n").unwrap();
+        let source = case.units[0].source_text.clone();
+        let related_start = u32::try_from(source.as_scannable_str().find('=').unwrap()).unwrap();
+        let diagnostic = CompilationDiagnostic {
+            file_name: None,
+            source_text: None,
+            range: None,
+            code: Some(2318),
+            category: Some(CompilationDiagnosticCategory::Error),
+            message: "Cannot find global type 'Array'.".to_owned(),
+            related_information: Some(vec![CompilationRelatedInformation {
+                file_name: Some("/case/global.ts".to_owned()),
+                source_text: Some(source),
+                range: Some(TextRange::new(
+                    TextPos::new(related_start),
+                    TextPos::new(related_start + 1),
+                )),
+                code: Some(2728),
+                message: "The declaration is here.".to_owned(),
+            }]),
+        };
+
+        let artifact = render_error_baseline(&case, &[diagnostic]);
+        assert!(artifact.unsupported_details.is_empty());
+        assert_eq!(
+            artifact.text,
+            concat!(
+                "error TS2318: Cannot find global type 'Array'.\r\n",
+                "\r\n",
+                "\r\n",
+                "!!! error TS2318: Cannot find global type 'Array'.\r\n",
+                "!!! related TS2728 global.ts:1:12: The declaration is here.\r\n",
+                "==== global.ts (0 errors) ====\r\n",
+                "    const café = 1;\r\n",
+                "    ",
+            )
+        );
+    }
+
+    #[test]
+    fn renders_multifile_multiline_spans_and_messages_exactly() {
+        let case = Case::parse(
+            "multifile.ts",
+            concat!(
+                "// @filename: a.ts\r\n",
+                "const first = 1;\r\n",
+                "// @filename: b.ts\r\n",
+                "const value:\r\n",
+                "    string = 1;\r\n",
+            ),
+        )
+        .unwrap();
+        let source = case.units[1].source_text.clone();
+        let start = u32::try_from(source.as_scannable_str().find("value").unwrap()).unwrap();
+        let end = u32::try_from(source.as_scannable_str().find("string").unwrap() + "string".len())
+            .unwrap();
+        let diagnostic = CompilationDiagnostic {
+            file_name: Some("/case/b.ts".to_owned()),
+            source_text: Some(source),
+            range: Some(TextRange::new(TextPos::new(start), TextPos::new(end))),
+            code: Some(9999),
+            category: Some(CompilationDiagnosticCategory::Error),
+            message: "First line.\nSecond line.".to_owned(),
+            related_information: None,
+        };
+
+        let artifact = render_error_baseline(&case, &[diagnostic]);
+        assert!(artifact.unsupported_details.is_empty());
+        assert_eq!(
+            artifact.text,
+            concat!(
+                "b.ts(1,7): error TS9999: First line.\r\n",
+                "Second line.\r\n",
+                "\r\n",
+                "\r\n",
+                "==== a.ts (0 errors) ====\r\n",
+                "    const first = 1;\r\n",
+                "    \r\n",
+                "==== b.ts (1 errors) ====\r\n",
+                "    const value:\r\n",
+                "          ~~~~~~\r\n",
+                "        string = 1;\r\n",
+                "    ~~~~~~~~~~\r\n",
+                "!!! error TS9999: First line.\r\n",
+                "!!! error TS9999: Second line.\r\n",
+                "    ",
+            )
+        );
+    }
+
+    #[test]
+    fn diagnostic_artifact_diff_classifies_exact_header_code_span_message_and_order() {
+        let case = Case::parse("input.ts", "const value = 1;\n").unwrap();
+        let source = case.units[0].source_text.clone();
+        let diagnostic = CompilationDiagnostic {
+            file_name: Some("/case/input.ts".to_owned()),
+            source_text: Some(source),
+            range: Some(TextRange::new(TextPos::new(6), TextPos::new(11))),
+            code: Some(1000),
+            category: Some(CompilationDiagnosticCategory::Error),
+            message: "Original message.".to_owned(),
+            related_information: None,
+        };
+        let actual = render_error_baseline(&case, std::slice::from_ref(&diagnostic));
+        assert!(
+            compare_diagnostic_artifacts(&actual.text, &actual, std::slice::from_ref(&diagnostic))
+                .is_exact()
+        );
+
+        let line_endings = actual.text.replace("\r\n", "\n");
+        assert_eq!(
+            compare_diagnostic_artifacts(&line_endings, &actual, std::slice::from_ref(&diagnostic))
+                .mismatch_kinds,
+            [DiagnosticArtifactMismatchKind::HeaderOnly]
+        );
+        let code = actual.text.replace("TS1000", "TS1001");
+        assert_eq!(
+            compare_diagnostic_artifacts(&code, &actual, std::slice::from_ref(&diagnostic))
+                .mismatch_kinds,
+            [DiagnosticArtifactMismatchKind::Code]
+        );
+        let span = actual.text.replacen("(1,7)", "(1,8)", 1);
+        assert_eq!(
+            compare_diagnostic_artifacts(&span, &actual, std::slice::from_ref(&diagnostic))
+                .mismatch_kinds,
+            [DiagnosticArtifactMismatchKind::Span]
+        );
+        let message = actual
+            .text
+            .replace("Original message.", "Different message.");
+        assert_eq!(
+            compare_diagnostic_artifacts(&message, &actual, std::slice::from_ref(&diagnostic))
+                .mismatch_kinds,
+            [DiagnosticArtifactMismatchKind::Message]
+        );
+
+        let globals = [
+            CompilationDiagnostic {
+                file_name: None,
+                source_text: None,
+                range: None,
+                code: Some(1000),
+                category: Some(CompilationDiagnosticCategory::Error),
+                message: "First.".to_owned(),
+                related_information: None,
+            },
+            CompilationDiagnostic {
+                file_name: None,
+                source_text: None,
+                range: None,
+                code: Some(2000),
+                category: Some(CompilationDiagnosticCategory::Error),
+                message: "Second.".to_owned(),
+                related_information: None,
+            },
+        ];
+        let actual = render_error_baseline(&case, &globals);
+        let (header, body) = actual.text.split_once("\r\n\r\n\r\n").unwrap();
+        let mut header_lines = header.split("\r\n").collect::<Vec<_>>();
+        header_lines.reverse();
+        let reordered = format!("{}\r\n\r\n\r\n{body}", header_lines.join("\r\n"));
+        assert_eq!(
+            compare_diagnostic_artifacts(&reordered, &actual, &globals).mismatch_kinds,
+            [DiagnosticArtifactMismatchKind::Order]
+        );
+    }
+
+    #[test]
+    fn expected_related_information_is_unsupported_when_checker_does_not_expose_it() {
+        let case = Case::parse("global.ts", "").unwrap();
+        let diagnostic = CompilationDiagnostic {
+            file_name: None,
+            source_text: None,
+            range: None,
+            code: Some(2318),
+            category: Some(CompilationDiagnosticCategory::Error),
+            message: "Global error.".to_owned(),
+            related_information: None,
+        };
+        let actual = render_error_baseline(&case, std::slice::from_ref(&diagnostic));
+        let expected = actual.text.replacen(
+            "\r\n====",
+            "\r\n!!! related TS2728: Missing checker detail.\r\n====",
+            1,
+        );
+        let comparison =
+            compare_diagnostic_artifacts(&expected, &actual, std::slice::from_ref(&diagnostic));
+        assert_eq!(
+            comparison.status(),
+            super::DiagnosticVariantStatus::UnsupportedDetail
+        );
+        assert!(
+            comparison
+                .mismatch_kinds
+                .contains(&DiagnosticArtifactMismatchKind::UnsupportedDetail)
+        );
+        assert!(!comparison.unsupported_details.is_empty());
+    }
+
+    #[test]
+    fn normalizes_upstream_prefixes_inside_messages_and_rejects_ambiguous_ordering() {
+        let case = Case::parse("global.ts", "").unwrap();
+        let diagnostics = [
+            CompilationDiagnostic {
+                file_name: None,
+                source_text: None,
+                range: None,
+                code: Some(1000),
+                category: Some(CompilationDiagnosticCategory::Error),
+                message: "See /.src/first.ts.".to_owned(),
+                related_information: None,
+            },
+            CompilationDiagnostic {
+                file_name: None,
+                source_text: None,
+                range: None,
+                code: Some(1000),
+                category: Some(CompilationDiagnosticCategory::Error),
+                message: "See bundled:///libs/second.d.ts.".to_owned(),
+                related_information: None,
+            },
+        ];
+        let artifact = render_error_baseline(&case, &diagnostics);
+        assert!(artifact.text.contains("See first.ts."));
+        assert!(artifact.text.contains("See second.d.ts."));
+        assert!(!artifact.text.contains("/.src/"));
+        assert!(!artifact.text.contains("bundled:///libs/"));
+        assert!(!artifact.unsupported_details.is_empty());
+
+        let comparison = compare_diagnostic_artifacts(&artifact.text, &artifact, &diagnostics);
+        assert!(!comparison.is_exact());
+        assert_eq!(
+            comparison.status(),
+            super::DiagnosticVariantStatus::UnsupportedDetail
         );
     }
 

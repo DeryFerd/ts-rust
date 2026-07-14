@@ -174,12 +174,12 @@ fn upstream_skips_are_visible_but_never_executed() {
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        "summary: discovered_cases=1 upstream_skipped_cases=1 selected_cases=0 executed_variants=0 matched=0 mismatched=0 missing=0 content=0 missing_sections=0 unexpected_sections=0 diagnostics=0 diagnostic_comparison=header-only exact_matches=0 header_only_matches=0 header_mismatches=0\n"
+        "summary: discovered_cases=1 upstream_skipped_cases=1 selected_cases=0 executed_variants=0 matched=0 mismatched=0 missing=0 content=0 missing_sections=0 unexpected_sections=0 diagnostics=0 diagnostic_comparison=full-artifact exact_matches=0 header_only_matches=0 code_mismatches=0 span_mismatches=0 message_mismatches=0 order_mismatches=0 unsupported_details=0 header_mismatches=0 artifact_mismatches=0\n"
     );
 }
 
 #[test]
-fn compares_diagnostic_headers_without_changing_emit_mode() {
+fn compares_complete_diagnostic_artifacts_without_changing_emit_mode() {
     let repository = TestRepository::new();
     repository.write_case(
         "diagnosticParity",
@@ -197,6 +197,10 @@ fn compares_diagnostic_headers_without_changing_emit_mode() {
             "\r\n",
             "\r\n",
             "==== diagnosticParity.ts (1 errors) ====\r\n",
+            "    const value: string = 1;\r\n",
+            "          ~~~~~~~~~~~~~~~~~\r\n",
+            "!!! error TS2322: Type 'number' is not assignable to type 'string'.\r\n",
+            "    ",
         ),
     );
 
@@ -211,12 +215,12 @@ fn compares_diagnostic_headers_without_changing_emit_mode() {
     );
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        "summary: discovered_cases=1 upstream_skipped_cases=0 selected_cases=1 executed_variants=1 matched=1 mismatched=0 missing=0 content=0 missing_sections=0 unexpected_sections=0 diagnostics=0 diagnostic_comparison=header-only exact_matches=0 header_only_matches=1 header_mismatches=0\n"
+        "summary: discovered_cases=1 upstream_skipped_cases=0 selected_cases=1 executed_variants=1 matched=1 mismatched=0 missing=0 content=0 missing_sections=0 unexpected_sections=0 diagnostics=0 diagnostic_comparison=full-artifact exact_matches=1 header_only_matches=0 code_mismatches=0 span_mismatches=0 message_mismatches=0 order_mismatches=0 unsupported_details=0 header_mismatches=0 artifact_mismatches=0\n"
     );
 }
 
 #[test]
-fn writes_deterministic_structured_header_only_scorecard() {
+fn writes_deterministic_structured_full_artifact_scorecard() {
     let repository = TestRepository::new();
     repository.write_case(
         "aHeaderMatch",
@@ -226,9 +230,14 @@ fn writes_deterministic_structured_header_only_scorecard() {
     repository.write_baseline(
         "aHeaderMatch.errors.txt",
         concat!(
-            "aHeaderMatch.ts(1,7): error TS2322: Type 'number' is not assignable to type 'string'.\n",
-            "\n",
-            "==== aHeaderMatch.ts (1 errors) ====\n",
+            "aHeaderMatch.ts(1,7): error TS2322: Type 'number' is not assignable to type 'string'.\r\n",
+            "\r\n",
+            "\r\n",
+            "==== aHeaderMatch.ts (1 errors) ====\r\n",
+            "    const value: string = 1;\r\n",
+            "          ~~~~~~~~~~~~~~~~~\r\n",
+            "!!! error TS2322: Type 'number' is not assignable to type 'string'.\r\n",
+            "    ",
         ),
     );
     repository.write_case(
@@ -238,7 +247,16 @@ fn writes_deterministic_structured_header_only_scorecard() {
     );
     repository.write_baseline(
         "bHeaderMismatch.errors.txt",
-        "bHeaderMismatch.ts(1,7): error TS9999: deliberately wrong\n",
+        concat!(
+            "bHeaderMismatch.ts(1,7): error TS9999: Type 'number' is not assignable to type 'string'.\r\n",
+            "\r\n",
+            "\r\n",
+            "==== bHeaderMismatch.ts (1 errors) ====\r\n",
+            "    const value: string = 1;\r\n",
+            "          ~~~~~~~~~~~~~~~~~\r\n",
+            "!!! error TS9999: Type 'number' is not assignable to type 'string'.\r\n",
+            "    ",
+        ),
     );
 
     let first_path = repository.0.join("scorecard-first.json");
@@ -266,12 +284,13 @@ fn writes_deterministic_structured_header_only_scorecard() {
     assert_eq!(first_json, fs::read_to_string(second_path).unwrap());
 
     let scorecard: serde_json::Value = serde_json::from_str(&first_json).unwrap();
-    assert_eq!(scorecard["schemaVersion"], 1);
-    assert_eq!(scorecard["comparisonScope"], "header_only");
-    assert_eq!(scorecard["fullArtifactComparison"], false);
+    assert_eq!(scorecard["schemaVersion"], 2);
+    assert_eq!(scorecard["comparisonScope"], "full_artifact");
+    assert_eq!(scorecard["fullArtifactComparison"], true);
     assert_eq!(scorecard["summary"]["executedVariants"], 2);
-    assert_eq!(scorecard["summary"]["exactMatches"], 0);
-    assert_eq!(scorecard["summary"]["headerOnlyMatches"], 1);
+    assert_eq!(scorecard["summary"]["exactMatches"], 1);
+    assert_eq!(scorecard["summary"]["headerOnlyMatches"], 0);
+    assert_eq!(scorecard["summary"]["codeMismatches"], 1);
     assert_eq!(scorecard["summary"]["headerMismatches"], 1);
     assert_eq!(scorecard["summary"]["actualDiagnostics"], 2);
 
@@ -280,13 +299,14 @@ fn writes_deterministic_structured_header_only_scorecard() {
         variants[0]["case"],
         "testdata/tests/cases/compiler/aHeaderMatch.ts"
     );
-    assert_eq!(variants[0]["status"], "header_only_match");
-    assert_eq!(variants[0]["comparisonScope"], "header_only");
+    assert_eq!(variants[0]["status"], "exact_match");
+    assert_eq!(variants[0]["comparisonScope"], "full_artifact");
     assert_eq!(
         variants[0]["expectedBaseline"],
         "testdata/baselines/reference/compiler/aHeaderMatch.errors.txt"
     );
-    assert_eq!(variants[1]["status"], "header_mismatch");
+    assert_eq!(variants[1]["status"], "code_mismatch");
+    assert_eq!(variants[1]["mismatchKinds"], serde_json::json!(["code"]));
 
     let diagnostic = &variants[0]["diagnostics"][0];
     assert_eq!(diagnostic["fileName"], "/case/aHeaderMatch.ts");
@@ -298,6 +318,25 @@ fn writes_deterministic_structured_header_only_scorecard() {
         diagnostic["message"],
         "Type 'number' is not assignable to type 'string'."
     );
+}
+
+#[test]
+fn diagnostics_mode_counts_a_clean_missing_baseline_as_an_exact_match() {
+    let repository = TestRepository::new();
+    repository.write_case(
+        "cleanDiagnostic",
+        "// @noLib: true\nconst value: number = 1;\n",
+        None,
+    );
+
+    let output = run(
+        &repository.0,
+        &["--diagnostics", "--filter", "cleanDiagnostic"],
+    );
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("matched=1 mismatched=0"));
+    assert!(stdout.contains("diagnostic_comparison=full-artifact exact_matches=1"));
 }
 
 #[test]
@@ -316,6 +355,7 @@ fn diagnostics_mode_treats_a_missing_error_baseline_as_no_expected_errors() {
     assert_eq!(output.status.code(), Some(1));
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("MISMATCH testdata/tests/cases/compiler/unexpectedDiagnostic.ts"));
+    assert!(stdout.contains("HeaderMismatch at artifact line 1"));
     assert!(stdout.contains("expected \"\""));
     assert!(stdout.contains("actual \"unexpectedDiagnostic.ts(1,7): error TS2322"));
     assert!(stdout.contains("matched=0 mismatched=1"));

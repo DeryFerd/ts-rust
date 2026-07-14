@@ -18,7 +18,6 @@ serde_json = "1"
 ts_compiler = { path = "../../crates/ts_compiler" }
 ts_config = { path = "../../crates/ts_config" }
 ts_core = { path = "../../crates/ts_core" }
-ts_diagnostic_writer = { path = "../../crates/ts_diagnostic_writer" }
 ts_options = { path = "../../crates/ts_options" }
 ts_path = { path = "../../crates/ts_path" }
 ts_vfs = { path = "../../crates/ts_vfs" }
