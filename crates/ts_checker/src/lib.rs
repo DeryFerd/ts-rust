@@ -1,5 +1,7 @@
 //! Initial semantic type checking over the arena-backed TypeScript AST.
 
+pub mod semantic;
+
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
