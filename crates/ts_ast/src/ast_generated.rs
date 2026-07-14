@@ -18,6 +18,39 @@ impl NodeId {
     }
 }
 
+/// Opaque identity for one node arena allocation.
+///
+/// Moving an arena preserves its identity. Cloning creates an independent
+/// arena with a fresh identity so binding provenance cannot cross clones.
+#[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct NodeArenaId(std::num::NonZeroU64);
+
+impl std::fmt::Debug for NodeArenaId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("NodeArenaId")
+    }
+}
+
+static LAST_NODE_ARENA_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn allocate_node_arena_id_from(counter: &std::sync::atomic::AtomicU64) -> NodeArenaId {
+    let previous = counter
+        .fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |current| current.checked_add(1),
+        )
+        .unwrap_or_else(|_| panic!("AST node arena identity space exhausted"));
+    NodeArenaId(
+        std::num::NonZeroU64::new(previous + 1)
+            .expect("allocated AST node arena identities are nonzero"),
+    )
+}
+
+fn allocate_node_arena_id() -> NodeArenaId {
+    allocate_node_arena_id_from(&LAST_NODE_ARENA_ID)
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct SymbolId(pub u32);
 
@@ -61,19 +94,53 @@ pub struct Node {
     pub data: NodeData,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Debug)]
 pub struct NodeArena {
+    id: NodeArenaId,
     nodes: Vec<Node>,
     source_text: Option<String>,
 }
 
-impl NodeArena {
-    #[must_use]
-    pub const fn new() -> Self {
+impl Clone for NodeArena {
+    fn clone(&self) -> Self {
         Self {
+            id: allocate_node_arena_id(),
+            nodes: self.nodes.clone(),
+            source_text: self.source_text.clone(),
+        }
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        self.id = allocate_node_arena_id();
+        self.nodes.clone_from(&source.nodes);
+        self.source_text.clone_from(&source.source_text);
+    }
+}
+
+impl Default for NodeArena {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl NodeArena {
+    /// Creates an empty arena with a fresh, process-local identity.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the process has exhausted the arena identity space.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            id: allocate_node_arena_id(),
             nodes: Vec::new(),
             source_text: None,
         }
+    }
+
+    #[must_use]
+    pub const fn id(&self) -> NodeArenaId {
+        self.id
     }
 
     pub fn set_source_text(&mut self, source_text: impl Into<String>) {

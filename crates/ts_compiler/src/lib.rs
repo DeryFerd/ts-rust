@@ -52,6 +52,13 @@ impl SourceFile {
     /// Returns a program-wide identity when `node` belongs to this file's arena.
     #[must_use]
     pub fn node_ref(&self, node: NodeId) -> Option<NodeRef> {
+        if self.binding.file_id() != Some(self.id)
+            || !self
+                .binding
+                .is_for_source(&self.parse.arena, self.parse.source_file)
+        {
+            return None;
+        }
         self.parse
             .arena
             .get(node)
@@ -2106,7 +2113,10 @@ impl Program {
             vec![Vec::new(); self.source_files.len()]
         };
         for (index, (source_file, mut checking)) in
-            self.source_files.iter_mut().zip(checked.files).enumerate()
+            self.source_files
+                .iter_mut()
+                .zip(checked.into_files())
+                .enumerate()
         {
             if check_declaration_portability {
                 add_nonportable_inferred_type_diagnostics(source_file, &mut checking);
@@ -2399,9 +2409,15 @@ impl Program {
             "SourceFile identity does not match its Program slot"
         );
         assert_eq!(
-            source_file.binding.file_id,
+            source_file.binding.file_id(),
             Some(source_file.id),
             "binding provenance does not match its owning SourceFile"
+        );
+        assert!(
+            source_file
+                .binding
+                .is_for_source(&source_file.parse.arena, source_file.parse.source_file),
+            "binding arena and source file do not match their owning SourceFile"
         );
         assert!(
             self.file_index.insert(canonical, index).is_none(),
@@ -5571,7 +5587,8 @@ mod tests {
     use ts_vfs::{FileSystem, MemoryFileSystem};
 
     use super::{
-        FileId, Program, SyntaxKind, defer_export_only_bundle_imports,
+        FileId, Program, SourceFile, SyntaxKind, bind_source_file_in_file,
+        defer_export_only_bundle_imports, empty_check_result, parse_source_file,
         percent_encode_source_map_url,
     };
 
@@ -5611,14 +5628,34 @@ mod tests {
 
         assert_eq!(first.parse.source_file, second.parse.source_file);
         assert_ne!(first.id, second.id);
-        assert_eq!(first.binding.file_id, Some(first.id));
-        assert_eq!(second.binding.file_id, Some(second.id));
+        assert_eq!(first.binding.file_id(), Some(first.id));
+        assert_eq!(second.binding.file_id(), Some(second.id));
 
         let first_ref = first.node_ref(first.parse.source_file).unwrap();
         let second_ref = second.node_ref(second.parse.source_file).unwrap();
         assert_ne!(first_ref, second_ref);
         assert_eq!(program.node(first_ref).unwrap().kind, SyntaxKind::SourceFile);
         assert_eq!(program.node(second_ref).unwrap().kind, SyntaxKind::SourceFile);
+    }
+
+    #[test]
+    fn source_file_node_refs_fail_closed_for_cross_wired_bindings() {
+        let first = parse_source_file("export const first = 1;");
+        let second = parse_source_file("export const second = 2;");
+        let id = FileId::new(7);
+        let binding = bind_source_file_in_file(&first.arena, first.source_file, id);
+        let source = SourceFile {
+            id,
+            file_name: "second.ts".to_owned(),
+            source_text: "export const second = 2;".to_owned(),
+            parse: second,
+            binding,
+            checking: empty_check_result(),
+            is_default_library: false,
+            implied_node_format: ModuleKind::None,
+        };
+
+        assert_eq!(source.node_ref(source.parse.source_file), None);
     }
 
     #[test]
@@ -5678,7 +5715,7 @@ mod tests {
         for (index, source) in program.source_files().iter().enumerate() {
             let expected = FileId::new(u32::try_from(index).unwrap());
             assert_eq!(source.id, expected);
-            assert_eq!(source.binding.file_id, Some(expected));
+            assert_eq!(source.binding.file_id(), Some(expected));
             assert_eq!(
                 program.source_file_by_id(expected).unwrap().file_name,
                 source.file_name

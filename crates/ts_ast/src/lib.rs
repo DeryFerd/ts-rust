@@ -80,6 +80,44 @@ mod tests {
     }
 
     #[test]
+    fn arena_identity_survives_moves_and_changes_across_clones() {
+        let arena = NodeArena::new();
+        let identity = arena.id();
+        let moved = arena;
+        assert_eq!(moved.id(), identity);
+
+        let cloned = moved.clone();
+        assert_ne!(cloned.id(), identity);
+        assert_ne!(NodeArena::default().id(), identity);
+
+        let mut clone_target = NodeArena::new();
+        let clone_target_identity = clone_target.id();
+        clone_target.clone_from(&moved);
+        assert_ne!(clone_target.id(), clone_target_identity);
+        assert_ne!(clone_target.id(), identity);
+        assert_eq!(format!("{identity:?}"), "NodeArenaId");
+    }
+
+    #[test]
+    fn arena_identity_allocation_fails_permanently_before_wrapping() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let counter = AtomicU64::new(u64::MAX - 1);
+        let _last_identity = super::ast_generated::allocate_node_arena_id_from(&counter);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+
+        for _ in 0..2 {
+            assert!(
+                std::panic::catch_unwind(|| {
+                    super::ast_generated::allocate_node_arena_id_from(&counter)
+                })
+                .is_err()
+            );
+            assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+        }
+    }
+
+    #[test]
     fn node_refs_disambiguate_file_local_node_ids() {
         let node = super::NodeId::new(7);
         let first = NodeRef::new(FileId::new(0), node);

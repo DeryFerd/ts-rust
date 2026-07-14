@@ -688,7 +688,7 @@ pub fn check_source_file_with_options(
     bindings: &BindResult,
     options: CheckerOptions,
 ) -> CheckResult {
-    Checker::new(arena, bindings)
+    Checker::new(arena, source_file, bindings)
         .with_options(options)
         .check(source_file)
 }
@@ -723,15 +723,28 @@ pub struct ProgramSource<'a> {
 impl ProgramSource<'_> {
     /// Returns the Program identity recorded by binding, when this source was
     /// produced by a compiler Program rather than a standalone test/tool.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the arena or source root does not match binding provenance.
     #[must_use]
-    pub const fn file_id(&self) -> Option<FileId> {
-        self.bindings.file_id
+    pub fn file_id(&self) -> Option<FileId> {
+        assert!(
+            self.bindings
+                .is_for_source(self.arena, self.source_file),
+            "ProgramSource arena and source file do not match binding provenance"
+        );
+        self.bindings.file_id()
     }
 
     /// Validates a node and pairs it with its bound Program identity.
     ///
     /// Detached sources have no identity until they cross the program-checker
     /// boundary; use [`ProgramCheckResult::node_ref`] for those sources.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the arena or source root does not match binding provenance.
     #[must_use]
     pub fn node_ref(&self, node: NodeId) -> Option<NodeRef> {
         let file_id = self.file_id()?;
@@ -745,7 +758,7 @@ impl ProgramSource<'_> {
 pub struct ProgramCheckResult {
     /// File identities used by program-wide semantic state, parallel to `files`.
     file_ids: Vec<FileId>,
-    pub files: Vec<CheckResult>,
+    files: Vec<CheckResult>,
     node_counts: Vec<usize>,
 }
 
@@ -754,6 +767,18 @@ impl ProgramCheckResult {
     #[must_use]
     pub fn file_ids(&self) -> &[FileId] {
         &self.file_ids
+    }
+
+    /// Per-source checking outputs in source-slice order.
+    #[must_use]
+    pub fn files(&self) -> &[CheckResult] {
+        &self.files
+    }
+
+    /// Consumes the program result and returns per-source checking outputs.
+    #[must_use]
+    pub fn into_files(self) -> Vec<CheckResult> {
+        self.files
     }
 
     /// Looks up the checker-assigned identity for a node in one source slot.
@@ -1034,7 +1059,7 @@ impl<'a> ProgramChecker<'a> {
                         });
                         external_names.insert(specifier.clone(), descriptor);
                     }
-                    Checker::new(source.arena, source.bindings)
+                    Checker::new(source.arena, source.source_file, source.bindings)
                         .with_options(source.checker_options)
                         .with_environment(external_symbols, external_imports, external_names)
                         .with_global_environment(
@@ -1754,15 +1779,15 @@ impl<'a> ProgramChecker<'a> {
                 };
                 variable.initializer
             })?;
-            let mut checker =
-                Checker::new(source.arena, source.bindings).with_options(source.checker_options);
+            let mut checker = Checker::new(source.arena, source.source_file, source.bindings)
+                .with_options(source.checker_options);
             checker.seed_symbol_types();
             let type_id = checker.type_of_expression(initializer);
             return Some(describe_checked_type(&checker.result, type_id));
         }
         let class = class.unwrap();
-        let mut checker =
-            Checker::new(source.arena, source.bindings).with_options(source.checker_options);
+        let mut checker = Checker::new(source.arena, source.source_file, source.bindings)
+            .with_options(source.checker_options);
         checker.seed_symbol_types();
         if class.type_parameters.is_none() {
             let instance = checker.result.symbol_types.get(&symbol_id).copied()?;
@@ -4272,7 +4297,11 @@ struct InferenceContext {
 }
 
 impl<'a> Checker<'a> {
-    fn new(arena: &'a NodeArena, bindings: &'a BindResult) -> Self {
+    fn new(arena: &'a NodeArena, source_file: NodeId, bindings: &'a BindResult) -> Self {
+        assert!(
+            bindings.is_for_source(arena, source_file),
+            "checker arena and source file do not match binding provenance"
+        );
         let mut children = HashMap::<NodeId, Vec<NodeId>>::new();
         for (id, node) in arena.iter() {
             if let Some(parent) = node.parent {
@@ -23838,8 +23867,8 @@ fn describe_alias(
     source: &ProgramSource<'_>,
     alias: &ts_ast::TypeAliasDeclarationData,
 ) -> TypeDescriptor {
-    let mut checker =
-        Checker::new(source.arena, source.bindings).with_options(source.checker_options);
+    let mut checker = Checker::new(source.arena, source.source_file, source.bindings)
+        .with_options(source.checker_options);
     checker.seed_symbol_types();
     let mut parameter_scope = HashMap::new();
     let mut parameters = Vec::new();
@@ -24020,8 +24049,8 @@ fn describe_explicit_function_value(
         return descriptor;
     };
     let exported_names = exported_reference_names(source);
-    let mut checker =
-        Checker::new(source.arena, source.bindings).with_options(source.checker_options);
+    let mut checker = Checker::new(source.arena, source.source_file, source.bindings)
+        .with_options(source.checker_options);
     checker.seed_symbol_types();
     for (index, parameter) in parameters.nodes.iter().enumerate() {
         let Some(NodeData::ParameterDeclaration(parameter)) =
@@ -25131,8 +25160,8 @@ fn describe_interface_member_syntax(
         }
         _ => return descriptor,
     };
-    let mut checker =
-        Checker::new(source.arena, source.bindings).with_options(source.checker_options);
+    let mut checker = Checker::new(source.arena, source.source_file, source.bindings)
+        .with_options(source.checker_options);
     checker.seed_symbol_types();
     let type_parameter_scope = alias_parameters
         .into_iter()
@@ -25325,7 +25354,7 @@ fn describe_declaration_symbol(
                 },
             ) = (function_declarations.first(), &mut descriptor)
             {
-                let mut checker = Checker::new(source.arena, source.bindings)
+                let mut checker = Checker::new(source.arena, source.source_file, source.bindings)
                     .with_options(source.checker_options);
                 checker.seed_symbol_types();
                 let mut exported_names = declaration_reference_names(source, symbol_id);
@@ -25424,7 +25453,7 @@ fn describe_declaration_symbol(
                     SyntaxKind::ExportKeyword,
                 )
             {
-                let mut checker = Checker::new(source.arena, source.bindings)
+                let mut checker = Checker::new(source.arena, source.source_file, source.bindings)
                     .with_options(source.checker_options);
                 checker.seed_symbol_types();
                 let mut exported_names = declaration_reference_names(source, symbol_id);
@@ -25473,8 +25502,8 @@ fn describe_declaration_symbol(
             }
             return Some(descriptor);
         }
-        let mut checker =
-            Checker::new(source.arena, source.bindings).with_options(source.checker_options);
+        let mut checker = Checker::new(source.arena, source.source_file, source.bindings)
+            .with_options(source.checker_options);
         let signatures = function_declarations
             .iter()
             .filter(|declaration| function_declarations.len() == 1 || declaration.body.is_none())
@@ -25523,8 +25552,8 @@ fn describe_declaration_symbol(
             }
             return Some(descriptor);
         }
-        let mut checker =
-            Checker::new(source.arena, source.bindings).with_options(source.checker_options);
+        let mut checker = Checker::new(source.arena, source.source_file, source.bindings)
+            .with_options(source.checker_options);
         checker.seed_symbol_types();
         let (parameters, arguments) =
             descriptor_parameters(&mut checker, first.type_parameters.as_ref());
@@ -25596,15 +25625,15 @@ fn describe_declaration_symbol(
             {
                 return describe_declaration_symbol(source, None, target);
             }
-            let mut checker =
-                Checker::new(source.arena, source.bindings).with_options(source.checker_options);
+            let mut checker = Checker::new(source.arena, source.source_file, source.bindings)
+                .with_options(source.checker_options);
             let type_id = checker.type_from_type_node(annotation);
             return Some(describe_source_type(source, &checker.result, type_id));
         };
         return result.map(|result| {
             let mut descriptor = describe_checked_type(result, type_id);
             if let Some(type_node) = variable.type_ {
-                let mut checker = Checker::new(source.arena, source.bindings)
+                let mut checker = Checker::new(source.arena, source.source_file, source.bindings)
                     .with_options(source.checker_options);
                 checker.seed_symbol_types();
                 let exported_names = declaration_reference_names(source, symbol_id);
@@ -25645,8 +25674,8 @@ fn describe_declaration_symbol(
         };
         Some(data.as_ref())
     })?;
-    let mut checker =
-        Checker::new(source.arena, source.bindings).with_options(source.checker_options);
+    let mut checker = Checker::new(source.arena, source.source_file, source.bindings)
+        .with_options(source.checker_options);
     let (parameters, arguments) =
         descriptor_parameters(&mut checker, class.type_parameters.as_ref());
     let object = checker.declared_object_type(
@@ -26923,7 +26952,7 @@ mod tests {
         TupleTypeNodeData, TypeOfExpressionData, UnionTypeNodeData, VariableDeclarationData,
         VariableDeclarationListData, VariableStatementData,
     };
-    use ts_binder::{BindResult, bind_source_file, bind_source_file_in_file};
+    use ts_binder::{bind_source_file, bind_source_file_in_file};
     use ts_core::TextRange;
     use ts_parser::parse_source_file;
 
@@ -27647,9 +27676,9 @@ mod tests {
 
     #[test]
     fn constructs_and_assigns_unions_intersections_and_tuples() {
-        let arena = NodeArena::new();
-        let bindings = BindResult::default();
-        let mut checker = Checker::new(&arena, &bindings);
+        let parsed = parse_source_file("");
+        let bindings = bind_source_file(&parsed.arena, parsed.source_file);
+        let mut checker = Checker::new(&parsed.arena, parsed.source_file, &bindings);
         let string = checker.result.types.string();
         let number = checker.result.types.number();
         let left = checker.result.types.alloc(TypeKind::Object(ObjectType {
@@ -28002,12 +28031,12 @@ mod tests {
         ]);
 
         assert!(
-            checked.files[1].diagnostics.is_empty(),
+            checked.files()[1].diagnostics.is_empty(),
             "{:?}",
-            checked.files[1].diagnostics
+            checked.files()[1].diagnostics
         );
         assert_eq!(
-            checked.files[1]
+            checked.files()[1]
                 .enum_access_values
                 .values()
                 .cloned()
@@ -28048,7 +28077,7 @@ mod tests {
         ]);
 
         assert_eq!(
-            checked.files[1]
+            checked.files()[1]
                 .enum_access_values
                 .values()
                 .cloned()
@@ -28664,14 +28693,14 @@ mod tests {
             },
         ]);
         assert!(
-            checked.files[0].diagnostics.is_empty(),
+            checked.files()[0].diagnostics.is_empty(),
             "{:?}",
-            checked.files[0].diagnostics
+            checked.files()[0].diagnostics
         );
         assert!(
-            checked.files[1].diagnostics.is_empty(),
+            checked.files()[1].diagnostics.is_empty(),
             "{:?}",
-            checked.files[1].diagnostics
+            checked.files()[1].diagnostics
         );
 
         let NodeData::SourceFile(source) = &consumer.arena.get(consumer.source_file).unwrap().data
@@ -28683,11 +28712,11 @@ mod tests {
         else {
             panic!("expected default export");
         };
-        let default_type = checked.files[1]
+        let default_type = checked.files()[1]
             .type_of_node(default_export.expression)
             .unwrap();
         assert!(matches!(
-            checked.files[1].types.get(default_type).unwrap().kind,
+            checked.files()[1].types.get(default_type).unwrap().kind,
             TypeKind::Constructor(_)
         ));
 
@@ -28697,15 +28726,16 @@ mod tests {
             .symbols
             .get("Mixed")
             .unwrap();
-        let mixed_type = checked.files[1].type_of_symbol(mixed).unwrap();
-        let TypeKind::Intersection(members) = &checked.files[1].types.get(mixed_type).unwrap().kind
+        let mixed_type = checked.files()[1].type_of_symbol(mixed).unwrap();
+        let TypeKind::Intersection(members) =
+            &checked.files()[1].types.get(mixed_type).unwrap().kind
         else {
             panic!("expected generic mixin intersection");
         };
         let constructors = members
             .iter()
             .filter_map(|member| {
-                let TypeKind::Constructor(signature) = &checked.files[1].types.get(*member)?.kind
+                let TypeKind::Constructor(signature) = &checked.files()[1].types.get(*member)?.kind
                 else {
                     return None;
                 };
@@ -28717,7 +28747,7 @@ mod tests {
             .iter()
             .find(|constructor| {
                 matches!(
-                    &checked.files[1]
+                    &checked.files()[1]
                         .types
                         .get(constructor.return_type)
                         .unwrap()
@@ -28731,18 +28761,18 @@ mod tests {
             .rest_parameter
             .expect("expected inherited constructor rest parameter");
         assert!(matches!(
-            checked.files[1]
+            checked.files()[1]
                 .types
                 .get(timestamped_rest)
                 .unwrap()
                 .kind,
-            TypeKind::Array(element) if element == checked.files[1].types.any()
+            TypeKind::Array(element) if element == checked.files()[1].types.any()
         ));
         let instance_properties = constructors
             .iter()
             .filter_map(|constructor| {
                 let TypeKind::Object(instance) =
-                    &checked.files[1].types.get(constructor.return_type)?.kind
+                    &checked.files()[1].types.get(constructor.return_type)?.kind
                 else {
                     return None;
                 };
@@ -28792,7 +28822,7 @@ mod tests {
                 checker_options: CheckerOptions::default(),
             },
         ]);
-        assert!(checked.files[1].diagnostics.is_empty());
+        assert!(checked.files()[1].diagnostics.is_empty());
         let x = consumer_bindings
             .root_scope()
             .unwrap()
@@ -28800,8 +28830,8 @@ mod tests {
             .get("x")
             .unwrap();
         assert_eq!(
-            checked.files[1].type_of_symbol(x),
-            Some(checked.files[1].types.number())
+            checked.files()[1].type_of_symbol(x),
+            Some(checked.files()[1].types.number())
         );
     }
 
@@ -28870,9 +28900,9 @@ mod tests {
             },
         ]);
         assert!(
-            checked.files[1].diagnostics.is_empty(),
+            checked.files()[1].diagnostics.is_empty(),
             "{:?}",
-            checked.files[1].diagnostics
+            checked.files()[1].diagnostics
         );
 
         let clock_now = consumer_bindings
@@ -28882,8 +28912,8 @@ mod tests {
             .get("clockNow")
             .unwrap();
         assert_eq!(
-            checked.files[1].type_of_symbol(clock_now),
-            Some(checked.files[1].types.number())
+            checked.files()[1].type_of_symbol(clock_now),
+            Some(checked.files()[1].types.number())
         );
         let collection_item = consumer_bindings
             .root_scope()
@@ -28892,8 +28922,8 @@ mod tests {
             .get("collectionItem")
             .unwrap();
         assert_eq!(
-            checked.files[1].type_of_symbol(collection_item),
-            Some(checked.files[1].types.number())
+            checked.files()[1].type_of_symbol(collection_item),
+            Some(checked.files()[1].types.number())
         );
         let make = consumer_bindings
             .root_scope()
@@ -28901,16 +28931,16 @@ mod tests {
             .symbols
             .get("makeTimestamped")
             .unwrap();
-        let make_type = checked.files[1].type_of_symbol(make).unwrap();
-        let TypeKind::Function(make) = &checked.files[1].types.get(make_type).unwrap().kind else {
+        let make_type = checked.files()[1].type_of_symbol(make).unwrap();
+        let TypeKind::Function(make) = &checked.files()[1].types.get(make_type).unwrap().kind else {
             panic!("expected function type");
         };
         let TypeKind::Constructor(returned_class) =
-            &checked.files[1].types.get(make.return_type).unwrap().kind
+            &checked.files()[1].types.get(make.return_type).unwrap().kind
         else {
             panic!("expected returned class constructor");
         };
-        let TypeKind::Object(instance) = &checked.files[1]
+        let TypeKind::Object(instance) = &checked.files()[1]
             .types
             .get(returned_class.return_type)
             .unwrap()
@@ -28920,11 +28950,11 @@ mod tests {
         };
         assert_eq!(
             instance.properties.get("timestamp"),
-            Some(&checked.files[1].types.number())
+            Some(&checked.files()[1].types.number())
         );
         assert_eq!(
             instance.properties.get("localTimestamp"),
-            Some(&checked.files[1].types.number())
+            Some(&checked.files()[1].types.number())
         );
         let timestamp_property = consumer
             .arena
@@ -28938,8 +28968,8 @@ mod tests {
             })
             .unwrap();
         assert_eq!(
-            checked.files[1].type_of_node(timestamp_property),
-            Some(checked.files[1].types.number())
+            checked.files()[1].type_of_node(timestamp_property),
+            Some(checked.files()[1].types.number())
         );
     }
 
@@ -29455,7 +29485,7 @@ mod tests {
     fn preserves_array_flat_aliases_and_reports_unserializable_recursive_inference() {
         let standard = parse_source_file("");
         let bindings = bind_source_file(&standard.arena, standard.source_file);
-        let mut checker = Checker::new(&standard.arena, &bindings);
+        let mut checker = Checker::new(&standard.arena, standard.source_file, &bindings);
         let element = checker.result.types.alloc(TypeKind::TypeParameter {
             name: "T".into(),
             constraint: None,
@@ -29529,7 +29559,7 @@ mod tests {
             .symbols
             .get("Recursive")
             .unwrap();
-        let mut checker = Checker::new(&parsed.arena, &bindings);
+        let mut checker = Checker::new(&parsed.arena, parsed.source_file, &bindings);
 
         let first = checker.instantiate_alias(symbol, &[]).unwrap();
         let type_count = checker.result.types.len();
@@ -29552,7 +29582,7 @@ mod tests {
             .symbols
             .get("Shared")
             .unwrap();
-        let mut checker = Checker::new(&parsed.arena, &bindings);
+        let mut checker = Checker::new(&parsed.arena, parsed.source_file, &bindings);
 
         let first = checker.instantiate_declared_object(symbol, &[]).unwrap();
         let type_count = checker.result.types.len();
@@ -29641,7 +29671,7 @@ mod tests {
                 parameter,
             ])),
         };
-        let result = Checker::new(&parsed.arena, &bindings)
+        let result = Checker::new(&parsed.arena, parsed.source_file, &bindings)
             .with_environment(
                 crate::HashMap::default(),
                 crate::HashMap::default(),
@@ -29699,7 +29729,7 @@ mod tests {
             parse_source_file("interface Result { value: string } declare const result: Result;");
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         let bindings = bind_source_file(&parsed.arena, parsed.source_file);
-        let mut checker = Checker::new(&parsed.arena, &bindings);
+        let mut checker = Checker::new(&parsed.arena, parsed.source_file, &bindings);
         let reference = parsed
             .arena
             .iter()
@@ -30584,9 +30614,9 @@ mod tests {
             },
         ]);
         assert!(
-            checked.files[1].diagnostics.is_empty(),
+            checked.files()[1].diagnostics.is_empty(),
             "{:?}",
-            checked.files[1].diagnostics
+            checked.files()[1].diagnostics
         );
         let value = client_bindings
             .root_scope()
@@ -30594,8 +30624,8 @@ mod tests {
             .symbols
             .get("value")
             .unwrap();
-        let value_type = checked.files[1].type_of_symbol(value).unwrap();
-        let reference = checked.files[1]
+        let value_type = checked.files()[1].type_of_symbol(value).unwrap();
+        let reference = checked.files()[1]
             .named_type_references
             .get(&value_type)
             .expect("new M.C() should retain its cross-file class name");
@@ -30635,26 +30665,26 @@ mod tests {
         ]);
 
         assert!(
-            checked.files[1].diagnostics.is_empty(),
+            checked.files()[1].diagnostics.is_empty(),
             "{:?}",
-            checked.files[1].diagnostics
+            checked.files()[1].diagnostics
         );
         let root = client_bindings.root_scope().unwrap();
-        let c_type = checked.files[1]
+        let c_type = checked.files()[1]
             .type_of_symbol(root.symbols.get("c").unwrap())
             .unwrap();
         assert!(
-            checked.files[1]
+            checked.files()[1]
                 .named_type_references
                 .get(&c_type)
                 .is_some_and(|reference| reference.name == "Foo"),
             "{}",
-            checked.files[1].types.display(c_type)
+            checked.files()[1].types.display(c_type)
         );
-        let result_type = checked.files[1]
+        let result_type = checked.files()[1]
             .type_of_symbol(root.symbols.get("result").unwrap())
             .unwrap();
-        assert_eq!(checked.files[1].types.display(result_type), "{ b: number; }");
+        assert_eq!(checked.files()[1].types.display(result_type), "{ b: number; }");
     }
 
     #[test]
@@ -30685,9 +30715,9 @@ mod tests {
             },
         ]);
         let y = client_bindings.root_scope().unwrap().symbols.get("y").unwrap();
-        let y_type = checked.files[1].type_of_symbol(y).unwrap();
+        let y_type = checked.files()[1].type_of_symbol(y).unwrap();
         assert_eq!(
-            checked.files[1].types.display(y_type),
+            checked.files()[1].types.display(y_type),
             "{ a: number; b: number; }"
         );
     }
@@ -31424,17 +31454,17 @@ mod tests {
             .symbols
             .get("Type")
             .unwrap_or_else(|| panic!("{:?}", consumer_bindings.root_scope().unwrap().symbols));
-        let imported_type = checked.files[1].type_of_symbol(imported).unwrap();
+        let imported_type = checked.files()[1].type_of_symbol(imported).unwrap();
         assert!(
             matches!(
-                checked.files[1].types.get(imported_type).map(|type_| &type_.kind),
+                checked.files()[1].types.get(imported_type).map(|type_| &type_.kind),
                 Some(TypeKind::Object(object)) if object.properties.contains_key("x")
             ),
             "{}",
-            checked.files[1].types.display(imported_type)
+            checked.files()[1].types.display(imported_type)
         );
-        let type_id = checked.files[1].type_of_symbol(symbol).unwrap();
-        let TypeKind::Object(object) = &checked.files[1].types.get(type_id).unwrap().kind else {
+        let type_id = checked.files()[1].type_of_symbol(symbol).unwrap();
+        let TypeKind::Object(object) = &checked.files()[1].types.get(type_id).unwrap().kind else {
             panic!("expected object type");
         };
         assert!(object.properties.contains_key("x"), "{object:?}");
@@ -31527,9 +31557,9 @@ mod tests {
         ]);
 
         assert!(
-            checked.files[1].diagnostics.is_empty(),
+            checked.files()[1].diagnostics.is_empty(),
             "{:?}",
-            checked.files[1].diagnostics
+            checked.files()[1].diagnostics
         );
     }
 
@@ -31651,12 +31681,12 @@ mod tests {
             .symbols
             .get("read")
             .unwrap();
-        let read_type = checked.files[1].type_of_symbol(read).unwrap();
-        let TypeKind::Function(read) = &checked.files[1].types.get(read_type).unwrap().kind else {
+        let read_type = checked.files()[1].type_of_symbol(read).unwrap();
+        let TypeKind::Function(read) = &checked.files()[1].types.get(read_type).unwrap().kind else {
             panic!("expected function type");
         };
         assert_eq!(
-            checked.files[1]
+            checked.files()[1]
                 .import_type_references
                 .get(&read.return_type),
             Some(&ImportTypeReference {
@@ -31726,12 +31756,12 @@ mod tests {
             .symbols
             .get("read")
             .unwrap();
-        let read_type = checked.files[2].type_of_symbol(read).unwrap();
-        let TypeKind::Function(read) = &checked.files[2].types.get(read_type).unwrap().kind else {
+        let read_type = checked.files()[2].type_of_symbol(read).unwrap();
+        let TypeKind::Function(read) = &checked.files()[2].types.get(read_type).unwrap().kind else {
             panic!("expected function type");
         };
         assert_eq!(
-            checked.files[2]
+            checked.files()[2]
                 .import_type_references
                 .get(&read.return_type),
             Some(&ImportTypeReference {
@@ -31740,13 +31770,13 @@ mod tests {
                 is_typeof: false,
             }),
             "return type: {}; named reference: {:?}; imports: {:?}",
-            checked.files[2].types.display(read.return_type),
-            checked.files[2]
+            checked.files()[2].types.display(read.return_type),
+            checked.files()[2]
                 .named_type_references
                 .get(&read.return_type),
-            checked.files[2].import_type_references,
+            checked.files()[2].import_type_references,
         );
-        let reference = checked.files[2]
+        let reference = checked.files()[2]
             .named_type_references
             .get(&read.return_type)
             .expect("public return alias should retain its type arguments");
@@ -31755,7 +31785,7 @@ mod tests {
             reference
                 .type_arguments
                 .iter()
-                .map(|argument| checked.files[2].types.display(*argument))
+                .map(|argument| checked.files()[2].types.display(*argument))
                 .collect::<Vec<_>>(),
             ["number", "string"],
         );
@@ -31833,7 +31863,7 @@ mod tests {
             ],
         );
         assert!(
-            checked.files.iter().all(|file| file.diagnostics.is_empty()),
+            checked.files().iter().all(|file| file.diagnostics.is_empty()),
             "{:?}",
             checked
                 .files
@@ -31847,22 +31877,22 @@ mod tests {
             .symbols
             .get("MyComp")
             .unwrap();
-        let type_id = checked.files[2].type_of_symbol(my_comp).unwrap();
+        let type_id = checked.files()[2].type_of_symbol(my_comp).unwrap();
         assert_eq!(
-            checked.files[2].import_type_references.get(&type_id),
+            checked.files()[2].import_type_references.get(&type_id),
             Some(&ImportTypeReference {
                 module_specifier: "mod/ctor".into(),
                 qualifier: "ExtendedCtor".into(),
                 is_typeof: false,
             }),
             "type: {}; named: {:?}; imports: {:?}",
-            checked.files[2].types.display(type_id),
-            checked.files[2].named_type_references.get(&type_id),
-            checked.files[2].import_type_references,
+            checked.files()[2].types.display(type_id),
+            checked.files()[2].named_type_references.get(&type_id),
+            checked.files()[2].import_type_references,
         );
-        let argument = checked.files[2].named_type_references[&type_id].type_arguments[0];
+        let argument = checked.files()[2].named_type_references[&type_id].type_arguments[0];
         assert_eq!(
-            checked.files[2].import_type_references.get(&argument),
+            checked.files()[2].import_type_references.get(&argument),
             Some(&ImportTypeReference {
                 module_specifier: "mod".into(),
                 qualifier: "default".into(),
@@ -31948,7 +31978,11 @@ mod tests {
             .iter()
             .find_map(|(id, node)| matches!(node.data, NodeData::TypeLiteralNode(_)).then_some(id))
             .unwrap();
-        let mut direct_checker = Checker::new(&dependency.arena, &dependency_bindings);
+        let mut direct_checker = Checker::new(
+            &dependency.arena,
+            dependency.source_file,
+            &dependency_bindings,
+        );
         direct_checker.seed_symbol_types();
         let literal_type = direct_checker.type_from_type_node(type_literal);
         let TypeKind::Object(literal_object) =
@@ -31963,13 +31997,13 @@ mod tests {
             .symbols
             .get("o")
             .unwrap();
-        let dependency_type = checked.files[0].type_of_symbol(dependency_symbol).unwrap();
+        let dependency_type = checked.files()[0].type_of_symbol(dependency_symbol).unwrap();
         let TypeKind::Function(dependency_function) =
-            &checked.files[0].types.get(dependency_type).unwrap().kind
+            &checked.files()[0].types.get(dependency_type).unwrap().kind
         else {
             panic!("expected dependency function type");
         };
-        let TypeKind::Object(dependency_object) = &checked.files[0]
+        let TypeKind::Object(dependency_object) = &checked.files()[0]
             .types
             .get(dependency_function.return_type)
             .unwrap()
@@ -31979,7 +32013,7 @@ mod tests {
         };
         assert_eq!(dependency_object.property_order, ["A", "foo", "1", "-1"]);
         let TypeDescriptor::Function { return_type, .. } =
-            super::describe_checked_type(&checked.files[0], dependency_type)
+            super::describe_checked_type(&checked.files()[0], dependency_type)
         else {
             panic!("expected dependency descriptor function");
         };
@@ -31993,12 +32027,12 @@ mod tests {
             .symbols
             .get("g")
             .unwrap();
-        let type_id = checked.files[1].type_of_symbol(symbol).unwrap();
-        let TypeKind::Function(function) = &checked.files[1].types.get(type_id).unwrap().kind
+        let type_id = checked.files()[1].type_of_symbol(symbol).unwrap();
+        let TypeKind::Function(function) = &checked.files()[1].types.get(type_id).unwrap().kind
         else {
             panic!("expected function type");
         };
-        let TypeKind::Object(object) = &checked.files[1]
+        let TypeKind::Object(object) = &checked.files()[1]
             .types
             .get(function.return_type)
             .unwrap()
@@ -32079,7 +32113,7 @@ mod tests {
         else {
             panic!("expected source file");
         };
-        let meanings = &checked.files[1].import_runtime_meanings;
+        let meanings = &checked.files()[1].import_runtime_meanings;
         assert_eq!(meanings.get(&source.statements.nodes[0]), Some(&false));
         assert_eq!(meanings.get(&source.statements.nodes[1]), Some(&true));
         assert!(!meanings.contains_key(&source.statements.nodes[2]));
@@ -32146,7 +32180,7 @@ mod tests {
         else {
             panic!("expected source file");
         };
-        let meanings = &checked.files[1].import_runtime_meanings;
+        let meanings = &checked.files()[1].import_runtime_meanings;
         for statement in &source.statements.nodes[..4] {
             assert_eq!(meanings.get(statement), Some(&true), "{statement:?}");
         }
@@ -32216,20 +32250,20 @@ mod tests {
             panic!("expected consumer source file");
         };
         assert_eq!(
-            checked.files[1]
+            checked.files()[1]
                 .import_runtime_meanings
                 .get(&reexport_source.statements.nodes[0]),
             Some(&true)
         );
         for statement in &consumer_source.statements.nodes[..2] {
             assert_eq!(
-                checked.files[2].import_runtime_meanings.get(statement),
+                checked.files()[2].import_runtime_meanings.get(statement),
                 Some(&true),
                 "{statement:?}"
             );
         }
         assert_eq!(
-            checked.files[2]
+            checked.files()[2]
                 .import_runtime_meanings
                 .get(&consumer_source.statements.nodes[2]),
             Some(&false)
@@ -32269,7 +32303,7 @@ mod tests {
             panic!("expected source file");
         };
         assert_eq!(
-            checked.files[1]
+            checked.files()[1]
                 .import_runtime_meanings
                 .get(&source.statements.nodes[0]),
             Some(&false)
@@ -32332,19 +32366,19 @@ mod tests {
             panic!("expected consumer source file");
         };
         assert_eq!(
-            checked.files[1]
+            checked.files()[1]
                 .import_runtime_meanings
                 .get(&merge_file.statements.nodes[0]),
             Some(&false)
         );
         assert_eq!(
-            checked.files[1]
+            checked.files()[1]
                 .import_runtime_meanings
                 .get(&merge_file.statements.nodes[2]),
             Some(&true)
         );
         assert_eq!(
-            checked.files[2]
+            checked.files()[2]
                 .import_runtime_meanings
                 .get(&consumer_file.statements.nodes[0]),
             Some(&true)
@@ -32415,7 +32449,7 @@ mod tests {
             panic!("expected source file");
         };
         assert_eq!(
-            checked.files[3]
+            checked.files()[3]
                 .import_runtime_meanings
                 .get(&source.statements.nodes[0]),
             Some(&true)
@@ -32451,16 +32485,16 @@ mod tests {
             },
         ]);
         assert!(
-            checked.files[1].diagnostics.is_empty(),
+            checked.files()[1].diagnostics.is_empty(),
             "{:?}",
-            checked.files[1].diagnostics
+            checked.files()[1].diagnostics
         );
         let NodeData::SourceFile(source) = &consumer.arena.get(consumer.source_file).unwrap().data
         else {
             panic!("expected source file");
         };
         assert_eq!(
-            checked.files[1]
+            checked.files()[1]
                 .import_runtime_meanings
                 .get(&source.statements.nodes[0]),
             Some(&true)
@@ -32506,14 +32540,14 @@ mod tests {
             .symbols
             .get("f")
             .unwrap();
-        let function_type = checked.files[1].type_of_symbol(function).unwrap();
+        let function_type = checked.files()[1].type_of_symbol(function).unwrap();
         let TypeKind::Function(signature) =
-            &checked.files[1].types.get(function_type).unwrap().kind
+            &checked.files()[1].types.get(function_type).unwrap().kind
         else {
             panic!("expected function type");
         };
         assert_eq!(
-            checked.files[1]
+            checked.files()[1]
                 .import_type_references
                 .get(&signature.return_type),
             Some(&ImportTypeReference {
@@ -32664,15 +32698,15 @@ mod tests {
             },
         ]);
         let key = consumer_bindings.root_scope().unwrap().symbols.get("key").unwrap();
-        let key_type = checked.files[1].type_of_symbol(key).unwrap();
-        let reference = checked.files[1]
+        let key_type = checked.files()[1].type_of_symbol(key).unwrap();
+        let reference = checked.files()[1]
             .named_type_references
             .get(&key_type)
             .expect("named BindingKey result");
         assert_eq!(reference.name, "BindingKey");
         assert_eq!(reference.type_arguments.len(), 1);
         assert_eq!(
-            checked.files[1]
+            checked.files()[1]
                 .import_type_references
                 .get(&reference.type_arguments[0]),
             Some(&ImportTypeReference {
@@ -32681,8 +32715,8 @@ mod tests {
                 is_typeof: false,
             }),
             "argument type: {}; named: {:?}",
-            checked.files[1].types.display(reference.type_arguments[0]),
-            checked.files[1]
+            checked.files()[1].types.display(reference.type_arguments[0]),
+            checked.files()[1]
                 .named_type_references
                 .get(&reference.type_arguments[0]),
         );
@@ -32831,7 +32865,7 @@ mod tests {
         else {
             panic!("expected source file");
         };
-        let meanings = &checked.files[2].import_runtime_meanings;
+        let meanings = &checked.files()[2].import_runtime_meanings;
         for statement in &source.statements.nodes[..5] {
             assert_eq!(meanings.get(statement), Some(&true), "{statement:?}");
         }
@@ -32903,7 +32937,7 @@ mod tests {
             panic!("expected source file");
         };
         assert_eq!(
-            checked.files[1]
+            checked.files()[1]
                 .import_runtime_meanings
                 .get(&a_source.statements.nodes[1]),
             Some(&true)
@@ -32912,7 +32946,7 @@ mod tests {
         else {
             panic!("expected source file");
         };
-        let meanings = &checked.files[2].import_runtime_meanings;
+        let meanings = &checked.files()[2].import_runtime_meanings;
         assert_eq!(meanings.get(&index_source.statements.nodes[0]), Some(&true));
         assert_eq!(meanings.get(&index_source.statements.nodes[1]), Some(&true));
         assert_eq!(
@@ -32951,7 +32985,7 @@ mod tests {
                 checker_options: CheckerOptions::default(),
             },
         ]);
-        for (source, result) in [&a, &b].into_iter().zip(&checked.files) {
+        for (source, result) in [&a, &b].into_iter().zip(checked.files()) {
             let NodeData::SourceFile(file) = &source.arena.get(source.source_file).unwrap().data
             else {
                 panic!("expected source file");
@@ -32995,7 +33029,7 @@ mod tests {
             skip_diagnostics: false,
             checker_options: CheckerOptions::default(),
         }]);
-        let meanings = &checked.files[0].import_runtime_meanings;
+        let meanings = &checked.files()[0].import_runtime_meanings;
         assert!(meanings.is_empty(), "{meanings:?}");
         for (node, data) in parsed.arena.iter() {
             let NodeData::ImportEqualsDeclaration(import) = &data.data else {
@@ -33066,20 +33100,20 @@ mod tests {
             .symbols
             .get("slice")
             .unwrap();
-        let slice_type = checked.files[1].type_of_symbol(slice).unwrap();
-        let TypeKind::Object(slice) = &checked.files[1].types.get(slice_type).unwrap().kind else {
+        let slice_type = checked.files()[1].type_of_symbol(slice).unwrap();
+        let TypeKind::Object(slice) = &checked.files()[1].types.get(slice_type).unwrap().kind else {
             panic!("expected mapped object");
         };
         let query_type = slice.properties["useTestQuery"];
-        let TypeKind::Function(query) = &checked.files[1].types.get(query_type).unwrap().kind
+        let TypeKind::Function(query) = &checked.files()[1].types.get(query_type).unwrap().kind
         else {
             panic!("expected query function");
         };
-        let result = match &checked.files[1].types.get(query.return_type).unwrap().kind {
+        let result = match &checked.files()[1].types.get(query.return_type).unwrap().kind {
             TypeKind::Object(object) => object,
             TypeKind::Intersection(return_types) => return_types
                 .iter()
-                .find_map(|member| match &checked.files[1].types.get(*member)?.kind {
+                .find_map(|member| match &checked.files()[1].types.get(*member)?.kind {
                     TypeKind::Object(object) if object.properties.contains_key("originalArgs") => {
                         Some(object)
                     }
@@ -33090,7 +33124,7 @@ mod tests {
         };
         assert!(result.optional_properties.contains("originalArgs"));
         assert!(matches!(
-            checked.files[1]
+            checked.files()[1]
                 .types
                 .get(result.properties["originalArgs"])
                 .map(|type_| &type_.kind),
@@ -33141,11 +33175,13 @@ mod tests {
                 .symbols
                 .get(symbol_name)
                 .unwrap();
-            let outer = checked.files[1].type_of_symbol(symbol).unwrap();
-            let TypeKind::Function(outer) = &checked.files[1].types.get(outer).unwrap().kind else {
+            let outer = checked.files()[1].type_of_symbol(symbol).unwrap();
+            let TypeKind::Function(outer) =
+                &checked.files()[1].types.get(outer).unwrap().kind
+            else {
                 panic!("expected imported call result");
             };
-            let reference = checked.files[1]
+            let reference = checked.files()[1]
                 .named_type_references
                 .get(&outer.return_type)
                 .unwrap();
@@ -33174,7 +33210,7 @@ mod tests {
             skip_diagnostics: false,
             checker_options: CheckerOptions::default(),
         }]);
-        assert!(checked.files[0].diagnostics.is_empty());
+        assert!(checked.files()[0].diagnostics.is_empty());
 
         let namespace = bindings.root_scope().unwrap().symbols.get("m1").unwrap();
         let member = bindings
@@ -33185,9 +33221,9 @@ mod tests {
             .get("m1")
             .unwrap();
         assert_ne!(namespace, member);
-        let member_type = checked.files[0].type_of_symbol(member).unwrap();
+        let member_type = checked.files()[0].type_of_symbol(member).unwrap();
         assert!(matches!(
-            checked.files[0].types.get(member_type).unwrap().kind,
+            checked.files()[0].types.get(member_type).unwrap().kind,
             TypeKind::Number | TypeKind::NumberLiteral(_)
         ));
     }
@@ -33249,7 +33285,7 @@ mod tests {
             .iter()
             .find_map(|(id, node)| matches!(node.data, NodeData::CallExpression(_)).then_some(id))
             .expect("consumer call");
-        let result = &checked.files[2];
+        let result = &checked.files()[2];
         let type_id = result.type_of_node(call).expect("call type");
         assert_eq!(
             result.import_type_references.get(&type_id),
@@ -33337,13 +33373,13 @@ mod tests {
                 "/index.ts".into(),
             ],
         );
-        assert!(checked.files[2].diagnostics.is_empty());
+        assert!(checked.files()[2].diagnostics.is_empty());
         let expression = consumer
             .arena
             .iter()
             .find_map(|(id, node)| matches!(node.data, NodeData::NewExpression(_)).then_some(id))
             .expect("new expression");
-        let result = &checked.files[2];
+        let result = &checked.files()[2];
         let type_id = result.type_of_node(expression).expect("new expression type");
         assert_eq!(
             result.import_type_references.get(&type_id),
@@ -33459,22 +33495,22 @@ mod tests {
             },
         ]);
         assert!(
-            checked.files[2].diagnostics.is_empty(),
+            checked.files()[2].diagnostics.is_empty(),
             "{:?}",
-            checked.files[2].diagnostics
+            checked.files()[2].diagnostics
         );
         let extended_class = extended_bindings
             .symbols
             .iter()
             .find(|symbol| symbol.name == "ExtendedClass")
             .unwrap();
-        let extended_type = checked.files[2].type_of_symbol(extended_class.id).unwrap();
+        let extended_type = checked.files()[2].type_of_symbol(extended_class.id).unwrap();
         let TypeKind::Constructor(extended_constructor) =
-            &checked.files[2].types.get(extended_type).unwrap().kind
+            &checked.files()[2].types.get(extended_type).unwrap().kind
         else {
             panic!("expected ExtendedClass constructor");
         };
-        let TypeKind::Intersection(instance_members) = &checked.files[2]
+        let TypeKind::Intersection(instance_members) = &checked.files()[2]
             .types
             .get(extended_constructor.return_type)
             .unwrap()
@@ -33485,21 +33521,21 @@ mod tests {
         let f_type = instance_members
             .iter()
             .find_map(|member| {
-                let TypeKind::Object(instance) = &checked.files[2].types.get(*member)?.kind else {
+                let TypeKind::Object(instance) = &checked.files()[2].types.get(*member)?.kind else {
                     return None;
                 };
                 instance.properties.get("f").copied()
             })
             .unwrap();
-        let TypeKind::Function(f) = &checked.files[2].types.get(f_type).unwrap().kind else {
+        let TypeKind::Function(f) = &checked.files()[2].types.get(f_type).unwrap().kind else {
             panic!("expected f function");
         };
         assert!(matches!(
-            checked.files[2].types.get(f.return_type).unwrap().kind,
+            checked.files()[2].types.get(f.return_type).unwrap().kind,
             TypeKind::StringLiteral(ref value) if value == "something"
         ));
         assert!(instance_members.iter().any(|member| {
-            checked.files[2]
+            checked.files()[2]
                 .import_type_references
                 .get(member)
                 .is_some_and(|reference| reference.module_specifier == "deps/BaseClass")
@@ -33630,7 +33666,7 @@ mod tests {
         else {
             panic!("expected source file");
         };
-        let retained = checked.files[2]
+        let retained = checked.files()[2]
             .declarations_to_emit(consumer.source_file)
             .unwrap();
 
@@ -33703,24 +33739,24 @@ mod tests {
             },
         ]);
         assert!(
-            checked.files[3].diagnostics.is_empty(),
+            checked.files()[3].diagnostics.is_empty(),
             "{:?}",
-            checked.files[3].diagnostics
+            checked.files()[3].diagnostics
         );
         let root = consumer_bindings.root_scope().unwrap();
         let foo = root.symbols.get("foo").unwrap();
         let bar = root.symbols.get("bar").unwrap();
         for symbol in [foo, bar] {
-            let type_id = checked.files[3].type_of_symbol(symbol).unwrap();
+            let type_id = checked.files()[3].type_of_symbol(symbol).unwrap();
             assert_eq!(
-                checked.files[3]
+                checked.files()[3]
                     .named_type_references
                     .get(&type_id)
                     .map(|reference| reference.name.as_str()),
                 Some("Lib")
             );
             assert!(
-                !checked.files[3]
+                !checked.files()[3]
                     .import_type_references
                     .contains_key(&type_id)
             );
@@ -33812,14 +33848,14 @@ mod tests {
             .symbols
             .get("styled")
             .unwrap();
-        let styled_type = checked.files[1].type_of_symbol(styled).unwrap();
+        let styled_type = checked.files()[1].type_of_symbol(styled).unwrap();
         let TypeKind::Function(styled_signature) =
-            &checked.files[1].types.get(styled_type).unwrap().kind
+            &checked.files()[1].types.get(styled_type).unwrap().kind
         else {
             panic!("expected styled function type");
         };
         assert_eq!(
-            checked.files[1]
+            checked.files()[1]
                 .import_type_references
                 .get(&styled_signature.return_type),
             Some(&ImportTypeReference {
@@ -33834,8 +33870,8 @@ mod tests {
             .symbols
             .get("styled")
             .unwrap();
-        let imported_styled_type = checked.files[2].type_of_symbol(imported_styled).unwrap();
-        let TypeKind::Function(imported_styled_signature) = &checked.files[2]
+        let imported_styled_type = checked.files()[2].type_of_symbol(imported_styled).unwrap();
+        let TypeKind::Function(imported_styled_signature) = &checked.files()[2]
             .types
             .get(imported_styled_type)
             .unwrap()
@@ -33844,7 +33880,7 @@ mod tests {
             panic!("expected imported styled function type");
         };
         assert_eq!(
-            checked.files[2]
+            checked.files()[2]
                 .import_type_references
                 .get(&imported_styled_signature.return_type),
             Some(&ImportTypeReference {
@@ -33859,9 +33895,9 @@ mod tests {
             .symbols
             .get("value")
             .unwrap();
-        let value_type = checked.files[2].type_of_symbol(value).unwrap();
+        let value_type = checked.files()[2].type_of_symbol(value).unwrap();
         assert_eq!(
-            checked.files[2].import_type_references.get(&value_type),
+            checked.files()[2].import_type_references.get(&value_type),
             Some(&ImportTypeReference {
                 module_specifier: "./color".into(),
                 qualifier: "default".into(),
@@ -33871,7 +33907,7 @@ mod tests {
         let NodeData::SourceFile(source) = &color.arena.get(color.source_file).unwrap().data else {
             panic!("expected source file");
         };
-        let retained = checked.files[0]
+        let retained = checked.files()[0]
             .declarations_to_emit(color.source_file)
             .unwrap();
 
@@ -34377,7 +34413,7 @@ mod tests {
             skip_diagnostics: false,
             checker_options: CheckerOptions::default(),
         }]);
-        assert!(checked.files[0].diagnostics.is_empty());
+        assert!(checked.files()[0].diagnostics.is_empty());
     }
 
     #[test]
@@ -34435,11 +34471,11 @@ mod tests {
         else {
             panic!("expected Card default export");
         };
-        let card_default_type = checked.files[1]
+        let card_default_type = checked.files()[1]
             .type_of_node(card_default.expression)
             .unwrap();
         assert!(matches!(
-            checked.files[1].types.get(card_default_type).unwrap().kind,
+            checked.files()[1].types.get(card_default_type).unwrap().kind,
             TypeKind::Function(_)
         ));
 
@@ -34453,14 +34489,14 @@ mod tests {
                 (identifier_text(&index.arena, call.expression) == Some("import")).then_some(id)
             })
             .unwrap();
-        let import_call_type = checked.files[2].type_of_node(import_call).unwrap();
-        let TypeKind::Object(module) = &checked.files[2].types.get(import_call_type).unwrap().kind
+        let import_call_type = checked.files()[2].type_of_node(import_call).unwrap();
+        let TypeKind::Object(module) = &checked.files()[2].types.get(import_call_type).unwrap().kind
         else {
             panic!("expected imported module object");
         };
         let default_type = module.properties["default"];
         assert!(matches!(
-            checked.files[2].types.get(default_type).unwrap().kind,
+            checked.files()[2].types.get(default_type).unwrap().kind,
             TypeKind::Function(_)
         ));
     }
@@ -34671,6 +34707,7 @@ mod tests {
 
         let checked = check_program(&sources);
         assert_eq!(checked.file_ids(), [FileId::new(0), FileId::new(1)]);
+        assert_eq!(checked.files().len(), 2);
         assert_eq!(sources[0].node_ref(first.source_file), None);
         let first_ref = checked.node_ref(0, first.source_file).unwrap();
         let second_ref = checked.node_ref(1, second.source_file).unwrap();
@@ -34719,6 +34756,7 @@ mod tests {
             reordered[0].node_ref(second.source_file),
             Some(NodeRef::new(second_id, second.source_file))
         );
+        assert_eq!(reordered[0].node_ref(NodeId::new(u32::MAX)), None);
         assert_eq!(
             checked.node_ref(0, second.source_file),
             Some(NodeRef::new(second_id, second.source_file))
@@ -34739,6 +34777,54 @@ mod tests {
             subset_checked.node_ref(0, first.source_file),
             Some(NodeRef::new(first_id, first.source_file))
         );
+        assert_eq!(subset_checked.into_files().len(), 1);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "ProgramSource arena and source file do not match binding provenance"
+    )]
+    fn checker_rejects_cross_wired_bound_arenas() {
+        let first = parse_source_file("export const first = 1;");
+        let second = parse_source_file("export const second = 2;");
+        let first_bindings =
+            bind_source_file_in_file(&first.arena, first.source_file, FileId::new(7));
+        let no_modules = BTreeMap::new();
+        let _ = check_program(&[ProgramSource {
+            arena: &second.arena,
+            source_file: second.source_file,
+            bindings: &first_bindings,
+            resolved_modules: &no_modules,
+            is_default_library: false,
+            skip_diagnostics: false,
+            checker_options: CheckerOptions::default(),
+        }]);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "ProgramSource arena and source file do not match binding provenance"
+    )]
+    fn checker_rejects_cross_wired_bound_source_roots() {
+        let parsed = parse_source_file("export const value = 1;");
+        let wrong_root = parsed
+            .arena
+            .iter()
+            .map(|(node, _)| node)
+            .find(|node| *node != parsed.source_file)
+            .unwrap();
+        let bindings =
+            bind_source_file_in_file(&parsed.arena, parsed.source_file, FileId::new(7));
+        let no_modules = BTreeMap::new();
+        let _ = check_program(&[ProgramSource {
+            arena: &parsed.arena,
+            source_file: wrong_root,
+            bindings: &bindings,
+            resolved_modules: &no_modules,
+            is_default_library: false,
+            skip_diagnostics: false,
+            checker_options: CheckerOptions::default(),
+        }]);
     }
 
     #[test]

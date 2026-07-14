@@ -6,7 +6,7 @@ use std::{
 };
 
 use ts_ast::{
-    FileId, NodeArena, NodeData, NodeFlags, NodeId, NodeRef, SymbolId, SyntaxKind,
+    FileId, NodeArena, NodeArenaId, NodeData, NodeFlags, NodeId, SymbolId, SyntaxKind,
 };
 use ts_diagnostics::{Diagnostic, message_by_code};
 
@@ -207,11 +207,13 @@ pub struct BindDiagnostic {
 }
 
 /// Complete binding output for one source-file arena.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BindResult {
     /// Program provenance when this file was bound as part of a Program.
     /// Standalone bindings deliberately remain unassigned.
-    pub file_id: Option<FileId>,
+    file_id: Option<FileId>,
+    arena_id: NodeArenaId,
+    bound_source_file: NodeId,
     pub symbols: SymbolArena,
     pub scopes: Vec<Scope>,
     pub node_symbols: BTreeMap<NodeId, SymbolId>,
@@ -222,10 +224,31 @@ pub struct BindResult {
 }
 
 impl BindResult {
-    /// Converts a file-local node ID into a program-wide identity.
+    fn new(arena: &NodeArena, source_file: NodeId, file_id: Option<FileId>) -> Self {
+        Self {
+            file_id,
+            arena_id: arena.id(),
+            bound_source_file: source_file,
+            symbols: SymbolArena::default(),
+            scopes: Vec::new(),
+            node_symbols: BTreeMap::new(),
+            node_scopes: BTreeMap::new(),
+            containers: BTreeMap::new(),
+            exports: SymbolTable::default(),
+            diagnostics: Vec::new(),
+        }
+    }
+
+    /// Program provenance, or `None` for a standalone binding.
     #[must_use]
-    pub fn node_ref(&self, node: NodeId) -> Option<NodeRef> {
-        self.file_id.map(|file| NodeRef::new(file, node))
+    pub const fn file_id(&self) -> Option<FileId> {
+        self.file_id
+    }
+
+    /// Whether these bindings were produced for this exact arena and root.
+    #[must_use]
+    pub fn is_for_source(&self, arena: &NodeArena, source_file: NodeId) -> bool {
+        self.arena_id == arena.id() && self.bound_source_file == source_file
     }
 
     #[must_use]
@@ -274,19 +297,27 @@ impl BindResult {
 }
 
 /// Binds declarations reachable from one source-file node.
+///
+/// # Panics
+///
+/// Panics if `source_file` is not a `SourceFile` node in `arena`.
 #[must_use]
 pub fn bind_source_file(arena: &NodeArena, source_file: NodeId) -> BindResult {
-    Binder::new(arena, None).bind(source_file)
+    Binder::new(arena, source_file, None).bind()
 }
 
 /// Binds one source file using its stable identity in a compiler Program.
+///
+/// # Panics
+///
+/// Panics if `source_file` is not a `SourceFile` node in `arena`.
 #[must_use]
 pub fn bind_source_file_in_file(
     arena: &NodeArena,
     source_file: NodeId,
     file_id: FileId,
 ) -> BindResult {
-    Binder::new(arena, Some(file_id)).bind(source_file)
+    Binder::new(arena, source_file, Some(file_id)).bind()
 }
 
 struct Binder<'a> {
@@ -297,7 +328,14 @@ struct Binder<'a> {
 }
 
 impl<'a> Binder<'a> {
-    fn new(arena: &'a NodeArena, file_id: Option<FileId>) -> Self {
+    fn new(arena: &'a NodeArena, source_file: NodeId, file_id: Option<FileId>) -> Self {
+        assert!(
+            matches!(
+                arena.get(source_file).map(|node| &node.data),
+                Some(NodeData::SourceFile(_))
+            ),
+            "binder source file must be a valid SourceFile node in its arena"
+        );
         let mut children = HashMap::<NodeId, Vec<NodeId>>::new();
         for (id, node) in arena.iter() {
             if let Some(parent) = node.parent {
@@ -306,16 +344,14 @@ impl<'a> Binder<'a> {
         }
         Self {
             arena,
-            result: BindResult {
-                file_id,
-                ..BindResult::default()
-            },
+            result: BindResult::new(arena, source_file, file_id),
             children,
             implicit_export_depth: 0,
         }
     }
 
-    fn bind(mut self, source_file: NodeId) -> BindResult {
+    fn bind(mut self) -> BindResult {
+        let source_file = self.result.bound_source_file;
         let Some(node) = self.arena.get(source_file) else {
             return self.result;
         };
@@ -1593,16 +1629,24 @@ mod tests {
     fn standalone_binding_does_not_claim_program_identity() {
         let parsed = parse_source_file("const value = 1;");
         let detached = bind_source_file(&parsed.arena, parsed.source_file);
-        assert_eq!(detached.file_id, None);
-        assert_eq!(detached.node_ref(parsed.source_file), None);
+        assert_eq!(detached.file_id(), None);
+        assert!(detached.is_for_source(&parsed.arena, parsed.source_file));
 
         let file_id = FileId::new(7);
         let assigned = bind_source_file_in_file(&parsed.arena, parsed.source_file, file_id);
-        assert_eq!(assigned.file_id, Some(file_id));
-        assert_eq!(
-            assigned.node_ref(parsed.source_file),
-            Some(ts_ast::NodeRef::new(file_id, parsed.source_file))
-        );
+        assert_eq!(assigned.file_id(), Some(file_id));
+        assert!(assigned.is_for_source(&parsed.arena, parsed.source_file));
+
+        let other = parse_source_file("const other = 2;");
+        assert!(!assigned.is_for_source(&other.arena, other.source_file));
+        assert!(!assigned.is_for_source(&parsed.arena, NodeId::new(u32::MAX)));
+    }
+
+    #[test]
+    #[should_panic(expected = "binder source file must be a valid SourceFile node in its arena")]
+    fn binding_rejects_invalid_source_file_ids() {
+        let arena = NodeArena::new();
+        let _ = bind_source_file(&arena, NodeId::new(u32::MAX));
     }
 
     impl AstBuilder {

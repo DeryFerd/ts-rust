@@ -87815,7 +87815,7 @@ class Board {
                 checker_options: CheckerOptions::default(),
             },
         ]);
-        let result = &checked.files[1];
+        let result = &checked.files()[1];
         let output = emit_declaration_file_with_semantics(
             &consumer.arena,
             consumer.source_file,
