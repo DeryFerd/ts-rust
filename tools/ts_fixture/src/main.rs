@@ -56,6 +56,14 @@ fn parse_arguments(arguments: &[String]) -> Result<Option<RunnerOptions>, String
             "--help" | "-h" => return Ok(None),
             "--diagnostics" => options.diagnostics = true,
             "--manifest" => options.manifest = true,
+            "--scorecard-json" => {
+                index += 1;
+                options.scorecard_json = Some(PathBuf::from(required_value(
+                    arguments,
+                    index,
+                    "--scorecard-json",
+                )?));
+            }
             "--filter" => {
                 index += 1;
                 options.filter = Some(required_value(arguments, index, "--filter")?);
@@ -80,6 +88,12 @@ fn parse_arguments(arguments: &[String]) -> Result<Option<RunnerOptions>, String
         }
         index += 1;
     }
+    if options.scorecard_json.is_some() && !options.diagnostics {
+        return Err("--scorecard-json requires --diagnostics".to_owned());
+    }
+    if options.scorecard_json.is_some() && options.manifest {
+        return Err("--scorecard-json cannot be used with --manifest".to_owned());
+    }
     Ok(Some(options))
 }
 
@@ -93,7 +107,7 @@ fn required_value(arguments: &[String], index: usize, option: &str) -> Result<St
 
 fn print_help() {
     println!(
-        "Usage: ts_fixture_baseline [--diagnostics] [--manifest] [--filter TEXT] [--skip COUNT] [--limit COUNT]"
+        "Usage: ts_fixture_baseline [--diagnostics] [--scorecard-json FILE] [--manifest] [--filter TEXT] [--skip COUNT] [--limit COUNT]"
     );
     println!(
         "Reads the pinned typescript-go compiler/conformance corpus and actual baselines below TS_GO_REPO."
@@ -114,7 +128,8 @@ mod tests {
             "--limit".into(),
             "25".into(),
             "--diagnostics".into(),
-            "--manifest".into(),
+            "--scorecard-json".into(),
+            "scorecard.json".into(),
         ])
         .unwrap()
         .unwrap();
@@ -122,13 +137,33 @@ mod tests {
         assert_eq!(options.skip, 10);
         assert_eq!(options.limit, Some(25));
         assert!(options.diagnostics);
-        assert!(options.manifest);
+        assert_eq!(
+            options.scorecard_json.as_deref(),
+            Some(std::path::Path::new("scorecard.json"))
+        );
+        assert!(!options.manifest);
     }
 
     #[test]
     fn rejects_invalid_arguments() {
+        assert!(
+            parse_arguments(&["--manifest".into()])
+                .unwrap()
+                .unwrap()
+                .manifest
+        );
         assert!(parse_arguments(&["--limit".into(), "many".into()]).is_err());
         assert!(parse_arguments(&["--skip".into(), "many".into()]).is_err());
         assert!(parse_arguments(&["--unknown".into()]).is_err());
+        assert!(parse_arguments(&["--scorecard-json".into(), "scorecard.json".into()]).is_err());
+        assert!(
+            parse_arguments(&[
+                "--diagnostics".into(),
+                "--manifest".into(),
+                "--scorecard-json".into(),
+                "scorecard.json".into(),
+            ])
+            .is_err()
+        );
     }
 }

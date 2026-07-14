@@ -174,7 +174,7 @@ fn upstream_skips_are_visible_but_never_executed() {
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        "summary: discovered_cases=1 upstream_skipped_cases=1 selected_cases=0 executed_variants=0 matched=0 mismatched=0 missing=0 content=0 missing_sections=0 unexpected_sections=0 diagnostics=0\n"
+        "summary: discovered_cases=1 upstream_skipped_cases=1 selected_cases=0 executed_variants=0 matched=0 mismatched=0 missing=0 content=0 missing_sections=0 unexpected_sections=0 diagnostics=0 diagnostic_comparison=header-only exact_matches=0 header_only_matches=0 header_mismatches=0\n"
     );
 }
 
@@ -211,7 +211,92 @@ fn compares_diagnostic_headers_without_changing_emit_mode() {
     );
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        "summary: discovered_cases=1 upstream_skipped_cases=0 selected_cases=1 executed_variants=1 matched=1 mismatched=0 missing=0 content=0 missing_sections=0 unexpected_sections=0 diagnostics=0\n"
+        "summary: discovered_cases=1 upstream_skipped_cases=0 selected_cases=1 executed_variants=1 matched=1 mismatched=0 missing=0 content=0 missing_sections=0 unexpected_sections=0 diagnostics=0 diagnostic_comparison=header-only exact_matches=0 header_only_matches=1 header_mismatches=0\n"
+    );
+}
+
+#[test]
+fn writes_deterministic_structured_header_only_scorecard() {
+    let repository = TestRepository::new();
+    repository.write_case(
+        "aHeaderMatch",
+        "// @noLib: true\nconst value: string = 1;\n",
+        None,
+    );
+    repository.write_baseline(
+        "aHeaderMatch.errors.txt",
+        concat!(
+            "aHeaderMatch.ts(1,7): error TS2322: Type 'number' is not assignable to type 'string'.\n",
+            "\n",
+            "==== aHeaderMatch.ts (1 errors) ====\n",
+        ),
+    );
+    repository.write_case(
+        "bHeaderMismatch",
+        "// @noLib: true\nconst value: string = 1;\n",
+        None,
+    );
+    repository.write_baseline(
+        "bHeaderMismatch.errors.txt",
+        "bHeaderMismatch.ts(1,7): error TS9999: deliberately wrong\n",
+    );
+
+    let first_path = repository.0.join("scorecard-first.json");
+    let first = run(
+        &repository.0,
+        &[
+            "--diagnostics",
+            "--scorecard-json",
+            first_path.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(first.status.code(), Some(1));
+    let first_json = fs::read_to_string(&first_path).unwrap();
+
+    let second_path = repository.0.join("scorecard-second.json");
+    let second = run(
+        &repository.0,
+        &[
+            "--diagnostics",
+            "--scorecard-json",
+            second_path.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(second.status.code(), Some(1));
+    assert_eq!(first_json, fs::read_to_string(second_path).unwrap());
+
+    let scorecard: serde_json::Value = serde_json::from_str(&first_json).unwrap();
+    assert_eq!(scorecard["schemaVersion"], 1);
+    assert_eq!(scorecard["comparisonScope"], "header_only");
+    assert_eq!(scorecard["fullArtifactComparison"], false);
+    assert_eq!(scorecard["summary"]["executedVariants"], 2);
+    assert_eq!(scorecard["summary"]["exactMatches"], 0);
+    assert_eq!(scorecard["summary"]["headerOnlyMatches"], 1);
+    assert_eq!(scorecard["summary"]["headerMismatches"], 1);
+    assert_eq!(scorecard["summary"]["actualDiagnostics"], 2);
+
+    let variants = scorecard["variants"].as_array().unwrap();
+    assert_eq!(
+        variants[0]["case"],
+        "testdata/tests/cases/compiler/aHeaderMatch.ts"
+    );
+    assert_eq!(variants[0]["status"], "header_only_match");
+    assert_eq!(variants[0]["comparisonScope"], "header_only");
+    assert_eq!(
+        variants[0]["expectedBaseline"],
+        "testdata/baselines/reference/compiler/aHeaderMatch.errors.txt"
+    );
+    assert_eq!(variants[1]["status"], "header_mismatch");
+
+    let diagnostic = &variants[0]["diagnostics"][0];
+    assert_eq!(diagnostic["fileName"], "/case/aHeaderMatch.ts");
+    assert_eq!(diagnostic["range"]["start"], 6);
+    assert_eq!(diagnostic["range"]["length"], 17);
+    assert_eq!(diagnostic["code"], 2322);
+    assert_eq!(diagnostic["category"], "error");
+    assert_eq!(
+        diagnostic["message"],
+        "Type 'number' is not assignable to type 'string'."
     );
 }
 

@@ -12,7 +12,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use ts_core::SourceText;
+use serde::Serialize;
+use ts_core::{SourceText, TextRange};
 use ts_diagnostic_writer::{Diagnostic, DiagnosticCategory, FormattingOptions, format_diagnostics};
 use ts_vfs::{FileSystem, MemoryFileSystem, decode_utf16_bom};
 
@@ -134,8 +135,20 @@ pub struct Compilation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompilationDiagnostic {
     pub file_name: Option<String>,
+    pub range: Option<TextRange>,
     pub code: Option<u32>,
+    pub category: Option<CompilationDiagnosticCategory>,
     pub message: String,
+}
+
+/// Diagnostic category retained by the fixture compiler when its source exposes one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompilationDiagnosticCategory {
+    Error,
+    Warning,
+    Suggestion,
+    Message,
 }
 
 /// One deterministic combination of scalar compiler-option directives.
@@ -186,6 +199,103 @@ pub struct RunnerOptions {
     pub diagnostics: bool,
     /// Print the discovered corpus/oracle manifest without compiling cases.
     pub manifest: bool,
+    /// Write a deterministic machine-readable diagnostic scorecard to this path.
+    pub scorecard_json: Option<PathBuf>,
+}
+
+/// Fidelity boundary of one diagnostic comparison.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticComparisonScope {
+    /// Only the unannotated diagnostic header of `.errors.txt` was compared.
+    HeaderOnly,
+}
+
+/// Deterministic outcome category for one diagnostic fixture variant.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticVariantStatus {
+    /// The diagnostic headers match, but full `.errors.txt` parity was not checked.
+    HeaderOnlyMatch,
+    HeaderMismatch,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticScorecardSummary {
+    pub discovered_cases: usize,
+    pub upstream_skipped_cases: usize,
+    pub selected_cases: usize,
+    pub executed_variants: usize,
+    /// Full diagnostic artifact matches. This remains zero for a header-only run.
+    pub exact_matches: usize,
+    pub header_only_matches: usize,
+    pub header_mismatches: usize,
+    pub actual_diagnostics: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticScorecardRange {
+    pub start: u32,
+    pub length: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticScorecardDiagnostic {
+    pub file_name: Option<String>,
+    pub range: Option<DiagnosticScorecardRange>,
+    pub code: Option<u32>,
+    pub category: Option<CompilationDiagnosticCategory>,
+    pub message: String,
+}
+
+impl From<&CompilationDiagnostic> for DiagnosticScorecardDiagnostic {
+    fn from(diagnostic: &CompilationDiagnostic) -> Self {
+        Self {
+            file_name: diagnostic.file_name.clone(),
+            range: diagnostic.range.map(|range| DiagnosticScorecardRange {
+                start: range.start.get(),
+                length: range.len(),
+            }),
+            code: diagnostic.code,
+            category: diagnostic.category,
+            message: diagnostic.message.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticVariantResult {
+    pub case: String,
+    pub options: BTreeMap<String, String>,
+    pub expected_baseline: Option<String>,
+    pub comparison_scope: DiagnosticComparisonScope,
+    pub status: DiagnosticVariantStatus,
+    pub expected_header: String,
+    pub actual_header: String,
+    pub diagnostics: Vec<DiagnosticScorecardDiagnostic>,
+}
+
+/// Machine-readable results for a diagnostic baseline run.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticScorecard {
+    pub schema_version: u32,
+    pub comparison_scope: DiagnosticComparisonScope,
+    pub full_artifact_comparison: bool,
+    pub summary: DiagnosticScorecardSummary,
+    pub variants: Vec<DiagnosticVariantResult>,
+}
+
+impl DiagnosticScorecard {
+    fn write_json(&self, path: &Path) -> io::Result<()> {
+        let mut file = fs::File::create(path)?;
+        serde_json::to_writer_pretty(&mut file, self).map_err(io::Error::other)?;
+        writeln!(file)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -374,6 +484,18 @@ pub fn run_upstream_diagnostic_baselines(
         selected_cases: cases.len(),
         ..RunnerSummary::default()
     };
+    let mut scorecard = DiagnosticScorecard {
+        schema_version: 1,
+        comparison_scope: DiagnosticComparisonScope::HeaderOnly,
+        full_artifact_comparison: false,
+        summary: DiagnosticScorecardSummary {
+            discovered_cases: summary.discovered_cases,
+            upstream_skipped_cases: summary.upstream_skipped_cases,
+            selected_cases: summary.selected_cases,
+            ..DiagnosticScorecardSummary::default()
+        },
+        variants: Vec::new(),
+    };
     for (case_path, baseline_index) in cases {
         let baseline_files = &baseline_sets[baseline_index];
         let source = fs::read(&case_path)?;
@@ -411,6 +533,9 @@ pub fn run_upstream_diagnostic_baselines(
                     ),
                 ));
             }
+            let expected_baseline = selected
+                .first()
+                .map(|path| relative_scorecard_path(repository, path));
             let expected = selected
                 .first()
                 .map(fs::read_to_string)
@@ -419,26 +544,63 @@ pub fn run_upstream_diagnostic_baselines(
                     parse_error_baseline_header(&baseline)
                 });
             let actual = normalize_diagnostic_header(&compilation.diagnostic_text);
-            if actual == expected {
+            let is_header_match = actual == expected;
+            let status = if is_header_match {
                 summary.matched += 1;
-                continue;
-            }
-            summary.mismatched += 1;
-            summary.diagnostic_failures += 1;
-            let display_path = case_path
-                .strip_prefix(repository)
-                .unwrap_or(&case_path)
-                .display();
-            let label = variant_label(&variant, &axes);
-            let (line, expected_line, actual_line) = first_different_line(&expected, &actual);
-            writeln!(
-                writer,
-                "MISMATCH {display_path}{label}: diagnostics differ at line {line}; expected {expected_line:?}, actual {actual_line:?}"
-            )?;
+                scorecard.summary.header_only_matches += 1;
+                DiagnosticVariantStatus::HeaderOnlyMatch
+            } else {
+                summary.mismatched += 1;
+                summary.diagnostic_failures += 1;
+                scorecard.summary.header_mismatches += 1;
+                let display_path = case_path
+                    .strip_prefix(repository)
+                    .unwrap_or(&case_path)
+                    .display();
+                let label = variant_label(&variant, &axes);
+                let (line, expected_line, actual_line) = first_different_line(&expected, &actual);
+                writeln!(
+                    writer,
+                    "MISMATCH {display_path}{label}: diagnostics differ at line {line}; expected {expected_line:?}, actual {actual_line:?}"
+                )?;
+                DiagnosticVariantStatus::HeaderMismatch
+            };
+            scorecard.summary.executed_variants += 1;
+            scorecard.summary.actual_diagnostics += compilation.diagnostics.len();
+            scorecard.variants.push(DiagnosticVariantResult {
+                case: relative_scorecard_path(repository, &case_path),
+                options: variant.values,
+                expected_baseline,
+                comparison_scope: DiagnosticComparisonScope::HeaderOnly,
+                status,
+                expected_header: expected,
+                actual_header: actual,
+                diagnostics: compilation
+                    .diagnostics
+                    .iter()
+                    .map(DiagnosticScorecardDiagnostic::from)
+                    .collect(),
+            });
         }
     }
-    writeln!(writer, "{summary}")?;
+    if let Some(path) = &options.scorecard_json {
+        scorecard.write_json(path)?;
+    }
+    writeln!(
+        writer,
+        "{summary} diagnostic_comparison=header-only exact_matches={} header_only_matches={} header_mismatches={}",
+        scorecard.summary.exact_matches,
+        scorecard.summary.header_only_matches,
+        scorecard.summary.header_mismatches,
+    )?;
     Ok(summary)
+}
+
+fn relative_scorecard_path(repository: &Path, path: &Path) -> String {
+    path.strip_prefix(repository)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 fn read_baseline_files(paths: &[&PathBuf]) -> io::Result<String> {
@@ -530,8 +692,8 @@ pub fn expand_option_matrix(case: &Case) -> Vec<OptionVariant> {
         let values = if value.trim() == "*" {
             if name == "module" {
                 [
-                    "amd", "commonjs", "es2020", "es2022", "es6", "esnext", "node16",
-                    "node18", "node20", "nodenext", "none", "preserve", "system", "umd",
+                    "amd", "commonjs", "es2020", "es2022", "es6", "esnext", "node16", "node18",
+                    "node20", "nodenext", "none", "preserve", "system", "umd",
                 ]
                 .into_iter()
                 .map(str::to_owned)
@@ -1002,7 +1164,11 @@ fn compile_case_variant(case: &Case, variant: &OptionVariant) -> std::io::Result
         .chain(program.diagnostics())
         .map(|diagnostic| CompilationDiagnostic {
             file_name: diagnostic.file_name.clone(),
+            range: diagnostic.range,
             code: diagnostic.code,
+            // ProgramDiagnostic currently has no category field. The fixture
+            // formatter renders this diagnostic stream as errors.
+            category: Some(CompilationDiagnosticCategory::Error),
             message: diagnostic.message.clone(),
         })
         .collect();
@@ -1118,11 +1284,12 @@ fn virtual_unit_path(case: &Case, unit: &Unit, index: usize) -> String {
 }
 
 fn virtual_unit_root(case: &Case) -> &'static str {
-    if case
-        .units
-        .iter()
-        .any(|unit| unit.path.to_string_lossy().replace('\\', "/").starts_with("/.src/"))
-    {
+    if case.units.iter().any(|unit| {
+        unit.path
+            .to_string_lossy()
+            .replace('\\', "/")
+            .starts_with("/.src/")
+    }) {
         "/.src"
     } else {
         "/case"
@@ -1732,9 +1899,7 @@ fn parse_directive_line(line: &str) -> Option<(&str, &str)> {
     if name.is_empty() || !name.chars().all(is_directive_name_character) {
         return None;
     }
-    if name.eq_ignore_ascii_case("ts-ignore")
-        || name.eq_ignore_ascii_case("ts-expect-error")
-    {
+    if name.eq_ignore_ascii_case("ts-ignore") || name.eq_ignore_ascii_case("ts-expect-error") {
         return None;
     }
     Some((name, value.trim()))
@@ -1789,11 +1954,18 @@ mod tests {
         )
         .unwrap();
         let compilation = compile_case(&case).unwrap();
-        assert!(compilation.outputs.keys().any(|path| path.ends_with("main.js")));
-        assert!(compilation
-            .outputs
-            .keys()
-            .all(|path| !path.contains("node_modules")));
+        assert!(
+            compilation
+                .outputs
+                .keys()
+                .any(|path| path.ends_with("main.js"))
+        );
+        assert!(
+            compilation
+                .outputs
+                .keys()
+                .all(|path| !path.contains("node_modules"))
+        );
     }
 
     #[test]
@@ -1886,11 +2058,7 @@ mod tests {
 
     #[test]
     fn preserves_trailing_blank_lines_in_virtual_units() {
-        let case = Case::parse(
-            "trailing.ts",
-            "// @filename: a.js\r\nvalue;\r\n\r\n",
-        )
-        .unwrap();
+        let case = Case::parse("trailing.ts", "// @filename: a.js\r\nvalue;\r\n\r\n").unwrap();
 
         assert_eq!(case.units[0].source_text, "value;\r\n\r\n");
     }

@@ -400,6 +400,8 @@ dependencies = [
 name = "ts_fixture"
 version = "7.0.0-dev"
 dependencies = [
+ "serde",
+ "serde_json",
  "ts_compiler",
  "ts_config",
  "ts_core",
