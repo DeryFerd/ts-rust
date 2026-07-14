@@ -405,6 +405,7 @@ dependencies = [
  "ts_compiler",
  "ts_config",
  "ts_core",
+ "ts_diagnostics",
  "ts_options",
  "ts_parser",
  "ts_path",

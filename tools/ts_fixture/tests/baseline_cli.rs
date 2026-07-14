@@ -179,7 +179,7 @@ fn upstream_skips_are_visible_but_never_executed() {
 }
 
 #[test]
-fn refuses_exact_diagnostics_when_program_category_data_is_unavailable() {
+fn matches_a_nonempty_full_diagnostic_artifact_exactly() {
     let repository = TestRepository::new();
     repository.write_case(
         "diagnosticParity",
@@ -208,13 +208,10 @@ fn refuses_exact_diagnostics_when_program_category_data_is_unavailable() {
         &repository.0,
         &["--diagnostics", "--filter", "diagnosticParity"],
     );
-    assert_eq!(output.status.code(), Some(1));
+    assert!(output.status.success());
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        concat!(
-            "MISMATCH testdata/tests/cases/compiler/diagnosticParity.ts: UnsupportedDetail at artifact line 1; expected \"diagnosticParity.ts(1,7): error TS2322: Type 'number' is not assignable to type 'string'.\\r\", actual \"diagnosticParity.ts(1,7): unknown TS2322: Type 'number' is not assignable to type 'string'.\\r\"\n",
-            "summary: discovered_cases=1 upstream_skipped_cases=0 selected_cases=1 executed_variants=1 matched=0 mismatched=1 missing=0 content=0 missing_sections=0 unexpected_sections=0 diagnostics=1 diagnostic_comparison=full-artifact exact_matches=0 header_only_matches=0 code_mismatches=0 span_mismatches=0 message_mismatches=0 order_mismatches=0 unsupported_details=1 header_mismatches=1 artifact_mismatches=0\n",
-        )
+        "summary: discovered_cases=1 upstream_skipped_cases=0 selected_cases=1 executed_variants=1 matched=1 mismatched=0 missing=0 content=0 missing_sections=0 unexpected_sections=0 diagnostics=0 diagnostic_comparison=full-artifact exact_matches=1 header_only_matches=0 code_mismatches=0 span_mismatches=0 message_mismatches=0 order_mismatches=0 unsupported_details=0 header_mismatches=0 artifact_mismatches=0\n"
     );
 }
 
@@ -287,11 +284,11 @@ fn writes_deterministic_structured_full_artifact_scorecard() {
     assert_eq!(scorecard["comparisonScope"], "full_artifact");
     assert_eq!(scorecard["fullArtifactComparison"], true);
     assert_eq!(scorecard["summary"]["executedVariants"], 2);
-    assert_eq!(scorecard["summary"]["exactMatches"], 0);
+    assert_eq!(scorecard["summary"]["exactMatches"], 1);
     assert_eq!(scorecard["summary"]["headerOnlyMatches"], 0);
-    assert_eq!(scorecard["summary"]["codeMismatches"], 0);
-    assert_eq!(scorecard["summary"]["unsupportedDetails"], 2);
-    assert_eq!(scorecard["summary"]["headerMismatches"], 2);
+    assert_eq!(scorecard["summary"]["codeMismatches"], 1);
+    assert_eq!(scorecard["summary"]["unsupportedDetails"], 0);
+    assert_eq!(scorecard["summary"]["headerMismatches"], 1);
     assert_eq!(scorecard["summary"]["actualDiagnostics"], 2);
 
     let variants = scorecard["variants"].as_array().unwrap();
@@ -299,20 +296,20 @@ fn writes_deterministic_structured_full_artifact_scorecard() {
         variants[0]["case"],
         "testdata/tests/cases/compiler/aHeaderMatch.ts"
     );
-    assert_eq!(variants[0]["status"], "unsupported_detail");
+    assert_eq!(variants[0]["status"], "exact_match");
     assert_eq!(variants[0]["comparisonScope"], "full_artifact");
     assert_eq!(
         variants[0]["expectedBaseline"],
         "testdata/baselines/reference/compiler/aHeaderMatch.errors.txt"
     );
-    assert_eq!(variants[1]["status"], "unsupported_detail");
+    assert_eq!(variants[1]["status"], "code_mismatch");
 
     let diagnostic = &variants[0]["diagnostics"][0];
     assert_eq!(diagnostic["fileName"], "/.src/aHeaderMatch.ts");
     assert_eq!(diagnostic["range"]["start"], 6);
     assert_eq!(diagnostic["range"]["length"], 17);
     assert_eq!(diagnostic["code"], 2322);
-    assert_eq!(diagnostic["category"], serde_json::Value::Null);
+    assert_eq!(diagnostic["category"], "error");
     assert_eq!(
         diagnostic["message"],
         "Type 'number' is not assignable to type 'string'."
@@ -468,9 +465,9 @@ fn diagnostics_mode_treats_a_missing_error_baseline_as_no_expected_errors() {
     assert_eq!(output.status.code(), Some(1));
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("MISMATCH testdata/tests/cases/compiler/unexpectedDiagnostic.ts"));
-    assert!(stdout.contains("UnsupportedDetail at artifact line 1"));
+    assert!(stdout.contains("HeaderMismatch at artifact line 1"));
     assert!(stdout.contains("expected \"\""));
-    assert!(stdout.contains("actual \"unexpectedDiagnostic.ts(1,7): unknown TS2322"));
+    assert!(stdout.contains("actual \"unexpectedDiagnostic.ts(1,7): error TS2322"));
     assert!(stdout.contains("matched=0 mismatched=1"));
     assert!(stdout.contains("diagnostics=1"));
 }

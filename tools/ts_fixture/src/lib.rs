@@ -2445,9 +2445,14 @@ fn compile_case_variant(case: &Case, variant: &OptionVariant) -> std::io::Result
                 .map(|source_file| SourceText::from(source_file.source_text.clone())),
             range: diagnostic.range,
             code: diagnostic.code,
-            // ProgramDiagnostic does not expose category or related information.
-            // Leaving these unknown prevents a synthetic exact match.
-            category: None,
+            category: Some(match diagnostic.category {
+                ts_diagnostics::Category::Error => CompilationDiagnosticCategory::Error,
+                ts_diagnostics::Category::Warning => CompilationDiagnosticCategory::Warning,
+                ts_diagnostics::Category::Suggestion => CompilationDiagnosticCategory::Suggestion,
+                ts_diagnostics::Category::Message => CompilationDiagnosticCategory::Message,
+            }),
+            // ProgramDiagnostic does not yet expose related information. The
+            // comparison rejects expected related records explicitly below.
             message: diagnostic.message.clone(),
             related_information: None,
         })
@@ -2518,7 +2523,7 @@ fn virtual_unit_root(_case: &Case) -> &'static str {
 
 fn is_pinned_program_root(path: &str) -> bool {
     let path = path.to_ascii_lowercase();
-    !path.ends_with(".json") && !path.ends_with(".tsbuildinfo")
+    !matches!(path.rsplit_once('.'), Some((_, "json" | "tsbuildinfo")))
 }
 
 fn unit_uses_implicit_references(unit: &Unit) -> bool {
