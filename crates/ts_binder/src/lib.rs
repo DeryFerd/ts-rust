@@ -368,9 +368,9 @@ pub struct BoundFlowGraph {
 }
 
 impl BoundFlowGraph {
-    fn new(file: FileId) -> Self {
+    fn new(arena: NodeArenaId, file: FileId) -> Self {
         Self {
-            nodes: FlowNodeArena::new(file),
+            nodes: FlowNodeArena::new(arena, file),
             node_flows: BTreeMap::new(),
             node_containers: BTreeMap::new(),
             container_starts: BTreeMap::new(),
@@ -387,6 +387,11 @@ impl BoundFlowGraph {
         self.nodes.file()
     }
 
+    #[must_use]
+    pub const fn node_arena_id(&self) -> NodeArenaId {
+        self.nodes.node_arena()
+    }
+
     /// Raw flow-node storage for graph algorithms and parity inspection.
     #[must_use]
     pub const fn nodes(&self) -> &FlowNodeArena {
@@ -397,7 +402,7 @@ impl BoundFlowGraph {
     /// control-flow container and file provenance are known.
     #[must_use]
     pub fn flow_at(&self, node: NodeRef) -> Option<FlowRef> {
-        if node.file != self.file_id() {
+        if !node.is_for(self.node_arena_id(), self.file_id()) {
             return None;
         }
         let container = self.node_containers.get(&node.node)?;
@@ -408,7 +413,8 @@ impl BoundFlowGraph {
 
     #[must_use]
     pub fn container_start(&self, container: NodeRef) -> Option<FlowRef> {
-        if container.file != self.file_id() || self.incomplete_containers.contains(&container.node)
+        if !container.is_for(self.node_arena_id(), self.file_id())
+            || self.incomplete_containers.contains(&container.node)
         {
             return None;
         }
@@ -417,7 +423,8 @@ impl BoundFlowGraph {
 
     #[must_use]
     pub fn container_end(&self, container: NodeRef) -> Option<FlowRef> {
-        if container.file != self.file_id() || self.incomplete_containers.contains(&container.node)
+        if !container.is_for(self.node_arena_id(), self.file_id())
+            || self.incomplete_containers.contains(&container.node)
         {
             return None;
         }
@@ -426,7 +433,8 @@ impl BoundFlowGraph {
 
     #[must_use]
     pub fn container_return(&self, container: NodeRef) -> Option<FlowRef> {
-        if container.file != self.file_id() || self.incomplete_containers.contains(&container.node)
+        if !container.is_for(self.node_arena_id(), self.file_id())
+            || self.incomplete_containers.contains(&container.node)
         {
             return None;
         }
@@ -437,7 +445,7 @@ impl BoundFlowGraph {
     /// container in this file.
     #[must_use]
     pub fn container_is_complete(&self, container: NodeRef) -> Option<bool> {
-        if container.file != self.file_id() {
+        if !container.is_for(self.node_arena_id(), self.file_id()) {
             return None;
         }
         (self.container_starts.contains_key(&container.node)
@@ -447,7 +455,7 @@ impl BoundFlowGraph {
 
     #[must_use]
     pub fn is_unreachable(&self, node: NodeRef) -> Option<bool> {
-        if node.file != self.file_id() {
+        if !node.is_for(self.node_arena_id(), self.file_id()) {
             return None;
         }
         let container = self.node_containers.get(&node.node)?;
@@ -1974,17 +1982,18 @@ fn is_value(flags: SymbolFlags) -> bool {
 mod tests {
     use ts_ast::{
         BlockData, ClassDeclarationData, EnumDeclarationData, EnumMemberData, FileId, FlowFlags,
-        FlowNodePayload, FunctionDeclarationData, IdentifierData, InterfaceDeclarationData, Node,
-        NodeArena, NodeData, NodeFlags, NodeId, NodeList, NodeRef, SourceFileData,
-        SymbolTable as AstSymbolTable, SyntaxKind, TokenData, TypeAliasDeclarationData,
-        VariableDeclarationData, VariableDeclarationListData, VariableStatementData,
+        FlowNodePayload, FlowRef, FunctionDeclarationData, IdentifierData,
+        InterfaceDeclarationData, Node, NodeArena, NodeData, NodeFlags, NodeId, NodeList, NodeRef,
+        SourceFileData, SymbolTable as AstSymbolTable, SyntaxKind, TokenData,
+        TypeAliasDeclarationData, VariableDeclarationData, VariableDeclarationListData,
+        VariableStatementData,
     };
     use ts_core::TextRange;
     use ts_parser::parse_source_file;
 
     use super::{
-        ScopeKind, SymbolFlags, UnsupportedFlowKind, bind_source_file, bind_source_file_in_file,
-        can_merge,
+        BoundFlowGraph, ScopeKind, SymbolFlags, UnsupportedFlowKind, bind_source_file,
+        bind_source_file_in_file, can_merge,
     };
 
     fn nodes_of_kind(arena: &NodeArena, kind: SyntaxKind) -> Vec<NodeId> {
@@ -1999,6 +2008,14 @@ mod tests {
             panic!("expected source file");
         };
         source.statements.nodes.clone()
+    }
+
+    fn node_ref(arena: &NodeArena, file: FileId, node: NodeId) -> NodeRef {
+        NodeRef::new(arena.id(), file, node)
+    }
+
+    fn assert_flow_flags(graph: &BoundFlowGraph, flow: FlowRef, flags: FlowFlags) {
+        assert!(graph.nodes().get(flow).unwrap().flags.contains(flags));
     }
 
     #[test]
@@ -2254,6 +2271,14 @@ mod tests {
                 .flow_graph(&parsed.arena, parsed.source_file)
                 .is_some()
         );
+        let cloned_arena = parsed.arena.clone();
+        let graph = assigned
+            .flow_graph(&parsed.arena, parsed.source_file)
+            .unwrap();
+        assert_eq!(
+            graph.container_start(node_ref(&cloned_arena, file_id, parsed.source_file)),
+            None
+        );
 
         let other = parse_source_file("const other = 2;");
         assert!(!assigned.is_for_source(&other.arena, other.source_file));
@@ -2286,19 +2311,16 @@ mod tests {
         let [initial, conditional, final_assignment] = statements.as_slice() else {
             panic!("expected three source statements");
         };
-        let source = NodeRef::new(file, parsed.source_file);
+        let source = node_ref(&parsed.arena, file, parsed.source_file);
         let start = graph.container_start(source).unwrap();
-        assert!(
-            graph
-                .nodes()
-                .get(start)
-                .unwrap()
-                .flags
-                .contains(FlowFlags::START)
+        assert_flow_flags(graph, start, FlowFlags::START);
+        assert_eq!(
+            graph.flow_at(node_ref(&parsed.arena, file, *initial)),
+            Some(start)
         );
-        assert_eq!(graph.flow_at(NodeRef::new(file, *initial)), Some(start));
-
-        let initial_flow = graph.flow_at(NodeRef::new(file, *conditional)).unwrap();
+        let initial_flow = graph
+            .flow_at(node_ref(&parsed.arena, file, *conditional))
+            .unwrap();
         let initial_node = graph.nodes().get(initial_flow).unwrap();
         assert!(initial_node.flags.contains(FlowFlags::ASSIGNMENT));
         assert!(initial_node.flags.contains(FlowFlags::SHARED));
@@ -2327,8 +2349,12 @@ mod tests {
         };
         let then_statement = then_block.statements.nodes[0];
         let else_statement = else_block.statements.nodes[0];
-        let then_entry = graph.flow_at(NodeRef::new(file, then_statement)).unwrap();
-        let else_entry = graph.flow_at(NodeRef::new(file, else_statement)).unwrap();
+        let then_entry = graph
+            .flow_at(node_ref(&parsed.arena, file, then_statement))
+            .unwrap();
+        let else_entry = graph
+            .flow_at(node_ref(&parsed.arena, file, else_statement))
+            .unwrap();
         let then_condition = graph.nodes().get(then_entry).unwrap();
         let else_condition = graph.nodes().get(else_entry).unwrap();
         assert!(then_condition.flags.contains(FlowFlags::TRUE_CONDITION));
@@ -2339,15 +2365,16 @@ mod tests {
         assert_eq!(else_condition.antecedent, Some(initial_flow));
         assert_eq!(
             then_condition.payload,
-            Some(FlowNodePayload::Ast(NodeRef::new(
+            Some(FlowNodePayload::Ast(node_ref(
+                &parsed.arena,
                 file,
-                if_statement.expression
+                if_statement.expression,
             )))
         );
         assert_eq!(else_condition.payload, then_condition.payload);
 
         let post_if = graph
-            .flow_at(NodeRef::new(file, *final_assignment))
+            .flow_at(node_ref(&parsed.arena, file, *final_assignment))
             .unwrap();
         let post_if_node = graph.nodes().get(post_if).unwrap();
         assert!(post_if_node.flags.contains(FlowFlags::BRANCH_LABEL));
@@ -2380,11 +2407,14 @@ mod tests {
         assert!(graph.is_complete(), "{:?}", graph.unsupported());
 
         let arrow = nodes_of_kind(&parsed.arena, SyntaxKind::ArrowFunction)[0];
-        let source = NodeRef::new(file, parsed.source_file);
+        let source = node_ref(&parsed.arena, file, parsed.source_file);
         let source_start = graph.container_start(source).unwrap();
-        assert_eq!(graph.flow_at(NodeRef::new(file, arrow)), Some(source_start));
+        assert_eq!(
+            graph.flow_at(node_ref(&parsed.arena, file, arrow)),
+            Some(source_start)
+        );
 
-        let arrow_ref = NodeRef::new(file, arrow);
+        let arrow_ref = node_ref(&parsed.arena, file, arrow);
         let arrow_start = graph.container_start(arrow_ref).unwrap();
         let arrow_start_node = graph.nodes().get(arrow_start).unwrap();
         assert_eq!(
@@ -2430,7 +2460,7 @@ mod tests {
         assert!(graph.is_complete(), "{:?}", graph.unsupported());
 
         let function = nodes_of_kind(&parsed.arena, SyntaxKind::FunctionDeclaration)[0];
-        let function_ref = NodeRef::new(file, function);
+        let function_ref = node_ref(&parsed.arena, file, function);
         assert!(graph.container_start(function_ref).is_some());
         assert_eq!(graph.container_end(function_ref), None);
 
@@ -2442,14 +2472,18 @@ mod tests {
         assert_eq!(condition_count, 4);
 
         let never = nodes_of_kind(&parsed.arena, SyntaxKind::VariableStatement)[0];
-        let never_ref = NodeRef::new(file, never);
+        let never_ref = node_ref(&parsed.arena, file, never);
         assert_eq!(graph.is_unreachable(never_ref), Some(true));
         assert_eq!(graph.flow_at(never_ref), None);
         for statement in nodes_of_kind(&parsed.arena, SyntaxKind::ReturnStatement)
             .into_iter()
             .chain(nodes_of_kind(&parsed.arena, SyntaxKind::ThrowStatement))
         {
-            assert!(graph.flow_at(NodeRef::new(file, statement)).is_some());
+            assert!(
+                graph
+                    .flow_at(node_ref(&parsed.arena, file, statement))
+                    .is_some()
+            );
         }
     }
 
@@ -2473,14 +2507,18 @@ mod tests {
         assert!(!graph.is_complete());
 
         let function = nodes_of_kind(&parsed.arena, SyntaxKind::FunctionDeclaration)[0];
-        let function_ref = NodeRef::new(file, function);
-        let source_ref = NodeRef::new(file, parsed.source_file);
+        let function_ref = node_ref(&parsed.arena, file, function);
+        let source_ref = node_ref(&parsed.arena, file, parsed.source_file);
         assert_eq!(graph.container_is_complete(function_ref), Some(false));
         assert_eq!(graph.container_start(function_ref), None);
         assert_eq!(graph.container_is_complete(source_ref), Some(true));
 
         let after = source_statements(&parsed.arena, parsed.source_file)[1];
-        assert!(graph.flow_at(NodeRef::new(file, after)).is_some());
+        assert!(
+            graph
+                .flow_at(node_ref(&parsed.arena, file, after))
+                .is_some()
+        );
         assert_eq!(graph.unsupported().len(), 1);
         assert_eq!(
             graph.unsupported()[0].kind,
@@ -2494,12 +2532,12 @@ mod tests {
         let top_graph = top_result
             .flow_graph(&top_level.arena, top_level.source_file)
             .unwrap();
-        let top_source = NodeRef::new(FileId::new(15), top_level.source_file);
+        let top_source = node_ref(&top_level.arena, FileId::new(15), top_level.source_file);
         assert_eq!(top_graph.container_is_complete(top_source), Some(false));
         assert_eq!(top_graph.container_start(top_source), None);
         let after = source_statements(&top_level.arena, top_level.source_file)[1];
         assert_eq!(
-            top_graph.flow_at(NodeRef::new(FileId::new(15), after)),
+            top_graph.flow_at(node_ref(&top_level.arena, FileId::new(15), after)),
             None
         );
     }

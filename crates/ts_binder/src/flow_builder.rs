@@ -47,7 +47,7 @@ impl<'a> FlowBuilder<'a> {
         Self {
             ast,
             children,
-            graph: BoundFlowGraph::new(file),
+            graph: BoundFlowGraph::new(ast.id(), file),
             current: None,
             container: NodeId::new(0),
             return_target: None,
@@ -931,7 +931,7 @@ impl<'a> FlowBuilder<'a> {
     }
 
     fn node_ref(&self, node: NodeId) -> NodeRef {
-        NodeRef::new(self.graph.file_id(), node)
+        NodeRef::new(self.graph.node_arena_id(), self.graph.file_id(), node)
     }
 
     fn node_kind(&self, node: NodeId) -> Option<SyntaxKind> {
