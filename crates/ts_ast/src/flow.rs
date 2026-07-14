@@ -160,7 +160,7 @@ impl FlowNode {
 }
 
 /// Stable storage for flow nodes allocated in binder traversal order.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FlowNodeArena {
     arena: NodeArenaId,
     file: FileId,
