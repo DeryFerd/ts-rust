@@ -1,6 +1,9 @@
 use std::{env, io, path::PathBuf, process::ExitCode};
 
-use ts_fixture::{RunnerOptions, run_upstream_baselines, run_upstream_diagnostic_baselines};
+use ts_fixture::{
+    RunnerOptions, discover_upstream_manifest, run_upstream_baselines,
+    run_upstream_diagnostic_baselines,
+};
 
 fn main() -> ExitCode {
     let arguments = env::args().skip(1).collect::<Vec<_>>();
@@ -19,6 +22,17 @@ fn main() -> ExitCode {
         eprintln!("error: TS_GO_REPO is not set");
         return ExitCode::from(2);
     };
+    if options.manifest {
+        return match discover_upstream_manifest(&repository)
+            .and_then(|manifest| manifest.write_to(&mut io::stdout().lock()))
+        {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("error: {error}");
+                ExitCode::from(2)
+            }
+        };
+    }
     let result = if options.diagnostics {
         run_upstream_diagnostic_baselines(&repository, &options, &mut io::stdout().lock())
     } else {
@@ -41,6 +55,7 @@ fn parse_arguments(arguments: &[String]) -> Result<Option<RunnerOptions>, String
         match arguments[index].as_str() {
             "--help" | "-h" => return Ok(None),
             "--diagnostics" => options.diagnostics = true,
+            "--manifest" => options.manifest = true,
             "--filter" => {
                 index += 1;
                 options.filter = Some(required_value(arguments, index, "--filter")?);
@@ -78,9 +93,11 @@ fn required_value(arguments: &[String], index: usize, option: &str) -> Result<St
 
 fn print_help() {
     println!(
-        "Usage: ts_fixture_baseline [--diagnostics] [--filter TEXT] [--skip COUNT] [--limit COUNT]"
+        "Usage: ts_fixture_baseline [--diagnostics] [--manifest] [--filter TEXT] [--skip COUNT] [--limit COUNT]"
     );
-    println!("Reads cases and reference baselines below TS_GO_REPO.");
+    println!(
+        "Reads the pinned typescript-go compiler/conformance corpus and actual baselines below TS_GO_REPO."
+    );
 }
 
 #[cfg(test)]
@@ -97,6 +114,7 @@ mod tests {
             "--limit".into(),
             "25".into(),
             "--diagnostics".into(),
+            "--manifest".into(),
         ])
         .unwrap()
         .unwrap();
@@ -104,6 +122,7 @@ mod tests {
         assert_eq!(options.skip, 10);
         assert_eq!(options.limit, Some(25));
         assert!(options.diagnostics);
+        assert!(options.manifest);
     }
 
     #[test]

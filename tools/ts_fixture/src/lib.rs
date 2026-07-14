@@ -16,6 +16,14 @@ use ts_core::SourceText;
 use ts_diagnostic_writer::{Diagnostic, DiagnosticCategory, FormattingOptions, format_diagnostics};
 use ts_vfs::{FileSystem, MemoryFileSystem, decode_utf16_bom};
 
+mod oracle;
+
+pub use oracle::{
+    OracleArtifactCounts, UpstreamCaseDisposition, UpstreamCaseManifest, UpstreamManifest,
+    UpstreamManifestSummary, UpstreamOrigin, UpstreamSuite, UpstreamSuiteManifest,
+    discover_upstream_manifest,
+};
+
 /// A parsed compiler test case.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Case {
@@ -176,10 +184,16 @@ pub struct RunnerOptions {
     pub limit: Option<usize>,
     /// Compare compiler diagnostics with upstream `.errors.txt` baselines instead of emit.
     pub diagnostics: bool,
+    /// Print the discovered corpus/oracle manifest without compiling cases.
+    pub manifest: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RunnerSummary {
+    pub discovered_cases: usize,
+    pub upstream_skipped_cases: usize,
+    pub selected_cases: usize,
+    pub executed_variants: usize,
     pub matched: usize,
     pub mismatched: usize,
     pub missing: usize,
@@ -196,6 +210,26 @@ impl RunnerSummary {
     }
 }
 
+impl fmt::Display for RunnerSummary {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "summary: discovered_cases={} upstream_skipped_cases={} selected_cases={} executed_variants={} matched={} mismatched={} missing={} content={} missing_sections={} unexpected_sections={} diagnostics={}",
+            self.discovered_cases,
+            self.upstream_skipped_cases,
+            self.selected_cases,
+            self.executed_variants,
+            self.matched,
+            self.mismatched,
+            self.missing,
+            self.content_differences,
+            self.missing_sections,
+            self.unexpected_sections,
+            self.diagnostic_failures,
+        )
+    }
+}
+
 /// Discovers upstream cases/reference baselines and runs emitted-output comparisons.
 ///
 /// # Errors
@@ -206,28 +240,20 @@ pub fn run_upstream_baselines(
     options: &RunnerOptions,
     writer: &mut impl Write,
 ) -> io::Result<RunnerSummary> {
-    let layouts = upstream_layouts(repository);
-    if layouts.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!(
-                "no TypeScript cases/reference baseline layout below {}",
-                repository.display()
-            ),
-        ));
-    }
+    let manifest = discover_upstream_manifest(repository)?;
+    let manifest_summary = manifest.summary();
     let mut cases = Vec::new();
     let mut baseline_sets = Vec::new();
-    for (case_root, baseline_root) in &layouts {
-        let baselines = collect_files(baseline_root, is_emit_baseline_file)?;
+    for suite in &manifest.suites {
+        let baselines = collect_files(&suite.oracle_root, is_emit_baseline_file)?;
         let baseline_index = baseline_sets.len();
         baseline_sets.push(index_baselines(baselines));
-        for case_path in collect_files(case_root, is_case_file)? {
-            cases.push((case_path, baseline_index));
+        for case in &suite.cases {
+            if case.disposition == UpstreamCaseDisposition::Runnable {
+                cases.push((case.path.clone(), baseline_index));
+            }
         }
     }
-    cases.sort_by(|left, right| left.0.cmp(&right.0));
-    cases.dedup_by(|left, right| left.0 == right.0);
     let filter = options.filter.as_deref().map(str::to_ascii_lowercase);
     let cases = cases
         .into_iter()
@@ -237,9 +263,15 @@ pub fn run_upstream_baselines(
                 .is_none_or(|filter| path.to_string_lossy().to_ascii_lowercase().contains(filter))
         })
         .skip(options.skip)
-        .take(options.limit.unwrap_or(usize::MAX));
+        .take(options.limit.unwrap_or(usize::MAX))
+        .collect::<Vec<_>>();
 
-    let mut summary = RunnerSummary::default();
+    let mut summary = RunnerSummary {
+        discovered_cases: manifest_summary.discovered_cases,
+        upstream_skipped_cases: manifest_summary.upstream_skipped_cases,
+        selected_cases: cases.len(),
+        ..RunnerSummary::default()
+    };
     for (case_path, baseline_index) in cases {
         let baseline_files = &baseline_sets[baseline_index];
         let source = fs::read(&case_path)?;
@@ -254,6 +286,7 @@ pub fn run_upstream_baselines(
             .get(case_name)
             .map_or_else(Vec::new, |paths| paths.iter().collect::<Vec<_>>());
         for (variant, compilation) in compile_case_matrix(&case)? {
+            summary.executed_variants += 1;
             let selected = select_variant_baselines(&candidates, case_name, &variant, &axes);
             let display_path = case_path
                 .strip_prefix(repository)
@@ -289,17 +322,7 @@ pub fn run_upstream_baselines(
             }
         }
     }
-    writeln!(
-        writer,
-        "summary: matched={} mismatched={} missing={} content={} missing_sections={} unexpected_sections={} diagnostics={}",
-        summary.matched,
-        summary.mismatched,
-        summary.missing,
-        summary.content_differences,
-        summary.missing_sections,
-        summary.unexpected_sections,
-        summary.diagnostic_failures,
-    )?;
+    writeln!(writer, "{summary}")?;
     Ok(summary)
 }
 
@@ -319,28 +342,20 @@ pub fn run_upstream_diagnostic_baselines(
     options: &RunnerOptions,
     writer: &mut impl Write,
 ) -> io::Result<RunnerSummary> {
-    let layouts = upstream_layouts(repository);
-    if layouts.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!(
-                "no TypeScript cases/reference baseline layout below {}",
-                repository.display()
-            ),
-        ));
-    }
+    let manifest = discover_upstream_manifest(repository)?;
+    let manifest_summary = manifest.summary();
     let mut cases = Vec::new();
     let mut baseline_sets = Vec::new();
-    for (case_root, baseline_root) in &layouts {
-        let baselines = collect_files(baseline_root, is_error_baseline_file)?;
+    for suite in &manifest.suites {
+        let baselines = collect_files(&suite.oracle_root, is_error_baseline_file)?;
         let baseline_index = baseline_sets.len();
         baseline_sets.push(index_baselines_with(baselines, error_baseline_base));
-        for case_path in collect_files(case_root, is_case_file)? {
-            cases.push((case_path, baseline_index));
+        for case in &suite.cases {
+            if case.disposition == UpstreamCaseDisposition::Runnable {
+                cases.push((case.path.clone(), baseline_index));
+            }
         }
     }
-    cases.sort_by(|left, right| left.0.cmp(&right.0));
-    cases.dedup_by(|left, right| left.0 == right.0);
     let filter = options.filter.as_deref().map(str::to_ascii_lowercase);
     let cases = cases
         .into_iter()
@@ -350,9 +365,15 @@ pub fn run_upstream_diagnostic_baselines(
                 .is_none_or(|filter| path.to_string_lossy().to_ascii_lowercase().contains(filter))
         })
         .skip(options.skip)
-        .take(options.limit.unwrap_or(usize::MAX));
+        .take(options.limit.unwrap_or(usize::MAX))
+        .collect::<Vec<_>>();
 
-    let mut summary = RunnerSummary::default();
+    let mut summary = RunnerSummary {
+        discovered_cases: manifest_summary.discovered_cases,
+        upstream_skipped_cases: manifest_summary.upstream_skipped_cases,
+        selected_cases: cases.len(),
+        ..RunnerSummary::default()
+    };
     for (case_path, baseline_index) in cases {
         let baseline_files = &baseline_sets[baseline_index];
         let source = fs::read(&case_path)?;
@@ -367,6 +388,7 @@ pub fn run_upstream_diagnostic_baselines(
             .get(case_name)
             .map_or_else(Vec::new, |paths| paths.iter().collect::<Vec<_>>());
         for (variant, compilation) in compile_case_matrix(&case)? {
+            summary.executed_variants += 1;
             let selected = select_variant_baselines_with(
                 &candidates,
                 case_name,
@@ -415,11 +437,7 @@ pub fn run_upstream_diagnostic_baselines(
             )?;
         }
     }
-    writeln!(
-        writer,
-        "summary: matched={} mismatched={} diagnostics={}",
-        summary.matched, summary.mismatched, summary.diagnostic_failures,
-    )?;
+    writeln!(writer, "{summary}")?;
     Ok(summary)
 }
 
@@ -1304,23 +1322,6 @@ const SCALAR_OPTION_NAMES: &[&str] = &[
 
 const LIST_OPTION_NAMES: &[&str] = &["lib", "rootDirs", "typeRoots", "types"];
 
-fn upstream_layouts(repository: &Path) -> Vec<(PathBuf, PathBuf)> {
-    let candidates = [
-        ("testdata/tests/cases", "testdata/tests/baselines/reference"),
-        (
-            "_submodules/TypeScript/tests/cases",
-            "_submodules/TypeScript/tests/baselines/reference",
-        ),
-        ("tests/cases", "tests/baselines/reference"),
-    ];
-    candidates
-        .into_iter()
-        .map(|(cases, baselines)| (repository.join(cases), repository.join(baselines)))
-        .find(|(cases, baselines)| cases.is_dir() && baselines.is_dir())
-        .into_iter()
-        .collect()
-}
-
 fn collect_files(root: &Path, include: fn(&Path) -> bool) -> io::Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     if !root.is_dir() {
@@ -1341,13 +1342,6 @@ fn collect_files(root: &Path, include: fn(&Path) -> bool) -> io::Result<Vec<Path
     }
     files.sort();
     Ok(files)
-}
-
-fn is_case_file(path: &Path) -> bool {
-    matches!(
-        path.extension().and_then(|extension| extension.to_str()),
-        Some("ts" | "tsx" | "js" | "jsx")
-    )
 }
 
 fn is_emit_baseline_file(path: &Path) -> bool {

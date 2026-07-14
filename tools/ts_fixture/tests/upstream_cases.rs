@@ -1,23 +1,20 @@
-use std::{env, fs, path::Path};
+use std::{env, fs};
 
-use ts_fixture::Case;
+use ts_fixture::{Case, discover_upstream_manifest};
 
 #[test]
 fn parses_all_available_upstream_compiler_cases() {
     let Ok(repository) = env::var("TS_GO_REPO") else {
         return;
     };
-    let roots = [
-        Path::new(&repository).join("testdata/tests/cases/compiler"),
-        Path::new(&repository).join("testdata/tests/cases/conformance"),
-        Path::new(&repository).join("_submodules/TypeScript/tests/cases/compiler"),
-        Path::new(&repository).join("_submodules/TypeScript/tests/cases/conformance"),
-    ];
+    let manifest = discover_upstream_manifest(repository.as_ref())
+        .unwrap_or_else(|error| panic!("failed to discover upstream compiler oracle: {error}"));
     let mut parsed = 0;
     let mut parsed_units = 0;
     let mut invalid_utf8 = 0;
-    for root in roots {
-        visit(&root, &mut |path| {
+    for suite in manifest.suites {
+        for case_manifest in suite.cases {
+            let path = &case_manifest.path;
             let bytes = fs::read(path).unwrap_or_else(|error| {
                 panic!("failed to read upstream case {}: {error}", path.display())
             });
@@ -32,7 +29,7 @@ fn parses_all_available_upstream_compiler_cases() {
                 parsed_units += 1;
             }
             parsed += 1;
-        });
+        }
     }
     assert!(
         parsed > 12_000,
@@ -46,22 +43,4 @@ fn parses_all_available_upstream_compiler_cases() {
         parsed_units >= parsed,
         "expected at least one parsed source unit per fixture"
     );
-}
-
-fn visit(root: &Path, callback: &mut impl FnMut(&Path)) {
-    let Ok(entries) = fs::read_dir(root) else {
-        return;
-    };
-    for entry in entries {
-        let entry = entry.unwrap();
-        let path = entry.path();
-        if path.is_dir() {
-            visit(&path, callback);
-        } else if matches!(
-            path.extension().and_then(|extension| extension.to_str()),
-            Some("ts" | "tsx" | "js" | "jsx")
-        ) {
-            callback(&path);
-        }
-    }
 }
