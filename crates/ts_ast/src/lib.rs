@@ -1,9 +1,11 @@
 //! TypeScript syntax model.
 
 mod ast_generated;
+mod flow;
 mod syntax_kind;
 
 pub use ast_generated::*;
+pub use flow::*;
 pub use syntax_kind::SyntaxKind;
 
 /// Stable identifier for one source-file arena during the lifetime of one
