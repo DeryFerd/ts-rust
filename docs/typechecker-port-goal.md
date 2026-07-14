@@ -65,8 +65,11 @@ remains the cluster-level source of truth.
   symbol masks and the typed flow substrate are integrated as well; the
   combined foundation passed 209 focused tests and adds no Clippy regression.
 - Canonical semantic IDs plus signature, predicate, index, and tuple records
-  are the active type-system lane. Program-owned symbols and binder CFG
-  construction are the next dependency-closed binder lane.
+  are integrated behind a store-branded aggregate. AST scope growth is
+  monotonic, raw payload allocation is crate-private, and independent review
+  proved that equal local IDs from another store cannot enter any public
+  record slot. Complete type payloads, lazy links, and program-owned symbols
+  are now the next dependency-closed semantic lanes.
 
 No percentage in this section is a whole-corpus parity claim. A score is
 publishable only when its variant manifest and complete artifact comparison are
