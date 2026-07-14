@@ -170,6 +170,9 @@ pub enum CompilationDiagnosticCategory {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct OptionVariant {
     pub values: BTreeMap<String, String>,
+    /// Configuration details that the Rust compiler cannot faithfully apply.
+    /// Such variants execute for visibility but can never count as exact.
+    pub unsupported_details: Vec<String>,
 }
 
 /// Compilation and baseline comparison for one option variant.
@@ -457,6 +460,15 @@ pub fn run_upstream_baselines(
                 .unwrap_or(&case_path)
                 .display();
             let label = variant_label(&variant, &axes);
+            if !variant.unsupported_details.is_empty() {
+                summary.mismatched += 1;
+                writeln!(
+                    writer,
+                    "MISMATCH {display_path}{label}: unsupported configuration: {}",
+                    variant.unsupported_details.join("; ")
+                )?;
+                continue;
+            }
             if selected.is_empty() {
                 if compilation
                     .outputs
@@ -595,7 +607,10 @@ pub fn run_upstream_diagnostic_baselines(
                 .map(fs::read_to_string)
                 .transpose()?
                 .unwrap_or_default();
-            let actual = render_error_baseline(&case, &compilation.diagnostics);
+            let mut actual = render_error_baseline(&case, &compilation.diagnostics);
+            actual
+                .unsupported_details
+                .extend(variant.unsupported_details.iter().cloned());
             let comparison =
                 compare_diagnostic_artifacts(&expected, &actual, &compilation.diagnostics);
             let status = comparison.status();
@@ -761,6 +776,8 @@ fn render_error_baseline(
             ));
         }
     }
+    let (unit_order, unit_order_issues) = error_baseline_unit_order(case);
+    artifact.unsupported_details.extend(unit_order_issues);
     artifact.text = render_diagnostic_header(case, &ordered, &mut artifact.unsupported_details);
     artifact.text.push_str(HARNESS_NEW_LINE);
     artifact.text.push_str(HARNESS_NEW_LINE);
@@ -780,7 +797,8 @@ fn render_error_baseline(
         }
     }
 
-    for (unit_index, unit) in case.units.iter().enumerate() {
+    for unit_index in unit_order {
+        let unit = &case.units[unit_index];
         let file_diagnostics = ordered
             .iter()
             .enumerate()
@@ -826,6 +844,87 @@ fn render_error_baseline(
     artifact.unsupported_details.sort();
     artifact.unsupported_details.dedup();
     artifact
+}
+
+fn error_baseline_unit_order(case: &Case) -> (Vec<usize>, Vec<String>) {
+    let config_indices = case
+        .units
+        .iter()
+        .enumerate()
+        .filter_map(|(index, unit)| {
+            unit.path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.eq_ignore_ascii_case("tsconfig.json")
+                        || name.eq_ignore_ascii_case("jsconfig.json")
+                })
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    if let Some(&config_index) = config_indices.first() {
+        let mut issues = Vec::new();
+        if config_indices.len() > 1 {
+            issues.push(
+                "multiple project configuration units make upstream tsConfigFiles ordering ambiguous"
+                    .to_owned(),
+            );
+        }
+        let config_path = virtual_unit_path(case, &case.units[config_index], config_index);
+        let config_directory = config_path
+            .rsplit_once('/')
+            .map_or("", |(directory, _)| directory);
+        let parsed = ts_config::parse_config_text(
+            &config_path,
+            case.units[config_index].source_text.as_scannable_str(),
+        );
+        let explicit_files = parsed.value.and_then(|config| config.files);
+        let mut roots = Vec::new();
+        if let Some(files) = explicit_files {
+            let configured = files
+                .iter()
+                .map(|file| ts_path::resolve_path(config_directory, &[file]))
+                .collect::<BTreeSet<_>>();
+            roots.extend(
+                case.units
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| !config_indices.contains(index))
+                    .filter_map(|(index, unit)| {
+                        configured
+                            .contains(&virtual_unit_path(case, unit, index))
+                            .then_some(index)
+                    }),
+            );
+        } else {
+            issues.push(
+                "project include/exclude expansion is not exposed to the fixture renderer; input-file order cannot be proven exact"
+                    .to_owned(),
+            );
+        }
+        let mut order = config_indices;
+        order.extend(roots.iter().copied());
+        let remaining = case
+            .units
+            .iter()
+            .enumerate()
+            .map(|(index, _)| index)
+            .filter(|index| !order.contains(index) && !roots.contains(index))
+            .collect::<Vec<_>>();
+        order.extend(remaining);
+        return (order, issues);
+    }
+
+    let mut order = (0..case.units.len()).collect::<Vec<_>>();
+    let implicit_references = case
+        .directive_values("noImplicitReferences")
+        .last()
+        .is_some_and(|value| !value.is_empty())
+        || case.units.last().is_some_and(unit_uses_implicit_references);
+    if implicit_references && let Some(last) = order.pop() {
+        order.insert(0, last);
+    }
+    (order, Vec::new())
 }
 
 fn render_diagnostic_header(
@@ -1555,51 +1654,38 @@ fn parse_baseline_section_list(baseline: &str) -> Vec<(String, String)> {
     sections
 }
 
-/// Expands comma-separated scalar option directives as a Cartesian product.
-/// Option names are ordered canonically and values retain directive order.
+/// Expands frozen-pin compiler variation directives as a Cartesian product.
+///
+/// This mirrors `harnessutil.GetFileBasedTestConfigurations`: only boolean and
+/// enum options in the pinned compiler's vary-by set expand, `*` uses the
+/// pinned option declaration order, aliases deduplicate by semantic value, and
+/// `-`/`!` exclusions remove normalized values. Variants that Rust cannot apply
+/// remain visible with an explicit unsupported reason.
 #[must_use]
 pub fn expand_option_matrix(case: &Case) -> Vec<OptionVariant> {
-    let mut option_values = BTreeMap::<String, Vec<String>>::new();
-    for &name in SCALAR_OPTION_NAMES {
-        let Some(value) = case.directive_values(name).last() else {
-            continue;
-        };
-        let values = if value.trim() == "*" {
-            if name == "module" {
-                [
-                    "amd", "commonjs", "es2020", "es2022", "es6", "esnext", "node16", "node18",
-                    "node20", "nodenext", "none", "preserve", "system", "umd",
-                ]
+    let (option_values, mut unsupported_details) = expanded_option_values(case);
+    let variation_count = option_values
+        .values()
+        .map(Vec::len)
+        .try_fold(1_usize, usize::checked_mul)
+        .unwrap_or(usize::MAX);
+    if variation_count > 25 {
+        unsupported_details.push(format!(
+            "pinned harness variation cap exceeded: {variation_count} configurations (maximum 25)"
+        ));
+        return vec![OptionVariant {
+            values: option_values
                 .into_iter()
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
-            } else {
-                vec!["false".to_owned(), "true".to_owned()]
-            }
-        } else {
-            value
-                .split(',')
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
-        };
-        option_values.insert(
-            name.to_owned(),
-            if values.is_empty() {
-                vec![String::new()]
-            } else {
-                values
-            },
-        );
-    }
-    for &name in LIST_OPTION_NAMES {
-        if let Some(value) = case.directive_values(name).last() {
-            option_values.insert(name.to_owned(), vec![value.to_owned()]);
-        }
+                .filter_map(|(name, values)| values.into_iter().next().map(|value| (name, value)))
+                .collect(),
+            unsupported_details,
+        }];
     }
 
-    let mut variants = vec![OptionVariant::default()];
+    let mut variants = vec![OptionVariant {
+        values: BTreeMap::new(),
+        unsupported_details,
+    }];
     for (name, values) in option_values {
         let mut expanded = Vec::with_capacity(variants.len() * values.len());
         for variant in variants {
@@ -1612,6 +1698,148 @@ pub fn expand_option_matrix(case: &Case) -> Vec<OptionVariant> {
         variants = expanded;
     }
     variants
+}
+
+fn expanded_option_values(case: &Case) -> (BTreeMap<String, Vec<String>>, Vec<String>) {
+    let mut option_values = BTreeMap::<String, Vec<String>>::new();
+    let mut unsupported_details = Vec::new();
+    for &name in COMPILER_OPTION_NAMES {
+        let Some(raw_value) = case.directive_values(name).last() else {
+            continue;
+        };
+        let values = if is_varying_boolean_option(name) || enum_option_values(name).is_some() {
+            if raw_value.is_empty() {
+                continue;
+            }
+            match split_pinned_option_values(raw_value, name) {
+                Ok(values) => values,
+                Err(detail) => {
+                    unsupported_details.push(detail);
+                    vec![raw_value.to_owned()]
+                }
+            }
+        } else {
+            vec![raw_value.to_owned()]
+        };
+        if !rust_applies_compiler_option(name) {
+            unsupported_details.push(format!(
+                "compiler option {name} is configured as {raw_value:?}, but Rust does not apply it"
+            ));
+        }
+        if name.eq_ignore_ascii_case("pretty") && raw_value.eq_ignore_ascii_case("true") {
+            unsupported_details.push(
+                "pretty diagnostic baselines are not implemented; non-pretty output cannot count as exact"
+                    .to_owned(),
+            );
+        }
+        option_values.insert(name.to_owned(), values);
+    }
+    for &name in LIST_OPTION_NAMES {
+        if let Some(value) = case.directive_values(name).last() {
+            option_values.insert(name.to_owned(), vec![value.to_owned()]);
+        }
+    }
+    unsupported_details.sort();
+    unsupported_details.dedup();
+    (option_values, unsupported_details)
+}
+
+fn split_pinned_option_values(raw_value: &str, option: &str) -> Result<Vec<String>, String> {
+    let mut star = false;
+    let mut includes = Vec::new();
+    let mut excludes = Vec::new();
+    for part in raw_value
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
+        if part == "*" {
+            star = true;
+        } else if let Some(excluded) = part.strip_prefix(['-', '!']) {
+            excludes.push(excluded);
+        } else {
+            includes.push(part);
+        }
+    }
+
+    let mut values = Vec::<(String, String)>::new();
+    for include in includes {
+        let Some(identity) = normalized_option_value(option, include) else {
+            return Err(format!(
+                "unknown value {include:?} for pinned compiler option {option}"
+            ));
+        };
+        if !values.iter().any(|(existing, _)| *existing == identity) {
+            values.push((identity, include.to_owned()));
+        }
+    }
+    if star {
+        let all_values = if is_varying_boolean_option(option) {
+            BOOLEAN_OPTION_VALUES
+        } else {
+            enum_option_values(option).unwrap_or_default()
+        };
+        for &(spelling, identity) in all_values {
+            if !values.iter().any(|(existing, _)| existing == identity) {
+                values.push((identity.to_owned(), spelling.to_owned()));
+            }
+        }
+    }
+    for exclude in excludes {
+        if let Some(identity) = normalized_option_value(option, exclude) {
+            values.retain(|(existing, _)| *existing != identity);
+        }
+    }
+    if values.is_empty() {
+        return Err(format!(
+            "variations in pinned compiler option @{option}: {raw_value} resulted in an empty set"
+        ));
+    }
+    Ok(values.into_iter().map(|(_, spelling)| spelling).collect())
+}
+
+fn normalized_option_value(option: &str, value: &str) -> Option<String> {
+    if is_varying_boolean_option(option) {
+        return matches!(value.to_ascii_lowercase().as_str(), "true" | "false")
+            .then(|| value.to_ascii_lowercase());
+    }
+    enum_option_values(option)?
+        .iter()
+        .find_map(|(spelling, identity)| {
+            spelling
+                .eq_ignore_ascii_case(value)
+                .then(|| (*identity).to_owned())
+        })
+}
+
+fn is_varying_boolean_option(name: &str) -> bool {
+    VARYING_BOOLEAN_OPTION_NAMES
+        .iter()
+        .any(|option| name.eq_ignore_ascii_case(option))
+}
+
+fn enum_option_values(name: &str) -> Option<&'static [(&'static str, &'static str)]> {
+    if name.eq_ignore_ascii_case("target") {
+        Some(TARGET_OPTION_VALUES)
+    } else if name.eq_ignore_ascii_case("module") {
+        Some(MODULE_OPTION_VALUES)
+    } else if name.eq_ignore_ascii_case("moduleResolution") {
+        Some(MODULE_RESOLUTION_OPTION_VALUES)
+    } else if name.eq_ignore_ascii_case("moduleDetection") {
+        Some(MODULE_DETECTION_OPTION_VALUES)
+    } else if name.eq_ignore_ascii_case("jsx") {
+        Some(JSX_OPTION_VALUES)
+    } else if name.eq_ignore_ascii_case("newLine") {
+        Some(NEW_LINE_OPTION_VALUES)
+    } else {
+        None
+    }
+}
+
+fn rust_applies_compiler_option(name: &str) -> bool {
+    RUST_APPLIED_COMPILER_OPTION_NAMES
+        .iter()
+        .any(|option| name.eq_ignore_ascii_case(option))
 }
 
 /// Compares compiler outputs with JavaScript and declaration baseline sections.
@@ -1988,18 +2216,13 @@ fn compile_case_variant(case: &Case, variant: &OptionVariant) -> std::io::Result
             roots.push(path);
         }
     }
-    let last_unit_uses_implicit_references = case.units.last().is_some_and(|unit| {
-        unit.source_text.as_scannable_str().contains("require(")
-            || unit
-                .source_text
-                .as_scannable_str()
-                .contains("reference path")
-    });
+    let last_unit_uses_implicit_references =
+        case.units.last().is_some_and(unit_uses_implicit_references);
     if project_directory.is_none()
         && (case
             .directive_values("noImplicitReferences")
-            .next()
-            .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+            .last()
+            .is_some_and(|value| !value.is_empty())
             || last_unit_uses_implicit_references)
         && let Some(last_root) = roots.pop()
     {
@@ -2031,10 +2254,12 @@ fn compile_case_variant(case: &Case, variant: &OptionVariant) -> std::io::Result
         compiler_options,
     );
     let emit = program.emit();
-    let mut diagnostics = emit
-        .diagnostics
+    // The Go harness baselines pre-emit program/syntactic/semantic/global and
+    // declaration diagnostics. Emit-result diagnostics are not part of that
+    // stream, so use Program's aggregate as the closest available Rust API.
+    let mut diagnostics = program
+        .diagnostics()
         .iter()
-        .chain(program.diagnostics())
         .map(|diagnostic| CompilationDiagnostic {
             file_name: diagnostic.file_name.clone(),
             source_text: diagnostic
@@ -2044,11 +2269,10 @@ fn compile_case_variant(case: &Case, variant: &OptionVariant) -> std::io::Result
                 .map(|source_file| SourceText::from(source_file.source_text.clone())),
             range: diagnostic.range,
             code: diagnostic.code,
-            // ProgramDiagnostic currently has no category field. The fixture
-            // formatter renders this diagnostic stream as errors.
-            category: Some(CompilationDiagnosticCategory::Error),
+            // ProgramDiagnostic does not expose category or related information.
+            // Leaving these unknown prevents a synthetic exact match.
+            category: None,
             message: diagnostic.message.clone(),
-            // ProgramDiagnostic does not currently transport related information.
             related_information: None,
         })
         .collect::<Vec<_>>();
@@ -2130,6 +2354,18 @@ fn is_compilation_unit(path: &str) -> bool {
     [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"]
         .iter()
         .any(|extension| path.ends_with(extension))
+}
+
+fn unit_uses_implicit_references(unit: &Unit) -> bool {
+    let source = unit.source_text.as_scannable_str();
+    source.contains("require(")
+        || source.match_indices("reference").any(|(index, _)| {
+            let remainder = &source[index + "reference".len()..];
+            remainder.chars().next().is_some_and(char::is_whitespace)
+                && remainder
+                    .trim_start_matches(char::is_whitespace)
+                    .starts_with("path")
+        })
 }
 
 fn fixture_compiler_options(case: &Case, variant: &OptionVariant) -> ts_options::CompilerOptions {
@@ -2251,27 +2487,107 @@ fn directive_json_value(name: &str, value: &str) -> ts_config::JsonValue {
     }
 }
 
-const SCALAR_OPTION_NAMES: &[&str] = &[
-    "alwaysStrict",
+/// Frozen `compilerVaryBy` boolean options from the pinned Go runner.
+const VARYING_BOOLEAN_OPTION_NAMES: &[&str] = &[
     "allowArbitraryExtensions",
+    "allowImportingTsExtensions",
     "allowJs",
     "allowSyntheticDefaultImports",
-    "baseUrl",
+    "allowUmdGlobalAccess",
+    "allowUnreachableCode",
+    "allowUnusedLabels",
+    "alwaysStrict",
+    "assumeChangesOnlyAffectDirectDependencies",
     "checkJs",
     "composite",
     "declaration",
     "declarationMap",
-    "declarationDir",
+    "deduplicatePackages",
+    "disableSizeLimit",
     "downlevelIteration",
     "emitBOM",
     "emitDeclarationOnly",
     "emitDecoratorMetadata",
+    "erasableSyntaxOnly",
     "experimentalDecorators",
     "esModuleInterop",
     "exactOptionalPropertyTypes",
     "forceConsistentCasingInFileNames",
-    "incremental",
     "importHelpers",
+    "inlineSourceMap",
+    "inlineSources",
+    "isolatedDeclarations",
+    "isolatedModules",
+    "libReplacement",
+    "noEmit",
+    "noEmitHelpers",
+    "noEmitOnError",
+    "noErrorTruncation",
+    "noFallthroughCasesInSwitch",
+    "noImplicitAny",
+    "noImplicitOverride",
+    "noImplicitReturns",
+    "noImplicitThis",
+    "noLib",
+    "noPropertyAccessFromIndexSignature",
+    "noResolve",
+    "noUncheckedIndexedAccess",
+    "noUncheckedSideEffectImports",
+    "noUnusedLocals",
+    "noUnusedParameters",
+    "preserveConstEnums",
+    "removeComments",
+    "resolveJsonModule",
+    "resolvePackageJsonExports",
+    "resolvePackageJsonImports",
+    "rewriteRelativeImportExtensions",
+    "skipDefaultLibCheck",
+    "skipLibCheck",
+    "sourceMap",
+    "stableTypeOrdering",
+    "stripInternal",
+    "strict",
+    "strictBindCallApply",
+    "strictBuiltinIteratorReturn",
+    "strictFunctionTypes",
+    "strictNullChecks",
+    "strictPropertyInitialization",
+    "useDefineForClassFields",
+    "useUnknownInCatchVariables",
+    "verbatimModuleSyntax",
+];
+
+/// Scalar compiler settings read by this fixture harness. Varying enum options
+/// are included here alongside the frozen boolean set and non-varying strings.
+const COMPILER_OPTION_NAMES: &[&str] = &[
+    "allowArbitraryExtensions",
+    "allowImportingTsExtensions",
+    "allowJs",
+    "allowSyntheticDefaultImports",
+    "allowUmdGlobalAccess",
+    "allowUnreachableCode",
+    "allowUnusedLabels",
+    "alwaysStrict",
+    "assumeChangesOnlyAffectDirectDependencies",
+    "baseUrl",
+    "checkJs",
+    "composite",
+    "declaration",
+    "declarationDir",
+    "declarationMap",
+    "deduplicatePackages",
+    "disableSizeLimit",
+    "downlevelIteration",
+    "emitBOM",
+    "emitDeclarationOnly",
+    "emitDecoratorMetadata",
+    "erasableSyntaxOnly",
+    "esModuleInterop",
+    "exactOptionalPropertyTypes",
+    "experimentalDecorators",
+    "forceConsistentCasingInFileNames",
+    "importHelpers",
+    "incremental",
     "inlineSourceMap",
     "inlineSources",
     "isolatedDeclarations",
@@ -2280,35 +2596,52 @@ const SCALAR_OPTION_NAMES: &[&str] = &[
     "jsxFactory",
     "jsxFragmentFactory",
     "jsxImportSource",
+    "libReplacement",
+    "mapRoot",
     "module",
     "moduleDetection",
     "moduleResolution",
-    "mapRoot",
+    "newLine",
     "noCheck",
     "noEmit",
     "noEmitHelpers",
     "noEmitOnError",
+    "noErrorTruncation",
+    "noFallthroughCasesInSwitch",
     "noImplicitAny",
+    "noImplicitOverride",
+    "noImplicitReturns",
+    "noImplicitThis",
     "noLib",
+    "noPropertyAccessFromIndexSignature",
+    "noResolve",
+    "noUncheckedIndexedAccess",
     "noUncheckedSideEffectImports",
     "noUnusedLocals",
     "noUnusedParameters",
-    "outFile",
     "outDir",
+    "outFile",
     "preserveConstEnums",
-    "resolveJsonModule",
+    "pretty",
+    "reactNamespace",
     "removeComments",
+    "resolveJsonModule",
+    "resolvePackageJsonExports",
+    "resolvePackageJsonImports",
     "rewriteRelativeImportExtensions",
     "rootDir",
-    "reactNamespace",
+    "skipDefaultLibCheck",
     "skipLibCheck",
     "sourceMap",
     "sourceRoot",
-    "stripInternal",
+    "stableTypeOrdering",
     "strict",
+    "strictBindCallApply",
     "strictBuiltinIteratorReturn",
+    "strictFunctionTypes",
     "strictNullChecks",
     "strictPropertyInitialization",
+    "stripInternal",
     "target",
     "tsBuildInfoFile",
     "useDefineForClassFields",
@@ -2317,6 +2650,126 @@ const SCALAR_OPTION_NAMES: &[&str] = &[
 ];
 
 const LIST_OPTION_NAMES: &[&str] = &["lib", "rootDirs", "typeRoots", "types"];
+
+const BOOLEAN_OPTION_VALUES: &[(&str, &str)] = &[("true", "true"), ("false", "false")];
+const TARGET_OPTION_VALUES: &[(&str, &str)] = &[
+    ("es5", "es5"),
+    ("es6", "es2015"),
+    ("es2015", "es2015"),
+    ("es2016", "es2016"),
+    ("es2017", "es2017"),
+    ("es2018", "es2018"),
+    ("es2019", "es2019"),
+    ("es2020", "es2020"),
+    ("es2021", "es2021"),
+    ("es2022", "es2022"),
+    ("es2023", "es2023"),
+    ("es2024", "es2024"),
+    ("es2025", "es2025"),
+    ("esnext", "esnext"),
+];
+const MODULE_OPTION_VALUES: &[(&str, &str)] = &[
+    ("commonjs", "commonjs"),
+    ("amd", "amd"),
+    ("system", "system"),
+    ("umd", "umd"),
+    ("es6", "es2015"),
+    ("es2015", "es2015"),
+    ("es2020", "es2020"),
+    ("es2022", "es2022"),
+    ("esnext", "esnext"),
+    ("node16", "node16"),
+    ("node18", "node18"),
+    ("node20", "node20"),
+    ("nodenext", "nodenext"),
+    ("preserve", "preserve"),
+];
+const MODULE_RESOLUTION_OPTION_VALUES: &[(&str, &str)] = &[
+    ("node16", "node16"),
+    ("nodenext", "nodenext"),
+    ("bundler", "bundler"),
+    ("classic", "classic"),
+    ("node", "node10"),
+    ("node10", "node10"),
+];
+const MODULE_DETECTION_OPTION_VALUES: &[(&str, &str)] =
+    &[("auto", "auto"), ("legacy", "legacy"), ("force", "force")];
+const JSX_OPTION_VALUES: &[(&str, &str)] = &[
+    ("preserve", "preserve"),
+    ("react-native", "react-native"),
+    ("react-jsx", "react-jsx"),
+    ("react-jsxdev", "react-jsxdev"),
+    ("react", "react"),
+];
+const NEW_LINE_OPTION_VALUES: &[(&str, &str)] = &[("crlf", "crlf"), ("lf", "lf")];
+
+const RUST_APPLIED_COMPILER_OPTION_NAMES: &[&str] = &[
+    "allowArbitraryExtensions",
+    "allowJs",
+    "allowSyntheticDefaultImports",
+    "allowUnreachableCode",
+    "alwaysStrict",
+    "baseUrl",
+    "checkJs",
+    "composite",
+    "declaration",
+    "declarationDir",
+    "declarationMap",
+    "downlevelIteration",
+    "emitBOM",
+    "emitDeclarationOnly",
+    "emitDecoratorMetadata",
+    "esModuleInterop",
+    "exactOptionalPropertyTypes",
+    "experimentalDecorators",
+    "forceConsistentCasingInFileNames",
+    "importHelpers",
+    "incremental",
+    "inlineSourceMap",
+    "inlineSources",
+    "isolatedDeclarations",
+    "isolatedModules",
+    "jsx",
+    "jsxFactory",
+    "jsxFragmentFactory",
+    "jsxImportSource",
+    "mapRoot",
+    "module",
+    "moduleDetection",
+    "moduleResolution",
+    "noCheck",
+    "noEmit",
+    "noEmitHelpers",
+    "noEmitOnError",
+    "noFallthroughCasesInSwitch",
+    "noImplicitAny",
+    "noImplicitReturns",
+    "noLib",
+    "noUncheckedSideEffectImports",
+    "noUnusedLocals",
+    "noUnusedParameters",
+    "outDir",
+    "outFile",
+    "preserveConstEnums",
+    "pretty",
+    "reactNamespace",
+    "removeComments",
+    "resolveJsonModule",
+    "rewriteRelativeImportExtensions",
+    "rootDir",
+    "skipLibCheck",
+    "sourceMap",
+    "sourceRoot",
+    "strict",
+    "strictNullChecks",
+    "strictPropertyInitialization",
+    "stripInternal",
+    "target",
+    "tsBuildInfoFile",
+    "useDefineForClassFields",
+    "useUnknownInCatchVariables",
+    "verbatimModuleSyntax",
+];
 
 fn collect_files(root: &Path, include: fn(&Path) -> bool) -> io::Result<Vec<PathBuf>> {
     let mut files = Vec::new();
@@ -2387,21 +2840,10 @@ fn error_baseline_base(file_name: &str) -> Option<&str> {
 }
 
 fn matrix_axes(case: &Case) -> Vec<String> {
-    SCALAR_OPTION_NAMES
-        .iter()
-        .filter_map(|name| {
-            case.directive_values(name)
-                .last()
-                .filter(|value| {
-                    value.trim() == "*"
-                        || value
-                            .split(',')
-                            .filter(|part| !part.trim().is_empty())
-                            .count()
-                            > 1
-                })
-                .map(|_| (*name).to_owned())
-        })
+    expanded_option_values(case)
+        .0
+        .into_iter()
+        .filter_map(|(name, values)| (values.len() > 1).then_some(name))
         .collect()
 }
 
@@ -2751,8 +3193,9 @@ mod tests {
         Case, CompilationDiagnostic, CompilationDiagnosticCategory, CompilationRelatedInformation,
         DiagnosticArtifactMismatchKind, OptionVariant, OutputDifferenceKind, ParseError,
         compare_case_emitted_output_sections, compare_diagnostic_artifacts,
-        compare_emitted_output_sections, compile_case, compile_case_matrix, expand_option_matrix,
-        first_different_line, fixture_compiler_options, matrix_axes, parse_baseline_sections,
+        compare_emitted_output_sections, compile_case, compile_case_matrix,
+        error_baseline_unit_order, expand_option_matrix, first_different_line,
+        fixture_compiler_options, matrix_axes, parse_baseline_sections,
         parse_error_baseline_header, render_error_baseline, run_case_against_baseline,
         select_variant_baselines, virtual_unit_path,
     };
@@ -3613,6 +4056,7 @@ mod tests {
                 ("jsx".to_owned(), "react".to_owned()),
                 ("module".to_owned(), "commonjs".to_owned()),
             ]),
+            ..OptionVariant::default()
         };
         let selected = select_variant_baselines(
             &candidates,
@@ -3639,6 +4083,211 @@ mod tests {
                 "strictBuiltinIteratorReturn".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn expands_pinned_target_wildcard_exclusions_and_aliases() {
+        let case = Case::parse(
+            "callChainWithSuper.ts",
+            concat!(
+                "// @target: *,-es3\r\n",
+                "// @strict: true\r\n",
+                "// @noTypesAndSymbols: true\r\n",
+                "\r\n",
+                "// GH#34952\r\n",
+                "class Base { method?() {} }\r\n",
+                "class Derived extends Base {\r\n",
+                "    method1() { return super.method?.(); }\r\n",
+                "    method2() { return super[\"method\"]?.(); }\r\n",
+                "}\r\n",
+            ),
+        )
+        .unwrap();
+        let variants = expand_option_matrix(&case);
+        let targets = variants
+            .iter()
+            .map(|variant| variant.values["target"].as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            targets,
+            [
+                "es5", "es6", "es2016", "es2017", "es2018", "es2019", "es2020", "es2021", "es2022",
+                "es2023", "es2024", "es2025", "esnext",
+            ]
+        );
+        assert_eq!(matrix_axes(&case), ["target"]);
+        assert!(
+            variants
+                .iter()
+                .all(|variant| variant.unsupported_details.is_empty())
+        );
+    }
+
+    #[test]
+    fn does_not_expand_non_varying_or_empty_pinned_options() {
+        let case = Case::parse(
+            "nonVarying.ts",
+            concat!(
+                "// @noCheck: true,false\n",
+                "// @strict:\n",
+                "const value = 1;\n",
+            ),
+        )
+        .unwrap();
+        let variants = expand_option_matrix(&case);
+
+        assert_eq!(variants.len(), 1);
+        assert_eq!(variants[0].values["noCheck"], "true,false");
+        assert!(!variants[0].values.contains_key("strict"));
+        assert!(matrix_axes(&case).is_empty());
+    }
+
+    #[test]
+    fn enumerates_missing_pinned_boolean_axes_as_unsupported() {
+        for option in [
+            "allowImportingTsExtensions",
+            "deduplicatePackages",
+            "noImplicitOverride",
+            "noPropertyAccessFromIndexSignature",
+            "noUncheckedIndexedAccess",
+        ] {
+            let case = Case::parse(
+                format!("{option}.ts"),
+                format!("// @{option}: true, false\nconst value = 1;\n"),
+            )
+            .unwrap();
+            let variants = expand_option_matrix(&case);
+            assert_eq!(variants.len(), 2, "{option}");
+            assert_eq!(matrix_axes(&case), [option], "{option}");
+            assert_eq!(variants[0].values[option], "true", "{option}");
+            assert_eq!(variants[1].values[option], "false", "{option}");
+            assert!(
+                variants
+                    .iter()
+                    .all(|variant| !variant.unsupported_details.is_empty()),
+                "{option}"
+            );
+        }
+    }
+
+    #[test]
+    fn enforces_pinned_twenty_five_variant_cap_without_a_false_exact_matrix() {
+        let case = Case::parse(
+            "tooMany.ts",
+            concat!(
+                "// @target: es5, es6, es2016, es2017, es2018, es2019\n",
+                "// @moduleDetection: *\n",
+                "// @strict: *\n",
+                "const value = 1;\n",
+            ),
+        )
+        .unwrap();
+        let variants = expand_option_matrix(&case);
+        assert_eq!(variants.len(), 1);
+        assert!(
+            variants[0]
+                .unsupported_details
+                .iter()
+                .any(|detail| detail.contains("variation cap exceeded"))
+        );
+    }
+
+    #[test]
+    fn orders_error_baseline_inputs_as_roots_then_other_files() {
+        let case = Case::parse(
+            "deduplicatePackages.ts",
+            concat!(
+                "// @noImplicitReferences: true\n",
+                "// @deduplicatePackages: true,false\n",
+                "\n",
+                "// @filename: /node_modules/a/index.d.ts\n",
+                "import X from \"x\";\n",
+                "export function a(x: X): void;\n",
+                "\n",
+                "// @filename: /node_modules/a/node_modules/x/index.d.ts\n",
+                "export default class X {\n",
+                "    private x: number;\n",
+                "}\n",
+                "\n",
+                "// @filename: /node_modules/a/node_modules/x/package.json\n",
+                "{ \"name\": \"x\", \"version\": \"1.2.3\" }\n",
+                "\n",
+                "// @filename: /node_modules/b/index.d.ts\n",
+                "import X from \"x\";\n",
+                "export const b: X;\n",
+                "\n",
+                "// @filename: /node_modules/b/node_modules/x/index.d.ts\n",
+                "content not parsed\n",
+                "\n",
+                "// @filename: /node_modules/b/node_modules/x/package.json\n",
+                "{ \"name\": \"x\", \"version\": \"1.2.3\" }\n",
+                "\n",
+                "// @filename: /node_modules/c/index.d.ts\n",
+                "import X from \"x\";\n",
+                "export const c: X;\n",
+                "\n",
+                "// @filename: /node_modules/c/node_modules/x/index.d.ts\n",
+                "export default class X {\n",
+                "    private x: number;\n",
+                "}\n",
+                "\n",
+                "// @filename: /node_modules/c/node_modules/x/package.json\n",
+                "{ \"name\": \"x\", \"version\": \"1.2.4\" }\n",
+                "\n",
+                "// @filename: /src/a.ts\n",
+                "import { a } from \"a\";\n",
+                "import { b } from \"b\";\n",
+                "import { c } from \"c\";\n",
+                "a(b); // Works\n",
+                "a(c); // Error, these are from different versions of the library.\n",
+            ),
+        )
+        .unwrap();
+        let (order, issues) = error_baseline_unit_order(&case);
+        assert!(issues.is_empty());
+        assert_eq!(
+            order
+                .iter()
+                .map(|index| case.units[*index].path.to_string_lossy())
+                .collect::<Vec<_>>(),
+            [
+                Path::new("/src/a.ts").to_string_lossy(),
+                Path::new("/node_modules/a/index.d.ts").to_string_lossy(),
+                Path::new("/node_modules/a/node_modules/x/index.d.ts").to_string_lossy(),
+                Path::new("/node_modules/a/node_modules/x/package.json").to_string_lossy(),
+                Path::new("/node_modules/b/index.d.ts").to_string_lossy(),
+                Path::new("/node_modules/b/node_modules/x/index.d.ts").to_string_lossy(),
+                Path::new("/node_modules/b/node_modules/x/package.json").to_string_lossy(),
+                Path::new("/node_modules/c/index.d.ts").to_string_lossy(),
+                Path::new("/node_modules/c/node_modules/x/index.d.ts").to_string_lossy(),
+                Path::new("/node_modules/c/node_modules/x/package.json").to_string_lossy(),
+            ]
+        );
+
+        let source = case.units[9].source_text.clone();
+        let diagnostic = CompilationDiagnostic {
+            file_name: Some("/src/a.ts".to_owned()),
+            source_text: Some(source),
+            range: Some(TextRange::new(TextPos::new(78), TextPos::new(79))),
+            code: Some(2345),
+            category: Some(CompilationDiagnosticCategory::Error),
+            message: concat!(
+                "Argument of type 'import(\"/node_modules/c/node_modules/x/index\").default' ",
+                "is not assignable to parameter of type ",
+                "'import(\"/node_modules/a/node_modules/x/index\").default'.\n",
+                "  Types have separate declarations of a private property 'x'.",
+            )
+            .to_owned(),
+            related_information: Some(Vec::new()),
+        };
+        let artifact = render_error_baseline(&case, &[diagnostic]);
+        let root = artifact.text.find("==== /src/a.ts").unwrap();
+        let dependency = artifact
+            .text
+            .find("==== /node_modules/a/index.d.ts")
+            .unwrap();
+        assert!(root < dependency, "{}", artifact.text);
     }
 
     #[test]
@@ -4094,6 +4743,7 @@ mod tests {
         );
         let declaration_only = OptionVariant {
             values: BTreeMap::from([("emitDeclarationOnly".into(), "true".into())]),
+            ..OptionVariant::default()
         };
         assert!(
             compare_case_emitted_output_sections(&outputs, baseline, &case, &declaration_only,)
@@ -4161,6 +4811,7 @@ mod tests {
         );
         let variant = OptionVariant {
             values: BTreeMap::from([("emitDeclarationOnly".into(), "true".into())]),
+            ..OptionVariant::default()
         };
         assert!(
             compare_case_emitted_output_sections(&outputs, baseline, &case, &variant).is_match()
