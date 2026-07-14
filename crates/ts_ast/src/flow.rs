@@ -197,15 +197,55 @@ impl FlowNodeArena {
     #[must_use]
     /// Allocates one flow node in binder traversal order.
     ///
+    /// Returns `None` without changing the arena when any embedded flow
+    /// reference does not already exist in this arena or an AST payload belongs
+    /// to a different AST arena or file. This arena does not own the AST, so the
+    /// producer remains responsible for ensuring that a same-brand `NodeRef`'s
+    /// local node ID exists.
+    ///
     /// # Panics
     ///
     /// Panics if a single flow arena would exceed `u32::MAX` nodes.
-    pub fn alloc(&mut self, node: FlowNode) -> FlowRef {
+    pub fn alloc(&mut self, node: FlowNode) -> Option<FlowRef> {
+        if !self.can_alloc(&node) {
+            return None;
+        }
         let flow = FlowNodeId(
             u32::try_from(self.nodes.len()).expect("flow-node arena exceeds u32::MAX nodes"),
         );
         self.nodes.push(node);
-        FlowRef::new(self.arena, self.file, flow)
+        Some(FlowRef::new(self.arena, self.file, flow))
+    }
+
+    fn can_alloc(&self, node: &FlowNode) -> bool {
+        node.antecedent
+            .is_none_or(|antecedent| self.get(antecedent).is_some())
+            && node
+                .antecedents
+                .iter()
+                .all(|antecedent| self.get(*antecedent).is_some())
+            && node
+                .payload
+                .as_ref()
+                .is_none_or(|payload| self.payload_belongs_to_arena(payload))
+    }
+
+    fn payload_belongs_to_arena(&self, payload: &FlowNodePayload) -> bool {
+        match payload {
+            FlowNodePayload::Ast(node) => node.is_for(self.arena, self.file),
+            FlowNodePayload::SwitchClause {
+                switch_statement, ..
+            } => switch_statement.is_for(self.arena, self.file),
+            FlowNodePayload::ReduceLabel {
+                target,
+                antecedents,
+            } => {
+                self.get(*target).is_some()
+                    && antecedents
+                        .iter()
+                        .all(|antecedent| self.get(*antecedent).is_some())
+            }
+        }
     }
 
     #[must_use]
@@ -358,13 +398,15 @@ mod tests {
     fn arena_assigns_dense_ids_and_preserves_graph_edges() {
         let nodes = NodeArena::new();
         let mut arena = FlowNodeArena::new(nodes.id(), FileId::new(3));
-        let start = arena.alloc(FlowNode::new(FlowFlags::START));
+        let start = arena.alloc(FlowNode::new(FlowFlags::START)).unwrap();
         let node = NodeRef::new(nodes.id(), FileId::new(3), NodeId::new(7));
-        let assignment = arena.alloc(FlowNode::with_antecedent(
-            FlowFlags::ASSIGNMENT,
-            FlowNodePayload::Ast(node),
-            start,
-        ));
+        let assignment = arena
+            .alloc(FlowNode::with_antecedent(
+                FlowFlags::ASSIGNMENT,
+                FlowNodePayload::Ast(node),
+                start,
+            ))
+            .unwrap();
 
         assert_eq!(arena.unreachable().flow.0, 0);
         assert_eq!(start.flow.0, 1);
@@ -396,9 +438,9 @@ mod tests {
         let nodes = NodeArena::new();
         let mut arena = FlowNodeArena::new(nodes.id(), FileId::new(0));
         let unreachable = arena.unreachable();
-        let first = arena.alloc(FlowNode::new(FlowFlags::START));
-        let second = arena.alloc(FlowNode::new(FlowFlags::ASSIGNMENT));
-        let label = arena.alloc(FlowNode::new(FlowFlags::BRANCH_LABEL));
+        let first = arena.alloc(FlowNode::new(FlowFlags::START)).unwrap();
+        let second = arena.alloc(FlowNode::new(FlowFlags::ASSIGNMENT)).unwrap();
+        let label = arena.alloc(FlowNode::new(FlowFlags::BRANCH_LABEL)).unwrap();
 
         assert_eq!(arena.finish_label(label), Some(unreachable));
         assert_eq!(arena.add_antecedent(label, unreachable), Some(false));
@@ -423,10 +465,10 @@ mod tests {
     fn combined_lists_preserve_duplicates_order_and_reference_flags() {
         let nodes = NodeArena::new();
         let mut arena = FlowNodeArena::new(nodes.id(), FileId::new(4));
-        let shared_path = arena.alloc(FlowNode::new(FlowFlags::ASSIGNMENT));
-        let normal_only = arena.alloc(FlowNode::new(FlowFlags::START));
-        let exceptional_only = arena.alloc(FlowNode::new(FlowFlags::CALL));
-        let finally_label = arena.alloc(FlowNode::new(FlowFlags::BRANCH_LABEL));
+        let shared_path = arena.alloc(FlowNode::new(FlowFlags::ASSIGNMENT)).unwrap();
+        let normal_only = arena.alloc(FlowNode::new(FlowFlags::START)).unwrap();
+        let exceptional_only = arena.alloc(FlowNode::new(FlowFlags::CALL)).unwrap();
+        let finally_label = arena.alloc(FlowNode::new(FlowFlags::BRANCH_LABEL)).unwrap();
 
         let normal = [shared_path, normal_only];
         let exceptional = [shared_path, exceptional_only];
@@ -450,13 +492,114 @@ mod tests {
         let file = FileId::new(5);
         let mut first = FlowNodeArena::new(first_nodes.id(), file);
         let mut second = FlowNodeArena::new(second_nodes.id(), file);
-        let first_start = first.alloc(FlowNode::new(FlowFlags::START));
-        let second_start = second.alloc(FlowNode::new(FlowFlags::START));
+        let first_start = first.alloc(FlowNode::new(FlowFlags::START)).unwrap();
+        let second_start = second.alloc(FlowNode::new(FlowFlags::START)).unwrap();
 
         assert_eq!(first_start.flow, second_start.flow);
         assert_ne!(first_start, second_start);
         assert!(first.get(second_start).is_none());
         assert!(second.get(first_start).is_none());
         assert!(first.mark_referenced(second_start).is_none());
+    }
+
+    #[test]
+    fn allocation_rejects_a_foreign_antecedent_before_mutation() {
+        let owner_nodes = NodeArena::new();
+        let foreign_nodes = NodeArena::new();
+        let file = FileId::new(6);
+        let mut owner = FlowNodeArena::new(owner_nodes.id(), file);
+        let mut foreign = FlowNodeArena::new(foreign_nodes.id(), file);
+        let foreign_start = foreign.alloc(FlowNode::new(FlowFlags::START)).unwrap();
+        let before = owner.len();
+
+        let result = owner.alloc(FlowNode::with_antecedent(
+            FlowFlags::ASSIGNMENT,
+            FlowNodePayload::Ast(NodeRef::new(owner_nodes.id(), file, NodeId::new(0))),
+            foreign_start,
+        ));
+
+        assert_eq!(result, None);
+        assert_eq!(owner.len(), before);
+    }
+
+    #[test]
+    fn allocation_rejects_a_foreign_label_antecedent_before_mutation() {
+        let owner_nodes = NodeArena::new();
+        let foreign_nodes = NodeArena::new();
+        let file = FileId::new(7);
+        let mut owner = FlowNodeArena::new(owner_nodes.id(), file);
+        let mut foreign = FlowNodeArena::new(foreign_nodes.id(), file);
+        let foreign_start = foreign.alloc(FlowNode::new(FlowFlags::START)).unwrap();
+        let before = owner.len();
+        let mut label = FlowNode::new(FlowFlags::BRANCH_LABEL);
+        label.antecedents.push(foreign_start);
+
+        assert_eq!(owner.alloc(label), None);
+        assert_eq!(owner.len(), before);
+    }
+
+    #[test]
+    fn allocation_rejects_foreign_reduce_label_refs_before_mutation() {
+        let owner_nodes = NodeArena::new();
+        let foreign_nodes = NodeArena::new();
+        let file = FileId::new(8);
+        let mut owner = FlowNodeArena::new(owner_nodes.id(), file);
+        let mut foreign = FlowNodeArena::new(foreign_nodes.id(), file);
+        let local_target = owner.alloc(FlowNode::new(FlowFlags::BRANCH_LABEL)).unwrap();
+        let foreign_target = foreign
+            .alloc(FlowNode::new(FlowFlags::BRANCH_LABEL))
+            .unwrap();
+        let before = owner.len();
+
+        let mut foreign_target_node = FlowNode::new(FlowFlags::REDUCE_LABEL);
+        foreign_target_node.payload = Some(FlowNodePayload::ReduceLabel {
+            target: foreign_target,
+            antecedents: vec![local_target],
+        });
+        assert_eq!(owner.alloc(foreign_target_node), None);
+        assert_eq!(owner.len(), before);
+
+        let mut foreign_antecedent_node = FlowNode::new(FlowFlags::REDUCE_LABEL);
+        foreign_antecedent_node.payload = Some(FlowNodePayload::ReduceLabel {
+            target: local_target,
+            antecedents: vec![foreign_target],
+        });
+        assert_eq!(owner.alloc(foreign_antecedent_node), None);
+        assert_eq!(owner.len(), before);
+    }
+
+    #[test]
+    fn allocation_rejects_a_foreign_ast_payload_before_mutation() {
+        let owner_nodes = NodeArena::new();
+        let foreign_nodes = NodeArena::new();
+        let file = FileId::new(9);
+        let mut owner = FlowNodeArena::new(owner_nodes.id(), file);
+        let before = owner.len();
+        let mut node = FlowNode::new(FlowFlags::ASSIGNMENT);
+        node.payload = Some(FlowNodePayload::Ast(NodeRef::new(
+            foreign_nodes.id(),
+            file,
+            NodeId::new(0),
+        )));
+
+        assert_eq!(owner.alloc(node), None);
+        assert_eq!(owner.len(), before);
+    }
+
+    #[test]
+    fn allocation_rejects_a_foreign_switch_payload_before_mutation() {
+        let owner_nodes = NodeArena::new();
+        let file = FileId::new(10);
+        let mut owner = FlowNodeArena::new(owner_nodes.id(), file);
+        let before = owner.len();
+        let mut node = FlowNode::new(FlowFlags::SWITCH_CLAUSE);
+        node.payload = Some(FlowNodePayload::SwitchClause {
+            switch_statement: NodeRef::new(owner_nodes.id(), FileId::new(11), NodeId::new(0)),
+            clause_start: 0,
+            clause_end: 1,
+        });
+
+        assert_eq!(owner.alloc(node), None);
+        assert_eq!(owner.len(), before);
     }
 }

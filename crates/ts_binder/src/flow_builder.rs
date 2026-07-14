@@ -861,13 +861,17 @@ impl<'a> FlowBuilder<'a> {
     fn alloc_start(&mut self, payload: Option<FlowNodePayload>) -> FlowRef {
         let mut node = FlowNode::new(FlowFlags::START);
         node.payload = payload;
-        self.graph.nodes.alloc(node)
+        self.graph
+            .nodes
+            .alloc(node)
+            .expect("binder-created start payload belongs to its flow arena")
     }
 
     fn alloc_label(&mut self) -> FlowRef {
         self.graph
             .nodes
             .alloc(FlowNode::new(FlowFlags::BRANCH_LABEL))
+            .expect("binder-created label belongs to its flow arena")
     }
 
     fn create_flow_condition(
@@ -895,11 +899,14 @@ impl<'a> FlowBuilder<'a> {
             .nodes
             .mark_referenced(antecedent)
             .expect("binder flow antecedent belongs to its file arena");
-        self.graph.nodes.alloc(FlowNode::with_antecedent(
-            flags,
-            FlowNodePayload::Ast(self.node_ref(expression)),
-            antecedent,
-        ))
+        self.graph
+            .nodes
+            .alloc(FlowNode::with_antecedent(
+                flags,
+                FlowNodePayload::Ast(self.node_ref(expression)),
+                antecedent,
+            ))
+            .expect("binder condition references belong to its flow arena")
     }
 
     fn create_flow_mutation(&mut self, flags: FlowFlags, node_id: NodeId) {
@@ -913,11 +920,15 @@ impl<'a> FlowBuilder<'a> {
             .nodes
             .mark_referenced(antecedent)
             .expect("binder flow antecedent belongs to its file arena");
-        let flow = self.graph.nodes.alloc(FlowNode::with_antecedent(
-            flags,
-            FlowNodePayload::Ast(self.node_ref(node_id)),
-            antecedent,
-        ));
+        let flow = self
+            .graph
+            .nodes
+            .alloc(FlowNode::with_antecedent(
+                flags,
+                FlowNodePayload::Ast(self.node_ref(node_id)),
+                antecedent,
+            ))
+            .expect("binder mutation references belong to its flow arena");
         self.current = Some(flow);
         self.has_flow_effects = true;
     }
@@ -1004,15 +1015,17 @@ impl<'a> FlowBuilder<'a> {
             if kind != SyntaxKind::VariableStatement {
                 return true;
             }
-            let Some(NodeData::VariableStatement(statement)) =
-                self.ast.get(node_id).map(|node| &node.data)
-            else {
+            let Some(statement_node) = self.ast.get(node_id) else {
+                return false;
+            };
+            let NodeData::VariableStatement(statement) = &statement_node.data else {
                 return false;
             };
             let Some(declaration_list) = self.ast.get(statement.declaration_list) else {
                 return false;
             };
-            if declaration_list.flags.0 & NODE_FLAGS_BLOCK_SCOPED != 0 {
+            let combined_flags = declaration_list.flags.0 | statement_node.flags.0;
+            if combined_flags & NODE_FLAGS_BLOCK_SCOPED != 0 {
                 return true;
             }
             let NodeData::VariableDeclarationList(declaration_list) = &declaration_list.data else {

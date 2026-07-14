@@ -1986,7 +1986,7 @@ mod tests {
         BlockData, ClassDeclarationData, EnumDeclarationData, EnumMemberData, FileId, FlowFlags,
         FlowNodePayload, FlowRef, FunctionDeclarationData, IdentifierData,
         InterfaceDeclarationData, Node, NodeArena, NodeData, NodeFlags, NodeId, NodeList, NodeRef,
-        SourceFileData, SymbolTable as AstSymbolTable, SyntaxKind, TokenData,
+        ReturnStatementData, SourceFileData, SymbolTable as AstSymbolTable, SyntaxKind, TokenData,
         TypeAliasDeclarationData, VariableDeclarationData, VariableDeclarationListData,
         VariableStatementData,
     };
@@ -2758,6 +2758,43 @@ mod tests {
     }
 
     #[test]
+    fn unreachable_synthetic_variables_use_combined_statement_and_list_flags() {
+        let mut builder = AstBuilder::new();
+        let return_statement = builder.return_statement();
+        let (statement_flag_let, _) =
+            builder.variable_statement("statementFlagLet", NodeFlags::default());
+        builder.arena.get_mut(statement_flag_let).unwrap().flags = NodeFlags(1);
+        let (dormant_var, _) = builder.variable_statement("dormantVar", NodeFlags::default());
+
+        let NodeData::VariableStatement(statement) =
+            &builder.arena.get(statement_flag_let).unwrap().data
+        else {
+            panic!("expected variable statement");
+        };
+        assert_eq!(
+            builder.arena.get(statement.declaration_list).unwrap().flags,
+            NodeFlags::default()
+        );
+
+        let body = builder.block(&[return_statement, statement_flag_let, dormant_var]);
+        let function = builder.function("stop", body);
+        let source = builder.source_file(vec![function]);
+        let file = FileId::new(25);
+        let result = bind_source_file_in_file(&builder.arena, source, file);
+        let graph = result.flow_graph(&builder.arena, source).unwrap();
+        assert!(graph.is_complete(), "{:?}", graph.unsupported());
+
+        assert_eq!(
+            graph.is_unreachable(node_ref(&builder.arena, file, statement_flag_let)),
+            Some(true)
+        );
+        assert_eq!(
+            graph.is_unreachable(node_ref(&builder.arena, file, dormant_var)),
+            None
+        );
+    }
+
+    #[test]
     fn unsupported_nested_effects_invalidate_an_enclosing_conditional() {
         let parsed = parse_source_file(
             "const result = flag ? (() => { while (value) { value = 1; } }) : 0;",
@@ -3010,6 +3047,19 @@ mod tests {
                 &[list],
             );
             (statement, declaration)
+        }
+
+        fn return_statement(&mut self) -> NodeId {
+            self.alloc(
+                SyntaxKind::ReturnStatement,
+                NodeFlags::default(),
+                NodeData::ReturnStatement(Box::new(ReturnStatementData {
+                    expression: None,
+                    flow_node: None,
+                    facts: 0,
+                })),
+                &[],
+            )
         }
 
         fn block(&mut self, statements: &[NodeId]) -> NodeId {
