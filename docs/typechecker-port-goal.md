@@ -52,12 +52,14 @@ remains the cluster-level source of truth.
 - Upstream corpus discovery is fail-closed and records all 12,750 discovered
   cases, including the pinned runner's 45 explicit skips.
 - Diagnostic scorecards distinguish header-only evidence from exact parity.
-- Program diagnostics now preserve their exact catalog category through the
-  compiler boundary; the fixture runner will consume it only after its
-  false-exact directive and parser guards are repaired.
-- Complete non-pretty `.errors.txt` rendering is implemented on a review branch,
-  but remains unmerged until exact option-matrix expansion cannot manufacture
-  clean variants.
+- Program diagnostics preserve their exact catalog category through the
+  compiler boundary and the fixture runner consumes it in complete non-pretty
+  `.errors.txt` artifacts.
+- Exact diagnostic comparison is integrated with column-zero directive parsing,
+  pinned option matrices and skip rules, exact configured baseline identity,
+  and fail-closed guards for unmodeled roots, projects, options, related
+  information, and pretty output. In a pinned first-50 run it reported 26 exact
+  artifacts, three explicit unsupported variants, and 21 honest checker gaps.
 - Canonical `TypeFlags`, `ObjectFlags`, signature flags, tuple/index flags, and
   relation ternary values are pinned to the audited upstream commit.
 - Program-wide node and flow references are branded by both `NodeArenaId` and
