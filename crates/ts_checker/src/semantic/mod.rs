@@ -3,4 +3,5 @@
 //! This module is intentionally separate from the legacy structural checker.
 //! Values from the two cores must not be mixed inside one program.
 
+pub mod signatures;
 pub mod types;
