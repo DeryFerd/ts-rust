@@ -52,15 +52,18 @@ remains the cluster-level source of truth.
 - Upstream corpus discovery is fail-closed and records all 12,750 discovered
   cases, including the pinned runner's 45 explicit skips.
 - Diagnostic scorecards distinguish header-only evidence from exact parity.
+- Program diagnostics now preserve their exact catalog category through the
+  compiler boundary; the fixture runner will consume it only after its
+  false-exact directive and parser guards are repaired.
 - Complete non-pretty `.errors.txt` rendering is implemented on a review branch,
   but remains unmerged until exact option-matrix expansion cannot manufacture
   clean variants.
 - Canonical `TypeFlags`, `ObjectFlags`, signature flags, tuple/index flags, and
   relation ternary values are pinned to the audited upstream commit.
-- Program-wide node identity is independently reviewed and verified on the
-  integration branch. Complete symbol masks and the typed flow substrate are
-  integrated as well; the combined stack passes 209 focused tests and adds no
-  Clippy regression.
+- Program-wide node and flow references are branded by both `NodeArenaId` and
+  `FileId`, so equal dense IDs from rebuilt Programs fail closed. Complete
+  symbol masks and the typed flow substrate are integrated as well; the
+  combined foundation passed 209 focused tests and adds no Clippy regression.
 - Canonical semantic IDs plus signature, predicate, index, and tuple records
   are the active type-system lane. Program-owned symbols and binder CFG
   construction are the next dependency-closed binder lane.
@@ -299,9 +302,9 @@ The precise crate boundary can evolve, but the ownership invariants cannot.
 
 | Upstream concept | Rust representation | Invariant |
 |---|---|---|
-| AST node pointer | `NodeRef { file: FileId, node: NodeId }` or equivalent | A node is unambiguous across the whole program. |
+| AST node pointer | `NodeRef { arena: NodeArenaId, file: FileId, node: NodeId }` | A node is unambiguous across files and Program rebuilds. |
 | Symbol pointer and merges | Program-owned `SymbolId`, tables, declarations, and flags | Imports and merged declarations refer to the same semantic symbol, not a copied type description. |
-| `FlowNode` graph | Program/binder-owned `FlowId` arena | Checker flow queries follow antecedents created by binding. |
+| `FlowNode` graph | Program/binder-owned `FlowRef { arena, file, flow }` arena | Checker flow queries follow antecedents created by binding without accepting a rebuilt Program's equal local ID. |
 | `Type` interfaces | Canonical `TypeId` arena plus a complete tagged payload | Identity, recursion, aliases, freshness, targets, and deferred forms survive across files. |
 | `Signature`, `IndexInfo`, predicates | Dedicated ID arenas/records | Complete call/construct rules and lazy links are retained. |
 | `NodeLinks` / `SymbolLinks` | Dense or sparse ID-keyed side tables | Lazy results and recursion state have one owner and stable cache keys. |
