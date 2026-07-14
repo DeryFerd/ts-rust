@@ -57,9 +57,13 @@ remains the cluster-level source of truth.
   clean variants.
 - Canonical `TypeFlags`, `ObjectFlags`, signature flags, tuple/index flags, and
   relation ternary values are pinned to the audited upstream commit.
-- Program-wide node identity, complete symbol masks, and a typed flow substrate
-  are implemented in separate worktrees and are being integrated in dependency
-  order after provenance review.
+- Program-wide node identity is independently reviewed and verified on the
+  integration branch. Complete symbol masks and the typed flow substrate are
+  integrated as well; the combined stack passes 209 focused tests and adds no
+  Clippy regression.
+- Canonical semantic IDs plus signature, predicate, index, and tuple records
+  are the active type-system lane. Program-owned symbols and binder CFG
+  construction are the next dependency-closed binder lane.
 
 No percentage in this section is a whole-corpus parity claim. A score is
 publishable only when its variant manifest and complete artifact comparison are
