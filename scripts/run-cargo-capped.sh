@@ -21,7 +21,20 @@ if ((memory_limit_kib > max_memory_limit_kib)); then
   memory_limit_kib=$max_memory_limit_kib
 fi
 
-lock_id="$(printf '%s' "$repo_root" | cksum | awk '{print $1}')"
+# Worktrees share object storage but have different repository roots. Derive the
+# lock from their common Git directory so parallel agents cannot accidentally
+# start one 1 GiB Cargo scope per worktree. An explicit ID remains useful for
+# non-Git copies that should join the same build queue.
+if [[ -n "${TS_CARGO_LOCK_ID:-}" ]]; then
+  lock_seed="$TS_CARGO_LOCK_ID"
+elif git_common_dir="$(
+  git -C "$repo_root" rev-parse --path-format=absolute --git-common-dir 2>/dev/null
+)"; then
+  lock_seed="$git_common_dir"
+else
+  lock_seed="$repo_root"
+fi
+lock_id="$(printf '%s' "$lock_seed" | cksum | awk '{print $1}')"
 
 # Limit the aggregate memory of Cargo and every process it starts. The existing
 # virtual-memory limit below remains as a second line of defense for individual
