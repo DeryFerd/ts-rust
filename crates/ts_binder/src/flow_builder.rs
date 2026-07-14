@@ -21,7 +21,6 @@ struct SavedFlow {
     current: Option<FlowRef>,
     container: NodeId,
     return_target: Option<FlowRef>,
-    has_flow_effects: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -93,7 +92,7 @@ impl<'a> FlowBuilder<'a> {
                 kind,
                 SyntaxKind::FunctionExpression | SyntaxKind::ArrowFunction
             ) {
-                self.record_node_flow(node_id);
+                self.record_node_flow_including_unreachable(node_id);
             }
             self.bind_function_container(node_id, function);
             return;
@@ -317,17 +316,7 @@ impl<'a> FlowBuilder<'a> {
             _ => return,
         };
         self.bind_node(expression);
-        if self.node_kind(expression) == Some(SyntaxKind::CallExpression) {
-            let call_target = match self.ast.get(expression).map(|node| &node.data) {
-                Some(NodeData::CallExpression(data)) => data.expression,
-                _ => return,
-            };
-            if self.node_kind(call_target) != Some(SyntaxKind::SuperKeyword)
-                && self.is_dotted_name(call_target)
-            {
-                self.create_flow_mutation(FlowFlags::CALL, expression);
-            }
-        }
+        self.maybe_bind_expression_flow_if_call(expression);
     }
 
     fn bind_conditional_expression(&mut self, node_id: NodeId) {
@@ -415,11 +404,17 @@ impl<'a> FlowBuilder<'a> {
         }
 
         self.bind_node(left);
+        if operator == SyntaxKind::CommaToken {
+            self.maybe_bind_expression_flow_if_call(left);
+        }
         if let Some(type_) = type_ {
             self.bind_node(type_);
         }
         self.bind_node(operator_token);
         self.bind_node(right);
+        if operator == SyntaxKind::CommaToken {
+            self.maybe_bind_expression_flow_if_call(right);
+        }
         if operator.is_assignment_operator() && !self.is_assignment_target(node_id) {
             self.bind_assignment_target_flow(left);
             if operator == SyntaxKind::EqualsToken
@@ -648,7 +643,6 @@ impl<'a> FlowBuilder<'a> {
         }
         let saved = self.save_flow();
         self.container = node_id;
-        self.has_flow_effects = false;
         let payload = function
             .start_payload
             .then(|| FlowNodePayload::Ast(self.node_ref(node_id)));
@@ -682,7 +676,6 @@ impl<'a> FlowBuilder<'a> {
         };
         let saved = self.save_flow();
         self.container = node_id;
-        self.has_flow_effects = false;
         let start = self.alloc_start(None);
         self.graph.container_starts.insert(node_id, start);
         self.current = Some(start);
@@ -697,7 +690,6 @@ impl<'a> FlowBuilder<'a> {
         }
         let saved = self.save_flow();
         self.container = node_id;
-        self.has_flow_effects = false;
         let start = self.alloc_start(None);
         self.graph.container_starts.insert(node_id, start);
         self.current = Some(start);
@@ -738,6 +730,12 @@ impl<'a> FlowBuilder<'a> {
                 if self.is_immediately_invoked_function(child) {
                     self.discover_nested_containers(child);
                 } else {
+                    if matches!(
+                        self.node_kind(child),
+                        Some(SyntaxKind::FunctionExpression | SyntaxKind::ArrowFunction)
+                    ) {
+                        self.record_node_flow_including_unreachable(child);
+                    }
                     self.bind_function_container(child, function);
                 }
             } else if self.node_kind(child) == Some(SyntaxKind::ModuleBlock) {
@@ -800,7 +798,6 @@ impl<'a> FlowBuilder<'a> {
             current: self.current,
             container: self.container,
             return_target: self.return_target,
-            has_flow_effects: self.has_flow_effects,
         }
     }
 
@@ -808,7 +805,21 @@ impl<'a> FlowBuilder<'a> {
         self.current = saved.current;
         self.container = saved.container;
         self.return_target = saved.return_target;
-        self.has_flow_effects = saved.has_flow_effects;
+    }
+
+    fn maybe_bind_expression_flow_if_call(&mut self, expression: NodeId) {
+        if self.node_kind(expression) != Some(SyntaxKind::CallExpression) {
+            return;
+        }
+        let call_target = match self.ast.get(expression).map(|node| &node.data) {
+            Some(NodeData::CallExpression(data)) => data.expression,
+            _ => return,
+        };
+        if self.node_kind(call_target) != Some(SyntaxKind::SuperKeyword)
+            && self.is_dotted_name(call_target)
+        {
+            self.create_flow_mutation(FlowFlags::CALL, expression);
+        }
     }
 
     fn record_node_flow(&mut self, node_id: NodeId) {
@@ -818,6 +829,13 @@ impl<'a> FlowBuilder<'a> {
         if self.is_unreachable(current) {
             return;
         }
+        self.record_node_flow_including_unreachable(node_id);
+    }
+
+    fn record_node_flow_including_unreachable(&mut self, node_id: NodeId) {
+        let Some(current) = self.current else {
+            return;
+        };
         self.graph.node_flows.insert(node_id, current);
         self.graph.node_containers.insert(node_id, self.container);
     }

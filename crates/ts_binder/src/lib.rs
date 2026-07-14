@@ -2438,6 +2438,76 @@ mod tests {
     }
 
     #[test]
+    fn comma_expression_calls_follow_upstream_assertion_order() {
+        let parsed = parse_source_file("checks.first(value), checks.second(value);");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(16);
+        let result = bind_source_file_in_file(&parsed.arena, parsed.source_file, file);
+        let graph = result
+            .flow_graph(&parsed.arena, parsed.source_file)
+            .unwrap();
+        assert!(graph.is_complete(), "{:?}", graph.unsupported());
+
+        let calls = nodes_of_kind(&parsed.arena, SyntaxKind::CallExpression);
+        let [first_call, second_call] = calls.as_slice() else {
+            panic!("expected two calls");
+        };
+        let source = node_ref(&parsed.arena, file, parsed.source_file);
+        let start = graph.container_start(source).unwrap();
+        let second_flow = graph.container_end(source).unwrap();
+        let second = graph.nodes().get(second_flow).unwrap();
+        assert!(second.flags.contains(FlowFlags::CALL));
+        assert_eq!(
+            second.payload,
+            Some(FlowNodePayload::Ast(node_ref(
+                &parsed.arena,
+                file,
+                *second_call,
+            )))
+        );
+        let first_flow = second.antecedent.unwrap();
+        let first = graph.nodes().get(first_flow).unwrap();
+        assert!(first.flags.contains(FlowFlags::CALL));
+        assert_eq!(first.antecedent, Some(start));
+        assert_eq!(
+            first.payload,
+            Some(FlowNodePayload::Ast(node_ref(
+                &parsed.arena,
+                file,
+                *first_call,
+            )))
+        );
+    }
+
+    #[test]
+    fn nested_function_effects_preserve_upstream_conditional_join() {
+        let parsed = parse_source_file(
+            "const result = flag ? ((value: number) => { value = 1; }) : ((value: number) => { value = 2; });",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(17);
+        let result = bind_source_file_in_file(&parsed.arena, parsed.source_file, file);
+        let graph = result
+            .flow_graph(&parsed.arena, parsed.source_file)
+            .unwrap();
+        assert!(graph.is_complete(), "{:?}", graph.unsupported());
+
+        // The pinned binder does not save/restore hasFlowEffects around a
+        // control-flow container. Preserve that observable allocation choice.
+        let source = node_ref(&parsed.arena, file, parsed.source_file);
+        let declaration_assignment = graph.container_end(source).unwrap();
+        let conditional_join = graph
+            .nodes()
+            .get(declaration_assignment)
+            .unwrap()
+            .antecedent
+            .unwrap();
+        let join = graph.nodes().get(conditional_join).unwrap();
+        assert!(join.flags.contains(FlowFlags::BRANCH_LABEL));
+        assert_eq!(join.antecedents.len(), 2);
+    }
+
+    #[test]
     fn nested_conditions_preserve_unreachable_function_tails() {
         let parsed = parse_source_file(
             r"
@@ -2448,6 +2518,7 @@ mod tests {
                     }
                     return 3;
                     const never = 4;
+                    const unreachableArrow = () => 5;
                 }
             ",
         );
@@ -2475,6 +2546,10 @@ mod tests {
         let never_ref = node_ref(&parsed.arena, file, never);
         assert_eq!(graph.is_unreachable(never_ref), Some(true));
         assert_eq!(graph.flow_at(never_ref), None);
+        let arrow = nodes_of_kind(&parsed.arena, SyntaxKind::ArrowFunction)[0];
+        let arrow_ref = node_ref(&parsed.arena, file, arrow);
+        assert_eq!(graph.flow_at(arrow_ref), Some(graph.nodes().unreachable()));
+        assert!(graph.container_start(arrow_ref).is_some());
         for statement in nodes_of_kind(&parsed.arena, SyntaxKind::ReturnStatement)
             .into_iter()
             .chain(nodes_of_kind(&parsed.arena, SyntaxKind::ThrowStatement))
