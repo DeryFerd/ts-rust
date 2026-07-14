@@ -728,10 +728,13 @@ impl ProgramSource<'_> {
         self.bindings.file_id
     }
 
-    /// Validates a node and pairs it with the identity assigned at the checker
-    /// boundary. Detached sources receive a deterministic identity there.
+    /// Validates a node and pairs it with its bound Program identity.
+    ///
+    /// Detached sources have no identity until they cross the program-checker
+    /// boundary; use [`ProgramCheckResult::node_ref`] for those sources.
     #[must_use]
-    pub fn node_ref(&self, file_id: FileId, node: NodeId) -> Option<NodeRef> {
+    pub fn node_ref(&self, node: NodeId) -> Option<NodeRef> {
+        let file_id = self.file_id()?;
         self.arena
             .get(node)
             .map(|_| NodeRef::new(file_id, node))
@@ -741,8 +744,31 @@ impl ProgramSource<'_> {
 #[derive(Debug)]
 pub struct ProgramCheckResult {
     /// File identities used by program-wide semantic state, parallel to `files`.
-    pub file_ids: Vec<FileId>,
+    file_ids: Vec<FileId>,
     pub files: Vec<CheckResult>,
+    node_counts: Vec<usize>,
+}
+
+impl ProgramCheckResult {
+    /// File identities used by program-wide semantic state, parallel to `files`.
+    #[must_use]
+    pub fn file_ids(&self) -> &[FileId] {
+        &self.file_ids
+    }
+
+    /// Looks up the checker-assigned identity for a node in one source slot.
+    ///
+    /// The source index and node ID are validated against the immutable arena
+    /// shape recorded at the checker boundary. No caller-supplied source or
+    /// `FileId` participates in the pairing.
+    #[must_use]
+    pub fn node_ref(&self, source_index: usize, node: NodeId) -> Option<NodeRef> {
+        if self.files.len() != self.file_ids.len() || self.node_counts.len() != self.file_ids.len() {
+            return None;
+        }
+        let file_id = *self.file_ids.get(source_index)?;
+        (node.index() < *self.node_counts.get(source_index)?).then(|| NodeRef::new(file_id, node))
+    }
 }
 
 #[must_use]
@@ -878,19 +904,27 @@ impl<'a> ProgramChecker<'a> {
             assigned == 0 || assigned == sources.len(),
             "program checker sources must be either all Program-bound or all detached"
         );
+        if assigned == 0 {
+            return (0..sources.len())
+                .map(|index| {
+                    FileId::new(
+                        u32::try_from(index).expect("Program exceeds u32::MAX source files"),
+                    )
+                })
+                .collect();
+        }
+        let mut seen = BTreeSet::new();
         sources
             .iter()
-            .enumerate()
-            .map(|(index, source)| {
-                let index = u32::try_from(index).expect("Program exceeds u32::MAX source files");
-                let expected = FileId::new(index);
-                if let Some(actual) = source.file_id() {
-                    assert_eq!(
-                        actual, expected,
-                        "ProgramSource binding provenance does not match source order"
-                    );
-                }
-                expected
+            .map(|source| {
+                let file_id = source
+                    .file_id()
+                    .expect("all ProgramSource bindings have provenance");
+                assert!(
+                    seen.insert(file_id),
+                    "duplicate ProgramSource FileId {file_id:?}"
+                );
+                file_id
             })
             .collect()
     }
@@ -1024,9 +1058,11 @@ impl<'a> ProgramChecker<'a> {
                 diagnostic: Diagnostic::with_arguments(message, [name]),
             });
         }
+        let node_counts = self.sources.iter().map(|source| source.arena.len()).collect();
         ProgramCheckResult {
             file_ids: self.file_ids,
             files,
+            node_counts,
         }
     }
 
@@ -26881,7 +26917,7 @@ mod tests {
         ArrayLiteralExpressionData, BlockData, ElementAccessExpressionData,
         ExpressionStatementData, FileId, FunctionDeclarationData, IdentifierData,
         IfStatementData, IndexedAccessTypeNodeData, KeywordExpressionData, KeywordTypeNodeData,
-        LiteralTypeNodeData, Node, NodeArena, NodeData, NodeFlags, NodeId, NodeList,
+        LiteralTypeNodeData, Node, NodeArena, NodeData, NodeFlags, NodeId, NodeList, NodeRef,
         NumericLiteralData, PropertyAccessExpressionData, ReturnStatementData, SourceFileData,
         StringLiteralData, SymbolTable as AstSymbolTable, SyntaxKind, TokenData, TokenFlags,
         TupleTypeNodeData, TypeOfExpressionData, UnionTypeNodeData, VariableDeclarationData,
@@ -34634,14 +34670,108 @@ mod tests {
         ];
 
         let checked = check_program(&sources);
-        assert_eq!(checked.file_ids, [FileId::new(0), FileId::new(1)]);
-        let first_ref = sources[0]
-            .node_ref(checked.file_ids[0], first.source_file)
-            .unwrap();
-        let second_ref = sources[1]
-            .node_ref(checked.file_ids[1], second.source_file)
-            .unwrap();
+        assert_eq!(checked.file_ids(), [FileId::new(0), FileId::new(1)]);
+        assert_eq!(sources[0].node_ref(first.source_file), None);
+        let first_ref = checked.node_ref(0, first.source_file).unwrap();
+        let second_ref = checked.node_ref(1, second.source_file).unwrap();
         assert_ne!(first_ref, second_ref);
+        assert_eq!(checked.node_ref(2, first.source_file), None);
+        assert_eq!(checked.node_ref(0, NodeId::new(u32::MAX)), None);
+        let first_snapshot_end = NodeId::new(u32::try_from(first.arena.len()).unwrap());
+        assert_eq!(checked.node_ref(0, first_snapshot_end), None);
+    }
+
+    #[test]
+    fn checker_preserves_nonzero_bound_ids_for_reordered_and_subset_inputs() {
+        let first = parse_source_file("export const first = 1;");
+        let second = parse_source_file("export const second = 2;");
+        let first_id = FileId::new(7);
+        let second_id = FileId::new(41);
+        let first_bindings =
+            bind_source_file_in_file(&first.arena, first.source_file, first_id);
+        let second_bindings =
+            bind_source_file_in_file(&second.arena, second.source_file, second_id);
+        let no_modules = BTreeMap::new();
+        let reordered = [
+            ProgramSource {
+                arena: &second.arena,
+                source_file: second.source_file,
+                bindings: &second_bindings,
+                resolved_modules: &no_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+            ProgramSource {
+                arena: &first.arena,
+                source_file: first.source_file,
+                bindings: &first_bindings,
+                resolved_modules: &no_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+        ];
+
+        let checked = check_program(&reordered);
+        assert_eq!(checked.file_ids(), [second_id, first_id]);
+        assert_eq!(
+            reordered[0].node_ref(second.source_file),
+            Some(NodeRef::new(second_id, second.source_file))
+        );
+        assert_eq!(
+            checked.node_ref(0, second.source_file),
+            Some(NodeRef::new(second_id, second.source_file))
+        );
+
+        let subset = [ProgramSource {
+            arena: &first.arena,
+            source_file: first.source_file,
+            bindings: &first_bindings,
+            resolved_modules: &no_modules,
+            is_default_library: false,
+            skip_diagnostics: false,
+            checker_options: CheckerOptions::default(),
+        }];
+        let subset_checked = check_program(&subset);
+        assert_eq!(subset_checked.file_ids(), [first_id]);
+        assert_eq!(
+            subset_checked.node_ref(0, first.source_file),
+            Some(NodeRef::new(first_id, first.source_file))
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate ProgramSource FileId")]
+    fn checker_rejects_duplicate_bound_file_ids() {
+        let first = parse_source_file("export const first = 1;");
+        let second = parse_source_file("export const second = 2;");
+        let duplicate = FileId::new(7);
+        let first_bindings =
+            bind_source_file_in_file(&first.arena, first.source_file, duplicate);
+        let second_bindings =
+            bind_source_file_in_file(&second.arena, second.source_file, duplicate);
+        let no_modules = BTreeMap::new();
+        let _ = check_program(&[
+            ProgramSource {
+                arena: &first.arena,
+                source_file: first.source_file,
+                bindings: &first_bindings,
+                resolved_modules: &no_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+            ProgramSource {
+                arena: &second.arena,
+                source_file: second.source_file,
+                bindings: &second_bindings,
+                resolved_modules: &no_modules,
+                is_default_library: false,
+                skip_diagnostics: false,
+                checker_options: CheckerOptions::default(),
+            },
+        ]);
     }
 
     #[test]
