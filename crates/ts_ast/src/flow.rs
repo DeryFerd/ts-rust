@@ -1,6 +1,6 @@
 use std::ops::{BitOr, BitOrAssign};
 
-use crate::{FileId, FlowNodeId, NodeRef};
+use crate::{FileId, FlowNodeId, NodeArenaId, NodeRef};
 
 /// Control-flow node flags.
 ///
@@ -66,14 +66,20 @@ impl BitOrAssign for FlowFlags {
 /// semantic state.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct FlowRef {
+    pub arena: NodeArenaId,
     pub file: FileId,
     pub flow: FlowNodeId,
 }
 
 impl FlowRef {
     #[must_use]
-    pub const fn new(file: FileId, flow: FlowNodeId) -> Self {
-        Self { file, flow }
+    pub const fn new(arena: NodeArenaId, file: FileId, flow: FlowNodeId) -> Self {
+        Self { arena, file, flow }
+    }
+
+    #[must_use]
+    pub fn is_for(self, arena: NodeArenaId, file: FileId) -> bool {
+        self.arena == arena && self.file == file
     }
 }
 
@@ -156,6 +162,7 @@ impl FlowNode {
 /// Stable storage for flow nodes allocated in binder traversal order.
 #[derive(Debug, Eq, PartialEq)]
 pub struct FlowNodeArena {
+    arena: NodeArenaId,
     file: FileId,
     nodes: Vec<FlowNode>,
 }
@@ -164,11 +171,17 @@ impl FlowNodeArena {
     /// Creates a file-scoped flow arena with its canonical unreachable node at
     /// local ID zero.
     #[must_use]
-    pub fn new(file: FileId) -> Self {
+    pub fn new(arena: NodeArenaId, file: FileId) -> Self {
         Self {
+            arena,
             file,
             nodes: vec![FlowNode::new(FlowFlags::UNREACHABLE)],
         }
+    }
+
+    #[must_use]
+    pub const fn node_arena(&self) -> NodeArenaId {
+        self.arena
     }
 
     #[must_use]
@@ -178,7 +191,7 @@ impl FlowNodeArena {
 
     #[must_use]
     pub const fn unreachable(&self) -> FlowRef {
-        FlowRef::new(self.file, FlowNodeId(0))
+        FlowRef::new(self.arena, self.file, FlowNodeId(0))
     }
 
     #[must_use]
@@ -192,19 +205,21 @@ impl FlowNodeArena {
             u32::try_from(self.nodes.len()).expect("flow-node arena exceeds u32::MAX nodes"),
         );
         self.nodes.push(node);
-        FlowRef::new(self.file, flow)
+        FlowRef::new(self.arena, self.file, flow)
     }
 
     #[must_use]
     pub fn get(&self, reference: FlowRef) -> Option<&FlowNode> {
-        (reference.file == self.file)
+        reference
+            .is_for(self.arena, self.file)
             .then(|| self.nodes.get(reference.flow.0 as usize))
             .flatten()
     }
 
     #[must_use]
     pub fn get_mut(&mut self, reference: FlowRef) -> Option<&mut FlowNode> {
-        (reference.file == self.file)
+        reference
+            .is_for(self.arena, self.file)
             .then(|| self.nodes.get_mut(reference.flow.0 as usize))
             .flatten()
     }
@@ -215,7 +230,7 @@ impl FlowNodeArena {
     pub fn flow_ref(&self, flow: FlowNodeId) -> Option<FlowRef> {
         self.nodes
             .get(flow.0 as usize)
-            .map(|_| FlowRef::new(self.file, flow))
+            .map(|_| FlowRef::new(self.arena, self.file, flow))
     }
 
     /// Applies typescript-go's first-reference/then-shared flag transition.
@@ -312,7 +327,7 @@ impl FlowNodeArena {
 #[cfg(test)]
 mod tests {
     use super::{FlowFlags, FlowNode, FlowNodeArena, FlowNodePayload};
-    use crate::{FileId, NodeId, NodeRef};
+    use crate::{FileId, NodeArena, NodeId, NodeRef};
 
     #[test]
     fn flags_match_typescript_go_bit_layout() {
@@ -341,9 +356,10 @@ mod tests {
 
     #[test]
     fn arena_assigns_dense_ids_and_preserves_graph_edges() {
-        let mut arena = FlowNodeArena::new(FileId::new(3));
+        let nodes = NodeArena::new();
+        let mut arena = FlowNodeArena::new(nodes.id(), FileId::new(3));
         let start = arena.alloc(FlowNode::new(FlowFlags::START));
-        let node = NodeRef::new(FileId::new(3), NodeId::new(7));
+        let node = NodeRef::new(nodes.id(), FileId::new(3), NodeId::new(7));
         let assignment = arena.alloc(FlowNode::with_antecedent(
             FlowFlags::ASSIGNMENT,
             FlowNodePayload::Ast(node),
@@ -359,15 +375,16 @@ mod tests {
 
     #[test]
     fn switch_payload_retains_exact_clause_range() {
+        let nodes = NodeArena::new();
         let payload = FlowNodePayload::SwitchClause {
-            switch_statement: NodeRef::new(FileId::new(1), NodeId::new(12)),
+            switch_statement: NodeRef::new(nodes.id(), FileId::new(1), NodeId::new(12)),
             clause_start: 4,
             clause_end: 4,
         };
         assert!(payload.is_empty_switch_clause());
 
         let non_empty = FlowNodePayload::SwitchClause {
-            switch_statement: NodeRef::new(FileId::new(1), NodeId::new(12)),
+            switch_statement: NodeRef::new(nodes.id(), FileId::new(1), NodeId::new(12)),
             clause_start: 4,
             clause_end: 6,
         };
@@ -376,7 +393,8 @@ mod tests {
 
     #[test]
     fn reference_and_label_transitions_match_upstream() {
-        let mut arena = FlowNodeArena::new(FileId::new(0));
+        let nodes = NodeArena::new();
+        let mut arena = FlowNodeArena::new(nodes.id(), FileId::new(0));
         let unreachable = arena.unreachable();
         let first = arena.alloc(FlowNode::new(FlowFlags::START));
         let second = arena.alloc(FlowNode::new(FlowFlags::ASSIGNMENT));
@@ -403,7 +421,8 @@ mod tests {
 
     #[test]
     fn combined_lists_preserve_duplicates_order_and_reference_flags() {
-        let mut arena = FlowNodeArena::new(FileId::new(4));
+        let nodes = NodeArena::new();
+        let mut arena = FlowNodeArena::new(nodes.id(), FileId::new(4));
         let shared_path = arena.alloc(FlowNode::new(FlowFlags::ASSIGNMENT));
         let normal_only = arena.alloc(FlowNode::new(FlowFlags::START));
         let exceptional_only = arena.alloc(FlowNode::new(FlowFlags::CALL));
@@ -425,9 +444,12 @@ mod tests {
     }
 
     #[test]
-    fn program_wide_refs_reject_a_different_file_arena() {
-        let mut first = FlowNodeArena::new(FileId::new(5));
-        let mut second = FlowNodeArena::new(FileId::new(6));
+    fn program_wide_refs_reject_a_different_node_arena() {
+        let first_nodes = NodeArena::new();
+        let second_nodes = NodeArena::new();
+        let file = FileId::new(5);
+        let mut first = FlowNodeArena::new(first_nodes.id(), file);
+        let mut second = FlowNodeArena::new(second_nodes.id(), file);
         let first_start = first.alloc(FlowNode::new(FlowFlags::START));
         let second_start = second.alloc(FlowNode::new(FlowFlags::START));
 

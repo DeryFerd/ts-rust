@@ -8,8 +8,7 @@ pub use ast_generated::*;
 pub use flow::*;
 pub use syntax_kind::SyntaxKind;
 
-/// Stable identifier for one source-file arena during the lifetime of one
-/// compiler `Program`.
+/// Stable source-file slot during the lifetime of one compiler `Program`.
 ///
 /// `NodeId` is intentionally dense and file-local. Pair it with `FileId` before
 /// storing a node identity in program-wide semantic state. File IDs are not
@@ -31,16 +30,25 @@ impl FileId {
 }
 
 /// Unambiguous identity for an AST node in a compiler Program.
+///
+/// The arena identity prevents a reference from another Program with the same
+/// file slot and dense node index from aliasing this Program's node.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct NodeRef {
+    pub arena: NodeArenaId,
     pub file: FileId,
     pub node: NodeId,
 }
 
 impl NodeRef {
     #[must_use]
-    pub const fn new(file: FileId, node: NodeId) -> Self {
-        Self { file, node }
+    pub const fn new(arena: NodeArenaId, file: FileId, node: NodeId) -> Self {
+        Self { arena, file, node }
+    }
+
+    #[must_use]
+    pub fn is_for(self, arena: NodeArenaId, file: FileId) -> bool {
+        self.arena == arena && self.file == file
     }
 }
 
@@ -122,10 +130,13 @@ mod tests {
     #[test]
     fn node_refs_disambiguate_file_local_node_ids() {
         let node = super::NodeId::new(7);
-        let first = NodeRef::new(FileId::new(0), node);
-        let second = NodeRef::new(FileId::new(1), node);
+        let first_arena = NodeArena::new();
+        let second_arena = NodeArena::new();
+        let first = NodeRef::new(first_arena.id(), FileId::new(0), node);
+        let second = NodeRef::new(second_arena.id(), FileId::new(1), node);
 
         assert_ne!(first, second);
         assert_eq!(first.node, second.node);
+        assert!(!first.is_for(second_arena.id(), FileId::new(0)));
     }
 }

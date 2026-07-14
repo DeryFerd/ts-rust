@@ -62,7 +62,7 @@ impl SourceFile {
         self.parse
             .arena
             .get(node)
-            .map(|_| NodeRef::new(self.id, node))
+            .map(|_| NodeRef::new(self.parse.arena.id(), self.id, node))
     }
 }
 
@@ -715,7 +715,10 @@ impl Program {
     /// Looks up a node using its unambiguous program-wide identity.
     #[must_use]
     pub fn node(&self, node: NodeRef) -> Option<&Node> {
-        self.source_file_by_id(node.file)?.parse.arena.get(node.node)
+        let source = self.source_file_by_id(node.file)?;
+        node.is_for(source.parse.arena.id(), source.id)
+            .then(|| source.parse.arena.get(node.node))
+            .flatten()
     }
 
     /// Emits modern JavaScript for all implementation source files currently
@@ -5656,6 +5659,36 @@ mod tests {
         assert_ne!(first_ref, second_ref);
         assert_eq!(program.node(first_ref).unwrap().kind, SyntaxKind::SourceFile);
         assert_eq!(program.node(second_ref).unwrap().kind, SyntaxKind::SourceFile);
+    }
+
+    #[test]
+    fn program_node_refs_reject_another_program_with_equal_dense_ids() {
+        let fs = MemoryFileSystem::new(true);
+        fs.write_file("/project/main.ts", "export const value = 1;")
+            .unwrap();
+        let options = CompilerOptions {
+            no_lib: true,
+            ..CompilerOptions::default()
+        };
+        let first = Program::new_with_options(
+            &fs,
+            "/project",
+            &["main.ts".to_owned()],
+            options.clone(),
+        );
+        let second =
+            Program::new_with_options(&fs, "/project", &["main.ts".to_owned()], options);
+        let first_source = first.source_file("/project/main.ts").unwrap();
+        let second_source = second.source_file("/project/main.ts").unwrap();
+        let reference = first_source
+            .node_ref(first_source.parse.source_file)
+            .unwrap();
+
+        assert_eq!(first_source.id, second_source.id);
+        assert_eq!(first_source.parse.source_file, second_source.parse.source_file);
+        assert_ne!(first_source.parse.arena.id(), second_source.parse.arena.id());
+        assert!(first.node(reference).is_some());
+        assert!(second.node(reference).is_none());
     }
 
     #[test]

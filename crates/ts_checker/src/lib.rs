@@ -5,7 +5,7 @@ pub mod semantic;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
-use ts_ast::{FileId, NodeArena, NodeData, NodeId, NodeRef, SymbolId, SyntaxKind};
+use ts_ast::{FileId, NodeArena, NodeArenaId, NodeData, NodeId, NodeRef, SymbolId, SyntaxKind};
 use ts_binder::BindResult;
 use ts_diagnostics::{Diagnostic, message_by_code};
 use ts_evaluator::{Evaluation, EvaluationOutcome, UnknownReason, Value, evaluate_with};
@@ -750,7 +750,7 @@ impl ProgramSource<'_> {
         let file_id = self.file_id()?;
         self.arena
             .get(node)
-            .map(|_| NodeRef::new(file_id, node))
+            .map(|_| NodeRef::new(self.arena.id(), file_id, node))
     }
 }
 
@@ -758,6 +758,7 @@ impl ProgramSource<'_> {
 pub struct ProgramCheckResult {
     /// File identities used by program-wide semantic state, parallel to `files`.
     file_ids: Vec<FileId>,
+    node_arena_ids: Vec<NodeArenaId>,
     files: Vec<CheckResult>,
     node_counts: Vec<usize>,
 }
@@ -767,6 +768,13 @@ impl ProgramCheckResult {
     #[must_use]
     pub fn file_ids(&self) -> &[FileId] {
         &self.file_ids
+    }
+
+    /// AST arena identities used by program-wide semantic state, parallel to
+    /// `files`.
+    #[must_use]
+    pub fn node_arena_ids(&self) -> &[NodeArenaId] {
+        &self.node_arena_ids
     }
 
     /// Per-source checking outputs in source-slice order.
@@ -788,11 +796,16 @@ impl ProgramCheckResult {
     /// `FileId` participates in the pairing.
     #[must_use]
     pub fn node_ref(&self, source_index: usize, node: NodeId) -> Option<NodeRef> {
-        if self.files.len() != self.file_ids.len() || self.node_counts.len() != self.file_ids.len() {
+        if self.files.len() != self.file_ids.len()
+            || self.node_arena_ids.len() != self.file_ids.len()
+            || self.node_counts.len() != self.file_ids.len()
+        {
             return None;
         }
         let file_id = *self.file_ids.get(source_index)?;
-        (node.index() < *self.node_counts.get(source_index)?).then(|| NodeRef::new(file_id, node))
+        let arena_id = *self.node_arena_ids.get(source_index)?;
+        (node.index() < *self.node_counts.get(source_index)?)
+            .then(|| NodeRef::new(arena_id, file_id, node))
     }
 }
 
@@ -1083,9 +1096,15 @@ impl<'a> ProgramChecker<'a> {
                 diagnostic: Diagnostic::with_arguments(message, [name]),
             });
         }
+        let node_arena_ids = self
+            .sources
+            .iter()
+            .map(|source| source.arena.id())
+            .collect();
         let node_counts = self.sources.iter().map(|source| source.arena.len()).collect();
         ProgramCheckResult {
             file_ids: self.file_ids,
+            node_arena_ids,
             files,
             node_counts,
         }
@@ -34753,13 +34772,25 @@ mod tests {
         let checked = check_program(&reordered);
         assert_eq!(checked.file_ids(), [second_id, first_id]);
         assert_eq!(
+            checked.node_arena_ids(),
+            [second.arena.id(), first.arena.id()]
+        );
+        assert_eq!(
             reordered[0].node_ref(second.source_file),
-            Some(NodeRef::new(second_id, second.source_file))
+            Some(NodeRef::new(
+                second.arena.id(),
+                second_id,
+                second.source_file
+            ))
         );
         assert_eq!(reordered[0].node_ref(NodeId::new(u32::MAX)), None);
         assert_eq!(
             checked.node_ref(0, second.source_file),
-            Some(NodeRef::new(second_id, second.source_file))
+            Some(NodeRef::new(
+                second.arena.id(),
+                second_id,
+                second.source_file
+            ))
         );
 
         let subset = [ProgramSource {
@@ -34775,7 +34806,11 @@ mod tests {
         assert_eq!(subset_checked.file_ids(), [first_id]);
         assert_eq!(
             subset_checked.node_ref(0, first.source_file),
-            Some(NodeRef::new(first_id, first.source_file))
+            Some(NodeRef::new(
+                first.arena.id(),
+                first_id,
+                first.source_file
+            ))
         );
         assert_eq!(subset_checked.into_files().len(), 1);
     }
