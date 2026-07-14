@@ -1,6 +1,6 @@
 use std::ops::{BitOr, BitOrAssign};
 
-use crate::{FlowNodeId, NodeRef};
+use crate::{FileId, FlowNodeId, NodeRef};
 
 /// Control-flow node flags.
 ///
@@ -59,6 +59,24 @@ impl BitOrAssign for FlowFlags {
     }
 }
 
+/// Unambiguous identity for a flow node within a compiler Program.
+///
+/// `FlowNodeId` remains dense and file-local because generated AST fields store
+/// it directly. Convert it to `FlowRef` before retaining it in program-wide
+/// semantic state.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct FlowRef {
+    pub file: FileId,
+    pub flow: FlowNodeId,
+}
+
+impl FlowRef {
+    #[must_use]
+    pub const fn new(file: FileId, flow: FlowNodeId) -> Self {
+        Self { file, flow }
+    }
+}
+
 /// Source payload associated with a flow node.
 ///
 /// typescript-go represents switch and reduce-label payloads as synthetic AST
@@ -73,8 +91,8 @@ pub enum FlowNodePayload {
         clause_end: i32,
     },
     ReduceLabel {
-        target: FlowNodeId,
-        antecedents: Vec<FlowNodeId>,
+        target: FlowRef,
+        antecedents: Vec<FlowRef>,
     },
 }
 
@@ -98,12 +116,15 @@ pub struct FlowNode {
     pub flags: FlowFlags,
     pub payload: Option<FlowNodePayload>,
     /// Antecedent for every node except branch and loop labels.
-    pub antecedent: Option<FlowNodeId>,
-    /// Ordered, de-duplicated antecedents for branch and loop labels.
+    pub antecedent: Option<FlowRef>,
+    /// Ordered antecedents for branch and loop labels.
     ///
     /// This `Vec` is the safe Rust equivalent of typescript-go's linked
-    /// `FlowList`; insertion order remains observable and is preserved.
-    pub antecedents: Vec<FlowNodeId>,
+    /// `FlowList`; insertion order remains observable and is preserved. Normal
+    /// `add_antecedent` calls suppress duplicates within a label, while
+    /// `replace_antecedents` intentionally preserves duplicates produced by
+    /// upstream `combineFlowLists` in try/finally binding.
+    pub antecedents: Vec<FlowRef>,
 }
 
 impl FlowNode {
@@ -121,7 +142,7 @@ impl FlowNode {
     pub fn with_antecedent(
         flags: FlowFlags,
         payload: FlowNodePayload,
-        antecedent: FlowNodeId,
+        antecedent: FlowRef,
     ) -> Self {
         Self {
             flags,
@@ -133,15 +154,31 @@ impl FlowNode {
 }
 
 /// Stable storage for flow nodes allocated in binder traversal order.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct FlowNodeArena {
+    file: FileId,
     nodes: Vec<FlowNode>,
 }
 
 impl FlowNodeArena {
+    /// Creates a file-scoped flow arena with its canonical unreachable node at
+    /// local ID zero.
     #[must_use]
-    pub const fn new() -> Self {
-        Self { nodes: Vec::new() }
+    pub fn new(file: FileId) -> Self {
+        Self {
+            file,
+            nodes: vec![FlowNode::new(FlowFlags::UNREACHABLE)],
+        }
+    }
+
+    #[must_use]
+    pub const fn file(&self) -> FileId {
+        self.file
+    }
+
+    #[must_use]
+    pub const fn unreachable(&self) -> FlowRef {
+        FlowRef::new(self.file, FlowNodeId(0))
     }
 
     #[must_use]
@@ -150,29 +187,43 @@ impl FlowNodeArena {
     /// # Panics
     ///
     /// Panics if a single flow arena would exceed `u32::MAX` nodes.
-    pub fn alloc(&mut self, node: FlowNode) -> FlowNodeId {
-        let id = FlowNodeId(
+    pub fn alloc(&mut self, node: FlowNode) -> FlowRef {
+        let flow = FlowNodeId(
             u32::try_from(self.nodes.len()).expect("flow-node arena exceeds u32::MAX nodes"),
         );
         self.nodes.push(node);
-        id
+        FlowRef::new(self.file, flow)
     }
 
     #[must_use]
-    pub fn get(&self, id: FlowNodeId) -> Option<&FlowNode> {
-        self.nodes.get(id.0 as usize)
+    pub fn get(&self, reference: FlowRef) -> Option<&FlowNode> {
+        (reference.file == self.file)
+            .then(|| self.nodes.get(reference.flow.0 as usize))
+            .flatten()
     }
 
     #[must_use]
-    pub fn get_mut(&mut self, id: FlowNodeId) -> Option<&mut FlowNode> {
-        self.nodes.get_mut(id.0 as usize)
+    pub fn get_mut(&mut self, reference: FlowRef) -> Option<&mut FlowNode> {
+        (reference.file == self.file)
+            .then(|| self.nodes.get_mut(reference.flow.0 as usize))
+            .flatten()
+    }
+
+    /// Converts an AST's file-local flow ID into a checked program-wide
+    /// reference.
+    #[must_use]
+    pub fn flow_ref(&self, flow: FlowNodeId) -> Option<FlowRef> {
+        self.nodes
+            .get(flow.0 as usize)
+            .map(|_| FlowRef::new(self.file, flow))
     }
 
     /// Applies typescript-go's first-reference/then-shared flag transition.
     ///
-    /// Returns the updated flags, or `None` when `id` is not in this arena.
-    pub fn mark_referenced(&mut self, id: FlowNodeId) -> Option<FlowFlags> {
-        let node = self.get_mut(id)?;
+    /// Returns the updated flags, or `None` when `reference` is not in this
+    /// arena.
+    pub fn mark_referenced(&mut self, reference: FlowRef) -> Option<FlowFlags> {
+        let node = self.get_mut(reference)?;
         if node.flags.intersects(FlowFlags::REFERENCED) {
             node.flags |= FlowFlags::SHARED;
         } else {
@@ -187,7 +238,7 @@ impl FlowNodeArena {
     /// Returns `Some(true)` when the edge was added, `Some(false)` when it was
     /// suppressed, or `None` when either ID is invalid or `label` is not a
     /// branch/loop label.
-    pub fn add_antecedent(&mut self, label: FlowNodeId, antecedent: FlowNodeId) -> Option<bool> {
+    pub fn add_antecedent(&mut self, label: FlowRef, antecedent: FlowRef) -> Option<bool> {
         let antecedent_flags = self.get(antecedent)?.flags;
         let label_node = self.get(label)?;
         if !label_node.flags.intersects(FlowFlags::LABEL) {
@@ -203,17 +254,40 @@ impl FlowNodeArena {
         Some(true)
     }
 
+    /// Replaces a label's antecedents with an upstream-combined list.
+    ///
+    /// Unlike [`Self::add_antecedent`], this operation deliberately preserves
+    /// order and duplicates and does not alter `REFERENCED`/`SHARED`. It is the
+    /// direct representation of `combineFlowLists` followed by wholesale label
+    /// assignment in the upstream try/finally binder.
+    pub fn replace_antecedents(&mut self, label: FlowRef, antecedents: Vec<FlowRef>) -> Option<()> {
+        if !self.get(label)?.flags.intersects(FlowFlags::LABEL)
+            || antecedents.iter().any(|flow| self.get(*flow).is_none())
+        {
+            return None;
+        }
+        self.get_mut(label)?.antecedents = antecedents;
+        Some(())
+    }
+
+    /// Concatenates flow lists in upstream order without de-duplication or
+    /// graph mutation.
+    #[must_use]
+    pub fn combine_antecedent_lists(head: &[FlowRef], tail: &[FlowRef]) -> Vec<FlowRef> {
+        head.iter().chain(tail).copied().collect()
+    }
+
     /// Collapses an empty or single-edge label exactly as the upstream binder.
     ///
     /// Returns `None` when `label` is invalid or is not a branch/loop label.
     #[must_use]
-    pub fn finish_label(&self, label: FlowNodeId, unreachable: FlowNodeId) -> Option<FlowNodeId> {
+    pub fn finish_label(&self, label: FlowRef) -> Option<FlowRef> {
         let node = self.get(label)?;
         if !node.flags.intersects(FlowFlags::LABEL) {
             return None;
         }
         Some(match node.antecedents.as_slice() {
-            [] => unreachable,
+            [] => self.unreachable(),
             [only] => *only,
             _ => label,
         })
@@ -267,7 +341,7 @@ mod tests {
 
     #[test]
     fn arena_assigns_dense_ids_and_preserves_graph_edges() {
-        let mut arena = FlowNodeArena::new();
+        let mut arena = FlowNodeArena::new(FileId::new(3));
         let start = arena.alloc(FlowNode::new(FlowFlags::START));
         let node = NodeRef::new(FileId::new(3), NodeId::new(7));
         let assignment = arena.alloc(FlowNode::with_antecedent(
@@ -276,10 +350,11 @@ mod tests {
             start,
         ));
 
-        assert_eq!(start.0, 0);
-        assert_eq!(assignment.0, 1);
+        assert_eq!(arena.unreachable().flow.0, 0);
+        assert_eq!(start.flow.0, 1);
+        assert_eq!(assignment.flow.0, 2);
         assert_eq!(arena.get(assignment).unwrap().antecedent, Some(start));
-        assert_eq!(arena.iter().count(), 2);
+        assert_eq!(arena.iter().count(), 3);
     }
 
     #[test]
@@ -301,13 +376,13 @@ mod tests {
 
     #[test]
     fn reference_and_label_transitions_match_upstream() {
-        let mut arena = FlowNodeArena::new();
-        let unreachable = arena.alloc(FlowNode::new(FlowFlags::UNREACHABLE));
+        let mut arena = FlowNodeArena::new(FileId::new(0));
+        let unreachable = arena.unreachable();
         let first = arena.alloc(FlowNode::new(FlowFlags::START));
         let second = arena.alloc(FlowNode::new(FlowFlags::ASSIGNMENT));
         let label = arena.alloc(FlowNode::new(FlowFlags::BRANCH_LABEL));
 
-        assert_eq!(arena.finish_label(label, unreachable), Some(unreachable));
+        assert_eq!(arena.finish_label(label), Some(unreachable));
         assert_eq!(arena.add_antecedent(label, unreachable), Some(false));
         assert_eq!(arena.add_antecedent(label, first), Some(true));
         assert!(
@@ -317,12 +392,49 @@ mod tests {
                 .flags
                 .contains(FlowFlags::REFERENCED)
         );
-        assert_eq!(arena.finish_label(label, unreachable), Some(first));
+        assert_eq!(arena.finish_label(label), Some(first));
         assert_eq!(arena.add_antecedent(label, first), Some(false));
         assert_eq!(arena.add_antecedent(label, second), Some(true));
-        assert_eq!(arena.finish_label(label, unreachable), Some(label));
+        assert_eq!(arena.finish_label(label), Some(label));
 
         arena.mark_referenced(first).unwrap();
         assert!(arena.get(first).unwrap().flags.contains(FlowFlags::SHARED));
+    }
+
+    #[test]
+    fn combined_lists_preserve_duplicates_order_and_reference_flags() {
+        let mut arena = FlowNodeArena::new(FileId::new(4));
+        let shared_path = arena.alloc(FlowNode::new(FlowFlags::ASSIGNMENT));
+        let normal_only = arena.alloc(FlowNode::new(FlowFlags::START));
+        let exceptional_only = arena.alloc(FlowNode::new(FlowFlags::CALL));
+        let finally_label = arena.alloc(FlowNode::new(FlowFlags::BRANCH_LABEL));
+
+        let normal = [shared_path, normal_only];
+        let exceptional = [shared_path, exceptional_only];
+        let combined = FlowNodeArena::combine_antecedent_lists(&normal, &exceptional);
+        arena
+            .replace_antecedents(finally_label, combined.clone())
+            .unwrap();
+
+        assert_eq!(
+            combined,
+            [shared_path, normal_only, shared_path, exceptional_only]
+        );
+        assert_eq!(arena.get(finally_label).unwrap().antecedents, combined);
+        assert_eq!(arena.get(shared_path).unwrap().flags, FlowFlags::ASSIGNMENT);
+    }
+
+    #[test]
+    fn program_wide_refs_reject_a_different_file_arena() {
+        let mut first = FlowNodeArena::new(FileId::new(5));
+        let mut second = FlowNodeArena::new(FileId::new(6));
+        let first_start = first.alloc(FlowNode::new(FlowFlags::START));
+        let second_start = second.alloc(FlowNode::new(FlowFlags::START));
+
+        assert_eq!(first_start.flow, second_start.flow);
+        assert_ne!(first_start, second_start);
+        assert!(first.get(second_start).is_none());
+        assert!(second.get(first_start).is_none());
+        assert!(first.mark_referenced(second_start).is_none());
     }
 }
