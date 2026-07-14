@@ -2,14 +2,17 @@
 //!
 //! This module is intentionally separate from the legacy structural checker.
 //! Values from the two cores must not be mixed inside one program. In
-//! particular, the IDs re-exported here are one-based canonical semantic IDs;
-//! they have no conversion to same-named legacy checker IDs.
+//! particular, the IDs re-exported here are one-based canonical semantic IDs
+//! branded by their aggregate [`SemanticStore`]; they have no conversion to
+//! same-named legacy checker IDs.
 
 pub mod ids;
 pub mod signatures;
+mod store;
 pub mod types;
 
 pub use ids::{
-    IndexInfoId, SemanticSymbolArena, SemanticSymbolId, SignatureId, TypeArena, TypeId,
-    TypeMapperArena, TypeMapperId, TypePredicateId,
+    IndexInfoId, SemanticStoreId, SemanticSymbolId, SignatureId, TypeId, TypeMapperId,
+    TypePredicateId,
 };
+pub use store::{AstScope, SemanticStore};
