@@ -13,7 +13,7 @@ use ts_checker::{
 };
 use ts_config::{ConfigDiagnostic, resolve_config_file};
 use ts_core::{TextPos, TextRange};
-use ts_diagnostics::{Diagnostic, message_by_code};
+use ts_diagnostics::{Category, Diagnostic, message_by_code};
 use ts_glob::{DiscoveryOptions, discover_files};
 use ts_module::{ResolutionOptions, Resolver, automatic_type_directive_names, parse_package_json};
 use ts_options::{
@@ -134,6 +134,7 @@ pub struct ProgramDiagnostic {
     pub file_name: Option<String>,
     pub range: Option<TextRange>,
     pub code: Option<u32>,
+    pub category: Category,
     pub message: String,
 }
 
@@ -626,6 +627,7 @@ impl Program {
                 file_name: Some(config.path.clone()),
                 range: None,
                 code: Some(diagnostic.code()),
+                category: diagnostic.category(),
                 message: diagnostic
                     .render()
                     .unwrap_or_else(|error| error.to_string()),
@@ -663,6 +665,7 @@ impl Program {
                 file_name: Some(config.path.clone()),
                 range: None,
                 code: None,
+                category: Category::Error,
                 message: error.to_string(),
             });
             discovery.files.clone()
@@ -2135,6 +2138,7 @@ impl Program {
                     file_name: Some(source_file.file_name.clone()),
                     range,
                     code: Some(diagnostic.diagnostic.code()),
+                    category: diagnostic.diagnostic.category(),
                     message: diagnostic
                         .diagnostic
                         .render()
@@ -2455,6 +2459,12 @@ impl Program {
                 file_name: Some(file_name.to_owned()),
                 range: Some(diagnostic.range),
                 code: diagnostic.code,
+                category: match diagnostic.category {
+                    ts_core::DiagnosticCategory::Warning => Category::Warning,
+                    ts_core::DiagnosticCategory::Error => Category::Error,
+                    ts_core::DiagnosticCategory::Suggestion => Category::Suggestion,
+                    ts_core::DiagnosticCategory::Message => Category::Message,
+                },
                 message: diagnostic.message.clone(),
             });
         }
@@ -2469,6 +2479,7 @@ impl Program {
                 file_name: Some(file_name.to_owned()),
                 range,
                 code: Some(diagnostic.diagnostic.code()),
+                category: diagnostic.diagnostic.category(),
                 message: diagnostic
                     .diagnostic
                     .render()
@@ -2495,6 +2506,7 @@ impl Program {
                         file_name: Some(file_name.to_owned()),
                         range: Some(node.range),
                         code: Some(message.code()),
+                        category: message.category(),
                         message: message
                             .format(&[])
                             .unwrap_or_else(|error| error.to_string()),
@@ -3468,6 +3480,7 @@ fn emit_diagnostic(source_file: &SourceFile, error: &ts_printer::EmitError) -> P
             .get(error.node)
             .map(|node| node.range),
         code: None,
+        category: Category::Error,
         message: error.to_string(),
     }
 }
@@ -5446,6 +5459,7 @@ fn missing_file_diagnostic(file_name: &str) -> ProgramDiagnostic {
         file_name: None,
         range: None,
         code: Some(message.code()),
+        category: message.category(),
         message: message
             .format(&[file_name.to_owned()])
             .expect("TS6053 has one formatting argument"),
@@ -5458,6 +5472,7 @@ fn output_overwrites_input_diagnostic(file_name: &str) -> ProgramDiagnostic {
         file_name: None,
         range: None,
         code: Some(message.code()),
+        category: message.category(),
         message: message
             .format(&[file_name.to_owned()])
             .expect("TS5055 has one formatting argument"),
@@ -5470,6 +5485,7 @@ fn output_collision_diagnostic(file_name: &str) -> ProgramDiagnostic {
         file_name: None,
         range: None,
         code: Some(message.code()),
+        category: message.category(),
         message: message
             .format(&[file_name.to_owned()])
             .expect("TS5056 has one formatting argument"),
@@ -5513,6 +5529,7 @@ fn emit_declaration_only_diagnostic() -> ProgramDiagnostic {
         file_name: None,
         range: None,
         code: Some(message.code()),
+        category: message.category(),
         message: message
             .format(&[
                 "emitDeclarationOnly".to_owned(),
@@ -5533,6 +5550,7 @@ fn module_not_found_diagnostic(
         file_name: Some(file_name.to_owned()),
         range: Some(range),
         code: Some(message.code()),
+        category: message.category(),
         message: message
             .format(&[specifier.to_owned()])
             .expect("TS2307 has one formatting argument"),
@@ -5549,6 +5567,7 @@ fn side_effect_import_not_found_diagnostic(
         file_name: Some(file_name.to_owned()),
         range: Some(range),
         code: Some(message.code()),
+        category: message.category(),
         message: message
             .format(&[specifier.to_owned()])
             .expect("TS2882 has one formatting argument"),
@@ -5561,6 +5580,7 @@ fn type_definition_not_found(name: &str) -> ProgramDiagnostic {
         file_name: None,
         range: None,
         code: Some(message.code()),
+        category: message.category(),
         message: message
             .format(&[name.to_owned()])
             .expect("TS2688 has one formatting argument"),
@@ -5572,6 +5592,7 @@ fn config_diagnostic(diagnostic: &ConfigDiagnostic) -> ProgramDiagnostic {
         file_name: Some(diagnostic.file_name.clone()),
         range: None,
         code: Some(diagnostic.code()),
+        category: diagnostic.diagnostic.category(),
         message: diagnostic.render(),
     }
 }
@@ -5581,6 +5602,7 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::time::{Duration, Instant};
 
+    use ts_diagnostics::Category;
     use ts_options::{CompilerOptions, ModuleKind, ScriptTarget};
     use ts_vfs::{FileSystem, MemoryFileSystem};
 
@@ -5767,6 +5789,12 @@ mod tests {
                 program.diagnostics()
             );
         }
+        assert!(
+            program
+                .diagnostics()
+                .iter()
+                .all(|diagnostic| diagnostic.category == Category::Error)
+        );
     }
 
     #[test]
@@ -7351,6 +7379,12 @@ export function create() { return new M.Value(); }"#,
                 .diagnostics()
                 .iter()
                 .any(|diagnostic| diagnostic.code == Some(2304))
+        );
+        assert!(
+            program
+                .diagnostics()
+                .iter()
+                .all(|diagnostic| diagnostic.category == Category::Error)
         );
     }
 
