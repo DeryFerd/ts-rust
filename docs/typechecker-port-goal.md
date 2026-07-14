@@ -776,6 +776,35 @@ worktrees or non-overlapping modules and integrate small coherent commits.
 Cargo-heavy verification should use the repository's capped runner and one
 integration lane to avoid memory contention.
 
+The useful concurrency is phase-dependent. More workers do not help while
+they are all changing the same identity, store, binder-state, or relation
+contract; after those contracts freeze, the same workers can own disjoint
+semantic families with little coordination.
+
+| Execution wave | Safe parallel implementation clusters | Practical concurrency with four slots |
+|---|---|---:|
+| Foundation and oracle | Diagnostic oracle; AST/store identity; binder flow; semantic records | 2-3 implementers, with root integrating and one worker rotating into review |
+| Canonical graph | Type payloads; lazy link records; program-owned binder symbols; exact artifact plumbing | 3 implementation lanes, provided each consumes the frozen store API |
+| Binder/checker bootstrap | Name/reference resolution; mappers; intrinsic/global bootstrap and declared types; semantic formatter | 2-3 implementation lanes plus continuous review |
+| Coupled algorithms | One owner for relation state and cache semantics; separate mapper/instantiation probes and source-dispatch scaffolding | 2 core implementation lanes; extra workers focus on tests, oracle shards, and review |
+| Feature expansion | Expressions, flow evaluation, classes, modules, JSX, JSDoc, and advanced-type families behind stable dispatch | 3 implementation lanes with four slots; 6-10 independent clusters if more reviewed workers are available |
+| Corpus closure | Root-cause failure clusters, modern-project gates, diagnostics, and integration regressions | Broadly parallel, bounded primarily by reviewer and integration throughput |
+
+With four active slots, the default operating shape is root/integration plus
+three workers. During a risky contract change, one worker implements, one
+independently compares against Go, and one advances a non-overlapping oracle or
+binder/type lane. During feature expansion, all three workers may implement
+disjoint modules while root performs rolling review and integration. Do not
+queue more than two unreviewed semantic clusters per available reviewer; an
+unreviewed pile merely moves the bottleneck to integration and makes bad shared
+assumptions expensive to unwind.
+
+Work is assigned by an exclusive tuple of upstream functions, Rust destination
+modules, and semantic records it may mutate. Fixture buckets are validation
+inputs, never ownership boundaries. A worker that discovers a required change
+to a shared contract stops at that boundary and returns a proposed interface
+change to the integration lane instead of editing another worker's substrate.
+
 ### Review loop for every cluster
 
 1. The implementer records the exact Go functions, dependencies, and fixture
