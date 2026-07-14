@@ -38,6 +38,7 @@ struct FlowBuilder<'a> {
     container: NodeId,
     return_target: Option<FlowRef>,
     has_flow_effects: bool,
+    effect_dependency_containers: Vec<NodeId>,
     built_containers: BTreeSet<NodeId>,
 }
 
@@ -51,6 +52,7 @@ impl<'a> FlowBuilder<'a> {
             container: NodeId::new(0),
             return_target: None,
             has_flow_effects: false,
+            effect_dependency_containers: Vec::new(),
             built_containers: BTreeSet::new(),
         }
     }
@@ -82,16 +84,19 @@ impl<'a> FlowBuilder<'a> {
         let kind = node.kind;
         let flags = node.flags;
 
+        if kind == SyntaxKind::ClassStaticBlockDeclaration {
+            self.mark_unsupported(node_id, UnsupportedFlowKind::ClassStaticBlock);
+            self.discover_nested_containers(node_id);
+            return;
+        }
+
         if let Some(function) = self.function_container(node_id) {
-            if self.is_immediately_invoked_function(node_id) {
-                self.mark_unsupported(node_id, UnsupportedFlowKind::ImmediatelyInvokedFunction);
+            if let Some(kind) = self.unsupported_direct_function_call_kind(node_id) {
+                self.mark_unsupported(node_id, kind);
                 self.discover_nested_containers(node_id);
                 return;
             }
-            if matches!(
-                kind,
-                SyntaxKind::FunctionExpression | SyntaxKind::ArrowFunction
-            ) {
+            if function.start_payload {
                 self.record_node_flow_including_unreachable(node_id);
             }
             self.bind_function_container(node_id, function);
@@ -119,11 +124,11 @@ impl<'a> FlowBuilder<'a> {
         }
 
         if self.current_is_unreachable() {
-            if is_flow_statement(kind) {
+            if self.is_potentially_executable_node(node_id) {
                 self.graph.unreachable_nodes.insert(node_id);
                 self.graph.node_containers.insert(node_id, self.container);
             }
-            self.discover_nested_containers(node_id);
+            self.bind_children(node_id);
             return;
         }
 
@@ -169,10 +174,6 @@ impl<'a> FlowBuilder<'a> {
                 self.mark_unsupported(node_id, UnsupportedFlowKind::WithStatement);
                 self.discover_nested_containers(node_id);
             }
-            SyntaxKind::ClassStaticBlockDeclaration => {
-                self.mark_unsupported(node_id, UnsupportedFlowKind::ClassStaticBlock);
-                self.discover_nested_containers(node_id);
-            }
             SyntaxKind::SourceFile => {}
             SyntaxKind::Block => self.bind_block(node_id),
             SyntaxKind::IfStatement => self.bind_if_statement(node_id),
@@ -188,6 +189,12 @@ impl<'a> FlowBuilder<'a> {
             SyntaxKind::PostfixUnaryExpression => self.bind_postfix_unary_expression(node_id),
             SyntaxKind::DeleteExpression => self.bind_delete_expression(node_id),
             SyntaxKind::CallExpression => self.bind_call_expression(node_id),
+            SyntaxKind::QualifiedName => {
+                if self.is_part_of_type_query(node_id) {
+                    self.record_node_flow(node_id);
+                }
+                self.bind_children(node_id);
+            }
             SyntaxKind::Identifier
             | SyntaxKind::ThisKeyword
             | SyntaxKind::SuperKeyword
@@ -320,6 +327,14 @@ impl<'a> FlowBuilder<'a> {
     }
 
     fn bind_conditional_expression(&mut self, node_id: NodeId) {
+        let dependency_container = self.container;
+        self.effect_dependency_containers.push(dependency_container);
+        self.bind_conditional_expression_worker(node_id);
+        let popped = self.effect_dependency_containers.pop();
+        debug_assert_eq!(popped, Some(dependency_container));
+    }
+
+    fn bind_conditional_expression_worker(&mut self, node_id: NodeId) {
         let (condition, question, when_true, colon, when_false) =
             match self.ast.get(node_id).map(|node| &node.data) {
                 Some(NodeData::ConditionalExpression(data)) => (
@@ -605,8 +620,11 @@ impl<'a> FlowBuilder<'a> {
                 ),
                 _ => return,
             };
-        if let Some(function) = self.immediately_invoked_target(expression) {
-            self.mark_unsupported(function, UnsupportedFlowKind::ImmediatelyInvokedFunction);
+        if let Some(function) = self.directly_invoked_function_target(expression) {
+            let kind = self
+                .unsupported_direct_function_call_kind(function)
+                .expect("direct function call target has an unsupported boundary kind");
+            self.mark_unsupported(function, kind);
             self.discover_nested_containers(node_id);
             return;
         }
@@ -727,17 +745,18 @@ impl<'a> FlowBuilder<'a> {
         let children = self.children.get(&node_id).cloned().unwrap_or_default();
         for child in children {
             if let Some(function) = self.function_container(child) {
-                if self.is_immediately_invoked_function(child) {
+                if let Some(kind) = self.unsupported_direct_function_call_kind(child) {
+                    self.mark_unsupported(child, kind);
                     self.discover_nested_containers(child);
                 } else {
-                    if matches!(
-                        self.node_kind(child),
-                        Some(SyntaxKind::FunctionExpression | SyntaxKind::ArrowFunction)
-                    ) {
+                    if function.start_payload {
                         self.record_node_flow_including_unreachable(child);
                     }
                     self.bind_function_container(child, function);
                 }
+            } else if self.node_kind(child) == Some(SyntaxKind::ClassStaticBlockDeclaration) {
+                self.mark_unsupported(child, UnsupportedFlowKind::ClassStaticBlock);
+                self.discover_nested_containers(child);
             } else if self.node_kind(child) == Some(SyntaxKind::ModuleBlock) {
                 self.bind_module_block(child);
             } else if self.node_kind(child) == Some(SyntaxKind::PropertyDeclaration)
@@ -767,7 +786,6 @@ impl<'a> FlowBuilder<'a> {
             | NodeData::ConstructorTypeNode(_)
             | NodeData::CallSignatureDeclaration(_)
             | NodeData::ConstructSignatureDeclaration(_)
-            | NodeData::IndexSignatureDeclaration(_)
             | NodeData::MethodSignatureDeclaration(_) => None,
             _ => return None,
         };
@@ -925,6 +943,29 @@ impl<'a> FlowBuilder<'a> {
 
     fn mark_unsupported(&mut self, node_id: NodeId, kind: UnsupportedFlowKind) {
         let container = self.container;
+        self.record_unsupported(node_id, container, kind);
+        let dependencies = self
+            .effect_dependency_containers
+            .iter()
+            .copied()
+            .filter(|dependency| *dependency != container)
+            .collect::<BTreeSet<_>>();
+        for dependency in dependencies {
+            self.record_unsupported(
+                node_id,
+                dependency,
+                UnsupportedFlowKind::CrossContainerFlowEffects,
+            );
+        }
+        self.current = None;
+    }
+
+    fn record_unsupported(
+        &mut self,
+        node_id: NodeId,
+        container: NodeId,
+        kind: UnsupportedFlowKind,
+    ) {
         let unsupported = UnsupportedFlow {
             node: self.node_ref(node_id),
             container: self.node_ref(container),
@@ -934,7 +975,6 @@ impl<'a> FlowBuilder<'a> {
             self.graph.unsupported.push(unsupported);
         }
         self.graph.incomplete_containers.insert(container);
-        self.current = None;
     }
 
     fn current_is_unreachable(&self) -> bool {
@@ -954,6 +994,60 @@ impl<'a> FlowBuilder<'a> {
 
     fn node_kind(&self, node: NodeId) -> Option<SyntaxKind> {
         self.ast.get(node).map(|node| node.kind)
+    }
+
+    fn is_potentially_executable_node(&self, node_id: NodeId) -> bool {
+        let Some(kind) = self.node_kind(node_id) else {
+            return false;
+        };
+        if is_flow_statement(kind) {
+            if kind != SyntaxKind::VariableStatement {
+                return true;
+            }
+            let Some(NodeData::VariableStatement(statement)) =
+                self.ast.get(node_id).map(|node| &node.data)
+            else {
+                return false;
+            };
+            let Some(declaration_list) = self.ast.get(statement.declaration_list) else {
+                return false;
+            };
+            if declaration_list.flags.0 & NODE_FLAGS_BLOCK_SCOPED != 0 {
+                return true;
+            }
+            let NodeData::VariableDeclarationList(declaration_list) = &declaration_list.data else {
+                return false;
+            };
+            return declaration_list
+                .declarations
+                .nodes
+                .iter()
+                .any(|declaration| {
+                    matches!(
+                        self.ast.get(*declaration).map(|node| &node.data),
+                        Some(NodeData::VariableDeclaration(data)) if data.initializer.is_some()
+                    )
+                });
+        }
+        matches!(
+            kind,
+            SyntaxKind::ClassDeclaration
+                | SyntaxKind::EnumDeclaration
+                | SyntaxKind::ModuleDeclaration
+        )
+    }
+
+    fn is_part_of_type_query(&self, mut node_id: NodeId) -> bool {
+        while matches!(
+            self.node_kind(node_id),
+            Some(SyntaxKind::QualifiedName | SyntaxKind::Identifier)
+        ) {
+            let Some(parent) = self.ast.get(node_id).and_then(|node| node.parent) else {
+                return false;
+            };
+            node_id = parent;
+        }
+        self.node_kind(node_id) == Some(SyntaxKind::TypeQuery)
     }
 
     fn identifier_text(&self, node: NodeId) -> Option<&str> {
@@ -1037,13 +1131,57 @@ impl<'a> FlowBuilder<'a> {
                 match self.node_kind(data.operator_token) {
                     Some(SyntaxKind::CommaToken) => self.is_narrowable_reference(data.right),
                     Some(operator) if operator.is_assignment_operator() => {
-                        self.is_narrowable_reference(data.left)
+                        self.is_left_hand_side_expression(data.left)
                     }
                     _ => false,
                 }
             }
             _ => false,
         }
+    }
+
+    fn is_left_hand_side_expression(&self, mut node_id: NodeId) -> bool {
+        while let Some(NodeData::PartiallyEmittedExpression(data)) =
+            self.ast.get(node_id).map(|node| &node.data)
+        {
+            node_id = data.expression;
+        }
+        matches!(
+            self.node_kind(node_id),
+            Some(
+                SyntaxKind::PropertyAccessExpression
+                    | SyntaxKind::ElementAccessExpression
+                    | SyntaxKind::NewExpression
+                    | SyntaxKind::CallExpression
+                    | SyntaxKind::JsxElement
+                    | SyntaxKind::JsxSelfClosingElement
+                    | SyntaxKind::JsxFragment
+                    | SyntaxKind::TaggedTemplateExpression
+                    | SyntaxKind::ArrayLiteralExpression
+                    | SyntaxKind::ParenthesizedExpression
+                    | SyntaxKind::ObjectLiteralExpression
+                    | SyntaxKind::ClassExpression
+                    | SyntaxKind::FunctionExpression
+                    | SyntaxKind::Identifier
+                    | SyntaxKind::PrivateIdentifier
+                    | SyntaxKind::RegularExpressionLiteral
+                    | SyntaxKind::NumericLiteral
+                    | SyntaxKind::BigIntLiteral
+                    | SyntaxKind::StringLiteral
+                    | SyntaxKind::NoSubstitutionTemplateLiteral
+                    | SyntaxKind::TemplateExpression
+                    | SyntaxKind::FalseKeyword
+                    | SyntaxKind::NullKeyword
+                    | SyntaxKind::ThisKeyword
+                    | SyntaxKind::TrueKeyword
+                    | SyntaxKind::SuperKeyword
+                    | SyntaxKind::NonNullExpression
+                    | SyntaxKind::ExpressionWithTypeArguments
+                    | SyntaxKind::MetaProperty
+                    | SyntaxKind::ImportKeyword
+                    | SyntaxKind::MissingDeclaration
+            )
+        )
     }
 
     fn has_narrowable_argument(&self, call: NodeId) -> bool {
@@ -1228,7 +1366,7 @@ impl<'a> FlowBuilder<'a> {
         node
     }
 
-    fn immediately_invoked_target(&self, expression: NodeId) -> Option<NodeId> {
+    fn directly_invoked_function_target(&self, expression: NodeId) -> Option<NodeId> {
         let expression = self.skip_parentheses(expression);
         matches!(
             self.node_kind(expression),
@@ -1237,7 +1375,26 @@ impl<'a> FlowBuilder<'a> {
         .then_some(expression)
     }
 
+    fn unsupported_direct_function_call_kind(
+        &self,
+        function: NodeId,
+    ) -> Option<UnsupportedFlowKind> {
+        self.is_directly_invoked_function(function).then(|| {
+            if self.is_immediately_invoked_function(function) {
+                UnsupportedFlowKind::ImmediatelyInvokedFunction
+            } else {
+                UnsupportedFlowKind::DirectFunctionCall
+            }
+        })
+    }
+
     fn is_immediately_invoked_function(&self, function: NodeId) -> bool {
+        self.is_directly_invoked_function(function)
+            && !self.is_async_function(function)
+            && !self.is_generator_function_expression(function)
+    }
+
+    fn is_directly_invoked_function(&self, function: NodeId) -> bool {
         let mut expression = function;
         loop {
             let Some(parent) = self.ast.get(expression).and_then(|node| node.parent) else {
@@ -1252,7 +1409,34 @@ impl<'a> FlowBuilder<'a> {
             }
         }
     }
+
+    fn is_async_function(&self, function: NodeId) -> bool {
+        let modifiers = match &self.ast.get(function).expect("known function node").data {
+            NodeData::FunctionExpression(data) if data.asterisk_token.is_none() => &data.modifiers,
+            NodeData::ArrowFunction(data) if data.asterisk_token.is_none() => &data.modifiers,
+            _ => return false,
+        };
+        modifiers.as_ref().is_some_and(|modifiers| {
+            modifiers
+                .list
+                .nodes
+                .iter()
+                .any(|modifier| self.node_kind(*modifier) == Some(SyntaxKind::AsyncKeyword))
+        })
+    }
+
+    fn is_generator_function_expression(&self, function: NodeId) -> bool {
+        matches!(
+            self.ast.get(function).map(|node| &node.data),
+            Some(NodeData::FunctionExpression(data)) if data.asterisk_token.is_some()
+        )
+    }
 }
+
+const NODE_FLAG_LET: u32 = 1 << 0;
+const NODE_FLAG_CONST: u32 = 1 << 1;
+const NODE_FLAG_USING: u32 = 1 << 2;
+const NODE_FLAGS_BLOCK_SCOPED: u32 = NODE_FLAG_LET | NODE_FLAG_CONST | NODE_FLAG_USING;
 
 fn is_flow_statement(kind: SyntaxKind) -> bool {
     (kind as u16) >= (SyntaxKind::FIRST_STATEMENT as u16)

@@ -338,7 +338,9 @@ pub enum UnsupportedFlowKind {
     OptionalChain,
     DestructuringAssignment,
     ImmediatelyInvokedFunction,
+    DirectFunctionCall,
     ClassStaticBlock,
+    CrossContainerFlowEffects,
 }
 
 /// One explicit incompleteness boundary in a bound control-flow container.
@@ -2438,6 +2440,138 @@ mod tests {
     }
 
     #[test]
+    fn index_signatures_are_not_control_flow_containers() {
+        let parsed =
+            parse_source_file("interface Shape { [name: string]: number; method(): void; }");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(18);
+        let result = bind_source_file_in_file(&parsed.arena, parsed.source_file, file);
+        let graph = result
+            .flow_graph(&parsed.arena, parsed.source_file)
+            .unwrap();
+        assert!(graph.is_complete(), "{:?}", graph.unsupported());
+
+        let index = nodes_of_kind(&parsed.arena, SyntaxKind::IndexSignature)[0];
+        assert_eq!(
+            graph.container_is_complete(node_ref(&parsed.arena, file, index)),
+            None
+        );
+        let method = nodes_of_kind(&parsed.arena, SyntaxKind::MethodSignature)[0];
+        assert_eq!(
+            graph.container_is_complete(node_ref(&parsed.arena, file, method)),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn object_literal_and_class_expression_members_capture_outer_flow() {
+        let parsed = parse_source_file(
+            r"
+                const object = {
+                    method() {},
+                    get value() { return 1; },
+                    set value(next: number) {}
+                };
+                const Expression = class {
+                    method() {}
+                    get value() { return 1; }
+                    set value(next: number) {}
+                };
+                class Declaration {
+                    method() {}
+                    get value() { return 1; }
+                    set value(next: number) {}
+                }
+            ",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(19);
+        let result = bind_source_file_in_file(&parsed.arena, parsed.source_file, file);
+        let graph = result
+            .flow_graph(&parsed.arena, parsed.source_file)
+            .unwrap();
+        assert!(graph.is_complete(), "{:?}", graph.unsupported());
+
+        let mut expression_members = 0;
+        let mut declaration_members = 0;
+        for kind in [
+            SyntaxKind::MethodDeclaration,
+            SyntaxKind::GetAccessor,
+            SyntaxKind::SetAccessor,
+        ] {
+            for member in nodes_of_kind(&parsed.arena, kind) {
+                let member_ref = node_ref(&parsed.arena, file, member);
+                let parent_kind = parsed
+                    .arena
+                    .get(member)
+                    .and_then(|node| node.parent)
+                    .and_then(|parent| parsed.arena.get(parent))
+                    .map(|parent| parent.kind);
+                match parent_kind {
+                    Some(SyntaxKind::ObjectLiteralExpression | SyntaxKind::ClassExpression) => {
+                        expression_members += 1;
+                        assert!(graph.flow_at(member_ref).is_some());
+                        let start = graph.container_start(member_ref).unwrap();
+                        assert_eq!(
+                            graph.nodes().get(start).unwrap().payload,
+                            Some(FlowNodePayload::Ast(member_ref))
+                        );
+                    }
+                    Some(SyntaxKind::ClassDeclaration) => {
+                        declaration_members += 1;
+                        assert_eq!(graph.flow_at(member_ref), None);
+                        let start = graph.container_start(member_ref).unwrap();
+                        assert_eq!(graph.nodes().get(start).unwrap().payload, None);
+                    }
+                    other => panic!("unexpected member parent: {other:?}"),
+                }
+            }
+        }
+        assert_eq!(expression_members, 6);
+        assert_eq!(declaration_members, 3);
+    }
+
+    #[test]
+    fn qualified_names_capture_flow_only_inside_type_queries() {
+        let parsed = parse_source_file(
+            "declare const value: typeof ns.deep.member; declare const other: ns.deep.Member;",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(20);
+        let result = bind_source_file_in_file(&parsed.arena, parsed.source_file, file);
+        let graph = result
+            .flow_graph(&parsed.arena, parsed.source_file)
+            .unwrap();
+        assert!(graph.is_complete(), "{:?}", graph.unsupported());
+
+        let mut in_query = 0;
+        let mut outside_query = 0;
+        for qualified in nodes_of_kind(&parsed.arena, SyntaxKind::QualifiedName) {
+            let mut ancestor = qualified;
+            let part_of_query = loop {
+                let Some(parent) = parsed.arena.get(ancestor).and_then(|node| node.parent) else {
+                    break false;
+                };
+                match parsed.arena.get(parent).map(|node| node.kind) {
+                    Some(SyntaxKind::QualifiedName | SyntaxKind::Identifier) => ancestor = parent,
+                    Some(SyntaxKind::TypeQuery) => break true,
+                    _ => break false,
+                }
+            };
+            let flow = graph.flow_at(node_ref(&parsed.arena, file, qualified));
+            if part_of_query {
+                in_query += 1;
+                assert!(flow.is_some());
+            } else {
+                outside_query += 1;
+                assert_eq!(flow, None);
+            }
+        }
+        assert!(in_query > 0);
+        assert!(outside_query > 0);
+    }
+
+    #[test]
     fn comma_expression_calls_follow_upstream_assertion_order() {
         let parsed = parse_source_file("checks.first(value), checks.second(value);");
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
@@ -2560,6 +2694,178 @@ mod tests {
                     .is_some()
             );
         }
+    }
+
+    #[test]
+    fn unreachable_traversal_marks_only_potentially_executable_nodes() {
+        let parsed = parse_source_file(
+            r"
+                function stop() {
+                    return;
+                    {
+                        var dormant;
+                        var initialized = 1;
+                        let lexical;
+                        class Local {}
+                        enum Choice { One }
+                        namespace Nested {}
+                    }
+                }
+            ",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(21);
+        let result = bind_source_file_in_file(&parsed.arena, parsed.source_file, file);
+        let graph = result
+            .flow_graph(&parsed.arena, parsed.source_file)
+            .unwrap();
+        assert!(graph.is_complete(), "{:?}", graph.unsupported());
+
+        let function = nodes_of_kind(&parsed.arena, SyntaxKind::FunctionDeclaration)[0];
+        let NodeData::FunctionDeclaration(function_data) =
+            &parsed.arena.get(function).unwrap().data
+        else {
+            panic!("expected function declaration");
+        };
+        let NodeData::Block(body) = &parsed.arena.get(function_data.body.unwrap()).unwrap().data
+        else {
+            panic!("expected function body");
+        };
+        let nested_block = body.statements.nodes[1];
+        assert_eq!(
+            graph.is_unreachable(node_ref(&parsed.arena, file, nested_block)),
+            None
+        );
+
+        let NodeData::Block(nested) = &parsed.arena.get(nested_block).unwrap().data else {
+            panic!("expected nested block");
+        };
+        let [dormant, initialized, lexical, class, enum_, module] =
+            nested.statements.nodes.as_slice()
+        else {
+            panic!("expected six unreachable statements");
+        };
+        assert_eq!(
+            graph.is_unreachable(node_ref(&parsed.arena, file, *dormant)),
+            None
+        );
+        for executable in [initialized, lexical, class, enum_, module] {
+            assert_eq!(
+                graph.is_unreachable(node_ref(&parsed.arena, file, *executable)),
+                Some(true)
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_nested_effects_invalidate_an_enclosing_conditional() {
+        let parsed = parse_source_file(
+            "const result = flag ? (() => { while (value) { value = 1; } }) : 0;",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(22);
+        let result = bind_source_file_in_file(&parsed.arena, parsed.source_file, file);
+        let graph = result
+            .flow_graph(&parsed.arena, parsed.source_file)
+            .unwrap();
+        assert!(!graph.is_complete());
+
+        let source_ref = node_ref(&parsed.arena, file, parsed.source_file);
+        let arrow = nodes_of_kind(&parsed.arena, SyntaxKind::ArrowFunction)[0];
+        let arrow_ref = node_ref(&parsed.arena, file, arrow);
+        assert_eq!(graph.container_is_complete(source_ref), Some(false));
+        assert_eq!(graph.container_is_complete(arrow_ref), Some(false));
+        assert!(graph.unsupported().iter().any(|unsupported| {
+            unsupported.container == arrow_ref
+                && unsupported.kind == UnsupportedFlowKind::IterationStatement
+        }));
+        assert!(graph.unsupported().iter().any(|unsupported| {
+            unsupported.container == source_ref
+                && unsupported.kind == UnsupportedFlowKind::CrossContainerFlowEffects
+        }));
+    }
+
+    #[test]
+    fn unreachable_direct_functions_and_static_blocks_remain_explicit_boundaries() {
+        let parsed = parse_source_file(
+            r"
+                function stop() {
+                    return;
+                    (() => 1)();
+                    (async () => 2)();
+                    (function* () { yield 3; })();
+                    class Local { static { sideEffect(); } }
+                }
+            ",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(23);
+        let result = bind_source_file_in_file(&parsed.arena, parsed.source_file, file);
+        let graph = result
+            .flow_graph(&parsed.arena, parsed.source_file)
+            .unwrap();
+        assert!(!graph.is_complete());
+
+        let function = nodes_of_kind(&parsed.arena, SyntaxKind::FunctionDeclaration)[0];
+        let function_ref = node_ref(&parsed.arena, file, function);
+        let source_ref = node_ref(&parsed.arena, file, parsed.source_file);
+        assert_eq!(graph.container_is_complete(function_ref), Some(false));
+        assert_eq!(graph.container_is_complete(source_ref), Some(true));
+        let kinds = graph
+            .unsupported()
+            .iter()
+            .filter(|unsupported| unsupported.container == function_ref)
+            .map(|unsupported| unsupported.kind)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds
+                .iter()
+                .filter(|kind| **kind == UnsupportedFlowKind::ImmediatelyInvokedFunction)
+                .count(),
+            1
+        );
+        assert_eq!(
+            kinds
+                .iter()
+                .filter(|kind| **kind == UnsupportedFlowKind::DirectFunctionCall)
+                .count(),
+            2
+        );
+        assert_eq!(
+            kinds
+                .iter()
+                .filter(|kind| **kind == UnsupportedFlowKind::ClassStaticBlock)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn assignment_references_use_left_hand_side_expression_kinds() {
+        let parsed = parse_source_file("if ((get() = value).property) { value; }");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(24);
+        let result = bind_source_file_in_file(&parsed.arena, parsed.source_file, file);
+        let graph = result
+            .flow_graph(&parsed.arena, parsed.source_file)
+            .unwrap();
+        assert!(graph.is_complete(), "{:?}", graph.unsupported());
+
+        let conditions = graph
+            .nodes()
+            .iter()
+            .filter(|node| node.flags.intersects(FlowFlags::CONDITION))
+            .collect::<Vec<_>>();
+        assert_eq!(conditions.len(), 2);
+        let condition = nodes_of_kind(&parsed.arena, SyntaxKind::PropertyAccessExpression)[0];
+        assert!(conditions.iter().all(|flow| {
+            flow.payload
+                == Some(FlowNodePayload::Ast(node_ref(
+                    &parsed.arena,
+                    file,
+                    condition,
+                )))
+        }));
     }
 
     #[test]
