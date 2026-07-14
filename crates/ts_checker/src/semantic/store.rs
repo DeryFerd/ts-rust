@@ -120,18 +120,16 @@ impl<TypePayload, SymbolPayload, MapperPayload>
 
     /// Registers a safe AST snapshot for semantic references.
     ///
-    /// Re-registering the same file/arena pair refreshes its node bound.
-    /// Reusing either identity with a different counterpart is rejected before
-    /// either registration map is modified.
+    /// Re-registering the same file/arena pair may increase its node bound.
+    /// Shrinking that bound, or reusing either identity with a different
+    /// counterpart, is rejected before either registration map is modified.
     pub fn register_ast_scope(&mut self, scope: AstScope) -> bool {
-        if self
-            .ast_scopes
-            .get(&scope.file)
-            .is_some_and(|registered| registered.arena != scope.arena)
-            || self
-                .ast_files
-                .get(&scope.arena)
-                .is_some_and(|registered| *registered != scope.file)
+        if self.ast_scopes.get(&scope.file).is_some_and(|registered| {
+            registered.arena != scope.arena || registered.node_count > scope.node_count
+        }) || self
+            .ast_files
+            .get(&scope.arena)
+            .is_some_and(|registered| *registered != scope.file)
         {
             return false;
         }
@@ -152,8 +150,9 @@ impl<TypePayload, SymbolPayload, MapperPayload>
     /// # Panics
     ///
     /// Panics before mutation if the local `u32` identity space is exhausted.
-    pub fn alloc_type(&mut self, payload: TypePayload) -> TypeId {
-        self.types.alloc(payload)
+    #[allow(dead_code)] // Hook for sibling concrete type allocators as they land.
+    pub(super) fn alloc_type(&mut self, payload: TypePayload) -> TypeId {
+        self.types.alloc_with(|_| payload)
     }
 
     #[must_use]
@@ -176,8 +175,9 @@ impl<TypePayload, SymbolPayload, MapperPayload>
     /// # Panics
     ///
     /// Panics before mutation if the local `u32` identity space is exhausted.
-    pub fn alloc_symbol(&mut self, payload: SymbolPayload) -> SemanticSymbolId {
-        self.symbols.alloc(payload)
+    #[allow(dead_code)] // Hook for sibling concrete symbol allocators as they land.
+    pub(super) fn alloc_symbol(&mut self, payload: SymbolPayload) -> SemanticSymbolId {
+        self.symbols.alloc_with(|_| payload)
     }
 
     #[must_use]
@@ -195,8 +195,9 @@ impl<TypePayload, SymbolPayload, MapperPayload>
     /// # Panics
     ///
     /// Panics before mutation if the local `u32` identity space is exhausted.
-    pub fn alloc_mapper(&mut self, payload: MapperPayload) -> TypeMapperId {
-        self.mappers.alloc(payload)
+    #[allow(dead_code)] // Hook for sibling concrete mapper allocators as they land.
+    pub(super) fn alloc_mapper(&mut self, payload: MapperPayload) -> TypeMapperId {
+        self.mappers.alloc_with(|_| payload)
     }
 
     #[must_use]
@@ -540,6 +541,26 @@ mod tests {
             .unwrap()
     }
 
+    fn signature_with_references(
+        store: &mut TestStore,
+        type_parameters: Vec<crate::semantic::TypeId>,
+        this_parameter: Option<crate::semantic::SemanticSymbolId>,
+        parameters: Vec<crate::semantic::SemanticSymbolId>,
+        return_type: Option<crate::semantic::TypeId>,
+        predicate: Option<crate::semantic::TypePredicateId>,
+    ) -> Option<crate::semantic::SignatureId> {
+        store.alloc_signature(
+            SignatureFlags::NONE,
+            None,
+            type_parameters,
+            this_parameter,
+            parameters,
+            return_type,
+            predicate,
+            0,
+        )
+    }
+
     struct SeededStore {
         store: TestStore,
         type_id: crate::semantic::TypeId,
@@ -630,22 +651,6 @@ mod tests {
         assert_ne!(first.predicate, second.predicate);
         assert_ne!(first.index_info, second.index_info);
 
-        let signature_count = second.store.signature_len();
-        assert_eq!(
-            second.store.alloc_signature(
-                SignatureFlags::NONE,
-                None,
-                vec![first.type_id],
-                Some(first.symbol),
-                vec![second.symbol],
-                Some(second.type_id),
-                None,
-                0,
-            ),
-            None
-        );
-        assert_eq!(second.store.signature_len(), signature_count);
-
         let predicate_count = second.store.type_predicate_len();
         assert_eq!(
             second.store.alloc_type_predicate(
@@ -664,7 +669,77 @@ mod tests {
                 .alloc_index_info(first.type_id, second.type_id, false, None, Vec::new()),
             None
         );
+        assert_eq!(
+            second
+                .store
+                .alloc_index_info(second.type_id, first.type_id, false, None, Vec::new()),
+            None
+        );
         assert_eq!(second.store.index_info_len(), index_count);
+    }
+
+    #[test]
+    fn signature_allocation_rejects_each_foreign_id_one_slot_independently() {
+        let first = seeded_store("first");
+        let mut second = seeded_store("second");
+        let signature_count = second.store.signature_len();
+
+        assert_eq!(
+            signature_with_references(
+                &mut second.store,
+                vec![first.type_id],
+                Some(second.symbol),
+                vec![second.symbol],
+                Some(second.type_id),
+                Some(second.predicate),
+            ),
+            None
+        );
+        assert_eq!(
+            signature_with_references(
+                &mut second.store,
+                vec![second.type_id],
+                Some(first.symbol),
+                vec![second.symbol],
+                Some(second.type_id),
+                Some(second.predicate),
+            ),
+            None
+        );
+        assert_eq!(
+            signature_with_references(
+                &mut second.store,
+                vec![second.type_id],
+                Some(second.symbol),
+                vec![first.symbol],
+                Some(second.type_id),
+                Some(second.predicate),
+            ),
+            None
+        );
+        assert_eq!(
+            signature_with_references(
+                &mut second.store,
+                vec![second.type_id],
+                Some(second.symbol),
+                vec![second.symbol],
+                Some(first.type_id),
+                Some(second.predicate),
+            ),
+            None
+        );
+        assert_eq!(
+            signature_with_references(
+                &mut second.store,
+                vec![second.type_id],
+                Some(second.symbol),
+                vec![second.symbol],
+                Some(second.type_id),
+                Some(first.predicate),
+            ),
+            None
+        );
+        assert_eq!(second.store.signature_len(), signature_count);
     }
 
     #[test]
@@ -684,12 +759,22 @@ mod tests {
             Some(first.signature),
             Some(second.mapper)
         ));
+        assert!(!store.set_signature_target_and_mapper(
+            target,
+            Some(second.signature),
+            Some(first.mapper)
+        ));
         assert!(!store.set_signature_resolved_return_type(target, Some(first.type_id)));
         assert!(!store.set_signature_isolated_type(target, Some(first.type_id)));
         assert!(!store.set_signature_resolved_type_predicate(target, Some(first.predicate)));
         assert!(!store.set_signature_this_parameter(target, Some(first.symbol)));
         assert!(!store.set_signature_type_parameters(target, vec![first.type_id]));
         assert!(!store.set_signature_composite(target, foreign_composite));
+        assert!(
+            store
+                .create_composite_signature(true, vec![first.signature])
+                .is_none()
+        );
         assert_signature_unmodified(store, target);
 
         assert_eq!(store.type_payload(first.type_id), None);
@@ -714,6 +799,12 @@ mod tests {
         let second_scope = AstScope::new(file, &second_parse.arena);
         let first_ref = first_scope.node_ref(first_parse.source_file).unwrap();
         let second_ref = second_scope.node_ref(second_parse.source_file).unwrap();
+
+        let mut first_store = TestStore::new();
+        assert!(first_store.register_ast_scope(first_scope));
+        let foreign_element = first_store
+            .create_tuple_element_info(ElementFlags::REQUIRED, Some(first_ref))
+            .unwrap();
 
         assert_eq!(first_ref.file, second_ref.file);
         assert_eq!(first_ref.node, second_ref.node);
@@ -754,9 +845,23 @@ mod tests {
             ),
             None
         );
+        assert_eq!(
+            store.alloc_index_info(
+                key_type,
+                value_type,
+                false,
+                Some(second_ref),
+                vec![first_ref]
+            ),
+            None
+        );
         assert_eq!(store.index_info_len(), index_count);
         assert_eq!(
             store.create_tuple_element_info(ElementFlags::REQUIRED, Some(first_ref)),
+            None
+        );
+        assert_eq!(
+            store.create_tuple_metadata(vec![foreign_element], false),
             None
         );
         assert!(
@@ -785,6 +890,42 @@ mod tests {
             ts_ast::NodeId::new(u32::MAX),
         );
         assert!(!store.contains_node_ref(out_of_bounds));
+    }
+
+    #[test]
+    fn ast_scope_refresh_cannot_shrink_past_a_stored_node_reference() {
+        let mut parsed = parse_source_file("const value = 1;");
+        let file = FileId::new(3);
+        let original_scope = AstScope::new(file, &parsed.arena);
+        let mut store = TestStore::new();
+        assert!(store.register_ast_scope(original_scope));
+
+        let copied_node = parsed.arena.get(parsed.source_file).unwrap().clone();
+        let later_node = parsed.arena.alloc(copied_node);
+        let grown_scope = AstScope::new(file, &parsed.arena);
+        assert!(grown_scope.node_count() > original_scope.node_count());
+        assert!(store.register_ast_scope(grown_scope));
+
+        let later_ref = grown_scope.node_ref(later_node).unwrap();
+        let signature = store
+            .alloc_signature(
+                SignatureFlags::NONE,
+                Some(later_ref),
+                Vec::new(),
+                None,
+                Vec::new(),
+                None,
+                None,
+                0,
+            )
+            .unwrap();
+
+        assert!(!store.register_ast_scope(original_scope));
+        assert!(store.contains_node_ref(later_ref));
+        assert_eq!(
+            store.signature(signature).unwrap().declaration(),
+            Some(later_ref)
+        );
     }
 
     #[test]

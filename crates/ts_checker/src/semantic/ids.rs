@@ -145,10 +145,6 @@ impl<I: ArenaId, T> TypedArena<I, T> {
         }
     }
 
-    pub(super) fn alloc(&mut self, value: T) -> I {
-        self.alloc_with(|_| value)
-    }
-
     pub(super) fn alloc_with(&mut self, make_value: impl FnOnce(I) -> T) -> I {
         let id = id_for_len::<I>(self.store, self.entries.len());
         self.entries.push(make_value(id));
@@ -213,8 +209,8 @@ mod tests {
         let second_store = allocate_semantic_store_id();
         let mut first = TypedArena::<TypeId, _>::new(first_store);
         let mut second = TypedArena::<TypeId, _>::new(second_store);
-        let first_id = first.alloc("first");
-        let second_id = second.alloc("second");
+        let first_id = first.alloc_with(|_| "first");
+        let second_id = second.alloc_with(|_| "second");
 
         assert_eq!(first_id.get(), 1);
         assert_eq!(second_id.get(), 1);
