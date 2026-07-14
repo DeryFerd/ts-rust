@@ -10,7 +10,10 @@ use ts_ast::{
 };
 use ts_diagnostics::{Diagnostic, message_by_code};
 
-/// TypeScript symbol meanings. Bit positions match the upstream compiler.
+/// TypeScript symbol meanings and merge masks.
+///
+/// Bit positions match `microsoft/typescript-go`'s `internal/ast/symbolflags.go`
+/// at `dc37b5249ab60e2bbce936f71b883e6c8136167e`.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct SymbolFlags(u32);
 
@@ -27,18 +30,126 @@ impl SymbolFlags {
     pub const REGULAR_ENUM: Self = Self(1 << 8);
     pub const VALUE_MODULE: Self = Self(1 << 9);
     pub const NAMESPACE_MODULE: Self = Self(1 << 10);
+    pub const TYPE_LITERAL: Self = Self(1 << 11);
+    pub const OBJECT_LITERAL: Self = Self(1 << 12);
     pub const METHOD: Self = Self(1 << 13);
     pub const CONSTRUCTOR: Self = Self(1 << 14);
     pub const GET_ACCESSOR: Self = Self(1 << 15);
     pub const SET_ACCESSOR: Self = Self(1 << 16);
+    pub const SIGNATURE: Self = Self(1 << 17);
     pub const TYPE_PARAMETER: Self = Self(1 << 18);
     pub const TYPE_ALIAS: Self = Self(1 << 19);
+    pub const EXPORT_VALUE: Self = Self(1 << 20);
     pub const ALIAS: Self = Self(1 << 21);
+    pub const PROTOTYPE: Self = Self(1 << 22);
+    pub const EXPORT_STAR: Self = Self(1 << 23);
+    pub const OPTIONAL: Self = Self(1 << 24);
+    pub const TRANSIENT: Self = Self(1 << 25);
+    pub const ASSIGNMENT: Self = Self(1 << 26);
+    pub const MODULE_EXPORTS: Self = Self(1 << 27);
+    pub const CONST_ENUM_ONLY_MODULE: Self = Self(1 << 28);
+    pub const REPLACEABLE_BY_METHOD: Self = Self(1 << 29);
+    pub const GLOBAL_LOOKUP: Self = Self(1 << 30);
+    pub const ALL: Self = Self((1 << 30) - 1);
 
+    pub const ENUM: Self = Self(Self::CONST_ENUM.0 | Self::REGULAR_ENUM.0);
     pub const VARIABLE: Self =
         Self(Self::FUNCTION_SCOPED_VARIABLE.0 | Self::BLOCK_SCOPED_VARIABLE.0);
-    pub const ENUM: Self = Self(Self::CONST_ENUM.0 | Self::REGULAR_ENUM.0);
+    pub const VALUE: Self = Self(
+        Self::VARIABLE.0
+            | Self::PROPERTY.0
+            | Self::ENUM_MEMBER.0
+            | Self::OBJECT_LITERAL.0
+            | Self::FUNCTION.0
+            | Self::CLASS.0
+            | Self::ENUM.0
+            | Self::VALUE_MODULE.0
+            | Self::METHOD.0
+            | Self::GET_ACCESSOR.0
+            | Self::SET_ACCESSOR.0,
+    );
+    pub const TYPE: Self = Self(
+        Self::CLASS.0
+            | Self::INTERFACE.0
+            | Self::ENUM.0
+            | Self::ENUM_MEMBER.0
+            | Self::TYPE_LITERAL.0
+            | Self::TYPE_PARAMETER.0
+            | Self::TYPE_ALIAS.0,
+    );
+    pub const NAMESPACE: Self =
+        Self(Self::VALUE_MODULE.0 | Self::NAMESPACE_MODULE.0 | Self::ENUM.0);
     pub const MODULE: Self = Self(Self::VALUE_MODULE.0 | Self::NAMESPACE_MODULE.0);
+    pub const ACCESSOR: Self = Self(Self::GET_ACCESSOR.0 | Self::SET_ACCESSOR.0);
+
+    pub const FUNCTION_SCOPED_VARIABLE_EXCLUDES: Self =
+        Self(Self::VALUE.0 & !Self::FUNCTION_SCOPED_VARIABLE.0);
+    pub const BLOCK_SCOPED_VARIABLE_EXCLUDES: Self = Self::VALUE;
+    pub const PARAMETER_EXCLUDES: Self = Self::VALUE;
+    pub const PROPERTY_EXCLUDES: Self =
+        Self(Self::VALUE.0 & !(Self::PROPERTY.0 | Self::ACCESSOR.0));
+    pub const ENUM_MEMBER_EXCLUDES: Self = Self(Self::VALUE.0 | Self::TYPE.0);
+    pub const FUNCTION_EXCLUDES: Self =
+        Self(Self::VALUE.0 & !(Self::FUNCTION.0 | Self::VALUE_MODULE.0 | Self::CLASS.0));
+    pub const CLASS_EXCLUDES: Self = Self(
+        (Self::VALUE.0 | Self::TYPE.0)
+            & !(Self::VALUE_MODULE.0 | Self::INTERFACE.0 | Self::FUNCTION.0),
+    );
+    pub const INTERFACE_EXCLUDES: Self = Self(Self::TYPE.0 & !(Self::INTERFACE.0 | Self::CLASS.0));
+    pub const REGULAR_ENUM_EXCLUDES: Self =
+        Self((Self::VALUE.0 | Self::TYPE.0) & !(Self::REGULAR_ENUM.0 | Self::VALUE_MODULE.0));
+    pub const CONST_ENUM_EXCLUDES: Self =
+        Self((Self::VALUE.0 | Self::TYPE.0) & !Self::CONST_ENUM.0);
+    pub const VALUE_MODULE_EXCLUDES: Self = Self(
+        Self::VALUE.0
+            & !(Self::FUNCTION.0 | Self::CLASS.0 | Self::REGULAR_ENUM.0 | Self::VALUE_MODULE.0),
+    );
+    pub const NAMESPACE_MODULE_EXCLUDES: Self = Self::NONE;
+    pub const METHOD_EXCLUDES: Self = Self(Self::VALUE.0 & !Self::METHOD.0);
+    pub const GET_ACCESSOR_EXCLUDES: Self =
+        Self(Self::VALUE.0 & !(Self::SET_ACCESSOR.0 | Self::PROPERTY.0));
+    pub const SET_ACCESSOR_EXCLUDES: Self =
+        Self(Self::VALUE.0 & !(Self::GET_ACCESSOR.0 | Self::PROPERTY.0));
+    pub const ACCESSOR_EXCLUDES: Self = Self(Self::VALUE.0 & !Self::PROPERTY.0);
+    pub const TYPE_PARAMETER_EXCLUDES: Self = Self(Self::TYPE.0 & !Self::TYPE_PARAMETER.0);
+    pub const TYPE_ALIAS_EXCLUDES: Self = Self::TYPE;
+    pub const ALIAS_EXCLUDES: Self = Self::ALIAS;
+    pub const MODULE_MEMBER: Self = Self(
+        Self::VARIABLE.0
+            | Self::FUNCTION.0
+            | Self::CLASS.0
+            | Self::INTERFACE.0
+            | Self::ENUM.0
+            | Self::MODULE.0
+            | Self::TYPE_ALIAS.0
+            | Self::ALIAS.0,
+    );
+    pub const EXPORT_HAS_LOCAL: Self =
+        Self(Self::FUNCTION.0 | Self::CLASS.0 | Self::ENUM.0 | Self::VALUE_MODULE.0);
+    pub const BLOCK_SCOPED: Self =
+        Self(Self::BLOCK_SCOPED_VARIABLE.0 | Self::CLASS.0 | Self::ENUM.0);
+    pub const PROPERTY_OR_ACCESSOR: Self = Self(Self::PROPERTY.0 | Self::ACCESSOR.0);
+    pub const CLASS_MEMBER: Self = Self(Self::METHOD.0 | Self::ACCESSOR.0 | Self::PROPERTY.0);
+    pub const EXPORT_SUPPORTS_DEFAULT_MODIFIER: Self =
+        Self(Self::CLASS.0 | Self::FUNCTION.0 | Self::INTERFACE.0);
+    pub const EXPORT_DOES_NOT_SUPPORT_DEFAULT_MODIFIER: Self =
+        Self(!Self::EXPORT_SUPPORTS_DEFAULT_MODIFIER.0);
+    pub const CLASSIFIABLE: Self = Self(
+        Self::CLASS.0
+            | Self::ENUM.0
+            | Self::TYPE_ALIAS.0
+            | Self::INTERFACE.0
+            | Self::TYPE_PARAMETER.0
+            | Self::MODULE.0
+            | Self::ALIAS.0,
+    );
+    pub const LATE_BINDING_CONTAINER: Self = Self(
+        Self::CLASS.0
+            | Self::INTERFACE.0
+            | Self::TYPE_LITERAL.0
+            | Self::OBJECT_LITERAL.0
+            | Self::FUNCTION.0,
+    );
 
     #[must_use]
     pub const fn bits(self) -> u32 {
@@ -449,6 +560,7 @@ impl<'a> Binder<'a> {
                         node_id,
                         name,
                         SymbolFlags::FUNCTION,
+                        SymbolFlags::FUNCTION_EXCLUDES,
                         parent_symbol,
                     )
                 });
@@ -472,7 +584,14 @@ impl<'a> Binder<'a> {
             }
             NodeData::ClassDeclaration(data) => {
                 let symbol = data.name.and_then(|name| {
-                    self.declare_and_export(scope, node_id, name, SymbolFlags::CLASS, parent_symbol)
+                    self.declare_and_export(
+                        scope,
+                        node_id,
+                        name,
+                        SymbolFlags::CLASS,
+                        SymbolFlags::CLASS_EXCLUDES,
+                        parent_symbol,
+                    )
                 });
                 let class_scope = self.create_scope(ScopeKind::Class, node_id, Some(scope));
                 self.result.node_scopes.insert(node_id, class_scope);
@@ -504,6 +623,7 @@ impl<'a> Binder<'a> {
                         node_id,
                         name,
                         SymbolFlags::CLASS,
+                        SymbolFlags::CLASS_EXCLUDES,
                         parent_symbol,
                     )
                 });
@@ -528,6 +648,7 @@ impl<'a> Binder<'a> {
                     node_id,
                     data.name,
                     SymbolFlags::INTERFACE,
+                    SymbolFlags::INTERFACE_EXCLUDES,
                     parent_symbol,
                 );
                 let interface_scope = self.create_scope(ScopeKind::Interface, node_id, Some(scope));
@@ -553,6 +674,7 @@ impl<'a> Binder<'a> {
                     node_id,
                     data.name,
                     SymbolFlags::TYPE_ALIAS,
+                    SymbolFlags::TYPE_ALIAS_EXCLUDES,
                     parent_symbol,
                 );
                 if data.type_parameters.is_some() {
@@ -575,8 +697,19 @@ impl<'a> Binder<'a> {
                 } else {
                     SymbolFlags::REGULAR_ENUM
                 };
-                let symbol =
-                    self.declare_and_export(scope, node_id, data.name, flags, parent_symbol);
+                let excludes = if flags == SymbolFlags::CONST_ENUM {
+                    SymbolFlags::CONST_ENUM_EXCLUDES
+                } else {
+                    SymbolFlags::REGULAR_ENUM_EXCLUDES
+                };
+                let symbol = self.declare_and_export(
+                    scope,
+                    node_id,
+                    data.name,
+                    flags,
+                    excludes,
+                    parent_symbol,
+                );
                 let enum_scope = self.create_scope(ScopeKind::Enum, node_id, Some(scope));
                 self.result.node_scopes.insert(node_id, enum_scope);
                 for member in &data.members.nodes {
@@ -591,6 +724,7 @@ impl<'a> Binder<'a> {
                     node_id,
                     data.name,
                     SymbolFlags::NAMESPACE_MODULE,
+                    SymbolFlags::NAMESPACE_MODULE_EXCLUDES,
                     parent_symbol,
                 );
                 let module_scope = self.create_scope(ScopeKind::Module, node_id, Some(scope));
@@ -611,6 +745,7 @@ impl<'a> Binder<'a> {
                     node_id,
                     data.name,
                     SymbolFlags::ENUM_MEMBER,
+                    SymbolFlags::ENUM_MEMBER_EXCLUDES,
                     parent_symbol,
                 );
             }
@@ -629,6 +764,7 @@ impl<'a> Binder<'a> {
                     node_id,
                     data.name,
                     SymbolFlags::BLOCK_SCOPED_VARIABLE,
+                    SymbolFlags::BLOCK_SCOPED_VARIABLE_EXCLUDES,
                     parent_symbol,
                 );
             }
@@ -638,6 +774,7 @@ impl<'a> Binder<'a> {
                     node_id,
                     data.name,
                     SymbolFlags::PROPERTY,
+                    SymbolFlags::PROPERTY_EXCLUDES,
                     parent_symbol,
                 );
                 if let Some(initializer) = data.initializer {
@@ -653,6 +790,7 @@ impl<'a> Binder<'a> {
                     node_id,
                     data.name,
                     SymbolFlags::PROPERTY,
+                    SymbolFlags::PROPERTY_EXCLUDES,
                     parent_symbol,
                 );
                 self.bind_node(data.type_, scope, container, parent_symbol);
@@ -663,6 +801,7 @@ impl<'a> Binder<'a> {
                     node_id,
                     data.name,
                     SymbolFlags::METHOD,
+                    SymbolFlags::METHOD_EXCLUDES,
                     parent_symbol,
                 );
                 self.bind_function_like(
@@ -683,6 +822,7 @@ impl<'a> Binder<'a> {
                     node_id,
                     data.name,
                     SymbolFlags::METHOD,
+                    SymbolFlags::METHOD_EXCLUDES,
                     parent_symbol,
                 );
                 self.bind_function_like(
@@ -703,6 +843,7 @@ impl<'a> Binder<'a> {
                     node_id,
                     data.name,
                     SymbolFlags::GET_ACCESSOR,
+                    SymbolFlags::GET_ACCESSOR_EXCLUDES,
                     parent_symbol,
                 );
                 self.bind_function_like(
@@ -720,6 +861,7 @@ impl<'a> Binder<'a> {
                     node_id,
                     data.name,
                     SymbolFlags::SET_ACCESSOR,
+                    SymbolFlags::SET_ACCESSOR_EXCLUDES,
                     parent_symbol,
                 );
                 self.bind_function_like(
@@ -737,6 +879,7 @@ impl<'a> Binder<'a> {
                     node_id,
                     "__constructor",
                     SymbolFlags::CONSTRUCTOR,
+                    SymbolFlags::NONE,
                     parent_symbol,
                 );
                 self.bind_function_like(
@@ -819,6 +962,7 @@ impl<'a> Binder<'a> {
                     node_id,
                     data.name,
                     SymbolFlags::TYPE_PARAMETER,
+                    SymbolFlags::TYPE_PARAMETER_EXCLUDES,
                     parent_symbol,
                 );
                 if let Some(constraint) = data.constraint {
@@ -840,6 +984,7 @@ impl<'a> Binder<'a> {
                     node_id,
                     data.name,
                     SymbolFlags::ALIAS,
+                    SymbolFlags::ALIAS_EXCLUDES,
                     parent_symbol,
                 );
                 self.bind_node(data.module_reference, scope, container, parent_symbol);
@@ -918,6 +1063,11 @@ impl<'a> Binder<'a> {
         } else {
             SymbolFlags::FUNCTION_SCOPED_VARIABLE
         };
+        let excludes = if block_scoped {
+            SymbolFlags::BLOCK_SCOPED_VARIABLE_EXCLUDES
+        } else {
+            SymbolFlags::FUNCTION_SCOPED_VARIABLE_EXCLUDES
+        };
         let target_scope = if block_scoped {
             scope
         } else {
@@ -931,7 +1081,14 @@ impl<'a> Binder<'a> {
                 let name = declaration_data.name;
                 let type_ = declaration_data.type_;
                 let initializer = declaration_data.initializer;
-                self.declare_binding_name(target_scope, *declaration, name, flags, parent_symbol);
+                self.declare_binding_name(
+                    target_scope,
+                    *declaration,
+                    name,
+                    flags,
+                    excludes,
+                    parent_symbol,
+                );
                 if let Some(type_) = type_ {
                     self.bind_node(type_, scope, container, parent_symbol);
                 }
@@ -1006,6 +1163,7 @@ impl<'a> Binder<'a> {
                 parameter,
                 name,
                 SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+                SymbolFlags::PARAMETER_EXCLUDES,
                 parent_symbol,
             );
             if let Some(property_name) = property_name
@@ -1021,6 +1179,7 @@ impl<'a> Binder<'a> {
                     parameter,
                     property_name,
                     SymbolFlags::PROPERTY,
+                    SymbolFlags::PROPERTY_EXCLUDES,
                     Some(class_symbol),
                 );
             }
@@ -1113,7 +1272,14 @@ impl<'a> Binder<'a> {
             return;
         };
         if let Some(name) = data.name {
-            self.declare_named(scope, clause, name, SymbolFlags::ALIAS, parent_symbol);
+            self.declare_named(
+                scope,
+                clause,
+                name,
+                SymbolFlags::ALIAS,
+                SymbolFlags::ALIAS_EXCLUDES,
+                parent_symbol,
+            );
         }
         let Some(bindings) = data.named_bindings else {
             return;
@@ -1135,6 +1301,7 @@ impl<'a> Binder<'a> {
                             specifier,
                             specifier_data.name,
                             SymbolFlags::ALIAS,
+                            SymbolFlags::ALIAS_EXCLUDES,
                             parent_symbol,
                         );
                     }
@@ -1146,6 +1313,7 @@ impl<'a> Binder<'a> {
                     bindings,
                     import.name,
                     SymbolFlags::ALIAS,
+                    SymbolFlags::ALIAS_EXCLUDES,
                     parent_symbol,
                 );
             }
@@ -1196,6 +1364,7 @@ impl<'a> Binder<'a> {
         declaration: NodeId,
         name: NodeId,
         flags: SymbolFlags,
+        excludes: SymbolFlags,
         parent_symbol: Option<SymbolId>,
     ) {
         let Some(node) = self.arena.get(name) else {
@@ -1203,7 +1372,7 @@ impl<'a> Binder<'a> {
         };
         match &node.data {
             NodeData::Identifier(_) => {
-                self.declare_named(scope, declaration, name, flags, parent_symbol);
+                self.declare_named(scope, declaration, name, flags, excludes, parent_symbol);
             }
             NodeData::BindingPattern(pattern) => {
                 for element in &pattern.elements.nodes {
@@ -1216,6 +1385,7 @@ impl<'a> Binder<'a> {
                             declaration,
                             element_name,
                             flags,
+                            excludes,
                             parent_symbol,
                         );
                     }
@@ -1231,6 +1401,7 @@ impl<'a> Binder<'a> {
         declaration: NodeId,
         name_node: NodeId,
         flags: SymbolFlags,
+        excludes: SymbolFlags,
         parent_symbol: Option<SymbolId>,
     ) -> Option<SymbolId> {
         let computed_expression = match self.arena.get(name_node).map(|node| &node.data) {
@@ -1257,11 +1428,8 @@ impl<'a> Binder<'a> {
                 .result
                 .scope(expression_scope)
                 .map_or(declaration, |scope| scope.owner);
-            let expression_parent_symbol = self
-                .result
-                .node_symbols
-                .get(&expression_container)
-                .copied();
+            let expression_parent_symbol =
+                self.result.node_symbols.get(&expression_container).copied();
             self.bind_node(
                 expression,
                 expression_scope,
@@ -1270,7 +1438,7 @@ impl<'a> Binder<'a> {
             );
         }
         let name = self.declaration_name_text(name_node)?;
-        let id = self.declare_name(scope, declaration, name, flags, parent_symbol)?;
+        let id = self.declare_name(scope, declaration, name, flags, excludes, parent_symbol)?;
         self.result.node_symbols.insert(declaration, id);
         self.result.node_symbols.insert(name_node, id);
         if let Some(container) = self.result.containers.get(&declaration).copied() {
@@ -1285,9 +1453,17 @@ impl<'a> Binder<'a> {
         declaration: NodeId,
         name_node: NodeId,
         flags: SymbolFlags,
+        excludes: SymbolFlags,
         parent_symbol: Option<SymbolId>,
     ) -> Option<SymbolId> {
-        let id = self.declare_named(scope, declaration, name_node, flags, parent_symbol)?;
+        let id = self.declare_named(
+            scope,
+            declaration,
+            name_node,
+            flags,
+            excludes,
+            parent_symbol,
+        )?;
         if self.should_export(declaration, parent_symbol) {
             let export_name = if self.has_modifier(declaration, SyntaxKind::DefaultKeyword) {
                 "default".to_owned()
@@ -1313,10 +1489,18 @@ impl<'a> Binder<'a> {
         declaration: NodeId,
         name: &str,
         flags: SymbolFlags,
+        excludes: SymbolFlags,
         parent_symbol: Option<SymbolId>,
     ) -> SymbolId {
         let id = self
-            .declare_name(scope, declaration, name.to_owned(), flags, parent_symbol)
+            .declare_name(
+                scope,
+                declaration,
+                name.to_owned(),
+                flags,
+                excludes,
+                parent_symbol,
+            )
             .expect("scope and symbol IDs originate from this binder");
         self.result.node_symbols.insert(declaration, id);
         id
@@ -1328,12 +1512,13 @@ impl<'a> Binder<'a> {
         declaration: NodeId,
         name: String,
         flags: SymbolFlags,
+        excludes: SymbolFlags,
         parent_symbol: Option<SymbolId>,
     ) -> Option<SymbolId> {
         let existing = self.result.scopes[scope.index()].symbols.get(&name);
         let id = if let Some(existing) = existing {
             let existing_flags = self.result.symbols.get(existing)?.flags;
-            if !can_merge(existing_flags, flags) {
+            if !can_merge(existing_flags, flags, excludes) {
                 if existing_flags.intersects(SymbolFlags::ENUM)
                     || flags.intersects(SymbolFlags::ENUM)
                 {
@@ -1549,17 +1734,26 @@ impl<'a> Binder<'a> {
     }
 }
 
-fn can_merge(existing: SymbolFlags, new: SymbolFlags) -> bool {
+fn can_merge(existing: SymbolFlags, new: SymbolFlags, excludes: SymbolFlags) -> bool {
+    if existing.intersects(excludes) {
+        return false;
+    }
+
+    // This allowlist is intentionally not full upstream parity. Keep the
+    // binder's currently supported merge set after applying the conflict mask:
+    // other mask-permitted merges depend on duplicate-member and class/function
+    // checker diagnostics or module-instantiation state that are not ported.
     let existing_has_alias = existing.contains(SymbolFlags::ALIAS);
     let new_has_alias = new.contains(SymbolFlags::ALIAS);
     if new_has_alias {
-        return !existing_has_alias;
+        return true;
     }
     if existing_has_alias {
         let existing_without_alias = SymbolFlags(existing.0 & !SymbolFlags::ALIAS.0);
         return existing_without_alias == SymbolFlags::NONE
-            || can_merge(existing_without_alias, new);
+            || can_merge(existing_without_alias, new, excludes);
     }
+
     (existing.contains(SymbolFlags::FUNCTION_SCOPED_VARIABLE)
         && new == SymbolFlags::FUNCTION_SCOPED_VARIABLE)
         || (existing.contains(SymbolFlags::FUNCTION) && new == SymbolFlags::FUNCTION)
@@ -1619,8 +1813,238 @@ mod tests {
     use ts_core::TextRange;
     use ts_parser::parse_source_file;
 
-    use super::{ScopeKind, SymbolFlags, bind_source_file, bind_source_file_in_file};
+    use super::{
+        ScopeKind, SymbolFlags, bind_source_file, bind_source_file_in_file, can_merge,
+    };
 
+    #[test]
+    fn symbol_flag_bits_match_pinned_upstream() {
+        let primitive_flags = [
+            (SymbolFlags::NONE, 0x0000_0000),
+            (SymbolFlags::FUNCTION_SCOPED_VARIABLE, 0x0000_0001),
+            (SymbolFlags::BLOCK_SCOPED_VARIABLE, 0x0000_0002),
+            (SymbolFlags::PROPERTY, 0x0000_0004),
+            (SymbolFlags::ENUM_MEMBER, 0x0000_0008),
+            (SymbolFlags::FUNCTION, 0x0000_0010),
+            (SymbolFlags::CLASS, 0x0000_0020),
+            (SymbolFlags::INTERFACE, 0x0000_0040),
+            (SymbolFlags::CONST_ENUM, 0x0000_0080),
+            (SymbolFlags::REGULAR_ENUM, 0x0000_0100),
+            (SymbolFlags::VALUE_MODULE, 0x0000_0200),
+            (SymbolFlags::NAMESPACE_MODULE, 0x0000_0400),
+            (SymbolFlags::TYPE_LITERAL, 0x0000_0800),
+            (SymbolFlags::OBJECT_LITERAL, 0x0000_1000),
+            (SymbolFlags::METHOD, 0x0000_2000),
+            (SymbolFlags::CONSTRUCTOR, 0x0000_4000),
+            (SymbolFlags::GET_ACCESSOR, 0x0000_8000),
+            (SymbolFlags::SET_ACCESSOR, 0x0001_0000),
+            (SymbolFlags::SIGNATURE, 0x0002_0000),
+            (SymbolFlags::TYPE_PARAMETER, 0x0004_0000),
+            (SymbolFlags::TYPE_ALIAS, 0x0008_0000),
+            (SymbolFlags::EXPORT_VALUE, 0x0010_0000),
+            (SymbolFlags::ALIAS, 0x0020_0000),
+            (SymbolFlags::PROTOTYPE, 0x0040_0000),
+            (SymbolFlags::EXPORT_STAR, 0x0080_0000),
+            (SymbolFlags::OPTIONAL, 0x0100_0000),
+            (SymbolFlags::TRANSIENT, 0x0200_0000),
+            (SymbolFlags::ASSIGNMENT, 0x0400_0000),
+            (SymbolFlags::MODULE_EXPORTS, 0x0800_0000),
+            (SymbolFlags::CONST_ENUM_ONLY_MODULE, 0x1000_0000),
+            (SymbolFlags::REPLACEABLE_BY_METHOD, 0x2000_0000),
+            (SymbolFlags::GLOBAL_LOOKUP, 0x4000_0000),
+            (SymbolFlags::ALL, 0x3fff_ffff),
+        ];
+
+        for (flags, expected) in primitive_flags {
+            assert_eq!(flags.bits(), expected);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn symbol_flag_composites_and_exclusions_match_pinned_upstream() {
+        let masks = [
+            (SymbolFlags::ENUM, 0x0000_0180),
+            (SymbolFlags::VARIABLE, 0x0000_0003),
+            (SymbolFlags::VALUE, 0x0001_b3bf),
+            (SymbolFlags::TYPE, 0x000c_09e8),
+            (SymbolFlags::NAMESPACE, 0x0000_0780),
+            (SymbolFlags::MODULE, 0x0000_0600),
+            (SymbolFlags::ACCESSOR, 0x0001_8000),
+            (SymbolFlags::FUNCTION_SCOPED_VARIABLE_EXCLUDES, 0x0001_b3be),
+            (SymbolFlags::BLOCK_SCOPED_VARIABLE_EXCLUDES, 0x0001_b3bf),
+            (SymbolFlags::PARAMETER_EXCLUDES, 0x0001_b3bf),
+            (SymbolFlags::PROPERTY_EXCLUDES, 0x0000_33bb),
+            (SymbolFlags::ENUM_MEMBER_EXCLUDES, 0x000d_bbff),
+            (SymbolFlags::FUNCTION_EXCLUDES, 0x0001_b18f),
+            (SymbolFlags::CLASS_EXCLUDES, 0x000d_b9af),
+            (SymbolFlags::INTERFACE_EXCLUDES, 0x000c_0988),
+            (SymbolFlags::REGULAR_ENUM_EXCLUDES, 0x000d_b8ff),
+            (SymbolFlags::CONST_ENUM_EXCLUDES, 0x000d_bb7f),
+            (SymbolFlags::VALUE_MODULE_EXCLUDES, 0x0001_b08f),
+            (SymbolFlags::NAMESPACE_MODULE_EXCLUDES, 0x0000_0000),
+            (SymbolFlags::METHOD_EXCLUDES, 0x0001_93bf),
+            (SymbolFlags::GET_ACCESSOR_EXCLUDES, 0x0000_b3bb),
+            (SymbolFlags::SET_ACCESSOR_EXCLUDES, 0x0001_33bb),
+            (SymbolFlags::ACCESSOR_EXCLUDES, 0x0001_b3bb),
+            (SymbolFlags::TYPE_PARAMETER_EXCLUDES, 0x0008_09e8),
+            (SymbolFlags::TYPE_ALIAS_EXCLUDES, 0x000c_09e8),
+            (SymbolFlags::ALIAS_EXCLUDES, 0x0020_0000),
+            (SymbolFlags::MODULE_MEMBER, 0x0028_07f3),
+            (SymbolFlags::EXPORT_HAS_LOCAL, 0x0000_03b0),
+            (SymbolFlags::BLOCK_SCOPED, 0x0000_01a2),
+            (SymbolFlags::PROPERTY_OR_ACCESSOR, 0x0001_8004),
+            (SymbolFlags::CLASS_MEMBER, 0x0001_a004),
+            (SymbolFlags::EXPORT_SUPPORTS_DEFAULT_MODIFIER, 0x0000_0070),
+            (
+                SymbolFlags::EXPORT_DOES_NOT_SUPPORT_DEFAULT_MODIFIER,
+                0xffff_ff8f,
+            ),
+            (SymbolFlags::CLASSIFIABLE, 0x002c_07e0),
+            (SymbolFlags::LATE_BINDING_CONTAINER, 0x0000_1870),
+        ];
+
+        for (flags, expected) in masks {
+            assert_eq!(flags.bits(), expected);
+        }
+    }
+
+    #[test]
+    fn merge_checks_use_the_incoming_declarations_exclusion_mask() {
+        assert!(can_merge(
+            SymbolFlags::FUNCTION,
+            SymbolFlags::FUNCTION,
+            SymbolFlags::FUNCTION_EXCLUDES
+        ));
+        assert!(can_merge(
+            SymbolFlags::INTERFACE,
+            SymbolFlags::CLASS,
+            SymbolFlags::CLASS_EXCLUDES
+        ));
+        assert!(can_merge(
+            SymbolFlags::CLASS,
+            SymbolFlags::INTERFACE,
+            SymbolFlags::INTERFACE_EXCLUDES
+        ));
+        assert!(can_merge(
+            SymbolFlags::GET_ACCESSOR,
+            SymbolFlags::SET_ACCESSOR,
+            SymbolFlags::SET_ACCESSOR_EXCLUDES
+        ));
+        assert!(can_merge(
+            SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+            SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+            SymbolFlags::FUNCTION_SCOPED_VARIABLE_EXCLUDES
+        ));
+        assert!(!can_merge(
+            SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+            SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+            SymbolFlags::PARAMETER_EXCLUDES
+        ));
+        assert!(!can_merge(
+            SymbolFlags::ALIAS,
+            SymbolFlags::ALIAS,
+            SymbolFlags::ALIAS_EXCLUDES
+        ));
+        assert!(!can_merge(
+            SymbolFlags::REGULAR_ENUM,
+            SymbolFlags::CONST_ENUM,
+            SymbolFlags::CONST_ENUM_EXCLUDES
+        ));
+        assert!(can_merge(
+            SymbolFlags::FUNCTION,
+            SymbolFlags::NAMESPACE_MODULE,
+            SymbolFlags::NAMESPACE_MODULE_EXCLUDES
+        ));
+    }
+
+    #[test]
+    fn defers_mask_permitted_merges_that_need_downstream_semantics() {
+        // Upstream permits these at bind time, then relies on checker diagnostics
+        // such as TS2813/TS2814 or duplicate-member checks.
+        assert!(!SymbolFlags::CLASS.intersects(SymbolFlags::FUNCTION_EXCLUDES));
+        assert!(!can_merge(
+            SymbolFlags::CLASS,
+            SymbolFlags::FUNCTION,
+            SymbolFlags::FUNCTION_EXCLUDES
+        ));
+        assert!(!SymbolFlags::PROPERTY.intersects(SymbolFlags::PROPERTY_EXCLUDES));
+        assert!(!can_merge(
+            SymbolFlags::PROPERTY,
+            SymbolFlags::PROPERTY,
+            SymbolFlags::PROPERTY_EXCLUDES
+        ));
+        assert!(!SymbolFlags::PROPERTY.intersects(SymbolFlags::GET_ACCESSOR_EXCLUDES));
+        assert!(!can_merge(
+            SymbolFlags::PROPERTY,
+            SymbolFlags::GET_ACCESSOR,
+            SymbolFlags::GET_ACCESSOR_EXCLUDES
+        ));
+
+        // The current binder does not yet classify instantiated namespaces as
+        // VALUE_MODULE, so applying the exclusion-free NAMESPACE_MODULE mask
+        // directly would allow value/namespace merges that upstream rejects.
+        assert!(!can_merge(
+            SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+            SymbolFlags::NAMESPACE_MODULE,
+            SymbolFlags::NAMESPACE_MODULE_EXCLUDES
+        ));
+    }
+
+    #[test]
+    fn binds_representative_declaration_merges_with_upstream_exclusions() {
+        let parsed = parse_source_file(
+            r#"
+                function overloaded(value: string): string;
+                function overloaded(value: number): number;
+                function overloaded(value: string | number) { return value; }
+                class Shape {}
+                interface Shape { value: string; }
+                class Accessors {
+                    get item(): string { return ""; }
+                    set item(value: string) {}
+                }
+            "#,
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let result = bind_source_file(&parsed.arena, parsed.source_file);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+
+        let root = result.root_scope().unwrap();
+        let overloaded = result
+            .symbols
+            .get(root.symbols.get("overloaded").unwrap())
+            .unwrap();
+        assert!(overloaded.flags.contains(SymbolFlags::FUNCTION));
+        assert_eq!(overloaded.declarations.len(), 3);
+
+        let shape = result
+            .symbols
+            .get(root.symbols.get("Shape").unwrap())
+            .unwrap();
+        assert!(shape.flags.contains(SymbolFlags::CLASS));
+        assert!(shape.flags.contains(SymbolFlags::INTERFACE));
+
+        let accessors = result
+            .symbols
+            .get(root.symbols.get("Accessors").unwrap())
+            .unwrap();
+        let item = result
+            .symbols
+            .get(accessors.members.get("item").unwrap())
+            .unwrap();
+        assert!(item.flags.contains(SymbolFlags::GET_ACCESSOR));
+        assert!(item.flags.contains(SymbolFlags::SET_ACCESSOR));
+    }
+
+    #[test]
+    fn parameter_exclusions_reject_duplicate_parameter_names() {
+        let parsed = parse_source_file("function duplicate(value: string, value: number) {}");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let result = bind_source_file(&parsed.arena, parsed.source_file);
+        assert_eq!(result.diagnostics.len(), 1, "{:?}", result.diagnostics);
+        assert_eq!(result.diagnostics[0].diagnostic.code(), 2300);
+    }
     struct AstBuilder {
         arena: NodeArena,
     }
@@ -2106,7 +2530,8 @@ mod tests {
                 .then_some(property.name)
             })
             .unwrap();
-        let NodeData::ComputedPropertyName(computed) = &parsed.arena.get(computed_name).unwrap().data
+        let NodeData::ComputedPropertyName(computed) =
+            &parsed.arena.get(computed_name).unwrap().data
         else {
             unreachable!();
         };
