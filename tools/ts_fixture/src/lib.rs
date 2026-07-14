@@ -44,7 +44,10 @@ impl Case {
     ///
     /// # Errors
     ///
-    /// Returns an error when a `filename` directive has an empty value.
+    /// Returns an error when a `filename` directive has an empty value or when
+    /// substantive source precedes the first virtual filename. The latter is a
+    /// panic in the pinned compiler harness; representing it as a parse error
+    /// keeps the fixture runner fail-closed.
     pub fn parse(
         path: impl Into<PathBuf>,
         source_text: impl Into<SourceText>,
@@ -56,15 +59,21 @@ impl Case {
         let mut directives = Vec::new();
         let mut units = Vec::new();
         let mut current = UnitBuilder::new(path.clone(), 1, false);
+        let source_bytes = source_text.as_bytes();
         let mut byte_offset = 0;
 
-        for (line_index, line_with_ending) in source_text
-            .as_bytes()
-            .split_inclusive(|byte| *byte == b'\n')
-            .enumerate()
-        {
+        // Go's `lineDelimiter.Split(code, -1)` retains a final empty line,
+        // normalizes CRLF to LF when units are rebuilt, and drops empty lines
+        // while the current unit is still empty. Reproduce those semantics so
+        // diagnostic locations are relative to the same virtual source text.
+        for (line_index, raw_line) in source_bytes.split(|byte| *byte == b'\n').enumerate() {
             let line_number = line_index + 1;
-            let line = strip_line_ending(line_with_ending);
+            let has_line_ending = byte_offset + raw_line.len() < source_bytes.len();
+            let line = if has_line_ending {
+                raw_line.strip_suffix(b"\r").unwrap_or(raw_line)
+            } else {
+                raw_line
+            };
 
             if let Some((line_text, name, value)) =
                 std::str::from_utf8(line).ok().and_then(|text| {
@@ -84,7 +93,10 @@ impl Case {
                         return Err(ParseError::EmptyFileName { line: line_number });
                     }
 
-                    if current.explicit || current.has_substantive_source() {
+                    if !current.explicit && current.has_substantive_source() {
+                        return Err(ParseError::ContentBeforeFirstFile { line: line_number });
+                    }
+                    if current.explicit {
                         units.push(current.finish());
                     }
                     current = UnitBuilder::new(
@@ -95,15 +107,13 @@ impl Case {
                 }
                 directives.push(directive);
             } else {
-                current.source_bytes.extend_from_slice(line_with_ending);
+                current.append_line(line);
             }
 
-            byte_offset += line_with_ending.len();
+            byte_offset += raw_line.len() + usize::from(has_line_ending);
         }
 
-        // `split_inclusive` yields no item for an empty source. It also handles a
-        // final non-newline-terminated line, so no separate tail pass is needed.
-        if current.explicit || current.has_source() || units.is_empty() {
+        if current.explicit || units.is_empty() {
             units.push(current.finish());
         }
 
@@ -1673,13 +1683,15 @@ pub fn expand_option_matrix(case: &Case) -> Vec<OptionVariant> {
         unsupported_details.push(format!(
             "pinned harness variation cap exceeded: {variation_count} configurations (maximum 25)"
         ));
-        return vec![OptionVariant {
+        let mut variant = OptionVariant {
             values: option_values
                 .into_iter()
                 .filter_map(|(name, values)| values.into_iter().next().map(|value| (name, value)))
                 .collect(),
             unsupported_details,
-        }];
+        };
+        finalize_option_variant(case, &mut variant);
+        return vec![variant];
     }
 
     let mut variants = vec![OptionVariant {
@@ -1697,14 +1709,17 @@ pub fn expand_option_matrix(case: &Case) -> Vec<OptionVariant> {
         }
         variants = expanded;
     }
+    for variant in &mut variants {
+        finalize_option_variant(case, variant);
+    }
     variants
 }
 
 fn expanded_option_values(case: &Case) -> (BTreeMap<String, Vec<String>>, Vec<String>) {
     let mut option_values = BTreeMap::<String, Vec<String>>::new();
-    let mut unsupported_details = Vec::new();
+    let mut unsupported_details = pinned_directive_unsupported_details(case);
     for &name in COMPILER_OPTION_NAMES {
-        let Some(raw_value) = case.directive_values(name).last() else {
+        let Some(raw_value) = case.directive_values(name).last().map(pinned_setting_value) else {
             continue;
         };
         let values = if is_varying_boolean_option(name) || enum_option_values(name).is_some() {
@@ -1719,6 +1734,13 @@ fn expanded_option_values(case: &Case) -> (BTreeMap<String, Vec<String>>, Vec<St
                 }
             }
         } else {
+            if is_non_varying_boolean_option(name)
+                && !matches!(raw_value.to_ascii_lowercase().as_str(), "true" | "false")
+            {
+                unsupported_details.push(format!(
+                    "invalid boolean value {raw_value:?} for pinned compiler option {name}"
+                ));
+            }
             vec![raw_value.to_owned()]
         };
         if !rust_applies_compiler_option(name) {
@@ -1735,13 +1757,172 @@ fn expanded_option_values(case: &Case) -> (BTreeMap<String, Vec<String>>, Vec<St
         option_values.insert(name.to_owned(), values);
     }
     for &name in LIST_OPTION_NAMES {
-        if let Some(value) = case.directive_values(name).last() {
+        if let Some(value) = case.directive_values(name).last().map(pinned_setting_value) {
             option_values.insert(name.to_owned(), vec![value.to_owned()]);
         }
+    }
+    if project_config_unit(case).is_some() {
+        unsupported_details.push(
+            "virtual project configurations are not modeled with pinned root/other-file semantics"
+                .to_owned(),
+        );
     }
     unsupported_details.sort();
     unsupported_details.dedup();
     (option_values, unsupported_details)
+}
+
+fn pinned_setting_value(value: &str) -> &str {
+    value.strip_suffix(';').unwrap_or(value)
+}
+
+fn is_non_varying_boolean_option(name: &str) -> bool {
+    ["incremental", "noCheck", "pretty"]
+        .iter()
+        .any(|option| name.eq_ignore_ascii_case(option))
+}
+
+fn pinned_directive_unsupported_details(case: &Case) -> Vec<String> {
+    let mut details = Vec::new();
+    let mut seen = BTreeSet::new();
+    // The pinned harness applies the last setting with a given name.
+    for directive in case.directives.iter().rev() {
+        let lower = directive.name.to_ascii_lowercase();
+        if !seen.insert(lower.clone())
+            || COMPILER_OPTION_NAMES
+                .iter()
+                .chain(LIST_OPTION_NAMES)
+                .any(|name| name.eq_ignore_ascii_case(&directive.name))
+            || matches!(
+                lower.as_str(),
+                "filename" | "notypesandsymbols" | "traceresolution" | "reportdiagnostics"
+            )
+        {
+            continue;
+        }
+
+        let reason = match lower.as_str() {
+            "capturesuggestions" => {
+                "the pinned harness adds suggestion diagnostics, which Rust does not collect"
+            }
+            "currentdirectory" => "custom current-directory path semantics are not proven exact",
+            "link" | "symlink" => "virtual link semantics are not proven exact",
+            "typescriptversion" => "version-specific harness semantics are not proven exact",
+            "noimplicitreferences" => {
+                "pinned root-file selection semantics are not modeled exactly"
+            }
+            "fullemitpaths" => "pinned root-file and output-path semantics are not modeled exactly",
+            "usecasesensitivefilenames" => {
+                let value = pinned_setting_value(&directive.value);
+                if value.eq_ignore_ascii_case("true") {
+                    continue;
+                }
+                if value.eq_ignore_ascii_case("false") {
+                    "case-insensitive virtual filesystem semantics are not modeled exactly"
+                } else {
+                    "the pinned harness requires a boolean useCaseSensitiveFileNames value"
+                }
+            }
+            _ => "the pinned compiler or harness setting is not modeled by Rust",
+        };
+        details.push(format!("@{}: {reason}", directive.name));
+    }
+
+    for name in [
+        "noImplicitReferences",
+        "fullEmitPaths",
+        "noTypesAndSymbols",
+        "traceResolution",
+        "reportDiagnostics",
+    ] {
+        if let Some(value) = case.directive_values(name).last().map(pinned_setting_value)
+            && !matches!(value.to_ascii_lowercase().as_str(), "true" | "false")
+        {
+            details.push(format!(
+                "invalid boolean value {value:?} for pinned harness/compiler option {name}"
+            ));
+        }
+    }
+    details
+}
+
+fn finalize_option_variant(case: &Case, variant: &mut OptionVariant) {
+    let skip_details = pinned_skip_unsupported_details(case, variant);
+    variant.unsupported_details.extend(skip_details);
+    variant.unsupported_details.sort();
+    variant.unsupported_details.dedup();
+}
+
+fn pinned_skip_unsupported_details(case: &Case, variant: &OptionVariant) -> Vec<String> {
+    let mut details = Vec::new();
+    let value = |name: &str| effective_option_value(case, variant, name);
+
+    if value("module").is_some_and(|module| {
+        matches!(
+            module.to_ascii_lowercase().as_str(),
+            "amd" | "umd" | "system"
+        )
+    }) {
+        details.push("pinned Go harness skips AMD, UMD, and System module variants".to_owned());
+    }
+    if value("moduleResolution").is_some_and(|resolution| {
+        matches!(
+            resolution.to_ascii_lowercase().as_str(),
+            "node" | "node10" | "classic"
+        )
+    }) {
+        details.push("pinned Go harness skips node10 and classic module resolution".to_owned());
+    }
+    for (name, label) in [
+        ("esModuleInterop", "esModuleInterop=false"),
+        (
+            "allowSyntheticDefaultImports",
+            "allowSyntheticDefaultImports=false",
+        ),
+        ("alwaysStrict", "alwaysStrict=false"),
+    ] {
+        if value(name).is_some_and(|configured| configured.eq_ignore_ascii_case("false")) {
+            details.push(format!("pinned Go harness skips {label}"));
+        }
+    }
+    for name in ["baseUrl", "outFile"] {
+        if value(name).is_some_and(|configured| !configured.trim().is_empty()) {
+            details.push(format!("pinned Go harness skips nonempty {name}"));
+        }
+    }
+    if value("target").is_some_and(|target| target.eq_ignore_ascii_case("es5")) {
+        details.push("pinned Go harness skips target ES5".to_owned());
+    }
+    details
+}
+
+fn effective_option_value(case: &Case, variant: &OptionVariant, name: &str) -> Option<String> {
+    variant
+        .values
+        .iter()
+        .find_map(|(configured_name, value)| {
+            configured_name
+                .eq_ignore_ascii_case(name)
+                .then(|| value.clone())
+        })
+        .or_else(|| {
+            project_config_unit(case)
+                .and_then(|(path, unit)| {
+                    ts_config::parse_config_text(&path, unit.source_text.as_scannable_str()).value
+                })
+                .and_then(|config| {
+                    config
+                        .compiler_options
+                        .into_iter()
+                        .find(|(configured_name, _)| configured_name.eq_ignore_ascii_case(name))
+                        .and_then(|(_, value)| match value {
+                            ts_config::JsonValue::String(value) => Some(value),
+                            ts_config::JsonValue::Bool(value) => Some(value.to_string()),
+                            ts_config::JsonValue::Number(value) => Some(value.as_str().to_owned()),
+                            _ => None,
+                        })
+                })
+        })
 }
 
 fn split_pinned_option_values(raw_value: &str, option: &str) -> Result<Vec<String>, String> {
@@ -2148,10 +2329,6 @@ fn compile_case_variant(case: &Case, variant: &OptionVariant) -> std::io::Result
         path.rsplit_once('/')
             .map(|(directory, _)| directory.to_owned())
     });
-    let include_node_modules_roots = project_directory.is_none()
-        && case
-            .directive_values("fullEmitPaths")
-            .any(|value| value.eq_ignore_ascii_case("true"));
     let links = case
         .directive_values("link")
         .filter_map(|value| value.split_once("->"))
@@ -2207,12 +2384,7 @@ fn compile_case_variant(case: &Case, variant: &OptionVariant) -> std::io::Result
                 unit.source_text.as_scannable_str(),
             )?;
         }
-        if is_compilation_unit(&path)
-            && (include_node_modules_roots
-                || !path
-                    .split('/')
-                    .any(|component| component.eq_ignore_ascii_case("node_modules")))
-        {
+        if is_pinned_program_root(&path) {
             roots.push(path);
         }
     }
@@ -2224,10 +2396,14 @@ fn compile_case_variant(case: &Case, variant: &OptionVariant) -> std::io::Result
             .last()
             .is_some_and(|value| !value.is_empty())
             || last_unit_uses_implicit_references)
-        && let Some(last_root) = roots.pop()
     {
         roots.clear();
-        roots.push(last_root);
+        if let Some((index, last_unit)) = case.units.iter().enumerate().next_back() {
+            let last_root = virtual_unit_path(case, last_unit, index);
+            if is_pinned_program_root(&last_root) {
+                roots.push(last_root);
+            }
+        }
     }
 
     let mut compiler_options = fixture_compiler_options(case, variant);
@@ -2296,7 +2472,7 @@ fn virtual_harness_path(path: &str) -> String {
     if path.starts_with('/') {
         ts_path::normalize_path(path)
     } else {
-        ts_path::resolve_path("/case", &[path])
+        ts_path::resolve_path("/.src", &[path])
     }
 }
 
@@ -2336,35 +2512,22 @@ fn virtual_unit_path(case: &Case, unit: &Unit, index: usize) -> String {
     ts_path::resolve_path(virtual_unit_root(case), &[&path])
 }
 
-fn virtual_unit_root(case: &Case) -> &'static str {
-    if case.units.iter().any(|unit| {
-        unit.path
-            .to_string_lossy()
-            .replace('\\', "/")
-            .starts_with("/.src/")
-    }) {
-        "/.src"
-    } else {
-        "/case"
-    }
+fn virtual_unit_root(_case: &Case) -> &'static str {
+    "/.src"
 }
 
-fn is_compilation_unit(path: &str) -> bool {
+fn is_pinned_program_root(path: &str) -> bool {
     let path = path.to_ascii_lowercase();
-    [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"]
-        .iter()
-        .any(|extension| path.ends_with(extension))
+    !path.ends_with(".json") && !path.ends_with(".tsbuildinfo")
 }
 
 fn unit_uses_implicit_references(unit: &Unit) -> bool {
     let source = unit.source_text.as_scannable_str();
     source.contains("require(")
-        || source.match_indices("reference").any(|(index, _)| {
-            let remainder = &source[index + "reference".len()..];
-            remainder.chars().next().is_some_and(char::is_whitespace)
-                && remainder
-                    .trim_start_matches(char::is_whitespace)
-                    .starts_with("path")
+        || source.as_bytes().windows(14).any(|window| {
+            window.starts_with(b"reference")
+                && matches!(window[9], b' ' | b'\t' | b'\n' | b'\r' | 0x0c)
+                && &window[10..] == b"path"
         })
 }
 
@@ -2425,36 +2588,13 @@ fn fixture_compiler_options(case: &Case, variant: &OptionVariant) -> ts_options:
 }
 
 fn project_config_unit(case: &Case) -> Option<(String, &Unit)> {
-    let entry = case
-        .units
-        .iter()
-        .enumerate()
-        .rev()
-        .find_map(|(index, unit)| {
-            let path = virtual_unit_path(case, unit, index);
-            is_compilation_unit(&path).then_some(path)
-        })?;
-    case.units
-        .iter()
-        .enumerate()
-        .filter_map(|(index, unit)| {
-            let path = virtual_unit_path(case, unit, index);
-            let (directory, file_name) = path.rsplit_once('/')?;
-            let directory_len = directory.len();
-            (file_name.eq_ignore_ascii_case("tsconfig.json")
-                && path_is_within_directory(&entry, directory))
-            .then_some((path, unit, directory_len))
-        })
-        .max_by_key(|(_, _, directory_len)| *directory_len)
-        .map(|(path, unit, _)| (path, unit))
-}
-
-fn path_is_within_directory(path: &str, directory: &str) -> bool {
-    directory.is_empty()
-        || path == directory
-        || path
-            .strip_prefix(directory)
-            .is_some_and(|suffix| suffix.starts_with('/'))
+    case.units.iter().enumerate().find_map(|(index, unit)| {
+        let path = virtual_unit_path(case, unit, index);
+        let file_name = path.rsplit('/').next()?;
+        (file_name.eq_ignore_ascii_case("tsconfig.json")
+            || file_name.eq_ignore_ascii_case("jsconfig.json"))
+        .then_some((path, unit))
+    })
 }
 
 fn directive_json_value(name: &str, value: &str) -> ts_config::JsonValue {
@@ -2477,13 +2617,7 @@ fn directive_json_value(name: &str, value: &str) -> ts_config::JsonValue {
     match value {
         value if value.eq_ignore_ascii_case("true") => ts_config::JsonValue::Bool(true),
         value if value.eq_ignore_ascii_case("false") => ts_config::JsonValue::Bool(false),
-        value => ts_config::JsonValue::String(
-            value
-                .split_once(',')
-                .map_or(value, |(first, _)| first)
-                .trim()
-                .to_owned(),
-        ),
+        value => ts_config::JsonValue::String(value.trim().to_owned()),
     }
 }
 
@@ -2863,46 +2997,37 @@ fn select_variant_baselines_with<'a>(
     axes: &[String],
     baseline_base: fn(&str) -> Option<&str>,
 ) -> Vec<&'a PathBuf> {
-    if axes.is_empty() {
-        return candidates.to_vec();
-    }
-    let tagged = candidates
+    let configured_base = configured_baseline_base(case_name, variant, axes);
+    candidates
         .iter()
         .copied()
         .filter(|path| {
-            let name = path
-                .file_name()
+            path.file_name()
                 .and_then(|name| name.to_str())
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-            axes.iter().all(|axis| {
-                variant.values.get(axis).is_some_and(|value| {
-                    let tag = format!(
-                        "{}={}",
-                        axis.to_ascii_lowercase(),
-                        value.to_ascii_lowercase()
-                    );
-                    name.match_indices(&tag).any(|(start, _)| {
-                        matches!(name.as_bytes().get(start + tag.len()), Some(b',' | b')'))
-                    })
-                })
+                .and_then(baseline_base)
+                .is_some_and(|base| base == configured_base)
+        })
+        .collect()
+}
+
+fn configured_baseline_base(case_name: &str, variant: &OptionVariant, axes: &[String]) -> String {
+    if axes.is_empty() {
+        return case_name.to_owned();
+    }
+    let description = axes
+        .iter()
+        .filter_map(|axis| {
+            variant.values.get(axis).map(|value| {
+                format!(
+                    "{}={}",
+                    axis.to_ascii_lowercase(),
+                    value.to_ascii_lowercase()
+                )
             })
         })
-        .collect::<Vec<_>>();
-    if tagged.is_empty() {
-        candidates
-            .iter()
-            .copied()
-            .filter(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .and_then(baseline_base)
-                    == Some(case_name)
-            })
-            .collect()
-    } else {
-        tagged
-    }
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{case_name}({description})")
 }
 
 fn variant_label(variant: &OptionVariant, axes: &[String]) -> String {
@@ -3009,6 +3134,7 @@ fn is_javascript_output_section(name: &str) -> bool {
 fn normalize_section_name(name: &str) -> String {
     let name = name.replace('\\', "/");
     name.strip_prefix("/case/")
+        .or_else(|| name.strip_prefix("/.src/"))
         .or_else(|| name.strip_prefix("./"))
         .unwrap_or(name.trim_start_matches('/'))
         .to_owned()
@@ -3049,8 +3175,8 @@ fn normalize_input_section(text: &str) -> String {
 pub struct Unit {
     /// Virtual path used by the compiler harness.
     pub path: PathBuf,
-    /// Source text with harness directive lines removed. Line endings and all
-    /// other bytes are preserved.
+    /// Source text reconstructed with pinned-harness newline and leading-blank
+    /// semantics after directive lines are removed.
     pub source_text: SourceText,
     /// One-based fixture line at which this unit's source begins.
     pub start_line: usize,
@@ -3084,6 +3210,8 @@ impl Directive {
 pub enum ParseError {
     /// A `filename` directive did not specify a virtual path.
     EmptyFileName { line: usize },
+    /// The regular compiler harness rejects source before its first virtual file.
+    ContentBeforeFirstFile { line: usize },
 }
 
 impl fmt::Display for ParseError {
@@ -3092,6 +3220,10 @@ impl fmt::Display for ParseError {
             Self::EmptyFileName { line } => {
                 write!(formatter, "empty @filename directive on line {line}")
             }
+            Self::ContentBeforeFirstFile { line } => write!(
+                formatter,
+                "substantive source precedes the first @filename directive on line {line}"
+            ),
         }
     }
 }
@@ -3115,33 +3247,43 @@ impl UnitBuilder {
         }
     }
 
-    fn has_source(&self) -> bool {
-        !SourceText::from_bytes(self.source_bytes.clone())
-            .as_scannable_str()
-            .trim()
-            .is_empty()
+    fn append_line(&mut self, line: &[u8]) {
+        if !self.source_bytes.is_empty() {
+            self.source_bytes.push(b'\n');
+        }
+        self.source_bytes.extend_from_slice(line);
     }
 
     fn has_substantive_source(&self) -> bool {
         let mut bytes = self.source_bytes.as_slice();
-        while let Some((&byte, rest)) = bytes.split_first() {
-            if byte.is_ascii_whitespace() {
+        loop {
+            if let Some(rest) = bytes.strip_prefix(b"\xef\xbb\xbf") {
                 bytes = rest;
-            } else if bytes.starts_with(b"//") {
+            }
+            bytes = bytes
+                .iter()
+                .position(|byte| !byte.is_ascii_whitespace())
+                .map_or(&[], |start| &bytes[start..]);
+            if bytes.is_empty() {
+                return false;
+            }
+            if bytes.starts_with(b"//") {
                 bytes = bytes
                     .iter()
                     .position(|byte| *byte == b'\n' || *byte == b'\r')
                     .map_or(&[], |end| &bytes[end..]);
-            } else if bytes.starts_with(b"/*") {
-                bytes = bytes[2..]
+                continue;
+            }
+            if bytes.starts_with(b"/*") {
+                let comment = &bytes[2..];
+                bytes = comment
                     .windows(2)
                     .position(|window| window == b"*/")
-                    .map_or(&[], |end| &bytes[end + 4..]);
-            } else {
-                return true;
+                    .map_or(&[], |end| &comment[end + 2..]);
+                continue;
             }
+            return true;
         }
-        false
     }
 
     fn finish(self) -> Unit {
@@ -3153,20 +3295,16 @@ impl UnitBuilder {
     }
 }
 
-fn strip_line_ending(line: &[u8]) -> &[u8] {
-    let line = line.strip_suffix(b"\n").unwrap_or(line);
-    line.strip_suffix(b"\r").unwrap_or(line)
-}
-
 fn parse_directive_line(line: &str) -> Option<(&str, &str)> {
+    // The pinned Go regexp begins `^//`: indented comments and UTF-8 BOM
+    // prefixed lines remain source, as do hyphenated TypeScript pragmas such as
+    // `@ts-nocheck` because the harness name grammar is `\w+`.
     let comment = line
-        .trim_start_matches('\u{feff}')
-        .trim_start()
         .strip_prefix("//")?
-        .trim_start();
+        .trim_start_matches(is_pinned_regex_whitespace);
     let directive = comment.strip_prefix('@')?;
     let (name, value) = directive.split_once(':')?;
-    let name = name.trim();
+    let name = name.trim_matches(is_pinned_regex_whitespace);
     if name.is_empty() || !name.chars().all(is_directive_name_character) {
         return None;
     }
@@ -3176,8 +3314,12 @@ fn parse_directive_line(line: &str) -> Option<(&str, &str)> {
     Some((name, value.trim()))
 }
 
+fn is_pinned_regex_whitespace(character: char) -> bool {
+    matches!(character, ' ' | '\t' | '\n' | '\r' | '\u{000c}')
+}
+
 fn is_directive_name_character(character: char) -> bool {
-    character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+    character.is_ascii_alphanumeric() || character == '_'
 }
 
 #[cfg(test)]
@@ -3201,7 +3343,7 @@ mod tests {
     };
 
     #[test]
-    fn parses_single_file_and_preserves_original_source() {
+    fn parses_single_file_with_pinned_unit_reconstruction() {
         let source = "// @target: esnext\r\n// @strict: true\r\n\r\nconst answer = 42;\r\n";
         let case = Case::parse("tests/cases/compiler/simple.ts", source).unwrap();
 
@@ -3209,7 +3351,7 @@ mod tests {
         assert_eq!(case.source_text, source);
         assert_eq!(case.units.len(), 1);
         assert_eq!(case.units[0].path, case.path);
-        assert_eq!(case.units[0].source_text, "\r\nconst answer = 42;\r\n");
+        assert_eq!(case.units[0].source_text, "const answer = 42;\n");
         assert_eq!(
             case.directive_values("TARGET").collect::<Vec<_>>(),
             ["esnext"]
@@ -3219,7 +3361,7 @@ mod tests {
     }
 
     #[test]
-    fn does_not_promote_node_modules_units_to_compilation_roots() {
+    fn includes_explicit_node_modules_units_as_pinned_compilation_roots() {
         let case = Case::parse(
             "dependencyUnit.ts",
             concat!(
@@ -3240,7 +3382,7 @@ mod tests {
             compilation
                 .outputs
                 .keys()
-                .all(|path| !path.contains("node_modules"))
+                .any(|path| path.ends_with("node_modules/pkg/index.js"))
         );
     }
 
@@ -3301,7 +3443,7 @@ mod tests {
         assert_eq!(case.units[0].path, Path::new("/src/fileA.ts"));
         assert_eq!(
             case.units[0].source_text,
-            "export interface Person { name: string }\n"
+            "export interface Person { name: string }"
         );
         assert_eq!(case.units[0].start_line, 5);
         assert_eq!(case.units[1].path, Path::new("./fileB.js"));
@@ -3333,22 +3475,33 @@ mod tests {
     }
 
     #[test]
-    fn preserves_trailing_blank_lines_in_virtual_units() {
+    fn normalizes_crlf_and_preserves_trailing_blank_lines_in_virtual_units() {
         let case = Case::parse("trailing.ts", "// @filename: a.js\r\nvalue;\r\n\r\n").unwrap();
 
-        assert_eq!(case.units[0].source_text, "value;\r\n\r\n");
+        assert_eq!(case.units[0].source_text, "value;\n\n");
     }
 
     #[test]
-    fn retains_substantive_implicit_unit_before_named_units() {
+    fn rejects_substantive_implicit_unit_before_named_units() {
         let source = "const implicit = 1;\n// @filename: named.ts\nconst named = 2;";
-        let case = Case::parse("mixed.ts", source).unwrap();
+        let error = Case::parse("mixed.ts", source).unwrap_err();
 
-        assert_eq!(case.units.len(), 2);
-        assert_eq!(case.units[0].path, Path::new("mixed.ts"));
-        assert_eq!(case.units[0].source_text, "const implicit = 1;\n");
-        assert_eq!(case.units[1].path, Path::new("named.ts"));
-        assert_eq!(case.units[1].source_text, "const named = 2;");
+        assert_eq!(error, ParseError::ContentBeforeFirstFile { line: 2 });
+    }
+
+    #[test]
+    fn drops_comment_trivia_before_the_first_named_unit() {
+        let source = concat!(
+            "// ordinary comment\n",
+            "/* block comment */\n",
+            "// @filename: named.ts\n",
+            "const named = 2;\n",
+        );
+        let case = Case::parse("comments.ts", source).unwrap();
+
+        assert_eq!(case.units.len(), 1);
+        assert_eq!(case.units[0].path, Path::new("named.ts"));
+        assert_eq!(case.units[0].source_text, "const named = 2;\n");
     }
 
     #[test]
@@ -3367,6 +3520,8 @@ mod tests {
             "const first: number = 'nope';\n",
             "// @ts-expect-error: explanation\n",
             "const second: number = 'nope';\n",
+            "// @ts-nocheck: source pragma\n",
+            " // @todo: indented source comment\n",
         );
         let case = Case::parse("directives.ts", source).unwrap();
 
@@ -3406,15 +3561,12 @@ mod tests {
     }
 
     #[test]
-    fn parses_a_directive_after_a_utf8_bom() {
+    fn preserves_a_bom_prefixed_directive_as_source() {
         let case = Case::parse("bom.ts", "\u{feff}// @target: es2015\nconst value = 1;").unwrap();
-        assert_eq!(
-            case.directive_values("target").collect::<Vec<_>>(),
-            ["es2015"]
-        );
+        assert!(case.directives.is_empty());
         assert_eq!(
             case.units[0].source_text.as_scannable_str(),
-            "const value = 1;"
+            "\u{feff}// @target: es2015\nconst value = 1;"
         );
     }
 
@@ -3442,10 +3594,10 @@ mod tests {
         );
         assert_eq!(compilation.outputs.len(), 2);
         assert_eq!(
-            compilation.outputs["/case/a.js"],
+            compilation.outputs["/.src/a.js"],
             "export const value = 1;\n"
         );
-        assert!(compilation.outputs["/case/b.js"].contains("result = value + 1"));
+        assert!(compilation.outputs["/.src/b.js"].contains("result = value + 1"));
     }
 
     #[test]
@@ -3538,7 +3690,7 @@ mod tests {
             "{:?}",
             compilation.diagnostics
         );
-        assert!(compilation.outputs.contains_key("/case/app/index.js"));
+        assert!(compilation.outputs.contains_key("/.src/app/index.js"));
     }
 
     #[test]
@@ -3594,7 +3746,7 @@ mod tests {
         )
         .unwrap();
         let preserved = compile_case(&preserved).unwrap();
-        let javascript = &preserved.outputs["/case/preserved.js"];
+        let javascript = &preserved.outputs["/.src/preserved.js"];
         assert!(
             javascript.contains("export const value = 1;"),
             "{javascript}"
@@ -3612,7 +3764,7 @@ mod tests {
         )
         .unwrap();
         let commonjs = compile_case(&commonjs).unwrap();
-        let javascript = &commonjs.outputs["/case/commonjs.js"];
+        let javascript = &commonjs.outputs["/.src/commonjs.js"];
         assert!(javascript.contains("exports.value = 1;"), "{javascript}");
         assert!(!javascript.contains("export const value"), "{javascript}");
     }
@@ -3732,7 +3884,6 @@ mod tests {
                 "\r\n",
                 "==== a.ts (0 errors) ====\r\n",
                 "    const first = 1;\r\n",
-                "    \r\n",
                 "==== b.ts (1 errors) ====\r\n",
                 "    const value:\r\n",
                 "          ~~~~~~\r\n",
@@ -3946,7 +4097,7 @@ mod tests {
         );
         assert_eq!(compilation.outputs.len(), 1);
         assert_eq!(
-            compilation.outputs["/case/out.js"],
+            compilation.outputs["/.src/out.js"],
             "\"use strict\";\nconst first = 1;\nconst second = 2;\n"
         );
     }
@@ -4025,7 +4176,7 @@ mod tests {
         for (variant, compilation) in matrix {
             let output = compilation
                 .outputs
-                .get("/case/useStrictLikePrologueString01.js")
+                .get("/.src/useStrictLikePrologueString01.js")
                 .unwrap();
             let expected = if variant.values["target"] == "es5" {
                 concat!(
@@ -4065,6 +4216,33 @@ mod tests {
             &["jsx".to_owned(), "module".to_owned()],
         );
         assert_eq!(selected, vec![&paths[0]]);
+    }
+
+    #[test]
+    fn matrix_baseline_selection_has_no_untagged_or_partial_fallback() {
+        let paths = [
+            PathBuf::from("case.js"),
+            PathBuf::from("case(module=commonjs).js"),
+            PathBuf::from("case(module=commonjs,target=esnext,extra=true).js"),
+        ];
+        let candidates = paths.iter().collect::<Vec<_>>();
+        let variant = OptionVariant {
+            values: BTreeMap::from([
+                ("module".to_owned(), "commonjs".to_owned()),
+                ("target".to_owned(), "esnext".to_owned()),
+            ]),
+            ..OptionVariant::default()
+        };
+
+        assert!(
+            select_variant_baselines(
+                &candidates,
+                "case",
+                &variant,
+                &["module".to_owned(), "target".to_owned()],
+            )
+            .is_empty()
+        );
     }
 
     #[test]
@@ -4118,7 +4296,13 @@ mod tests {
         );
         assert_eq!(matrix_axes(&case), ["target"]);
         assert!(
-            variants
+            variants[0]
+                .unsupported_details
+                .iter()
+                .any(|detail| detail.contains("target ES5"))
+        );
+        assert!(
+            variants[1..]
                 .iter()
                 .all(|variant| variant.unsupported_details.is_empty())
         );
@@ -4141,6 +4325,93 @@ mod tests {
         assert_eq!(variants[0].values["noCheck"], "true,false");
         assert!(!variants[0].values.contains_key("strict"));
         assert!(matrix_axes(&case).is_empty());
+        assert!(
+            variants[0]
+                .unsupported_details
+                .iter()
+                .any(|detail| detail.contains("invalid boolean value"))
+        );
+    }
+
+    #[test]
+    fn mirrors_pinned_go_unsupported_option_skips() {
+        for (directive, expected) in [
+            ("// @module: amd\n", "AMD, UMD, and System"),
+            ("// @module: umd\n", "AMD, UMD, and System"),
+            ("// @module: system\n", "AMD, UMD, and System"),
+            ("// @moduleResolution: node10\n", "node10 and classic"),
+            ("// @moduleResolution: classic\n", "node10 and classic"),
+            ("// @esModuleInterop: false\n", "esModuleInterop=false"),
+            (
+                "// @allowSyntheticDefaultImports: false\n",
+                "allowSyntheticDefaultImports=false",
+            ),
+            ("// @alwaysStrict: false\n", "alwaysStrict=false"),
+            ("// @baseUrl: .\n", "nonempty baseUrl"),
+            ("// @outFile: output.js\n", "nonempty outFile"),
+            ("// @target: es5\n", "target ES5"),
+        ] {
+            let case =
+                Case::parse("unsupported.ts", format!("{directive}const value = 1;\n")).unwrap();
+            let variants = expand_option_matrix(&case);
+            assert_eq!(variants.len(), 1, "{directive:?}");
+            assert!(
+                variants[0]
+                    .unsupported_details
+                    .iter()
+                    .any(|detail| detail.contains(expected)),
+                "{directive:?}: {:?}",
+                variants[0].unsupported_details
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_exactness_for_unmodeled_harness_and_project_semantics() {
+        for (source, expected) in [
+            (
+                "// @useCaseSensitiveFileNames: false\nconst value = 1;\n",
+                "case-insensitive virtual filesystem",
+            ),
+            (
+                "// @noImplicitReferences: true\nconst value = 1;\n",
+                "root-file selection",
+            ),
+            (
+                "// @fullEmitPaths: true\nconst value = 1;\n",
+                "root-file and output-path",
+            ),
+            (
+                "// @filename: tsconfig.json\n{}\n// @filename: index.ts\nconst value = 1;\n",
+                "virtual project configurations",
+            ),
+            (
+                "// @captureSuggestions: true\nconst value = 1;\n",
+                "suggestion diagnostics",
+            ),
+        ] {
+            let case = Case::parse("unsupported.ts", source).unwrap();
+            let variant = expand_option_matrix(&case).remove(0);
+            assert!(
+                variant
+                    .unsupported_details
+                    .iter()
+                    .any(|detail| detail.contains(expected)),
+                "{source:?}: {:?}",
+                variant.unsupported_details
+            );
+        }
+
+        let case = Case::parse(
+            "supported.ts",
+            "// @useCaseSensitiveFileNames: true\nconst value = 1;\n",
+        )
+        .unwrap();
+        assert!(
+            expand_option_matrix(&case)[0]
+                .unsupported_details
+                .is_empty()
+        );
     }
 
     #[test]
@@ -4645,7 +4916,7 @@ mod tests {
                 run.compilation.diagnostics
             );
             assert!(
-                run.compilation.outputs.contains_key("/case/out/app.js"),
+                run.compilation.outputs.contains_key("/.src/out/app.js"),
                 "{:?}: {:?}",
                 run.variant,
                 run.compilation.outputs.keys().collect::<Vec<_>>()

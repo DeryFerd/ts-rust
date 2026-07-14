@@ -308,7 +308,7 @@ fn writes_deterministic_structured_full_artifact_scorecard() {
     assert_eq!(variants[1]["status"], "unsupported_detail");
 
     let diagnostic = &variants[0]["diagnostics"][0];
-    assert_eq!(diagnostic["fileName"], "/case/aHeaderMatch.ts");
+    assert_eq!(diagnostic["fileName"], "/.src/aHeaderMatch.ts");
     assert_eq!(diagnostic["range"]["start"], 6);
     assert_eq!(diagnostic["range"]["length"], 17);
     assert_eq!(diagnostic["code"], 2322);
@@ -509,7 +509,7 @@ fn reports_missing_baselines() {
 }
 
 #[test]
-fn accepts_a_missing_emit_baseline_when_virtual_project_disables_emit() {
+fn refuses_exact_emit_parity_for_a_virtual_project_config() {
     let repository = TestRepository::new();
     repository.write_case(
         "projectNoEmit",
@@ -524,14 +524,13 @@ fn accepts_a_missing_emit_baseline_when_virtual_project_disables_emit() {
     );
 
     let output = run(&repository.0, &["--filter", "projectNoEmit"]);
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stdout)
-    );
+    assert_eq!(output.status.code(), Some(1));
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        "summary: discovered_cases=1 upstream_skipped_cases=0 selected_cases=1 executed_variants=1 matched=1 mismatched=0 missing=0 content=0 missing_sections=0 unexpected_sections=0 diagnostics=0\n"
+        concat!(
+            "MISMATCH testdata/tests/cases/compiler/projectNoEmit.ts: unsupported configuration: virtual project configurations are not modeled with pinned root/other-file semantics\n",
+            "summary: discovered_cases=1 upstream_skipped_cases=0 selected_cases=1 executed_variants=1 matched=0 mismatched=1 missing=0 content=0 missing_sections=0 unexpected_sections=0 diagnostics=0\n",
+        )
     );
 }
 
@@ -540,12 +539,12 @@ fn compiles_and_matches_option_variants() {
     let repository = TestRepository::new();
     repository.write_case(
         "matrix",
-        "// @target: es5, esnext\n// @module: esnext\n// @noLib: true\nconst value = 1;\n",
+        "// @target: es2015, esnext\n// @module: esnext\n// @noLib: true\nconst value = 1;\n",
         None,
     );
     repository.write_baseline(
-        "matrix(target=es5).js",
-        "//// [matrix.js] ////\n\"use strict\";\nvar value = 1;\n",
+        "matrix(target=es2015).js",
+        "//// [matrix.js] ////\n\"use strict\";\nconst value = 1;\n",
     );
     repository.write_baseline(
         "matrix(target=esnext).js",
@@ -581,7 +580,7 @@ fn reports_compilation_diagnostic_for_missing_emitted_section() {
     assert!(
         stdout.contains("MISMATCH testdata/tests/cases/compiler/diagnostic.ts: diagnostic TS2322")
     );
-    assert!(stdout.contains("/case/diagnostic.ts"));
+    assert!(stdout.contains("/.src/diagnostic.ts"));
     assert!(stdout.contains("Type 'number' is not assignable to type 'string'."));
     assert!(stdout.contains(
         "matched=0 mismatched=1 missing=0 content=0 missing_sections=0 unexpected_sections=0 diagnostics=1"
@@ -627,8 +626,8 @@ fn counts_missing_and_unexpected_output_sections() {
 
     repository.write_case(
         "unexpectedSection",
-        "// @declaration: true\n// @target: es5\nconst value = 1;\n",
-        Some("//// [unexpectedSection.js] ////\n\"use strict\";\nvar value = 1;\n"),
+        "// @declaration: true\n// @target: es2015\nconst value = 1;\n",
+        Some("//// [unexpectedSection.js] ////\n\"use strict\";\nconst value = 1;\n"),
     );
     let unexpected = run(&repository.0, &["--filter", "unexpectedSection"]);
     assert_eq!(unexpected.status.code(), Some(1));
