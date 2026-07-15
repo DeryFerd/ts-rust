@@ -109,6 +109,17 @@ remains the cluster-level source of truth.
   prevents its symbol owner from reaching the checker until B02 declarations
   complete. The merged stack passes 99 binder and 219 checker tests plus strict
   binder Clippy and the all-target workspace check.
+- The dependency-closed `NewChecker` bootstrap is integrated as
+  `9e50ec6..01c5a92`. It creates the exact checker transient symbols,
+  `globalThis` table cycle, intrinsic/literal/union/template/anonymous marker
+  types, predicates, sentinel signatures, and index infos through `typeofType`,
+  including strict-null/exact-optional identity splits and the populated
+  literal, union, and template caches. Initialization is one-shot and rejects
+  preexisting checker arenas, sparse links, resolution history, or transients
+  while accepting the real prebound binder graph, including private-name
+  global IDs. Eight focused bootstrap tests and all 227 checker tests pass; an
+  independent review found no semantic issue. Callback-owned function mappers
+  and Program/global-library initialization remain explicit later slices.
 
 No percentage in this section is a whole-corpus parity claim. A score is
 publishable only when its variant manifest and complete artifact comparison are
