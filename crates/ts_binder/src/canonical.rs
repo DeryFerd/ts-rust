@@ -5293,23 +5293,6 @@ mod tests {
                 holder[dynamic] = 1;
             "#,
         );
-        // The current parser aliases ExportAssignment.expression into its
-        // generated `type_` slot. Canonical traversal correctly rejects that
-        // DAG, so give this focused binder probe distinct but equivalent leaf
-        // nodes until the parser schema slice fixes the alias.
-        for assignment in nodes_of_kind(&parsed.arena, SyntaxKind::ExportAssignment) {
-            let expression = match &parsed.arena.get(assignment).unwrap().data {
-                NodeData::ExportAssignment(data) => data.expression,
-                _ => unreachable!(),
-            };
-            let mut duplicate = parsed.arena.get(expression).unwrap().clone();
-            duplicate.parent = Some(assignment);
-            let duplicate = parsed.arena.alloc(duplicate);
-            match &mut parsed.arena.get_mut(assignment).unwrap().data {
-                NodeData::ExportAssignment(data) => data.type_ = duplicate,
-                _ => unreachable!(),
-            }
-        }
         for property in nodes_of_kind(&parsed.arena, SyntaxKind::PropertyAssignment) {
             let name = match &parsed.arena.get(property).unwrap().data {
                 NodeData::PropertyAssignment(data) => data.name,
