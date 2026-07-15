@@ -68,9 +68,11 @@ remains the cluster-level source of truth.
   CFG slices are integrated as well. Sequential flow, branches, returns,
   mutations, calls, unreachable traversal, detached function containers,
   while/do/classic-for/for-in/for-of loops, and labeled or unlabeled jumps are
-  active. Switch, try/finally, optional/logical chains, destructuring, IIFEs,
-  and static blocks remain explicit incomplete boundaries rather than guessed
-  graphs.
+  active. Switch/case flow now includes exact clause ranges, empty-clause
+  grouping, fallthrough, default/no-default joins, nested break restoration,
+  and source-order clause traversal. Try/finally, optional/logical chains,
+  destructuring, direct-call boundaries, and static blocks remain explicit
+  incomplete boundaries rather than guessed graphs.
 - Canonical semantic IDs plus signature, predicate, index, and tuple records
   are integrated behind a store-branded aggregate. AST scope growth is
   monotonic, raw payload allocation is crate-private, and independent review
