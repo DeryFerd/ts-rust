@@ -748,6 +748,29 @@ impl<'store> RelaterSession<'store> {
                 {
                     return Err(RelationUnavailable::InvalidStructuredMembers(target));
                 }
+                let Some(declarations) = record
+                    .declarations()
+                    .filter(|declarations| !declarations.is_empty())
+                else {
+                    return Err(RelationUnavailable::InvalidStructuredMembers(target));
+                };
+                let Some(value_declaration) = record.value_declaration() else {
+                    return Err(RelationUnavailable::InvalidStructuredMembers(target));
+                };
+                let mut seen_declarations = HashSet::with_capacity(declarations.len());
+                for declaration in declarations {
+                    if !seen_declarations.insert(*declaration)
+                        || !matches!(
+                            self.store.source_node_kind(*declaration),
+                            Some(SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature)
+                        )
+                    {
+                        return Err(RelationUnavailable::InvalidStructuredMembers(target));
+                    }
+                }
+                if !seen_declarations.contains(&value_declaration) {
+                    return Err(RelationUnavailable::InvalidStructuredMembers(target));
+                }
                 required.push(member);
             }
         }
@@ -800,15 +823,16 @@ impl<'store> RelaterSession<'store> {
                                 arrays[right].expect("one side is an Array"),
                             )
                         };
-                        let flags = self.store.type_flags(object).map_err(|_| {
-                            LiteralTypeCacheError::UnsupportedUnionConstituent(object)
-                        })?;
+                        let flags = self
+                            .store
+                            .type_flags(object)
+                            .map_err(|error| object_surface_preflight_error(object, error))?;
                         if !flags.intersects(TypeFlags::OBJECT) {
                             continue;
                         }
-                        let members = self.resolved_object_members(object, true).map_err(|_| {
-                            LiteralTypeCacheError::UnsupportedUnionConstituent(object)
-                        })?;
+                        let members = self
+                            .resolved_object_members(object, true)
+                            .map_err(|error| object_surface_preflight_error(object, error))?;
                         if !members.properties.is_empty() {
                             return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(object));
                         }
@@ -3649,6 +3673,22 @@ const fn array_surface_preflight_error(
     }
 }
 
+const fn object_surface_preflight_error(
+    type_: TypeId,
+    error: RelationUnavailable,
+) -> LiteralTypeCacheError {
+    match error {
+        RelationUnavailable::Type(_)
+        | RelationUnavailable::Symbol(_)
+        | RelationUnavailable::MalformedStructuredType(_)
+        | RelationUnavailable::InvalidSymbolMembers(_)
+        | RelationUnavailable::InvalidStructuredMembers(_) => {
+            LiteralTypeCacheError::InvalidCachedUnion(type_)
+        }
+        _ => LiteralTypeCacheError::UnsupportedUnionConstituent(type_),
+    }
+}
+
 const fn bool_to_ternary(value: bool) -> Ternary {
     if value { Ternary::True } else { Ternary::False }
 }
@@ -4194,7 +4234,35 @@ mod tests {
         target: CanonicalArrayTargetFixture,
         name: &str,
     ) -> SemanticSymbolId {
-        let property = alloc_symbol(store, SymbolFlags::PROPERTY, name);
+        let parsed = parse_source_file(&format!("interface Array<T> {{ {name}: number }}"));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(
+            u32::try_from(store.symbol_len())
+                .unwrap()
+                .checked_add(20_000)
+                .unwrap(),
+        );
+        let scope = AstScope::new(file, &parsed.arena);
+        assert!(
+            store
+                .register_source_file(&parsed.arena, parsed.source_file, file)
+                .is_some()
+        );
+        let declaration = parsed
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                matches!(
+                    record.kind,
+                    SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature
+                )
+                .then(|| scope.node_ref(node).unwrap())
+            })
+            .unwrap();
+        let mut data = SymbolData::new(SymbolFlags::PROPERTY, EscapedName::source(name));
+        data.declarations = Some(vec![declaration]);
+        data.value_declaration = Some(declaration);
+        let property = store.alloc_symbol(data).unwrap();
         assert!(store.set_symbol_relationships(property, None, None, Some(target.symbol), None,));
         let members = store.alloc_symbol_table();
         assert_eq!(
@@ -5532,6 +5600,111 @@ mod tests {
             ),
             Ok(false)
         );
+        assert_eq!(store.relation_state_snapshot(), before);
+
+        let (length_declarations, length_value_declaration) = {
+            let record = store.symbol(length).unwrap();
+            (
+                record.declarations().unwrap().to_vec(),
+                record.value_declaration(),
+            )
+        };
+        for (declarations, value_declaration) in
+            [(None, None), (Some(length_declarations.clone()), None)]
+        {
+            assert!(store.set_symbol_declarations(length, declarations, value_declaration));
+            let poisoned = store.relation_state_snapshot();
+            assert_eq!(
+                store.is_type_related_to_with_optional_global_types(
+                    empty,
+                    array_number,
+                    RelationKind::StrictSubtype,
+                    Some(global_types),
+                ),
+                Err(RelationUnavailable::InvalidStructuredMembers(array.target))
+            );
+            assert_eq!(store.relation_state_snapshot(), poisoned);
+            {
+                let bootstrap = store.relation_bootstrap_facts().unwrap();
+                let mut session = super::RelaterSession::new_with_global_types(
+                    &mut store,
+                    RelationKind::StrictSubtype,
+                    bootstrap,
+                    Some(global_types),
+                );
+                assert_eq!(
+                    session.preflight_expression_union_array_object_pairs(&[array_number, empty,]),
+                    Err(LiteralTypeCacheError::ArrayType {
+                        type_: array_number,
+                        error: ArrayTypeError::InvalidReference(array_number),
+                    })
+                );
+            }
+            assert_eq!(store.relation_state_snapshot(), poisoned);
+            assert!(store.set_symbol_declarations(
+                length,
+                Some(length_declarations.clone()),
+                length_value_declaration,
+            ));
+        }
+        assert_eq!(
+            store.is_type_related_to_with_optional_global_types(
+                empty,
+                array_number,
+                RelationKind::StrictSubtype,
+                Some(global_types),
+            ),
+            Ok(false)
+        );
+        assert_eq!(store.relation_state_snapshot(), before);
+
+        let invalid_member = alloc_symbol(&mut store, SymbolFlags::PROPERTY, "invalid");
+        let invalid_members = store.alloc_symbol_table();
+        assert_eq!(
+            store.insert_symbol(
+                invalid_members,
+                EscapedName::source("invalid"),
+                invalid_member,
+            ),
+            Some(None)
+        );
+        assert!(store.set_structured_type_members(
+            empty,
+            Some(invalid_members),
+            None,
+            None,
+            None,
+            None,
+        ));
+        let poisoned = store.relation_state_snapshot();
+        {
+            let bootstrap = store.relation_bootstrap_facts().unwrap();
+            let mut session = super::RelaterSession::new_with_global_types(
+                &mut store,
+                RelationKind::StrictSubtype,
+                bootstrap,
+                Some(global_types),
+            );
+            assert_eq!(
+                session.preflight_expression_union_array_object_pairs(&[array_number, empty]),
+                Err(LiteralTypeCacheError::InvalidCachedUnion(empty))
+            );
+        }
+        assert_eq!(store.relation_state_snapshot(), poisoned);
+        assert!(store.set_structured_type_members(empty, None, None, None, None, None));
+        {
+            let bootstrap = store.relation_bootstrap_facts().unwrap();
+            let mut repaired = super::RelaterSession::new_with_global_types(
+                &mut store,
+                RelationKind::StrictSubtype,
+                bootstrap,
+                Some(global_types),
+            );
+            assert_eq!(
+                repaired.preflight_expression_union_array_object_pairs(&[empty, array_number]),
+                Ok(())
+            );
+        }
         assert_eq!(store.relation_state_snapshot(), before);
 
         for (source, target) in [(array_number, nonempty), (nonempty, array_number)] {
