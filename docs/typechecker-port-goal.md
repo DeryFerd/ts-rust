@@ -93,12 +93,18 @@ remains the cluster-level source of truth.
   and all 420 declared child slots in pinned order. This removes hand-maintained
   structural traversal as a source of silent binder/checker omissions, while
   keeping binder-specific flow order as a distinct contract.
-- The first sparse-link slice covers nine common upstream stores and the type-
-  resolution stack, but remains off the integration branch until its live-state
-  probe, field-specific sentinel domains, and opaque LIFO boundary pass repair
-  and re-review. The canonical binder slice is likewise being repaired so its
-  container/declaration order comes from the sole flow-driven recursive walk;
-  no declaration phase will build on the rejected generated-order second pass.
+- The first sparse-link slice is integrated as `c1863d0..f82e28d`. It covers
+  nine common upstream stores plus all ten live type-resolution property probes,
+  exact field-specific sentinel domains, and an opaque store-branded LIFO
+  boundary. The dependency-closed mapper kernel is integrated as `ceb51a0` with
+  exact simple, array, array-to-single, merge, prepend, and append semantics;
+  callback-, instantiation-, and inference-owned mapper variants remain
+  explicit later dependencies. The combined semantic stack passes 219 checker
+  tests, strict targeted Clippy, and the all-target workspace check after two
+  independent reviews. The canonical binder slice is still being repaired so
+  its container/declaration order comes from the sole flow-driven recursive
+  walk; no declaration phase will build on the rejected generated-order second
+  pass.
 
 No percentage in this section is a whole-corpus parity claim. A score is
 publishable only when its variant manifest and complete artifact comparison are
