@@ -17,7 +17,7 @@ use std::{
 };
 
 use ts_ast::NodeRef;
-use ts_binder::{SemanticSymbolId, SymbolFlags};
+use ts_binder::{SemanticStoreId, SemanticSymbolId, SymbolFlags};
 
 use super::{SignatureId, TypeId, TypeMapperId, type_records::CacheHashKey};
 
@@ -143,50 +143,97 @@ impl Not for NodeCheckFlags {
     }
 }
 
-/// Explicit state of a lazily resolved checker cache.
+/// Exact state domain of `SignatureLinks.resolvedSignature`.
 ///
-/// Upstream uses `nil`, distinguished singleton pointers, and concrete
-/// pointers for these states.  Keeping them as variants prevents an
-/// unresolved cache, a cached negative answer, and a recursion marker from
-/// collapsing when pointer sentinels become semantic IDs.
+/// `Resolving` is the pinned checker's distinguished `resolvingSignature`;
+/// no other signature-link field admits that recursion sentinel.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
-pub enum ResolutionState<T> {
+pub enum ResolvedSignatureState {
     #[default]
     Unresolved,
     Resolving,
-    Resolved(T),
-    ResolvedAbsent,
+    Resolved(SignatureId),
 }
 
-impl<T> ResolutionState<T> {
+impl ResolvedSignatureState {
     #[must_use]
-    pub const fn is_unresolved(&self) -> bool {
-        matches!(self, Self::Unresolved)
-    }
-
-    #[must_use]
-    pub const fn is_resolving(&self) -> bool {
-        matches!(self, Self::Resolving)
-    }
-
-    #[must_use]
-    pub const fn is_resolved_absent(&self) -> bool {
-        matches!(self, Self::ResolvedAbsent)
-    }
-
-    #[must_use]
-    /// Matches upstream's pointer/flag presence test: a recursion sentinel is
-    /// present even though it is not a completed value.
-    pub const fn has_property(&self) -> bool {
-        !matches!(self, Self::Unresolved)
-    }
-
-    #[must_use]
-    pub const fn resolved(&self) -> Option<&T> {
+    pub const fn signature(self) -> Option<SignatureId> {
         match self {
-            Self::Resolved(value) => Some(value),
-            Self::Unresolved | Self::Resolving | Self::ResolvedAbsent => None,
+            Self::Resolved(signature) => Some(signature),
+            Self::Unresolved | Self::Resolving => None,
         }
+    }
+}
+
+/// Exact state domain of `SignatureLinks.effectsSignature`.
+///
+/// `NoEffects` represents the private `unknownSignature` sentinel returned to
+/// callers as no control-flow effects.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum EffectsSignatureState {
+    #[default]
+    Unresolved,
+    NoEffects,
+    Resolved(SignatureId),
+}
+
+impl EffectsSignatureState {
+    #[must_use]
+    pub const fn signature(self) -> Option<SignatureId> {
+        match self {
+            Self::Resolved(signature) => Some(signature),
+            Self::Unresolved | Self::NoEffects => None,
+        }
+    }
+}
+
+/// Exact state domain of `SignatureLinks.decoratorSignature`.
+///
+/// `NotApplicable` represents the private `anySignature` sentinel used to
+/// cache a negative decorator-signature result.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum DecoratorSignatureState {
+    #[default]
+    Unresolved,
+    NotApplicable,
+    Resolved(SignatureId),
+}
+
+impl DecoratorSignatureState {
+    #[must_use]
+    pub const fn signature(self) -> Option<SignatureId> {
+        match self {
+            Self::Resolved(signature) => Some(signature),
+            Self::Unresolved | Self::NotApplicable => None,
+        }
+    }
+}
+
+/// Exact state domain of `AliasSymbolLinks.aliasTarget`.
+///
+/// `Unknown` is the pinned checker's private `unknownSymbol` sentinel. Other
+/// symbol caches retain that singleton as a concrete `SemanticSymbolId`; only
+/// alias resolution interprets it as a cached negative result.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum AliasTargetState {
+    #[default]
+    Unresolved,
+    Unknown,
+    Resolved(SemanticSymbolId),
+}
+
+impl AliasTargetState {
+    #[must_use]
+    pub const fn symbol(self) -> Option<SemanticSymbolId> {
+        match self {
+            Self::Resolved(symbol) => Some(symbol),
+            Self::Unresolved | Self::Unknown => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn has_property(self) -> bool {
+        !matches!(self, Self::Unresolved)
     }
 }
 
@@ -201,13 +248,13 @@ pub struct NodeLinks {
 /// Cached symbol resolution for a syntax node.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SymbolNodeLinks {
-    pub resolved_symbol: ResolutionState<SemanticSymbolId>,
+    pub resolved_symbol: Option<SemanticSymbolId>,
 }
 
 /// Cached type resolution for a syntax node.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TypeNodeLinks {
-    pub resolved_type: ResolutionState<TypeId>,
+    pub resolved_type: Option<TypeId>,
     /// `None` is not computed/non-generic; `Some([])` is a computed empty set.
     pub outer_type_parameters: Option<Vec<TypeId>>,
 }
@@ -215,9 +262,9 @@ pub struct TypeNodeLinks {
 /// Signature-specific syntax-node links.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SignatureLinks {
-    pub resolved_signature: ResolutionState<SignatureId>,
-    pub effects_signature: ResolutionState<SignatureId>,
-    pub decorator_signature: ResolutionState<SignatureId>,
+    pub resolved_signature: ResolvedSignatureState,
+    pub effects_signature: EffectsSignatureState,
+    pub decorator_signature: DecoratorSignatureState,
 }
 
 /// Reference meanings observed for one symbol.
@@ -229,8 +276,8 @@ pub struct SymbolReferenceLinks {
 /// Type and mapper links attached to value symbols.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ValueSymbolLinks {
-    pub resolved_type: ResolutionState<TypeId>,
-    pub write_type: ResolutionState<TypeId>,
+    pub resolved_type: Option<TypeId>,
+    pub write_type: Option<TypeId>,
     pub target: Option<SemanticSymbolId>,
     pub mapper: Option<TypeMapperId>,
     pub name_type: Option<TypeId>,
@@ -241,8 +288,8 @@ pub struct ValueSymbolLinks {
 /// Alias-target and use-state links.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct AliasSymbolLinks {
-    pub immediate_target: ResolutionState<SemanticSymbolId>,
-    pub alias_target: ResolutionState<SemanticSymbolId>,
+    pub immediate_target: Option<SemanticSymbolId>,
+    pub alias_target: AliasTargetState,
     pub referenced: bool,
     pub type_only_declaration: Option<NodeRef>,
 }
@@ -250,7 +297,7 @@ pub struct AliasSymbolLinks {
 /// Links specific to type-alias symbols.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TypeAliasLinks {
-    pub declared_type: ResolutionState<TypeId>,
+    pub declared_type: Option<TypeId>,
     /// `None` is a non-generic alias; `Some([])` remains observably allocated.
     pub type_parameters: Option<Vec<TypeId>>,
     /// `None` is unallocated; `Some({})` is an allocated empty cache.
@@ -263,7 +310,7 @@ pub struct TypeAliasLinks {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 #[allow(clippy::struct_excessive_bools)] // Mirrors the complete upstream link record.
 pub struct DeclaredTypeLinks {
-    pub declared_type: ResolutionState<TypeId>,
+    pub declared_type: Option<TypeId>,
     pub interface_checked: bool,
     pub index_signatures_checked: bool,
     pub type_parameters_checked: bool,
@@ -491,14 +538,45 @@ struct TypeResolution {
     result: bool,
 }
 
+/// Opaque restoration token for a temporary type-resolution boundary.
+///
+/// Tokens are store-branded, single-use, and must be restored in LIFO order.
+/// Safe callers cannot construct or duplicate one.
+#[derive(Debug)]
+#[must_use = "resolution boundaries must be restored in LIFO order"]
+pub struct TypeResolutionBoundary {
+    owner: SemanticStoreId,
+    serial: u64,
+}
+
+#[derive(Debug)]
+struct TypeResolutionBoundaryFrame {
+    serial: u64,
+    previous_start: usize,
+    boundary_depth: usize,
+}
+
 /// Cycle-detection stack for lazy type-system property resolution.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(super) struct TypeResolutionStack {
+    owner: SemanticStoreId,
     entries: Vec<TypeResolution>,
     resolution_start: usize,
+    boundaries: Vec<TypeResolutionBoundaryFrame>,
+    next_boundary_serial: u64,
 }
 
 impl TypeResolutionStack {
+    pub(super) const fn new(owner: SemanticStoreId) -> Self {
+        Self {
+            owner,
+            entries: Vec::new(),
+            resolution_start: 0,
+            boundaries: Vec::new(),
+            next_boundary_serial: 0,
+        }
+    }
+
     #[must_use]
     pub(super) fn len(&self) -> usize {
         self.entries.len()
@@ -514,29 +592,59 @@ impl TypeResolutionStack {
         self.resolution_start
     }
 
-    /// Temporarily starts cycle scanning at the current stack depth and
-    /// returns the previous boundary for later restoration.
-    pub(super) fn reset_resolution_start(&mut self) -> usize {
-        let previous = self.resolution_start;
+    /// Temporarily starts cycle scanning at the current stack depth.
+    ///
+    /// # Panics
+    ///
+    /// Panics before mutation if this stack exhausts its boundary-token
+    /// identity space.
+    pub(super) fn reset_resolution_start(&mut self) -> TypeResolutionBoundary {
+        let serial = self
+            .next_boundary_serial
+            .checked_add(1)
+            .expect("type resolution boundary identity space exhausted");
+        let previous_start = self.resolution_start;
+        self.next_boundary_serial = serial;
+        self.boundaries.push(TypeResolutionBoundaryFrame {
+            serial,
+            previous_start,
+            boundary_depth: self.entries.len(),
+        });
         self.resolution_start = self.entries.len();
-        previous
+        TypeResolutionBoundary {
+            owner: self.owner,
+            serial,
+        }
     }
 
-    /// Restores a boundary previously returned by `reset_resolution_start`.
-    /// Invalid boundaries are rejected without mutation.
-    pub(super) fn restore_resolution_start(&mut self, previous: usize) -> bool {
-        if previous > self.entries.len() {
-            return false;
+    /// Restores the most recent boundary. Foreign, reused, out-of-order, or
+    /// still-active tokens are returned to the caller without mutation.
+    pub(super) fn restore_resolution_start(
+        &mut self,
+        token: TypeResolutionBoundary,
+    ) -> Result<(), TypeResolutionBoundary> {
+        let Some(frame) = self.boundaries.last() else {
+            return Err(token);
+        };
+        if token.owner != self.owner
+            || token.serial != frame.serial
+            || self.entries.len() != frame.boundary_depth
+        {
+            return Err(token);
         }
-        self.resolution_start = previous;
-        true
+        let frame = self
+            .boundaries
+            .pop()
+            .expect("validated boundary frame exists");
+        self.resolution_start = frame.previous_start;
+        Ok(())
     }
 
     /// Ports `pushTypeResolution`.
     ///
-    /// `has_property` must perform only an immutable snapshot lookup. A found
-    /// cycle marks the existing entry and every later entry false and does not
-    /// push a new entry.
+    /// `has_property` probes disjoint live semantic fields while this stack is
+    /// borrowed. A found cycle marks the existing entry and every later entry
+    /// false and does not push a new entry.
     pub(super) fn push(
         &mut self,
         target: TypeResolutionTarget,
@@ -560,8 +668,16 @@ impl TypeResolutionStack {
     }
 
     /// Ports `popTypeResolution`. Empty stacks return `None` instead of
-    /// reproducing an upstream out-of-bounds panic.
+    /// reproducing an upstream out-of-bounds panic. An active boundary also
+    /// prevents callers from popping an entry owned by its outer scope.
     pub(super) fn pop(&mut self) -> Option<bool> {
+        if self
+            .boundaries
+            .last()
+            .is_some_and(|boundary| self.entries.len() <= boundary.boundary_depth)
+        {
+            return None;
+        }
         Some(self.entries.pop()?.result)
     }
 
@@ -628,8 +744,9 @@ mod tests {
     use ts_binder::SymbolFlags;
 
     use super::{
-        CacheHashKey, LinkStore, NodeCheckFlags, ResolutionState, Tristate, TypeAliasLinks,
-        TypeResolutionStack, TypeResolutionTarget, TypeSystemPropertyName,
+        AliasTargetState, CacheHashKey, DecoratorSignatureState, EffectsSignatureState, LinkStore,
+        NodeCheckFlags, ResolvedSignatureState, Tristate, TypeAliasLinks, TypeResolutionStack,
+        TypeResolutionTarget, TypeSystemPropertyName,
     };
 
     #[test]
@@ -722,22 +839,25 @@ mod tests {
     }
 
     #[test]
-    fn cache_states_and_allocated_empty_collections_remain_distinct() {
-        let states = [
-            ResolutionState::<u32>::Unresolved,
-            ResolutionState::Resolving,
-            ResolutionState::ResolvedAbsent,
-            ResolutionState::Resolved(0),
-        ];
-        for (left_index, left) in states.iter().enumerate() {
-            for (right_index, right) in states.iter().enumerate() {
-                assert_eq!(left == right, left_index == right_index);
-            }
-        }
-        assert!(!ResolutionState::<u32>::Unresolved.has_property());
-        assert!(ResolutionState::<u32>::Resolving.has_property());
-        assert!(ResolutionState::<u32>::ResolvedAbsent.has_property());
-        assert!(ResolutionState::Resolved(0).has_property());
+    fn exact_field_states_and_allocated_empty_collections_remain_distinct() {
+        assert_ne!(
+            ResolvedSignatureState::Unresolved,
+            ResolvedSignatureState::Resolving
+        );
+        assert_ne!(
+            EffectsSignatureState::Unresolved,
+            EffectsSignatureState::NoEffects
+        );
+        assert_ne!(
+            DecoratorSignatureState::Unresolved,
+            DecoratorSignatureState::NotApplicable
+        );
+        assert_eq!(ResolvedSignatureState::Resolving.signature(), None);
+        assert_eq!(EffectsSignatureState::NoEffects.signature(), None);
+        assert_eq!(DecoratorSignatureState::NotApplicable.signature(), None);
+        assert!(!AliasTargetState::Unresolved.has_property());
+        assert!(AliasTargetState::Unknown.has_property());
+        assert_eq!(AliasTargetState::Unknown.symbol(), None);
 
         let unallocated = TypeAliasLinks::default();
         let allocated_empty = TypeAliasLinks {
@@ -777,8 +897,8 @@ mod tests {
 
     #[test]
     fn resolution_stack_marks_cycles_and_does_not_push_duplicate() {
-        let (symbol, other) = test_symbol_targets();
-        let mut stack = TypeResolutionStack::default();
+        let (owner, symbol, other) = test_symbol_targets();
+        let mut stack = TypeResolutionStack::new(owner);
 
         assert_eq!(
             stack.push(symbol, TypeSystemPropertyName::Type, |_, _| false),
@@ -800,8 +920,8 @@ mod tests {
 
     #[test]
     fn resolved_property_and_resolution_boundary_break_cycle_scan() {
-        let (symbol, other) = test_symbol_targets();
-        let mut stack = TypeResolutionStack::default();
+        let (owner, symbol, other) = test_symbol_targets();
+        let mut stack = TypeResolutionStack::new(owner);
         stack
             .push(symbol, TypeSystemPropertyName::Type, |_, _| false)
             .unwrap();
@@ -816,24 +936,27 @@ mod tests {
             .unwrap();
         assert_eq!(no_cycle, None);
 
-        let previous = stack.reset_resolution_start();
-        assert_eq!(previous, 0);
+        let boundary = stack.reset_resolution_start();
         assert_eq!(stack.resolution_start(), 2);
         assert!(
             stack
                 .push(symbol, TypeSystemPropertyName::Type, |_, _| false)
                 .unwrap()
         );
-        assert!(stack.restore_resolution_start(previous));
+        let boundary = stack
+            .restore_resolution_start(boundary)
+            .expect_err("a live entry inside the boundary prevents restoration");
+        assert_eq!(stack.resolution_start(), 2);
         assert_eq!(stack.pop(), Some(true));
+        assert!(stack.restore_resolution_start(boundary).is_ok());
         assert_eq!(stack.pop(), Some(true));
         assert_eq!(stack.pop(), Some(true));
     }
 
     #[test]
     fn resolution_stack_rejects_wrong_target_kind_without_mutation() {
-        let (symbol, _) = test_symbol_targets();
-        let mut stack = TypeResolutionStack::default();
+        let (owner, symbol, _) = test_symbol_targets();
+        let mut stack = TypeResolutionStack::new(owner);
         let error = stack
             .push(
                 symbol,
@@ -846,8 +969,13 @@ mod tests {
         assert!(stack.is_empty());
     }
 
-    fn test_symbol_targets() -> (TypeResolutionTarget, TypeResolutionTarget) {
+    fn test_symbol_targets() -> (
+        ts_binder::SemanticStoreId,
+        TypeResolutionTarget,
+        TypeResolutionTarget,
+    ) {
         let mut store = ts_binder::SymbolStore::new();
+        let owner = store.id();
         let first = store.alloc_transient_symbol(
             SymbolFlags::TRANSIENT,
             ts_binder::EscapedName::source("first"),
@@ -859,6 +987,7 @@ mod tests {
             ts_binder::CheckFlags::NONE,
         );
         (
+            owner,
             TypeResolutionTarget::Symbol(first),
             TypeResolutionTarget::Symbol(second),
         )

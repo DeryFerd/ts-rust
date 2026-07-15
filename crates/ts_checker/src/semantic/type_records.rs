@@ -447,6 +447,29 @@ impl TypeData {
         }
     }
 
+    pub(super) const fn constrained(&self) -> Option<&ConstrainedTypeData> {
+        match self {
+            Self::Object(data) => Some(&data.structured.constrained),
+            Self::TypeReference(data) => Some(&data.object.structured.constrained),
+            Self::Interface(data) => Some(&data.reference.object.structured.constrained),
+            Self::Tuple(data) => Some(&data.interface.reference.object.structured.constrained),
+            Self::InstantiationExpression(data) => Some(&data.object.structured.constrained),
+            Self::Mapped(data) => Some(&data.object.structured.constrained),
+            Self::ReverseMapped(data) => Some(&data.object.structured.constrained),
+            Self::EvolvingArray(data) => Some(&data.object.structured.constrained),
+            Self::Union(data) => Some(&data.union.structured.constrained),
+            Self::Intersection(data) => Some(&data.intersection.structured.constrained),
+            Self::TypeParameter(data) => Some(&data.constrained),
+            Self::Index(data) => Some(&data.constrained),
+            Self::IndexedAccess(data) => Some(&data.constrained),
+            Self::TemplateLiteral(data) => Some(&data.constrained),
+            Self::StringMapping(data) => Some(&data.constrained),
+            Self::Substitution(data) => Some(&data.constrained),
+            Self::Conditional(data) => Some(&data.constrained),
+            Self::Intrinsic(_) | Self::Literal(_) | Self::UniqueEsSymbol(_) => None,
+        }
+    }
+
     fn constrained_mut(&mut self) -> Option<&mut ConstrainedTypeData> {
         match self {
             Self::Object(data) => Some(&mut data.structured.constrained),

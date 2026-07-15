@@ -20,10 +20,11 @@ pub use ids::{
     ConditionalRootId, IndexInfoId, SignatureId, TypeAliasId, TypeId, TypeMapperId, TypePredicateId,
 };
 pub use links::{
-    AliasSymbolLinks, DeclaredTypeLinks, LinkHandle, LinkStore, NodeCheckFlags, NodeLinks,
-    ResolutionState, SignatureLinks, SymbolNodeLinks, SymbolReferenceLinks, Tristate,
-    TypeAliasLinks, TypeNodeLinks, TypeResolutionTarget, TypeResolutionTargetError,
-    TypeSystemPropertyName, ValueSymbolLinks,
+    AliasSymbolLinks, AliasTargetState, DeclaredTypeLinks, DecoratorSignatureState,
+    EffectsSignatureState, LinkHandle, LinkStore, NodeCheckFlags, NodeLinks,
+    ResolvedSignatureState, SignatureLinks, SymbolNodeLinks, SymbolReferenceLinks, Tristate,
+    TypeAliasLinks, TypeNodeLinks, TypeResolutionBoundary, TypeResolutionTarget,
+    TypeResolutionTargetError, TypeSystemPropertyName, ValueSymbolLinks,
 };
 pub use mapper::{CanonicalTypeMapperStore, TypeMapper, TypeMapperKind};
 pub use store::SemanticStore;

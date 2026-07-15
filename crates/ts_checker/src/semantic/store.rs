@@ -13,16 +13,16 @@ use super::{
         TypePredicateId, TypedArena,
     },
     links::{
-        AliasSymbolLinks, CheckerLinkStores, DeclaredTypeLinks, NodeLinks, ResolutionState,
-        SignatureLinks, SymbolNodeLinks, SymbolReferenceLinks, TypeAliasLinks, TypeNodeLinks,
-        TypeResolutionStack, TypeResolutionTarget, TypeResolutionTargetError,
-        TypeSystemPropertyName, ValueSymbolLinks,
+        AliasSymbolLinks, CheckerLinkStores, DeclaredTypeLinks, NodeLinks, SignatureLinks,
+        SymbolNodeLinks, SymbolReferenceLinks, TypeAliasLinks, TypeNodeLinks,
+        TypeResolutionBoundary, TypeResolutionStack, TypeResolutionTarget,
+        TypeResolutionTargetError, TypeSystemPropertyName, ValueSymbolLinks,
     },
     signatures::{
         CompositeSignature, IndexInfo, IndexInfoArena, Signature, SignatureArena, SignatureFlags,
         TupleElementInfo, TupleMetadata, TypePredicate, TypePredicateArena, TypePredicateKind,
     },
-    type_records::{ConditionalRoot, TypeAlias},
+    type_records::{ConditionalRoot, TypeAlias, TypeData, TypeRecord},
 };
 
 /// Sole allocator and owner of one canonical program's semantic graph.
@@ -78,7 +78,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             type_aliases: TypedArena::new(id),
             conditional_roots: TypedArena::new(id),
             links: CheckerLinkStores::default(),
-            type_resolutions: TypeResolutionStack::default(),
+            type_resolutions: TypeResolutionStack::new(id),
         }
     }
 
@@ -328,7 +328,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     }
 
     pub fn set_symbol_node_links(&mut self, node: NodeRef, links: SymbolNodeLinks) -> bool {
-        if !self.contains_node_ref(node) || !self.valid_symbol_resolution(&links.resolved_symbol) {
+        if !self.contains_node_ref(node) || !self.valid_optional_symbol(links.resolved_symbol) {
             return false;
         }
         self.links.symbol_node.replace_key(node, links);
@@ -352,7 +352,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
 
     pub fn set_type_node_links(&mut self, node: NodeRef, links: TypeNodeLinks) -> bool {
         if !self.contains_node_ref(node)
-            || !self.valid_type_resolution(&links.resolved_type)
+            || !self.valid_optional_type(links.resolved_type)
             || !self.valid_optional_types(links.outer_type_parameters.as_deref())
         {
             return false;
@@ -378,9 +378,9 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
 
     pub fn set_signature_links(&mut self, node: NodeRef, links: SignatureLinks) -> bool {
         if !self.contains_node_ref(node)
-            || !self.valid_signature_resolution(&links.resolved_signature)
-            || !self.valid_signature_resolution(&links.effects_signature)
-            || !self.valid_signature_resolution(&links.decorator_signature)
+            || !self.valid_optional_signature(links.resolved_signature.signature())
+            || !self.valid_optional_signature(links.effects_signature.signature())
+            || !self.valid_optional_signature(links.decorator_signature.signature())
         {
             return false;
         }
@@ -441,8 +441,8 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         links: ValueSymbolLinks,
     ) -> bool {
         if !self.symbols.contains_symbol(symbol)
-            || !self.valid_type_resolution(&links.resolved_type)
-            || !self.valid_type_resolution(&links.write_type)
+            || !self.valid_optional_type(links.resolved_type)
+            || !self.valid_optional_type(links.write_type)
             || !self.valid_optional_symbol(links.target)
             || !self.valid_optional_mapper(links.mapper)
             || !self.valid_optional_type(links.name_type)
@@ -476,8 +476,8 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         links: AliasSymbolLinks,
     ) -> bool {
         if !self.symbols.contains_symbol(symbol)
-            || !self.valid_symbol_resolution(&links.immediate_target)
-            || !self.valid_symbol_resolution(&links.alias_target)
+            || !self.valid_optional_symbol(links.immediate_target)
+            || !self.valid_optional_symbol(links.alias_target.symbol())
             || !self.valid_optional_node(links.type_only_declaration)
         {
             return false;
@@ -508,7 +508,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         links: TypeAliasLinks,
     ) -> bool {
         if !self.symbols.contains_symbol(symbol)
-            || !self.valid_type_resolution(&links.declared_type)
+            || !self.valid_optional_type(links.declared_type)
             || !self.valid_optional_types(links.type_parameters.as_deref())
             || links.instantiations.as_ref().is_some_and(|instantiations| {
                 instantiations
@@ -543,51 +543,11 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         symbol: SemanticSymbolId,
         links: DeclaredTypeLinks,
     ) -> bool {
-        if !self.symbols.contains_symbol(symbol)
-            || !self.valid_type_resolution(&links.declared_type)
-        {
+        if !self.symbols.contains_symbol(symbol) || !self.valid_optional_type(links.declared_type) {
             return false;
         }
         self.links.declared_type.replace_key(symbol, links);
         true
-    }
-
-    /// Pushes one validated lazy-property query onto this Program's cycle
-    /// stack.
-    ///
-    /// All IDs and nodes are checked against this aggregate owner before the
-    /// stack changes. `has_property` must consult snapshots captured before
-    /// this call; this keeps link borrows out of recursive checker work.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the property does not accept the target kind or
-    /// the target belongs to another semantic store/AST scope.
-    pub fn push_type_resolution(
-        &mut self,
-        target: TypeResolutionTarget,
-        property: TypeSystemPropertyName,
-        has_property: impl FnMut(TypeResolutionTarget, TypeSystemPropertyName) -> bool,
-    ) -> Result<bool, TypeResolutionTargetError> {
-        self.validate_type_resolution_target(target, property)?;
-        self.type_resolutions.push(target, property, has_property)
-    }
-
-    /// Finds a cycle start without changing the stack or allocating links.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the property does not accept the target kind or
-    /// the target belongs to another semantic store/AST scope.
-    pub fn find_type_resolution_cycle_start(
-        &self,
-        target: TypeResolutionTarget,
-        property: TypeSystemPropertyName,
-        has_property: impl FnMut(TypeResolutionTarget, TypeSystemPropertyName) -> bool,
-    ) -> Result<Option<usize>, TypeResolutionTargetError> {
-        self.validate_type_resolution_target(target, property)?;
-        self.type_resolutions
-            .find_cycle_start_index(target, property, has_property)
     }
 
     /// Pops one query and returns whether its dependency chain remained
@@ -611,14 +571,23 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.type_resolutions.resolution_start()
     }
 
-    /// Starts cycle scanning at the current depth and returns the old boundary
-    /// for `restore_type_resolution_start`.
-    pub fn reset_type_resolution_start(&mut self) -> usize {
+    /// Starts cycle scanning at the current depth and returns an opaque,
+    /// single-use LIFO restoration token.
+    pub fn reset_type_resolution_start(&mut self) -> TypeResolutionBoundary {
         self.type_resolutions.reset_resolution_start()
     }
 
-    pub fn restore_type_resolution_start(&mut self, previous: usize) -> bool {
-        self.type_resolutions.restore_resolution_start(previous)
+    /// Restores the most recent boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns the token without mutation when it is foreign, reused, or
+    /// out-of-order, or when entries pushed inside its boundary remain live.
+    pub fn restore_type_resolution_start(
+        &mut self,
+        token: TypeResolutionBoundary,
+    ) -> Result<(), TypeResolutionBoundary> {
+        self.type_resolutions.restore_resolution_start(token)
     }
 
     /// Allocates a canonical type-mapper payload.
@@ -930,12 +899,6 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         id.is_none_or(|id| self.types.get(id).is_some())
     }
 
-    fn valid_type_resolution(&self, state: &ResolutionState<TypeId>) -> bool {
-        state
-            .resolved()
-            .is_none_or(|id| self.types.get(*id).is_some())
-    }
-
     fn valid_symbols(&self, ids: &[SemanticSymbolId]) -> bool {
         ids.iter().all(|id| self.symbols.contains_symbol(*id))
     }
@@ -944,24 +907,12 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         id.is_none_or(|id| self.symbols.contains_symbol(id))
     }
 
-    fn valid_symbol_resolution(&self, state: &ResolutionState<SemanticSymbolId>) -> bool {
-        state
-            .resolved()
-            .is_none_or(|id| self.symbols.contains_symbol(*id))
-    }
-
     fn valid_optional_mapper(&self, id: Option<TypeMapperId>) -> bool {
         id.is_none_or(|id| self.mappers.get(id).is_some())
     }
 
     fn valid_optional_signature(&self, id: Option<SignatureId>) -> bool {
         id.is_none_or(|id| self.signatures.get(id).is_some())
-    }
-
-    fn valid_signature_resolution(&self, state: &ResolutionState<SignatureId>) -> bool {
-        state
-            .resolved()
-            .is_none_or(|id| self.signatures.get(*id).is_some())
     }
 
     fn validate_type_resolution_target(
@@ -987,6 +938,184 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     }
 }
 
+impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
+    /// Pushes one validated lazy-property query and probes the current owned
+    /// semantic graph while scanning for cycles.
+    ///
+    /// The stack, sparse links, types, and signatures are borrowed as disjoint
+    /// fields. This preserves upstream's live reverse scan without exposing a
+    /// mutable link record across recursion or requiring a stale caller-made
+    /// snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the target is foreign, the property rejects its
+    /// target kind, or a type target does not implement that property.
+    pub fn push_type_resolution(
+        &mut self,
+        target: TypeResolutionTarget,
+        property: TypeSystemPropertyName,
+    ) -> Result<bool, TypeResolutionTargetError> {
+        self.validate_canonical_resolution_target(target, property)?;
+        let links = &mut self.links;
+        let types = &self.types;
+        let signatures = &self.signatures;
+        self.type_resolutions
+            .push(target, property, |target, property| {
+                canonical_resolution_has_property(links, types, signatures, target, property)
+            })
+    }
+
+    /// Finds a cycle start using the current owned semantic graph.
+    ///
+    /// This may allocate an exact default sparse link record, matching
+    /// typescript-go's use of `LinkStore.Get` in `typeResolutionHasProperty`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the target is foreign, the property rejects its
+    /// target kind, or a type target does not implement that property.
+    pub fn find_type_resolution_cycle_start(
+        &mut self,
+        target: TypeResolutionTarget,
+        property: TypeSystemPropertyName,
+    ) -> Result<Option<usize>, TypeResolutionTargetError> {
+        self.validate_canonical_resolution_target(target, property)?;
+        let links = &mut self.links;
+        let types = &self.types;
+        let signatures = &self.signatures;
+        self.type_resolutions
+            .find_cycle_start_index(target, property, |target, property| {
+                canonical_resolution_has_property(links, types, signatures, target, property)
+            })
+    }
+
+    fn validate_canonical_resolution_target(
+        &self,
+        target: TypeResolutionTarget,
+        property: TypeSystemPropertyName,
+    ) -> Result<(), TypeResolutionTargetError> {
+        self.validate_type_resolution_target(target, property)?;
+        if let TypeResolutionTarget::Type(type_id) = target {
+            let record = self
+                .types
+                .get(type_id)
+                .expect("validated canonical type target exists");
+            if canonical_type_resolution_property(record.data(), property).is_none() {
+                return Err(TypeResolutionTargetError { target, property });
+            }
+        }
+        Ok(())
+    }
+}
+
+fn canonical_resolution_has_property(
+    links: &mut CheckerLinkStores,
+    types: &TypedArena<TypeId, TypeRecord>,
+    signatures: &SignatureArena,
+    target: TypeResolutionTarget,
+    property: TypeSystemPropertyName,
+) -> bool {
+    match (target, property) {
+        (TypeResolutionTarget::Symbol(symbol), TypeSystemPropertyName::Type) => {
+            let handle = links.value_symbol.get(symbol);
+            links
+                .value_symbol
+                .value(handle)
+                .expect("same-store link handle exists")
+                .resolved_type
+                .is_some()
+        }
+        (TypeResolutionTarget::Symbol(symbol), TypeSystemPropertyName::DeclaredType) => {
+            let handle = links.type_alias.get(symbol);
+            links
+                .type_alias
+                .value(handle)
+                .expect("same-store link handle exists")
+                .declared_type
+                .is_some()
+        }
+        (TypeResolutionTarget::Symbol(symbol), TypeSystemPropertyName::WriteType) => {
+            let handle = links.value_symbol.get(symbol);
+            links
+                .value_symbol
+                .value(handle)
+                .expect("same-store link handle exists")
+                .write_type
+                .is_some()
+        }
+        (TypeResolutionTarget::Symbol(symbol), TypeSystemPropertyName::AliasTarget) => {
+            let handle = links.alias_symbol.get(symbol);
+            links
+                .alias_symbol
+                .value(handle)
+                .expect("same-store link handle exists")
+                .alias_target
+                .has_property()
+        }
+        (TypeResolutionTarget::Type(type_id), property) => {
+            let record = types
+                .get(type_id)
+                .expect("validated canonical type target exists");
+            canonical_type_resolution_property(record.data(), property)
+                .expect("validated type property is supported")
+        }
+        (
+            TypeResolutionTarget::Signature(signature),
+            TypeSystemPropertyName::ResolvedReturnType,
+        ) => signatures
+            .get(signature)
+            .expect("validated canonical signature target exists")
+            .resolved_return_type()
+            .is_some(),
+        (TypeResolutionTarget::Node(node), TypeSystemPropertyName::InitializerIsUndefined) => {
+            let handle = links.node.get(node);
+            links
+                .node
+                .value(handle)
+                .expect("same-store link handle exists")
+                .flags
+                .contains(super::links::NodeCheckFlags::INITIALIZER_IS_UNDEFINED_COMPUTED)
+        }
+        _ => unreachable!("target/property pairing was validated before stack mutation"),
+    }
+}
+
+fn canonical_type_resolution_property(
+    data: &TypeData,
+    property: TypeSystemPropertyName,
+) -> Option<bool> {
+    match property {
+        TypeSystemPropertyName::ResolvedTypeArguments => match data {
+            TypeData::TypeReference(data) => Some(data.resolved_type_arguments.is_some()),
+            TypeData::Interface(data) => Some(data.reference.resolved_type_arguments.is_some()),
+            TypeData::Tuple(data) => {
+                Some(data.interface.reference.resolved_type_arguments.is_some())
+            }
+            _ => None,
+        },
+        TypeSystemPropertyName::ResolvedBaseTypes => match data {
+            TypeData::Interface(data) => Some(data.base_types_resolved),
+            TypeData::Tuple(data) => Some(data.interface.base_types_resolved),
+            _ => None,
+        },
+        TypeSystemPropertyName::ResolvedBaseConstructorType => match data {
+            TypeData::Interface(data) => Some(data.resolved_base_constructor_type.is_some()),
+            TypeData::Tuple(data) => Some(data.interface.resolved_base_constructor_type.is_some()),
+            _ => None,
+        },
+        TypeSystemPropertyName::ResolvedBaseConstraint => data
+            .constrained()
+            .map(|data| data.resolved_base_constraint.is_some()),
+        TypeSystemPropertyName::Type
+        | TypeSystemPropertyName::DeclaredType
+        | TypeSystemPropertyName::ResolvedReturnType
+        | TypeSystemPropertyName::WriteType
+        | TypeSystemPropertyName::InitializerIsUndefined
+        | TypeSystemPropertyName::AliasTarget => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -997,15 +1126,21 @@ mod tests {
 
     use super::{AstScope, SemanticStore};
     use crate::semantic::{
-        AliasSymbolLinks, CacheHashKey, DeclaredTypeLinks, NodeLinks, ResolutionState,
+        AliasSymbolLinks, AliasTargetState, CacheHashKey, DeclaredTypeLinks,
+        DecoratorSignatureState, EffectsSignatureState, NodeLinks, ResolvedSignatureState,
         SignatureLinks, SymbolNodeLinks, SymbolReferenceLinks, TypeAliasLinks, TypeNodeLinks,
-        TypeResolutionTarget, TypeSystemPropertyName, ValueSymbolLinks,
+        TypeRecord, TypeResolutionTarget, TypeSystemPropertyName, ValueSymbolLinks,
         signatures::{ElementFlags, SignatureFlags, TypePredicateKind},
+        types::{ObjectFlags, TypeFlags},
     };
 
     type TestStore = SemanticStore<&'static str, &'static str>;
+    type CanonicalTestStore = SemanticStore<TypeRecord, &'static str>;
 
-    fn alloc_test_symbol(store: &mut TestStore, name: &str) -> crate::semantic::SemanticSymbolId {
+    fn alloc_test_symbol<TypePayload, MapperPayload>(
+        store: &mut SemanticStore<TypePayload, MapperPayload>,
+        name: &str,
+    ) -> crate::semantic::SemanticSymbolId {
         store
             .alloc_symbol(SymbolData::new(
                 SymbolFlags::PROPERTY,
@@ -1014,7 +1149,9 @@ mod tests {
             .unwrap()
     }
 
-    fn empty_signature(store: &mut TestStore) -> crate::semantic::SignatureId {
+    fn empty_signature<TypePayload, MapperPayload>(
+        store: &mut SemanticStore<TypePayload, MapperPayload>,
+    ) -> crate::semantic::SignatureId {
         store
             .alloc_signature(
                 SignatureFlags::NONE,
@@ -1027,6 +1164,20 @@ mod tests {
                 0,
             )
             .unwrap()
+    }
+
+    fn assert_canonical_property_present(
+        store: &mut CanonicalTestStore,
+        target: TypeResolutionTarget,
+        property: TypeSystemPropertyName,
+    ) {
+        assert_eq!(store.push_type_resolution(target, property), Ok(true));
+        assert_eq!(
+            store.find_type_resolution_cycle_start(target, property),
+            Ok(None),
+            "a live cached property must stop the reverse scan before equality"
+        );
+        assert_eq!(store.pop_type_resolution(), Some(true));
     }
 
     fn signature_with_references(
@@ -1666,7 +1817,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_link_commits_accept_owned_ids_and_all_cache_states() {
+    fn semantic_link_commits_accept_owned_ids_and_exact_field_states() {
         let parsed = parse_source_file("const value = 1;");
         let scope = AstScope::new(FileId::new(22), &parsed.arena);
         let node = scope.node_ref(parsed.source_file).unwrap();
@@ -1674,34 +1825,47 @@ mod tests {
         assert!(store.register_ast_scope(scope));
         let symbol = alloc_test_symbol(&mut store, "value");
         let target = alloc_test_symbol(&mut store, "target");
-        let type_id = store.alloc_type("number");
+        // Upstream's unknown/error/unresolved type sentinels are still real
+        // type pointers. Their Rust equivalents remain concrete TypeIds in
+        // every type-valued cache rather than becoming generic enum states.
+        let type_id = store.alloc_type("concrete unresolved/error type sentinel");
         let mapper = store.alloc_mapper("identity");
         let signature = empty_signature(&mut store);
 
         let symbol_node = SymbolNodeLinks {
-            resolved_symbol: ResolutionState::Resolved(target),
+            resolved_symbol: Some(target),
         };
         assert!(store.set_symbol_node_links(node, symbol_node.clone()));
         assert_eq!(store.symbol_node_links(node), Some(&symbol_node));
 
         let type_node = TypeNodeLinks {
-            resolved_type: ResolutionState::Resolving,
+            resolved_type: Some(type_id),
             outer_type_parameters: Some(vec![type_id]),
         };
         assert!(store.set_type_node_links(node, type_node.clone()));
         assert_eq!(store.type_node_links(node), Some(&type_node));
 
         let signature_links = SignatureLinks {
-            resolved_signature: ResolutionState::Resolving,
-            effects_signature: ResolutionState::ResolvedAbsent,
-            decorator_signature: ResolutionState::Resolved(signature),
+            resolved_signature: ResolvedSignatureState::Resolving,
+            effects_signature: EffectsSignatureState::NoEffects,
+            decorator_signature: DecoratorSignatureState::Resolved(signature),
         };
         assert!(store.set_signature_links(node, signature_links.clone()));
         assert_eq!(store.signature_links(node), Some(&signature_links));
+        let completed_signature_links = SignatureLinks {
+            resolved_signature: ResolvedSignatureState::Resolved(signature),
+            effects_signature: EffectsSignatureState::Resolved(signature),
+            decorator_signature: DecoratorSignatureState::NotApplicable,
+        };
+        assert!(store.set_signature_links(node, completed_signature_links.clone()));
+        assert_eq!(
+            store.signature_links(node),
+            Some(&completed_signature_links)
+        );
 
         let value_links = ValueSymbolLinks {
-            resolved_type: ResolutionState::Resolved(type_id),
-            write_type: ResolutionState::ResolvedAbsent,
+            resolved_type: Some(type_id),
+            write_type: Some(type_id),
             target: Some(target),
             mapper: Some(mapper),
             name_type: Some(type_id),
@@ -1712,8 +1876,8 @@ mod tests {
         assert_eq!(store.value_symbol_links(symbol), Some(&value_links));
 
         let alias_links = AliasSymbolLinks {
-            immediate_target: ResolutionState::Resolved(target),
-            alias_target: ResolutionState::Resolving,
+            immediate_target: Some(target),
+            alias_target: AliasTargetState::Unknown,
             referenced: true,
             type_only_declaration: Some(node),
         };
@@ -1721,7 +1885,7 @@ mod tests {
         assert_eq!(store.alias_symbol_links(symbol), Some(&alias_links));
 
         let type_alias_links = TypeAliasLinks {
-            declared_type: ResolutionState::Resolved(type_id),
+            declared_type: Some(type_id),
             type_parameters: Some(vec![type_id]),
             instantiations: Some(HashMap::from([(CacheHashKey::from_halves(1, 2), type_id)])),
             is_constructor_declared_property: true,
@@ -1730,7 +1894,7 @@ mod tests {
         assert_eq!(store.type_alias_links(symbol), Some(&type_alias_links));
 
         let declared_links = DeclaredTypeLinks {
-            declared_type: ResolutionState::Resolved(type_id),
+            declared_type: Some(type_id),
             interface_checked: true,
             index_signatures_checked: true,
             type_parameters_checked: true,
@@ -1741,6 +1905,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Exhaustive per-slot foreign provenance matrix.
     fn semantic_link_keys_and_payloads_reject_every_foreign_id_kind_atomically() {
         let first_parse = parse_source_file("const value = 1;");
         let second_parse = parse_source_file("const value = 1;");
@@ -1779,22 +1944,22 @@ mod tests {
         assert!(!store.set_symbol_node_links(
             second_node,
             SymbolNodeLinks {
-                resolved_symbol: ResolutionState::Resolved(foreign_symbol),
+                resolved_symbol: Some(foreign_symbol),
             },
         ));
         assert_eq!(store.symbol_node_links(second_node), None);
 
         for invalid in [
             SignatureLinks {
-                resolved_signature: ResolutionState::Resolved(foreign_signature),
+                resolved_signature: ResolvedSignatureState::Resolved(foreign_signature),
                 ..SignatureLinks::default()
             },
             SignatureLinks {
-                effects_signature: ResolutionState::Resolved(foreign_signature),
+                effects_signature: EffectsSignatureState::Resolved(foreign_signature),
                 ..SignatureLinks::default()
             },
             SignatureLinks {
-                decorator_signature: ResolutionState::Resolved(foreign_signature),
+                decorator_signature: DecoratorSignatureState::Resolved(foreign_signature),
                 ..SignatureLinks::default()
             },
         ] {
@@ -1805,7 +1970,7 @@ mod tests {
         assert!(!store.set_type_node_links(
             second_node,
             TypeNodeLinks {
-                resolved_type: ResolutionState::Resolved(foreign_type),
+                resolved_type: Some(foreign_type),
                 ..TypeNodeLinks::default()
             },
         ));
@@ -1820,11 +1985,11 @@ mod tests {
 
         let invalid_values = [
             ValueSymbolLinks {
-                resolved_type: ResolutionState::Resolved(foreign_type),
+                resolved_type: Some(foreign_type),
                 ..ValueSymbolLinks::default()
             },
             ValueSymbolLinks {
-                write_type: ResolutionState::Resolved(foreign_type),
+                write_type: Some(foreign_type),
                 ..ValueSymbolLinks::default()
             },
             ValueSymbolLinks {
@@ -1852,14 +2017,14 @@ mod tests {
         assert!(!store.set_alias_symbol_links(
             symbol,
             AliasSymbolLinks {
-                immediate_target: ResolutionState::Resolved(foreign_symbol),
+                immediate_target: Some(foreign_symbol),
                 ..AliasSymbolLinks::default()
             },
         ));
         assert!(!store.set_alias_symbol_links(
             symbol,
             AliasSymbolLinks {
-                alias_target: ResolutionState::Resolved(foreign_symbol),
+                alias_target: AliasTargetState::Resolved(foreign_symbol),
                 ..AliasSymbolLinks::default()
             },
         ));
@@ -1874,7 +2039,7 @@ mod tests {
 
         let invalid_aliases = [
             TypeAliasLinks {
-                declared_type: ResolutionState::Resolved(foreign_type),
+                declared_type: Some(foreign_type),
                 ..TypeAliasLinks::default()
             },
             TypeAliasLinks {
@@ -1897,21 +2062,21 @@ mod tests {
         assert!(!store.set_declared_type_links(
             symbol,
             DeclaredTypeLinks {
-                declared_type: ResolutionState::Resolved(foreign_type),
+                declared_type: Some(foreign_type),
                 ..DeclaredTypeLinks::default()
             },
         ));
         assert_eq!(store.declared_type_links(symbol), None);
 
         let baseline = ValueSymbolLinks {
-            resolved_type: ResolutionState::Resolved(local_type),
+            resolved_type: Some(local_type),
             ..ValueSymbolLinks::default()
         };
         assert!(store.set_value_symbol_links(symbol, baseline.clone()));
         assert!(!store.set_value_symbol_links(
             symbol,
             ValueSymbolLinks {
-                resolved_type: ResolutionState::Resolved(foreign_type),
+                resolved_type: Some(foreign_type),
                 ..ValueSymbolLinks::default()
             },
         ));
@@ -1923,25 +2088,28 @@ mod tests {
         let parsed = parse_source_file("const first = 1; const second = 2;");
         let scope = AstScope::new(FileId::new(24), &parsed.arena);
         let node = scope.node_ref(parsed.source_file).unwrap();
-        let mut store = TestStore::new();
+        let mut store = CanonicalTestStore::new();
         assert!(store.register_ast_scope(scope));
         let first = alloc_test_symbol(&mut store, "first");
         let second = alloc_test_symbol(&mut store, "second");
-        let type_id = store.alloc_type("number");
+        let type_id = store.alloc_type_parameter(None).unwrap();
+        let intrinsic = store
+            .alloc_intrinsic_type(TypeFlags::NUMBER, "number")
+            .unwrap();
         let signature = empty_signature(&mut store);
 
         let first_target = TypeResolutionTarget::Symbol(first);
         let second_target = TypeResolutionTarget::Symbol(second);
         assert_eq!(
-            store.push_type_resolution(first_target, TypeSystemPropertyName::Type, |_, _| false),
+            store.push_type_resolution(first_target, TypeSystemPropertyName::Type),
             Ok(true)
         );
         assert_eq!(
-            store.push_type_resolution(second_target, TypeSystemPropertyName::Type, |_, _| false),
+            store.push_type_resolution(second_target, TypeSystemPropertyName::Type),
             Ok(true)
         );
         assert_eq!(
-            store.push_type_resolution(first_target, TypeSystemPropertyName::Type, |_, _| false),
+            store.push_type_resolution(first_target, TypeSystemPropertyName::Type),
             Ok(false)
         );
         assert_eq!(store.type_resolution_len(), 2);
@@ -1963,28 +2131,190 @@ mod tests {
                 TypeSystemPropertyName::InitializerIsUndefined,
             ),
         ] {
-            assert_eq!(
-                store.push_type_resolution(target, property, |_, _| false),
-                Ok(true)
-            );
+            assert_eq!(store.push_type_resolution(target, property), Ok(true));
             assert_eq!(store.pop_type_resolution(), Some(true));
         }
-
-        let previous = store.reset_type_resolution_start();
-        assert_eq!(previous, 0);
-        assert_eq!(store.type_resolution_start(), 0);
-        assert!(store.restore_type_resolution_start(previous));
 
         assert!(
             store
                 .push_type_resolution(
                     TypeResolutionTarget::Symbol(first),
                     TypeSystemPropertyName::ResolvedReturnType,
-                    |_, _| false,
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .push_type_resolution(
+                    TypeResolutionTarget::Type(intrinsic),
+                    TypeSystemPropertyName::ResolvedBaseConstraint,
                 )
                 .is_err()
         );
         assert!(store.type_resolution_is_empty());
+    }
+
+    #[test]
+    fn type_resolution_cycle_scan_observes_live_owned_link_state() {
+        let mut store = CanonicalTestStore::new();
+        let first = alloc_test_symbol(&mut store, "first");
+        let second = alloc_test_symbol(&mut store, "second");
+        let resolved_type = store.alloc_type_parameter(None).unwrap();
+        let first_target = TypeResolutionTarget::Symbol(first);
+        let second_target = TypeResolutionTarget::Symbol(second);
+
+        assert_eq!(
+            store.push_type_resolution(first_target, TypeSystemPropertyName::Type),
+            Ok(true)
+        );
+        assert_eq!(
+            store.push_type_resolution(second_target, TypeSystemPropertyName::Type),
+            Ok(true)
+        );
+        assert_eq!(
+            store.value_symbol_links(first),
+            Some(&ValueSymbolLinks::default()),
+            "the live probe must preserve upstream LinkStore.Get allocation"
+        );
+
+        // This cache write occurs after both stack entries were pushed. The
+        // next reverse scan must observe it live and stop before treating the
+        // older `first` entry as a cycle.
+        assert!(store.set_value_symbol_links(
+            second,
+            ValueSymbolLinks {
+                resolved_type: Some(resolved_type),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+        assert_eq!(
+            store.push_type_resolution(first_target, TypeSystemPropertyName::Type),
+            Ok(true)
+        );
+        assert_eq!(store.type_resolution_len(), 3);
+        assert_eq!(store.pop_type_resolution(), Some(true));
+        assert_eq!(store.pop_type_resolution(), Some(true));
+        assert_eq!(store.pop_type_resolution(), Some(true));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Exhaustive pinned ten-property storage matrix.
+    fn live_property_probe_covers_every_pinned_property_storage_location() {
+        let parsed = parse_source_file("const value = 1;");
+        let scope = AstScope::new(FileId::new(26), &parsed.arena);
+        let node = scope.node_ref(parsed.source_file).unwrap();
+        let mut store = CanonicalTestStore::new();
+        assert!(store.register_ast_scope(scope));
+
+        let cached_type = store.alloc_type_parameter(None).unwrap();
+        let value_symbol = alloc_test_symbol(&mut store, "value");
+        assert!(store.set_value_symbol_links(
+            value_symbol,
+            ValueSymbolLinks {
+                resolved_type: Some(cached_type),
+                write_type: Some(cached_type),
+                ..ValueSymbolLinks::default()
+            },
+        ));
+
+        let alias_symbol = alloc_test_symbol(&mut store, "alias");
+        assert!(store.set_alias_symbol_links(
+            alias_symbol,
+            AliasSymbolLinks {
+                alias_target: AliasTargetState::Unknown,
+                ..AliasSymbolLinks::default()
+            },
+        ));
+
+        let type_alias_symbol = alloc_test_symbol(&mut store, "TypeAlias");
+        assert!(store.set_type_alias_links(
+            type_alias_symbol,
+            TypeAliasLinks {
+                declared_type: Some(cached_type),
+                ..TypeAliasLinks::default()
+            },
+        ));
+
+        assert!(store.set_node_links(
+            node,
+            NodeLinks {
+                flags: crate::semantic::NodeCheckFlags::INITIALIZER_IS_UNDEFINED_COMPUTED,
+                ..NodeLinks::default()
+            },
+        ));
+
+        let signature = store
+            .alloc_signature(
+                SignatureFlags::NONE,
+                None,
+                Vec::new(),
+                None,
+                Vec::new(),
+                Some(cached_type),
+                None,
+                0,
+            )
+            .unwrap();
+
+        let reference = store
+            .alloc_type_reference(ObjectFlags::REFERENCE, None)
+            .unwrap();
+        assert!(store.set_type_reference_resolution(reference, None, Some(Vec::new())));
+        let interface = store
+            .alloc_interface_type(ObjectFlags::INTERFACE, None)
+            .unwrap();
+        assert!(store.set_interface_base_resolution(
+            interface,
+            true,
+            Some(cached_type),
+            Some(Vec::new()),
+        ));
+        assert!(store.set_resolved_base_constraint(cached_type, Some(cached_type)));
+
+        for (target, property) in [
+            (
+                TypeResolutionTarget::Symbol(value_symbol),
+                TypeSystemPropertyName::Type,
+            ),
+            (
+                TypeResolutionTarget::Symbol(value_symbol),
+                TypeSystemPropertyName::WriteType,
+            ),
+            (
+                TypeResolutionTarget::Symbol(type_alias_symbol),
+                TypeSystemPropertyName::DeclaredType,
+            ),
+            (
+                TypeResolutionTarget::Symbol(alias_symbol),
+                TypeSystemPropertyName::AliasTarget,
+            ),
+            (
+                TypeResolutionTarget::Type(reference),
+                TypeSystemPropertyName::ResolvedTypeArguments,
+            ),
+            (
+                TypeResolutionTarget::Type(interface),
+                TypeSystemPropertyName::ResolvedBaseTypes,
+            ),
+            (
+                TypeResolutionTarget::Type(interface),
+                TypeSystemPropertyName::ResolvedBaseConstructorType,
+            ),
+            (
+                TypeResolutionTarget::Type(cached_type),
+                TypeSystemPropertyName::ResolvedBaseConstraint,
+            ),
+            (
+                TypeResolutionTarget::Signature(signature),
+                TypeSystemPropertyName::ResolvedReturnType,
+            ),
+            (
+                TypeResolutionTarget::Node(node),
+                TypeSystemPropertyName::InitializerIsUndefined,
+            ),
+        ] {
+            assert_canonical_property_present(&mut store, target, property);
+        }
     }
 
     #[test]
@@ -1996,16 +2326,16 @@ mod tests {
         let first_node = first_scope.node_ref(first_parse.source_file).unwrap();
         let second_node = second_scope.node_ref(second_parse.source_file).unwrap();
 
-        let mut first = TestStore::new();
+        let mut first = CanonicalTestStore::new();
         assert!(first.register_ast_scope(first_scope));
         let foreign_symbol = alloc_test_symbol(&mut first, "value");
-        let foreign_type = first.alloc_type("number");
+        let foreign_type = first.alloc_type_parameter(None).unwrap();
         let foreign_signature = empty_signature(&mut first);
 
-        let mut store = TestStore::new();
+        let mut store = CanonicalTestStore::new();
         assert!(store.register_ast_scope(second_scope));
         let local_symbol = alloc_test_symbol(&mut store, "value");
-        let local_type = store.alloc_type("number");
+        let local_type = store.alloc_type_parameter(None).unwrap();
         let local_signature = empty_signature(&mut store);
 
         assert_eq!(foreign_symbol.get(), local_symbol.get());
@@ -2022,7 +2352,7 @@ mod tests {
             ),
             (
                 TypeResolutionTarget::Type(foreign_type),
-                TypeSystemPropertyName::ResolvedBaseTypes,
+                TypeSystemPropertyName::ResolvedBaseConstraint,
             ),
             (
                 TypeResolutionTarget::Signature(foreign_signature),
@@ -2034,14 +2364,10 @@ mod tests {
             ),
         ];
         for (target, property) in foreign_targets {
+            assert!(store.push_type_resolution(target, property).is_err());
             assert!(
                 store
-                    .push_type_resolution(target, property, |_, _| false)
-                    .is_err()
-            );
-            assert!(
-                store
-                    .find_type_resolution_cycle_start(target, property, |_, _| false)
+                    .find_type_resolution_cycle_start(target, property)
                     .is_err()
             );
             assert!(store.type_resolution_is_empty());
@@ -2054,7 +2380,7 @@ mod tests {
             ),
             (
                 TypeResolutionTarget::Type(local_type),
-                TypeSystemPropertyName::ResolvedBaseTypes,
+                TypeSystemPropertyName::ResolvedBaseConstraint,
             ),
             (
                 TypeResolutionTarget::Signature(local_signature),
@@ -2065,11 +2391,77 @@ mod tests {
                 TypeSystemPropertyName::InitializerIsUndefined,
             ),
         ] {
-            assert_eq!(
-                store.push_type_resolution(target, property, |_, _| false),
-                Ok(true)
-            );
+            assert_eq!(store.push_type_resolution(target, property), Ok(true));
             assert_eq!(store.pop_type_resolution(), Some(true));
         }
+    }
+
+    #[test]
+    fn type_resolution_boundaries_are_store_branded_single_use_and_lifo() {
+        let mut first = CanonicalTestStore::new();
+        let first_symbol = alloc_test_symbol(&mut first, "first");
+        let second_symbol = alloc_test_symbol(&mut first, "second");
+        let third_symbol = alloc_test_symbol(&mut first, "third");
+        assert_eq!(
+            first.push_type_resolution(
+                TypeResolutionTarget::Symbol(first_symbol),
+                TypeSystemPropertyName::Type,
+            ),
+            Ok(true)
+        );
+        let outer = first.reset_type_resolution_start();
+        assert_eq!(first.type_resolution_start(), 1);
+        assert_eq!(first.pop_type_resolution(), None);
+        assert_eq!(
+            first.push_type_resolution(
+                TypeResolutionTarget::Symbol(second_symbol),
+                TypeSystemPropertyName::Type,
+            ),
+            Ok(true)
+        );
+        let inner = first.reset_type_resolution_start();
+        assert_eq!(first.type_resolution_start(), 2);
+        assert_eq!(first.pop_type_resolution(), None);
+        assert_eq!(
+            first.push_type_resolution(
+                TypeResolutionTarget::Symbol(third_symbol),
+                TypeSystemPropertyName::Type,
+            ),
+            Ok(true)
+        );
+
+        let outer = first
+            .restore_type_resolution_start(outer)
+            .expect_err("outer token cannot restore before inner token");
+        assert_eq!(first.type_resolution_start(), 2);
+        let inner = first
+            .restore_type_resolution_start(inner)
+            .expect_err("inner token cannot restore while its entry is live");
+        assert_eq!(first.type_resolution_start(), 2);
+        assert_eq!(first.pop_type_resolution(), Some(true));
+        assert!(first.restore_type_resolution_start(inner).is_ok());
+        assert_eq!(first.type_resolution_start(), 1);
+        let outer = first
+            .restore_type_resolution_start(outer)
+            .expect_err("outer token cannot restore while its entry is live");
+        assert_eq!(first.type_resolution_start(), 1);
+        assert_eq!(first.pop_type_resolution(), Some(true));
+        assert!(first.restore_type_resolution_start(outer).is_ok());
+        assert_eq!(first.type_resolution_start(), 0);
+
+        assert_eq!(first.pop_type_resolution(), Some(true));
+        assert!(first.type_resolution_is_empty());
+
+        // Fresh stores both allocate boundary serial 1. Branding, rather than
+        // an incidental serial mismatch, must reject the crossed token.
+        let mut left = CanonicalTestStore::new();
+        let mut right = CanonicalTestStore::new();
+        let left_token = left.reset_type_resolution_start();
+        let right_token = right.reset_type_resolution_start();
+        let left_token = right
+            .restore_type_resolution_start(left_token)
+            .expect_err("another semantic store must reject an equal-serial token");
+        assert!(right.restore_type_resolution_start(right_token).is_ok());
+        assert!(left.restore_type_resolution_start(left_token).is_ok());
     }
 }
