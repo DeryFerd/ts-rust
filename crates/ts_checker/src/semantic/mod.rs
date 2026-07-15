@@ -82,6 +82,6 @@ pub use relation::{
 };
 pub use relater::RelationUnavailable;
 pub use store::SemanticStore;
-pub use type_nodes::{CanonicalTypeQuery, CanonicalTypeQueryOptions, TypeNodeUnavailable};
+pub use type_nodes::TypeNodeUnavailable;
 pub use type_records::{CacheHashKey, CanonicalSemanticStore, TypeData, TypeDataKind, TypeRecord};
 pub use types::VarianceFlags;

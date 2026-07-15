@@ -24,12 +24,12 @@ use super::{
     CanonicalCheckerDiagnostics, CanonicalGlobalTypeInitializationError, CanonicalGlobalTypes,
     CanonicalModuleResolutionLookup, CanonicalModuleResolutionManifest,
     CanonicalModuleResolutionManifestError, CanonicalModuleResolutionManifestInput,
-    CanonicalTypeMapperStore, CanonicalTypeQuery, DeclaredTypeError, DeclaredTypeHost,
-    DeclaredTypeHostError, IntrinsicBootstrapError, IntrinsicBootstrapOptions, SourceFileRef,
-    SymbolMergeError, TypeId,
+    CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, DeclaredTypeHostError,
+    IntrinsicBootstrapError, IntrinsicBootstrapOptions, SourceFileRef, SymbolMergeError, TypeId,
     global_types::initialize_global_library_types,
     module_resolution::validate_module_resolution_manifest,
     name_resolution::{ProductionNameResolverHost, ProductionNameResolverHostError},
+    type_nodes::CanonicalTypeQuery,
 };
 
 /// Compiler options consumed by the installed production-construction slice.

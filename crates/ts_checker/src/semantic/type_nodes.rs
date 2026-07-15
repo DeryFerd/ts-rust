@@ -22,7 +22,7 @@ use super::{
 const NODE_FLAG_JSDOC: u32 = 1 << 22;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct CanonicalTypeQueryOptions {
+pub(super) struct CanonicalTypeQueryOptions {
     pub strict_builtin_iterator_return: bool,
 }
 
@@ -528,7 +528,7 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
     }
 }
 
-pub struct CanonicalTypeQuery<'store, 'host, 'arena, 'diagnostics> {
+pub(super) struct CanonicalTypeQuery<'store, 'host, 'arena, 'diagnostics> {
     store: &'store mut CanonicalTypeMapperStore,
     host: &'host DeclaredTypeHost<'arena>,
     options: CanonicalTypeQueryOptions,
@@ -542,7 +542,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
     ///
     /// Returns a typed option mismatch when the store was already claimed by
     /// a checker session with a different strict iterator-return mode.
-    pub fn new(
+    pub(super) fn new(
         store: &'store mut CanonicalTypeMapperStore,
         host: &'host DeclaredTypeHost<'arena>,
         options: impl Into<CanonicalTypeQueryOptions>,
@@ -574,7 +574,10 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
     ///
     /// Returns a typed unavailable or provenance error before mutation when
     /// the node's dependency closure is outside the installed semantic cut.
-    pub fn get_type_from_type_node(&mut self, node: NodeRef) -> Result<TypeId, DeclaredTypeError> {
+    pub(super) fn get_type_from_type_node(
+        &mut self,
+        node: NodeRef,
+    ) -> Result<TypeId, DeclaredTypeError> {
         let mut planner = TypeQueryPlanner::new(
             self.store,
             self.host,
@@ -591,7 +594,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
     ///
     /// Returns a typed unavailable, resolution, or provenance error when the
     /// symbol's dependency closure cannot be resolved by this semantic cut.
-    pub fn get_declared_type_of_symbol(
+    pub(super) fn get_declared_type_of_symbol(
         &mut self,
         symbol: SemanticSymbolId,
     ) -> Result<TypeId, DeclaredTypeError> {
