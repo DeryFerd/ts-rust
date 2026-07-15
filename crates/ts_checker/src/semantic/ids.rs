@@ -122,6 +122,14 @@ impl<I: ArenaId, T> TypedArena<I, T> {
         id
     }
 
+    pub(super) fn try_reserve(&mut self, additional: usize) -> bool {
+        self.entries
+            .len()
+            .checked_add(additional)
+            .is_some_and(|len| u32::try_from(len).is_ok())
+            && self.entries.try_reserve(additional).is_ok()
+    }
+
     pub(super) fn get(&self, id: I) -> Option<&T> {
         (id.store() == self.store)
             .then(|| self.entries.get(id.storage_index()))

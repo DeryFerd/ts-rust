@@ -6,11 +6,13 @@ use ts_binder::{
     SemanticSymbolId, SymbolFlags,
 };
 use ts_diagnostics::{Diagnostic, message_by_code};
+use ts_jsnum::{Number, PseudoBigInt};
 
 use super::{
     CanonicalCheckerDiagnostics, CanonicalCheckerOptions, CanonicalTypeMapperStore,
     DeclaredTypeError, DeclaredTypeHost, DeclaredTypeUnavailable, TypeId, TypeResolutionTarget,
     TypeSystemPropertyName, UnsupportedDeclaredTypeKind,
+    bootstrap::LiteralTypeCacheError,
     declared::{
         cached_ordinary_type_parameter_owner, execute_type_parameter,
         explicit_type_parameter_symbols, get_declared_class_interface_or_type_parameter,
@@ -80,6 +82,11 @@ pub enum TypeNodeUnavailable {
     DiagnosticOwnerRequired(SemanticSymbolId),
     MissingPlannedTypeAlias(SemanticSymbolId),
     MissingPlannedTypeReference(NodeRef),
+    InvalidLiteralType(NodeRef),
+    MissingPlannedLiteralType(NodeRef),
+    InvalidLiteralCacheValue,
+    InvalidCachedLiteralType(TypeId),
+    LiteralTypeCapacity,
     ResolutionStackInvariant(SemanticSymbolId),
 }
 
@@ -91,10 +98,26 @@ struct TypeAliasPlan {
     type_parameter_symbols: Vec<SemanticSymbolId>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+enum PlannedLiteralType {
+    Null,
+    String(String),
+    Number {
+        value: Number,
+        unary_operand: Option<Number>,
+    },
+    BigInt {
+        value: PseudoBigInt,
+        unary_operand: Option<PseudoBigInt>,
+    },
+    Boolean(bool),
+}
+
 #[derive(Debug, Default)]
 struct TypeQueryPlan {
     aliases: BTreeMap<SemanticSymbolId, TypeAliasPlan>,
     references: BTreeMap<NodeRef, SemanticSymbolId>,
+    literals: BTreeMap<NodeRef, PlannedLiteralType>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -105,6 +128,79 @@ struct CachedTypeAlias {
 
 fn type_node_unavailable(reason: TypeNodeUnavailable) -> DeclaredTypeError {
     DeclaredTypeError::TypeNodeUnavailable(reason)
+}
+
+fn normalize_numeric_separators(text: &str) -> Option<String> {
+    if text.is_empty() || text.starts_with(['+', '-']) || text.ends_with('n') {
+        return None;
+    }
+    let radix = numeric_radix(text);
+    if !valid_numeric_separators(text, radix) {
+        return None;
+    }
+    let normalized = text.replace('_', "");
+    normalized
+        .chars()
+        .next()
+        .is_some_and(|first| first.is_ascii_digit() || first == '.')
+        .then_some(normalized)
+}
+
+fn normalize_bigint_literal(text: &str) -> Option<String> {
+    let body = text.strip_suffix('n')?;
+    if body.is_empty() || body.starts_with(['+', '-']) {
+        return None;
+    }
+    let radix = numeric_radix(body);
+    if !valid_numeric_separators(body, radix) {
+        return None;
+    }
+    let normalized = body.replace('_', "");
+    let digits = match radix {
+        2 | 8 | 16 => normalized.get(2..)?,
+        _ => normalized.as_str(),
+    };
+    if digits.is_empty()
+        || !digits.chars().all(|digit| match radix {
+            2 => matches!(digit, '0' | '1'),
+            8 => matches!(digit, '0'..='7'),
+            16 => digit.is_ascii_hexdigit(),
+            _ => digit.is_ascii_digit(),
+        })
+    {
+        return None;
+    }
+    Some(format!("{normalized}n"))
+}
+
+fn numeric_radix(text: &str) -> u32 {
+    match text.get(..2) {
+        Some("0b" | "0B") => 2,
+        Some("0o" | "0O") => 8,
+        Some("0x" | "0X") => 16,
+        _ => 10,
+    }
+}
+
+fn valid_numeric_separators(text: &str, radix: u32) -> bool {
+    let bytes = text.as_bytes();
+    bytes.iter().enumerate().all(|(index, byte)| {
+        if *byte != b'_' {
+            return true;
+        }
+        let valid_digit = |candidate: u8| match radix {
+            2 => matches!(candidate, b'0' | b'1'),
+            8 => matches!(candidate, b'0'..=b'7'),
+            16 => candidate.is_ascii_hexdigit(),
+            _ => candidate.is_ascii_digit(),
+        };
+        index
+            .checked_sub(1)
+            .and_then(|previous| bytes.get(previous))
+            .copied()
+            .is_some_and(valid_digit)
+            && bytes.get(index + 1).copied().is_some_and(valid_digit)
+    })
 }
 
 fn symbol_is_builtin_iterator_return(
@@ -256,35 +352,192 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
                 }
                 self.plan_type_node(inner)
             }
-            SyntaxKind::LiteralType => {
-                let NodeData::LiteralTypeNode(literal) = &record.data else {
-                    return Err(type_node_unavailable(
-                        TypeNodeUnavailable::UnsupportedSyntax {
-                            node,
-                            kind: record.kind,
-                        },
-                    ));
-                };
-                let literal = NodeRef::new(node.arena, node.file, literal.literal);
-                let literal_node = preflight_node(self.store, self.host, literal)?;
-                if literal_node.parent == Some(node.node)
-                    && literal_node.kind == SyntaxKind::NullKeyword
-                {
-                    Ok(())
-                } else {
-                    Err(type_node_unavailable(
-                        TypeNodeUnavailable::UnsupportedSyntax {
-                            node,
-                            kind: record.kind,
-                        },
-                    ))
-                }
-            }
+            SyntaxKind::LiteralType => self.plan_literal_type(node),
             SyntaxKind::TypeReference => self.plan_type_reference(node),
             kind => Err(type_node_unavailable(
                 TypeNodeUnavailable::UnsupportedSyntax { node, kind },
             )),
         }
+    }
+
+    #[allow(clippy::too_many_lines)] // Keeps the pinned literal grammar and provenance checks linear.
+    fn plan_literal_type(&mut self, node: NodeRef) -> Result<(), DeclaredTypeError> {
+        let record = preflight_node(self.store, self.host, node)?;
+        let NodeData::LiteralTypeNode(literal) = &record.data else {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidLiteralType(node),
+            ));
+        };
+        let literal = NodeRef::new(node.arena, node.file, literal.literal);
+        let literal_node = preflight_node(self.store, self.host, literal)?;
+        if literal_node.parent != Some(node.node) || literal_node.range != record.range {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidLiteralType(node),
+            ));
+        }
+        if literal_node.flags.0 & NODE_FLAG_JSDOC != 0 {
+            return Err(type_node_unavailable(TypeNodeUnavailable::JsDoc(literal)));
+        }
+
+        let planned = match literal_node.kind {
+            SyntaxKind::NullKeyword
+                if matches!(literal_node.data, NodeData::KeywordExpression(_)) =>
+            {
+                PlannedLiteralType::Null
+            }
+            SyntaxKind::TrueKeyword
+                if matches!(literal_node.data, NodeData::KeywordExpression(_)) =>
+            {
+                PlannedLiteralType::Boolean(true)
+            }
+            SyntaxKind::FalseKeyword
+                if matches!(literal_node.data, NodeData::KeywordExpression(_)) =>
+            {
+                PlannedLiteralType::Boolean(false)
+            }
+            SyntaxKind::StringLiteral => {
+                let NodeData::StringLiteral(data) = &literal_node.data else {
+                    unreachable!("preflight_node validates syntax-kind payloads")
+                };
+                if data.token_flags.0 != 0 {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidLiteralType(node),
+                    ));
+                }
+                PlannedLiteralType::String(data.text.clone())
+            }
+            SyntaxKind::NoSubstitutionTemplateLiteral => {
+                let NodeData::NoSubstitutionTemplateLiteral(data) = &literal_node.data else {
+                    unreachable!("preflight_node validates syntax-kind payloads")
+                };
+                if data.token_flags.0 != 0 || data.template_flags.0 != 0 {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidLiteralType(node),
+                    ));
+                }
+                PlannedLiteralType::String(data.text.clone())
+            }
+            SyntaxKind::NumericLiteral => PlannedLiteralType::Number {
+                value: self.preflight_numeric_literal(node, literal)?,
+                unary_operand: None,
+            },
+            SyntaxKind::BigIntLiteral => PlannedLiteralType::BigInt {
+                value: self.preflight_bigint_literal(node, literal)?,
+                unary_operand: None,
+            },
+            SyntaxKind::PrefixUnaryExpression => {
+                let NodeData::PrefixUnaryExpression(prefix) = &literal_node.data else {
+                    unreachable!("preflight_node validates syntax-kind payloads")
+                };
+                if prefix.operator != SyntaxKind::MinusToken {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidLiteralType(node),
+                    ));
+                }
+                let operand = NodeRef::new(node.arena, node.file, prefix.operand);
+                let operand_node = preflight_node(self.store, self.host, operand)?;
+                if operand_node.parent != Some(literal.node)
+                    || operand_node.flags.0 & NODE_FLAG_JSDOC != 0
+                {
+                    return Err(type_node_unavailable(
+                        TypeNodeUnavailable::InvalidLiteralType(node),
+                    ));
+                }
+                match operand_node.kind {
+                    SyntaxKind::NumericLiteral => {
+                        let positive = self.preflight_numeric_literal(node, operand)?;
+                        PlannedLiteralType::Number {
+                            value: -positive,
+                            unary_operand: Some(positive),
+                        }
+                    }
+                    SyntaxKind::BigIntLiteral => {
+                        let positive = self.preflight_bigint_literal(node, operand)?;
+                        PlannedLiteralType::BigInt {
+                            value: PseudoBigInt::new(&positive.base10_value, true),
+                            unary_operand: Some(positive),
+                        }
+                    }
+                    _ => {
+                        return Err(type_node_unavailable(
+                            TypeNodeUnavailable::InvalidLiteralType(node),
+                        ));
+                    }
+                }
+            }
+            _ => {
+                return Err(type_node_unavailable(
+                    TypeNodeUnavailable::InvalidLiteralType(node),
+                ));
+            }
+        };
+
+        if let Some(existing) = self.plan.literals.insert(node, planned.clone()) {
+            assert_eq!(existing, planned, "one literal type node has one value");
+        }
+        Ok(())
+    }
+
+    fn preflight_numeric_literal(
+        &self,
+        owner: NodeRef,
+        literal: NodeRef,
+    ) -> Result<Number, DeclaredTypeError> {
+        let record = preflight_node(self.store, self.host, literal)?;
+        let NodeData::NumericLiteral(data) = &record.data else {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidLiteralType(owner),
+            ));
+        };
+        if data.token_flags.0 != 0 || !self.source_spelling_matches(literal, &data.text) {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidLiteralType(owner),
+            ));
+        }
+        let normalized = normalize_numeric_separators(&data.text)
+            .ok_or_else(|| type_node_unavailable(TypeNodeUnavailable::InvalidLiteralType(owner)))?;
+        let value = ts_jsnum::from_string(&normalized);
+        if value.is_nan() {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidLiteralType(owner),
+            ));
+        }
+        Ok(value)
+    }
+
+    fn preflight_bigint_literal(
+        &self,
+        owner: NodeRef,
+        literal: NodeRef,
+    ) -> Result<PseudoBigInt, DeclaredTypeError> {
+        let record = preflight_node(self.store, self.host, literal)?;
+        let NodeData::BigIntLiteral(data) = &record.data else {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidLiteralType(owner),
+            ));
+        };
+        if data.token_flags.0 != 0 || !self.source_spelling_matches(literal, &data.text) {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidLiteralType(owner),
+            ));
+        }
+        let normalized = normalize_bigint_literal(&data.text)
+            .ok_or_else(|| type_node_unavailable(TypeNodeUnavailable::InvalidLiteralType(owner)))?;
+        Ok(PseudoBigInt::parse_valid(&normalized))
+    }
+
+    fn source_spelling_matches(&self, node: NodeRef, expected: &str) -> bool {
+        let Some((arena, _)) = self.host.source(node) else {
+            return false;
+        };
+        let Some(source) = arena.source_text() else {
+            return true;
+        };
+        let Some(record) = arena.get(node.node) else {
+            return false;
+        };
+        source.get(record.range.start.get() as usize..record.range.end.get() as usize)
+            == Some(expected)
     }
 
     fn plan_type_reference(&mut self, node: NodeRef) -> Result<(), DeclaredTypeError> {
@@ -585,6 +838,7 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
         );
         planner.plan_type_node(node)?;
         let plan = planner.finish();
+        self.prepare_literal_types(&plan)?;
         self.execute_type_node(node, &plan)
     }
 
@@ -617,7 +871,66 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
             planner.plan_type_alias(symbol)?;
         }
         let plan = planner.finish();
+        self.prepare_literal_types(&plan)?;
         self.execute_declared_type(symbol, &plan)
+    }
+
+    fn prepare_literal_types(&mut self, plan: &TypeQueryPlan) -> Result<(), DeclaredTypeError> {
+        let mut strings = Vec::new();
+        let mut numbers = Vec::new();
+        let mut bigints = Vec::new();
+        for (node, literal) in &plan.literals {
+            if self
+                .store
+                .type_node_links(*node)
+                .and_then(|links| links.resolved_type)
+                .is_some()
+            {
+                continue;
+            }
+            match literal {
+                PlannedLiteralType::String(value) => strings.push(value.clone()),
+                PlannedLiteralType::Number {
+                    value,
+                    unary_operand,
+                } => {
+                    if let Some(operand) = unary_operand {
+                        numbers.push(*operand);
+                    }
+                    numbers.push(*value);
+                }
+                PlannedLiteralType::BigInt {
+                    value,
+                    unary_operand,
+                } => {
+                    if let Some(operand) = unary_operand {
+                        bigints.push(operand.clone());
+                    }
+                    bigints.push(value.clone());
+                }
+                PlannedLiteralType::Null | PlannedLiteralType::Boolean(_) => {}
+            }
+        }
+        self.store
+            .prepare_regular_literal_types(&strings, &numbers, &bigints)
+            .map_err(Self::literal_cache_error)
+    }
+
+    fn literal_cache_error(error: LiteralTypeCacheError) -> DeclaredTypeError {
+        match error {
+            LiteralTypeCacheError::BootstrapUninitialized => DeclaredTypeError::Unavailable(
+                DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized,
+            ),
+            LiteralTypeCacheError::InvalidValue => {
+                type_node_unavailable(TypeNodeUnavailable::InvalidLiteralCacheValue)
+            }
+            LiteralTypeCacheError::InvalidCachedLiteral(literal) => {
+                type_node_unavailable(TypeNodeUnavailable::InvalidCachedLiteralType(literal))
+            }
+            LiteralTypeCacheError::Capacity => {
+                type_node_unavailable(TypeNodeUnavailable::LiteralTypeCapacity)
+            }
+        }
     }
 
     fn canonical_symbol(
@@ -821,36 +1134,97 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
                     plan,
                 )
             }
-            SyntaxKind::LiteralType => {
-                let NodeData::LiteralTypeNode(literal) = &record.data else {
-                    return Err(type_node_unavailable(
-                        TypeNodeUnavailable::UnsupportedSyntax {
-                            node,
-                            kind: record.kind,
-                        },
-                    ));
-                };
-                let literal = NodeRef::new(node.arena, node.file, literal.literal);
-                if preflight_node(self.store, self.host, literal)?.kind != SyntaxKind::NullKeyword {
-                    return Err(type_node_unavailable(
-                        TypeNodeUnavailable::UnsupportedSyntax {
-                            node,
-                            kind: record.kind,
-                        },
-                    ));
-                }
-                self.store
-                    .intrinsic_bootstrap()
-                    .map(|bootstrap| bootstrap.null_type)
-                    .ok_or(DeclaredTypeError::Unavailable(
-                        DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized,
-                    ))
-            }
+            SyntaxKind::LiteralType => self.execute_literal_type(node, plan),
             SyntaxKind::TypeReference => self.execute_type_reference(node, plan),
             kind => Err(type_node_unavailable(
                 TypeNodeUnavailable::UnsupportedSyntax { node, kind },
             )),
         }
+    }
+
+    fn execute_literal_type(
+        &mut self,
+        node: NodeRef,
+        plan: &TypeQueryPlan,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let literal = plan.literals.get(&node).cloned().ok_or_else(|| {
+            type_node_unavailable(TypeNodeUnavailable::MissingPlannedLiteralType(node))
+        })?;
+        if matches!(literal, PlannedLiteralType::Null) {
+            return self
+                .store
+                .intrinsic_bootstrap()
+                .map(|bootstrap| bootstrap.null_type)
+                .ok_or(DeclaredTypeError::Unavailable(
+                    DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized,
+                ));
+        }
+        if let Some(resolved_type) = self
+            .store
+            .type_node_links(node)
+            .and_then(|links| links.resolved_type)
+        {
+            return Ok(resolved_type);
+        }
+
+        let resolved_type = match literal {
+            PlannedLiteralType::Null => unreachable!("null returns before the non-null cache"),
+            PlannedLiteralType::String(value) => self
+                .store
+                .regular_string_literal_type(value)
+                .map_err(Self::literal_cache_error)?,
+            PlannedLiteralType::Number {
+                value,
+                unary_operand,
+            } => {
+                if let Some(operand) = unary_operand {
+                    self.store
+                        .regular_number_literal_type(operand)
+                        .map_err(Self::literal_cache_error)?;
+                }
+                self.store
+                    .regular_number_literal_type(value)
+                    .map_err(Self::literal_cache_error)?
+            }
+            PlannedLiteralType::BigInt {
+                value,
+                unary_operand,
+            } => {
+                if let Some(operand) = unary_operand {
+                    self.store
+                        .regular_bigint_literal_type(operand)
+                        .map_err(Self::literal_cache_error)?;
+                }
+                self.store
+                    .regular_bigint_literal_type(value)
+                    .map_err(Self::literal_cache_error)?
+            }
+            PlannedLiteralType::Boolean(value) => self
+                .store
+                .intrinsic_bootstrap()
+                .map(|bootstrap| {
+                    if value {
+                        bootstrap.regular_true_type
+                    } else {
+                        bootstrap.regular_false_type
+                    }
+                })
+                .ok_or(DeclaredTypeError::Unavailable(
+                    DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized,
+                ))?,
+        };
+        let mut links = self
+            .store
+            .type_node_links(node)
+            .cloned()
+            .unwrap_or_default();
+        links.resolved_type = Some(resolved_type);
+        if !self.store.set_type_node_links(node, links) {
+            return Err(type_node_unavailable(
+                TypeNodeUnavailable::InvalidLiteralType(node),
+            ));
+        }
+        Ok(resolved_type)
     }
 
     fn execute_type_reference(
@@ -964,7 +1338,8 @@ mod tests {
     use super::*;
     use crate::semantic::{
         DeclaredTypeHostError, DeclaredTypeLinks, IntrinsicBootstrapOptions, SymbolNodeLinks,
-        TypeAliasLinks, TypeNodeLinks, production::GlobalMergeCompletion,
+        TypeAliasLinks, TypeData, TypeNodeLinks, production::GlobalMergeCompletion,
+        type_records::LiteralValue,
     };
 
     struct Fixture {
@@ -973,6 +1348,9 @@ mod tests {
         files: BTreeMap<FileId, BoundFile>,
         store: CanonicalTypeMapperStore,
     }
+
+    type StoreState = (usize, usize, [usize; 26], usize, usize);
+    type LiteralState = (StoreState, usize, usize, usize);
 
     fn fixture(source: &str) -> Fixture {
         fixture_with(source, CanonicalModuleState::Script, |_| {})
@@ -1114,7 +1492,7 @@ mod tests {
         )
     }
 
-    fn store_state(store: &CanonicalTypeMapperStore) -> (usize, usize, [usize; 26], usize, usize) {
+    fn store_state(store: &CanonicalTypeMapperStore) -> StoreState {
         (
             store.type_len(),
             store.mapper_len(),
@@ -1122,6 +1500,38 @@ mod tests {
             store.type_resolution_len(),
             store.type_resolution_start(),
         )
+    }
+
+    fn literal_state(store: &CanonicalTypeMapperStore) -> LiteralState {
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        (
+            store_state(store),
+            bootstrap.string_literal_cache_len(),
+            bootstrap.number_literal_cache_len(),
+            bootstrap.bigint_literal_cache_len(),
+        )
+    }
+
+    fn assert_regular_literal(
+        store: &CanonicalTypeMapperStore,
+        regular: TypeId,
+        expected: &LiteralValue,
+    ) {
+        let TypeData::Literal(regular_data) = store.type_payload(regular).unwrap().data() else {
+            panic!("expected regular literal type")
+        };
+        assert_eq!(&regular_data.value, expected);
+        assert_eq!(regular_data.regular_type, regular);
+        let fresh = regular_data
+            .fresh_type
+            .expect("literal query creates freshness");
+        assert_ne!(fresh, regular);
+        let TypeData::Literal(fresh_data) = store.type_payload(fresh).unwrap().data() else {
+            panic!("expected fresh literal type")
+        };
+        assert_eq!(&fresh_data.value, expected);
+        assert_eq!(fresh_data.regular_type, regular);
+        assert_eq!(fresh_data.fresh_type, Some(fresh));
     }
 
     fn query_declared(
@@ -1136,6 +1546,26 @@ mod tests {
         );
         CanonicalTypeQuery::new(&mut fixture.store, &host, options, diagnostics)?
             .get_declared_type_of_symbol(symbol)
+    }
+
+    fn assert_invalid_literal_query_is_atomic(fixture: &mut Fixture) {
+        let alias = named_symbol(fixture, SyntaxKind::TypeAliasDeclaration, "Bad");
+        let before = literal_state(&fixture.store);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        assert!(matches!(
+            query_declared(
+                fixture,
+                alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::InvalidLiteralType(_)
+            ))
+        ));
+        assert_eq!(literal_state(&fixture.store), before);
+        assert!(fixture.store.type_alias_links(alias).is_none());
+        assert!(diagnostics.is_empty());
     }
 
     #[test]
@@ -1185,6 +1615,321 @@ mod tests {
         .unwrap();
         for (node, expected) in nodes {
             assert_eq!(query.get_type_from_type_node(node), Ok(expected));
+        }
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One identity matrix shares a single checker cache.
+    fn non_null_literal_nodes_use_regular_interned_identities_and_exact_fresh_links() {
+        let source = concat!(
+            "type Single = 'shared'; type Template = `shared`; ",
+            "type Thousand = 1_000; type ThousandAgain = 1000; ",
+            "type Zero = 0; type NegativeZero = -0; ",
+            "type PositiveBig = 123_456n; type PositiveBigAgain = 123456n; ",
+            "type NegativeBig = -123_456n; type ZeroBig = 0n; type NegativeZeroBig = -0n; ",
+            "type True = true; type False = false; type NullLiteral = null;",
+        );
+        let mut fixture = fixture(source);
+        let names = [
+            "Single",
+            "Template",
+            "Thousand",
+            "ThousandAgain",
+            "NegativeZero",
+            "Zero",
+            "NegativeBig",
+            "PositiveBig",
+            "PositiveBigAgain",
+            "ZeroBig",
+            "NegativeZeroBig",
+            "True",
+            "False",
+            "NullLiteral",
+        ];
+        let nodes = names
+            .iter()
+            .map(|name| (*name, alias_parts(&fixture, name).2))
+            .collect::<Vec<_>>();
+        let (zero, zero_bigint, regular_true, regular_false, null) = {
+            let bootstrap = fixture.store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.zero_type,
+                bootstrap.zero_bigint_type,
+                bootstrap.regular_true_type,
+                bootstrap.regular_false_type,
+                bootstrap.null_type,
+            )
+        };
+        let before = literal_state(&fixture.store);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut resolved = BTreeMap::new();
+        {
+            let host = post_global_host(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            );
+            let mut query = CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap();
+            for (name, node) in &nodes {
+                resolved.insert(*name, query.get_type_from_type_node(*node).unwrap());
+            }
+        }
+
+        assert_eq!(resolved["Single"], resolved["Template"]);
+        assert_eq!(resolved["Thousand"], resolved["ThousandAgain"]);
+        assert_eq!(resolved["Zero"], zero);
+        assert_eq!(resolved["NegativeZero"], zero);
+        assert_eq!(resolved["PositiveBig"], resolved["PositiveBigAgain"]);
+        assert_ne!(resolved["PositiveBig"], resolved["NegativeBig"]);
+        assert_eq!(resolved["ZeroBig"], zero_bigint);
+        assert_eq!(resolved["NegativeZeroBig"], zero_bigint);
+        assert_eq!(resolved["True"], regular_true);
+        assert_eq!(resolved["False"], regular_false);
+        assert_eq!(resolved["NullLiteral"], null);
+
+        assert_regular_literal(
+            &fixture.store,
+            resolved["Single"],
+            &LiteralValue::String("shared".into()),
+        );
+        assert_regular_literal(
+            &fixture.store,
+            resolved["Thousand"],
+            &LiteralValue::Number(Number::new(1000.0)),
+        );
+        assert_regular_literal(
+            &fixture.store,
+            zero,
+            &LiteralValue::Number(Number::new(0.0)),
+        );
+        assert_regular_literal(
+            &fixture.store,
+            resolved["PositiveBig"],
+            &LiteralValue::BigInt(PseudoBigInt::parse_valid("123456n")),
+        );
+        assert_regular_literal(
+            &fixture.store,
+            resolved["NegativeBig"],
+            &LiteralValue::BigInt(PseudoBigInt::parse_valid("-123456n")),
+        );
+        assert_regular_literal(
+            &fixture.store,
+            zero_bigint,
+            &LiteralValue::BigInt(PseudoBigInt::default()),
+        );
+
+        let after = literal_state(&fixture.store);
+        assert_eq!(after.0.0, before.0.0 + 10);
+        assert_eq!(after.1, before.1 + 1);
+        assert_eq!(after.2, before.2 + 1);
+        assert_eq!(after.3, before.3 + 2);
+        let null_node = alias_parts(&fixture, "NullLiteral").2;
+        assert!(fixture.store.type_node_links(null_node).is_none());
+        for (name, node) in &nodes {
+            if *name != "NullLiteral" {
+                assert_eq!(
+                    fixture
+                        .store
+                        .type_node_links(*node)
+                        .and_then(|links| links.resolved_type),
+                    Some(resolved[*name])
+                );
+            }
+        }
+
+        {
+            let host = post_global_host(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            );
+            let mut query = CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap();
+            for (name, node) in &nodes {
+                assert_eq!(query.get_type_from_type_node(*node), Ok(resolved[*name]));
+            }
+        }
+        assert_eq!(literal_state(&fixture.store), after);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn unary_minus_evaluates_and_interns_the_positive_operand_before_the_result() {
+        let mut bigint = fixture("type Negative = -42n;");
+        let node = alias_parts(&bigint, "Negative").2;
+        let symbol = named_symbol(&bigint, SyntaxKind::TypeAliasDeclaration, "Negative");
+        let before = literal_state(&bigint.store);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let resolved = {
+            let host = post_global_host(
+                &bigint.parsed.arena,
+                bigint.files.get(&bigint.file).unwrap(),
+            );
+            CanonicalTypeQuery::new(
+                &mut bigint.store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_declared_type_of_symbol(symbol)
+            .unwrap()
+        };
+        let after = literal_state(&bigint.store);
+        assert_eq!(after.0.0, before.0.0 + 4);
+        assert_eq!(after.3, before.3 + 2);
+        let positive = bigint
+            .store
+            .intrinsic_bootstrap()
+            .unwrap()
+            .cached_bigint_literal_type(&PseudoBigInt::parse_valid("42n"))
+            .unwrap();
+        let negative = bigint
+            .store
+            .intrinsic_bootstrap()
+            .unwrap()
+            .cached_bigint_literal_type(&PseudoBigInt::parse_valid("-42n"))
+            .unwrap();
+        assert_eq!(resolved, negative);
+        assert_eq!(
+            bigint
+                .store
+                .type_node_links(node)
+                .and_then(|links| links.resolved_type),
+            Some(negative)
+        );
+        assert_eq!(
+            bigint
+                .store
+                .type_alias_links(symbol)
+                .and_then(|links| links.declared_type),
+            Some(negative)
+        );
+        assert_ne!(positive, negative);
+        assert_regular_literal(
+            &bigint.store,
+            positive,
+            &LiteralValue::BigInt(PseudoBigInt::parse_valid("42n")),
+        );
+        assert_regular_literal(
+            &bigint.store,
+            negative,
+            &LiteralValue::BigInt(PseudoBigInt::parse_valid("-42n")),
+        );
+        assert!(diagnostics.is_empty());
+
+        let mut negative_zero = fixture("type NegativeZero = -0;");
+        let node = alias_parts(&negative_zero, "NegativeZero").2;
+        let symbol = named_symbol(
+            &negative_zero,
+            SyntaxKind::TypeAliasDeclaration,
+            "NegativeZero",
+        );
+        let zero = negative_zero.store.intrinsic_bootstrap().unwrap().zero_type;
+        let before = literal_state(&negative_zero.store);
+        let resolved = {
+            let host = post_global_host(
+                &negative_zero.parsed.arena,
+                negative_zero.files.get(&negative_zero.file).unwrap(),
+            );
+            CanonicalTypeQuery::new(
+                &mut negative_zero.store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap()
+            .get_declared_type_of_symbol(symbol)
+            .unwrap()
+        };
+        let after = literal_state(&negative_zero.store);
+        assert_eq!(resolved, zero);
+        assert_eq!(
+            negative_zero
+                .store
+                .type_node_links(node)
+                .and_then(|links| links.resolved_type),
+            Some(zero)
+        );
+        assert_eq!(after.0.0, before.0.0 + 1);
+        assert_eq!(after.2, before.2);
+        assert_regular_literal(
+            &negative_zero.store,
+            zero,
+            &LiteralValue::Number(Number::new(0.0)),
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn literal_spelling_variants_normalize_to_the_same_canonical_values() {
+        let mut fixture = fixture(concat!(
+            r#"type Escaped = "\x61"; type Plain = 'a'; type Template = `a`; "#,
+            "type Hex = 0xff; type Decimal = 255; type Binary = 0b1010; type Ten = 10; ",
+            "type Octal = 0o10; type Eight = 8; type Exponent = 1.5e2; type OneFifty = 150; ",
+            "type HexBig = 0xffn; type DecimalBig = 255n; ",
+            "type SeparatedBig = 1_000n; type ThousandBig = 1000n;",
+        ));
+        let names = [
+            "Escaped",
+            "Plain",
+            "Template",
+            "Hex",
+            "Decimal",
+            "Binary",
+            "Ten",
+            "Octal",
+            "Eight",
+            "Exponent",
+            "OneFifty",
+            "HexBig",
+            "DecimalBig",
+            "SeparatedBig",
+            "ThousandBig",
+        ];
+        let nodes = names
+            .iter()
+            .map(|name| (*name, alias_parts(&fixture, name).2))
+            .collect::<Vec<_>>();
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let mut resolved = BTreeMap::new();
+        {
+            let host = post_global_host(
+                &fixture.parsed.arena,
+                fixture.files.get(&fixture.file).unwrap(),
+            );
+            let mut query = CanonicalTypeQuery::new(
+                &mut fixture.store,
+                &host,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            )
+            .unwrap();
+            for (name, node) in nodes {
+                resolved.insert(name, query.get_type_from_type_node(node).unwrap());
+            }
+        }
+        assert_eq!(resolved["Escaped"], resolved["Plain"]);
+        assert_eq!(resolved["Plain"], resolved["Template"]);
+        for (left, right) in [
+            ("Hex", "Decimal"),
+            ("Binary", "Ten"),
+            ("Octal", "Eight"),
+            ("Exponent", "OneFifty"),
+            ("HexBig", "DecimalBig"),
+            ("SeparatedBig", "ThousandBig"),
+        ] {
+            assert_eq!(resolved[left], resolved[right], "{left} versus {right}");
         }
         assert!(diagnostics.is_empty());
     }
@@ -1821,10 +2566,68 @@ mod tests {
     }
 
     #[test]
+    fn malformed_literal_payloads_and_operators_fail_before_semantic_writes() {
+        let mut malformed_number = fixture_with_mutation("type Bad = 1;", |parsed| {
+            let numeric = parsed
+                .arena
+                .iter()
+                .find_map(|(id, node)| (node.kind == SyntaxKind::NumericLiteral).then_some(id))
+                .unwrap();
+            let NodeData::NumericLiteral(data) = &mut parsed.arena.get_mut(numeric).unwrap().data
+            else {
+                unreachable!()
+            };
+            data.text = "not-a-number".into();
+        });
+        assert_invalid_literal_query_is_atomic(&mut malformed_number);
+
+        let mut invalid_prefix = fixture_with_mutation("type Bad = -1n;", |parsed| {
+            let prefix = parsed
+                .arena
+                .iter()
+                .find_map(|(id, node)| {
+                    (node.kind == SyntaxKind::PrefixUnaryExpression).then_some(id)
+                })
+                .unwrap();
+            let NodeData::PrefixUnaryExpression(data) =
+                &mut parsed.arena.get_mut(prefix).unwrap().data
+            else {
+                unreachable!()
+            };
+            data.operator = SyntaxKind::PlusToken;
+        });
+        assert_invalid_literal_query_is_atomic(&mut invalid_prefix);
+    }
+
+    #[test]
+    fn invalid_literal_cache_links_are_rejected_atomically_before_alias_execution() {
+        let mut fixture = fixture("type Bad = 0;");
+        let zero = fixture.store.intrinsic_bootstrap().unwrap().zero_type;
+        assert!(fixture.store.set_literal_links(zero, Some(zero), zero));
+        let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "Bad");
+        let before = literal_state(&fixture.store);
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        assert_eq!(
+            query_declared(
+                &mut fixture,
+                alias,
+                CanonicalTypeQueryOptions::default(),
+                &mut diagnostics,
+            ),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::InvalidCachedLiteralType(zero)
+            ))
+        );
+        assert_eq!(literal_state(&fixture.store), before);
+        assert!(fixture.store.type_alias_links(alias).is_none());
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
     fn every_deferred_type_node_family_and_recursive_array_fail_atomically() {
         let source = concat!(
             "declare const value: string; ",
-            "type Literal = 'x'; type ArrayAlias = string[]; type TupleAlias = [string]; ",
+            "type ArrayAlias = string[]; type TupleAlias = [string]; ",
             "type UnionAlias = string | number; type IntersectionAlias = object & {}; ",
             "type ObjectAlias = { value: string }; type FunctionAlias = () => string; ",
             "type OperatorAlias = keyof object; type IndexedAlias = { a: string }['a']; ",
@@ -1835,7 +2638,6 @@ mod tests {
             "type ThisAlias = this; type RecursiveArray = RecursiveArray[];",
         );
         let aliases = [
-            "Literal",
             "ArrayAlias",
             "TupleAlias",
             "UnionAlias",

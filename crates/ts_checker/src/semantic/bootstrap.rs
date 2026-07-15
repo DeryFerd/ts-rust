@@ -15,10 +15,11 @@
 //!   The empty globals table and `globalThis` insertion performed by
 //!   `NewChecker` itself are included; resolving or augmenting that table is
 //!   not.
-//! - general literal, union, and template-literal reduction algorithms remain
-//!   outside this module. The closed bootstrap cases below encode their pinned
-//!   normalized results and seed the exact cache entries produced by upstream,
-//!   without exposing an approximate general reduction API.
+//! - union and template-literal reduction algorithms remain outside this
+//!   module. The closed bootstrap cases below encode their pinned normalized
+//!   results. Literal cache ownership stays here so the type-node query can
+//!   extend the exact upstream caches without exposing an approximate general
+//!   reduction API.
 
 use std::collections::HashMap;
 
@@ -33,7 +34,7 @@ use super::{
     relation::RelationStateSnapshot,
     signatures::{SignatureFlags, TypePredicateKind},
     store::SemanticStore,
-    type_records::{LiteralValue, RegularLiteralLink, TypeCacheState, TypeRecord},
+    type_records::{LiteralValue, RegularLiteralLink, TypeCacheState, TypeData, TypeRecord},
     types::{ObjectFlags, TypeFlags},
 };
 
@@ -203,6 +204,14 @@ impl NumberLiteralCacheKey {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum LiteralTypeCacheError {
+    BootstrapUninitialized,
+    InvalidValue,
+    InvalidCachedLiteral(TypeId),
+    Capacity,
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct TemplateLiteralCacheKey {
     texts: Vec<String>,
@@ -306,6 +315,286 @@ impl SemanticStore<TypeRecord, TypeMapper> {
     #[must_use]
     pub fn intrinsic_bootstrap(&self) -> Option<&IntrinsicBootstrap> {
         self.intrinsic_bootstrap.as_ref()
+    }
+
+    /// Reserves one dependency-closed batch of regular/fresh literal pairs.
+    ///
+    /// This is the mutation barrier for literal type-node execution. Every
+    /// existing cache entry and fresh/regular link is validated before any
+    /// semantic record is allocated, and every fallible backing allocation is
+    /// completed before the caller starts publishing query results.
+    #[allow(clippy::too_many_lines)] // One atomic reservation matrix covers all literal caches.
+    pub(super) fn prepare_regular_literal_types(
+        &mut self,
+        strings: &[String],
+        numbers: &[Number],
+        bigints: &[PseudoBigInt],
+    ) -> Result<(), LiteralTypeCacheError> {
+        if numbers.iter().any(|value| value.is_nan())
+            || bigints.iter().any(|value| {
+                value.base10_value.is_empty() && value.negative
+                    || !value.base10_value.is_empty()
+                        && (value.base10_value.starts_with('0')
+                            || !value
+                                .base10_value
+                                .bytes()
+                                .all(|digit| digit.is_ascii_digit()))
+            })
+        {
+            return Err(LiteralTypeCacheError::InvalidValue);
+        }
+        let bootstrap = self
+            .intrinsic_bootstrap
+            .as_ref()
+            .ok_or(LiteralTypeCacheError::BootstrapUninitialized)?;
+        let mut additional_types = 0usize;
+        let mut additional_strings = 0usize;
+        let mut additional_numbers = 0usize;
+        let mut additional_bigints = 0usize;
+
+        for (index, value) in strings.iter().enumerate() {
+            if strings[..index].contains(value) {
+                continue;
+            }
+            if let Some(cached) = bootstrap.cached_string_literal_type(value) {
+                additional_types = additional_types
+                    .checked_add(self.validate_regular_literal_cache_entry(
+                        cached,
+                        TypeFlags::STRING_LITERAL,
+                        &LiteralValue::String(value.clone()),
+                    )?)
+                    .ok_or(LiteralTypeCacheError::Capacity)?;
+            } else {
+                additional_types = additional_types
+                    .checked_add(2)
+                    .ok_or(LiteralTypeCacheError::Capacity)?;
+                additional_strings = additional_strings
+                    .checked_add(1)
+                    .ok_or(LiteralTypeCacheError::Capacity)?;
+            }
+        }
+        for (index, value) in numbers.iter().copied().enumerate() {
+            if numbers[..index].iter().copied().any(|candidate| {
+                NumberLiteralCacheKey::from_number(candidate)
+                    == NumberLiteralCacheKey::from_number(value)
+            }) {
+                continue;
+            }
+            if let Some(cached) = bootstrap.cached_number_literal_type(value) {
+                additional_types = additional_types
+                    .checked_add(self.validate_regular_literal_cache_entry(
+                        cached,
+                        TypeFlags::NUMBER_LITERAL,
+                        &LiteralValue::Number(value),
+                    )?)
+                    .ok_or(LiteralTypeCacheError::Capacity)?;
+            } else {
+                additional_types = additional_types
+                    .checked_add(2)
+                    .ok_or(LiteralTypeCacheError::Capacity)?;
+                additional_numbers = additional_numbers
+                    .checked_add(1)
+                    .ok_or(LiteralTypeCacheError::Capacity)?;
+            }
+        }
+        for (index, value) in bigints.iter().enumerate() {
+            if bigints[..index].contains(value) {
+                continue;
+            }
+            if let Some(cached) = bootstrap.cached_bigint_literal_type(value) {
+                additional_types = additional_types
+                    .checked_add(self.validate_regular_literal_cache_entry(
+                        cached,
+                        TypeFlags::BIG_INT_LITERAL,
+                        &LiteralValue::BigInt(value.clone()),
+                    )?)
+                    .ok_or(LiteralTypeCacheError::Capacity)?;
+            } else {
+                additional_types = additional_types
+                    .checked_add(2)
+                    .ok_or(LiteralTypeCacheError::Capacity)?;
+                additional_bigints = additional_bigints
+                    .checked_add(1)
+                    .ok_or(LiteralTypeCacheError::Capacity)?;
+            }
+        }
+
+        if !self.try_reserve_types(additional_types) {
+            return Err(LiteralTypeCacheError::Capacity);
+        }
+        let Some(bootstrap) = self.intrinsic_bootstrap.as_mut() else {
+            return Err(LiteralTypeCacheError::BootstrapUninitialized);
+        };
+        if bootstrap
+            .string_literal_types
+            .try_reserve(additional_strings)
+            .is_err()
+            || bootstrap
+                .number_literal_types
+                .try_reserve(additional_numbers)
+                .is_err()
+            || bootstrap
+                .bigint_literal_types
+                .try_reserve(additional_bigints)
+                .is_err()
+        {
+            return Err(LiteralTypeCacheError::Capacity);
+        }
+        Ok(())
+    }
+
+    pub(super) fn regular_string_literal_type(
+        &mut self,
+        value: String,
+    ) -> Result<TypeId, LiteralTypeCacheError> {
+        self.prepare_regular_literal_types(std::slice::from_ref(&value), &[], &[])?;
+        if let Some(cached) = self
+            .intrinsic_bootstrap
+            .as_ref()
+            .and_then(|bootstrap| bootstrap.cached_string_literal_type(&value))
+        {
+            return self.ensure_fresh_literal(cached);
+        }
+        let regular = self.allocate_regular_literal(
+            TypeFlags::STRING_LITERAL,
+            LiteralValue::String(value.clone()),
+        )?;
+        let bootstrap = self
+            .intrinsic_bootstrap
+            .as_mut()
+            .ok_or(LiteralTypeCacheError::BootstrapUninitialized)?;
+        let previous = bootstrap.string_literal_types.insert(value, regular);
+        if let Some(previous) = previous {
+            return Err(LiteralTypeCacheError::InvalidCachedLiteral(previous));
+        }
+        Ok(regular)
+    }
+
+    pub(super) fn regular_number_literal_type(
+        &mut self,
+        value: Number,
+    ) -> Result<TypeId, LiteralTypeCacheError> {
+        self.prepare_regular_literal_types(&[], std::slice::from_ref(&value), &[])?;
+        if let Some(cached) = self
+            .intrinsic_bootstrap
+            .as_ref()
+            .and_then(|bootstrap| bootstrap.cached_number_literal_type(value))
+        {
+            return self.ensure_fresh_literal(cached);
+        }
+        let Some(key) = NumberLiteralCacheKey::from_number(value) else {
+            return Err(LiteralTypeCacheError::InvalidValue);
+        };
+        let regular =
+            self.allocate_regular_literal(TypeFlags::NUMBER_LITERAL, LiteralValue::Number(value))?;
+        let bootstrap = self
+            .intrinsic_bootstrap
+            .as_mut()
+            .ok_or(LiteralTypeCacheError::BootstrapUninitialized)?;
+        let previous = bootstrap.number_literal_types.insert(key, regular);
+        if let Some(previous) = previous {
+            return Err(LiteralTypeCacheError::InvalidCachedLiteral(previous));
+        }
+        Ok(regular)
+    }
+
+    pub(super) fn regular_bigint_literal_type(
+        &mut self,
+        value: PseudoBigInt,
+    ) -> Result<TypeId, LiteralTypeCacheError> {
+        self.prepare_regular_literal_types(&[], &[], std::slice::from_ref(&value))?;
+        if let Some(cached) = self
+            .intrinsic_bootstrap
+            .as_ref()
+            .and_then(|bootstrap| bootstrap.cached_bigint_literal_type(&value))
+        {
+            return self.ensure_fresh_literal(cached);
+        }
+        let regular = self.allocate_regular_literal(
+            TypeFlags::BIG_INT_LITERAL,
+            LiteralValue::BigInt(value.clone()),
+        )?;
+        let bootstrap = self
+            .intrinsic_bootstrap
+            .as_mut()
+            .ok_or(LiteralTypeCacheError::BootstrapUninitialized)?;
+        bootstrap.bigint_literal_types.push((value, regular));
+        Ok(regular)
+    }
+
+    fn validate_regular_literal_cache_entry(
+        &self,
+        regular: TypeId,
+        expected_flags: TypeFlags,
+        expected_value: &LiteralValue,
+    ) -> Result<usize, LiteralTypeCacheError> {
+        let Some(regular_record) = self.type_payload(regular) else {
+            return Err(LiteralTypeCacheError::InvalidCachedLiteral(regular));
+        };
+        let TypeData::Literal(regular_data) = regular_record.data() else {
+            return Err(LiteralTypeCacheError::InvalidCachedLiteral(regular));
+        };
+        if regular_record.flags() != expected_flags
+            || &regular_data.value != expected_value
+            || regular_data.regular_type != regular
+        {
+            return Err(LiteralTypeCacheError::InvalidCachedLiteral(regular));
+        }
+        let Some(fresh) = regular_data.fresh_type else {
+            return Ok(1);
+        };
+        let Some(fresh_record) = self.type_payload(fresh) else {
+            return Err(LiteralTypeCacheError::InvalidCachedLiteral(regular));
+        };
+        let TypeData::Literal(fresh_data) = fresh_record.data() else {
+            return Err(LiteralTypeCacheError::InvalidCachedLiteral(regular));
+        };
+        if fresh == regular
+            || fresh_record.flags() != expected_flags
+            || &fresh_data.value != expected_value
+            || fresh_data.fresh_type != Some(fresh)
+            || fresh_data.regular_type != regular
+        {
+            return Err(LiteralTypeCacheError::InvalidCachedLiteral(regular));
+        }
+        Ok(0)
+    }
+
+    fn allocate_regular_literal(
+        &mut self,
+        flags: TypeFlags,
+        value: LiteralValue,
+    ) -> Result<TypeId, LiteralTypeCacheError> {
+        let Some(regular) = self.alloc_literal_type(flags, value, RegularLiteralLink::SelfType)
+        else {
+            return Err(LiteralTypeCacheError::InvalidValue);
+        };
+        self.ensure_fresh_literal(regular)
+    }
+
+    fn ensure_fresh_literal(&mut self, regular: TypeId) -> Result<TypeId, LiteralTypeCacheError> {
+        let (flags, value, fresh) = {
+            let Some(record) = self.type_payload(regular) else {
+                return Err(LiteralTypeCacheError::InvalidCachedLiteral(regular));
+            };
+            let TypeData::Literal(data) = record.data() else {
+                return Err(LiteralTypeCacheError::InvalidCachedLiteral(regular));
+            };
+            (record.flags(), data.value.clone(), data.fresh_type)
+        };
+        if fresh.is_some() {
+            return Ok(regular);
+        }
+        let Some(fresh) = self.alloc_literal_type(flags, value, RegularLiteralLink::Type(regular))
+        else {
+            return Err(LiteralTypeCacheError::InvalidCachedLiteral(regular));
+        };
+        if !self.set_literal_links(fresh, Some(fresh), regular)
+            || !self.set_literal_links(regular, Some(fresh), regular)
+        {
+            return Err(LiteralTypeCacheError::InvalidCachedLiteral(regular));
+        }
+        Ok(regular)
     }
 
     /// Initializes the exact dependency-closed intrinsic set once.
@@ -443,13 +732,13 @@ impl SemanticStore<TypeRecord, TypeMapper> {
 }
 
 impl IntrinsicBootstrap {
-    /// Looks up the exact string-literal cache populated during bootstrap.
+    /// Looks up the exact checker-owned string-literal cache.
     #[must_use]
     pub fn cached_string_literal_type(&self, value: &str) -> Option<TypeId> {
         self.string_literal_types.get(value).copied()
     }
 
-    /// Looks up the exact number-literal cache populated during bootstrap.
+    /// Looks up the exact checker-owned number-literal cache.
     ///
     /// NaN is absent because pinned `NewChecker` does not initialize `nanType`.
     #[must_use]
@@ -458,7 +747,7 @@ impl IntrinsicBootstrap {
             .and_then(|key| self.number_literal_types.get(&key).copied())
     }
 
-    /// Looks up the exact bigint-literal cache populated during bootstrap.
+    /// Looks up the exact checker-owned bigint-literal cache.
     #[must_use]
     pub fn cached_bigint_literal_type(&self, value: &PseudoBigInt) -> Option<TypeId> {
         self.bigint_literal_types
@@ -488,19 +777,19 @@ impl IntrinsicBootstrap {
         })
     }
 
-    /// Number of string-literal entries seeded by pinned bootstrap calls.
+    /// Number of checker-owned string-literal cache entries.
     #[must_use]
     pub fn string_literal_cache_len(&self) -> usize {
         self.string_literal_types.len()
     }
 
-    /// Number of number-literal entries seeded by pinned bootstrap calls.
+    /// Number of checker-owned number-literal cache entries.
     #[must_use]
     pub fn number_literal_cache_len(&self) -> usize {
         self.number_literal_types.len()
     }
 
-    /// Number of bigint-literal entries seeded by pinned bootstrap calls.
+    /// Number of checker-owned bigint-literal cache entries.
     #[must_use]
     pub fn bigint_literal_cache_len(&self) -> usize {
         self.bigint_literal_types.len()

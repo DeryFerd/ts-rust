@@ -459,6 +459,10 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.types.len()
     }
 
+    pub(super) fn try_reserve_types(&mut self, additional: usize) -> bool {
+        self.types.try_reserve(additional)
+    }
+
     #[must_use]
     pub fn types(&self) -> impl ExactSizeIterator<Item = (TypeId, &TypePayload)> {
         self.types.iter()
