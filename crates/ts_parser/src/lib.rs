@@ -71,6 +71,28 @@ pub struct ParseResult {
     pub amd_module_names: Vec<AmdModuleName>,
 }
 
+/// A parser-validated standalone `Identifier | QualifiedName` tree.
+///
+/// Construction is sealed so downstream semantic stores can trust that the
+/// complete input was parsed in JavaScript context without diagnostics.
+#[derive(Debug)]
+pub struct IsolatedEntityName {
+    arena: NodeArena,
+    root: NodeId,
+}
+
+impl IsolatedEntityName {
+    #[must_use]
+    pub const fn arena(&self) -> &NodeArena {
+        &self.arena
+    }
+
+    #[must_use]
+    pub const fn root(&self) -> NodeId {
+        self.root
+    }
+}
+
 /// One leading `amd-dependency` triple-slash directive.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AmdDependency {
@@ -110,6 +132,15 @@ pub fn parse_jsx_source_file(source: &str) -> ParseResult {
 #[must_use]
 pub fn parse_javascript_source_file(source: &str) -> ParseResult {
     Parser::new_with_variant_and_javascript(source, LanguageVariant::Jsx, true).parse_source_file()
+}
+
+/// Parses one complete entity name using the pinned checker's isolated JS
+/// grammar. Reserved words are accepted as identifier names, while trailing
+/// tokens and every scanner or parser diagnostic reject the entire result.
+#[must_use]
+pub fn parse_isolated_entity_name(source: &str) -> Option<IsolatedEntityName> {
+    Parser::new_with_variant_and_javascript(source, LanguageVariant::Standard, true)
+        .parse_isolated_entity_name()
 }
 
 fn parse_amd_pragmas(source: &str) -> (Vec<AmdDependency>, Vec<AmdModuleName>, Vec<Diagnostic>) {
@@ -9321,6 +9352,31 @@ impl<'a> Parser<'a> {
     }
 }
 
+impl Parser<'_> {
+    fn parse_isolated_entity_name(mut self) -> Option<IsolatedEntityName> {
+        let entity = self.parse_entity_name(true);
+
+        if self.current.kind != SyntaxKind::EndOfFile
+            || !self.diagnostics.is_empty()
+            || !self.scanner.diagnostics().is_empty()
+        {
+            return None;
+        }
+
+        for index in 0..self.arena.len() {
+            let index = u32::try_from(index).expect("AST node arena exceeds u32::MAX nodes");
+            self.arena
+                .get_mut(NodeId::new(index))
+                .expect("allocated entity-name node exists")
+                .flags = NodeFlags::JAVASCRIPT_FILE;
+        }
+        Some(IsolatedEntityName {
+            arena: self.arena,
+            root: entity,
+        })
+    }
+}
+
 fn extend_list_children(children: &mut Vec<NodeId>, list: Option<&NodeList>) {
     if let Some(list) = list {
         children.extend(list.nodes.iter().copied());
@@ -9615,9 +9671,70 @@ mod tests {
 
     use super::{
         NODE_FLAG_AWAIT_USING, NODE_FLAG_HAS_ERROR, NODE_FLAG_USING, ParseResult,
-        parse_javascript_source_file, parse_jsdoc_comment, parse_jsx_source_file,
-        parse_source_file, text_range,
+        parse_isolated_entity_name, parse_javascript_source_file, parse_jsdoc_comment,
+        parse_jsx_source_file, parse_source_file, text_range,
     };
+
+    #[test]
+    fn parses_exact_isolated_entity_names_in_javascript_context() {
+        let parsed = parse_isolated_entity_name("default . Namespace.createElement").unwrap();
+        assert_eq!(
+            parsed.arena().source_text(),
+            Some("default . Namespace.createElement")
+        );
+        assert_eq!(parsed.arena().len(), 5);
+        for (_, node) in parsed.arena().iter() {
+            assert_eq!(node.flags, NodeFlags::JAVASCRIPT_FILE);
+        }
+
+        let root = parsed.arena().get(parsed.root()).unwrap();
+        assert_eq!(root.kind, SyntaxKind::QualifiedName);
+        assert_eq!(root.parent, None);
+        let NodeData::QualifiedName(root) = &root.data else {
+            panic!("isolated dotted name must produce a QualifiedName")
+        };
+        let right_node = parsed.arena().get(root.right).unwrap();
+        let NodeData::Identifier(right) = &right_node.data else {
+            panic!("qualified-name right side must be an Identifier")
+        };
+        assert_eq!(right.text, "createElement");
+        assert_eq!(right.flow_node, None);
+        assert_eq!(right_node.parent, Some(parsed.root()));
+
+        for valid in [
+            "default",
+            "default.class",
+            "await.yield",
+            "R\\u0065act.createElement",
+        ] {
+            assert!(
+                parse_isolated_entity_name(valid).is_some(),
+                "{valid:?} is an IdentifierName chain in isolated JS context"
+            );
+        }
+    }
+
+    #[test]
+    fn isolated_entity_names_require_clean_complete_input() {
+        for invalid in [
+            "",
+            " ",
+            ".React",
+            "React.",
+            "React..factory",
+            "React factory",
+            "React.createElement()",
+            "1React",
+            "#private",
+            "React.\\u{notHex}",
+        ] {
+            assert_eq!(
+                parse_isolated_entity_name(invalid).map(|parsed| parsed.root()),
+                None,
+                "{invalid:?} must not produce a sealed entity name",
+            );
+        }
+    }
 
     #[test]
     fn parses_leading_amd_pragmas_and_reports_duplicate_module_names() {

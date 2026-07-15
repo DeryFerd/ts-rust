@@ -1065,15 +1065,18 @@ fn empty_signature(
 mod tests {
     use std::collections::HashSet;
 
-    use ts_ast::{FileId, IdentifierData, Node, NodeArena, NodeData, NodeFlags, SyntaxKind};
+    use ts_ast::{FileId, NodeRef, SyntaxKind};
     use ts_binder::{
         AstScope, CheckFlags, EscapedName, InternalSymbolName, SymbolData, SymbolFlags, SymbolStore,
     };
-    use ts_core::TextRange;
     use ts_parser::parse_source_file;
 
     use super::*;
-    use crate::semantic::type_records::{LiteralTypeData, TypeData};
+    use crate::semantic::{
+        AliasSymbolLinks, AliasTargetState, DecoratorSignatureState, EffectsSignatureState,
+        ResolvedSignatureState, SignatureLinks,
+        type_records::{LiteralTypeData, TypeData},
+    };
 
     type TestStore = SemanticStore<TypeRecord, TypeMapper>;
 
@@ -1081,6 +1084,68 @@ mod tests {
         let mut store = TestStore::new();
         store.initialize_intrinsic_bootstrap(options).unwrap();
         store
+    }
+
+    #[test]
+    fn sparse_links_canonicalize_bootstrap_sentinel_id_encodings() {
+        let mut store = initialized(IntrinsicBootstrapOptions::default());
+        let (resolving_signature, unknown_signature, any_signature, unknown_symbol) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.resolving_signature,
+                bootstrap.unknown_signature,
+                bootstrap.any_signature,
+                bootstrap.unknown_symbol,
+            )
+        };
+        let parsed = parse_source_file("factory();");
+        let file = FileId::new(91);
+        assert!(
+            store
+                .register_source_file(&parsed.arena, parsed.source_file, file)
+                .is_some()
+        );
+        let call = parsed
+            .arena
+            .iter()
+            .find_map(|(id, node)| (node.kind == SyntaxKind::CallExpression).then_some(id))
+            .unwrap();
+        let call = NodeRef::new(parsed.arena.id(), file, call);
+
+        assert!(store.set_signature_links(
+            call,
+            SignatureLinks {
+                resolved_signature: ResolvedSignatureState::Resolved(resolving_signature),
+                effects_signature: EffectsSignatureState::Resolved(unknown_signature),
+                decorator_signature: DecoratorSignatureState::Resolved(any_signature),
+            }
+        ));
+        assert_eq!(
+            store.signature_links(call),
+            Some(&SignatureLinks {
+                resolved_signature: ResolvedSignatureState::Resolving,
+                effects_signature: EffectsSignatureState::NoEffects,
+                decorator_signature: DecoratorSignatureState::NotApplicable,
+            })
+        );
+
+        let alias = store
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::ALIAS,
+                EscapedName::source("alias"),
+            ))
+            .unwrap();
+        assert!(store.set_alias_symbol_links(
+            alias,
+            AliasSymbolLinks {
+                alias_target: AliasTargetState::Resolved(unknown_symbol),
+                ..AliasSymbolLinks::default()
+            }
+        ));
+        assert_eq!(
+            store.alias_symbol_links(alias).unwrap().alias_target,
+            AliasTargetState::Unknown
+        );
     }
 
     fn record(store: &TestStore, id: TypeId) -> &TypeRecord {
@@ -2069,11 +2134,11 @@ mod tests {
     #[allow(clippy::too_many_lines)] // Exercises every disjoint checker-owned side store.
     fn sparse_links_and_resolution_state_reject_bootstrap_atomically() {
         let options = IntrinsicBootstrapOptions::default();
-        let parsed = parse_source_file("const linked = 1;");
+        let parsed = parse_source_file(
+            "enum E { A } const asserted = value as string; const array = [...items]; \
+             switch (value) { case 0: break; } factory();",
+        );
         let file = FileId::new(0);
-        let scope = AstScope::new(file, &parsed.arena);
-        let (node, _) = parsed.arena.iter().next().unwrap();
-        let node = scope.node_ref(node).unwrap();
         let mut symbols = SymbolStore::new();
         let linked_symbol = symbols
             .alloc_symbol(SymbolData::new(
@@ -2085,31 +2150,27 @@ mod tests {
         let source_file = linked
             .register_source_file(&parsed.arena, parsed.source_file, file)
             .unwrap();
-        let mut entity_arena = NodeArena::new();
-        let entity_root = entity_arena.alloc(Node {
-            kind: SyntaxKind::Identifier,
-            flags: NodeFlags::default(),
-            range: TextRange::default(),
-            parent: None,
-            data: NodeData::Identifier(Box::new(IdentifierData {
-                flow_node: None,
-                text: "factory".into(),
-            })),
-        });
-        assert!(
-            linked
-                .register_entity_name(&entity_arena, entity_root)
-                .is_some()
-        );
+        let node = source_file.node_ref();
+        let node_of_kind = |kind| {
+            let node = parsed
+                .arena
+                .iter()
+                .find_map(|(id, node)| (node.kind == kind).then_some(id))
+                .unwrap_or_else(|| panic!("parsed source must contain {kind:?}"));
+            NodeRef::new(parsed.arena.id(), file, node)
+        };
+        assert!(linked.register_entity_name_text("factory").is_some());
         assert!(linked.ensure_node_links(node));
         assert!(linked.ensure_symbol_node_links(node));
         assert!(linked.ensure_type_node_links(node));
-        assert!(linked.ensure_enum_member_links(node));
-        assert!(linked.ensure_assertion_links(node));
-        assert!(linked.ensure_array_literal_links(node));
-        assert!(linked.ensure_switch_statement_links(node));
+        assert!(linked.ensure_enum_member_links(node_of_kind(SyntaxKind::EnumMember)));
+        assert!(linked.ensure_assertion_links(node_of_kind(SyntaxKind::AsExpression)));
+        assert!(
+            linked.ensure_array_literal_links(node_of_kind(SyntaxKind::ArrayLiteralExpression))
+        );
+        assert!(linked.ensure_switch_statement_links(node_of_kind(SyntaxKind::SwitchStatement)));
         assert!(linked.ensure_jsx_element_links(node));
-        assert!(linked.ensure_signature_links(node));
+        assert!(linked.ensure_signature_links(node_of_kind(SyntaxKind::CallExpression)));
         assert!(linked.ensure_symbol_reference_links(linked_symbol));
         assert!(linked.ensure_value_symbol_links(linked_symbol));
         assert!(linked.ensure_mapped_symbol_links(linked_symbol));

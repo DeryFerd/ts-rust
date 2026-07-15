@@ -90,6 +90,9 @@ impl NodeData {
 impl NodeFlags {
     /// The parser synthesized this node while representing source grammar.
     pub const REPARSED: Self = Self(1 << 3);
+
+    /// The node was parsed in JavaScript source context.
+    pub const JAVASCRIPT_FILE: Self = Self(1 << 16);
 }
 
 impl ModifierFlags {

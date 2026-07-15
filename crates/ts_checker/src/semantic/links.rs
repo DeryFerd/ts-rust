@@ -91,6 +91,17 @@ impl NodeCheckFlags {
     pub const IN_CHECK_IDENTIFIER: Self = Self(1 << 22);
     pub const INITIALIZER_IS_UNDEFINED: Self = Self(1 << 24);
     pub const INITIALIZER_IS_UNDEFINED_COMPUTED: Self = Self(1 << 25);
+    pub const ALL_DEFINED: Self = Self(
+        Self::TYPE_CHECKED.0
+            | Self::CONTEXT_CHECKED.0
+            | Self::ENUM_VALUES_COMPUTED.0
+            | Self::ASSIGNMENTS_MARKED.0
+            | Self::CONTAINS_CLASS_WITH_PRIVATE_IDENTIFIERS.0
+            | Self::CONTAINS_SUPER_PROPERTY_IN_STATIC_INITIALIZER.0
+            | Self::IN_CHECK_IDENTIFIER.0
+            | Self::INITIALIZER_IS_UNDEFINED.0
+            | Self::INITIALIZER_IS_UNDEFINED_COMPUTED.0,
+    );
 
     #[must_use]
     pub const fn bits(self) -> u32 {
@@ -105,6 +116,15 @@ impl NodeCheckFlags {
     #[must_use]
     pub const fn intersects(self, other: Self) -> bool {
         self.0 & other.0 != 0
+    }
+
+    pub(super) const fn has_only_defined_bits(self) -> bool {
+        self.0 & !Self::ALL_DEFINED.0 == 0
+    }
+
+    #[cfg(test)]
+    pub(super) const fn from_bits_retain(bits: u32) -> Self {
+        Self(bits)
     }
 }
 
@@ -140,7 +160,7 @@ impl Not for NodeCheckFlags {
     type Output = Self;
 
     fn not(self) -> Self::Output {
-        Self(!self.0)
+        Self(!self.0 & Self::ALL_DEFINED.0)
     }
 }
 
@@ -672,6 +692,7 @@ impl ExternalEmitHelpers {
     pub const PROP_KEY: Self = Self(1 << 17);
     pub const ADD_DISPOSABLE_RESOURCE_AND_DISPOSE_RESOURCES: Self = Self(1 << 18);
     pub const REWRITE_RELATIVE_IMPORT_EXTENSION: Self = Self(1 << 19);
+    pub const ALL_DEFINED: Self = Self((1 << 20) - 1);
 
     pub const ES_DECORATE_AND_RUN_INITIALIZERS: Self = Self::DECORATE;
     pub const FIRST_EMIT_HELPER: Self = Self::REST;
@@ -694,6 +715,15 @@ impl ExternalEmitHelpers {
     #[must_use]
     pub const fn intersects(self, other: Self) -> bool {
         self.0 & other.0 != 0
+    }
+
+    pub(super) const fn has_only_defined_bits(self) -> bool {
+        self.0 & !Self::ALL_DEFINED.0 == 0
+    }
+
+    #[cfg(test)]
+    pub(super) const fn from_bits_retain(bits: u32) -> Self {
+        Self(bits)
     }
 }
 
@@ -729,7 +759,7 @@ impl Not for ExternalEmitHelpers {
     type Output = Self;
 
     fn not(self) -> Self::Output {
-        Self(!self.0)
+        Self(!self.0 & Self::ALL_DEFINED.0)
     }
 }
 
@@ -1375,6 +1405,11 @@ mod tests {
         assert!(combined.contains(NodeCheckFlags::TYPE_CHECKED));
         assert!(combined.intersects(NodeCheckFlags::CONTEXT_CHECKED));
         assert_eq!((combined & !NodeCheckFlags::TYPE_CHECKED).bits(), 1 << 6);
+        assert_eq!(!NodeCheckFlags::NONE, NodeCheckFlags::ALL_DEFINED);
+        assert_eq!((!NodeCheckFlags::ALL_DEFINED).bits(), 0);
+        let undefined = NodeCheckFlags::from_bits_retain(1 << 2);
+        assert!(!undefined.has_only_defined_bits());
+        assert_eq!(!undefined, NodeCheckFlags::ALL_DEFINED);
     }
 
     #[test]
@@ -1554,6 +1589,11 @@ mod tests {
         let mut requested = ExternalEmitHelpers::REST | ExternalEmitHelpers::IMPORT_STAR;
         requested &= !ExternalEmitHelpers::REST;
         assert_eq!(requested, ExternalEmitHelpers::IMPORT_STAR);
+        assert_eq!(!ExternalEmitHelpers::NONE, ExternalEmitHelpers::ALL_DEFINED);
+        assert_eq!((!ExternalEmitHelpers::ALL_DEFINED).bits(), 0);
+        let undefined = ExternalEmitHelpers::from_bits_retain(1 << 31);
+        assert!(!undefined.has_only_defined_bits());
+        assert_eq!(!undefined, ExternalEmitHelpers::ALL_DEFINED);
     }
 
     #[test]

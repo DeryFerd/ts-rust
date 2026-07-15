@@ -5,12 +5,13 @@ use std::{
     num::NonZeroU32,
 };
 
-use ts_ast::{FileId, NodeArena, NodeArenaId, NodeData, NodeFlags, NodeId, NodeRef, SyntaxKind};
+use ts_ast::{FileId, NodeArena, NodeArenaId, NodeData, NodeId, NodeRef, SyntaxKind};
 use ts_binder::{
     AstScope, CheckFlags, EscapedName, SemanticStoreId, SemanticSymbolId, SymbolData, SymbolFlags,
     SymbolStore, SymbolTableId,
     semantic::{Symbol, SymbolTable},
 };
+use ts_parser::{IsolatedEntityName, parse_isolated_entity_name};
 
 use super::{
     bootstrap::IntrinsicBootstrap,
@@ -19,15 +20,16 @@ use super::{
         TypePredicateId, TypedArena,
     },
     links::{
-        AliasSymbolLinks, ArrayLiteralLinks, AssertionLinks, CheckerLinkStores,
-        ContainingSymbolLinks, DeclaredTypeLinks, DeferredSymbolLinks, EntityNameNode,
-        EntityNameRef, EnumMemberLinks, ExportTypeLinks, ExtendedContainersState, JsxElementLinks,
-        LateBoundLinks, MappedSymbolLinks, MarkedAssignmentSymbolLinks, MembersAndExportsLinks,
-        ModuleSymbolLinks, NodeLinks, OptionalSymbolSequence, ReverseMappedSymbolLinks,
-        SignatureLinks, SourceFileLinks, SourceFileRef, SpreadLinks, SwitchStatementLinks,
-        SymbolNodeLinks, SymbolReferenceLinks, TypeAliasLinks, TypeNodeLinks,
-        TypeResolutionBoundary, TypeResolutionStack, TypeResolutionTarget,
-        TypeResolutionTargetError, TypeSystemPropertyName, ValueSymbolLinks, VarianceLinks,
+        AliasSymbolLinks, AliasTargetState, ArrayLiteralLinks, AssertionLinks, CheckerLinkStores,
+        ContainingSymbolLinks, DeclaredTypeLinks, DecoratorSignatureState, DeferredSymbolLinks,
+        EffectsSignatureState, EntityNameNode, EntityNameRef, EnumMemberLinks, ExportTypeLinks,
+        ExtendedContainersState, JsxElementLinks, LateBoundLinks, MappedSymbolLinks,
+        MarkedAssignmentSymbolLinks, MembersAndExportsLinks, ModuleSymbolLinks, NodeLinks,
+        OptionalSymbolSequence, ResolvedSignatureState, ReverseMappedSymbolLinks, SignatureLinks,
+        SourceFileLinks, SourceFileRef, SpreadLinks, SwitchStatementLinks, SymbolNodeLinks,
+        SymbolReferenceLinks, TypeAliasLinks, TypeNodeLinks, TypeResolutionBoundary,
+        TypeResolutionStack, TypeResolutionTarget, TypeResolutionTargetError,
+        TypeSystemPropertyName, ValueSymbolLinks, VarianceLinks,
     },
     relation::{RelationCaches, RelationComparisonResult, RelationKind, RelationStateSnapshot},
     signatures::{
@@ -69,6 +71,7 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     entity_names: Vec<EntityNameNode>,
     source_files: BTreeMap<FileId, SourceFileRef>,
     source_files_by_arena: BTreeMap<NodeArenaId, SourceFileRef>,
+    source_node_kinds: BTreeMap<NodeArenaId, Vec<Option<SyntaxKind>>>,
     links: CheckerLinkStores,
     type_resolutions: TypeResolutionStack,
     relations: RelationCaches,
@@ -112,6 +115,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             entity_names: Vec::new(),
             source_files: BTreeMap::new(),
             source_files_by_arena: BTreeMap::new(),
+            source_node_kinds: BTreeMap::new(),
             links: CheckerLinkStores::default(),
             type_resolutions: TypeResolutionStack::new(id),
             relations: RelationCaches::default(),
@@ -153,6 +157,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         }
 
         let source = SourceFileRef::new(NodeRef::new(arena.id(), file, source_file));
+        let node_kinds = Self::validated_source_node_kinds(arena, source_file)?;
         if self
             .source_files
             .get(&file)
@@ -161,6 +166,13 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 .source_files_by_arena
                 .get(&arena.id())
                 .is_some_and(|registered| *registered != source)
+            || self
+                .source_node_kinds
+                .get(&arena.id())
+                .is_some_and(|registered| {
+                    node_kinds.len() < registered.len()
+                        || node_kinds[..registered.len()] != registered[..]
+                })
         {
             return None;
         }
@@ -170,25 +182,33 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         }
         self.source_files.insert(file, source);
         self.source_files_by_arena.insert(arena.id(), source);
+        self.source_node_kinds.insert(arena.id(), node_kinds);
         Some(source)
     }
 
-    /// Copies one exact standalone `Identifier | QualifiedName` tree into the
-    /// checker-owned synthetic entity-name arena.
+    /// Parses and copies one exact standalone `Identifier | QualifiedName`
+    /// tree into the checker-owned synthetic entity-name arena.
     ///
-    /// The entire kind/data/parent/child closure is preflighted before any
-    /// semantic allocation, matching the fresh AST returned by pinned
-    /// `parser.ParseIsolatedEntityName` without fabricating a source-file
-    /// [`NodeRef`].
+    /// Parsing uses the pinned JavaScript-context isolated grammar and rejects
+    /// trailing tokens or diagnostics before any semantic allocation.
     ///
     /// # Panics
     ///
     /// Panics if the checker-owned entity-name identity space is exhausted.
-    pub fn register_entity_name(
+    pub fn register_entity_name_text(&mut self, text: &str) -> Option<EntityNameRef> {
+        let parsed = parse_isolated_entity_name(text)?;
+        self.register_parsed_entity_name(&parsed)
+    }
+
+    /// Copies one sealed parser result after preflighting its full closure.
+    pub fn register_parsed_entity_name(
         &mut self,
-        arena: &NodeArena,
-        root: NodeId,
+        parsed: &IsolatedEntityName,
     ) -> Option<EntityNameRef> {
+        self.register_entity_name(parsed.arena(), parsed.root())
+    }
+
+    fn register_entity_name(&mut self, arena: &NodeArena, root: NodeId) -> Option<EntityNameRef> {
         let mut visited = HashSet::new();
         let prepared = Self::prepare_entity_name(arena, root, None, &mut visited)?;
         self.entity_names
@@ -234,7 +254,9 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             return None;
         }
         let node_data = arena.get(node)?;
-        if node_data.parent != expected_parent || node_data.flags != NodeFlags::default() {
+        if node_data.parent != expected_parent
+            || node_data.flags != ts_ast::NodeFlags::JAVASCRIPT_FILE
+        {
             return None;
         }
         match (&node_data.kind, &node_data.data) {
@@ -488,7 +510,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     }
 
     pub fn set_node_links(&mut self, node: NodeRef, links: NodeLinks) -> bool {
-        if !self.contains_node_ref(node) {
+        if !self.contains_node_ref(node) || !links.flags.has_only_defined_bits() {
             return false;
         }
         self.links.node.replace_key(node, links);
@@ -546,13 +568,13 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
 
     #[must_use]
     pub fn enum_member_links(&self, node: NodeRef) -> Option<&EnumMemberLinks> {
-        self.contains_node_ref(node)
+        self.node_has_kind(node, |kind| kind == SyntaxKind::EnumMember)
             .then(|| self.links.enum_member.try_get(&node))
             .flatten()
     }
 
     pub fn ensure_enum_member_links(&mut self, node: NodeRef) -> bool {
-        if !self.contains_node_ref(node) {
+        if !self.node_has_kind(node, |kind| kind == SyntaxKind::EnumMember) {
             return false;
         }
         self.links.enum_member.get(node);
@@ -560,7 +582,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     }
 
     pub fn set_enum_member_links(&mut self, node: NodeRef, links: EnumMemberLinks) -> bool {
-        if !self.contains_node_ref(node) {
+        if !self.node_has_kind(node, |kind| kind == SyntaxKind::EnumMember) {
             return false;
         }
         self.links.enum_member.replace_key(node, links);
@@ -569,21 +591,38 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
 
     #[must_use]
     pub fn signature_links(&self, node: NodeRef) -> Option<&SignatureLinks> {
-        self.contains_node_ref(node)
+        self.node_has_kind(node, Self::is_signature_link_kind)
             .then(|| self.links.signature.try_get(&node))
             .flatten()
     }
 
     pub fn ensure_signature_links(&mut self, node: NodeRef) -> bool {
-        if !self.contains_node_ref(node) {
+        if !self.node_has_kind(node, Self::is_signature_link_kind) {
             return false;
         }
         self.links.signature.get(node);
         true
     }
 
-    pub fn set_signature_links(&mut self, node: NodeRef, links: SignatureLinks) -> bool {
-        if !self.contains_node_ref(node)
+    pub fn set_signature_links(&mut self, node: NodeRef, mut links: SignatureLinks) -> bool {
+        if let Some(bootstrap) = &self.intrinsic_bootstrap {
+            if links.resolved_signature
+                == ResolvedSignatureState::Resolved(bootstrap.resolving_signature)
+            {
+                links.resolved_signature = ResolvedSignatureState::Resolving;
+            }
+            if links.effects_signature
+                == EffectsSignatureState::Resolved(bootstrap.unknown_signature)
+            {
+                links.effects_signature = EffectsSignatureState::NoEffects;
+            }
+            if links.decorator_signature
+                == DecoratorSignatureState::Resolved(bootstrap.any_signature)
+            {
+                links.decorator_signature = DecoratorSignatureState::NotApplicable;
+            }
+        }
+        if !self.node_has_kind(node, Self::is_signature_link_kind)
             || !self.valid_optional_signature(links.resolved_signature.signature())
             || !self.valid_optional_signature(links.effects_signature.signature())
             || !self.valid_optional_signature(links.decorator_signature.signature())
@@ -679,8 +718,13 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     pub fn set_alias_symbol_links(
         &mut self,
         symbol: SemanticSymbolId,
-        links: AliasSymbolLinks,
+        mut links: AliasSymbolLinks,
     ) -> bool {
+        if let Some(bootstrap) = &self.intrinsic_bootstrap
+            && links.alias_target == AliasTargetState::Resolved(bootstrap.unknown_symbol)
+        {
+            links.alias_target = AliasTargetState::Unknown;
+        }
         if !self.symbols.contains_symbol(symbol)
             || !self.valid_optional_symbol(links.immediate_target)
             || !self.valid_optional_symbol(links.alias_target.symbol())
@@ -758,13 +802,23 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
 
     #[must_use]
     pub fn assertion_links(&self, node: NodeRef) -> Option<&AssertionLinks> {
-        self.contains_node_ref(node)
-            .then(|| self.links.assertion.try_get(&node))
-            .flatten()
+        self.node_has_kind(node, |kind| {
+            matches!(
+                kind,
+                SyntaxKind::TypeAssertionExpression | SyntaxKind::AsExpression
+            )
+        })
+        .then(|| self.links.assertion.try_get(&node))
+        .flatten()
     }
 
     pub fn ensure_assertion_links(&mut self, node: NodeRef) -> bool {
-        if !self.contains_node_ref(node) {
+        if !self.node_has_kind(node, |kind| {
+            matches!(
+                kind,
+                SyntaxKind::TypeAssertionExpression | SyntaxKind::AsExpression
+            )
+        }) {
             return false;
         }
         self.links.assertion.get(node);
@@ -772,7 +826,13 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     }
 
     pub fn set_assertion_links(&mut self, node: NodeRef, links: AssertionLinks) -> bool {
-        if !self.contains_node_ref(node) || !self.valid_optional_type(links.expr_type) {
+        if !self.node_has_kind(node, |kind| {
+            matches!(
+                kind,
+                SyntaxKind::TypeAssertionExpression | SyntaxKind::AsExpression
+            )
+        }) || !self.valid_optional_type(links.expr_type)
+        {
             return false;
         }
         self.links.assertion.replace_key(node, links);
@@ -781,13 +841,13 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
 
     #[must_use]
     pub fn array_literal_links(&self, node: NodeRef) -> Option<&ArrayLiteralLinks> {
-        self.contains_node_ref(node)
+        self.node_has_kind(node, |kind| kind == SyntaxKind::ArrayLiteralExpression)
             .then(|| self.links.array_literal.try_get(&node))
             .flatten()
     }
 
     pub fn ensure_array_literal_links(&mut self, node: NodeRef) -> bool {
-        if !self.contains_node_ref(node) {
+        if !self.node_has_kind(node, |kind| kind == SyntaxKind::ArrayLiteralExpression) {
             return false;
         }
         self.links.array_literal.get(node);
@@ -795,7 +855,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     }
 
     pub fn set_array_literal_links(&mut self, node: NodeRef, links: ArrayLiteralLinks) -> bool {
-        if !self.contains_node_ref(node) {
+        if !self.node_has_kind(node, |kind| kind == SyntaxKind::ArrayLiteralExpression) {
             return false;
         }
         self.links.array_literal.replace_key(node, links);
@@ -804,13 +864,13 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
 
     #[must_use]
     pub fn switch_statement_links(&self, node: NodeRef) -> Option<&SwitchStatementLinks> {
-        self.contains_node_ref(node)
+        self.node_has_kind(node, |kind| kind == SyntaxKind::SwitchStatement)
             .then(|| self.links.switch_statement.try_get(&node))
             .flatten()
     }
 
     pub fn ensure_switch_statement_links(&mut self, node: NodeRef) -> bool {
-        if !self.contains_node_ref(node) {
+        if !self.node_has_kind(node, |kind| kind == SyntaxKind::SwitchStatement) {
             return false;
         }
         self.links.switch_statement.get(node);
@@ -822,7 +882,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         node: NodeRef,
         links: SwitchStatementLinks,
     ) -> bool {
-        if !self.contains_node_ref(node)
+        if !self.node_has_kind(node, |kind| kind == SyntaxKind::SwitchStatement)
             || !self.valid_optional_types(links.switch_types.as_deref())
         {
             return false;
@@ -833,13 +893,13 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
 
     #[must_use]
     pub fn jsx_element_links(&self, node: NodeRef) -> Option<&JsxElementLinks> {
-        self.contains_node_ref(node)
+        self.node_is_source_reachable(node)
             .then(|| self.links.jsx_element.try_get(&node))
             .flatten()
     }
 
     pub fn ensure_jsx_element_links(&mut self, node: NodeRef) -> bool {
-        if !self.contains_node_ref(node) {
+        if !self.node_is_source_reachable(node) {
             return false;
         }
         self.links.jsx_element.get(node);
@@ -847,7 +907,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     }
 
     pub fn set_jsx_element_links(&mut self, node: NodeRef, links: JsxElementLinks) -> bool {
-        if !self.contains_node_ref(node)
+        if !self.node_is_source_reachable(node)
             || !self.valid_optional_type(links.resolved_jsx_element_attributes_type)
             || !self.valid_optional_symbol(links.jsx_namespace)
             || !self.valid_optional_symbol(links.jsx_implicit_import_container)
@@ -1265,6 +1325,9 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             .is_none_or(|entity| self.entity_name(entity).is_some());
         if !self.contains_source_file(source_file)
             || !self.valid_optional_symbol(links.external_helpers_module)
+            || !links
+                .requested_external_emit_helpers
+                .has_only_defined_bits()
             || !valid_deferred_nodes
             || !valid_identifier_nodes
             || !valid_jsx_factory
@@ -1729,6 +1792,78 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         node.is_none_or(|node| self.contains_node_ref(node))
     }
 
+    fn node_has_kind(&self, node: NodeRef, predicate: impl FnOnce(SyntaxKind) -> bool) -> bool {
+        self.source_node_kind(node).is_some_and(predicate)
+    }
+
+    fn node_is_source_reachable(&self, node: NodeRef) -> bool {
+        self.source_node_kind(node).is_some()
+    }
+
+    fn source_node_kind(&self, node: NodeRef) -> Option<SyntaxKind> {
+        if !self.contains_node_ref(node) {
+            return None;
+        }
+        self.source_node_kinds
+            .get(&node.arena)
+            .and_then(|kinds| kinds.get(node.node.index()))
+            .copied()
+            .flatten()
+    }
+
+    fn validated_source_node_kinds(
+        arena: &NodeArena,
+        source_file: NodeId,
+    ) -> Option<Vec<Option<SyntaxKind>>> {
+        let mut kinds = vec![None; arena.len()];
+        let mut pending = vec![(source_file, None)];
+        while let Some((node_id, expected_parent)) = pending.pop() {
+            let slot = kinds.get_mut(node_id.index())?;
+            if slot.is_some() {
+                return None;
+            }
+            let node = arena.get(node_id)?;
+            if node.parent != expected_parent || !node.data.matches_syntax_kind(node.kind) {
+                return None;
+            }
+            *slot = Some(node.kind);
+            node.for_each_child(|child| pending.push((child, Some(node_id))));
+        }
+        Some(kinds)
+    }
+
+    fn is_signature_link_kind(kind: SyntaxKind) -> bool {
+        matches!(
+            kind,
+            SyntaxKind::MethodSignature
+                | SyntaxKind::MethodDeclaration
+                | SyntaxKind::Constructor
+                | SyntaxKind::GetAccessor
+                | SyntaxKind::SetAccessor
+                | SyntaxKind::CallSignature
+                | SyntaxKind::ConstructSignature
+                | SyntaxKind::IndexSignature
+                | SyntaxKind::FunctionType
+                | SyntaxKind::ConstructorType
+                | SyntaxKind::FunctionExpression
+                | SyntaxKind::ArrowFunction
+                | SyntaxKind::FunctionDeclaration
+                | SyntaxKind::JsDocSignature
+                | SyntaxKind::JsxOpeningElement
+                | SyntaxKind::JsxSelfClosingElement
+                | SyntaxKind::JsxOpeningFragment
+                | SyntaxKind::CallExpression
+                | SyntaxKind::NewExpression
+                | SyntaxKind::TaggedTemplateExpression
+                | SyntaxKind::Decorator
+                | SyntaxKind::BinaryExpression
+                | SyntaxKind::ClassDeclaration
+                | SyntaxKind::ClassExpression
+                | SyntaxKind::Parameter
+                | SyntaxKind::PropertyDeclaration
+        )
+    }
+
     fn valid_source_node(&self, source_file: SourceFileRef, node: NodeRef) -> bool {
         let source = source_file.node_ref();
         self.contains_source_file(source_file)
@@ -1985,7 +2120,7 @@ mod tests {
     };
     use ts_binder::{EscapedName, SymbolData, SymbolFlags, SymbolStore};
     use ts_core::TextRange;
-    use ts_parser::parse_source_file;
+    use ts_parser::{parse_isolated_entity_name, parse_source_file};
 
     use super::{AstScope, SemanticStore};
     use crate::semantic::{
@@ -1995,11 +2130,11 @@ mod tests {
         EnumMemberLinks, EvaluatorResult, EvaluatorValue, ExhaustiveState, ExportTypeLinks,
         ExtendedContainersState, ExternalEmitHelpers, JsxElementLinks, JsxFlags, LateBoundLinks,
         MappedSymbolLinks, MarkedAssignmentSymbolLinks, MembersAndExportsLinks, ModuleSymbolLinks,
-        NodeLinks, OptionalSymbolSequence, OrderedNodeSet, RelationComparisonResult, RelationKind,
-        ResolvedSignatureState, ReverseMappedSymbolLinks, SignatureLinks, SourceFileLinks,
-        SpreadLinks, SwitchStatementLinks, SymbolNodeLinks, SymbolReferenceLinks, TypeAliasLinks,
-        TypeNodeLinks, TypeRecord, TypeResolutionTarget, TypeSystemPropertyName, ValueSymbolLinks,
-        VarianceFlags, VarianceLinks,
+        NodeCheckFlags, NodeLinks, OptionalSymbolSequence, OrderedNodeSet,
+        RelationComparisonResult, RelationKind, ResolvedSignatureState, ReverseMappedSymbolLinks,
+        SignatureLinks, SourceFileLinks, SpreadLinks, SwitchStatementLinks, SymbolNodeLinks,
+        SymbolReferenceLinks, TypeAliasLinks, TypeNodeLinks, TypeRecord, TypeResolutionTarget,
+        TypeSystemPropertyName, ValueSymbolLinks, VarianceFlags, VarianceLinks,
         signatures::{ElementFlags, SignatureFlags, TypePredicateKind},
         types::{ObjectFlags, TypeFlags},
     };
@@ -2020,50 +2155,12 @@ mod tests {
             .unwrap()
     }
 
-    fn isolated_entity_name_arena(parts: &[&str]) -> (NodeArena, NodeId) {
-        assert!(!parts.is_empty());
-        let mut arena = NodeArena::new();
-        let first_parent = (parts.len() > 1).then(|| NodeId::new(2));
-        let mut entity = arena.alloc(Node {
-            kind: SyntaxKind::Identifier,
-            flags: NodeFlags::default(),
-            range: TextRange::default(),
-            parent: first_parent,
-            data: NodeData::Identifier(Box::new(IdentifierData {
-                flow_node: None,
-                text: parts[0].into(),
-            })),
-        });
-        for (index, part) in parts.iter().enumerate().skip(1) {
-            let index = u32::try_from(index).unwrap();
-            let qualified = NodeId::new(index * 2);
-            let right = arena.alloc(Node {
-                kind: SyntaxKind::Identifier,
-                flags: NodeFlags::default(),
-                range: TextRange::default(),
-                parent: Some(qualified),
-                data: NodeData::Identifier(Box::new(IdentifierData {
-                    flow_node: None,
-                    text: (*part).into(),
-                })),
-            });
-            assert_eq!(right, NodeId::new(index * 2 - 1));
-            let parent = (index as usize + 1 < parts.len()).then(|| NodeId::new((index + 1) * 2));
-            entity = arena.alloc(Node {
-                kind: SyntaxKind::QualifiedName,
-                flags: NodeFlags::default(),
-                range: TextRange::default(),
-                parent,
-                data: NodeData::QualifiedName(Box::new(QualifiedNameData {
-                    flow_node: None,
-                    left: entity,
-                    right,
-                    facts: 0,
-                })),
-            });
-            assert_eq!(entity, qualified);
-        }
-        (arena, entity)
+    fn node_ref_of_kind(arena: &NodeArena, file: FileId, kind: SyntaxKind) -> NodeRef {
+        let node = arena
+            .iter()
+            .find_map(|(id, node)| (node.kind == kind).then_some(id))
+            .unwrap_or_else(|| panic!("parsed source must contain {kind:?}"));
+        NodeRef::new(arena.id(), file, node)
     }
 
     fn empty_signature<TypePayload, MapperPayload>(
@@ -2644,10 +2741,124 @@ mod tests {
     }
 
     #[test]
-    fn checker_owned_entity_names_validate_exact_closure_and_preserve_identity() {
-        let (arena, root) = isolated_entity_name_arena(&["Namespace", "Nested", "factory"]);
+    fn source_kind_branding_validates_reachable_payloads_and_ignores_discarded_nodes() {
+        let mut mismatched = parse_source_file("const value = 1;");
+        let identifier = mismatched
+            .arena
+            .iter()
+            .find_map(|(id, node)| (node.kind == SyntaxKind::Identifier).then_some(id))
+            .unwrap();
+        mismatched.arena.get_mut(identifier).unwrap().kind = SyntaxKind::EnumMember;
+
         let mut store = TestStore::new();
-        let entity = store.register_entity_name(&arena, root).unwrap();
+        let mismatched_file = FileId::new(34);
+        let mismatched_ref = NodeRef::new(mismatched.arena.id(), mismatched_file, identifier);
+        let before = store.checker_link_allocated_lengths();
+        assert_eq!(
+            store.register_source_file(&mismatched.arena, mismatched.source_file, mismatched_file),
+            None
+        );
+        assert!(!store.contains_node_ref(mismatched_ref));
+        assert!(!store.ensure_enum_member_links(mismatched_ref));
+        assert_eq!(store.checker_link_allocated_lengths(), before);
+
+        let mut parsed = parse_source_file("enum E { A }");
+        let file = FileId::new(35);
+        let member = parsed
+            .arena
+            .iter()
+            .find_map(|(id, node)| (node.kind == SyntaxKind::EnumMember).then_some(id))
+            .unwrap();
+        let mut discarded = parsed.arena.get(member).unwrap().clone();
+        discarded.parent = None;
+        let discarded = parsed.arena.alloc(discarded);
+        assert!(
+            store
+                .register_source_file(&parsed.arena, parsed.source_file, file)
+                .is_some()
+        );
+
+        let member = NodeRef::new(parsed.arena.id(), file, member);
+        let discarded = NodeRef::new(parsed.arena.id(), file, discarded);
+        assert!(store.contains_node_ref(discarded));
+        assert!(store.ensure_enum_member_links(member));
+        let before = store.checker_link_allocated_lengths();
+        assert!(!store.ensure_enum_member_links(discarded));
+        assert!(!store.ensure_jsx_element_links(discarded));
+        assert_eq!(store.enum_member_links(discarded), None);
+        assert_eq!(store.jsx_element_links(discarded), None);
+        assert_eq!(store.checker_link_allocated_lengths(), before);
+    }
+
+    #[test]
+    fn specialized_node_links_enforce_their_pinned_call_domains_atomically() {
+        let parsed = parse_source_file(
+            "enum E { A } const asserted = value as string; \
+             const angled = <string>value; const array = [...items]; \
+             switch (value) { case 0: break; } factory();",
+        );
+        let file = FileId::new(37);
+        let mut store = TestStore::new();
+        assert!(
+            store
+                .register_source_file(&parsed.arena, parsed.source_file, file)
+                .is_some()
+        );
+
+        let ordinary = node_ref_of_kind(&parsed.arena, file, SyntaxKind::Identifier);
+        let enum_member = node_ref_of_kind(&parsed.arena, file, SyntaxKind::EnumMember);
+        let as_expression = node_ref_of_kind(&parsed.arena, file, SyntaxKind::AsExpression);
+        let type_assertion =
+            node_ref_of_kind(&parsed.arena, file, SyntaxKind::TypeAssertionExpression);
+        let array = node_ref_of_kind(&parsed.arena, file, SyntaxKind::ArrayLiteralExpression);
+        let switch = node_ref_of_kind(&parsed.arena, file, SyntaxKind::SwitchStatement);
+        let call = node_ref_of_kind(&parsed.arena, file, SyntaxKind::CallExpression);
+
+        let before = store.checker_link_allocated_lengths();
+        assert!(!store.ensure_enum_member_links(ordinary));
+        assert!(!store.set_enum_member_links(ordinary, EnumMemberLinks::default()));
+        assert!(!store.ensure_assertion_links(ordinary));
+        assert!(!store.set_assertion_links(ordinary, AssertionLinks::default()));
+        assert!(!store.ensure_array_literal_links(ordinary));
+        assert!(!store.set_array_literal_links(ordinary, ArrayLiteralLinks::default()));
+        assert!(!store.ensure_switch_statement_links(ordinary));
+        assert!(!store.set_switch_statement_links(ordinary, SwitchStatementLinks::default()));
+        assert!(!store.ensure_signature_links(ordinary));
+        assert!(!store.set_signature_links(ordinary, SignatureLinks::default()));
+        assert_eq!(store.checker_link_allocated_lengths(), before);
+
+        assert!(store.ensure_enum_member_links(enum_member));
+        assert!(store.ensure_assertion_links(as_expression));
+        assert!(store.ensure_assertion_links(type_assertion));
+        assert!(store.ensure_array_literal_links(array));
+        assert!(store.ensure_switch_statement_links(switch));
+        assert!(store.ensure_signature_links(call));
+        assert!(
+            store.ensure_jsx_element_links(ordinary),
+            "JSX namespace caching accepts arbitrary source locations upstream"
+        );
+
+        let foreign = parse_source_file("const ordinary = 1;");
+        let foreign_file = FileId::new(38);
+        let foreign_node = node_ref_of_kind(&foreign.arena, foreign_file, SyntaxKind::Identifier);
+        let mut foreign_store = TestStore::new();
+        assert!(
+            foreign_store
+                .register_source_file(&foreign.arena, foreign.source_file, foreign_file)
+                .is_some()
+        );
+        let before = store.checker_link_allocated_lengths();
+        assert!(!store.ensure_jsx_element_links(foreign_node));
+        assert!(!store.set_jsx_element_links(foreign_node, JsxElementLinks::default()));
+        assert_eq!(store.jsx_element_links(foreign_node), None);
+        assert_eq!(store.checker_link_allocated_lengths(), before);
+    }
+
+    #[test]
+    fn checker_owned_entity_names_validate_exact_closure_and_preserve_identity() {
+        let mut store = TestStore::new();
+        let parsed = parse_isolated_entity_name("Namespace.Nested.factory").unwrap();
+        let entity = store.register_parsed_entity_name(&parsed).unwrap();
         assert_eq!(store.entity_name_len(), 5);
         let EntityNameNode::QualifiedName { left, right } = store.entity_name(entity).unwrap()
         else {
@@ -2679,25 +2890,40 @@ mod tests {
             })
         );
 
-        let duplicate = store.register_entity_name(&arena, root).unwrap();
+        let duplicate = store
+            .register_entity_name_text("Namespace.Nested.factory")
+            .unwrap();
         assert_ne!(duplicate, entity, "separate parses retain distinct roots");
         assert_eq!(store.entity_name_len(), 10);
 
-        let parsed = parse_source_file("type Value = Namespace.Member;");
-        let qualified = parsed
+        let before = store.entity_name_len();
+        for invalid in [
+            "",
+            "Namespace.",
+            "Namespace..factory",
+            "Namespace factory",
+            "Namespace.factory()",
+            "#private",
+            "Namespace.\\u{notHex}",
+        ] {
+            assert_eq!(store.register_entity_name_text(invalid), None);
+            assert_eq!(store.entity_name_len(), before);
+        }
+
+        let source = parse_source_file("type Value = Namespace.Member;");
+        let qualified = source
             .arena
             .iter()
             .find_map(|(id, node)| (node.kind == SyntaxKind::QualifiedName).then_some(id))
             .unwrap();
-        let before = store.entity_name_len();
-        assert_eq!(store.register_entity_name(&parsed.arena, qualified), None);
+        assert_eq!(store.register_entity_name(&source.arena, qualified), None);
         assert_eq!(store.entity_name_len(), before);
 
         let mut malformed = NodeArena::new();
         let root = NodeId::new(2);
         let left = malformed.alloc(Node {
             kind: SyntaxKind::Identifier,
-            flags: NodeFlags::default(),
+            flags: NodeFlags::JAVASCRIPT_FILE,
             range: TextRange::default(),
             parent: Some(root),
             data: NodeData::Identifier(Box::new(IdentifierData {
@@ -2705,13 +2931,14 @@ mod tests {
                 text: "Namespace".into(),
             })),
         });
-        let mut invalid_right = parsed.arena.get(parsed.source_file).unwrap().clone();
+        let mut invalid_right = source.arena.get(source.source_file).unwrap().clone();
+        invalid_right.flags = NodeFlags::JAVASCRIPT_FILE;
         invalid_right.parent = Some(root);
         let right = malformed.alloc(invalid_right);
         assert_eq!(right, NodeId::new(1));
         let malformed_root = malformed.alloc(Node {
             kind: SyntaxKind::QualifiedName,
-            flags: NodeFlags::default(),
+            flags: NodeFlags::JAVASCRIPT_FILE,
             range: TextRange::default(),
             parent: None,
             data: NodeData::QualifiedName(Box::new(QualifiedNameData {
@@ -2729,9 +2956,9 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)] // Every ID-bearing slot gets an independent foreign probe.
     fn final_sparse_link_stores_preserve_state_and_reject_every_foreign_id_atomically() {
-        let local_parse = parse_source_file("type Value = Namespace.Member;");
+        let local_parse = parse_source_file("enum E { A } type Value = Namespace.Member;");
         let other_parse = parse_source_file("type Other = OtherNamespace.Member;");
-        let foreign_parse = parse_source_file("type Value = Namespace.Member;");
+        let foreign_parse = parse_source_file("enum E { A } type Value = Namespace.Member;");
         let local_file = FileId::new(41);
         let other_file = FileId::new(42);
 
@@ -2742,21 +2969,12 @@ mod tests {
         let other_source = store
             .register_source_file(&other_parse.arena, other_parse.source_file, other_file)
             .unwrap();
-        let local_identifier = local_parse
-            .arena
-            .iter()
-            .find_map(|(id, node)| (node.kind == SyntaxKind::Identifier).then_some(id))
-            .unwrap();
-        let local_node = NodeRef::new(local_parse.arena.id(), local_file, local_identifier);
-        let (local_factory_arena, local_factory_root) =
-            isolated_entity_name_arena(&["Namespace", "factory"]);
+        let local_node = node_ref_of_kind(&local_parse.arena, local_file, SyntaxKind::EnumMember);
         let local_factory = store
-            .register_entity_name(&local_factory_arena, local_factory_root)
+            .register_entity_name_text("Namespace.factory")
             .unwrap();
-        let (local_fragment_arena, local_fragment_root) =
-            isolated_entity_name_arena(&["Namespace", "Fragment"]);
         let local_fragment_factory = store
-            .register_entity_name(&local_fragment_arena, local_fragment_root)
+            .register_entity_name_text("Namespace.Fragment")
             .unwrap();
         assert_ne!(local_factory, local_fragment_factory);
         let other_identifier = other_parse
@@ -2773,21 +2991,13 @@ mod tests {
         let foreign_source = foreign
             .register_source_file(&foreign_parse.arena, foreign_parse.source_file, local_file)
             .unwrap();
-        let foreign_identifier = foreign_parse
-            .arena
-            .iter()
-            .find_map(|(id, node)| (node.kind == SyntaxKind::Identifier).then_some(id))
-            .unwrap();
-        let foreign_node = NodeRef::new(foreign_parse.arena.id(), local_file, foreign_identifier);
-        let (foreign_factory_arena, foreign_factory_root) =
-            isolated_entity_name_arena(&["Namespace", "factory"]);
+        let foreign_node =
+            node_ref_of_kind(&foreign_parse.arena, local_file, SyntaxKind::EnumMember);
         let foreign_factory = foreign
-            .register_entity_name(&foreign_factory_arena, foreign_factory_root)
+            .register_entity_name_text("Namespace.factory")
             .unwrap();
-        let (foreign_fragment_arena, foreign_fragment_root) =
-            isolated_entity_name_arena(&["Namespace", "Fragment"]);
         let foreign_fragment_factory = foreign
-            .register_entity_name(&foreign_fragment_arena, foreign_fragment_root)
+            .register_entity_name_text("Namespace.Fragment")
             .unwrap();
         let foreign_symbol = alloc_test_symbol(&mut foreign, "foreign");
         let foreign_type = foreign.alloc_type("foreign type");
@@ -3094,21 +3304,32 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)] // Exercises all sparse stores and exact default states.
     fn sparse_semantic_links_preserve_absent_and_allocated_default_records() {
-        let parsed = parse_source_file("type T = string;");
-        let scope = AstScope::new(FileId::new(21), &parsed.arena);
-        let node = scope.node_ref(parsed.source_file).unwrap();
+        let parsed = parse_source_file(
+            "const asserted = value as string; const array = [...items]; \
+             switch (value) { case 0: break; } factory();",
+        );
+        let file = FileId::new(21);
+        let node = NodeRef::new(parsed.arena.id(), file, parsed.source_file);
+        let assertion_node = node_ref_of_kind(&parsed.arena, file, SyntaxKind::AsExpression);
+        let array_node = node_ref_of_kind(&parsed.arena, file, SyntaxKind::ArrayLiteralExpression);
+        let switch_node = node_ref_of_kind(&parsed.arena, file, SyntaxKind::SwitchStatement);
+        let signature_node = node_ref_of_kind(&parsed.arena, file, SyntaxKind::CallExpression);
         let mut store = TestStore::new();
-        assert!(store.register_ast_scope(scope));
+        assert!(
+            store
+                .register_source_file(&parsed.arena, parsed.source_file, file)
+                .is_some()
+        );
         let symbol = alloc_test_symbol(&mut store, "T");
 
         assert_eq!(store.node_links(node), None);
         assert_eq!(store.symbol_node_links(node), None);
         assert_eq!(store.type_node_links(node), None);
-        assert_eq!(store.assertion_links(node), None);
-        assert_eq!(store.array_literal_links(node), None);
-        assert_eq!(store.switch_statement_links(node), None);
+        assert_eq!(store.assertion_links(assertion_node), None);
+        assert_eq!(store.array_literal_links(array_node), None);
+        assert_eq!(store.switch_statement_links(switch_node), None);
         assert_eq!(store.jsx_element_links(node), None);
-        assert_eq!(store.signature_links(node), None);
+        assert_eq!(store.signature_links(signature_node), None);
         assert_eq!(store.symbol_reference_links(symbol), None);
         assert_eq!(store.value_symbol_links(symbol), None);
         assert_eq!(store.mapped_symbol_links(symbol), None);
@@ -3128,11 +3349,11 @@ mod tests {
         assert!(store.ensure_node_links(node));
         assert!(store.ensure_symbol_node_links(node));
         assert!(store.ensure_type_node_links(node));
-        assert!(store.ensure_assertion_links(node));
-        assert!(store.ensure_array_literal_links(node));
-        assert!(store.ensure_switch_statement_links(node));
+        assert!(store.ensure_assertion_links(assertion_node));
+        assert!(store.ensure_array_literal_links(array_node));
+        assert!(store.ensure_switch_statement_links(switch_node));
         assert!(store.ensure_jsx_element_links(node));
-        assert!(store.ensure_signature_links(node));
+        assert!(store.ensure_signature_links(signature_node));
         assert!(store.ensure_symbol_reference_links(symbol));
         assert!(store.ensure_value_symbol_links(symbol));
         assert!(store.ensure_mapped_symbol_links(symbol));
@@ -3156,15 +3377,15 @@ mod tests {
         );
         assert_eq!(store.type_node_links(node), Some(&TypeNodeLinks::default()));
         assert_eq!(
-            store.assertion_links(node),
+            store.assertion_links(assertion_node),
             Some(&AssertionLinks::default())
         );
         assert_eq!(
-            store.array_literal_links(node),
+            store.array_literal_links(array_node),
             Some(&ArrayLiteralLinks::default())
         );
         assert_eq!(
-            store.switch_statement_links(node),
+            store.switch_statement_links(switch_node),
             Some(&SwitchStatementLinks::default())
         );
         assert_eq!(
@@ -3172,7 +3393,7 @@ mod tests {
             Some(&JsxElementLinks::default())
         );
         assert_eq!(
-            store.signature_links(node),
+            store.signature_links(signature_node),
             Some(&SignatureLinks::default())
         );
         assert_eq!(
@@ -3247,13 +3468,65 @@ mod tests {
     }
 
     #[test]
+    fn undefined_flag_bits_are_rejected_without_replacing_sparse_records() {
+        let parsed = parse_source_file("const value = 1;");
+        let file = FileId::new(36);
+        let mut store = TestStore::new();
+        let source = store
+            .register_source_file(&parsed.arena, parsed.source_file, file)
+            .unwrap();
+        let node = source.node_ref();
+
+        let node_links = NodeLinks {
+            flags: NodeCheckFlags::TYPE_CHECKED,
+            ..NodeLinks::default()
+        };
+        assert!(store.set_node_links(node, node_links.clone()));
+        let node_counts = store.checker_link_allocated_lengths();
+        let invalid_node_links = NodeLinks {
+            flags: NodeCheckFlags::from_bits_retain(NodeCheckFlags::TYPE_CHECKED.bits() | (1 << 2)),
+            ..NodeLinks::default()
+        };
+        assert!(!store.set_node_links(node, invalid_node_links));
+        assert_eq!(store.node_links(node), Some(&node_links));
+        assert_eq!(store.checker_link_allocated_lengths(), node_counts);
+
+        let source_links = SourceFileLinks {
+            requested_external_emit_helpers: ExternalEmitHelpers::REST,
+            ..SourceFileLinks::default()
+        };
+        assert!(store.set_source_file_links(source, source_links.clone()));
+        let source_counts = store.checker_link_allocated_lengths();
+        let invalid_source_links = SourceFileLinks {
+            requested_external_emit_helpers: ExternalEmitHelpers::from_bits_retain(
+                ExternalEmitHelpers::REST.bits() | (1 << 31),
+            ),
+            ..SourceFileLinks::default()
+        };
+        assert!(!store.set_source_file_links(source, invalid_source_links));
+        assert_eq!(store.source_file_links(source), Some(&source_links));
+        assert_eq!(store.checker_link_allocated_lengths(), source_counts);
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)] // Exercises every field in the dependency-closed link slice.
     fn semantic_link_commits_accept_owned_ids_and_exact_field_states() {
-        let parsed = parse_source_file("const value = 1;");
-        let scope = AstScope::new(FileId::new(22), &parsed.arena);
-        let node = scope.node_ref(parsed.source_file).unwrap();
+        let parsed = parse_source_file(
+            "const asserted = value as string; const array = [...items]; \
+             switch (value) { case 0: break; } factory();",
+        );
+        let file = FileId::new(22);
+        let node = NodeRef::new(parsed.arena.id(), file, parsed.source_file);
+        let signature_node = node_ref_of_kind(&parsed.arena, file, SyntaxKind::CallExpression);
+        let assertion_node = node_ref_of_kind(&parsed.arena, file, SyntaxKind::AsExpression);
+        let array_node = node_ref_of_kind(&parsed.arena, file, SyntaxKind::ArrayLiteralExpression);
+        let switch_node = node_ref_of_kind(&parsed.arena, file, SyntaxKind::SwitchStatement);
         let mut store = TestStore::new();
-        assert!(store.register_ast_scope(scope));
+        assert!(
+            store
+                .register_source_file(&parsed.arena, parsed.source_file, file)
+                .is_some()
+        );
         let symbol = alloc_test_symbol(&mut store, "value");
         let target = alloc_test_symbol(&mut store, "target");
         // Upstream's unknown/error/unresolved type sentinels are still real
@@ -3282,16 +3555,19 @@ mod tests {
             effects_signature: EffectsSignatureState::NoEffects,
             decorator_signature: DecoratorSignatureState::Resolved(signature),
         };
-        assert!(store.set_signature_links(node, signature_links.clone()));
-        assert_eq!(store.signature_links(node), Some(&signature_links));
+        assert!(store.set_signature_links(signature_node, signature_links.clone()));
+        assert_eq!(
+            store.signature_links(signature_node),
+            Some(&signature_links)
+        );
         let completed_signature_links = SignatureLinks {
             resolved_signature: ResolvedSignatureState::Resolved(signature),
             effects_signature: EffectsSignatureState::Resolved(signature),
             decorator_signature: DecoratorSignatureState::NotApplicable,
         };
-        assert!(store.set_signature_links(node, completed_signature_links.clone()));
+        assert!(store.set_signature_links(signature_node, completed_signature_links.clone()));
         assert_eq!(
-            store.signature_links(node),
+            store.signature_links(signature_node),
             Some(&completed_signature_links)
         );
 
@@ -3338,16 +3614,16 @@ mod tests {
         let assertion = AssertionLinks {
             expr_type: Some(type_id),
         };
-        assert!(store.set_assertion_links(node, assertion.clone()));
-        assert_eq!(store.assertion_links(node), Some(&assertion));
+        assert!(store.set_assertion_links(assertion_node, assertion.clone()));
+        assert_eq!(store.assertion_links(assertion_node), Some(&assertion));
 
         let array_literal = ArrayLiteralLinks {
             indices_computed: true,
             first_spread_index: -1,
             last_spread_index: -1,
         };
-        assert!(store.set_array_literal_links(node, array_literal.clone()));
-        assert_eq!(store.array_literal_links(node), Some(&array_literal));
+        assert!(store.set_array_literal_links(array_node, array_literal.clone()));
+        assert_eq!(store.array_literal_links(array_node), Some(&array_literal));
 
         let switch_statement = SwitchStatementLinks {
             exhaustive_state: ExhaustiveState::True,
@@ -3356,8 +3632,11 @@ mod tests {
             switch_types: Some(vec![type_id]),
             witnesses: Some(Vec::new()),
         };
-        assert!(store.set_switch_statement_links(node, switch_statement.clone()));
-        assert_eq!(store.switch_statement_links(node), Some(&switch_statement));
+        assert!(store.set_switch_statement_links(switch_node, switch_statement.clone()));
+        assert_eq!(
+            store.switch_statement_links(switch_node),
+            Some(&switch_statement)
+        );
 
         let jsx_element = JsxElementLinks {
             jsx_flags: JsxFlags::INTRINSIC_ELEMENT,
@@ -3454,15 +3733,37 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)] // Exhaustive per-slot foreign provenance matrix.
     fn semantic_link_keys_and_payloads_reject_every_foreign_id_kind_atomically() {
-        let first_parse = parse_source_file("const value = 1;");
-        let second_parse = parse_source_file("const value = 1;");
-        let first_scope = AstScope::new(FileId::new(23), &first_parse.arena);
-        let second_scope = AstScope::new(FileId::new(23), &second_parse.arena);
-        let first_node = first_scope.node_ref(first_parse.source_file).unwrap();
-        let second_node = second_scope.node_ref(second_parse.source_file).unwrap();
+        let source = "const asserted = value as string; const array = [...items]; \
+                      switch (value) { case 0: break; } factory();";
+        let first_parse = parse_source_file(source);
+        let second_parse = parse_source_file(source);
+        let file = FileId::new(23);
+        let first_node = NodeRef::new(first_parse.arena.id(), file, first_parse.source_file);
+        let first_assertion = node_ref_of_kind(&first_parse.arena, file, SyntaxKind::AsExpression);
+        let first_array =
+            node_ref_of_kind(&first_parse.arena, file, SyntaxKind::ArrayLiteralExpression);
+        let first_switch = node_ref_of_kind(&first_parse.arena, file, SyntaxKind::SwitchStatement);
+        let first_signature =
+            node_ref_of_kind(&first_parse.arena, file, SyntaxKind::CallExpression);
+        let second_node = NodeRef::new(second_parse.arena.id(), file, second_parse.source_file);
+        let second_assertion =
+            node_ref_of_kind(&second_parse.arena, file, SyntaxKind::AsExpression);
+        let second_array = node_ref_of_kind(
+            &second_parse.arena,
+            file,
+            SyntaxKind::ArrayLiteralExpression,
+        );
+        let second_switch =
+            node_ref_of_kind(&second_parse.arena, file, SyntaxKind::SwitchStatement);
+        let second_signature =
+            node_ref_of_kind(&second_parse.arena, file, SyntaxKind::CallExpression);
 
         let mut first = TestStore::new();
-        assert!(first.register_ast_scope(first_scope));
+        assert!(
+            first
+                .register_source_file(&first_parse.arena, first_parse.source_file, file)
+                .is_some()
+        );
         let foreign_symbol = alloc_test_symbol(&mut first, "foreign");
         let foreign_type = first.alloc_type("foreign type");
         let foreign_mapper = first.alloc_mapper("foreign mapper");
@@ -3470,7 +3771,11 @@ mod tests {
         let foreign_table = first.alloc_symbol_table();
 
         let mut store = TestStore::new();
-        assert!(store.register_ast_scope(second_scope));
+        assert!(
+            store
+                .register_source_file(&second_parse.arena, second_parse.source_file, file)
+                .is_some()
+        );
         let symbol = alloc_test_symbol(&mut store, "local");
         let local_type = store.alloc_type("local type");
         let local_table = store.alloc_symbol_table();
@@ -3478,19 +3783,19 @@ mod tests {
         assert!(!store.ensure_node_links(first_node));
         assert!(!store.ensure_symbol_node_links(first_node));
         assert!(!store.ensure_type_node_links(first_node));
-        assert!(!store.ensure_assertion_links(first_node));
-        assert!(!store.ensure_array_literal_links(first_node));
-        assert!(!store.ensure_switch_statement_links(first_node));
+        assert!(!store.ensure_assertion_links(first_assertion));
+        assert!(!store.ensure_array_literal_links(first_array));
+        assert!(!store.ensure_switch_statement_links(first_switch));
         assert!(!store.ensure_jsx_element_links(first_node));
-        assert!(!store.ensure_signature_links(first_node));
+        assert!(!store.ensure_signature_links(first_signature));
         assert_eq!(store.node_links(second_node), None);
         assert_eq!(store.symbol_node_links(second_node), None);
         assert_eq!(store.type_node_links(second_node), None);
-        assert_eq!(store.assertion_links(second_node), None);
-        assert_eq!(store.array_literal_links(second_node), None);
-        assert_eq!(store.switch_statement_links(second_node), None);
+        assert_eq!(store.assertion_links(second_assertion), None);
+        assert_eq!(store.array_literal_links(second_array), None);
+        assert_eq!(store.switch_statement_links(second_switch), None);
         assert_eq!(store.jsx_element_links(second_node), None);
-        assert_eq!(store.signature_links(second_node), None);
+        assert_eq!(store.signature_links(second_signature), None);
 
         assert!(!store.ensure_symbol_reference_links(foreign_symbol));
         assert!(!store.ensure_value_symbol_links(foreign_symbol));
@@ -3530,8 +3835,8 @@ mod tests {
                 ..SignatureLinks::default()
             },
         ] {
-            assert!(!store.set_signature_links(second_node, invalid));
-            assert_eq!(store.signature_links(second_node), None);
+            assert!(!store.set_signature_links(second_signature, invalid));
+            assert_eq!(store.signature_links(second_signature), None);
         }
 
         assert!(!store.set_type_node_links(
@@ -3551,21 +3856,21 @@ mod tests {
         assert_eq!(store.type_node_links(second_node), None);
 
         assert!(!store.set_assertion_links(
-            second_node,
+            second_assertion,
             AssertionLinks {
                 expr_type: Some(foreign_type),
             },
         ));
-        assert_eq!(store.assertion_links(second_node), None);
+        assert_eq!(store.assertion_links(second_assertion), None);
 
         assert!(!store.set_switch_statement_links(
-            second_node,
+            second_switch,
             SwitchStatementLinks {
                 switch_types: Some(vec![foreign_type]),
                 ..SwitchStatementLinks::default()
             },
         ));
-        assert_eq!(store.switch_statement_links(second_node), None);
+        assert_eq!(store.switch_statement_links(second_switch), None);
 
         for invalid in [
             JsxElementLinks {
