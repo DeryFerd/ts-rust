@@ -7,6 +7,7 @@
 //! same-named legacy checker IDs.
 
 pub mod alias;
+pub mod alias_flags;
 pub mod bootstrap;
 pub mod declared;
 pub mod diagnostics;
