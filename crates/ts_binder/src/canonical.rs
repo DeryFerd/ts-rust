@@ -314,6 +314,7 @@ pub struct CanonicalSourceFileFacts {
     source_file_symbol_name: EscapedName,
     language: CanonicalSourceLanguage,
     is_declaration_file: bool,
+    is_default_library: bool,
     module_state: CanonicalModuleState,
 }
 
@@ -378,10 +379,32 @@ impl CanonicalSourceFileFacts {
         is_declaration_file: bool,
         module_state: CanonicalModuleState,
     ) -> Self {
+        Self::new_with_default_library(
+            source_file_symbol_name,
+            language,
+            is_declaration_file,
+            false,
+            module_state,
+        )
+    }
+
+    /// Retains the Program-owned default-library classification explicitly.
+    ///
+    /// Default-library identity cannot be reconstructed from a declaration-file
+    /// bit or filename: callers must supply the exact Program fact.
+    #[must_use]
+    pub const fn new_with_default_library(
+        source_file_symbol_name: EscapedName,
+        language: CanonicalSourceLanguage,
+        is_declaration_file: bool,
+        is_default_library: bool,
+        module_state: CanonicalModuleState,
+    ) -> Self {
         Self {
             source_file_symbol_name,
             language,
             is_declaration_file,
+            is_default_library,
             module_state,
         }
     }
@@ -399,6 +422,12 @@ impl CanonicalSourceFileFacts {
     #[must_use]
     pub const fn is_declaration_file(&self) -> bool {
         self.is_declaration_file
+    }
+
+    /// Whether the Program classified this source as one of its lib files.
+    #[must_use]
+    pub const fn is_default_library(&self) -> bool {
+        self.is_default_library
     }
 
     #[must_use]
@@ -6970,9 +6999,10 @@ mod tests {
     fn source_file_facts_are_explicit_canonical_input() {
         let parsed = parse_source_file("export interface Box<T> { value: T }");
         let file = FileId::new(41);
-        let facts = CanonicalSourceFileFacts::new(
+        let facts = CanonicalSourceFileFacts::new_with_default_library(
             EscapedName::source("\"/project/main\""),
             CanonicalSourceLanguage::TypeScript,
+            true,
             true,
             CanonicalModuleState::External,
         );
@@ -6982,6 +7012,7 @@ mod tests {
             .unwrap();
         let bound = binder.file(file).unwrap();
         assert_eq!(bound.source_facts(), Some(&facts));
+        assert!(bound.source_facts().unwrap().is_default_library());
         assert_eq!(bound.phase(), BindingPhase::Traversal);
         assert_eq!(bound.symbol_count(), 0);
 
@@ -6993,6 +7024,14 @@ mod tests {
             traversal_only.file(FileId::new(42)).unwrap().source_facts(),
             None
         );
+
+        let ordinary = CanonicalSourceFileFacts::new(
+            EscapedName::source("\"/project/ordinary\""),
+            CanonicalSourceLanguage::TypeScript,
+            true,
+            CanonicalModuleState::Script,
+        );
+        assert!(!ordinary.is_default_library());
     }
 
     #[test]

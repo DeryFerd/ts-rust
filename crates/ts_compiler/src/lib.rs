@@ -3452,10 +3452,11 @@ fn canonical_source_file_facts(
     } else {
         CanonicalModuleState::Script
     };
-    Ok(CanonicalSourceFileFacts::new(
+    Ok(CanonicalSourceFileFacts::new_with_default_library(
         EscapedName::source(format!("\"{}\"", remove_file_extension(&source.file_name))),
         CanonicalSourceLanguage::TypeScript,
         is_declaration_file,
+        source.is_default_library,
         module_state,
     ))
 }
@@ -6777,6 +6778,19 @@ mod tests {
             .unwrap();
         assert!(!program.options().skip_lib_check);
         assert!(es5.is_default_library);
+        assert!(
+            canonical_source_file_facts(es5, program.options())
+                .unwrap()
+                .is_default_library()
+        );
+        assert!(
+            !canonical_source_file_facts(
+                program.source_file("/project/first.ts").unwrap(),
+                program.options(),
+            )
+            .unwrap()
+            .is_default_library()
+        );
         assert!(es5.checking.diagnostics.is_empty());
 
         let diagnostics = program.diagnostics();
@@ -7142,13 +7156,13 @@ mod tests {
     #[test]
     fn canonical_program_requires_skip_lib_check_for_ordinary_declarations() {
         let fs = MemoryFileSystem::new(true);
-        fs.write_file("/project/globals.d.ts", "declare const value: number;")
+        fs.write_file("/project/lib.es5.d.ts", "declare const value: number;")
             .unwrap();
 
         let error = Program::try_new_with_canonical_checker(
             &fs,
             "/project",
-            &["globals.d.ts".to_owned()],
+            &["lib.es5.d.ts".to_owned()],
             CompilerOptions {
                 lib: Some(vec!["es5".to_owned()]),
                 ..CompilerOptions::default()
@@ -7158,13 +7172,13 @@ mod tests {
         assert!(matches!(
             error,
             CanonicalProgramCheckError::DeclarationFileCheckingUnsupported { file_name }
-                if file_name == "/project/globals.d.ts"
+                if file_name == "/project/lib.es5.d.ts"
         ));
 
         let program = Program::try_new_with_canonical_checker(
             &fs,
             "/project",
-            &["globals.d.ts".to_owned()],
+            &["lib.es5.d.ts".to_owned()],
             CompilerOptions {
                 lib: Some(vec!["es5".to_owned()]),
                 module_detection: ModuleDetectionKind::Force,
@@ -7174,9 +7188,10 @@ mod tests {
         )
         .unwrap();
         assert!(program.diagnostics().is_empty());
-        let declaration = program.source_file("/project/globals.d.ts").unwrap();
+        let declaration = program.source_file("/project/lib.es5.d.ts").unwrap();
         let facts = canonical_source_file_facts(declaration, program.options()).unwrap();
         assert!(facts.is_declaration_file());
+        assert!(!facts.is_default_library());
         assert!(!facts.is_external_or_common_js_module());
     }
 
