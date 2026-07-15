@@ -77,13 +77,28 @@ remains the cluster-level source of truth.
   are integrated behind a store-branded aggregate. AST scope growth is
   monotonic, raw payload allocation is crate-private, and independent review
   proved that equal local IDs from another store cannot enter any public
-  record slot. Complete type payloads, lazy links, and program-owned symbols
-  are now the next dependency-closed semantic lanes.
-- The program-symbol ownership boundary is frozen: `ts_binder` owns the exact
-  symbol/table substrate and `ts_checker::SemanticStore` embeds it under the
-  same semantic brand. This preserves the existing crate dependency direction
-  and makes one binder/declaration/flow traversal possible; the mechanical
-  ownership migration follows the complete type-payload slice.
+  record slot.
+- The complete canonical type-payload graph is integrated. Every upstream
+  `TypeData` family has an explicit store-owned record instead of a descriptor,
+  with exact byte-backed names, immutable unique-symbol identity, atomic
+  interface/tuple `this` initialization, validated instantiation caches, and
+  exact union-discriminant cache states. Two semantic review rounds and 36
+  focused graph tests closed the reachable invalid states found during audit.
+- The program-symbol ownership boundary is integrated: `ts_binder` owns the
+  exact symbol/table substrate and `ts_checker::SemanticStore` consumes and
+  embeds that owner under one immutable semantic brand. The graph landed as
+  eight reviewable commits through `b6c058e` and passes 86 binder tests, 196
+  checker tests, the all-target workspace check, and strict targeted Clippy.
+- Generated AST child traversal now covers all 192 `NodeData` payload variants
+  and all 420 declared child slots in pinned order. This removes hand-maintained
+  structural traversal as a source of silent binder/checker omissions, while
+  keeping binder-specific flow order as a distinct contract.
+- The first sparse-link slice covers nine common upstream stores and the type-
+  resolution stack, but remains off the integration branch until its live-state
+  probe, field-specific sentinel domains, and opaque LIFO boundary pass repair
+  and re-review. The canonical binder slice is likewise being repaired so its
+  container/declaration order comes from the sole flow-driven recursive walk;
+  no declaration phase will build on the rejected generated-order second pass.
 
 No percentage in this section is a whole-corpus parity claim. A score is
 publishable only when its variant manifest and complete artifact comparison are
