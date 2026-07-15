@@ -3203,10 +3203,14 @@ mod tests {
     fn malformed_checked_expression_shapes_fail_atomically_before_elaboration() {
         let source = parsed("var value: number[] = [1];");
         let file = FileId::new(130);
-        let context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let array_context = context(&[(file, &source)], CanonicalCheckerOptions::default());
         let array = variable_initializer(&source, file, "value");
         let planned = PlannedExpression::new(array, PlannedExpressionKind::Array(Vec::new()));
-        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let number = array_context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .number_type;
         let checked_element = CheckedExpressionTypes::leaf(number, number);
         let mismatched_length = CheckedExpressionTypes {
             raw: number,
@@ -3214,7 +3218,7 @@ mod tests {
             shape: CheckedExpressionShape::Array(vec![checked_element]),
         };
         let mismatched_kind = CheckedExpressionTypes::leaf(number, number);
-        let before = observable_state(&context, file);
+        let before = observable_state(&array_context, file);
 
         for checked in [&mismatched_length, &mismatched_kind] {
             assert!(matches!(
@@ -3225,8 +3229,8 @@ mod tests {
             ));
         }
 
-        assert_eq!(observable_state(&context, file), before);
-        assert!(context.diagnostics().is_empty());
+        assert_eq!(observable_state(&array_context, file), before);
+        assert!(array_context.diagnostics().is_empty());
 
         let nested_source = parsed(
             "var value: { ok: number; nested: { value: number } } = \
