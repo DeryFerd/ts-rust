@@ -6,13 +6,14 @@ use ts_ast::{FileId, NodeArena, NodeArenaId, NodeId, NodeRef};
 
 use super::{
     ids::{
-        IndexInfoId, SemanticStoreId, SemanticSymbolId, SignatureId, TypeId, TypeMapperId,
-        TypePredicateId, TypedArena, allocate_semantic_store_id,
+        ConditionalRootId, IndexInfoId, SemanticStoreId, SemanticSymbolId, SignatureId,
+        TypeAliasId, TypeId, TypeMapperId, TypePredicateId, TypedArena, allocate_semantic_store_id,
     },
     signatures::{
         CompositeSignature, IndexInfo, IndexInfoArena, Signature, SignatureArena, SignatureFlags,
         TupleElementInfo, TupleMetadata, TypePredicate, TypePredicateArena, TypePredicateKind,
     },
+    type_records::{ConditionalRoot, TypeAlias},
 };
 
 /// Snapshot of one Program file's AST identity and allocated node range.
@@ -77,6 +78,8 @@ pub struct SemanticStore<TypePayload, SymbolPayload, MapperPayload> {
     signatures: SignatureArena,
     predicates: TypePredicateArena,
     index_infos: IndexInfoArena,
+    type_aliases: TypedArena<TypeAliasId, TypeAlias>,
+    conditional_roots: TypedArena<ConditionalRootId, ConditionalRoot>,
     ast_scopes: BTreeMap<FileId, AstScope>,
     ast_files: BTreeMap<NodeArenaId, FileId>,
 }
@@ -108,6 +111,8 @@ impl<TypePayload, SymbolPayload, MapperPayload>
             signatures: SignatureArena::new(id),
             predicates: TypePredicateArena::new(id),
             index_infos: IndexInfoArena::new(id),
+            type_aliases: TypedArena::new(id),
+            conditional_roots: TypedArena::new(id),
             ast_scopes: BTreeMap::new(),
             ast_files: BTreeMap::new(),
         }
@@ -153,6 +158,61 @@ impl<TypePayload, SymbolPayload, MapperPayload>
     #[allow(dead_code)] // Hook for sibling concrete type allocators as they land.
     pub(super) fn alloc_type(&mut self, payload: TypePayload) -> TypeId {
         self.types.alloc_with(|_| payload)
+    }
+
+    pub(super) fn alloc_type_with(
+        &mut self,
+        make_payload: impl FnOnce(TypeId) -> TypePayload,
+    ) -> TypeId {
+        self.types.alloc_with(make_payload)
+    }
+
+    pub(super) fn type_payload_mut(&mut self, id: TypeId) -> Option<&mut TypePayload> {
+        self.types.get_mut(id)
+    }
+
+    pub(super) fn alloc_type_alias_with(
+        &mut self,
+        make_payload: impl FnOnce(TypeAliasId) -> TypeAlias,
+    ) -> TypeAliasId {
+        self.type_aliases.alloc_with(make_payload)
+    }
+
+    pub(super) fn type_alias_payload(&self, id: TypeAliasId) -> Option<&TypeAlias> {
+        self.type_aliases.get(id)
+    }
+
+    pub(super) fn type_alias_payload_mut(&mut self, id: TypeAliasId) -> Option<&mut TypeAlias> {
+        self.type_aliases.get_mut(id)
+    }
+
+    pub(super) fn type_alias_len_internal(&self) -> usize {
+        self.type_aliases.len()
+    }
+
+    pub(super) fn alloc_conditional_root_with(
+        &mut self,
+        make_payload: impl FnOnce(ConditionalRootId) -> ConditionalRoot,
+    ) -> ConditionalRootId {
+        self.conditional_roots.alloc_with(make_payload)
+    }
+
+    pub(super) fn conditional_root_payload(
+        &self,
+        id: ConditionalRootId,
+    ) -> Option<&ConditionalRoot> {
+        self.conditional_roots.get(id)
+    }
+
+    pub(super) fn conditional_root_payload_mut(
+        &mut self,
+        id: ConditionalRootId,
+    ) -> Option<&mut ConditionalRoot> {
+        self.conditional_roots.get_mut(id)
+    }
+
+    pub(super) fn conditional_root_len_internal(&self) -> usize {
+        self.conditional_roots.len()
     }
 
     #[must_use]

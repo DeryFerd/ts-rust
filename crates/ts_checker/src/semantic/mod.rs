@@ -9,10 +9,12 @@
 pub mod ids;
 pub mod signatures;
 mod store;
+pub mod type_records;
 pub mod types;
 
 pub use ids::{
-    IndexInfoId, SemanticStoreId, SemanticSymbolId, SignatureId, TypeId, TypeMapperId,
-    TypePredicateId,
+    ConditionalRootId, IndexInfoId, SemanticStoreId, SemanticSymbolId, SignatureId, TypeAliasId,
+    TypeId, TypeMapperId, TypePredicateId,
 };
 pub use store::{AstScope, SemanticStore};
+pub use type_records::{CanonicalSemanticStore, TypeData, TypeDataKind, TypeRecord};

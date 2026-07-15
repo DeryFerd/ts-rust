@@ -113,6 +113,11 @@ define_semantic_id!(
     "Identity of one program-owned canonical semantic symbol."
 );
 define_semantic_id!(TypeMapperId, "Identity of one canonical type mapper.");
+define_semantic_id!(TypeAliasId, "Identity of one canonical type-alias record.");
+define_semantic_id!(
+    ConditionalRootId,
+    "Identity of one shared canonical conditional-type root."
+);
 
 fn id_for_len<I: ArenaId>(store: SemanticStoreId, len: usize) -> I {
     let zero_based = u32::try_from(len)
@@ -180,8 +185,9 @@ mod tests {
     use std::{panic::catch_unwind, sync::atomic::AtomicU64};
 
     use super::{
-        IndexInfoId, SemanticSymbolId, SignatureId, TypeId, TypeMapperId, TypePredicateId,
-        TypedArena, allocate_semantic_store_id, allocate_semantic_store_id_from, id_for_len,
+        ConditionalRootId, IndexInfoId, SemanticSymbolId, SignatureId, TypeAliasId, TypeId,
+        TypeMapperId, TypePredicateId, TypedArena, allocate_semantic_store_id,
+        allocate_semantic_store_id_from, id_for_len,
     };
 
     #[test]
@@ -201,6 +207,10 @@ mod tests {
         assert!(catch_unwind(|| id_for_len::<TypePredicateId>(store, u32::MAX as usize)).is_err());
         assert!(catch_unwind(|| id_for_len::<SemanticSymbolId>(store, u32::MAX as usize)).is_err());
         assert!(catch_unwind(|| id_for_len::<TypeMapperId>(store, u32::MAX as usize)).is_err());
+        assert!(catch_unwind(|| id_for_len::<TypeAliasId>(store, u32::MAX as usize)).is_err());
+        assert!(
+            catch_unwind(|| id_for_len::<ConditionalRootId>(store, u32::MAX as usize)).is_err()
+        );
     }
 
     #[test]

@@ -408,6 +408,17 @@ impl ObjectFlags {
     pub const IS_NEVER_INTERSECTION: Self = Self(1 << 26);
     pub const IS_CONSTRAINED_TYPE_VARIABLE: Self = Self(1 << 27);
 
+    /// Clears the lazy-state bits reset by pinned `checker.newType`.
+    #[must_use]
+    pub(crate) const fn normalized_for_new_type(self) -> Self {
+        Self(
+            self.0
+                & !(Self::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED.0
+                    | Self::COULD_CONTAIN_TYPE_VARIABLES.0
+                    | Self::MEMBERS_RESOLVED.0),
+        )
+    }
+
     #[must_use]
     pub const fn bits(self) -> u32 {
         self.0
@@ -431,9 +442,125 @@ impl ObjectFlags {
 
 impl_flag_operators!(ObjectFlags);
 
+/// Indexed-access context bits from pinned `checker/types.go::AccessFlags`.
+///
+/// Only [`Self::PERSISTENT`] is stored on an `IndexedAccessType`; the remaining
+/// bits are transient checker inputs represented here so the record boundary
+/// can reject accidental persistence of them.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct AccessFlags(u32);
+
+impl AccessFlags {
+    pub const NONE: Self = Self(0);
+    pub const INCLUDE_UNDEFINED: Self = Self(1 << 0);
+    pub const NO_INDEX_SIGNATURES: Self = Self(1 << 1);
+    pub const WRITING: Self = Self(1 << 2);
+    pub const CACHE_SYMBOL: Self = Self(1 << 3);
+    pub const ALLOW_MISSING: Self = Self(1 << 4);
+    pub const EXPRESSION_POSITION: Self = Self(1 << 5);
+    pub const REPORT_DEPRECATED: Self = Self(1 << 6);
+    pub const SUPPRESS_NO_IMPLICIT_ANY_ERROR: Self = Self(1 << 7);
+    pub const CONTEXTUAL: Self = Self(1 << 8);
+    pub const PERSISTENT: Self = Self::INCLUDE_UNDEFINED;
+
+    #[must_use]
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    #[must_use]
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    #[must_use]
+    pub const fn intersects(self, other: Self) -> bool {
+        self.0 & other.0 != 0
+    }
+
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
+impl_flag_operators!(AccessFlags);
+
+/// Measured variance and reliability bits from pinned
+/// `checker/types.go::VarianceFlags`.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct VarianceFlags(u32);
+
+impl VarianceFlags {
+    pub const INVARIANT: Self = Self(0);
+    pub const COVARIANT: Self = Self(1 << 0);
+    pub const CONTRAVARIANT: Self = Self(1 << 1);
+    pub const BIVARIANT: Self = Self(Self::COVARIANT.0 | Self::CONTRAVARIANT.0);
+    pub const INDEPENDENT: Self = Self(1 << 2);
+    pub const VARIANCE_MASK: Self =
+        Self(Self::COVARIANT.0 | Self::CONTRAVARIANT.0 | Self::INDEPENDENT.0);
+    pub const UNMEASURABLE: Self = Self(1 << 3);
+    pub const UNRELIABLE: Self = Self(1 << 4);
+    pub const ALLOWS_STRUCTURAL_FALLBACK: Self = Self(Self::UNMEASURABLE.0 | Self::UNRELIABLE.0);
+
+    #[must_use]
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    #[must_use]
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    #[must_use]
+    pub const fn intersects(self, other: Self) -> bool {
+        self.0 & other.0 != 0
+    }
+
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
+impl_flag_operators!(VarianceFlags);
+
 #[cfg(test)]
 mod tests {
-    use super::{ObjectFlags, TypeFlags};
+    use super::{AccessFlags, ObjectFlags, TypeFlags, VarianceFlags};
+
+    #[test]
+    fn access_and_variance_flags_match_pinned_values() {
+        assert_eq!(AccessFlags::NONE.bits(), 0);
+        for (bit, flag) in [
+            AccessFlags::INCLUDE_UNDEFINED,
+            AccessFlags::NO_INDEX_SIGNATURES,
+            AccessFlags::WRITING,
+            AccessFlags::CACHE_SYMBOL,
+            AccessFlags::ALLOW_MISSING,
+            AccessFlags::EXPRESSION_POSITION,
+            AccessFlags::REPORT_DEPRECATED,
+            AccessFlags::SUPPRESS_NO_IMPLICIT_ANY_ERROR,
+            AccessFlags::CONTEXTUAL,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(flag.bits(), 1 << bit);
+        }
+        assert_eq!(AccessFlags::PERSISTENT, AccessFlags::INCLUDE_UNDEFINED);
+
+        assert_eq!(VarianceFlags::INVARIANT.bits(), 0);
+        assert_eq!(VarianceFlags::COVARIANT.bits(), 1);
+        assert_eq!(VarianceFlags::CONTRAVARIANT.bits(), 2);
+        assert_eq!(VarianceFlags::BIVARIANT.bits(), 3);
+        assert_eq!(VarianceFlags::INDEPENDENT.bits(), 4);
+        assert_eq!(VarianceFlags::VARIANCE_MASK.bits(), 7);
+        assert_eq!(VarianceFlags::UNMEASURABLE.bits(), 8);
+        assert_eq!(VarianceFlags::UNRELIABLE.bits(), 16);
+        assert_eq!(VarianceFlags::ALLOWS_STRUCTURAL_FALLBACK.bits(), 24);
+    }
 
     #[test]
     fn type_flag_bits_match_upstream_and_preserve_sort_order() {
