@@ -16,11 +16,13 @@ pub(super) fn build_flow_graph(
     FlowBuilder::new(arena, children, file).build(source_file)
 }
 
-#[derive(Clone, Copy)]
 struct SavedFlow {
     current: Option<FlowRef>,
     container: NodeId,
     return_target: Option<FlowRef>,
+    break_target: Option<FlowRef>,
+    continue_target: Option<FlowRef>,
+    active_labels: Vec<ActiveLabel>,
 }
 
 #[derive(Clone, Copy)]
@@ -30,6 +32,19 @@ struct FunctionContainer {
     start_payload: bool,
 }
 
+struct ActiveLabel {
+    name: String,
+    break_target: FlowRef,
+    continue_target: Option<FlowRef>,
+    referenced: bool,
+}
+
+#[derive(Clone, Copy)]
+enum JumpKind {
+    Break,
+    Continue,
+}
+
 struct FlowBuilder<'a> {
     ast: &'a NodeArena,
     children: &'a HashMap<NodeId, Vec<NodeId>>,
@@ -37,6 +52,9 @@ struct FlowBuilder<'a> {
     current: Option<FlowRef>,
     container: NodeId,
     return_target: Option<FlowRef>,
+    break_target: Option<FlowRef>,
+    continue_target: Option<FlowRef>,
+    active_labels: Vec<ActiveLabel>,
     has_flow_effects: bool,
     effect_dependency_containers: Vec<NodeId>,
     built_containers: BTreeSet<NodeId>,
@@ -51,6 +69,9 @@ impl<'a> FlowBuilder<'a> {
             current: None,
             container: NodeId::new(0),
             return_target: None,
+            break_target: None,
+            continue_target: None,
+            active_labels: Vec::new(),
             has_flow_effects: false,
             effect_dependency_containers: Vec::new(),
             built_containers: BTreeSet::new(),
@@ -147,13 +168,11 @@ impl<'a> FlowBuilder<'a> {
 
     fn bind_node_by_kind(&mut self, node_id: NodeId, kind: SyntaxKind) {
         match kind {
-            SyntaxKind::WhileStatement
-            | SyntaxKind::DoStatement
-            | SyntaxKind::ForStatement
-            | SyntaxKind::ForInStatement
-            | SyntaxKind::ForOfStatement => {
-                self.mark_unsupported(node_id, UnsupportedFlowKind::IterationStatement);
-                self.discover_nested_containers(node_id);
+            SyntaxKind::WhileStatement => self.bind_while_statement(node_id),
+            SyntaxKind::DoStatement => self.bind_do_statement(node_id),
+            SyntaxKind::ForStatement => self.bind_for_statement(node_id),
+            SyntaxKind::ForInStatement | SyntaxKind::ForOfStatement => {
+                self.bind_for_in_or_of_statement(node_id);
             }
             SyntaxKind::SwitchStatement | SyntaxKind::CaseBlock => {
                 self.mark_unsupported(node_id, UnsupportedFlowKind::SwitchStatement);
@@ -163,13 +182,13 @@ impl<'a> FlowBuilder<'a> {
                 self.mark_unsupported(node_id, UnsupportedFlowKind::TryStatement);
                 self.discover_nested_containers(node_id);
             }
-            SyntaxKind::BreakStatement | SyntaxKind::ContinueStatement => {
-                self.mark_unsupported(node_id, UnsupportedFlowKind::BreakOrContinueStatement);
+            SyntaxKind::BreakStatement => {
+                self.bind_break_or_continue_statement(node_id, JumpKind::Break);
             }
-            SyntaxKind::LabeledStatement => {
-                self.mark_unsupported(node_id, UnsupportedFlowKind::LabeledStatement);
-                self.discover_nested_containers(node_id);
+            SyntaxKind::ContinueStatement => {
+                self.bind_break_or_continue_statement(node_id, JumpKind::Continue);
             }
+            SyntaxKind::LabeledStatement => self.bind_labeled_statement(node_id),
             SyntaxKind::WithStatement => {
                 self.mark_unsupported(node_id, UnsupportedFlowKind::WithStatement);
                 self.discover_nested_containers(node_id);
@@ -233,6 +252,273 @@ impl<'a> FlowBuilder<'a> {
         }
     }
 
+    fn set_continue_target(&mut self, mut node_id: NodeId, target: FlowRef) -> FlowRef {
+        let mut label_index = self.active_labels.len();
+        while let Some(parent) = self.ast.get(node_id).and_then(|node| node.parent) {
+            if self.node_kind(parent) != Some(SyntaxKind::LabeledStatement) || label_index == 0 {
+                break;
+            }
+            label_index -= 1;
+            self.active_labels[label_index].continue_target = Some(target);
+            node_id = parent;
+        }
+        target
+    }
+
+    fn bind_iterative_statement(
+        &mut self,
+        statement: NodeId,
+        break_target: FlowRef,
+        continue_target: FlowRef,
+    ) {
+        let saved_break_target = self.break_target.replace(break_target);
+        let saved_continue_target = self.continue_target.replace(continue_target);
+        self.bind_node(statement);
+        self.break_target = saved_break_target;
+        self.continue_target = saved_continue_target;
+    }
+
+    fn bind_while_statement(&mut self, node_id: NodeId) {
+        let (expression, statement) = match self.ast.get(node_id).map(|node| &node.data) {
+            Some(NodeData::WhileStatement(data)) => (data.expression, data.statement),
+            _ => return,
+        };
+        let pre_while_label = self.alloc_loop_label();
+        let pre_while_label = self.set_continue_target(node_id, pre_while_label);
+        let pre_body_label = self.alloc_label();
+        let post_while_label = self.alloc_label();
+        self.add_current_antecedent(pre_while_label);
+        self.current = Some(pre_while_label);
+        self.bind_condition(expression, pre_body_label, post_while_label);
+        if self.current.is_none() {
+            self.discover_nested_containers(statement);
+            return;
+        }
+        self.current = self.finish_label(pre_body_label);
+        self.bind_iterative_statement(statement, post_while_label, pre_while_label);
+        if self.current.is_none() {
+            return;
+        }
+        self.add_current_antecedent(pre_while_label);
+        self.current = self.finish_label(post_while_label);
+    }
+
+    fn bind_do_statement(&mut self, node_id: NodeId) {
+        let (expression, statement) = match self.ast.get(node_id).map(|node| &node.data) {
+            Some(NodeData::DoStatement(data)) => (data.expression, data.statement),
+            _ => return,
+        };
+        let pre_do_label = self.alloc_loop_label();
+        let pre_condition_label = self.alloc_label();
+        let pre_condition_label = self.set_continue_target(node_id, pre_condition_label);
+        let post_do_label = self.alloc_label();
+        self.add_current_antecedent(pre_do_label);
+        self.current = Some(pre_do_label);
+        self.bind_iterative_statement(statement, post_do_label, pre_condition_label);
+        if self.current.is_none() {
+            self.discover_nested_containers(expression);
+            return;
+        }
+        self.add_current_antecedent(pre_condition_label);
+        self.current = self.finish_label(pre_condition_label);
+        self.bind_condition(expression, pre_do_label, post_do_label);
+        if self.current.is_none() {
+            return;
+        }
+        self.current = self.finish_label(post_do_label);
+    }
+
+    fn bind_for_statement(&mut self, node_id: NodeId) {
+        let (initializer, condition, incrementor, statement) =
+            match self.ast.get(node_id).map(|node| &node.data) {
+                Some(NodeData::ForStatement(data)) => (
+                    data.initializer,
+                    data.condition,
+                    data.incrementor,
+                    data.statement,
+                ),
+                _ => return,
+            };
+        let pre_loop_label = self.alloc_loop_label();
+        let pre_loop_label = self.set_continue_target(node_id, pre_loop_label);
+        let pre_body_label = self.alloc_label();
+        let pre_incrementor_label = self.alloc_label();
+        let post_loop_label = self.alloc_label();
+        if let Some(initializer) = initializer {
+            self.bind_node(initializer);
+        }
+        if self.current.is_none() {
+            if let Some(condition) = condition {
+                self.discover_nested_containers(condition);
+            }
+            if let Some(incrementor) = incrementor {
+                self.discover_nested_containers(incrementor);
+            }
+            self.discover_nested_containers(statement);
+            return;
+        }
+        self.add_current_antecedent(pre_loop_label);
+        self.current = Some(pre_loop_label);
+        self.bind_optional_condition(condition, pre_body_label, post_loop_label);
+        if self.current.is_none() {
+            self.discover_nested_containers(statement);
+            if let Some(incrementor) = incrementor {
+                self.discover_nested_containers(incrementor);
+            }
+            return;
+        }
+        self.current = self.finish_label(pre_body_label);
+        self.bind_iterative_statement(statement, post_loop_label, pre_incrementor_label);
+        if self.current.is_none() {
+            if let Some(incrementor) = incrementor {
+                self.discover_nested_containers(incrementor);
+            }
+            return;
+        }
+        self.add_current_antecedent(pre_incrementor_label);
+        self.current = self.finish_label(pre_incrementor_label);
+        if let Some(incrementor) = incrementor {
+            self.bind_node(incrementor);
+        }
+        if self.current.is_none() {
+            return;
+        }
+        self.add_current_antecedent(pre_loop_label);
+        self.current = self.finish_label(post_loop_label);
+    }
+
+    fn bind_for_in_or_of_statement(&mut self, node_id: NodeId) {
+        let (await_modifier, expression, initializer, statement) =
+            match self.ast.get(node_id).map(|node| &node.data) {
+                Some(NodeData::ForInOrOfStatement(data)) => (
+                    data.await_modifier,
+                    data.expression,
+                    data.initializer,
+                    data.statement,
+                ),
+                _ => return,
+            };
+        let pre_loop_label = self.alloc_loop_label();
+        let pre_loop_label = self.set_continue_target(node_id, pre_loop_label);
+        let post_loop_label = self.alloc_label();
+        self.bind_node(expression);
+        if self.current.is_none() {
+            self.discover_nested_containers(initializer);
+            self.discover_nested_containers(statement);
+            return;
+        }
+        self.add_current_antecedent(pre_loop_label);
+        self.current = Some(pre_loop_label);
+        if self.node_kind(node_id) == Some(SyntaxKind::ForOfStatement)
+            && let Some(await_modifier) = await_modifier
+        {
+            self.bind_node(await_modifier);
+        }
+        self.add_current_antecedent(post_loop_label);
+        if self.node_kind(initializer) != Some(SyntaxKind::VariableDeclarationList)
+            && matches!(
+                self.node_kind(self.skip_parentheses(initializer)),
+                Some(SyntaxKind::ArrayLiteralExpression | SyntaxKind::ObjectLiteralExpression)
+            )
+        {
+            self.mark_unsupported(initializer, UnsupportedFlowKind::DestructuringAssignment);
+            self.discover_nested_containers(initializer);
+            self.discover_nested_containers(statement);
+            return;
+        }
+        self.bind_node(initializer);
+        if self.current.is_none() {
+            self.discover_nested_containers(statement);
+            return;
+        }
+        if self.node_kind(initializer) != Some(SyntaxKind::VariableDeclarationList) {
+            self.bind_assignment_target_flow(initializer);
+        }
+        self.bind_iterative_statement(statement, post_loop_label, pre_loop_label);
+        if self.current.is_none() {
+            return;
+        }
+        self.add_current_antecedent(pre_loop_label);
+        self.current = self.finish_label(post_loop_label);
+    }
+
+    fn bind_break_or_continue_statement(&mut self, node_id: NodeId, jump: JumpKind) {
+        let label = match self.ast.get(node_id).map(|node| &node.data) {
+            Some(NodeData::BreakStatement(data)) => data.label,
+            Some(NodeData::ContinueStatement(data)) => data.label,
+            _ => return,
+        };
+        if let Some(label) = label {
+            self.bind_node(label);
+            let Some(name) = self.identifier_text(label).map(str::to_owned) else {
+                return;
+            };
+            if let Some(index) = self.find_active_label(&name) {
+                self.active_labels[index].referenced = true;
+                let target = match jump {
+                    JumpKind::Break => Some(self.active_labels[index].break_target),
+                    JumpKind::Continue => self.active_labels[index].continue_target,
+                };
+                self.bind_break_or_continue_flow(target);
+            }
+        } else {
+            let target = match jump {
+                JumpKind::Break => self.break_target,
+                JumpKind::Continue => self.continue_target,
+            };
+            self.bind_break_or_continue_flow(target);
+        }
+    }
+
+    fn find_active_label(&self, name: &str) -> Option<usize> {
+        self.active_labels
+            .iter()
+            .rposition(|label| label.name == name)
+    }
+
+    fn bind_break_or_continue_flow(&mut self, target: Option<FlowRef>) {
+        let (Some(target), Some(current)) = (target, self.current) else {
+            return;
+        };
+        self.add_antecedent(target, current);
+        self.current = Some(self.graph.nodes.unreachable());
+        self.has_flow_effects = true;
+    }
+
+    fn bind_labeled_statement(&mut self, node_id: NodeId) {
+        let (label, statement) = match self.ast.get(node_id).map(|node| &node.data) {
+            Some(NodeData::LabeledStatement(data)) => (data.label, data.statement),
+            _ => return,
+        };
+        let Some(name) = self.identifier_text(label).map(str::to_owned) else {
+            self.mark_unsupported(node_id, UnsupportedFlowKind::DestructuringAssignment);
+            self.discover_nested_containers(statement);
+            return;
+        };
+        let post_statement_label = self.alloc_label();
+        self.active_labels.push(ActiveLabel {
+            name,
+            break_target: post_statement_label,
+            continue_target: None,
+            referenced: false,
+        });
+        self.bind_node(label);
+        self.bind_node(statement);
+        let active_label = self
+            .active_labels
+            .pop()
+            .expect("labeled statement keeps its active label until its body is bound");
+        if !active_label.referenced {
+            self.graph.unreachable_nodes.insert(label);
+            self.graph.node_containers.insert(label, self.container);
+        }
+        if self.current.is_none() {
+            return;
+        }
+        self.add_current_antecedent(post_statement_label);
+        self.current = self.finish_label(post_statement_label);
+    }
+
     fn bind_if_statement(&mut self, node_id: NodeId) {
         let (expression, then_statement, else_statement) =
             match self.ast.get(node_id).map(|node| &node.data) {
@@ -277,13 +563,29 @@ impl<'a> FlowBuilder<'a> {
     }
 
     fn bind_condition(&mut self, expression: NodeId, true_target: FlowRef, false_target: FlowRef) {
-        self.bind_node(expression);
+        self.bind_optional_condition(Some(expression), true_target, false_target);
+    }
+
+    fn bind_optional_condition(
+        &mut self,
+        expression: Option<NodeId>,
+        true_target: FlowRef,
+        false_target: FlowRef,
+    ) {
+        if let Some(expression) = expression {
+            self.bind_node(expression);
+        }
         let Some(current) = self.current else {
             return;
         };
-        let true_flow = self.create_flow_condition(FlowFlags::TRUE_CONDITION, current, expression);
-        let false_flow =
-            self.create_flow_condition(FlowFlags::FALSE_CONDITION, current, expression);
+        let (true_flow, false_flow) = if let Some(expression) = expression {
+            (
+                self.create_flow_condition(FlowFlags::TRUE_CONDITION, current, expression),
+                self.create_flow_condition(FlowFlags::FALSE_CONDITION, current, expression),
+            )
+        } else {
+            (current, self.graph.nodes.unreachable())
+        };
         self.add_antecedent(true_target, true_flow);
         self.add_antecedent(false_target, false_flow);
     }
@@ -457,7 +759,8 @@ impl<'a> FlowBuilder<'a> {
                 ),
                 _ => return,
             };
-        if initializer.is_some()
+        let initialized_by_iteration = self.is_for_in_or_of_initializer(node_id);
+        if (initializer.is_some() || initialized_by_iteration)
             && matches!(
                 self.node_kind(name),
                 Some(SyntaxKind::ObjectBindingPattern | SyntaxKind::ArrayBindingPattern)
@@ -476,6 +779,8 @@ impl<'a> FlowBuilder<'a> {
         }
         if let Some(initializer) = initializer {
             self.bind_node(initializer);
+        }
+        if initializer.is_some() || initialized_by_iteration {
             self.create_flow_mutation(FlowFlags::ASSIGNMENT, node_id);
         }
     }
@@ -811,11 +1116,14 @@ impl<'a> FlowBuilder<'a> {
         })
     }
 
-    fn save_flow(&self) -> SavedFlow {
+    fn save_flow(&mut self) -> SavedFlow {
         SavedFlow {
             current: self.current,
             container: self.container,
-            return_target: self.return_target,
+            return_target: self.return_target.take(),
+            break_target: self.break_target.take(),
+            continue_target: self.continue_target.take(),
+            active_labels: std::mem::take(&mut self.active_labels),
         }
     }
 
@@ -823,6 +1131,9 @@ impl<'a> FlowBuilder<'a> {
         self.current = saved.current;
         self.container = saved.container;
         self.return_target = saved.return_target;
+        self.break_target = saved.break_target;
+        self.continue_target = saved.continue_target;
+        self.active_labels = saved.active_labels;
     }
 
     fn maybe_bind_expression_flow_if_call(&mut self, expression: NodeId) {
@@ -872,6 +1183,13 @@ impl<'a> FlowBuilder<'a> {
             .nodes
             .alloc(FlowNode::new(FlowFlags::BRANCH_LABEL))
             .expect("binder-created label belongs to its flow arena")
+    }
+
+    fn alloc_loop_label(&mut self) -> FlowRef {
+        self.graph
+            .nodes
+            .alloc(FlowNode::new(FlowFlags::LOOP_LABEL))
+            .expect("binder-created loop label belongs to its flow arena")
     }
 
     fn create_flow_condition(
@@ -1005,6 +1323,22 @@ impl<'a> FlowBuilder<'a> {
 
     fn node_kind(&self, node: NodeId) -> Option<SyntaxKind> {
         self.ast.get(node).map(|node| node.kind)
+    }
+
+    fn is_for_in_or_of_initializer(&self, declaration: NodeId) -> bool {
+        let Some(declaration_list) = self.ast.get(declaration).and_then(|node| node.parent) else {
+            return false;
+        };
+        if self.node_kind(declaration_list) != Some(SyntaxKind::VariableDeclarationList) {
+            return false;
+        }
+        let Some(statement) = self.ast.get(declaration_list).and_then(|node| node.parent) else {
+            return false;
+        };
+        matches!(
+            self.ast.get(statement).map(|node| &node.data),
+            Some(NodeData::ForInOrOfStatement(data)) if data.initializer == declaration_list
+        )
     }
 
     fn is_potentially_executable_node(&self, node_id: NodeId) -> bool {

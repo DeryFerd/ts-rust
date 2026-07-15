@@ -328,11 +328,8 @@ pub struct BindDiagnostic {
 /// downstream semantic work mistake them for complete TypeScript control flow.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UnsupportedFlowKind {
-    IterationStatement,
     SwitchStatement,
     TryStatement,
-    BreakOrContinueStatement,
-    LabeledStatement,
     WithStatement,
     LogicalExpression,
     OptionalChain,
@@ -2012,6 +2009,40 @@ mod tests {
         source.statements.nodes.clone()
     }
 
+    fn block_statements(arena: &NodeArena, block: NodeId) -> Vec<NodeId> {
+        let NodeData::Block(block) = &arena.get(block).unwrap().data else {
+            panic!("expected block");
+        };
+        block.statements.nodes.clone()
+    }
+
+    fn label_named(arena: &NodeArena, name: &str) -> NodeId {
+        nodes_of_kind(arena, SyntaxKind::LabeledStatement)
+            .into_iter()
+            .find_map(|statement| {
+                let NodeData::LabeledStatement(data) = &arena.get(statement).unwrap().data else {
+                    return None;
+                };
+                matches!(
+                    &arena.get(data.label).unwrap().data,
+                    NodeData::Identifier(identifier) if identifier.text == name
+                )
+                .then_some(data.label)
+            })
+            .unwrap()
+    }
+
+    fn branch_target_index(graph: &BoundFlowGraph, antecedent: FlowRef) -> usize {
+        graph
+            .nodes()
+            .iter()
+            .position(|node| {
+                node.flags.contains(FlowFlags::BRANCH_LABEL)
+                    && node.antecedents.contains(&antecedent)
+            })
+            .unwrap()
+    }
+
     fn node_ref(arena: &NodeArena, file: FileId, node: NodeId) -> NodeRef {
         NodeRef::new(arena.id(), file, node)
     }
@@ -2393,6 +2424,326 @@ mod tests {
         let end_node = graph.nodes().get(end).unwrap();
         assert!(end_node.flags.contains(FlowFlags::ASSIGNMENT));
         assert_eq!(end_node.antecedent, Some(post_if));
+    }
+
+    #[test]
+    fn while_flow_preserves_entry_condition_and_back_edge_order() {
+        let parsed = parse_source_file("let value = 0; while (value) { value = 1; } value = 2;");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(26);
+        let result = bind_source_file_in_file(&parsed.arena, parsed.source_file, file);
+        let graph = result
+            .flow_graph(&parsed.arena, parsed.source_file)
+            .unwrap();
+        assert!(graph.is_complete(), "{:?}", graph.unsupported());
+
+        let statements = source_statements(&parsed.arena, parsed.source_file);
+        let [_, while_statement, final_statement] = statements.as_slice() else {
+            panic!("expected initializer, while, and final assignment");
+        };
+        let NodeData::WhileStatement(while_data) =
+            &parsed.arena.get(*while_statement).unwrap().data
+        else {
+            panic!("expected while statement");
+        };
+        let body_statement = block_statements(&parsed.arena, while_data.statement)[0];
+        let while_entry = graph
+            .flow_at(node_ref(&parsed.arena, file, *while_statement))
+            .unwrap();
+        let body_entry = graph
+            .flow_at(node_ref(&parsed.arena, file, body_statement))
+            .unwrap();
+        let true_condition = graph.nodes().get(body_entry).unwrap();
+        assert!(true_condition.flags.contains(FlowFlags::TRUE_CONDITION));
+        let loop_flow = true_condition.antecedent.unwrap();
+        let loop_node = graph.nodes().get(loop_flow).unwrap();
+        assert!(loop_node.flags.contains(FlowFlags::LOOP_LABEL));
+        assert_eq!(loop_node.antecedents.len(), 2);
+        assert_eq!(loop_node.antecedents[0], while_entry);
+        assert!(
+            graph
+                .nodes()
+                .get(loop_node.antecedents[1])
+                .unwrap()
+                .flags
+                .contains(FlowFlags::ASSIGNMENT)
+        );
+
+        let final_entry = graph
+            .flow_at(node_ref(&parsed.arena, file, *final_statement))
+            .unwrap();
+        let false_condition = graph.nodes().get(final_entry).unwrap();
+        assert!(false_condition.flags.contains(FlowFlags::FALSE_CONDITION));
+        assert_eq!(false_condition.antecedent, Some(loop_flow));
+    }
+
+    #[test]
+    fn do_flow_runs_the_body_before_its_condition_back_edge() {
+        let parsed =
+            parse_source_file("let value = 0; do { value = 1; } while (value); value = 2;");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(27);
+        let result = bind_source_file_in_file(&parsed.arena, parsed.source_file, file);
+        let graph = result
+            .flow_graph(&parsed.arena, parsed.source_file)
+            .unwrap();
+        assert!(graph.is_complete(), "{:?}", graph.unsupported());
+
+        let statements = source_statements(&parsed.arena, parsed.source_file);
+        let [_, do_statement, final_statement] = statements.as_slice() else {
+            panic!("expected initializer, do, and final assignment");
+        };
+        let NodeData::DoStatement(do_data) = &parsed.arena.get(*do_statement).unwrap().data else {
+            panic!("expected do statement");
+        };
+        let body_statement = block_statements(&parsed.arena, do_data.statement)[0];
+        let loop_flow = graph
+            .flow_at(node_ref(&parsed.arena, file, body_statement))
+            .unwrap();
+        let loop_node = graph.nodes().get(loop_flow).unwrap();
+        assert!(loop_node.flags.contains(FlowFlags::LOOP_LABEL));
+        assert_eq!(loop_node.antecedents.len(), 2);
+        assert_eq!(
+            loop_node.antecedents[0],
+            graph
+                .flow_at(node_ref(&parsed.arena, file, *do_statement))
+                .unwrap()
+        );
+        let true_flow = loop_node.antecedents[1];
+        let true_condition = graph.nodes().get(true_flow).unwrap();
+        assert!(true_condition.flags.contains(FlowFlags::TRUE_CONDITION));
+
+        let false_flow = graph
+            .flow_at(node_ref(&parsed.arena, file, *final_statement))
+            .unwrap();
+        let false_condition = graph.nodes().get(false_flow).unwrap();
+        assert!(false_condition.flags.contains(FlowFlags::FALSE_CONDITION));
+        assert_eq!(true_condition.antecedent, false_condition.antecedent);
+    }
+
+    #[test]
+    fn classic_for_without_condition_keeps_initializer_and_incrementor_edges() {
+        let parsed = parse_source_file("for (let i = 0; ; i++) { if (i) break; } i;");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(28);
+        let result = bind_source_file_in_file(&parsed.arena, parsed.source_file, file);
+        let graph = result
+            .flow_graph(&parsed.arena, parsed.source_file)
+            .unwrap();
+        assert!(graph.is_complete(), "{:?}", graph.unsupported());
+
+        let statements = source_statements(&parsed.arena, parsed.source_file);
+        let [for_statement, final_statement] = statements.as_slice() else {
+            panic!("expected for and final statements");
+        };
+        let NodeData::ForStatement(for_data) = &parsed.arena.get(*for_statement).unwrap().data
+        else {
+            panic!("expected for statement");
+        };
+        assert_eq!(for_data.condition, None);
+        let loop_node = graph
+            .nodes()
+            .iter()
+            .find(|flow| flow.flags.contains(FlowFlags::LOOP_LABEL))
+            .unwrap();
+        assert_eq!(loop_node.antecedents.len(), 2);
+        for antecedent in &loop_node.antecedents {
+            assert!(
+                graph
+                    .nodes()
+                    .get(*antecedent)
+                    .unwrap()
+                    .flags
+                    .contains(FlowFlags::ASSIGNMENT)
+            );
+        }
+        assert_eq!(
+            graph
+                .nodes()
+                .iter()
+                .filter(|flow| flow.flags.intersects(FlowFlags::CONDITION))
+                .count(),
+            2
+        );
+        let final_flow = graph
+            .flow_at(node_ref(&parsed.arena, file, *final_statement))
+            .unwrap();
+        assert!(
+            graph
+                .nodes()
+                .get(final_flow)
+                .unwrap()
+                .flags
+                .contains(FlowFlags::TRUE_CONDITION)
+        );
+    }
+
+    #[test]
+    fn labeled_for_continue_bypasses_the_incrementor_target() {
+        let parsed = parse_source_file(
+            "outer: for (let i = 0; cond; i++) { if (a) continue; if (b) continue outer; }",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(36);
+        let result = bind_source_file_in_file(&parsed.arena, parsed.source_file, file);
+        let graph = result
+            .flow_graph(&parsed.arena, parsed.source_file)
+            .unwrap();
+        assert!(graph.is_complete(), "{:?}", graph.unsupported());
+
+        let mut unlabeled_continue = None;
+        let mut labeled_continue = None;
+        for statement in nodes_of_kind(&parsed.arena, SyntaxKind::ContinueStatement) {
+            let NodeData::ContinueStatement(data) = &parsed.arena.get(statement).unwrap().data
+            else {
+                unreachable!();
+            };
+            if data.label.is_some() {
+                labeled_continue = Some(statement);
+            } else {
+                unlabeled_continue = Some(statement);
+            }
+        }
+        let unlabeled_continue_flow = graph
+            .flow_at(node_ref(&parsed.arena, file, unlabeled_continue.unwrap()))
+            .unwrap();
+        let labeled_continue_flow = graph
+            .flow_at(node_ref(&parsed.arena, file, labeled_continue.unwrap()))
+            .unwrap();
+
+        let pre_loop = graph
+            .nodes()
+            .iter()
+            .find(|flow| flow.flags.contains(FlowFlags::LOOP_LABEL))
+            .unwrap();
+        assert_eq!(pre_loop.antecedents.len(), 3);
+        assert!(
+            graph
+                .nodes()
+                .get(pre_loop.antecedents[0])
+                .unwrap()
+                .flags
+                .contains(FlowFlags::ASSIGNMENT)
+        );
+        assert_eq!(pre_loop.antecedents[1], labeled_continue_flow);
+
+        let incrementor_flow = pre_loop.antecedents[2];
+        let incrementor = graph.nodes().get(incrementor_flow).unwrap();
+        assert!(incrementor.flags.contains(FlowFlags::ASSIGNMENT));
+        let pre_incrementor_flow = incrementor.antecedent.unwrap();
+        let pre_incrementor = graph.nodes().get(pre_incrementor_flow).unwrap();
+        assert!(pre_incrementor.flags.contains(FlowFlags::BRANCH_LABEL));
+        assert_eq!(pre_incrementor.antecedents.len(), 2);
+        assert_eq!(pre_incrementor.antecedents[0], unlabeled_continue_flow);
+        assert!(!pre_incrementor.antecedents.contains(&labeled_continue_flow));
+        assert!(!pre_loop.antecedents.contains(&unlabeled_continue_flow));
+    }
+
+    #[test]
+    fn for_in_and_for_of_create_iteration_assignment_back_edges() {
+        let parsed = parse_source_file(
+            "let key; for (key in object) {} for (const value of values) {} key;",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(29);
+        let result = bind_source_file_in_file(&parsed.arena, parsed.source_file, file);
+        let graph = result
+            .flow_graph(&parsed.arena, parsed.source_file)
+            .unwrap();
+        assert!(graph.is_complete(), "{:?}", graph.unsupported());
+
+        let statements = source_statements(&parsed.arena, parsed.source_file);
+        let [_, for_in, for_of, after] = statements.as_slice() else {
+            panic!("expected declaration, for-in, for-of, and trailing statement");
+        };
+        let NodeData::ForInOrOfStatement(for_in_data) = &parsed.arena.get(*for_in).unwrap().data
+        else {
+            panic!("expected for-in statement");
+        };
+        let NodeData::ForInOrOfStatement(for_of_data) = &parsed.arena.get(*for_of).unwrap().data
+        else {
+            panic!("expected for-of statement");
+        };
+        let first_loop = graph
+            .flow_at(node_ref(&parsed.arena, file, *for_of))
+            .unwrap();
+        let first_loop_node = graph.nodes().get(first_loop).unwrap();
+        assert!(first_loop_node.flags.contains(FlowFlags::LOOP_LABEL));
+        assert_eq!(first_loop_node.antecedents.len(), 2);
+        let first_assignment = graph.nodes().get(first_loop_node.antecedents[1]).unwrap();
+        assert!(first_assignment.flags.contains(FlowFlags::ASSIGNMENT));
+        assert_eq!(
+            first_assignment.payload,
+            Some(FlowNodePayload::Ast(node_ref(
+                &parsed.arena,
+                file,
+                for_in_data.initializer,
+            )))
+        );
+
+        let second_loop = graph
+            .flow_at(node_ref(&parsed.arena, file, *after))
+            .unwrap();
+        let second_loop_node = graph.nodes().get(second_loop).unwrap();
+        assert!(second_loop_node.flags.contains(FlowFlags::LOOP_LABEL));
+        assert_eq!(second_loop_node.antecedents.len(), 2);
+        assert_eq!(second_loop_node.antecedents[0], first_loop);
+        let NodeData::VariableDeclarationList(list) =
+            &parsed.arena.get(for_of_data.initializer).unwrap().data
+        else {
+            panic!("expected for-of declaration list");
+        };
+        let declaration = list.declarations.nodes[0];
+        let second_assignment = graph.nodes().get(second_loop_node.antecedents[1]).unwrap();
+        assert!(second_assignment.flags.contains(FlowFlags::ASSIGNMENT));
+        assert_eq!(
+            second_assignment.payload,
+            Some(FlowNodePayload::Ast(node_ref(
+                &parsed.arena,
+                file,
+                declaration,
+            )))
+        );
+    }
+
+    #[test]
+    fn for_await_binds_its_modifier_and_unlabeled_continue_to_the_loop_head() {
+        let parsed = parse_source_file(
+            "async function consume(values: any) { for await (const value of values) { continue; } }",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(30);
+        let result = bind_source_file_in_file(&parsed.arena, parsed.source_file, file);
+        let graph = result
+            .flow_graph(&parsed.arena, parsed.source_file)
+            .unwrap();
+        assert!(graph.is_complete(), "{:?}", graph.unsupported());
+
+        let for_of = nodes_of_kind(&parsed.arena, SyntaxKind::ForOfStatement)[0];
+        let NodeData::ForInOrOfStatement(for_of_data) = &parsed.arena.get(for_of).unwrap().data
+        else {
+            panic!("expected for-await-of statement");
+        };
+        assert!(for_of_data.await_modifier.is_some());
+        let continue_statement = nodes_of_kind(&parsed.arena, SyntaxKind::ContinueStatement)[0];
+        let continue_flow = graph
+            .flow_at(node_ref(&parsed.arena, file, continue_statement))
+            .unwrap();
+        let loop_node = graph
+            .nodes()
+            .iter()
+            .find(|flow| flow.flags.contains(FlowFlags::LOOP_LABEL))
+            .unwrap();
+        assert_eq!(loop_node.antecedents.len(), 2);
+        assert_eq!(loop_node.antecedents[1], continue_flow);
+        assert!(
+            graph
+                .nodes()
+                .get(continue_flow)
+                .unwrap()
+                .flags
+                .contains(FlowFlags::ASSIGNMENT)
+        );
     }
 
     #[test]
@@ -2795,9 +3146,281 @@ mod tests {
     }
 
     #[test]
+    fn nested_labeled_jumps_select_distinct_break_and_continue_targets() {
+        let parsed = parse_source_file(
+            r"
+                outer: for (;;) {
+                    inner: while (flag) {
+                        if (skip) continue outer;
+                        if (done) break inner;
+                        break outer;
+                    }
+                }
+                after;
+                unused: { after; }
+            ",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(31);
+        let result = bind_source_file_in_file(&parsed.arena, parsed.source_file, file);
+        let graph = result
+            .flow_graph(&parsed.arena, parsed.source_file)
+            .unwrap();
+        assert!(graph.is_complete(), "{:?}", graph.unsupported());
+
+        let outer_label = label_named(&parsed.arena, "outer");
+        let inner_label = label_named(&parsed.arena, "inner");
+        let unused_label = label_named(&parsed.arena, "unused");
+        assert_eq!(
+            graph.is_unreachable(node_ref(&parsed.arena, file, outer_label)),
+            Some(false)
+        );
+        assert_eq!(
+            graph.is_unreachable(node_ref(&parsed.arena, file, inner_label)),
+            Some(false)
+        );
+        assert_eq!(
+            graph.is_unreachable(node_ref(&parsed.arena, file, unused_label)),
+            Some(true)
+        );
+
+        let continue_statement = nodes_of_kind(&parsed.arena, SyntaxKind::ContinueStatement)[0];
+        let continue_flow = graph
+            .flow_at(node_ref(&parsed.arena, file, continue_statement))
+            .unwrap();
+        let mut inner_break = None;
+        let mut outer_break = None;
+        for statement in nodes_of_kind(&parsed.arena, SyntaxKind::BreakStatement) {
+            let NodeData::BreakStatement(data) = &parsed.arena.get(statement).unwrap().data else {
+                unreachable!();
+            };
+            let label = data.label.unwrap();
+            let name = match &parsed.arena.get(label).unwrap().data {
+                NodeData::Identifier(identifier) => identifier.text.as_str(),
+                _ => panic!("expected jump label"),
+            };
+            match name {
+                "inner" => inner_break = Some(statement),
+                "outer" => outer_break = Some(statement),
+                _ => panic!("unexpected jump label"),
+            }
+        }
+        let inner_break_flow = graph
+            .flow_at(node_ref(&parsed.arena, file, inner_break.unwrap()))
+            .unwrap();
+        let outer_break_flow = graph
+            .flow_at(node_ref(&parsed.arena, file, outer_break.unwrap()))
+            .unwrap();
+        let continue_target = branch_target_index(graph, continue_flow);
+        let inner_break_target = branch_target_index(graph, inner_break_flow);
+        let outer_break_target = branch_target_index(graph, outer_break_flow);
+        assert_ne!(continue_target, inner_break_target);
+        assert_ne!(continue_target, outer_break_target);
+        assert_ne!(inner_break_target, outer_break_target);
+        assert_eq!(
+            graph
+                .nodes()
+                .iter()
+                .nth(inner_break_target)
+                .unwrap()
+                .antecedents
+                .len(),
+            2
+        );
+        assert_eq!(
+            graph
+                .nodes()
+                .iter()
+                .nth(outer_break_target)
+                .unwrap()
+                .antecedents,
+            vec![outer_break_flow]
+        );
+        let after = source_statements(&parsed.arena, parsed.source_file)[1];
+        assert_eq!(
+            graph.flow_at(node_ref(&parsed.arena, file, after)),
+            Some(outer_break_flow)
+        );
+    }
+
+    #[test]
+    fn unknown_jump_labels_do_not_capture_the_current_loop_targets() {
+        let parsed = parse_source_file(
+            "while (flag) { break missing; continue absent; afterInvalidJumps; }",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(32);
+        let result = bind_source_file_in_file(&parsed.arena, parsed.source_file, file);
+        let graph = result
+            .flow_graph(&parsed.arena, parsed.source_file)
+            .unwrap();
+        assert!(graph.is_complete(), "{:?}", graph.unsupported());
+
+        let break_statement = nodes_of_kind(&parsed.arena, SyntaxKind::BreakStatement)[0];
+        let continue_statement = nodes_of_kind(&parsed.arena, SyntaxKind::ContinueStatement)[0];
+        let expression_statement = nodes_of_kind(&parsed.arena, SyntaxKind::ExpressionStatement)[0];
+        let break_flow = graph
+            .flow_at(node_ref(&parsed.arena, file, break_statement))
+            .unwrap();
+        assert_eq!(
+            graph.flow_at(node_ref(&parsed.arena, file, continue_statement)),
+            Some(break_flow)
+        );
+        assert_eq!(
+            graph.flow_at(node_ref(&parsed.arena, file, expression_statement)),
+            Some(break_flow)
+        );
+    }
+
+    #[test]
+    fn unlabeled_while_and_do_continues_leave_their_loop_tails_unreachable() {
+        let parsed = parse_source_file(
+            r"
+                function tails(flag: boolean) {
+                    while (flag) { continue; const afterWhile = 1; }
+                    do { continue; const afterDo = 2; } while (flag);
+                    const reachable = 3;
+                }
+            ",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(33);
+        let result = bind_source_file_in_file(&parsed.arena, parsed.source_file, file);
+        let graph = result
+            .flow_graph(&parsed.arena, parsed.source_file)
+            .unwrap();
+        assert!(graph.is_complete(), "{:?}", graph.unsupported());
+
+        let variables = nodes_of_kind(&parsed.arena, SyntaxKind::VariableStatement);
+        let [after_while, after_do, reachable] = variables.as_slice() else {
+            panic!("expected two loop tails and one reachable declaration");
+        };
+        for unreachable in [after_while, after_do] {
+            assert_eq!(
+                graph.is_unreachable(node_ref(&parsed.arena, file, *unreachable)),
+                Some(true)
+            );
+        }
+        assert_eq!(
+            graph.is_unreachable(node_ref(&parsed.arena, file, *reachable)),
+            Some(false)
+        );
+
+        let continue_statements = nodes_of_kind(&parsed.arena, SyntaxKind::ContinueStatement);
+        let while_continue_flow = graph
+            .flow_at(node_ref(&parsed.arena, file, continue_statements[0]))
+            .unwrap();
+        assert!(graph.nodes().iter().any(|node| {
+            node.flags.contains(FlowFlags::LOOP_LABEL)
+                && node.antecedents.contains(&while_continue_flow)
+        }));
+        let do_statement = nodes_of_kind(&parsed.arena, SyntaxKind::DoStatement)[0];
+        let NodeData::DoStatement(do_data) = &parsed.arena.get(do_statement).unwrap().data else {
+            unreachable!();
+        };
+        let do_continue_flow = graph
+            .flow_at(node_ref(&parsed.arena, file, continue_statements[1]))
+            .unwrap();
+        assert!(graph.nodes().iter().any(|node| {
+            node.flags.contains(FlowFlags::TRUE_CONDITION)
+                && node.antecedent == Some(do_continue_flow)
+                && node.payload
+                    == Some(FlowNodePayload::Ast(node_ref(
+                        &parsed.arena,
+                        file,
+                        do_data.expression,
+                    )))
+        }));
+    }
+
+    #[test]
+    fn detached_function_jumps_cannot_capture_outer_labels_or_loop_targets() {
+        let parsed = parse_source_file(
+            r"
+                outer: while (flag) {
+                    function detached() {
+                        break outer;
+                        afterInvalidBreak;
+                    }
+                }
+            ",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(34);
+        let result = bind_source_file_in_file(&parsed.arena, parsed.source_file, file);
+        let graph = result
+            .flow_graph(&parsed.arena, parsed.source_file)
+            .unwrap();
+        assert!(graph.is_complete(), "{:?}", graph.unsupported());
+
+        let labeled = nodes_of_kind(&parsed.arena, SyntaxKind::LabeledStatement)[0];
+        let NodeData::LabeledStatement(label_data) = &parsed.arena.get(labeled).unwrap().data
+        else {
+            unreachable!();
+        };
+        assert_eq!(
+            graph.is_unreachable(node_ref(&parsed.arena, file, label_data.label)),
+            Some(true)
+        );
+        let function = nodes_of_kind(&parsed.arena, SyntaxKind::FunctionDeclaration)[0];
+        assert_eq!(
+            graph.container_is_complete(node_ref(&parsed.arena, file, function)),
+            Some(true)
+        );
+        let after_invalid_break = nodes_of_kind(&parsed.arena, SyntaxKind::ExpressionStatement)[0];
+        let break_statement = nodes_of_kind(&parsed.arena, SyntaxKind::BreakStatement)[0];
+        assert_eq!(
+            graph.flow_at(node_ref(&parsed.arena, file, after_invalid_break)),
+            graph.flow_at(node_ref(&parsed.arena, file, break_statement))
+        );
+        assert!(
+            graph
+                .flow_at(node_ref(&parsed.arena, file, after_invalid_break))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn for_await_of_destructuring_invalidates_only_its_flow_container() {
+        let parsed = parse_source_file(
+            r"
+                async function consume(entries: any) {
+                    for await (const [key, value] of entries) {}
+                }
+                const after = 1;
+            ",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(35);
+        let result = bind_source_file_in_file(&parsed.arena, parsed.source_file, file);
+        let graph = result
+            .flow_graph(&parsed.arena, parsed.source_file)
+            .unwrap();
+        assert!(!graph.is_complete());
+
+        let function = nodes_of_kind(&parsed.arena, SyntaxKind::FunctionDeclaration)[0];
+        let function_ref = node_ref(&parsed.arena, file, function);
+        let source_ref = node_ref(&parsed.arena, file, parsed.source_file);
+        assert_eq!(graph.container_is_complete(function_ref), Some(false));
+        assert_eq!(graph.container_is_complete(source_ref), Some(true));
+        assert_eq!(graph.unsupported().len(), 1);
+        assert_eq!(
+            graph.unsupported()[0].kind,
+            UnsupportedFlowKind::DestructuringAssignment
+        );
+        assert_eq!(graph.unsupported()[0].container, function_ref);
+        let after = source_statements(&parsed.arena, parsed.source_file)[1];
+        assert!(
+            graph
+                .flow_at(node_ref(&parsed.arena, file, after))
+                .is_some()
+        );
+    }
+
+    #[test]
     fn unsupported_nested_effects_invalidate_an_enclosing_conditional() {
         let parsed = parse_source_file(
-            "const result = flag ? (() => { while (value) { value = 1; } }) : 0;",
+            "const result = flag ? (() => { switch (value) { default: value = 1; } }) : 0;",
         );
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         let file = FileId::new(22);
@@ -2814,7 +3437,7 @@ mod tests {
         assert_eq!(graph.container_is_complete(arrow_ref), Some(false));
         assert!(graph.unsupported().iter().any(|unsupported| {
             unsupported.container == arrow_ref
-                && unsupported.kind == UnsupportedFlowKind::IterationStatement
+                && unsupported.kind == UnsupportedFlowKind::SwitchStatement
         }));
         assert!(graph.unsupported().iter().any(|unsupported| {
             unsupported.container == source_ref
@@ -2910,7 +3533,7 @@ mod tests {
         let parsed = parse_source_file(
             r"
                 function iterate(value: number) {
-                    while (value) { value = 0; }
+                    switch (value) { default: value = 0; }
                     value = 1;
                 }
                 const after = 1;
@@ -2940,11 +3563,11 @@ mod tests {
         assert_eq!(graph.unsupported().len(), 1);
         assert_eq!(
             graph.unsupported()[0].kind,
-            UnsupportedFlowKind::IterationStatement
+            UnsupportedFlowKind::SwitchStatement
         );
         assert_eq!(graph.unsupported()[0].container, function_ref);
 
-        let top_level = parse_source_file("while (flag) {} const after = 1;");
+        let top_level = parse_source_file("switch (flag) {} const after = 1;");
         let top_result =
             bind_source_file_in_file(&top_level.arena, top_level.source_file, FileId::new(15));
         let top_graph = top_result
