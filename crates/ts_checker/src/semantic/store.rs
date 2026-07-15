@@ -501,6 +501,15 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.symbols.symbol_len()
     }
 
+    pub(super) fn try_reserve_checker_symbol_allocations(
+        &mut self,
+        additional_symbols: usize,
+        additional_tables: usize,
+    ) -> bool {
+        self.symbols
+            .try_reserve_checker_allocations(additional_symbols, additional_tables)
+    }
+
     /// Returns a symbol after exactly one merged-symbol redirect lookup.
     ///
     /// `None` means the input is not owned by this store. Redirect targets are

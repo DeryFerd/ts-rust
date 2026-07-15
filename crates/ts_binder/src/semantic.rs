@@ -454,6 +454,26 @@ impl SymbolStore {
         self.symbol_table(id).is_some()
     }
 
+    /// Reserves parallel checker-owned symbol slots and table slots without
+    /// changing any semantic identity or published record.
+    #[must_use]
+    pub fn try_reserve_checker_allocations(
+        &mut self,
+        additional_symbols: usize,
+        additional_tables: usize,
+    ) -> bool {
+        self.symbols.try_reserve(additional_symbols).is_ok()
+            && self
+                .checker_created_symbols
+                .try_reserve(additional_symbols)
+                .is_ok()
+            && self
+                .global_symbol_ids
+                .try_reserve(additional_symbols)
+                .is_ok()
+            && self.tables.try_reserve(additional_tables).is_ok()
+    }
+
     /// Registers a safe AST snapshot. Re-registration may grow but not shrink.
     pub fn register_ast_scope(&mut self, scope: AstScope) -> bool {
         if self.ast_scopes.get(&scope.file).is_some_and(|registered| {
@@ -980,6 +1000,54 @@ mod tests {
         assert_eq!(table.get_source("__call"), Some(source));
         assert_eq!(table.get_source("þcall"), Some(thorn));
         assert_eq!(table.get(InternalSymbolName::Call.as_ref()), Some(call));
+    }
+
+    #[test]
+    fn checker_allocation_reservation_preserves_lengths_identities_and_parallel_alignment() {
+        let mut store = SymbolStore::new();
+        let bound = alloc_source_symbol(&mut store, "bound");
+        let original_table = store.alloc_symbol_table();
+        assert_eq!(
+            store.insert_symbol(original_table, EscapedName::source("bound"), bound,),
+            Some(None)
+        );
+        let bound_before = store.symbol(bound).unwrap().clone();
+        let table_before = store.symbol_table(original_table).unwrap().clone();
+        let symbol_len = store.symbol_len();
+        let table_len = store.symbol_table_len();
+        let checker_created_len = store.checker_created_symbol_len();
+
+        assert!(store.try_reserve_checker_allocations(3, 2));
+        assert_eq!(store.symbol_len(), symbol_len);
+        assert_eq!(store.symbol_table_len(), table_len);
+        assert_eq!(store.checker_created_symbol_len(), checker_created_len);
+        assert_eq!(store.symbol(bound), Some(&bound_before));
+        assert_eq!(store.symbol_table(original_table), Some(&table_before));
+
+        let transient = store.alloc_transient_symbol(
+            SymbolFlags::PROPERTY,
+            EscapedName::source("clone"),
+            CheckFlags::NONE,
+        );
+        let result_table = store.alloc_symbol_table();
+        assert_eq!(transient.index(), symbol_len);
+        assert_eq!(result_table.index(), table_len);
+        assert_eq!(store.symbol_len(), symbol_len + 1);
+        assert_eq!(store.symbol_table_len(), table_len + 1);
+        assert_eq!(store.checker_created_symbol_len(), checker_created_len + 1);
+        assert!(
+            store
+                .symbol(transient)
+                .unwrap()
+                .flags()
+                .contains(SymbolFlags::TRANSIENT)
+        );
+        assert!(store.symbol_table(result_table).unwrap().is_empty());
+        assert!(store.set_symbol_flags(
+            transient,
+            SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT,
+            CheckFlags::LATE,
+        ));
     }
 
     #[test]

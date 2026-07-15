@@ -1,9 +1,9 @@
 //! Atomic canonical checking for the first source-statement slice.
 //!
-//! This module deliberately supports only unmodified type aliases, empty
-//! external-module markers, and explicitly typed ordinary variable
-//! declarations (optionally exported) with primitive literal initializers. The
-//! complete source tree and the complete supported-statement plan are
+//! This module deliberately supports only unmodified type aliases and simple
+//! interfaces, empty external-module markers, and explicitly typed ordinary
+//! variable declarations (optionally exported) with supported literal
+//! initializers. The complete source tree and the complete supported-statement plan are
 //! validated before checker state is touched. Unsupported syntax is therefore
 //! a typed boundary, never a request to fall back to the legacy checker or to
 //! synthesize `any`. Canonical memo caches are not rolled back after a later
@@ -38,6 +38,7 @@ pub enum SourceSyntaxRole {
     SourceFile,
     Statement,
     TypeAliasDeclaration,
+    InterfaceDeclaration,
     ExportDeclaration,
     ExportClause,
     VariableStatement,
@@ -48,6 +49,8 @@ pub enum SourceSyntaxRole {
     VariableType,
     VariableInitializer,
     PrefixUnaryOperand,
+    ObjectLiteral,
+    ObjectProperty,
 }
 
 /// Syntax that cannot be checked exactly by the installed source slice.
@@ -120,6 +123,16 @@ pub enum SourceLiteralCacheError {
     Capacity,
 }
 
+/// Source-level object-literal construction or cache validation failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SourceObjectLiteralError {
+    InvalidCache {
+        node: NodeRef,
+        type_: Option<TypeId>,
+    },
+    Capacity(NodeRef),
+}
+
 impl From<LiteralTypeCacheError> for SourceLiteralCacheError {
     fn from(error: LiteralTypeCacheError) -> Self {
         match error {
@@ -148,6 +161,7 @@ pub enum SourceCheckError {
     RelationUnavailable(RelationUnavailable),
     TypeDisplayUnavailable(TypeDisplayUnavailable),
     LiteralCache(SourceLiteralCacheError),
+    ObjectLiteral(SourceObjectLiteralError),
     MissingDiagnostic(u32),
 }
 
@@ -162,6 +176,7 @@ impl std::fmt::Display for SourceCheckError {
             Self::RelationUnavailable(error) => write!(formatter, "{error}"),
             Self::TypeDisplayUnavailable(error) => write!(formatter, "{error}"),
             Self::LiteralCache(error) => write!(formatter, "literal cache failed: {error:?}"),
+            Self::ObjectLiteral(error) => write!(formatter, "object literal failed: {error:?}"),
             Self::MissingDiagnostic(code) => {
                 write!(formatter, "diagnostic TS{code} is absent from the catalog")
             }
@@ -178,6 +193,7 @@ impl std::error::Error for SourceCheckError {
             Self::Provenance(_)
             | Self::Unsupported(_)
             | Self::LiteralCache(_)
+            | Self::ObjectLiteral(_)
             | Self::MissingDiagnostic(_) => None,
         }
     }
@@ -220,6 +236,11 @@ enum PlannedExpression {
         unary_operand: Option<PseudoBigInt>,
     },
     Boolean(bool),
+    GlobalUndefined,
+    Object {
+        plan: super::object_members::PropertyObjectPlan,
+        properties: Vec<PlannedExpression>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -232,6 +253,7 @@ struct PlannedVariable {
 #[derive(Clone, Debug)]
 enum PlannedStatement {
     TypeAlias(SemanticSymbolId),
+    Interface(SemanticSymbolId),
     ExternalModuleMarker,
     Variables(Vec<PlannedVariable>),
 }
@@ -244,16 +266,21 @@ struct SourceCheckPlan {
     bigints: Vec<PseudoBigInt>,
 }
 
-struct SourcePlanner<'arena> {
+struct SourcePlanner<'arena, 'semantic, 'sources> {
     arena: &'arena NodeArena,
     bound: &'arena BoundFile,
     source: SourceFileRef,
     strings: Vec<String>,
     numbers: Vec<Number>,
     bigints: Vec<PseudoBigInt>,
+    semantic: Option<(
+        &'semantic CanonicalTypeMapperStore,
+        &'semantic DeclaredTypeHost<'sources>,
+    )>,
 }
 
-impl<'arena> SourcePlanner<'arena> {
+impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
+    #[cfg(test)]
     fn new(arena: &'arena NodeArena, bound: &'arena BoundFile, source: SourceFileRef) -> Self {
         Self {
             arena,
@@ -262,6 +289,25 @@ impl<'arena> SourcePlanner<'arena> {
             strings: Vec::new(),
             numbers: Vec::new(),
             bigints: Vec::new(),
+            semantic: None,
+        }
+    }
+
+    fn new_semantic(
+        arena: &'arena NodeArena,
+        bound: &'arena BoundFile,
+        source: SourceFileRef,
+        store: &'semantic CanonicalTypeMapperStore,
+        host: &'semantic DeclaredTypeHost<'sources>,
+    ) -> Self {
+        Self {
+            arena,
+            bound,
+            source,
+            strings: Vec::new(),
+            numbers: Vec::new(),
+            bigints: Vec::new(),
+            semantic: Some((store, host)),
         }
     }
 
@@ -318,6 +364,40 @@ impl<'arena> SourcePlanner<'arena> {
                                 SourceCheckProvenanceError::MissingDeclarationSymbol(statement),
                             ))?;
                     statements.push(PlannedStatement::TypeAlias(symbol));
+                }
+                SyntaxKind::InterfaceDeclaration => {
+                    let node = self.node(statement)?;
+                    let NodeData::InterfaceDeclaration(interface) = &node.data else {
+                        return Err(SourceCheckError::Provenance(
+                            SourceCheckProvenanceError::MismatchedNodeData {
+                                node: statement,
+                                kind: node.kind,
+                            },
+                        ));
+                    };
+                    if node.flags.0 != 0
+                        || interface.flow_node.is_some()
+                        || interface.local_symbol.is_some()
+                        || interface.symbol.is_some()
+                        || interface.modifiers.is_some()
+                    {
+                        return Err(self.unsupported(
+                            statement,
+                            node.kind,
+                            SourceSyntaxRole::InterfaceDeclaration,
+                        ));
+                    }
+                    let symbol =
+                        self.bound
+                            .symbol(statement)
+                            .ok_or(SourceCheckError::Provenance(
+                                SourceCheckProvenanceError::MissingDeclarationSymbol(statement),
+                            ))?;
+                    if let Some((store, host)) = self.semantic {
+                        super::object_members::plan_interface(store, host, symbol)
+                            .map_err(|error| self.interface_plan_error(error))?;
+                    }
+                    statements.push(PlannedStatement::Interface(symbol));
                 }
                 SyntaxKind::ExportDeclaration => {
                     if !is_external_module {
@@ -710,6 +790,24 @@ impl<'arena> SourcePlanner<'arena> {
             {
                 Ok(PlannedExpression::Boolean(false))
             }
+            SyntaxKind::Identifier => {
+                let node = self.node(expression)?;
+                let NodeData::Identifier(identifier) = &node.data else {
+                    return Err(self.unsupported(
+                        expression,
+                        node.kind,
+                        SourceSyntaxRole::VariableInitializer,
+                    ));
+                };
+                if identifier.text != "undefined" || !self.is_global_undefined() {
+                    return Err(self.unsupported(
+                        expression,
+                        node.kind,
+                        SourceSyntaxRole::VariableInitializer,
+                    ));
+                }
+                Ok(PlannedExpression::GlobalUndefined)
+            }
             SyntaxKind::StringLiteral => {
                 let value = {
                     let node = self.node(expression)?;
@@ -790,8 +888,112 @@ impl<'arena> SourcePlanner<'arena> {
                 self.plan_expression(inner)
             }
             SyntaxKind::PrefixUnaryExpression => self.plan_prefix_unary(expression),
+            SyntaxKind::ObjectLiteralExpression => self.plan_object_literal(expression),
             _ => Err(self.unsupported(expression, kind, SourceSyntaxRole::VariableInitializer)),
         }
+    }
+
+    fn is_global_undefined(&self) -> bool {
+        let Some((store, _)) = self.semantic else {
+            return false;
+        };
+        let Some(bootstrap) = store.intrinsic_bootstrap() else {
+            return false;
+        };
+        let global_matches = store
+            .symbol_table(bootstrap.globals)
+            .and_then(|globals| globals.get_source("undefined"))
+            .and_then(|symbol| store.get_merged_symbol(symbol))
+            == Some(bootstrap.undefined_symbol);
+        let locally_shadowed = self
+            .bound
+            .locals(self.bound.source_file())
+            .and_then(|locals| store.symbol_table(locals))
+            .and_then(|locals| locals.get_source("undefined"))
+            .is_some_and(|symbol| {
+                store.get_merged_symbol(symbol) != Some(bootstrap.undefined_symbol)
+            });
+        global_matches && !locally_shadowed
+    }
+
+    fn plan_object_literal(
+        &mut self,
+        expression: NodeRef,
+    ) -> Result<PlannedExpression, SourceCheckError> {
+        let Some((store, host)) = self.semantic else {
+            return Err(self.unsupported(
+                expression,
+                SyntaxKind::ObjectLiteralExpression,
+                SourceSyntaxRole::ObjectLiteral,
+            ));
+        };
+        let plan = super::object_members::plan_object_literal(store, host, expression)
+            .map_err(|error| self.object_plan_error(error))?;
+        let mut properties = Vec::with_capacity(plan.properties.len());
+        for initializer in plan.property_type_nodes() {
+            properties.push(self.plan_expression(initializer)?);
+        }
+        Ok(PlannedExpression::Object { plan, properties })
+    }
+
+    fn object_plan_error(
+        &self,
+        error: super::object_members::PropertyObjectError,
+    ) -> SourceCheckError {
+        use super::object_members::PropertyObjectError;
+        match error {
+            PropertyObjectError::UnsupportedMember { node, kind } => {
+                self.unsupported(node, kind, SourceSyntaxRole::ObjectProperty)
+            }
+            PropertyObjectError::InvalidObjectLiteral(node)
+            | PropertyObjectError::InvalidTypeLiteral(node)
+            | PropertyObjectError::InvalidCachedTypeLiteral { node, .. }
+            | PropertyObjectError::Capacity(node) => self.unsupported(
+                node,
+                self.arena
+                    .get(node.node)
+                    .map_or(SyntaxKind::ObjectLiteralExpression, |record| record.kind),
+                SourceSyntaxRole::ObjectLiteral,
+            ),
+            PropertyObjectError::InvalidInterface { declaration, .. } => self.unsupported(
+                declaration,
+                SyntaxKind::InterfaceDeclaration,
+                SourceSyntaxRole::ObjectLiteral,
+            ),
+            PropertyObjectError::InvalidInterfaceSymbol(_)
+            | PropertyObjectError::InvalidCachedInterface { .. } => self.unsupported(
+                self.source.node_ref(),
+                SyntaxKind::SourceFile,
+                SourceSyntaxRole::ObjectLiteral,
+            ),
+        }
+    }
+
+    fn interface_plan_error(
+        &self,
+        error: super::object_members::PropertyObjectError,
+    ) -> SourceCheckError {
+        use super::object_members::PropertyObjectError;
+        let (node, kind) = match error {
+            PropertyObjectError::UnsupportedMember { node, kind } => (node, kind),
+            PropertyObjectError::InvalidInterface { declaration, .. } => {
+                (declaration, SyntaxKind::InterfaceDeclaration)
+            }
+            PropertyObjectError::InvalidInterfaceSymbol(_)
+            | PropertyObjectError::InvalidCachedInterface { .. } => {
+                (self.source.node_ref(), SyntaxKind::SourceFile)
+            }
+            PropertyObjectError::InvalidTypeLiteral(node)
+            | PropertyObjectError::InvalidObjectLiteral(node)
+            | PropertyObjectError::InvalidCachedTypeLiteral { node, .. }
+            | PropertyObjectError::Capacity(node) => (
+                node,
+                self.arena
+                    .get(node.node)
+                    .map_or(SyntaxKind::SourceFile, |record| record.kind),
+            ),
+        };
+        self.unsupported(node, kind, SourceSyntaxRole::InterfaceDeclaration)
     }
 
     fn plan_prefix_unary(
@@ -1013,6 +1215,12 @@ fn expression_type(
                     .fresh_type_of_literal_type(regular)
                     .map_err(Into::into)
             }),
+        PlannedExpression::GlobalUndefined => store
+            .intrinsic_bootstrap()
+            .map(|bootstrap| bootstrap.undefined_widening_type)
+            .ok_or(SourceCheckError::LiteralCache(
+                SourceLiteralCacheError::BootstrapUninitialized,
+            )),
         PlannedExpression::String(value) => {
             let regular = store.regular_string_literal_type(value.clone())?;
             Ok(store.fresh_type_of_literal_type(regular)?)
@@ -1036,6 +1244,51 @@ fn expression_type(
             }
             let regular = store.regular_bigint_literal_type(value.clone())?;
             Ok(store.fresh_type_of_literal_type(regular)?)
+        }
+        PlannedExpression::Object { plan, properties } => {
+            super::object_members::object_literal_state(store, plan)
+                .map_err(source_object_execution_error)?;
+            let mut property_types = Vec::with_capacity(properties.len());
+            for property in properties {
+                property_types.push(expression_type(store, property)?);
+            }
+            super::object_members::publish_object_literal(store, plan, &property_types)
+                .map_err(source_object_execution_error)
+        }
+    }
+}
+
+fn source_object_execution_error(
+    error: super::object_members::PropertyObjectError,
+) -> SourceCheckError {
+    use super::object_members::PropertyObjectError;
+    match error {
+        PropertyObjectError::Capacity(node) => {
+            SourceCheckError::ObjectLiteral(SourceObjectLiteralError::Capacity(node))
+        }
+        PropertyObjectError::InvalidCachedTypeLiteral { node, type_ } => {
+            SourceCheckError::ObjectLiteral(SourceObjectLiteralError::InvalidCache {
+                node,
+                type_: Some(type_),
+            })
+        }
+        PropertyObjectError::InvalidObjectLiteral(node)
+        | PropertyObjectError::InvalidTypeLiteral(node)
+        | PropertyObjectError::UnsupportedMember { node, .. } => {
+            SourceCheckError::ObjectLiteral(SourceObjectLiteralError::InvalidCache {
+                node,
+                type_: None,
+            })
+        }
+        PropertyObjectError::InvalidInterface { declaration, .. } => {
+            SourceCheckError::ObjectLiteral(SourceObjectLiteralError::InvalidCache {
+                node: declaration,
+                type_: None,
+            })
+        }
+        PropertyObjectError::InvalidInterfaceSymbol(_)
+        | PropertyObjectError::InvalidCachedInterface { .. } => {
+            unreachable!("object-literal execution cannot produce an interface cache error")
         }
     }
 }
@@ -1096,12 +1349,12 @@ pub(super) fn check_source_file(
         return Ok(());
     }
 
-    let plan = SourcePlanner::new(arena, bound, source).finish()?;
+    let plan = SourcePlanner::new_semantic(arena, bound, source, store, host).finish()?;
     store.prepare_regular_literal_types(&plan.strings, &plan.numbers, &plan.bigints)?;
 
     for statement in plan.statements {
         match statement {
-            PlannedStatement::TypeAlias(symbol) => {
+            PlannedStatement::TypeAlias(symbol) | PlannedStatement::Interface(symbol) => {
                 let mut statement_diagnostics = CanonicalCheckerDiagnostics::default();
                 let result =
                     CanonicalTypeQuery::new(store, host, options, &mut statement_diagnostics)
@@ -1163,19 +1416,22 @@ pub(super) fn publish_type_checked(
 mod tests {
     use ts_binder::{
         CanonicalBinder, CanonicalModuleState, CanonicalNameResolverOptions,
-        CanonicalProgramBindings, CanonicalSourceFileFacts, CanonicalSourceLanguage, EscapedName,
+        CanonicalProgramBindings, CanonicalSourceFileFacts, CanonicalSourceLanguage, CheckFlags,
+        EscapedName, InternalSymbolName, SymbolFlags,
     };
     use ts_parser::{ParseResult, parse_source_file};
 
     use super::*;
     use crate::semantic::{
         CanonicalCheckerContext, DeclaredTypeHostError, IntrinsicBootstrapOptions,
-        RelationStateSnapshot, TypeNodeUnavailable, production::GlobalMergeCompletion,
+        RelationStateSnapshot, TypeNodeUnavailable, ValueSymbolLinks,
+        production::GlobalMergeCompletion,
+        type_records::{TypeData, TypeDataKind},
+        types::ObjectFlags,
     };
 
     type ObservableSourceState = (
-        usize,
-        usize,
+        [usize; 4],
         [usize; 26],
         usize,
         usize,
@@ -1273,6 +1529,26 @@ mod tests {
         NodeRef::new(parsed.arena.id(), file, name)
     }
 
+    fn variable_initializer(parsed: &ParseResult, file: FileId, expected: &str) -> NodeRef {
+        let initializer = parsed
+            .arena
+            .iter()
+            .find_map(|(_, node)| {
+                let NodeData::VariableDeclaration(variable) = &node.data else {
+                    return None;
+                };
+                let name = parsed.arena.get(variable.name)?;
+                let NodeData::Identifier(identifier) = &name.data else {
+                    return None;
+                };
+                (identifier.text == expected)
+                    .then_some(variable.initializer)
+                    .flatten()
+            })
+            .unwrap_or_else(|| panic!("missing initializer for variable {expected}"));
+        NodeRef::new(parsed.arena.id(), file, initializer)
+    }
+
     fn is_type_checked(context: &CanonicalCheckerContext<'_>, file: FileId) -> bool {
         context
             .source_file(file)
@@ -1287,8 +1563,12 @@ mod tests {
         let store = context.store();
         let bootstrap = store.intrinsic_bootstrap().unwrap();
         (
-            store.type_len(),
-            store.mapper_len(),
+            [
+                store.type_len(),
+                store.mapper_len(),
+                store.symbol_len(),
+                store.symbol_store().symbol_table_len(),
+            ],
             store.checker_link_allocated_lengths(),
             store.type_resolution_len(),
             store.type_resolution_start(),
@@ -1620,6 +1900,526 @@ mod tests {
     }
 
     #[test]
+    fn simple_interfaces_and_nested_object_literals_check_and_reuse_warm_identity() {
+        let source = parsed(concat!(
+            "interface Leaf { value: string } ",
+            "interface Model { count: number; nested: Leaf } ",
+            "type Shape = { label: string; nested: { enabled: boolean } }; ",
+            r#"const model: Model = { count: 1, nested: { value: "ok" } }; "#,
+            r#"const leaf: Leaf = { value: "also ok" }; "#,
+            r#"const shape: Shape = { label: "shape", nested: { enabled: true } };"#,
+        ));
+        let file = FileId::new(67);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+        assert!(context.diagnostics().is_empty());
+        assert!(is_type_checked(&context, file));
+
+        let warm = observable_state(&context, file);
+        context.check_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn interface_object_assignability_stops_at_typed_object_display_boundary() {
+        let source = parsed(concat!(
+            "interface TextValue { value: string } ",
+            "interface NumberValue { value: number } ",
+            "const first: TextValue = { value: 1 }; ",
+            r#"const second: NumberValue = { value: "wrong" };"#,
+        ));
+        let file = FileId::new(68);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let first = variable_initializer(&source, file, "first");
+        let second = variable_initializer(&source, file, "second");
+
+        let error = context.check_source_file(file).unwrap_err();
+        let displayed_type = match error {
+            SourceCheckError::TypeDisplayUnavailable(TypeDisplayUnavailable::UnsupportedType {
+                type_id,
+                kind: TypeDataKind::Object,
+            }) => type_id,
+            other => panic!("unexpected source-check boundary: {other:?}"),
+        };
+        assert_eq!(
+            context
+                .store()
+                .type_node_links(first)
+                .and_then(|links| links.resolved_type),
+            Some(displayed_type)
+        );
+        assert!(
+            context
+                .store()
+                .type_node_links(second)
+                .and_then(|links| links.resolved_type)
+                .is_none(),
+            "the first display failure must stop source execution before the second initializer"
+        );
+        assert!(context.diagnostics().is_empty());
+        assert!(!is_type_checked(&context, file));
+
+        let retained = observable_state(&context, file);
+        assert_eq!(
+            context.check_source_file(file),
+            Err(SourceCheckError::TypeDisplayUnavailable(
+                TypeDisplayUnavailable::UnsupportedType {
+                    type_id: displayed_type,
+                    kind: TypeDataKind::Object,
+                }
+            ))
+        );
+        assert_eq!(observable_state(&context, file), retained);
+        assert!(context.diagnostics().is_empty());
+        assert!(!is_type_checked(&context, file));
+    }
+
+    #[test]
+    fn unsupported_interfaces_reject_the_complete_source_plan_atomically() {
+        let cases = [
+            "type Earlier = Earlier; export interface Bad { value: string }",
+            "type Earlier = Earlier; interface Bad<T> { value: T }",
+            "type Earlier = Earlier; interface Base {} interface Bad extends Base {}",
+            "type Earlier = Earlier; interface Bad { method(): string }",
+        ];
+        for (index, text) in cases.into_iter().enumerate() {
+            let source = parsed(text);
+            let file = FileId::new(80 + u32::try_from(index).unwrap());
+            let mut context = context_with_module_state(
+                &[(file, &source)],
+                CanonicalModuleState::External,
+                CanonicalCheckerOptions::default(),
+            );
+            let before = observable_state(&context, file);
+
+            assert!(matches!(
+                context.check_source_file(file),
+                Err(SourceCheckError::Unsupported(
+                    UnsupportedSourceSyntax::Syntax {
+                        role: SourceSyntaxRole::InterfaceDeclaration,
+                        ..
+                    }
+                ))
+            ));
+            assert_eq!(observable_state(&context, file), before, "source: {text}");
+            assert!(context.diagnostics().is_empty());
+            assert!(!is_type_checked(&context, file));
+        }
+    }
+
+    #[test]
+    fn source_object_literals_publish_nested_members_in_order_without_structural_relation() {
+        let source = parsed(concat!(
+            r#"const value: any = { text: "ok", "#,
+            "nested: { count: -1, missing: undefined } };",
+        ));
+        let file = FileId::new(70);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let objects = source
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::ObjectLiteralExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(objects.len(), 2);
+
+        context.check_source_file(file).unwrap();
+
+        for object in &objects {
+            let type_ = context
+                .store()
+                .type_node_links(*object)
+                .and_then(|links| links.resolved_type)
+                .unwrap();
+            let record = context.store().type_payload(type_).unwrap();
+            assert_eq!(
+                record.object_flags(),
+                ObjectFlags::ANONYMOUS
+                    | ObjectFlags::OBJECT_LITERAL
+                    | ObjectFlags::FRESH_LITERAL
+                    | ObjectFlags::CONTAINS_WIDENING_TYPE
+                    | ObjectFlags::CONTAINS_OBJECT_OR_ARRAY_LITERAL
+                    | ObjectFlags::MEMBERS_RESOLVED
+            );
+            let TypeData::Object(object_data) = record.data() else {
+                panic!("object-literal type must use the plain object payload")
+            };
+            let owner = record.symbol().unwrap();
+            let owner_record = context.store().symbol(owner).unwrap();
+            assert_eq!(owner_record.flags(), SymbolFlags::OBJECT_LITERAL);
+            assert_eq!(owner_record.check_flags(), CheckFlags::NONE);
+            assert_eq!(owner_record.name(), InternalSymbolName::Object.as_ref());
+            assert_eq!(owner_record.declarations(), Some([*object].as_slice()));
+            assert_eq!(owner_record.value_declaration(), Some(*object));
+            assert!(owner_record.parent().is_none());
+            assert!(owner_record.exports().is_none());
+            assert!(owner_record.export_symbol().is_none());
+
+            let raw_members = owner_record.members().unwrap();
+            let cloned_members = object_data.structured.members.unwrap();
+            assert_ne!(cloned_members, raw_members);
+            let raw_table = context.store().symbol_table(raw_members).unwrap();
+            let cloned_table = context.store().symbol_table(cloned_members).unwrap();
+            let cloned_properties = object_data.structured.properties.as_ref().unwrap();
+            assert_eq!(cloned_table.len(), cloned_properties.len());
+            for cloned in cloned_properties {
+                let clone_record = context.store().symbol(*cloned).unwrap();
+                let clone_links = context.store().value_symbol_links(*cloned).unwrap();
+                let raw = clone_links.target.unwrap();
+                let raw_record = context.store().symbol(raw).unwrap();
+                assert_eq!(raw_record.flags(), SymbolFlags::PROPERTY);
+                assert_eq!(raw_record.check_flags(), CheckFlags::NONE);
+                assert_eq!(
+                    clone_record.flags(),
+                    raw_record.flags() | SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT
+                );
+                assert_eq!(clone_record.check_flags(), CheckFlags::NONE);
+                assert_eq!(clone_record.name(), raw_record.name());
+                assert_eq!(clone_record.declarations(), raw_record.declarations());
+                assert_eq!(
+                    clone_record.value_declaration(),
+                    raw_record.value_declaration()
+                );
+                assert_eq!(clone_record.parent(), Some(owner));
+                assert_eq!(raw_record.parent(), Some(owner));
+                assert_eq!(context.store().get_merged_symbol(*cloned), Some(*cloned));
+                assert!(clone_record.members().is_none());
+                assert!(clone_record.exports().is_none());
+                assert!(clone_record.export_symbol().is_none());
+                assert_eq!(
+                    cloned_table.get(clone_record.name()),
+                    Some(*cloned),
+                    "the result table owns the checker clone"
+                );
+                assert_eq!(
+                    raw_table.get(raw_record.name()),
+                    Some(raw),
+                    "the binder table retains the raw member"
+                );
+                assert!(
+                    context
+                        .store()
+                        .value_symbol_links(raw)
+                        .is_none_or(|links| links == &ValueSymbolLinks::default())
+                );
+                assert_eq!(
+                    clone_links,
+                    &ValueSymbolLinks {
+                        resolved_type: clone_links.resolved_type,
+                        target: Some(raw),
+                        ..ValueSymbolLinks::default()
+                    }
+                );
+            }
+        }
+        assert!(context.diagnostics().is_empty());
+        assert!(is_type_checked(&context, file));
+
+        let warm = observable_state(&context, file);
+        context.check_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn empty_object_literal_allocates_a_distinct_empty_result_table_and_reuses_it_warm() {
+        let source = parsed("const value: any = {};");
+        let file = FileId::new(87);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let object = variable_initializer(&source, file, "value");
+        let owner = context.file(file).unwrap().1.symbol(object).unwrap();
+        assert!(context.store().symbol(owner).unwrap().members().is_none());
+
+        context.check_source_file(file).unwrap();
+        let type_ = context
+            .store()
+            .type_node_links(object)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let record = context.store().type_payload(type_).unwrap();
+        assert_eq!(record.symbol(), Some(owner));
+        assert_eq!(
+            record.object_flags(),
+            ObjectFlags::ANONYMOUS
+                | ObjectFlags::OBJECT_LITERAL
+                | ObjectFlags::FRESH_LITERAL
+                | ObjectFlags::CONTAINS_OBJECT_OR_ARRAY_LITERAL
+                | ObjectFlags::MEMBERS_RESOLVED
+        );
+        let TypeData::Object(object_data) = record.data() else {
+            panic!("empty object literal must retain a plain object payload")
+        };
+        let result_members = object_data.structured.members.unwrap();
+        assert!(
+            context
+                .store()
+                .symbol_table(result_members)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(object_data.structured.properties.is_none());
+        assert!(context.store().symbol(owner).unwrap().members().is_none());
+
+        let warm = observable_state(&context, file);
+        context.check_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+        let warm_record = context.store().type_payload(type_).unwrap();
+        let TypeData::Object(warm_object) = warm_record.data() else {
+            unreachable!()
+        };
+        assert_eq!(warm_object.structured.members, Some(result_members));
+    }
+
+    #[test]
+    fn object_literal_owner_parent_poison_rejects_planning_without_writes() {
+        let source = parsed("const value: any = {};");
+        let file = FileId::new(88);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let object = variable_initializer(&source, file, "value");
+        let owner = context.file(file).unwrap().1.symbol(object).unwrap();
+        let parent = context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .undefined_symbol;
+        assert!(context.store_mut_for_test().set_symbol_relationships(
+            owner,
+            None,
+            None,
+            Some(parent),
+            None,
+        ));
+        let before = observable_state(&context, file);
+
+        assert!(matches!(
+            context.check_source_file(file),
+            Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::Syntax {
+                    node,
+                    role: SourceSyntaxRole::ObjectLiteral,
+                    ..
+                }
+            )) if node == object
+        ));
+        assert_eq!(observable_state(&context, file), before);
+        assert!(context.diagnostics().is_empty());
+        assert!(!is_type_checked(&context, file));
+    }
+
+    #[test]
+    fn warm_object_propagating_flag_poison_is_typed_and_repair_reuses_identity() {
+        let source = parsed("const value: any = { nested: { missing: undefined } };");
+        let file = FileId::new(86);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let outer = variable_initializer(&source, file, "value");
+
+        context.check_source_file(file).unwrap();
+        let outer_type = context
+            .store()
+            .type_node_links(outer)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let expected_flags = context
+            .store()
+            .type_payload(outer_type)
+            .unwrap()
+            .object_flags();
+        assert!(expected_flags.contains(ObjectFlags::CONTAINS_OBJECT_OR_ARRAY_LITERAL));
+        assert!(expected_flags.contains(ObjectFlags::CONTAINS_WIDENING_TYPE));
+
+        let poisoned_flags = expected_flags & !ObjectFlags::CONTAINS_WIDENING_TYPE;
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_object_flags(outer_type, poisoned_flags)
+        );
+        let source_ref = context.source_file(file).unwrap();
+        let mut source_links = context
+            .store()
+            .source_file_links(source_ref)
+            .cloned()
+            .unwrap();
+        source_links.type_checked = false;
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_source_file_links(source_ref, source_links)
+        );
+        let poisoned = observable_state(&context, file);
+
+        assert_eq!(
+            context.check_source_file(file),
+            Err(SourceCheckError::ObjectLiteral(
+                SourceObjectLiteralError::InvalidCache {
+                    node: outer,
+                    type_: Some(outer_type),
+                }
+            ))
+        );
+        assert_eq!(observable_state(&context, file), poisoned);
+        assert!(context.diagnostics().is_empty());
+        assert!(!is_type_checked(&context, file));
+
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_type_object_flags(outer_type, expected_flags)
+        );
+        context.check_source_file(file).unwrap();
+        assert_eq!(
+            context
+                .store()
+                .type_node_links(outer)
+                .and_then(|links| links.resolved_type),
+            Some(outer_type)
+        );
+        assert!(context.diagnostics().is_empty());
+        assert!(is_type_checked(&context, file));
+    }
+
+    #[test]
+    fn warm_object_property_poison_is_typed_and_repair_reuses_identity() {
+        let source = parsed(r#"const value: any = { text: "ok" };"#);
+        let file = FileId::new(71);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let object = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ObjectLiteralExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+
+        context.check_source_file(file).unwrap();
+        let object_type = context
+            .store()
+            .type_node_links(object)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let property = match context.store().type_payload(object_type).unwrap().data() {
+            TypeData::Object(object) => object.structured.properties.as_ref().unwrap()[0],
+            _ => unreachable!(),
+        };
+        let expected = context
+            .store()
+            .value_symbol_links(property)
+            .cloned()
+            .unwrap();
+        let poison = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let mut wrong_type = expected.clone();
+        wrong_type.resolved_type = Some(poison);
+        let mut missing_target = expected.clone();
+        missing_target.target = None;
+        let source_ref = context.source_file(file).unwrap();
+        let mut source_links = context
+            .store()
+            .source_file_links(source_ref)
+            .cloned()
+            .unwrap();
+        source_links.type_checked = false;
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_source_file_links(source_ref, source_links)
+        );
+        for poisoned_links in [wrong_type, missing_target] {
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_value_symbol_links(property, poisoned_links)
+            );
+            let poisoned = observable_state(&context, file);
+            assert!(matches!(
+                context.check_source_file(file),
+                Err(SourceCheckError::ObjectLiteral(
+                    SourceObjectLiteralError::InvalidCache {
+                        node,
+                        type_: Some(type_),
+                    }
+                )) if node == object && type_ == object_type
+            ));
+            assert_eq!(observable_state(&context, file), poisoned);
+            assert!(!is_type_checked(&context, file));
+            assert!(
+                context
+                    .store_mut_for_test()
+                    .set_value_symbol_links(property, expected.clone())
+            );
+        }
+        context.check_source_file(file).unwrap();
+        assert_eq!(
+            context
+                .store()
+                .type_node_links(object)
+                .and_then(|links| links.resolved_type),
+            Some(object_type)
+        );
+        assert!(is_type_checked(&context, file));
+    }
+
+    #[test]
+    fn unsupported_object_forms_and_shadowed_undefined_fail_before_writes() {
+        let cases = [
+            (
+                r#"const property: string = "ok"; const value: any = { property };"#,
+                SourceSyntaxRole::ObjectProperty,
+            ),
+            (
+                "const value: any = { ...{ property: 1 } };",
+                SourceSyntaxRole::ObjectLiteral,
+            ),
+            (
+                "const value: any = { method(): string { return ''; } };",
+                SourceSyntaxRole::ObjectProperty,
+            ),
+            (
+                "const value: any = { ['property']: 1 };",
+                SourceSyntaxRole::ObjectProperty,
+            ),
+            (
+                r#"const undefined: string = "shadow"; const value: any = { missing: undefined };"#,
+                SourceSyntaxRole::VariableInitializer,
+            ),
+        ];
+        for (index, (text, role)) in cases.into_iter().enumerate() {
+            let source = parsed(text);
+            let file = FileId::new(72 + u32::try_from(index).unwrap());
+            let mut context = context_with_module_state(
+                &[(file, &source)],
+                CanonicalModuleState::External,
+                CanonicalCheckerOptions::default(),
+            );
+            let before = observable_state(&context, file);
+
+            let result = context.check_source_file(file);
+            assert!(
+                matches!(
+                    result,
+                    Err(SourceCheckError::Unsupported(
+                        UnsupportedSourceSyntax::Syntax {
+                            role: actual,
+                            ..
+                        }
+                    )) if actual == role
+                ),
+                "source: {text}; result: {result:?}"
+            );
+            assert_eq!(observable_state(&context, file), before, "source: {text}");
+            assert!(context.diagnostics().is_empty());
+            assert!(!is_type_checked(&context, file));
+        }
+    }
+
+    #[test]
     fn expression_literals_use_fresh_booleans_and_null_widening_identity() {
         let source = parsed("");
         let file = FileId::new(43);
@@ -1780,7 +2580,7 @@ mod tests {
         let first = parsed(concat!(
             "type Blocked<T> = T; ",
             "const first: B = 1; ",
-            r#"const blocked: Blocked<{ value: string }> = "";"#,
+            r#"const blocked: Blocked<() => string> = "";"#,
         ));
         let second = parsed("type B = B;");
         let first_file = FileId::new(53);
@@ -1797,7 +2597,7 @@ mod tests {
                 Err(SourceCheckError::DeclaredType(
                     DeclaredTypeError::TypeNodeUnavailable(
                         TypeNodeUnavailable::UnsupportedSyntax {
-                            kind: SyntaxKind::TypeLiteral,
+                            kind: SyntaxKind::FunctionType,
                             ..
                         }
                     )

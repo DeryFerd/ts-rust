@@ -20,6 +20,7 @@ pub mod mapper;
 mod merge;
 pub mod module_resolution;
 pub mod name_resolution;
+mod object_members;
 pub mod production;
 pub mod relater;
 pub mod relation;
@@ -91,8 +92,8 @@ pub use relation::{
     SignatureCheckMode,
 };
 pub use source::{
-    SourceCheckError, SourceCheckProvenanceError, SourceLiteralCacheError, SourceSyntaxRole,
-    UnsupportedSourceSyntax,
+    SourceCheckError, SourceCheckProvenanceError, SourceLiteralCacheError,
+    SourceObjectLiteralError, SourceSyntaxRole, UnsupportedSourceSyntax,
 };
 pub use store::SemanticStore;
 pub use type_nodes::TypeNodeUnavailable;
