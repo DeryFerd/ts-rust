@@ -28,11 +28,13 @@ use ts_binder::{
 use xxhash_rust::xxh3::Xxh3;
 
 use super::{
+    CanonicalCheckerDiagnostics, TypeResolutionTargetError,
     ids::TypeId,
     mapper::TypeMapper,
     name_resolution::{ProductionNameResolverHost, ProductionNameResolverHostError},
     production::GlobalMergeCompletion,
     store::SemanticStore,
+    type_nodes::{CanonicalTypeQuery, CanonicalTypeQueryOptions, TypeNodeUnavailable},
     type_records::{CacheHashKey, InterfaceTypeData, TypeCacheState, TypeData, TypeRecord},
     types::{ObjectFlags, TypeFlags},
 };
@@ -205,6 +207,12 @@ impl<'a> DeclaredTypeHost<'a> {
             .filter(|node| node.data.matches_syntax_kind(node.kind))
     }
 
+    pub(super) fn source(&self, reference: NodeRef) -> Option<(&NodeArena, &BoundFile)> {
+        let source = self.sources.get(&reference.file)?;
+        (source.arena.id() == reference.arena && source.bound.contains(reference))
+            .then_some((source.arena, source.bound))
+    }
+
     pub(super) fn name_resolver_host<'store>(
         &self,
         store: &'store SemanticStore<TypeRecord, TypeMapper>,
@@ -223,12 +231,12 @@ impl<'a> DeclaredTypeHost<'a> {
         )?)
     }
 
-    fn bound_file(&self, reference: NodeRef) -> Option<&BoundFile> {
+    pub(super) fn bound_file(&self, reference: NodeRef) -> Option<&BoundFile> {
         let source = self.sources.get(&reference.file)?;
         (source.arena.id() == reference.arena).then_some(source.bound)
     }
 
-    fn symbol_matches(
+    pub(super) fn symbol_matches(
         &self,
         store: &SemanticStore<TypeRecord, TypeMapper>,
         node: NodeRef,
@@ -246,7 +254,6 @@ impl<'a> DeclaredTypeHost<'a> {
 /// Declared families intentionally outside this cut.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UnsupportedDeclaredTypeKind {
-    TypeAlias,
     Enum,
     EnumMember,
     Alias,
@@ -295,8 +302,10 @@ pub enum DeclaredTypeUnavailable {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeclaredTypeError {
     Unavailable(DeclaredTypeUnavailable),
+    TypeNodeUnavailable(TypeNodeUnavailable),
     NameResolverHost(ProductionNameResolverHostError),
     NameResolution(CanonicalNameResolutionError),
+    TypeResolutionTarget(TypeResolutionTargetError),
 }
 
 impl From<DeclaredTypeUnavailable> for DeclaredTypeError {
@@ -311,8 +320,12 @@ impl std::fmt::Display for DeclaredTypeError {
             Self::Unavailable(reason) => {
                 write!(formatter, "declared type is unavailable: {reason:?}")
             }
+            Self::TypeNodeUnavailable(reason) => {
+                write!(formatter, "type node is unavailable: {reason:?}")
+            }
             Self::NameResolverHost(error) => write!(formatter, "{error}"),
             Self::NameResolution(error) => write!(formatter, "{error}"),
+            Self::TypeResolutionTarget(error) => write!(formatter, "{error:?}"),
         }
     }
 }
@@ -320,7 +333,9 @@ impl std::fmt::Display for DeclaredTypeError {
 impl std::error::Error for DeclaredTypeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Unavailable(_) => None,
+            Self::Unavailable(_)
+            | Self::TypeNodeUnavailable(_)
+            | Self::TypeResolutionTarget(_) => None,
             Self::NameResolverHost(error) => Some(error),
             Self::NameResolution(error) => Some(error),
         }
@@ -336,6 +351,18 @@ impl From<ProductionNameResolverHostError> for DeclaredTypeError {
 impl From<CanonicalNameResolutionError> for DeclaredTypeError {
     fn from(error: CanonicalNameResolutionError) -> Self {
         Self::NameResolution(error)
+    }
+}
+
+impl From<TypeNodeUnavailable> for DeclaredTypeError {
+    fn from(error: TypeNodeUnavailable) -> Self {
+        Self::TypeNodeUnavailable(error)
+    }
+}
+
+impl From<TypeResolutionTargetError> for DeclaredTypeError {
+    fn from(error: TypeResolutionTargetError) -> Self {
+        Self::TypeResolutionTarget(error)
     }
 }
 
@@ -391,7 +418,7 @@ fn unavailable(reason: DeclaredTypeUnavailable) -> DeclaredTypeError {
     DeclaredTypeError::Unavailable(reason)
 }
 
-fn malformed_alias_merge(flags: SymbolFlags) -> bool {
+pub(super) fn malformed_alias_merge(flags: SymbolFlags) -> bool {
     flags.contains(SymbolFlags::ALIAS) && flags.without(SymbolFlags::ALIAS) != SymbolFlags::NONE
 }
 
@@ -408,7 +435,7 @@ fn origin_type_parameter_object_flags(flags: ObjectFlags) -> bool {
                 | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES)
 }
 
-fn cached_ordinary_type_parameter_owner(
+pub(super) fn cached_ordinary_type_parameter_owner(
     store: &SemanticStore<TypeRecord, TypeMapper>,
     declared_type: TypeId,
 ) -> Option<SemanticSymbolId> {
@@ -627,7 +654,7 @@ fn cached_type_parameter(
     }
 }
 
-fn preflight_node<'a>(
+pub(super) fn preflight_node<'a>(
     store: &SemanticStore<TypeRecord, TypeMapper>,
     host: &'a DeclaredTypeHost<'_>,
     node: NodeRef,
@@ -641,7 +668,7 @@ fn preflight_node<'a>(
         .ok_or_else(|| unavailable(DeclaredTypeUnavailable::MissingOrForeignFacts(node)))
 }
 
-fn preflight_type_parameter_symbol(
+pub(super) fn preflight_type_parameter_symbol(
     store: &SemanticStore<TypeRecord, TypeMapper>,
     host: &DeclaredTypeHost<'_>,
     symbol: SemanticSymbolId,
@@ -701,7 +728,7 @@ fn push_unique(symbols: &mut Vec<SemanticSymbolId>, symbol: SemanticSymbolId) {
     }
 }
 
-fn explicit_type_parameter_symbols(
+pub(super) fn explicit_type_parameter_symbols(
     store: &SemanticStore<TypeRecord, TypeMapper>,
     host: &DeclaredTypeHost<'_>,
     container: NodeRef,
@@ -1325,7 +1352,7 @@ fn publish_declared_type(
     assert!(store.set_declared_type_links(symbol, links));
 }
 
-fn execute_type_parameter(
+pub(super) fn execute_type_parameter(
     store: &mut SemanticStore<TypeRecord, TypeMapper>,
     symbol: SemanticSymbolId,
 ) -> TypeId {
@@ -1472,6 +1499,104 @@ fn initialize_published_origin(
     ));
 }
 
+pub(super) fn get_declared_class_interface_or_type_parameter(
+    store: &mut SemanticStore<TypeRecord, TypeMapper>,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+    flags: SymbolFlags,
+) -> Result<Option<TypeId>, DeclaredTypeError> {
+    if flags.contains(SymbolFlags::CLASS) {
+        if let Some(declared_type) = cached_class_type(store, symbol)? {
+            return Ok(Some(declared_type));
+        }
+        let plan = preflight_class_plan(store, host, symbol)?;
+        return Ok(Some(execute_class_plan(store, plan)));
+    }
+    if flags.contains(SymbolFlags::INTERFACE) {
+        if let Some(declared_type) = cached_interface_type(store, symbol)? {
+            return Ok(Some(declared_type));
+        }
+        let plan = RecursiveInterfacePlanner::plan(store, host, symbol)?;
+        return Ok(Some(execute_recursive_interface_plan(store, plan)));
+    }
+    if flags.contains(SymbolFlags::TYPE_PARAMETER) {
+        if let Some(declared_type) = cached_type_parameter(store, symbol)? {
+            return Ok(Some(declared_type));
+        }
+        preflight_type_parameter_symbol(store, host, symbol, &mut HashSet::new())?;
+        return Ok(Some(execute_type_parameter(store, symbol)));
+    }
+    Ok(None)
+}
+
+fn cached_local_type_parameter_count(
+    store: &SemanticStore<TypeRecord, TypeMapper>,
+    symbol: SemanticSymbolId,
+    declared_type: TypeId,
+) -> Result<usize, DeclaredTypeError> {
+    let Some(TypeData::Interface(data)) = store.type_payload(declared_type).map(TypeRecord::data)
+    else {
+        return Err(unavailable(
+            DeclaredTypeUnavailable::InvalidCachedDeclaredType {
+                symbol,
+                declared_type,
+            },
+        ));
+    };
+    let parameter_count = data
+        .reference
+        .resolved_type_arguments
+        .as_deref()
+        .map_or(0, <[TypeId]>::len);
+    parameter_count
+        .checked_sub(data.outer_type_parameter_count)
+        .ok_or_else(|| {
+            unavailable(DeclaredTypeUnavailable::InvalidCachedDeclaredType {
+                symbol,
+                declared_type,
+            })
+        })
+}
+
+pub(super) fn preflight_class_or_interface_reference(
+    store: &SemanticStore<TypeRecord, TypeMapper>,
+    host: &DeclaredTypeHost<'_>,
+    symbol: SemanticSymbolId,
+    flags: SymbolFlags,
+) -> Result<usize, DeclaredTypeError> {
+    if flags.contains(SymbolFlags::CLASS) {
+        if let Some(declared_type) = cached_class_type(store, symbol)? {
+            return cached_local_type_parameter_count(store, symbol, declared_type);
+        }
+        let plan = preflight_class_plan(store, host, symbol)?;
+        return Ok(plan
+            .type_parameters
+            .len()
+            .checked_sub(plan.outer_type_parameter_count)
+            .expect("a class plan appends local parameters after outer parameters"));
+    }
+
+    if let Some(declared_type) = cached_interface_type(store, symbol)? {
+        return cached_local_type_parameter_count(store, symbol, declared_type);
+    }
+    let plan = RecursiveInterfacePlanner::plan(store, host, symbol)?;
+    let root = plan
+        .nodes
+        .get(plan.root)
+        .expect("an uncached interface plan always contains its root");
+    let (parameter_count, outer_type_parameter_count) = match root {
+        RecursiveInterfacePlanNode::Class(plan) => {
+            (plan.type_parameters.len(), plan.outer_type_parameter_count)
+        }
+        RecursiveInterfacePlanNode::Interface(plan) => {
+            (plan.type_parameters.len(), plan.outer_type_parameter_count)
+        }
+    };
+    Ok(parameter_count
+        .checked_sub(outer_type_parameter_count)
+        .expect("an interface plan appends local parameters after outer parameters"))
+}
+
 impl SemanticStore<TypeRecord, TypeMapper> {
     /// Returns the exact declared identity for the installed class/interface/
     /// type-parameter cut.
@@ -1494,74 +1619,14 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         host: &DeclaredTypeHost<'_>,
         symbol: SemanticSymbolId,
     ) -> Result<TypeId, DeclaredTypeError> {
-        let symbol = self
-            .get_merged_symbol(symbol)
-            .ok_or_else(|| unavailable(DeclaredTypeUnavailable::SymbolNotOwned(symbol)))?;
-        let flags = self
-            .symbol(symbol)
-            .ok_or_else(|| unavailable(DeclaredTypeUnavailable::SymbolNotOwned(symbol)))?
-            .flags();
-        let error_type = self
-            .intrinsic_bootstrap()
-            .ok_or_else(|| unavailable(DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized))?
-            .error_type;
-
-        if malformed_alias_merge(flags) {
-            return Err(unavailable(
-                DeclaredTypeUnavailable::AliasMergedWithDeclaredSymbol(symbol),
-            ));
-        }
-
-        // This is the pinned dispatcher order. Class wins for
-        // `Class | Interface`.
-        if flags.contains(SymbolFlags::CLASS) {
-            if let Some(declared_type) = cached_class_type(self, symbol)? {
-                return Ok(declared_type);
-            }
-            let plan = preflight_class_plan(self, host, symbol)?;
-            return Ok(execute_class_plan(self, plan));
-        }
-        if flags.contains(SymbolFlags::INTERFACE) {
-            if let Some(declared_type) = cached_interface_type(self, symbol)? {
-                return Ok(declared_type);
-            }
-            let plan = RecursiveInterfacePlanner::plan(self, host, symbol)?;
-            return Ok(execute_recursive_interface_plan(self, plan));
-        }
-        if flags.contains(SymbolFlags::TYPE_PARAMETER) {
-            if let Some(declared_type) = cached_type_parameter(self, symbol)? {
-                return Ok(declared_type);
-            }
-            preflight_type_parameter_symbol(self, host, symbol, &mut HashSet::new())?;
-            return Ok(execute_type_parameter(self, symbol));
-        }
-        if flags.contains(SymbolFlags::TYPE_ALIAS) {
-            return Err(unavailable(
-                DeclaredTypeUnavailable::UnsupportedDeclaredType(
-                    UnsupportedDeclaredTypeKind::TypeAlias,
-                ),
-            ));
-        }
-        if flags.intersects(SymbolFlags::ENUM) {
-            return Err(unavailable(
-                DeclaredTypeUnavailable::UnsupportedDeclaredType(UnsupportedDeclaredTypeKind::Enum),
-            ));
-        }
-        if flags.contains(SymbolFlags::ENUM_MEMBER) {
-            return Err(unavailable(
-                DeclaredTypeUnavailable::UnsupportedDeclaredType(
-                    UnsupportedDeclaredTypeKind::EnumMember,
-                ),
-            ));
-        }
-        if flags.contains(SymbolFlags::ALIAS) {
-            return Err(unavailable(
-                DeclaredTypeUnavailable::UnsupportedDeclaredType(
-                    UnsupportedDeclaredTypeKind::Alias,
-                ),
-            ));
-        }
-        Ok(error_type)
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        CanonicalTypeQuery::new(
+            self,
+            host,
+            CanonicalTypeQueryOptions::default(),
+            &mut diagnostics,
+        )
+        .get_declared_type_of_symbol(symbol)
     }
 }
 
@@ -2882,10 +2947,9 @@ mod tests {
     #[test]
     fn dispatcher_keeps_unsupported_families_unavailable_and_values_on_error_type() {
         let mut fixture = fixture_with_module_state(
-            "import { remote as local } from 'm'; type A = string; enum E { M } const value = 1;",
+            "import { remote as local } from 'm'; enum E { M } const value = 1;",
             CanonicalModuleState::External,
         );
-        let alias = named_symbol(&fixture, SyntaxKind::TypeAliasDeclaration, "A");
         let enum_symbol = named_symbol(&fixture, SyntaxKind::EnumDeclaration, "E");
         let member = named_symbol(&fixture, SyntaxKind::EnumMember, "M");
         let import = named_symbol(&fixture, SyntaxKind::ImportSpecifier, "local");
@@ -2897,7 +2961,6 @@ mod tests {
         let link_counts = fixture.store.checker_link_allocated_lengths();
 
         for (symbol, kind) in [
-            (alias, UnsupportedDeclaredTypeKind::TypeAlias),
             (enum_symbol, UnsupportedDeclaredTypeKind::Enum),
             (member, UnsupportedDeclaredTypeKind::EnumMember),
             (import, UnsupportedDeclaredTypeKind::Alias),

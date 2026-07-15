@@ -23,6 +23,7 @@ pub mod relation;
 pub mod relater;
 pub mod signatures;
 mod store;
+pub mod type_nodes;
 pub mod type_records;
 pub mod types;
 
@@ -81,5 +82,6 @@ pub use relation::{
 };
 pub use relater::RelationUnavailable;
 pub use store::SemanticStore;
+pub use type_nodes::{CanonicalTypeQuery, CanonicalTypeQueryOptions, TypeNodeUnavailable};
 pub use type_records::{CacheHashKey, CanonicalSemanticStore, TypeData, TypeDataKind, TypeRecord};
 pub use types::VarianceFlags;
