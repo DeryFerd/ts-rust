@@ -353,6 +353,7 @@ impl SymbolTable {
 pub struct SymbolStore {
     id: SemanticStoreId,
     symbols: Vec<Symbol>,
+    checker_created_symbols: Vec<bool>,
     global_symbol_ids: Vec<Option<NonZeroU64>>,
     tables: Vec<SymbolTable>,
     ast_scopes: BTreeMap<FileId, AstScope>,
@@ -371,6 +372,7 @@ impl SymbolStore {
         Self {
             id: allocate_store_id(),
             symbols: Vec::new(),
+            checker_created_symbols: Vec::new(),
             global_symbol_ids: Vec::new(),
             tables: Vec::new(),
             ast_scopes: BTreeMap::new(),
@@ -442,7 +444,9 @@ impl SymbolStore {
 
     /// Allocates a symbol only after validating every embedded reference.
     pub fn alloc_symbol(&mut self, data: SymbolData) -> Option<SemanticSymbolId> {
-        if !self.valid_nodes(data.declarations.as_deref())
+        let checker_created = data.flags.contains(SymbolFlags::TRANSIENT);
+        if (data.check_flags != CheckFlags::NONE && !checker_created)
+            || !self.valid_nodes(data.declarations.as_deref())
             || !self.valid_optional_node(data.value_declaration)
             || !self.valid_optional_table(data.members)
             || !self.valid_optional_table(data.exports)
@@ -467,6 +471,7 @@ impl SymbolStore {
             parent: data.parent,
             export_symbol: data.export_symbol,
         });
+        self.checker_created_symbols.push(checker_created);
         self.global_symbol_ids.push(None);
         Some(id)
     }
@@ -531,6 +536,11 @@ impl SymbolStore {
         flags: SymbolFlags,
         check_flags: CheckFlags,
     ) -> bool {
+        if !self.contains_symbol(symbol)
+            || (check_flags != CheckFlags::NONE && !self.checker_created_symbols[symbol.index()])
+        {
+            return false;
+        }
         let Some(record) = self.symbol_mut(symbol) else {
             return false;
         };
@@ -819,6 +829,32 @@ mod tests {
         assert!(record.flags().contains(SymbolFlags::PROPERTY));
         assert!(record.flags().contains(SymbolFlags::TRANSIENT));
         assert_eq!(record.check_flags(), CheckFlags::SYNTHETIC_PROPERTY);
+    }
+
+    #[test]
+    fn checker_flags_require_transient_allocation_provenance() {
+        let mut store = SymbolStore::new();
+        let before = store.symbol_len();
+        let mut invalid =
+            SymbolData::new(SymbolFlags::PROPERTY, EscapedName::source("not transient"));
+        invalid.check_flags = CheckFlags::SYNTHETIC_PROPERTY;
+        assert_eq!(store.alloc_symbol(invalid), None);
+        assert_eq!(store.symbol_len(), before);
+
+        let bound = alloc_source_symbol(&mut store, "bound");
+        let bound_before = store.symbol(bound).unwrap().clone();
+        assert!(!store.set_symbol_flags(bound, SymbolFlags::PROPERTY, CheckFlags::LATE));
+        assert_eq!(store.symbol(bound), Some(&bound_before));
+
+        let transient = store.alloc_transient_symbol(
+            SymbolFlags::PROPERTY,
+            EscapedName::source("late"),
+            CheckFlags::LATE,
+        );
+        assert!(store.set_symbol_flags(transient, SymbolFlags::PROPERTY, CheckFlags::LATE));
+        let late = store.symbol(transient).unwrap();
+        assert!(!late.flags().contains(SymbolFlags::TRANSIENT));
+        assert_eq!(late.check_flags(), CheckFlags::LATE);
     }
 
     #[test]

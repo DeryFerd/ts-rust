@@ -49,7 +49,16 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     /// Panics if the process has exhausted semantic-store identities.
     #[must_use]
     pub fn new() -> Self {
-        let symbols = SymbolStore::new();
+        Self::from_symbol_store(SymbolStore::new())
+    }
+
+    /// Adopts the already-bound Program symbol graph before allocating any
+    /// checker-owned semantic records.
+    ///
+    /// The owner is consumed so safe callers cannot later replace it and split
+    /// the brand captured by the type, signature, and mapper arenas.
+    #[must_use]
+    pub fn from_symbol_store(symbols: SymbolStore) -> Self {
         let id = symbols.id();
         Self {
             symbols,
@@ -177,15 +186,13 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         self.symbols.symbol_len()
     }
 
-    /// Returns the embedded canonical symbol owner.
+    /// Returns the embedded canonical symbol owner for read-only queries.
+    ///
+    /// Mutable access to the owner itself is intentionally unavailable because
+    /// replacing it would invalidate the aggregate's single-brand invariant.
     #[must_use]
     pub const fn symbol_store(&self) -> &SymbolStore {
         &self.symbols
-    }
-
-    /// Returns the embedded canonical symbol owner for validated mutations.
-    pub const fn symbol_store_mut(&mut self) -> &mut SymbolStore {
-        &mut self.symbols
     }
 
     /// Lazily assigns the pinned process-global symbol identity.
@@ -238,6 +245,37 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
 
     pub fn clone_symbol_table(&mut self, source: SymbolTableId) -> Option<SymbolTableId> {
         self.symbols.clone_symbol_table(source)
+    }
+
+    pub fn set_symbol_flags(
+        &mut self,
+        symbol: SemanticSymbolId,
+        flags: SymbolFlags,
+        check_flags: CheckFlags,
+    ) -> bool {
+        self.symbols.set_symbol_flags(symbol, flags, check_flags)
+    }
+
+    pub fn set_symbol_declarations(
+        &mut self,
+        symbol: SemanticSymbolId,
+        declarations: Option<Vec<NodeRef>>,
+        value_declaration: Option<NodeRef>,
+    ) -> bool {
+        self.symbols
+            .set_symbol_declarations(symbol, declarations, value_declaration)
+    }
+
+    pub fn set_symbol_relationships(
+        &mut self,
+        symbol: SemanticSymbolId,
+        members: Option<SymbolTableId>,
+        exports: Option<SymbolTableId>,
+        parent: Option<SemanticSymbolId>,
+        export_symbol: Option<SemanticSymbolId>,
+    ) -> bool {
+        self.symbols
+            .set_symbol_relationships(symbol, members, exports, parent, export_symbol)
     }
 
     /// Allocates a canonical type-mapper payload.
@@ -569,7 +607,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
 #[cfg(test)]
 mod tests {
     use ts_ast::{FileId, NodeRef};
-    use ts_binder::{EscapedName, SymbolData, SymbolFlags};
+    use ts_binder::{EscapedName, SymbolData, SymbolFlags, SymbolStore};
     use ts_parser::parse_source_file;
 
     use super::{AstScope, SemanticStore};
@@ -692,6 +730,60 @@ mod tests {
         assert_eq!(symbol.get(), foreign_symbol.get());
         assert_ne!(symbol, foreign_symbol);
         assert_eq!(store.global_symbol_id(foreign_symbol), None);
+    }
+
+    #[test]
+    fn prebound_symbol_store_is_consumed_without_splitting_identity() {
+        let mut symbols = SymbolStore::new();
+        let identity = symbols.id();
+        let parsed = parse_source_file("const prebound = 1;");
+        let scope = AstScope::new(FileId::new(41), &parsed.arena);
+        let declaration = scope.node_ref(parsed.source_file).unwrap();
+        assert!(symbols.register_ast_scope(scope));
+        let mut symbol_data =
+            SymbolData::new(SymbolFlags::PROPERTY, EscapedName::source("prebound"));
+        symbol_data.declarations = Some(vec![declaration]);
+        symbol_data.value_declaration = Some(declaration);
+        let symbol = symbols.alloc_symbol(symbol_data).unwrap();
+        let table = symbols.alloc_symbol_table();
+        assert_eq!(
+            symbols.insert_symbol(table, EscapedName::source("prebound"), symbol),
+            Some(None)
+        );
+        let global_id = symbols.global_symbol_id(symbol).unwrap();
+
+        let mut store = TestStore::from_symbol_store(symbols);
+        assert_eq!(store.id(), identity);
+        assert_eq!(store.symbol_store().id(), identity);
+        assert!(store.contains_node_ref(declaration));
+        assert_eq!(
+            store.symbol(symbol).unwrap().name().as_utf8(),
+            Some("prebound")
+        );
+        assert_eq!(
+            store.symbol_table(table).unwrap().get_source("prebound"),
+            Some(symbol)
+        );
+        assert_eq!(store.global_symbol_id(symbol), Some(global_id));
+
+        let type_id = store.alloc_type("checker type");
+        assert_eq!(store.type_payload(type_id), Some(&"checker type"));
+        let signature = store
+            .alloc_signature(
+                SignatureFlags::NONE,
+                None,
+                Vec::new(),
+                Some(symbol),
+                vec![symbol],
+                Some(type_id),
+                None,
+                1,
+            )
+            .unwrap();
+        assert_eq!(
+            store.signature(signature).unwrap().this_parameter(),
+            Some(symbol)
+        );
     }
 
     #[test]
