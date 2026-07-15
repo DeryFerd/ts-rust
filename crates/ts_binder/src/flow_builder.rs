@@ -1695,6 +1695,9 @@ impl<'a> FlowBuilder<'a> {
                         SyntaxKind::PlusPlusToken | SyntaxKind::MinusMinusToken
                     );
                 }
+                NodeData::ForInOrOfStatement(data) => {
+                    return data.initializer == node_id;
+                }
                 NodeData::ParenthesizedExpression(_)
                 | NodeData::ArrayLiteralExpression(_)
                 | NodeData::SpreadElement(_)
