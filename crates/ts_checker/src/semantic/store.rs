@@ -128,6 +128,7 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     type_resolutions: TypeResolutionStack,
     relations: RelationCaches,
     pub(super) intrinsic_bootstrap: Option<IntrinsicBootstrap>,
+    claimed_strict_builtin_iterator_return: Option<bool>,
 }
 
 impl<TypePayload, MapperPayload> Default for SemanticStore<TypePayload, MapperPayload> {
@@ -174,12 +175,35 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             type_resolutions: TypeResolutionStack::new(id),
             relations: RelationCaches::default(),
             intrinsic_bootstrap: None,
+            claimed_strict_builtin_iterator_return: None,
         }
     }
 
     #[must_use]
     pub fn id(&self) -> SemanticStoreId {
         self.symbols.id()
+    }
+
+    /// Claims the checker-global iterator-return mode for this store's query
+    /// session. The first claim configures the session; later claims must
+    /// match and never rewrite the established mode.
+    pub(super) fn claim_strict_builtin_iterator_return(
+        &mut self,
+        requested: bool,
+    ) -> Result<(), bool> {
+        match self.claimed_strict_builtin_iterator_return {
+            Some(established) if established != requested => Err(established),
+            Some(_) => Ok(()),
+            None => {
+                self.claimed_strict_builtin_iterator_return = Some(requested);
+                Ok(())
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) const fn claimed_strict_builtin_iterator_return(&self) -> Option<bool> {
+        self.claimed_strict_builtin_iterator_return
     }
 
     /// Registers a safe AST snapshot for semantic references.

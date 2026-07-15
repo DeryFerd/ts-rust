@@ -21,11 +21,12 @@ use ts_binder::{
 };
 
 use super::{
-    CanonicalGlobalTypeInitializationError, CanonicalGlobalTypes, CanonicalModuleResolutionLookup,
-    CanonicalModuleResolutionManifest, CanonicalModuleResolutionManifestError,
-    CanonicalModuleResolutionManifestInput, CanonicalTypeMapperStore, DeclaredTypeHost,
+    CanonicalCheckerDiagnostics, CanonicalGlobalTypeInitializationError, CanonicalGlobalTypes,
+    CanonicalModuleResolutionLookup, CanonicalModuleResolutionManifest,
+    CanonicalModuleResolutionManifestError, CanonicalModuleResolutionManifestInput,
+    CanonicalTypeMapperStore, CanonicalTypeQuery, DeclaredTypeError, DeclaredTypeHost,
     DeclaredTypeHostError, IntrinsicBootstrapError, IntrinsicBootstrapOptions, SourceFileRef,
-    SymbolMergeError,
+    SymbolMergeError, TypeId,
     global_types::initialize_global_library_types,
     module_resolution::validate_module_resolution_manifest,
     name_resolution::{ProductionNameResolverHost, ProductionNameResolverHostError},
@@ -99,6 +100,7 @@ pub struct CanonicalCheckerContext<'arena> {
     globals: SymbolTableId,
     global_types: CanonicalGlobalTypes,
     module_resolutions: CanonicalModuleResolutionManifest,
+    diagnostics: CanonicalCheckerDiagnostics,
     pending_ambient_modules: Vec<SemanticSymbolId>,
     pattern_ambient_modules: Vec<CanonicalPatternAmbientModule>,
 }
@@ -204,6 +206,17 @@ impl<'arena> CanonicalCheckerContext<'arena> {
         store
             .initialize_intrinsic_bootstrap(options.intrinsic)
             .map_err(CanonicalCheckerContextError::Bootstrap)?;
+        if let Err(established_strict_builtin_iterator_return) =
+            store.claim_strict_builtin_iterator_return(options.strict_builtin_iterator_return)
+        {
+            return Err(
+                CanonicalCheckerContextError::StrictBuiltinIteratorReturnClaim {
+                    established_strict_builtin_iterator_return,
+                    requested_strict_builtin_iterator_return: options
+                        .strict_builtin_iterator_return,
+                },
+            );
+        }
 
         let mut files = BTreeMap::new();
         for (file, arena, source_file) in registered {
@@ -240,6 +253,7 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             globals: initialized.globals,
             global_types: initialized.global_types,
             module_resolutions,
+            diagnostics: CanonicalCheckerDiagnostics::default(),
             pending_ambient_modules: initialized.pending_ambient_modules,
             pattern_ambient_modules: initialized.pattern_ambient_modules,
         })
@@ -300,6 +314,58 @@ impl<'arena> CanonicalCheckerContext<'arena> {
     #[must_use]
     pub fn module_resolution(&self, specifier: NodeRef) -> CanonicalModuleResolutionLookup {
         self.module_resolutions.lookup(specifier)
+    }
+
+    /// General checker diagnostics in raw issuance order.
+    #[must_use]
+    pub const fn diagnostics(&self) -> &CanonicalCheckerDiagnostics {
+        &self.diagnostics
+    }
+
+    /// Resolves one declared type through the context-owned query session.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed host, option, provenance, or unavailable error when the
+    /// retained Program cannot resolve the symbol in the installed cut.
+    pub fn get_declared_type_of_symbol(
+        &mut self,
+        symbol: SemanticSymbolId,
+    ) -> Result<TypeId, DeclaredTypeError> {
+        let Self {
+            options,
+            files,
+            store,
+            diagnostics,
+            ..
+        } = self;
+        let host = DeclaredTypeHost::new_after_global_merge(
+            files.values().map(|file| (file.arena, &file.bound)),
+            GlobalMergeCompletion::new(options.name_resolution),
+        )?;
+        CanonicalTypeQuery::new(store, &host, *options, diagnostics)?
+            .get_declared_type_of_symbol(symbol)
+    }
+
+    /// Resolves one type node through the context-owned query session.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed host, option, provenance, or unavailable error when the
+    /// retained Program cannot resolve the node in the installed cut.
+    pub fn get_type_from_type_node(&mut self, node: NodeRef) -> Result<TypeId, DeclaredTypeError> {
+        let Self {
+            options,
+            files,
+            store,
+            diagnostics,
+            ..
+        } = self;
+        let host = DeclaredTypeHost::new_after_global_merge(
+            files.values().map(|file| (file.arena, &file.bound)),
+            GlobalMergeCompletion::new(options.name_resolution),
+        )?;
+        CanonicalTypeQuery::new(store, &host, *options, diagnostics)?.get_type_from_type_node(node)
     }
 
     /// Quoted ambient-module symbols deferred until global library types exist.
@@ -1026,6 +1092,11 @@ pub enum CanonicalCheckerContextError {
     Bootstrap(IntrinsicBootstrapError),
     /// The explicit checker-owned module-resolution manifest was invalid.
     ModuleResolutions(CanonicalModuleResolutionManifestError),
+    /// The checker store already retained a conflicting query-session option.
+    StrictBuiltinIteratorReturnClaim {
+        established_strict_builtin_iterator_return: bool,
+        requested_strict_builtin_iterator_return: bool,
+    },
     /// The supported `initializeChecker` global prefix could not complete.
     GlobalInitialization(CanonicalGlobalInitializationError),
 }
@@ -1121,6 +1192,13 @@ impl std::fmt::Display for CanonicalCheckerContextError {
             Self::ModuleResolutions(error) => {
                 write!(formatter, "checker module resolutions are invalid: {error}")
             }
+            Self::StrictBuiltinIteratorReturnClaim {
+                established_strict_builtin_iterator_return,
+                requested_strict_builtin_iterator_return,
+            } => write!(
+                formatter,
+                "checker store retained strictBuiltinIteratorReturn={established_strict_builtin_iterator_return}, not the requested {requested_strict_builtin_iterator_return}"
+            ),
             Self::GlobalInitialization(error) => {
                 write!(formatter, "checker global initialization failed: {error}")
             }
@@ -1250,6 +1328,23 @@ mod tests {
             .get_source(name)
     }
 
+    fn type_alias_body(source: &ParseResult, file: FileId, name: &str) -> NodeRef {
+        let body = source
+            .arena
+            .iter()
+            .find_map(|(_, node)| {
+                let NodeData::TypeAliasDeclaration(alias) = &node.data else {
+                    return None;
+                };
+                let NodeData::Identifier(identifier) = &source.arena.get(alias.name)?.data else {
+                    return None;
+                };
+                (identifier.text == name).then_some(alias.type_)
+            })
+            .unwrap_or_else(|| panic!("missing type alias {name}"));
+        NodeRef::new(source.arena.id(), file, body)
+    }
+
     type NormalizedGlobalSnapshot = Vec<(Vec<u8>, u32, usize)>;
     type NormalizedRedirectSnapshot = Vec<(usize, Vec<u8>, bool)>;
 
@@ -1323,6 +1418,69 @@ mod tests {
         let options = CanonicalCheckerOptions::from(intrinsic);
         assert_eq!(options.intrinsic, intrinsic);
         assert!(!options.strict_builtin_iterator_return);
+    }
+
+    #[test]
+    fn context_query_facade_retains_options_and_diagnostics_across_retries() {
+        let source = parsed(concat!(
+            "type BuiltinIteratorReturn = intrinsic; ",
+            "type Wrapper = BuiltinIteratorReturn; ",
+            "type A = B; type B = A;",
+        ));
+        let file = FileId::new(2);
+        let wrapper_body = type_alias_body(&source, file, "Wrapper");
+        let options = CanonicalCheckerOptions {
+            strict_builtin_iterator_return: true,
+            ..CanonicalCheckerOptions::default()
+        };
+        let mut context = CanonicalCheckerContext::new(
+            completed_bindings(&[(file, &source)]),
+            vec![(file, &source.arena)],
+            options,
+        )
+        .unwrap();
+        let cycle = global_symbol(&context, "A").unwrap();
+        let wrapper = global_symbol(&context, "Wrapper").unwrap();
+        let (error_type, undefined_type) = {
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            (bootstrap.error_type, bootstrap.undefined_type)
+        };
+
+        assert!(context.diagnostics().is_empty());
+        assert_eq!(context.get_declared_type_of_symbol(cycle), Ok(error_type));
+        assert_eq!(context.diagnostics().len(), 2);
+        assert!(
+            context
+                .diagnostics()
+                .as_slice()
+                .iter()
+                .all(|diagnostic| diagnostic.diagnostic.code() == 2456)
+        );
+        assert_eq!(
+            context
+                .diagnostics()
+                .as_slice()
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.arguments[0].as_str())
+                .collect::<Vec<_>>(),
+            ["B", "A"]
+        );
+        assert_eq!(context.get_declared_type_of_symbol(cycle), Ok(error_type));
+        assert_eq!(context.diagnostics().len(), 2);
+
+        assert_eq!(
+            context.get_type_from_type_node(wrapper_body),
+            Ok(undefined_type)
+        );
+        assert_eq!(
+            context.get_declared_type_of_symbol(wrapper),
+            Ok(undefined_type)
+        );
+        assert_eq!(
+            context.store().claimed_strict_builtin_iterator_return(),
+            Some(true)
+        );
+        assert_eq!(context.diagnostics().len(), 2);
     }
 
     #[test]

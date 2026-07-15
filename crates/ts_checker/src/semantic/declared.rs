@@ -28,13 +28,13 @@ use ts_binder::{
 use xxhash_rust::xxh3::Xxh3;
 
 use super::{
-    CanonicalCheckerDiagnostics, TypeResolutionTargetError,
+    TypeResolutionTargetError,
     ids::TypeId,
     mapper::TypeMapper,
     name_resolution::{ProductionNameResolverHost, ProductionNameResolverHostError},
     production::GlobalMergeCompletion,
     store::SemanticStore,
-    type_nodes::{CanonicalTypeQuery, CanonicalTypeQueryOptions, TypeNodeUnavailable},
+    type_nodes::TypeNodeUnavailable,
     type_records::{CacheHashKey, InterfaceTypeData, TypeCacheState, TypeData, TypeRecord},
     types::{ObjectFlags, TypeFlags},
 };
@@ -303,6 +303,7 @@ pub enum DeclaredTypeUnavailable {
 pub enum DeclaredTypeError {
     Unavailable(DeclaredTypeUnavailable),
     TypeNodeUnavailable(TypeNodeUnavailable),
+    Host(DeclaredTypeHostError),
     NameResolverHost(ProductionNameResolverHostError),
     NameResolution(CanonicalNameResolutionError),
     TypeResolutionTarget(TypeResolutionTargetError),
@@ -323,6 +324,7 @@ impl std::fmt::Display for DeclaredTypeError {
             Self::TypeNodeUnavailable(reason) => {
                 write!(formatter, "type node is unavailable: {reason:?}")
             }
+            Self::Host(error) => write!(formatter, "{error}"),
             Self::NameResolverHost(error) => write!(formatter, "{error}"),
             Self::NameResolution(error) => write!(formatter, "{error}"),
             Self::TypeResolutionTarget(error) => write!(formatter, "{error:?}"),
@@ -333,9 +335,10 @@ impl std::fmt::Display for DeclaredTypeError {
 impl std::error::Error for DeclaredTypeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Unavailable(_)
-            | Self::TypeNodeUnavailable(_)
-            | Self::TypeResolutionTarget(_) => None,
+            Self::Unavailable(_) | Self::TypeNodeUnavailable(_) | Self::TypeResolutionTarget(_) => {
+                None
+            }
+            Self::Host(error) => Some(error),
             Self::NameResolverHost(error) => Some(error),
             Self::NameResolution(error) => Some(error),
         }
@@ -345,6 +348,12 @@ impl std::error::Error for DeclaredTypeError {
 impl From<ProductionNameResolverHostError> for DeclaredTypeError {
     fn from(error: ProductionNameResolverHostError) -> Self {
         Self::NameResolverHost(error)
+    }
+}
+
+impl From<DeclaredTypeHostError> for DeclaredTypeError {
+    fn from(error: DeclaredTypeHostError) -> Self {
+        Self::Host(error)
     }
 }
 
@@ -1619,14 +1628,56 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         host: &DeclaredTypeHost<'_>,
         symbol: SemanticSymbolId,
     ) -> Result<TypeId, DeclaredTypeError> {
-        let mut diagnostics = CanonicalCheckerDiagnostics::default();
-        CanonicalTypeQuery::new(
-            self,
-            host,
-            CanonicalTypeQueryOptions::default(),
-            &mut diagnostics,
-        )
-        .get_declared_type_of_symbol(symbol)
+        let symbol = self
+            .get_merged_symbol(symbol)
+            .ok_or_else(|| unavailable(DeclaredTypeUnavailable::SymbolNotOwned(symbol)))?;
+        let flags = self
+            .symbol(symbol)
+            .ok_or_else(|| unavailable(DeclaredTypeUnavailable::SymbolNotOwned(symbol)))?
+            .flags();
+        if malformed_alias_merge(flags) {
+            return Err(unavailable(
+                DeclaredTypeUnavailable::AliasMergedWithDeclaredSymbol(symbol),
+            ));
+        }
+        if !flags
+            .intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE | SymbolFlags::TYPE_PARAMETER)
+            && flags.contains(SymbolFlags::TYPE_ALIAS)
+        {
+            return Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::DiagnosticOwnerRequired(symbol),
+            ));
+        }
+
+        let error_type = self
+            .intrinsic_bootstrap()
+            .ok_or_else(|| unavailable(DeclaredTypeUnavailable::IntrinsicBootstrapNotInitialized))?
+            .error_type;
+        if let Some(declared_type) =
+            get_declared_class_interface_or_type_parameter(self, host, symbol, flags)?
+        {
+            return Ok(declared_type);
+        }
+        if flags.intersects(SymbolFlags::ENUM) {
+            return Err(unavailable(
+                DeclaredTypeUnavailable::UnsupportedDeclaredType(UnsupportedDeclaredTypeKind::Enum),
+            ));
+        }
+        if flags.contains(SymbolFlags::ENUM_MEMBER) {
+            return Err(unavailable(
+                DeclaredTypeUnavailable::UnsupportedDeclaredType(
+                    UnsupportedDeclaredTypeKind::EnumMember,
+                ),
+            ));
+        }
+        if flags.contains(SymbolFlags::ALIAS) {
+            return Err(unavailable(
+                DeclaredTypeUnavailable::UnsupportedDeclaredType(
+                    UnsupportedDeclaredTypeKind::Alias,
+                ),
+            ));
+        }
+        Ok(error_type)
     }
 }
 
