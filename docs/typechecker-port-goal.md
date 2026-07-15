@@ -451,6 +451,27 @@ remains the cluster-level source of truth.
   property-local excess diagnostics. Exact object-literal diagnostic
   elaboration is therefore the active cluster, with simple assignment-statement
   dispatch being traced independently behind the same frozen contracts.
+- The object-diagnostic and direct-assignment wave is integrated through
+  `2ff2d4f`, `a65912f`, `3d636ec`, and `86ba585`. Failed property-object
+  assignments now follow the pinned elaboration order for known-property
+  mismatches, nested errors, excess/spelling diagnostics, and one/many missing
+  properties, including exact primary spans, related-information order,
+  suppression, TypeToString flags, and whole-batch diagnostic staging. TS6500
+  suppression consumes the exact Program-owned default-library fact rather
+  than a filename or same-file heuristic. Independent review also exposed and
+  closed the legal base-types-warm/members-cold interface state and the global
+  `interface Object` plus value-side `var Object` merge without a name-based
+  bypass. Top-level direct assignments to unique, explicitly typed and
+  initialized same-file `var` declarations now reuse the same contextual
+  object and relation path; Script-global, hoisted, and exported symbol routing
+  is provenance-checked, while aliases, block-scoped, inferred, merged, and
+  cross-file targets remain typed boundaries. The merged checker passes
+  655/655 library tests and strict checker/compiler Clippy. Pinned corpus
+  artifacts for `contextualTyping16`, `contextualTyping17`,
+  `contextualTyping2`, and `objectLitStructuralTypeMismatch` match exactly;
+  the first two prove zero diagnostics and the sole TS2353 over `name` at
+  `[46,50)` respectively. Arrays/assertions, calls, functions, and broader
+  assignment targets are the next dependency clusters.
 
 No percentage in this section is a whole-corpus parity claim. A score is
 publishable only when its variant manifest and complete artifact comparison are
@@ -1226,6 +1247,20 @@ disjoint modules while root performs rolling review and integration. Do not
 queue more than two unreviewed semantic clusters per available reviewer; an
 unreviewed pile merely moves the bottleneck to integration and makes bad shared
 assumptions expensive to unwind.
+
+The 2026-07-15 object/assignment wave validated this shape empirically: one
+worker owned diagnostic elaboration, one owned read-only assignment planning,
+one alternated between pinned-Go oracle work and independent review, and root
+owned source dispatch, compiler classification, and integration. When the
+object lane exposed a separate global-`Object` cache contract, it became a
+fourth bounded module slice only after the first worker released that
+ownership. Cargo remained serialized while review, oracle analysis, and static
+editing continued in parallel. The result was four coherent commits with no
+P0/P1 review defect at integration, rather than four overlapping source-file
+patches. With four slots this pattern yields roughly 2.5-3 useful worker lanes;
+additional workers become valuable only after dispatch and shared cache
+contracts are frozen, at which point 6-10 disjoint feature clusters are
+plausible but reviewer/integration throughput becomes the limiting resource.
 
 Work is assigned by an exclusive tuple of upstream functions, Rust destination
 modules, and semantic records it may mutate. Fixture buckets are validation
