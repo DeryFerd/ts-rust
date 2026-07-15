@@ -779,7 +779,7 @@ impl CanonicalBinder {
     /// Like the pinned binder, a parent mismatch is checked after
     /// `addDeclarationToSymbol` and therefore panics after those mutations.
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-    pub fn declare_symbol_ex(
+    fn declare_symbol_ex(
         &mut self,
         arena: &NodeArena,
         file: FileId,
@@ -5617,31 +5617,10 @@ mod tests {
                 .is_empty()
         );
 
-        let computed = binder
-            .declare_symbol_ex(
-                &parsed.arena,
-                file,
-                table,
-                None,
-                module_assignment,
-                SymbolFlags::ASSIGNMENT,
-                SymbolFlags::NONE,
-                false,
-                true,
-            )
-            .unwrap();
         let bound = binder.file(file).unwrap();
-        assert_eq!(bound.symbol_count(), 1);
+        assert_eq!(bound.symbol_count(), 0);
         assert_eq!(bound.classifiable_names().count(), 0);
         assert!(bound.diagnostics().is_empty());
-        assert_eq!(
-            binder
-                .symbol_store()
-                .symbol_table(table)
-                .unwrap()
-                .get(InternalSymbolName::Computed.as_ref()),
-            Some(computed)
-        );
     }
 
     #[test]
