@@ -24,6 +24,7 @@ use super::{
     DeclaredTypeHost, RelationUnavailable, SourceFileLinks, SourceFileRef, TypeDisplayUnavailable,
     TypeId,
     bootstrap::LiteralTypeCacheError,
+    contextual::{LiteralTreatment, PreparedExpression, prepare_expression_context},
     formatter::get_type_names_for_assignability_error_with_host_and_flags,
     type_nodes::{CanonicalTypeQuery, normalize_bigint_literal, normalize_numeric_separators},
 };
@@ -224,7 +225,7 @@ impl From<LiteralTypeCacheError> for SourceCheckError {
 }
 
 #[derive(Clone, Debug)]
-enum PlannedExpression {
+pub(super) enum PlannedExpression {
     Null,
     String(String),
     Number {
@@ -1190,70 +1191,122 @@ fn valid_range(
 fn expression_type(
     store: &mut CanonicalTypeMapperStore,
     expression: &PlannedExpression,
+    prepared: &PreparedExpression,
 ) -> Result<TypeId, SourceCheckError> {
-    match expression {
-        PlannedExpression::Null => store
+    match (expression, prepared) {
+        (PlannedExpression::Null, PreparedExpression::Literal(LiteralTreatment::Identity)) => store
             .intrinsic_bootstrap()
             .map(|bootstrap| bootstrap.null_widening_type)
             .ok_or(SourceCheckError::LiteralCache(
                 SourceLiteralCacheError::BootstrapUninitialized,
             )),
-        PlannedExpression::Boolean(value) => store
-            .intrinsic_bootstrap()
-            .map(|bootstrap| {
-                if *value {
-                    bootstrap.regular_true_type
-                } else {
-                    bootstrap.regular_false_type
-                }
-            })
-            .ok_or(SourceCheckError::LiteralCache(
-                SourceLiteralCacheError::BootstrapUninitialized,
-            ))
-            .and_then(|regular| {
-                store
-                    .fresh_type_of_literal_type(regular)
-                    .map_err(Into::into)
-            }),
-        PlannedExpression::GlobalUndefined => store
+        (PlannedExpression::Boolean(value), PreparedExpression::Literal(treatment)) => {
+            let (regular, widened) = store
+                .intrinsic_bootstrap()
+                .map(|bootstrap| {
+                    (
+                        if *value {
+                            bootstrap.regular_true_type
+                        } else {
+                            bootstrap.regular_false_type
+                        },
+                        bootstrap.boolean_type,
+                    )
+                })
+                .ok_or(SourceCheckError::LiteralCache(
+                    SourceLiteralCacheError::BootstrapUninitialized,
+                ))?;
+            prepared_literal_type(store, regular, widened, *treatment)
+        }
+        (
+            PlannedExpression::GlobalUndefined,
+            PreparedExpression::Literal(LiteralTreatment::Identity),
+        ) => store
             .intrinsic_bootstrap()
             .map(|bootstrap| bootstrap.undefined_widening_type)
             .ok_or(SourceCheckError::LiteralCache(
                 SourceLiteralCacheError::BootstrapUninitialized,
             )),
-        PlannedExpression::String(value) => {
+        (PlannedExpression::String(value), PreparedExpression::Literal(treatment)) => {
             let regular = store.regular_string_literal_type(value.clone())?;
-            Ok(store.fresh_type_of_literal_type(regular)?)
+            let widened = store
+                .intrinsic_bootstrap()
+                .map(|bootstrap| bootstrap.string_type)
+                .ok_or(SourceCheckError::LiteralCache(
+                    SourceLiteralCacheError::BootstrapUninitialized,
+                ))?;
+            prepared_literal_type(store, regular, widened, *treatment)
         }
-        PlannedExpression::Number {
-            value,
-            unary_operand,
-        } => {
+        (
+            PlannedExpression::Number {
+                value,
+                unary_operand,
+            },
+            PreparedExpression::Literal(treatment),
+        ) => {
             if let Some(operand) = unary_operand {
                 store.regular_number_literal_type(*operand)?;
             }
             let regular = store.regular_number_literal_type(*value)?;
-            Ok(store.fresh_type_of_literal_type(regular)?)
+            let widened = store
+                .intrinsic_bootstrap()
+                .map(|bootstrap| bootstrap.number_type)
+                .ok_or(SourceCheckError::LiteralCache(
+                    SourceLiteralCacheError::BootstrapUninitialized,
+                ))?;
+            prepared_literal_type(store, regular, widened, *treatment)
         }
-        PlannedExpression::BigInt {
-            value,
-            unary_operand,
-        } => {
+        (
+            PlannedExpression::BigInt {
+                value,
+                unary_operand,
+            },
+            PreparedExpression::Literal(treatment),
+        ) => {
             if let Some(operand) = unary_operand {
                 store.regular_bigint_literal_type(operand.clone())?;
             }
             let regular = store.regular_bigint_literal_type(value.clone())?;
-            Ok(store.fresh_type_of_literal_type(regular)?)
+            let widened = store
+                .intrinsic_bootstrap()
+                .map(|bootstrap| bootstrap.bigint_type)
+                .ok_or(SourceCheckError::LiteralCache(
+                    SourceLiteralCacheError::BootstrapUninitialized,
+                ))?;
+            prepared_literal_type(store, regular, widened, *treatment)
         }
-        PlannedExpression::Object { plan, properties } => {
+        (
+            PlannedExpression::Object { plan, properties },
+            PreparedExpression::Object(prepared_properties),
+        ) => {
+            debug_assert_eq!(properties.len(), prepared_properties.len());
             super::object_members::object_literal_state(store, plan)
                 .map_err(source_object_execution_error)?;
             let mut property_types = Vec::with_capacity(properties.len());
-            for property in properties {
-                property_types.push(expression_type(store, property)?);
+            for (property, prepared) in properties.iter().zip(prepared_properties) {
+                property_types.push(expression_type(store, property, prepared)?);
             }
             super::object_members::publish_object_literal(store, plan, &property_types)
                 .map_err(source_object_execution_error)
+        }
+        _ => unreachable!("a prepared expression must retain its planned expression shape"),
+    }
+}
+
+fn prepared_literal_type(
+    store: &CanonicalTypeMapperStore,
+    regular: TypeId,
+    widened: TypeId,
+    treatment: LiteralTreatment,
+) -> Result<TypeId, SourceCheckError> {
+    match treatment {
+        LiteralTreatment::Fresh => store
+            .fresh_type_of_literal_type(regular)
+            .map_err(Into::into),
+        LiteralTreatment::Regular => Ok(regular),
+        LiteralTreatment::WidenedPrimitive => Ok(widened),
+        LiteralTreatment::Identity => {
+            unreachable!("null and undefined do not use literal-pair treatment")
         }
     }
 }
@@ -1371,7 +1424,9 @@ pub(super) fn check_source_file(
                             .get_type_from_type_node(variable.type_node);
                     merge_retry_diagnostics(diagnostics, statement_diagnostics);
                     let target = target?;
-                    let source_type = expression_type(store, &variable.initializer)?;
+                    let prepared =
+                        prepare_expression_context(store, host, &variable.initializer, target)?;
+                    let source_type = expression_type(store, &variable.initializer, &prepared)?;
                     if !store.is_type_assignable_to(source_type, target)? {
                         let AssignabilityErrorDisplay { source, target } =
                             get_type_names_for_assignability_error_with_host_and_flags(
@@ -1546,6 +1601,102 @@ mod tests {
             })
             .unwrap_or_else(|| panic!("missing initializer for variable {expected}"));
         NodeRef::new(parsed.arena.id(), file, initializer)
+    }
+
+    fn variable_type_node(parsed: &ParseResult, file: FileId, expected: &str) -> NodeRef {
+        let type_node = parsed
+            .arena
+            .iter()
+            .find_map(|(_, node)| {
+                let NodeData::VariableDeclaration(variable) = &node.data else {
+                    return None;
+                };
+                let name = parsed.arena.get(variable.name)?;
+                let NodeData::Identifier(identifier) = &name.data else {
+                    return None;
+                };
+                (identifier.text == expected)
+                    .then_some(variable.type_)
+                    .flatten()
+            })
+            .unwrap_or_else(|| panic!("missing type node for variable {expected}"));
+        NodeRef::new(parsed.arena.id(), file, type_node)
+    }
+
+    fn object_property_initializer(
+        parsed: &ParseResult,
+        file: FileId,
+        object: NodeRef,
+        expected: &str,
+    ) -> NodeRef {
+        let object_record = parsed.arena.get(object.node).unwrap();
+        let NodeData::ObjectLiteralExpression(object_data) = &object_record.data else {
+            panic!("expected object literal")
+        };
+        let initializer = object_data
+            .properties
+            .nodes
+            .iter()
+            .find_map(|property| {
+                let property = parsed.arena.get(*property)?;
+                let NodeData::PropertyAssignment(property) = &property.data else {
+                    return None;
+                };
+                let name = parsed.arena.get(property.name)?;
+                let NodeData::Identifier(name) = &name.data else {
+                    return None;
+                };
+                (name.text == expected).then_some(property.initializer)
+            })
+            .unwrap_or_else(|| panic!("missing object property {expected}"));
+        NodeRef::new(parsed.arena.id(), file, initializer)
+    }
+
+    fn object_property_type(
+        context: &CanonicalCheckerContext<'_>,
+        object: NodeRef,
+        expected: &str,
+    ) -> TypeId {
+        let store = context.store();
+        let object = store
+            .type_node_links(object)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let TypeData::Object(object) = store.type_payload(object).unwrap().data() else {
+            panic!("expected object type")
+        };
+        let property = store
+            .symbol_table(object.structured.members.unwrap())
+            .and_then(|members| members.get_source(expected))
+            .unwrap_or_else(|| panic!("missing resolved object property {expected}"));
+        store
+            .value_symbol_links(property)
+            .and_then(|links| links.resolved_type)
+            .unwrap()
+    }
+
+    fn declared_object_property_symbol(
+        context: &CanonicalCheckerContext<'_>,
+        object: TypeId,
+        expected: &str,
+    ) -> SemanticSymbolId {
+        let store = context.store();
+        let structured = store
+            .type_payload(object)
+            .and_then(|record| record.data().structured())
+            .unwrap_or_else(|| panic!("expected structured target {object:?}"));
+        store
+            .symbol_table(structured.members.unwrap())
+            .and_then(|members| members.get_source(expected))
+            .unwrap_or_else(|| panic!("missing declared object property {expected}"))
+    }
+
+    fn resolved_node_type(context: &CanonicalCheckerContext<'_>, node: NodeRef) -> TypeId {
+        context
+            .store()
+            .type_node_links(node)
+            .and_then(|links| links.resolved_type)
+            .unwrap_or_else(|| panic!("missing resolved type for {node:?}"))
     }
 
     fn is_type_checked(context: &CanonicalCheckerContext<'_>, file: FileId) -> bool {
@@ -1921,6 +2072,369 @@ mod tests {
     }
 
     #[test]
+    fn contextual_object_properties_preserve_literals_or_widen_primitives_by_kind() {
+        let source = parsed(concat!(
+            "interface Expected { ",
+            r#"exactString: "x"; broadString: string; "#,
+            "exactNumber: 1; broadNumber: number; ",
+            "exactBigInt: 1n; broadBigInt: bigint; ",
+            "exactBoolean: true; broadBoolean: boolean; ",
+            "nullValue: null; undefinedValue: undefined; } ",
+            r#"const contextual: Expected = { exactString: "x", broadString: "x", "#,
+            "exactNumber: 1, broadNumber: 1, exactBigInt: 1n, broadBigInt: 1n, ",
+            "exactBoolean: true, broadBoolean: true, nullValue: null, ",
+            "undefinedValue: undefined }; ",
+            r#"const uncontextual: any = { stringValue: "x", numberValue: 1, "#,
+            "bigintValue: 1n, booleanValue: true, nullValue: null, ",
+            "undefinedValue: undefined };",
+        ));
+        let file = FileId::new(89);
+        let mut context = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    exact_optional_property_types: false,
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+        let contextual = variable_initializer(&source, file, "contextual");
+        let uncontextual = variable_initializer(&source, file, "uncontextual");
+
+        context.check_source_file(file).unwrap();
+
+        let (
+            string,
+            number,
+            bigint,
+            boolean,
+            null_widening,
+            undefined_widening,
+            regular_x,
+            regular_one,
+            regular_one_bigint,
+            regular_true,
+        ) = {
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.string_type,
+                bootstrap.number_type,
+                bootstrap.bigint_type,
+                bootstrap.boolean_type,
+                bootstrap.null_widening_type,
+                bootstrap.undefined_widening_type,
+                bootstrap.cached_string_literal_type("x").unwrap(),
+                bootstrap
+                    .cached_number_literal_type(Number::new(1.0))
+                    .unwrap(),
+                bootstrap
+                    .cached_bigint_literal_type(&PseudoBigInt::parse_valid("1n"))
+                    .unwrap(),
+                bootstrap.regular_true_type,
+            )
+        };
+        assert_eq!(
+            [
+                object_property_type(&context, contextual, "exactString"),
+                object_property_type(&context, contextual, "broadString"),
+                object_property_type(&context, contextual, "exactNumber"),
+                object_property_type(&context, contextual, "broadNumber"),
+                object_property_type(&context, contextual, "exactBigInt"),
+                object_property_type(&context, contextual, "broadBigInt"),
+                object_property_type(&context, contextual, "exactBoolean"),
+                object_property_type(&context, contextual, "broadBoolean"),
+                object_property_type(&context, contextual, "nullValue"),
+                object_property_type(&context, contextual, "undefinedValue"),
+            ],
+            [
+                regular_x,
+                string,
+                regular_one,
+                number,
+                regular_one_bigint,
+                bigint,
+                regular_true,
+                regular_true,
+                null_widening,
+                undefined_widening,
+            ]
+        );
+        assert_eq!(
+            [
+                object_property_type(&context, uncontextual, "stringValue"),
+                object_property_type(&context, uncontextual, "numberValue"),
+                object_property_type(&context, uncontextual, "bigintValue"),
+                object_property_type(&context, uncontextual, "booleanValue"),
+                object_property_type(&context, uncontextual, "nullValue"),
+                object_property_type(&context, uncontextual, "undefinedValue"),
+            ],
+            [
+                string,
+                number,
+                bigint,
+                boolean,
+                null_widening,
+                undefined_widening,
+            ]
+        );
+        assert!(context.diagnostics().is_empty());
+        assert!(is_type_checked(&context, file));
+    }
+
+    #[test]
+    fn contextual_literal_kind_matching_is_value_independent_at_source_level() {
+        let source = parsed(concat!(
+            "interface Context { ",
+            r#"exact: "expected"; literalOrNumber: "expected" | number; "#,
+            "primitiveOrNumber: string | number; booleanValue: boolean; } ",
+            r#"const value: Context = { exact: "wrong", literalOrNumber: "wrong", "#,
+            r#"primitiveOrNumber: "wrong", booleanValue: true };"#,
+        ));
+        let file = FileId::new(90);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let value = variable_initializer(&source, file, "value");
+
+        context.check_source_file(file).unwrap();
+
+        let (regular_wrong, string, regular_true) = {
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.cached_string_literal_type("wrong").unwrap(),
+                bootstrap.string_type,
+                bootstrap.regular_true_type,
+            )
+        };
+        assert_eq!(
+            [
+                object_property_type(&context, value, "exact"),
+                object_property_type(&context, value, "literalOrNumber"),
+                object_property_type(&context, value, "primitiveOrNumber"),
+                object_property_type(&context, value, "booleanValue"),
+            ],
+            [regular_wrong, regular_wrong, string, regular_true]
+        );
+        assert_eq!(context.diagnostics().len(), 1);
+        assert_eq!(context.diagnostics().as_slice()[0].diagnostic.code(), 2322);
+        assert!(is_type_checked(&context, file));
+    }
+
+    #[test]
+    fn nested_context_and_no_match_widening_reuse_warm_object_identity() {
+        let source = parsed(concat!(
+            r#"interface Node { tag: "node"; broad: string; next?: Node } "#,
+            r#"interface Outer { known: { exact: "x"; broad: string }; recursive: Node } "#,
+            r#"const value: Outer = { known: { exact: "x", broad: "a" }, "#,
+            r#"recursive: { tag: "node", broad: "a", next: { tag: "node", broad: "b" } } }; "#,
+            r#"const noContext: any = { unknown: { exact: "free", "#,
+            r#"broad: "free", deeper: { count: 1 } } };"#,
+        ));
+        let file = FileId::new(91);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let value = variable_initializer(&source, file, "value");
+        let known = object_property_initializer(&source, file, value, "known");
+        let recursive = object_property_initializer(&source, file, value, "recursive");
+        let next = object_property_initializer(&source, file, recursive, "next");
+        let no_context = variable_initializer(&source, file, "noContext");
+        let unknown = object_property_initializer(&source, file, no_context, "unknown");
+        let deeper = object_property_initializer(&source, file, unknown, "deeper");
+        let object_nodes = [value, known, recursive, next, no_context, unknown, deeper];
+
+        context.check_source_file(file).unwrap();
+
+        let (regular_x, regular_node, string, number) = {
+            let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.cached_string_literal_type("x").unwrap(),
+                bootstrap.cached_string_literal_type("node").unwrap(),
+                bootstrap.string_type,
+                bootstrap.number_type,
+            )
+        };
+        assert_eq!(object_property_type(&context, known, "exact"), regular_x);
+        assert_eq!(object_property_type(&context, known, "broad"), string);
+        assert_eq!(
+            object_property_type(&context, recursive, "tag"),
+            regular_node
+        );
+        assert_eq!(object_property_type(&context, recursive, "broad"), string);
+        assert_eq!(object_property_type(&context, next, "tag"), regular_node);
+        assert_eq!(object_property_type(&context, next, "broad"), string);
+        assert_eq!(object_property_type(&context, unknown, "exact"), string);
+        assert_eq!(object_property_type(&context, unknown, "broad"), string);
+        assert_eq!(object_property_type(&context, deeper, "count"), number);
+        assert!(context.diagnostics().is_empty());
+
+        let object_types = object_nodes.map(|node| resolved_node_type(&context, node));
+        let warm = observable_state(&context, file);
+        let source_ref = context.source_file(file).unwrap();
+        let mut source_links = context
+            .store()
+            .source_file_links(source_ref)
+            .cloned()
+            .unwrap();
+        source_links.type_checked = false;
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_source_file_links(source_ref, source_links)
+        );
+
+        context.check_source_file(file).unwrap();
+
+        assert_eq!(
+            object_nodes.map(|node| resolved_node_type(&context, node)),
+            object_types
+        );
+        assert_eq!(observable_state(&context, file), warm);
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn cached_alias_context_contract_poisons_reject_cold_source_without_writes() {
+        #[derive(Clone, Copy)]
+        enum Poison {
+            OwnerMembers,
+            AliasParent,
+            PropertyLinks,
+        }
+
+        for (index, poison) in [
+            Poison::OwnerMembers,
+            Poison::AliasParent,
+            Poison::PropertyLinks,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = parsed(concat!(
+                "const value: Target = { good: true }; ",
+                "type Target = { good: boolean; missing: string };",
+            ));
+            let file = FileId::new(92 + u32::try_from(index).unwrap());
+            let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+            let target = context
+                .get_type_from_type_node(variable_type_node(&source, file, "value"))
+                .unwrap();
+            let record = context.store().type_payload(target).unwrap();
+            let owner = record.symbol().unwrap();
+            let alias = record.alias().unwrap();
+            let alias_symbol = context.store().type_alias(alias).unwrap().symbol().unwrap();
+            match poison {
+                Poison::OwnerMembers => {
+                    assert!(context.store().symbol(owner).unwrap().members().is_some());
+                    assert!(
+                        context
+                            .store_mut_for_test()
+                            .set_symbol_relationships(owner, None, None, None, None,)
+                    );
+                }
+                Poison::AliasParent => {
+                    assert!(context.store_mut_for_test().set_symbol_relationships(
+                        alias_symbol,
+                        None,
+                        None,
+                        Some(owner),
+                        None,
+                    ));
+                }
+                Poison::PropertyLinks => {
+                    let property = declared_object_property_symbol(&context, target, "missing");
+                    let mut links = context
+                        .store()
+                        .value_symbol_links(property)
+                        .cloned()
+                        .unwrap();
+                    links.write_type =
+                        Some(context.store().intrinsic_bootstrap().unwrap().string_type);
+                    assert!(
+                        context
+                            .store_mut_for_test()
+                            .set_value_symbol_links(property, links)
+                    );
+                }
+            }
+            let before = observable_state(&context, file);
+
+            assert_eq!(
+                context.check_source_file(file),
+                Err(SourceCheckError::RelationUnavailable(
+                    RelationUnavailable::InvalidStructuredMembers(target)
+                ))
+            );
+            assert_eq!(observable_state(&context, file), before);
+            assert!(context.diagnostics().is_empty());
+            assert!(!is_type_checked(&context, file));
+            assert!(
+                context
+                    .store()
+                    .type_node_links(variable_initializer(&source, file, "value"))
+                    .and_then(|links| links.resolved_type)
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn unmatched_malformed_nested_alias_context_rejects_before_source_publication() {
+        let source = parsed(concat!(
+            "const value: Target = { good: true }; ",
+            "type Target = { good: boolean; missing: NestedTarget }; ",
+            "type NestedTarget = { bad: string };",
+        ));
+        let file = FileId::new(95);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let target = context
+            .get_type_from_type_node(variable_type_node(&source, file, "value"))
+            .unwrap();
+        let missing = declared_object_property_symbol(&context, target, "missing");
+        let nested = context
+            .store()
+            .value_symbol_links(missing)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let nested_owner = context
+            .store()
+            .type_payload(nested)
+            .unwrap()
+            .symbol()
+            .unwrap();
+        assert!(
+            context
+                .store()
+                .symbol(nested_owner)
+                .unwrap()
+                .members()
+                .is_some()
+        );
+        assert!(context.store_mut_for_test().set_symbol_relationships(
+            nested_owner,
+            None,
+            None,
+            None,
+            None,
+        ));
+        let before = observable_state(&context, file);
+
+        assert_eq!(
+            context.check_source_file(file),
+            Err(SourceCheckError::RelationUnavailable(
+                RelationUnavailable::InvalidStructuredMembers(nested)
+            ))
+        );
+        assert_eq!(observable_state(&context, file), before);
+        assert!(context.diagnostics().is_empty());
+        assert!(!is_type_checked(&context, file));
+        assert!(
+            context
+                .store()
+                .type_node_links(variable_initializer(&source, file, "value"))
+                .and_then(|links| links.resolved_type)
+                .is_none()
+        );
+    }
+
+    #[test]
     fn interface_object_assignability_uses_property_object_display() {
         let source = parsed(concat!(
             "interface TextValue { value: string } ",
@@ -1958,7 +2472,7 @@ mod tests {
         assert_eq!(diagnostics[0].diagnostic.code(), 2322);
         assert_eq!(
             diagnostics[0].diagnostic.render().unwrap(),
-            "Type '{ value: 1; }' is not assignable to type 'TextValue'."
+            "Type '{ value: number; }' is not assignable to type 'TextValue'."
         );
         assert_eq!(
             diagnostics[1].node,
@@ -1967,7 +2481,7 @@ mod tests {
         assert_eq!(diagnostics[1].diagnostic.code(), 2322);
         assert_eq!(
             diagnostics[1].diagnostic.render().unwrap(),
-            "Type '{ value: \"wrong\"; }' is not assignable to type 'NumberValue'."
+            "Type '{ value: string; }' is not assignable to type 'NumberValue'."
         );
         assert!(is_type_checked(&context, file));
 
@@ -2439,15 +2953,27 @@ mod tests {
 
         let store = context.store_mut_for_test();
         assert_eq!(
-            expression_type(store, &PlannedExpression::Boolean(true)),
+            expression_type(
+                store,
+                &PlannedExpression::Boolean(true),
+                &PreparedExpression::Literal(LiteralTreatment::Fresh),
+            ),
             Ok(true_type)
         );
         assert_eq!(
-            expression_type(store, &PlannedExpression::Boolean(false)),
+            expression_type(
+                store,
+                &PlannedExpression::Boolean(false),
+                &PreparedExpression::Literal(LiteralTreatment::Fresh),
+            ),
             Ok(false_type)
         );
         assert_eq!(
-            expression_type(store, &PlannedExpression::Null),
+            expression_type(
+                store,
+                &PlannedExpression::Null,
+                &PreparedExpression::Literal(LiteralTreatment::Identity),
+            ),
             Ok(null_widening)
         );
         assert_ne!(true_type, regular_true);

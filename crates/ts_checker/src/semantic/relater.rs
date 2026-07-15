@@ -10,9 +10,13 @@
 
 use std::collections::{HashMap, HashSet};
 
-use ts_binder::{CheckFlags, InternalSymbolName, SemanticSymbolId, SymbolFlags, SymbolTableId};
+use ts_ast::{NodeRef, SyntaxKind};
+use ts_binder::{
+    CheckFlags, EscapedName, InternalSymbolName, SemanticSymbolId, SymbolFlags, SymbolTableId,
+};
 
 use super::{
+    DeclaredTypeHost,
     bootstrap::LiteralTypeCacheError,
     ids::TypeId,
     links::{MembersOrExportsResolutionKind, ValueSymbolLinks},
@@ -217,6 +221,39 @@ struct ResolvedObjectMembers {
     members: Option<SymbolTableId>,
     properties: Vec<SemanticSymbolId>,
     object_literal_owner: Option<SemanticSymbolId>,
+}
+
+/// One validated property in a declared property-only object type.
+///
+/// This is the shared read-only boundary used by contextual typing and object
+/// diagnostics. The vector containing these records retains target declaration
+/// order; name lookup never observes `HashMap` iteration order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ResolvedDeclaredProperty {
+    pub(super) symbol: SemanticSymbolId,
+    pub(super) name: EscapedName,
+    pub(super) type_: TypeId,
+    pub(super) optional: bool,
+    pub(super) declaration: NodeRef,
+}
+
+/// Ordered, name-indexed view of one validated declared property-only object.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ResolvedDeclaredPropertyObject {
+    properties: Vec<ResolvedDeclaredProperty>,
+    by_name: HashMap<EscapedName, usize>,
+}
+
+impl ResolvedDeclaredPropertyObject {
+    pub(super) fn properties(&self) -> &[ResolvedDeclaredProperty] {
+        &self.properties
+    }
+
+    pub(super) fn get_source(&self, name: &str) -> Option<&ResolvedDeclaredProperty> {
+        self.by_name
+            .get(&EscapedName::source(name))
+            .map(|index| &self.properties[*index])
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1949,6 +1986,191 @@ impl<'store> RelaterSession<'store> {
 }
 
 impl SemanticStore<TypeRecord, TypeMapper> {
+    /// Returns the exact ordered property view used when a declared object
+    /// supplies context to an object literal.
+    ///
+    /// Non-object types provide no property context. Object types are accepted
+    /// only after the same fail-closed validation used by structural relation;
+    /// this function does not compare types or publish relation-cache entries.
+    pub(super) fn resolved_declared_property_object(
+        &mut self,
+        host: &DeclaredTypeHost<'_>,
+        type_id: TypeId,
+    ) -> Result<Option<ResolvedDeclaredPropertyObject>, RelationUnavailable> {
+        let flags = self
+            .type_payload(type_id)
+            .map(TypeRecord::flags)
+            .ok_or(RelationUnavailable::Type(type_id))?;
+        if !flags.intersects(TypeFlags::OBJECT) {
+            return Ok(None);
+        }
+
+        let empty_type_literal = self
+            .intrinsic_bootstrap()
+            .ok_or(RelationUnavailable::MissingBootstrap)?
+            .empty_type_literal_type;
+        let plan = if type_id == empty_type_literal {
+            None
+        } else {
+            let record = self
+                .type_payload(type_id)
+                .ok_or(RelationUnavailable::Type(type_id))?;
+            let plan = match record.data() {
+                TypeData::Interface(_) => {
+                    let owner = record
+                        .symbol()
+                        .ok_or(RelationUnavailable::InvalidStructuredMembers(type_id))?;
+                    let plan = super::object_members::plan_interface(self, host, owner)
+                        .map_err(|_| RelationUnavailable::InvalidStructuredMembers(type_id))?;
+                    let state = super::object_members::interface_state(self, &plan, type_id)
+                        .map_err(|_| RelationUnavailable::InvalidStructuredMembers(type_id))?;
+                    if !matches!(
+                        state,
+                        super::object_members::PropertyObjectState::Resolved(resolved)
+                            if resolved == type_id
+                    ) {
+                        return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
+                    }
+                    plan
+                }
+                TypeData::Object(_) => {
+                    let owner = record
+                        .symbol()
+                        .ok_or(RelationUnavailable::InvalidStructuredMembers(type_id))?;
+                    let owner_declaration = self
+                        .symbol(owner)
+                        .and_then(|owner| match owner.declarations() {
+                            Some([declaration]) => Some(*declaration),
+                            _ => None,
+                        })
+                        .ok_or(RelationUnavailable::InvalidStructuredMembers(type_id))?;
+                    let alias_symbol = match record.alias() {
+                        Some(alias_id) => {
+                            let alias = self
+                                .type_alias(alias_id)
+                                .ok_or(RelationUnavailable::InvalidStructuredMembers(type_id))?;
+                            let alias_symbol = alias
+                                .symbol()
+                                .ok_or(RelationUnavailable::InvalidStructuredMembers(type_id))?;
+                            let alias_record = self
+                                .symbol(alias_symbol)
+                                .ok_or(RelationUnavailable::InvalidStructuredMembers(type_id))?;
+                            let alias_declaration = match alias_record.declarations() {
+                                Some([declaration]) => *declaration,
+                                _ => {
+                                    return Err(RelationUnavailable::InvalidStructuredMembers(
+                                        type_id,
+                                    ));
+                                }
+                            };
+                            if alias.type_arguments().is_some()
+                                || self.get_merged_symbol(alias_symbol) != Some(alias_symbol)
+                                || alias_record.flags() != SymbolFlags::TYPE_ALIAS
+                                || alias_record.check_flags() != CheckFlags::NONE
+                                || alias_record.parent().is_some()
+                                || alias_record.value_declaration().is_some()
+                                || alias_record.exports().is_some()
+                                || alias_record.export_symbol().is_some()
+                                || self.source_node_kind(alias_declaration)
+                                    != Some(SyntaxKind::TypeAliasDeclaration)
+                                || !host.symbol_matches(self, alias_declaration, alias_symbol)
+                                || self.type_alias_links(alias_symbol).is_none_or(|links| {
+                                    links.declared_type != Some(type_id)
+                                        || links.type_parameters.is_some()
+                                        || links.instantiations.is_some()
+                                        || links.is_constructor_declared_property
+                                })
+                            {
+                                return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
+                            }
+                            Some(alias_symbol)
+                        }
+                        None => None,
+                    };
+                    let plan = super::object_members::plan_type_literal(
+                        self,
+                        host,
+                        owner_declaration,
+                        alias_symbol,
+                    )
+                    .map_err(|_| RelationUnavailable::InvalidStructuredMembers(type_id))?;
+                    let state = super::object_members::type_literal_state(self, &plan)
+                        .map_err(|_| RelationUnavailable::InvalidStructuredMembers(type_id))?
+                        .ok_or(RelationUnavailable::InvalidStructuredMembers(type_id))?;
+                    if !matches!(
+                        state,
+                        super::object_members::PropertyObjectState::Resolved(resolved)
+                            if resolved == type_id
+                    ) {
+                        return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
+                    }
+                    plan
+                }
+                _ => return Err(RelationUnavailable::UnsupportedStructuredType(type_id)),
+            };
+            let property_types = plan
+                .properties
+                .iter()
+                .map(|property| {
+                    self.value_symbol_links(property.symbol)
+                        .and_then(|links| links.resolved_type)
+                        .ok_or(RelationUnavailable::UnsupportedProperty(property.symbol))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            super::object_members::validate_resolved_property_types(self, &plan, &property_types)
+                .map_err(|_| RelationUnavailable::InvalidStructuredMembers(type_id))?;
+            Some((plan, property_types))
+        };
+
+        let bootstrap = self.relation_bootstrap_facts()?;
+        let session = RelaterSession::new(self, RelationKind::Assignable, bootstrap);
+        let resolved = session.resolved_object_members(type_id, false)?;
+        if let Some((plan, property_types)) = plan {
+            if resolved.members != plan.members
+                || resolved.object_literal_owner.is_some()
+                || resolved.properties
+                    != plan
+                        .properties
+                        .iter()
+                        .map(|property| property.symbol)
+                        .collect::<Vec<_>>()
+            {
+                return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
+            }
+            let mut properties = Vec::with_capacity(plan.properties.len());
+            let mut by_name = HashMap::with_capacity(plan.properties.len());
+            for (property, property_type) in plan.properties.into_iter().zip(property_types) {
+                let name = EscapedName::source(&property.name);
+                let index = properties.len();
+                if by_name.insert(name.clone(), index).is_some() {
+                    return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
+                }
+                properties.push(ResolvedDeclaredProperty {
+                    symbol: property.symbol,
+                    name,
+                    type_: property_type,
+                    optional: property.optional,
+                    declaration: property.declaration,
+                });
+            }
+            return Ok(Some(ResolvedDeclaredPropertyObject {
+                properties,
+                by_name,
+            }));
+        }
+
+        if !resolved.properties.is_empty()
+            || resolved.members.is_some()
+            || resolved.object_literal_owner.is_some()
+        {
+            return Err(RelationUnavailable::InvalidStructuredMembers(type_id));
+        }
+        Ok(Some(ResolvedDeclaredPropertyObject {
+            properties: Vec::new(),
+            by_name: HashMap::new(),
+        }))
+    }
+
     /// Pinned `isTypeIdenticalTo` for the dependency-closed relation domain.
     ///
     /// # Errors
@@ -2598,7 +2820,7 @@ const fn bool_to_ternary(value: bool) -> Ternary {
     if value { Ternary::True } else { Ternary::False }
 }
 
-const fn union_validation_unavailable(
+pub(super) const fn union_validation_unavailable(
     union: TypeId,
     error: LiteralTypeCacheError,
 ) -> RelationUnavailable {

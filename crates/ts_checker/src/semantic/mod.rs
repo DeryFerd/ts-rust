@@ -10,6 +10,7 @@ pub mod alias;
 pub mod alias_flags;
 pub mod alias_provider;
 pub mod bootstrap;
+mod contextual;
 pub mod declared;
 pub mod diagnostics;
 pub mod formatter;
