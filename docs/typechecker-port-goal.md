@@ -120,6 +120,16 @@ remains the cluster-level source of truth.
   global IDs. Eight focused bootstrap tests and all 227 checker tests pass; an
   independent review found no semantic issue. Callback-owned function mappers
   and Program/global-library initialization remain explicit later slices.
+- The B02a canonical declaration primitive is integrated as
+  `7959d30..bc4d0ab`. It ports the pinned declaration insert, compatible merge,
+  replacement, conflict, diagnostic, value-declaration, and parent-link state
+  machine; exact computed/default/private/ambient/assigned names; and atomic
+  exported local/export symbol pairing. JavaScript-only assigned names remain
+  behind an explicit file-kind boundary rather than guessed from syntax. The
+  merged stack passes 113 binder tests, all 227 checker tests, strict binder
+  Clippy, and the all-target workspace check. Independent review found no
+  P0-P2 issue. Full source facts, declaration-family dispatch, and table
+  routing are the active B02b slice, so checker extraction remains closed.
 
 No percentage in this section is a whole-corpus parity claim. A score is
 publishable only when its variant manifest and complete artifact comparison are
