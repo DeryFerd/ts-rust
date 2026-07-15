@@ -15,13 +15,16 @@
 //!   The empty globals table and `globalThis` insertion performed by
 //!   `NewChecker` itself are included; resolving or augmenting that table is
 //!   not.
-//! - union and template-literal reduction algorithms remain outside this
-//!   module. The closed bootstrap cases below encode their pinned normalized
-//!   results. Literal cache ownership stays here so the type-node query can
-//!   extend the exact upstream caches without exposing an approximate general
-//!   reduction API.
+//! - template-literal reduction remains outside this module. The closed
+//!   bootstrap cases below encode its pinned normalized results. Literal and
+//!   dependency-closed union cache ownership stays here so type-node queries
+//!   can extend the exact upstream caches without exposing approximate subtype,
+//!   template, or generic reduction APIs.
 
-use std::collections::HashMap;
+use std::{
+    cmp::Ordering,
+    collections::{HashMap, HashSet},
+};
 
 use ts_binder::{
     CheckFlags, EscapedName, InternalSymbolName, SemanticSymbolId, SymbolFlags, SymbolTableId,
@@ -29,12 +32,14 @@ use ts_binder::{
 use ts_jsnum::{Number, PseudoBigInt};
 
 use super::{
-    ids::{IndexInfoId, SignatureId, TypeId, TypePredicateId},
+    ids::{IndexInfoId, SignatureId, TypeAliasId, TypeId, TypePredicateId},
     mapper::TypeMapper,
     relation::RelationStateSnapshot,
     signatures::{SignatureFlags, TypePredicateKind},
     store::SemanticStore,
-    type_records::{LiteralValue, RegularLiteralLink, TypeCacheState, TypeData, TypeRecord},
+    type_records::{
+        ConstituentMapState, LiteralValue, RegularLiteralLink, TypeCacheState, TypeData, TypeRecord,
+    },
     types::{ObjectFlags, TypeFlags},
 };
 
@@ -209,8 +214,47 @@ pub(super) enum LiteralTypeCacheError {
     BootstrapUninitialized,
     InvalidValue,
     InvalidCachedLiteral(TypeId),
+    InvalidCachedUnion(TypeId),
+    UnsupportedUnionConstituent(TypeId),
+    InvalidUnionAlias(SemanticSymbolId),
     Capacity,
 }
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct UnionAliasCacheKey {
+    symbol: SemanticSymbolId,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct UnionTypeCacheKey {
+    types: Vec<TypeId>,
+    /// `Some` is the exact denormalized named-union origin key. `None` uses
+    /// the normalized constituent list, matching pinned `getUnionKey`.
+    origin_types: Option<Vec<TypeId>>,
+    alias: Option<UnionAliasCacheKey>,
+}
+
+impl UnionTypeCacheKey {
+    fn anonymous(types: Vec<TypeId>) -> Self {
+        Self {
+            types,
+            origin_types: None,
+            alias: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct UnionOfUnionCacheKey {
+    first: TypeId,
+    second: TypeId,
+    alias: Option<UnionAliasCacheKey>,
+}
+
+/// Proof that one dependency-closed type-node execution has completed its
+/// global literal/union cache scan and capacity reservation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct PreparedTypeQueryTypes(());
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct TemplateLiteralCacheKey {
@@ -306,7 +350,8 @@ pub struct IntrinsicBootstrap {
     string_literal_types: HashMap<String, TypeId>,
     number_literal_types: HashMap<NumberLiteralCacheKey, TypeId>,
     bigint_literal_types: Vec<(PseudoBigInt, TypeId)>,
-    union_types: HashMap<Vec<TypeId>, TypeId>,
+    union_types: HashMap<UnionTypeCacheKey, TypeId>,
+    union_of_union_types: HashMap<UnionOfUnionCacheKey, TypeId>,
     template_literal_types: HashMap<TemplateLiteralCacheKey, TypeId>,
 }
 
@@ -315,6 +360,11 @@ impl SemanticStore<TypeRecord, TypeMapper> {
     #[must_use]
     pub fn intrinsic_bootstrap(&self) -> Option<&IntrinsicBootstrap> {
         self.intrinsic_bootstrap.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(super) const fn union_cache_validation_scan_count(&self) -> usize {
+        self.union_cache_validation_scans
     }
 
     /// Reserves one dependency-closed batch of regular/fresh literal pairs.
@@ -330,6 +380,23 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         numbers: &[Number],
         bigints: &[PseudoBigInt],
     ) -> Result<(), LiteralTypeCacheError> {
+        self.prepare_type_query_types(strings, numbers, bigints, 0, 0)
+            .map(|_| ())
+    }
+
+    /// Preflights one complete literal/union query before its first semantic
+    /// write. Each union operation can allocate one denormalized origin and
+    /// one normalized result; named results additionally allocate one alias
+    /// shell. The conservative counts keep recursive execution infallible even
+    /// when a cache hit later makes some reservations unnecessary.
+    pub(super) fn prepare_type_query_types(
+        &mut self,
+        strings: &[String],
+        numbers: &[Number],
+        bigints: &[PseudoBigInt],
+        union_operations: usize,
+        named_union_operations: usize,
+    ) -> Result<PreparedTypeQueryTypes, LiteralTypeCacheError> {
         if numbers.iter().any(|value| value.is_nan())
             || bigints.iter().any(|value| {
                 value.base10_value.is_empty() && value.negative
@@ -343,11 +410,16 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         {
             return Err(LiteralTypeCacheError::InvalidValue);
         }
+        if union_operations != 0 {
+            self.validate_union_cache()?;
+        }
         let bootstrap = self
             .intrinsic_bootstrap
             .as_ref()
             .ok_or(LiteralTypeCacheError::BootstrapUninitialized)?;
-        let mut additional_types = 0usize;
+        let mut additional_types = union_operations
+            .checked_mul(2)
+            .ok_or(LiteralTypeCacheError::Capacity)?;
         let mut additional_strings = 0usize;
         let mut additional_numbers = 0usize;
         let mut additional_bigints = 0usize;
@@ -419,7 +491,9 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             }
         }
 
-        if !self.try_reserve_types(additional_types) {
+        if !self.try_reserve_types(additional_types)
+            || !self.try_reserve_type_aliases(named_union_operations)
+        {
             return Err(LiteralTypeCacheError::Capacity);
         }
         let Some(bootstrap) = self.intrinsic_bootstrap.as_mut() else {
@@ -437,10 +511,15 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 .bigint_literal_types
                 .try_reserve(additional_bigints)
                 .is_err()
+            || bootstrap.union_types.try_reserve(union_operations).is_err()
+            || bootstrap
+                .union_of_union_types
+                .try_reserve(union_operations)
+                .is_err()
         {
             return Err(LiteralTypeCacheError::Capacity);
         }
-        Ok(())
+        Ok(PreparedTypeQueryTypes(()))
     }
 
     pub(super) fn regular_string_literal_type(
@@ -595,6 +674,1153 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             return Err(LiteralTypeCacheError::InvalidCachedLiteral(regular));
         }
         Ok(regular)
+    }
+
+    fn validate_union_cache(&mut self) -> Result<(), LiteralTypeCacheError> {
+        #[cfg(test)]
+        {
+            self.union_cache_validation_scans = self
+                .union_cache_validation_scans
+                .checked_add(1)
+                .ok_or(LiteralTypeCacheError::Capacity)?;
+        }
+        let bootstrap = self
+            .intrinsic_bootstrap
+            .as_ref()
+            .ok_or(LiteralTypeCacheError::BootstrapUninitialized)?;
+        for (key, union) in &bootstrap.union_types {
+            self.validate_union_cache_entry(key, *union)?;
+        }
+        for (key, result) in &bootstrap.union_of_union_types {
+            self.validate_union_of_union_cache_entry(*key, *result)?;
+        }
+        Ok(())
+    }
+
+    fn validate_union_cache_entry(
+        &self,
+        key: &UnionTypeCacheKey,
+        union: TypeId,
+    ) -> Result<(), LiteralTypeCacheError> {
+        self.validate_union_structure(union)?;
+        let record = self
+            .type_payload(union)
+            .ok_or(LiteralTypeCacheError::InvalidCachedUnion(union))?;
+        let TypeData::Union(data) = record.data() else {
+            return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
+        };
+        if data.union.types != key.types
+            || self.checked_union_alias_symbol(union, record.alias())?
+                != key.alias.map(|alias| alias.symbol)
+            || !self.union_origin_matches(data.origin, key.origin_types.as_deref())
+        {
+            return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
+        }
+        Ok(())
+    }
+
+    fn validate_union_of_union_cache_entry(
+        &self,
+        key: UnionOfUnionCacheKey,
+        result: TypeId,
+    ) -> Result<(), LiteralTypeCacheError> {
+        if !self.valid_union_alias_key(key.alias) {
+            return Err(LiteralTypeCacheError::InvalidCachedUnion(result));
+        }
+        for candidate in [key.first, key.second, result] {
+            self.validate_union_constituent(candidate)?;
+        }
+        if let Some(alias) = key.alias
+            && let Some(record) = self.type_payload(result)
+            && matches!(record.data(), TypeData::Union(_))
+            && self.checked_union_alias_symbol(result, record.alias())? != Some(alias.symbol)
+        {
+            return Err(LiteralTypeCacheError::InvalidCachedUnion(result));
+        }
+        Ok(())
+    }
+
+    fn valid_union_alias_key(&self, alias: Option<UnionAliasCacheKey>) -> bool {
+        alias.is_none_or(|alias| self.valid_union_alias_symbol(alias.symbol))
+    }
+
+    fn valid_union_alias_symbol(&self, symbol: SemanticSymbolId) -> bool {
+        self.get_merged_symbol(symbol) == Some(symbol)
+            && self.symbol(symbol).is_some_and(|symbol| {
+                let flags = symbol.flags();
+                flags.contains(SymbolFlags::TYPE_ALIAS)
+                    && !(flags.contains(SymbolFlags::ALIAS)
+                        && flags.without(SymbolFlags::ALIAS) != SymbolFlags::NONE)
+            })
+    }
+
+    fn checked_union_alias_symbol(
+        &self,
+        union: TypeId,
+        alias: Option<TypeAliasId>,
+    ) -> Result<Option<SemanticSymbolId>, LiteralTypeCacheError> {
+        let Some(alias) = alias else {
+            return Ok(None);
+        };
+        let alias = self
+            .type_alias(alias)
+            .ok_or(LiteralTypeCacheError::InvalidCachedUnion(union))?;
+        let symbol = alias
+            .symbol()
+            .filter(|symbol| self.valid_union_alias_symbol(*symbol))
+            .ok_or(LiteralTypeCacheError::InvalidCachedUnion(union))?;
+        if alias.type_arguments().is_some() {
+            return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
+        }
+        Ok(Some(symbol))
+    }
+
+    fn union_origin_matches(&self, origin: Option<TypeId>, expected: Option<&[TypeId]>) -> bool {
+        match (origin, expected) {
+            (None, None) => true,
+            (Some(origin), Some(expected)) => {
+                let Some(record) = self.type_payload(origin) else {
+                    return false;
+                };
+                let TypeData::Union(data) = record.data() else {
+                    return false;
+                };
+                record.flags() == TypeFlags::UNION
+                    && Self::valid_union_lazy_object_flags(record.object_flags())
+                    && record.symbol().is_none()
+                    && record.alias().is_none()
+                    && data.origin.is_none()
+                    && data.union.types == expected
+            }
+            _ => false,
+        }
+    }
+
+    fn union_types_are_strictly_sorted(&self, types: &[TypeId]) -> bool {
+        types.windows(2).all(|pair| {
+            self.compare_union_types(pair[0], pair[1])
+                .is_ok_and(|ordering| ordering == Ordering::Less)
+        })
+    }
+
+    fn valid_union_lazy_object_flags(flags: ObjectFlags) -> bool {
+        let allowed = ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
+            | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES
+            | ObjectFlags::IS_GENERIC_TYPE_COMPUTED
+            | ObjectFlags::IS_GENERIC_TYPE
+            | ObjectFlags::IS_UNKNOWN_LIKE_UNION_COMPUTED
+            | ObjectFlags::IS_UNKNOWN_LIKE_UNION;
+        flags.bits() & !allowed.bits() == 0
+            && (!flags.intersects(ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES)
+                || flags.intersects(ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED))
+            && (!flags.intersects(ObjectFlags::IS_GENERIC_TYPE)
+                || flags.intersects(ObjectFlags::IS_GENERIC_TYPE_COMPUTED))
+            && (!flags.intersects(ObjectFlags::IS_UNKNOWN_LIKE_UNION)
+                || flags.intersects(ObjectFlags::IS_UNKNOWN_LIKE_UNION_COMPUTED))
+    }
+
+    fn expected_union_type_flags(
+        &self,
+        types: &[TypeId],
+    ) -> Result<TypeFlags, LiteralTypeCacheError> {
+        let mut flags = TypeFlags::UNION;
+        if types.len() == 2
+            && types.iter().all(|constituent| {
+                self.type_payload(*constituent)
+                    .is_some_and(|record| record.flags() == TypeFlags::BOOLEAN_LITERAL)
+            })
+        {
+            flags |= TypeFlags::BOOLEAN;
+        }
+        if types
+            .iter()
+            .any(|constituent| self.type_payload(*constituent).is_none())
+        {
+            return Err(LiteralTypeCacheError::InvalidValue);
+        }
+        Ok(flags)
+    }
+
+    fn expected_union_immutable_object_flags(
+        &self,
+        types: &[TypeId],
+    ) -> Result<ObjectFlags, LiteralTypeCacheError> {
+        let mut includes = TypeFlags::NONE;
+        let mut propagating = ObjectFlags::NONE;
+        for type_ in types {
+            let record = self
+                .type_payload(*type_)
+                .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(*type_))?;
+            includes |= record.flags() & TypeFlags::INCLUDES_MASK;
+            if record.flags().intersects(TypeFlags::INSTANTIABLE) {
+                includes |= TypeFlags::INCLUDES_INSTANTIABLE;
+            }
+            if !record.flags().intersects(TypeFlags::NULLABLE) {
+                propagating |= record.object_flags();
+            }
+        }
+        let mut expected = if includes.intersects(TypeFlags::NOT_PRIMITIVE_UNION) {
+            ObjectFlags::NONE
+        } else {
+            ObjectFlags::PRIMITIVE_UNION
+        };
+        if includes.intersects(TypeFlags::INTERSECTION) {
+            expected |= ObjectFlags::CONTAINS_INTERSECTIONS;
+        }
+        Ok(expected | propagating & ObjectFlags::PROPAGATING_FLAGS)
+    }
+
+    fn union_object_flags_match(
+        &self,
+        types: &[TypeId],
+        actual: ObjectFlags,
+    ) -> Result<bool, LiteralTypeCacheError> {
+        let immutable_mask = ObjectFlags::PRIMITIVE_UNION
+            | ObjectFlags::CONTAINS_INTERSECTIONS
+            | ObjectFlags::PROPAGATING_FLAGS;
+        let expected = self.expected_union_immutable_object_flags(types)?;
+        Ok(actual & immutable_mask == expected
+            && Self::valid_union_lazy_object_flags(actual & !immutable_mask))
+    }
+
+    fn validate_union_origin_structure(
+        &self,
+        union: TypeId,
+        origin: TypeId,
+    ) -> Result<(), LiteralTypeCacheError> {
+        let Some(record) = self.type_payload(origin) else {
+            return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
+        };
+        let TypeData::Union(data) = record.data() else {
+            return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
+        };
+        if origin == union
+            || record.flags() != TypeFlags::UNION
+            || !Self::valid_union_lazy_object_flags(record.object_flags())
+            || record.symbol().is_some()
+            || record.alias().is_some()
+            || data.origin.is_some()
+            || data.union.types.is_empty()
+            || data
+                .union
+                .types
+                .iter()
+                .any(|constituent| self.type_payload(*constituent).is_none())
+            || !self.union_types_are_strictly_sorted(&data.union.types)
+        {
+            return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
+        }
+        Ok(())
+    }
+
+    fn validate_union_structure(&self, union: TypeId) -> Result<(), LiteralTypeCacheError> {
+        let Some(record) = self.type_payload(union) else {
+            return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
+        };
+        let TypeData::Union(data) = record.data() else {
+            return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
+        };
+        if data.union.types.len() < 2
+            || record.symbol().is_some()
+            || data
+                .union
+                .types
+                .iter()
+                .any(|constituent| self.type_payload(*constituent).is_none())
+            || record.flags() != self.expected_union_type_flags(&data.union.types)?
+            || !self.union_object_flags_match(&data.union.types, record.object_flags())?
+            || !self.union_types_are_strictly_sorted(&data.union.types)
+        {
+            return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
+        }
+        self.checked_union_alias_symbol(union, record.alias())?;
+        if let Some(origin) = data.origin {
+            self.validate_union_origin_structure(union, origin)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn validate_union_constituent(
+        &self,
+        type_: TypeId,
+    ) -> Result<(), LiteralTypeCacheError> {
+        self.validate_union_constituent_worker(type_, &mut HashSet::new())
+    }
+
+    pub(super) fn validate_cached_union_result(
+        &self,
+        type_: TypeId,
+        expected_alias: Option<SemanticSymbolId>,
+    ) -> Result<(), LiteralTypeCacheError> {
+        self.validate_union_constituent(type_)?;
+        if let Some(expected_alias) = expected_alias
+            && let Some(record) = self.type_payload(type_)
+            && matches!(record.data(), TypeData::Union(_))
+            && self.checked_union_alias_symbol(type_, record.alias())? != Some(expected_alias)
+        {
+            return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
+        }
+        Ok(())
+    }
+
+    fn validate_supported_intrinsic(
+        &self,
+        type_: TypeId,
+        record: &TypeRecord,
+        intrinsic_name: &str,
+    ) -> Result<(), LiteralTypeCacheError> {
+        let bootstrap = self
+            .intrinsic_bootstrap
+            .as_ref()
+            .ok_or(LiteralTypeCacheError::BootstrapUninitialized)?;
+        let expected = [
+            (bootstrap.any_type, TypeFlags::ANY, "any"),
+            (bootstrap.wildcard_type, TypeFlags::ANY, "any"),
+            (bootstrap.error_type, TypeFlags::ANY, "error"),
+            (bootstrap.intrinsic_marker_type, TypeFlags::ANY, "intrinsic"),
+            (bootstrap.unknown_type, TypeFlags::UNKNOWN, "unknown"),
+            (bootstrap.undefined_type, TypeFlags::UNDEFINED, "undefined"),
+            (bootstrap.null_type, TypeFlags::NULL, "null"),
+            (bootstrap.string_type, TypeFlags::STRING, "string"),
+            (bootstrap.number_type, TypeFlags::NUMBER, "number"),
+            (bootstrap.bigint_type, TypeFlags::BIG_INT, "bigint"),
+            (bootstrap.es_symbol_type, TypeFlags::ES_SYMBOL, "symbol"),
+            (bootstrap.void_type, TypeFlags::VOID, "void"),
+            (bootstrap.never_type, TypeFlags::NEVER, "never"),
+            (
+                bootstrap.non_primitive_type,
+                TypeFlags::NON_PRIMITIVE,
+                "object",
+            ),
+        ]
+        .into_iter()
+        .find_map(|(candidate, flags, name)| (candidate == type_).then_some((flags, name)));
+        if expected != Some((record.flags(), intrinsic_name))
+            || record.object_flags() != ObjectFlags::NONE
+            || record.symbol().is_some()
+            || record.alias().is_some()
+        {
+            return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_));
+        }
+        Ok(())
+    }
+
+    fn validate_supported_literal_identity(
+        &self,
+        type_: TypeId,
+        regular: TypeId,
+        fresh: TypeId,
+        value: &LiteralValue,
+    ) -> Result<(), LiteralTypeCacheError> {
+        let bootstrap = self
+            .intrinsic_bootstrap
+            .as_ref()
+            .ok_or(LiteralTypeCacheError::BootstrapUninitialized)?;
+        let (canonical_regular, canonical_fresh) = match value {
+            LiteralValue::String(value) => (bootstrap.cached_string_literal_type(value), None),
+            LiteralValue::Number(value) => (bootstrap.cached_number_literal_type(*value), None),
+            LiteralValue::BigInt(value) => (bootstrap.cached_bigint_literal_type(value), None),
+            LiteralValue::Boolean(false) => (
+                Some(bootstrap.regular_false_type),
+                Some(bootstrap.false_type),
+            ),
+            LiteralValue::Boolean(true) => {
+                (Some(bootstrap.regular_true_type), Some(bootstrap.true_type))
+            }
+            LiteralValue::ComputedEnum => (None, None),
+        };
+        if canonical_regular != Some(regular)
+            || canonical_fresh.is_some_and(|canonical| canonical != fresh)
+            || type_ != regular && type_ != fresh
+        {
+            return Err(LiteralTypeCacheError::InvalidCachedLiteral(type_));
+        }
+        Ok(())
+    }
+
+    fn validate_supported_union_cache_identity(
+        &self,
+        union: TypeId,
+        record: &TypeRecord,
+        data: &super::type_records::UnionTypeData,
+    ) -> Result<(), LiteralTypeCacheError> {
+        let alias = self
+            .checked_union_alias_symbol(union, record.alias())?
+            .map(|symbol| UnionAliasCacheKey { symbol });
+        let origin_types = data.origin.map(|origin| {
+            let Some(TypeData::Union(origin)) = self.type_payload(origin).map(TypeRecord::data)
+            else {
+                return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
+            };
+            Ok(origin.union.types.clone())
+        });
+        let origin_types = match origin_types {
+            Some(origin_types) => Some(origin_types?),
+            None => None,
+        };
+        let key = UnionTypeCacheKey {
+            types: data.union.types.clone(),
+            origin_types,
+            alias,
+        };
+        let cached = self
+            .intrinsic_bootstrap
+            .as_ref()
+            .and_then(|bootstrap| bootstrap.union_types.get(&key))
+            .copied();
+        if cached != Some(union) {
+            return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
+        }
+        self.validate_union_cache_entry(&key, union)
+    }
+
+    fn validate_union_constituent_worker(
+        &self,
+        type_: TypeId,
+        visiting: &mut HashSet<TypeId>,
+    ) -> Result<(), LiteralTypeCacheError> {
+        let Some(record) = self.type_payload(type_) else {
+            return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_));
+        };
+        match record.data() {
+            TypeData::Intrinsic(data) => {
+                self.validate_supported_intrinsic(type_, record, &data.intrinsic_name)
+            }
+            TypeData::Literal(data) => {
+                let regular = data.regular_type;
+                let Some(regular_record) = self.type_payload(regular) else {
+                    return Err(LiteralTypeCacheError::InvalidCachedLiteral(type_));
+                };
+                let TypeData::Literal(regular_data) = regular_record.data() else {
+                    return Err(LiteralTypeCacheError::InvalidCachedLiteral(type_));
+                };
+                let expected_flags = match &data.value {
+                    LiteralValue::String(_) => Some(TypeFlags::STRING_LITERAL),
+                    LiteralValue::Number(value) if !value.is_nan() => {
+                        Some(TypeFlags::NUMBER_LITERAL)
+                    }
+                    LiteralValue::Boolean(_) => Some(TypeFlags::BOOLEAN_LITERAL),
+                    LiteralValue::BigInt(value)
+                        if !(value.base10_value.is_empty() && value.negative)
+                            && (value.base10_value.is_empty()
+                                || !value.base10_value.starts_with('0')
+                                    && value
+                                        .base10_value
+                                        .bytes()
+                                        .all(|digit| digit.is_ascii_digit())) =>
+                    {
+                        Some(TypeFlags::BIG_INT_LITERAL)
+                    }
+                    LiteralValue::Number(_)
+                    | LiteralValue::BigInt(_)
+                    | LiteralValue::ComputedEnum => None,
+                };
+                if expected_flags != Some(record.flags())
+                    || record.object_flags() != ObjectFlags::NONE
+                    || record.symbol().is_some()
+                    || record.alias().is_some()
+                    || regular_record.flags() != record.flags()
+                    || regular_record.object_flags() != ObjectFlags::NONE
+                    || regular_record.symbol().is_some()
+                    || regular_record.alias().is_some()
+                    || regular_data.value != data.value
+                    || regular_data.regular_type != regular
+                    || regular_data.fresh_type.is_none()
+                    || type_ != regular
+                        && (data.fresh_type != Some(type_)
+                            || regular_data.fresh_type != Some(type_))
+                {
+                    return Err(LiteralTypeCacheError::InvalidCachedLiteral(type_));
+                }
+                let Some(fresh) = regular_data.fresh_type else {
+                    return Err(LiteralTypeCacheError::InvalidCachedLiteral(type_));
+                };
+                if fresh == regular {
+                    return Err(LiteralTypeCacheError::InvalidCachedLiteral(type_));
+                }
+                let Some(fresh_record) = self.type_payload(fresh) else {
+                    return Err(LiteralTypeCacheError::InvalidCachedLiteral(type_));
+                };
+                let TypeData::Literal(fresh_data) = fresh_record.data() else {
+                    return Err(LiteralTypeCacheError::InvalidCachedLiteral(type_));
+                };
+                if fresh_record.flags() != record.flags()
+                    || fresh_record.object_flags() != ObjectFlags::NONE
+                    || fresh_record.symbol().is_some()
+                    || fresh_record.alias().is_some()
+                    || fresh_data.value != data.value
+                    || fresh_data.regular_type != regular
+                    || fresh_data.fresh_type != Some(fresh)
+                {
+                    return Err(LiteralTypeCacheError::InvalidCachedLiteral(type_));
+                }
+                self.validate_supported_literal_identity(type_, regular, fresh, &data.value)?;
+                Ok(())
+            }
+            TypeData::Union(data) => {
+                if !visiting.insert(type_) {
+                    return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_));
+                }
+                self.validate_union_structure(type_)?;
+                for constituent in &data.union.types {
+                    self.validate_union_constituent_worker(*constituent, visiting)?;
+                }
+                let expected_flags = TypeFlags::UNION
+                    | if data.union.types.len() == 2
+                        && data.union.types.iter().all(|constituent| {
+                            self.type_payload(*constituent).is_some_and(|record| {
+                                record.flags().intersects(TypeFlags::BOOLEAN_LITERAL)
+                            })
+                        })
+                    {
+                        TypeFlags::BOOLEAN
+                    } else {
+                        TypeFlags::NONE
+                    };
+                if record.flags() != expected_flags {
+                    return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
+                }
+                if let Some(origin) = data.origin {
+                    self.validate_supported_union_origin(
+                        type_,
+                        origin,
+                        &data.union.types,
+                        visiting,
+                    )?;
+                }
+                self.validate_supported_union_cache_identity(type_, record, data)?;
+                visiting.remove(&type_);
+                Ok(())
+            }
+            _ => Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_)),
+        }
+    }
+
+    fn validate_supported_union_origin(
+        &self,
+        union: TypeId,
+        origin: TypeId,
+        normalized: &[TypeId],
+        visiting: &mut HashSet<TypeId>,
+    ) -> Result<(), LiteralTypeCacheError> {
+        self.validate_union_origin_structure(union, origin)?;
+        let Some(TypeData::Union(data)) = self.type_payload(origin).map(TypeRecord::data) else {
+            return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
+        };
+        for constituent in &data.union.types {
+            self.validate_union_constituent_worker(*constituent, visiting)?;
+        }
+
+        let mut flattened = Vec::new();
+        let mut leaf_count = 0usize;
+        let mut flattening = HashSet::new();
+        for constituent in &data.union.types {
+            self.flatten_supported_union_type(
+                *constituent,
+                &mut flattened,
+                &mut leaf_count,
+                &mut flattening,
+            )?;
+        }
+        if leaf_count != normalized.len() || flattened != normalized {
+            return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
+        }
+        Ok(())
+    }
+
+    fn flatten_supported_union_type(
+        &self,
+        type_: TypeId,
+        flattened: &mut Vec<TypeId>,
+        leaf_count: &mut usize,
+        visiting: &mut HashSet<TypeId>,
+    ) -> Result<(), LiteralTypeCacheError> {
+        let record = self
+            .type_payload(type_)
+            .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(type_))?;
+        if let TypeData::Union(data) = record.data() {
+            if !visiting.insert(type_) {
+                return Err(LiteralTypeCacheError::InvalidCachedUnion(type_));
+            }
+            for constituent in &data.union.types {
+                self.flatten_supported_union_type(*constituent, flattened, leaf_count, visiting)?;
+            }
+            visiting.remove(&type_);
+        } else {
+            *leaf_count = leaf_count
+                .checked_add(1)
+                .ok_or(LiteralTypeCacheError::Capacity)?;
+            self.insert_union_type(flattened, type_)?;
+        }
+        Ok(())
+    }
+
+    fn type_name_for_union_order(
+        &self,
+        type_: TypeId,
+    ) -> Result<Option<(SemanticSymbolId, Vec<TypeId>)>, LiteralTypeCacheError> {
+        let record = self
+            .type_payload(type_)
+            .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(type_))?;
+        if let Some(alias) = record.alias() {
+            let alias = self
+                .type_alias(alias)
+                .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(type_))?;
+            let symbol = alias
+                .symbol()
+                .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(type_))?;
+            return Ok(Some((
+                symbol,
+                alias.type_arguments().unwrap_or_default().to_vec(),
+            )));
+        }
+        Ok(record.symbol().map(|symbol| (symbol, Vec::new())))
+    }
+
+    fn compare_union_type_lists_worker(
+        &self,
+        left: &[TypeId],
+        right: &[TypeId],
+        comparing: &mut HashSet<(TypeId, TypeId)>,
+    ) -> Result<Ordering, LiteralTypeCacheError> {
+        let lengths = left.len().cmp(&right.len());
+        if lengths != Ordering::Equal {
+            return Ok(lengths);
+        }
+        for (left, right) in left.iter().zip(right) {
+            let ordering = self.compare_union_types_worker(*left, *right, comparing)?;
+            if ordering != Ordering::Equal {
+                return Ok(ordering);
+            }
+        }
+        Ok(Ordering::Equal)
+    }
+
+    fn compare_union_types(
+        &self,
+        left: TypeId,
+        right: TypeId,
+    ) -> Result<Ordering, LiteralTypeCacheError> {
+        self.compare_union_types_worker(left, right, &mut HashSet::new())
+    }
+
+    fn compare_union_types_worker(
+        &self,
+        left: TypeId,
+        right: TypeId,
+        comparing: &mut HashSet<(TypeId, TypeId)>,
+    ) -> Result<Ordering, LiteralTypeCacheError> {
+        if left == right {
+            return Ok(Ordering::Equal);
+        }
+        if !comparing.insert((left, right)) {
+            return Err(LiteralTypeCacheError::InvalidCachedUnion(left));
+        }
+        let result = (|| {
+            let left_record = self
+                .type_payload(left)
+                .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(left))?;
+            let right_record = self
+                .type_payload(right)
+                .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(right))?;
+            let flags = left_record.flags().cmp(&right_record.flags());
+            if flags != Ordering::Equal {
+                return Ok(flags);
+            }
+
+            match (
+                self.type_name_for_union_order(left)?,
+                self.type_name_for_union_order(right)?,
+            ) {
+                (Some((left_symbol, left_arguments)), Some((right_symbol, right_arguments))) => {
+                    if left_symbol == right_symbol {
+                        let arguments = self.compare_union_type_lists_worker(
+                            &left_arguments,
+                            &right_arguments,
+                            comparing,
+                        )?;
+                        if arguments != Ordering::Equal {
+                            return Ok(arguments);
+                        }
+                    } else {
+                        let left_name = self
+                            .symbol(left_symbol)
+                            .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(left))?
+                            .name();
+                        let right_name = self
+                            .symbol(right_symbol)
+                            .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(right))?
+                            .name();
+                        let names = left_name.as_bytes().cmp(right_name.as_bytes());
+                        if names != Ordering::Equal {
+                            return Ok(names);
+                        }
+                    }
+                }
+                (Some(_), None) => return Ok(Ordering::Less),
+                (None, Some(_)) => return Ok(Ordering::Greater),
+                (None, None) => {}
+            }
+
+            match (left_record.data(), right_record.data()) {
+                (TypeData::Literal(left_data), TypeData::Literal(right_data)) => {
+                    let values = match (&left_data.value, &right_data.value) {
+                        (LiteralValue::String(left), LiteralValue::String(right)) => {
+                            left.cmp(right)
+                        }
+                        (LiteralValue::Number(left), LiteralValue::Number(right)) => left
+                            .partial_cmp(right)
+                            .ok_or(LiteralTypeCacheError::InvalidValue)?,
+                        (LiteralValue::Boolean(left), LiteralValue::Boolean(right)) => {
+                            left.cmp(right)
+                        }
+                        _ => Ordering::Equal,
+                    };
+                    if values != Ordering::Equal {
+                        return Ok(values);
+                    }
+                }
+                (TypeData::Union(left_data), TypeData::Union(right_data)) => {
+                    let origins = match (left_data.origin, right_data.origin) {
+                        (None, None) => self.compare_union_type_lists_worker(
+                            &left_data.union.types,
+                            &right_data.union.types,
+                            comparing,
+                        )?,
+                        (None, Some(_)) => Ordering::Greater,
+                        (Some(_), None) => Ordering::Less,
+                        (Some(left), Some(right)) => {
+                            self.compare_union_types_worker(left, right, comparing)?
+                        }
+                    };
+                    if origins != Ordering::Equal {
+                        return Ok(origins);
+                    }
+                }
+                _ => {}
+            }
+            Ok(left.get().cmp(&right.get()))
+        })();
+        comparing.remove(&(left, right));
+        result
+    }
+
+    fn insert_union_type(
+        &self,
+        types: &mut Vec<TypeId>,
+        candidate: TypeId,
+    ) -> Result<(), LiteralTypeCacheError> {
+        for (index, current) in types.iter().copied().enumerate() {
+            match self.compare_union_types(current, candidate)? {
+                Ordering::Less => {}
+                Ordering::Equal => return Ok(()),
+                Ordering::Greater => {
+                    types.insert(index, candidate);
+                    return Ok(());
+                }
+            }
+        }
+        types.push(candidate);
+        Ok(())
+    }
+
+    fn add_types_to_literal_union(
+        &self,
+        type_set: &mut Vec<TypeId>,
+        includes: &mut TypeFlags,
+        types: &[TypeId],
+    ) -> Result<(), LiteralTypeCacheError> {
+        let bootstrap = self
+            .intrinsic_bootstrap
+            .as_ref()
+            .ok_or(LiteralTypeCacheError::BootstrapUninitialized)?;
+        for type_ in types {
+            let record = self
+                .type_payload(*type_)
+                .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(*type_))?;
+            if let TypeData::Union(data) = record.data() {
+                if record.alias().is_some() || data.origin.is_some() {
+                    *includes |= TypeFlags::UNION;
+                }
+                self.add_types_to_literal_union(type_set, includes, &data.union.types)?;
+                continue;
+            }
+            let flags = record.flags();
+            if flags.intersects(TypeFlags::NEVER) {
+                continue;
+            }
+            *includes |= flags & TypeFlags::INCLUDES_MASK;
+            if *type_ == bootstrap.wildcard_type {
+                *includes |= TypeFlags::INCLUDES_WILDCARD;
+            }
+            if *type_ == bootstrap.error_type
+                || flags.intersects(TypeFlags::ANY) && record.alias().is_some()
+            {
+                *includes |= TypeFlags::INCLUDES_ERROR;
+            }
+            if !bootstrap.options.strict_null_checks && flags.intersects(TypeFlags::NULLABLE) {
+                if !record
+                    .object_flags()
+                    .contains(ObjectFlags::CONTAINS_WIDENING_TYPE)
+                {
+                    *includes |= TypeFlags::INCLUDES_NON_WIDENING_TYPE;
+                }
+            } else {
+                self.insert_union_type(type_set, *type_)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn remove_redundant_literal_union_types(
+        &self,
+        types: &mut Vec<TypeId>,
+        includes: TypeFlags,
+    ) -> Result<(), LiteralTypeCacheError> {
+        let mut index = types.len();
+        while index != 0 {
+            index -= 1;
+            let candidate = types[index];
+            let record = self.type_payload(candidate).ok_or(
+                LiteralTypeCacheError::UnsupportedUnionConstituent(candidate),
+            )?;
+            let flags = record.flags();
+            let fresh_redundant = if let TypeData::Literal(data) = record.data() {
+                data.fresh_type == Some(candidate)
+                    && data.regular_type != candidate
+                    && types.contains(&data.regular_type)
+            } else {
+                false
+            };
+            if flags.intersects(TypeFlags::STRING_LITERAL) && includes.intersects(TypeFlags::STRING)
+                || flags.intersects(TypeFlags::NUMBER_LITERAL)
+                    && includes.intersects(TypeFlags::NUMBER)
+                || flags.intersects(TypeFlags::BIG_INT_LITERAL)
+                    && includes.intersects(TypeFlags::BIG_INT)
+                || fresh_redundant
+            {
+                types.remove(index);
+            }
+        }
+        Ok(())
+    }
+
+    fn collect_named_unions(
+        &self,
+        types: &[TypeId],
+        named: &mut Vec<TypeId>,
+        visiting: &mut HashSet<TypeId>,
+    ) -> Result<(), LiteralTypeCacheError> {
+        for type_ in types {
+            let record = self
+                .type_payload(*type_)
+                .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(*type_))?;
+            let TypeData::Union(data) = record.data() else {
+                continue;
+            };
+            if !visiting.insert(*type_) {
+                return Err(LiteralTypeCacheError::InvalidCachedUnion(*type_));
+            }
+            if record.alias().is_some()
+                || data.origin.is_some_and(|origin| {
+                    self.type_payload(origin)
+                        .is_some_and(|origin| !origin.flags().intersects(TypeFlags::UNION))
+                })
+            {
+                if !named.contains(type_) {
+                    named.push(*type_);
+                }
+            } else if let Some(origin) = data.origin {
+                let Some(TypeData::Union(origin)) = self.type_payload(origin).map(TypeRecord::data)
+                else {
+                    return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(*type_));
+                };
+                self.collect_named_unions(&origin.union.types, named, visiting)?;
+            }
+            visiting.remove(type_);
+        }
+        Ok(())
+    }
+
+    fn union_contains_type(&self, union: TypeId, type_: TypeId) -> bool {
+        self.type_payload(union).is_some_and(|record| {
+            matches!(record.data(), TypeData::Union(data) if data.union.types.contains(&type_))
+        })
+    }
+
+    fn union_propagating_flags(&self, types: &[TypeId]) -> ObjectFlags {
+        types.iter().fold(ObjectFlags::NONE, |flags, type_| {
+            let Some(record) = self.type_payload(*type_) else {
+                return flags;
+            };
+            if record.flags().intersects(TypeFlags::NULLABLE) {
+                flags
+            } else {
+                flags | record.object_flags()
+            }
+        }) & ObjectFlags::PROPAGATING_FLAGS
+    }
+
+    #[cfg(test)]
+    pub(super) fn literal_union_type(
+        &mut self,
+        types: &[TypeId],
+        alias_symbol: Option<SemanticSymbolId>,
+    ) -> Result<TypeId, LiteralTypeCacheError> {
+        let prepared =
+            self.prepare_type_query_types(&[], &[], &[], 1, usize::from(alias_symbol.is_some()))?;
+        self.literal_union_type_prepared(types, alias_symbol, prepared)
+    }
+
+    pub(super) fn literal_union_type_prepared(
+        &mut self,
+        types: &[TypeId],
+        alias_symbol: Option<SemanticSymbolId>,
+        _prepared: PreparedTypeQueryTypes,
+    ) -> Result<TypeId, LiteralTypeCacheError> {
+        for type_ in types {
+            self.validate_union_constituent(*type_)?;
+        }
+        if !self.valid_union_alias_key(alias_symbol.map(|symbol| UnionAliasCacheKey { symbol })) {
+            return Err(alias_symbol.map_or(
+                LiteralTypeCacheError::InvalidValue,
+                LiteralTypeCacheError::InvalidUnionAlias,
+            ));
+        }
+        if types.is_empty() {
+            return self
+                .intrinsic_bootstrap
+                .as_ref()
+                .map(|bootstrap| bootstrap.never_type)
+                .ok_or(LiteralTypeCacheError::BootstrapUninitialized);
+        }
+        if types.len() == 1 {
+            return Ok(types[0]);
+        }
+
+        let alias = alias_symbol.map(|symbol| UnionAliasCacheKey { symbol });
+        let first_is_union = self
+            .type_payload(types[0])
+            .is_some_and(|record| record.flags().intersects(TypeFlags::UNION));
+        let second_is_union = self
+            .type_payload(types[1])
+            .is_some_and(|record| record.flags().intersects(TypeFlags::UNION));
+        let union_of_union_key =
+            (types.len() == 2 && (first_is_union || second_is_union)).then(|| {
+                let (first, second) = if types[0] < types[1] {
+                    (types[0], types[1])
+                } else {
+                    (types[1], types[0])
+                };
+                UnionOfUnionCacheKey {
+                    first,
+                    second,
+                    alias,
+                }
+            });
+        if let Some(key) = union_of_union_key
+            && let Some(cached) = self
+                .intrinsic_bootstrap
+                .as_ref()
+                .and_then(|bootstrap| bootstrap.union_of_union_types.get(&key))
+                .copied()
+        {
+            self.validate_union_of_union_cache_entry(key, cached)?;
+            return Ok(cached);
+        }
+
+        let result = self.literal_union_type_worker(types, alias_symbol)?;
+        if let Some(key) = union_of_union_key {
+            let bootstrap = self
+                .intrinsic_bootstrap
+                .as_mut()
+                .ok_or(LiteralTypeCacheError::BootstrapUninitialized)?;
+            bootstrap.union_of_union_types.insert(key, result);
+        }
+        Ok(result)
+    }
+
+    fn literal_union_type_worker(
+        &mut self,
+        types: &[TypeId],
+        alias_symbol: Option<SemanticSymbolId>,
+    ) -> Result<TypeId, LiteralTypeCacheError> {
+        let mut type_set = Vec::with_capacity(types.len());
+        let mut includes = TypeFlags::NONE;
+        self.add_types_to_literal_union(&mut type_set, &mut includes, types)?;
+        let bootstrap = self
+            .intrinsic_bootstrap
+            .as_ref()
+            .ok_or(LiteralTypeCacheError::BootstrapUninitialized)?;
+        if includes.intersects(TypeFlags::ANY_OR_UNKNOWN) {
+            if includes.intersects(TypeFlags::ANY) {
+                return Ok(if includes.intersects(TypeFlags::INCLUDES_WILDCARD) {
+                    bootstrap.wildcard_type
+                } else if includes.intersects(TypeFlags::INCLUDES_ERROR) {
+                    bootstrap.error_type
+                } else {
+                    bootstrap.any_type
+                });
+            }
+            return Ok(bootstrap.unknown_type);
+        }
+        if includes.intersects(TypeFlags::UNDEFINED)
+            && type_set.len() >= 2
+            && type_set[0] == bootstrap.undefined_type
+            && type_set[1] == bootstrap.missing_type
+        {
+            type_set.remove(1);
+        }
+        if includes.intersects(
+            TypeFlags::ENUM
+                | TypeFlags::LITERAL
+                | TypeFlags::UNIQUE_ES_SYMBOL
+                | TypeFlags::TEMPLATE_LITERAL
+                | TypeFlags::STRING_MAPPING,
+        ) || includes.intersects(TypeFlags::VOID) && includes.intersects(TypeFlags::UNDEFINED)
+        {
+            self.remove_redundant_literal_union_types(&mut type_set, includes)?;
+        }
+        if type_set.is_empty() {
+            return Ok(if includes.intersects(TypeFlags::NULL) {
+                if includes.intersects(TypeFlags::INCLUDES_NON_WIDENING_TYPE) {
+                    bootstrap.null_type
+                } else {
+                    bootstrap.null_widening_type
+                }
+            } else if includes.intersects(TypeFlags::UNDEFINED) {
+                if includes.intersects(TypeFlags::INCLUDES_NON_WIDENING_TYPE) {
+                    bootstrap.undefined_type
+                } else {
+                    bootstrap.undefined_widening_type
+                }
+            } else {
+                bootstrap.never_type
+            });
+        }
+
+        let mut origin_types = None;
+        if includes.intersects(TypeFlags::UNION) {
+            let mut named = Vec::new();
+            self.collect_named_unions(types, &mut named, &mut HashSet::new())?;
+            let mut reduced = Vec::new();
+            for type_ in &type_set {
+                if !named
+                    .iter()
+                    .any(|union| self.union_contains_type(*union, *type_))
+                {
+                    reduced.push(*type_);
+                }
+            }
+            if alias_symbol.is_none() && named.len() == 1 && reduced.is_empty() {
+                return Ok(named[0]);
+            }
+            let named_type_count = named.iter().try_fold(0usize, |count, union| {
+                let Some(TypeData::Union(data)) = self.type_payload(*union).map(TypeRecord::data)
+                else {
+                    return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(*union));
+                };
+                count
+                    .checked_add(data.union.types.len())
+                    .ok_or(LiteralTypeCacheError::Capacity)
+            })?;
+            if named_type_count
+                .checked_add(reduced.len())
+                .ok_or(LiteralTypeCacheError::Capacity)?
+                == type_set.len()
+            {
+                for union in named {
+                    self.insert_union_type(&mut reduced, union)?;
+                }
+                origin_types = Some(reduced);
+            }
+        }
+
+        let mut object_flags = if includes.intersects(TypeFlags::NOT_PRIMITIVE_UNION) {
+            ObjectFlags::NONE
+        } else {
+            ObjectFlags::PRIMITIVE_UNION
+        };
+        if includes.intersects(TypeFlags::INTERSECTION) {
+            object_flags |= ObjectFlags::CONTAINS_INTERSECTIONS;
+        }
+        object_flags |= self.union_propagating_flags(&type_set);
+        self.union_type_from_sorted_list(type_set, object_flags, alias_symbol, origin_types)
+    }
+
+    fn union_type_from_sorted_list(
+        &mut self,
+        types: Vec<TypeId>,
+        object_flags: ObjectFlags,
+        alias_symbol: Option<SemanticSymbolId>,
+        origin_types: Option<Vec<TypeId>>,
+    ) -> Result<TypeId, LiteralTypeCacheError> {
+        let bootstrap = self
+            .intrinsic_bootstrap
+            .as_ref()
+            .ok_or(LiteralTypeCacheError::BootstrapUninitialized)?;
+        if types.is_empty() {
+            return Ok(bootstrap.never_type);
+        }
+        if types.len() == 1 {
+            return Ok(types[0]);
+        }
+        let key = UnionTypeCacheKey {
+            types: types.clone(),
+            origin_types,
+            alias: alias_symbol.map(|symbol| UnionAliasCacheKey { symbol }),
+        };
+        if let Some(cached) = self
+            .intrinsic_bootstrap
+            .as_ref()
+            .and_then(|bootstrap| bootstrap.union_types.get(&key))
+            .copied()
+        {
+            self.validate_union_cache_entry(&key, cached)?;
+            return Ok(cached);
+        }
+
+        let origin = key.origin_types.as_ref().map(|types| {
+            self.alloc_union_type(ObjectFlags::NONE, types.clone())
+                .expect("preflighted named-union origin is valid")
+        });
+        let is_boolean = types.len() == 2
+            && types.iter().all(|type_| {
+                self.type_payload(*type_)
+                    .is_some_and(|record| record.flags().intersects(TypeFlags::BOOLEAN_LITERAL))
+            });
+        let union = self
+            .alloc_union_type(object_flags, types)
+            .expect("preflighted sorted union constituents are valid");
+        if is_boolean {
+            assert!(self.add_type_flags(union, TypeFlags::BOOLEAN));
+        }
+        if let Some(origin) = origin {
+            assert!(self.set_union_caches(
+                union,
+                None,
+                None,
+                Some(origin),
+                EscapedName::default(),
+                ConstituentMapState::Unallocated,
+            ));
+        }
+        if let Some(symbol) = alias_symbol {
+            let alias = self
+                .alloc_type_alias(Some(symbol))
+                .expect("preflighted union alias symbol belongs to this store");
+            assert!(self.set_type_alias(union, Some(alias)));
+        }
+        let bootstrap = self
+            .intrinsic_bootstrap
+            .as_mut()
+            .ok_or(LiteralTypeCacheError::BootstrapUninitialized)?;
+        let previous = bootstrap.union_types.insert(key, union);
+        debug_assert!(
+            previous.is_none(),
+            "union cache was checked before allocation"
+        );
+        Ok(previous.unwrap_or(union))
     }
 
     /// Initializes the exact dependency-closed intrinsic set once.
@@ -761,7 +1987,9 @@ impl IntrinsicBootstrap {
     /// future general `getUnionType`; this read API never approximates them.
     #[must_use]
     pub fn cached_union_type(&self, normalized_types: &[TypeId]) -> Option<TypeId> {
-        self.union_types.get(normalized_types).copied()
+        self.union_types
+            .get(&UnionTypeCacheKey::anonymous(normalized_types.to_vec()))
+            .copied()
     }
 
     /// Looks up an already-normalized bootstrap template-literal key.
@@ -801,6 +2029,13 @@ impl IntrinsicBootstrap {
         self.union_types.len()
     }
 
+    /// Number of two-input union fast-path entries created after bootstrap.
+    #[cfg(test)]
+    #[must_use]
+    pub(super) fn union_of_union_cache_len(&self) -> usize {
+        self.union_of_union_types.len()
+    }
+
     /// Number of template-literal entries seeded by pinned bootstrap calls.
     #[must_use]
     pub fn template_literal_cache_len(&self) -> usize {
@@ -816,6 +2051,7 @@ impl IntrinsicBootstrap {
         let mut number_literal_types = HashMap::new();
         let mut bigint_literal_types = Vec::new();
         let mut union_types = HashMap::new();
+        let union_of_union_types = HashMap::new();
         let mut template_literal_types = HashMap::new();
 
         let globals = store.alloc_symbol_table();
@@ -1176,6 +2412,7 @@ impl IntrinsicBootstrap {
             number_literal_types,
             bigint_literal_types,
             union_types,
+            union_of_union_types,
             template_literal_types,
         }
     }
@@ -1223,15 +2460,15 @@ fn literal(
 
 fn fixed_union(
     store: &mut SemanticStore<TypeRecord, TypeMapper>,
-    cache: &mut HashMap<Vec<TypeId>, TypeId>,
+    cache: &mut HashMap<UnionTypeCacheKey, TypeId>,
     types: Vec<TypeId>,
     object_flags: ObjectFlags,
     is_boolean: bool,
 ) -> TypeId {
-    if let Some(cached) = cache.get(types.as_slice()) {
+    let key = UnionTypeCacheKey::anonymous(types.clone());
+    if let Some(cached) = cache.get(&key) {
         return *cached;
     }
-    let key = types.clone();
     let union = store
         .alloc_union_type(object_flags, types)
         .expect("the pinned sorted union constituents belong to this store");
@@ -2685,5 +3922,179 @@ mod tests {
                 .cached_template_literal_type(&[String::new(), String::new()], &[number_type],),
             None,
         );
+    }
+
+    #[test]
+    fn union_cache_rejects_wrong_generator_flags_atomically_and_accepts_repair() {
+        for corruption in 0..4 {
+            let mut store = initialized(IntrinsicBootstrapOptions::default());
+            let (string_type, number_type) = {
+                let bootstrap = store.intrinsic_bootstrap().unwrap();
+                (bootstrap.string_type, bootstrap.number_type)
+            };
+            let types = vec![string_type, number_type];
+            let malformed = store
+                .alloc_union_type(
+                    if corruption == 0 {
+                        ObjectFlags::NONE
+                    } else {
+                        ObjectFlags::PRIMITIVE_UNION
+                    },
+                    types.clone(),
+                )
+                .unwrap();
+            match corruption {
+                0 => {}
+                1 => assert!(store.add_type_flags(malformed, TypeFlags::ENUM_LITERAL)),
+                2 => assert!(
+                    store.add_type_object_flags(malformed, ObjectFlags::NON_INFERRABLE_TYPE,)
+                ),
+                3 => assert!(
+                    store.add_type_object_flags(malformed, ObjectFlags::CONTAINS_INTERSECTIONS,)
+                ),
+                _ => unreachable!(),
+            }
+            let key = UnionTypeCacheKey::anonymous(types.clone());
+            store
+                .intrinsic_bootstrap
+                .as_mut()
+                .unwrap()
+                .union_types
+                .insert(key.clone(), malformed);
+            let before = (
+                store.type_len(),
+                store.type_alias_len(),
+                store.intrinsic_bootstrap().unwrap().union_cache_len(),
+            );
+            assert_eq!(
+                store.prepare_type_query_types(&[], &[], &[], 1, 0),
+                Err(LiteralTypeCacheError::InvalidCachedUnion(malformed)),
+            );
+            assert_eq!(
+                (
+                    store.type_len(),
+                    store.type_alias_len(),
+                    store.intrinsic_bootstrap().unwrap().union_cache_len(),
+                ),
+                before,
+            );
+
+            let repaired = store
+                .alloc_union_type(ObjectFlags::PRIMITIVE_UNION, types)
+                .unwrap();
+            store
+                .intrinsic_bootstrap
+                .as_mut()
+                .unwrap()
+                .union_types
+                .insert(key, repaired);
+            assert!(store.prepare_type_query_types(&[], &[], &[], 1, 0).is_ok());
+        }
+    }
+
+    #[test]
+    fn cyclic_union_origins_fail_typed_cache_validation_without_recursing_forever() {
+        let mut store = initialized(IntrinsicBootstrapOptions::default());
+        let (string_type, number_type) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let leaves = vec![string_type, number_type];
+        let left = store
+            .alloc_union_type(ObjectFlags::PRIMITIVE_UNION, leaves.clone())
+            .unwrap();
+        let right = store
+            .alloc_union_type(ObjectFlags::PRIMITIVE_UNION, leaves)
+            .unwrap();
+        assert!(store.set_union_caches(
+            left,
+            None,
+            None,
+            Some(right),
+            EscapedName::default(),
+            ConstituentMapState::Unallocated,
+        ));
+        assert!(store.set_union_caches(
+            right,
+            None,
+            None,
+            Some(left),
+            EscapedName::default(),
+            ConstituentMapState::Unallocated,
+        ));
+        let types = vec![left, right];
+        let cached = store
+            .alloc_union_type(ObjectFlags::PRIMITIVE_UNION, types.clone())
+            .unwrap();
+        store
+            .intrinsic_bootstrap
+            .as_mut()
+            .unwrap()
+            .union_types
+            .insert(UnionTypeCacheKey::anonymous(types), cached);
+        let before = store.type_len();
+        assert_eq!(
+            store.prepare_type_query_types(&[], &[], &[], 1, 0),
+            Err(LiteralTypeCacheError::InvalidCachedUnion(cached)),
+        );
+        assert_eq!(store.type_len(), before);
+    }
+
+    #[test]
+    fn union_cache_rejects_noncanonical_alias_owners_and_accepts_canonical_repair() {
+        let mut store = initialized(IntrinsicBootstrapOptions::default());
+        let (string_type, number_type) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let canonical = store.alloc_transient_symbol(
+            SymbolFlags::TYPE_ALIAS,
+            EscapedName::source("Canonical"),
+            CheckFlags::NONE,
+        );
+        let raw = store.alloc_transient_symbol(
+            SymbolFlags::TYPE_ALIAS,
+            EscapedName::source("Raw"),
+            CheckFlags::NONE,
+        );
+        store.record_merged_symbol(canonical, raw).unwrap();
+        let types = vec![string_type, number_type];
+        let malformed = store
+            .alloc_union_type(ObjectFlags::PRIMITIVE_UNION, types.clone())
+            .unwrap();
+        let malformed_alias = store.alloc_type_alias(Some(raw)).unwrap();
+        assert!(store.set_type_alias(malformed, Some(malformed_alias)));
+        let malformed_key = UnionTypeCacheKey {
+            types: types.clone(),
+            origin_types: None,
+            alias: Some(UnionAliasCacheKey { symbol: raw }),
+        };
+        store
+            .intrinsic_bootstrap
+            .as_mut()
+            .unwrap()
+            .union_types
+            .insert(malformed_key.clone(), malformed);
+        let before = store.type_len();
+        assert_eq!(
+            store.prepare_type_query_types(&[], &[], &[], 1, 1),
+            Err(LiteralTypeCacheError::InvalidCachedUnion(malformed)),
+        );
+        assert_eq!(store.type_len(), before);
+
+        let repaired = store
+            .alloc_union_type(ObjectFlags::PRIMITIVE_UNION, types.clone())
+            .unwrap();
+        let repaired_alias = store.alloc_type_alias(Some(canonical)).unwrap();
+        assert!(store.set_type_alias(repaired, Some(repaired_alias)));
+        let repaired_key = UnionTypeCacheKey {
+            types,
+            origin_types: None,
+            alias: Some(UnionAliasCacheKey { symbol: canonical }),
+        };
+        let cache = &mut store.intrinsic_bootstrap.as_mut().unwrap().union_types;
+        cache.remove(&malformed_key);
+        cache.insert(repaired_key, repaired);
+        assert!(store.prepare_type_query_types(&[], &[], &[], 1, 1).is_ok());
     }
 }

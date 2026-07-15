@@ -1993,7 +1993,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES
     }
 
-    fn valid_union_object_flags(flags: ObjectFlags) -> bool {
+    pub(super) fn valid_union_object_flags(flags: ObjectFlags) -> bool {
         let allowed = Self::common_non_object_flags()
             | ObjectFlags::MEMBERS_RESOLVED
             | ObjectFlags::PRIMITIVE_UNION

@@ -129,6 +129,8 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     relations: RelationCaches,
     pub(super) intrinsic_bootstrap: Option<IntrinsicBootstrap>,
     claimed_strict_builtin_iterator_return: Option<bool>,
+    #[cfg(test)]
+    pub(super) union_cache_validation_scans: usize,
 }
 
 impl<TypePayload, MapperPayload> Default for SemanticStore<TypePayload, MapperPayload> {
@@ -176,6 +178,8 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             relations: RelationCaches::default(),
             intrinsic_bootstrap: None,
             claimed_strict_builtin_iterator_return: None,
+            #[cfg(test)]
+            union_cache_validation_scans: 0,
         }
     }
 
@@ -463,6 +467,10 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
 
     pub(super) fn try_reserve_types(&mut self, additional: usize) -> bool {
         self.types.try_reserve(additional)
+    }
+
+    pub(super) fn try_reserve_type_aliases(&mut self, additional: usize) -> bool {
+        self.type_aliases.try_reserve(additional)
     }
 
     #[must_use]
