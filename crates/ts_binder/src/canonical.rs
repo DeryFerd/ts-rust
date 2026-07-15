@@ -3530,9 +3530,7 @@ fn is_ambient_node(arena: &NodeArena, mut node: NodeId, facts: &CanonicalSourceF
         return true;
     }
     loop {
-        if has_syntactic_modifier(arena, node, SyntaxKind::DeclareKeyword)
-            || is_ambient_module(arena, node)
-        {
+        if has_syntactic_modifier(arena, node, SyntaxKind::DeclareKeyword) {
             return true;
         }
         let Some(parent) = arena.get(node).and_then(|node| node.parent) else {
@@ -6570,6 +6568,120 @@ declare global { interface Window {} }
             bound.diagnostics()[0].diagnostic.arguments,
             ["bad**pattern"]
         );
+    }
+
+    #[test]
+    fn export_context_uses_ambient_flags_not_recovered_module_shape() {
+        let parsed = parse_source_file(
+            r#"
+module "recovery" { interface Hidden {} }
+declare module "declared" { interface Visible {} }
+"#,
+        );
+        let modules = nodes_of_kind(&parsed.arena, SyntaxKind::ModuleDeclaration);
+        assert_eq!(modules.len(), 2);
+        let file = FileId::new(70);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/recovered-module\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+
+        let bound = binder.file(file).unwrap();
+        let source_locals = binder
+            .symbol_store()
+            .symbol_table(bound.locals(bound.source_file()).unwrap())
+            .unwrap();
+        let recovered = source_locals.get_source("\"recovery\"").unwrap();
+        let declared = source_locals.get_source("\"declared\"").unwrap();
+        assert!(
+            binder
+                .symbol_store()
+                .symbol(recovered)
+                .unwrap()
+                .exports()
+                .is_none_or(|exports| binder
+                    .symbol_store()
+                    .symbol_table(exports)
+                    .unwrap()
+                    .get_source("Hidden")
+                    .is_none())
+        );
+        let recovered_locals = binder
+            .symbol_store()
+            .symbol_table(bound.locals(node_ref(&parsed.arena, file, modules[0])).unwrap())
+            .unwrap();
+        assert!(recovered_locals.get_source("Hidden").is_some());
+        let declared_exports = binder
+            .symbol_store()
+            .symbol_table(
+                binder
+                    .symbol_store()
+                    .symbol(declared)
+                    .unwrap()
+                    .exports()
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(declared_exports.get_source("Visible").is_some());
+
+        let declaration_file = parse_source_file(
+            r#"module "file-context" { interface FileVisible {} }"#,
+        );
+        let declaration_file_id = FileId::new(71);
+        let mut declaration_binder = CanonicalBinder::new();
+        declaration_binder
+            .bind_source_file_with_facts(
+                &declaration_file.arena,
+                declaration_file.source_file,
+                declaration_file_id,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/types.d.ts\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    true,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        declaration_binder
+            .bind_typescript_declaration_slice(&declaration_file.arena, declaration_file_id)
+            .unwrap();
+        let declaration_bound = declaration_binder.file(declaration_file_id).unwrap();
+        let declaration_source_locals = declaration_binder
+            .symbol_store()
+            .symbol_table(
+                declaration_bound
+                    .locals(declaration_bound.source_file())
+                    .unwrap(),
+            )
+            .unwrap();
+        let file_module = declaration_source_locals
+            .get_source("\"file-context\"")
+            .unwrap();
+        let file_exports = declaration_binder
+            .symbol_store()
+            .symbol_table(
+                declaration_binder
+                    .symbol_store()
+                    .symbol(file_module)
+                    .unwrap()
+                    .exports()
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(file_exports.get_source("FileVisible").is_some());
     }
 
     #[test]
