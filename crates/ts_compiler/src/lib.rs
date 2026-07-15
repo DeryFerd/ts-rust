@@ -309,7 +309,9 @@ fn global_type_initialization_error_is_unsupported(
         | CanonicalGlobalTypeInitializationError::InvalidAnonymousTypeMembers(_)
         | CanonicalGlobalTypeInitializationError::InvalidGenericTarget(_)
         | CanonicalGlobalTypeInitializationError::InvalidTypeReference(_)
-        | CanonicalGlobalTypeInitializationError::InvalidInstantiationCache(_) => false,
+        | CanonicalGlobalTypeInitializationError::InvalidInstantiationCache(_)
+        | CanonicalGlobalTypeInitializationError::InvalidGlobalObjectDeclaration(_)
+        | CanonicalGlobalTypeInitializationError::InvalidGlobalObjectBaseResolution(_) => false,
     }
 }
 
@@ -6649,6 +6651,24 @@ mod tests {
                 CanonicalCheckerContextError::GlobalInitialization(
                     CanonicalGlobalInitializationError::GlobalTypes(
                         CanonicalGlobalTypeInitializationError::InvalidType(type_id),
+                    ),
+                ),
+            ),
+            CanonicalProgramCheckError::Context(
+                CanonicalCheckerContextError::GlobalInitialization(
+                    CanonicalGlobalInitializationError::GlobalTypes(
+                        CanonicalGlobalTypeInitializationError::InvalidGlobalObjectDeclaration(
+                            node,
+                        ),
+                    ),
+                ),
+            ),
+            CanonicalProgramCheckError::Context(
+                CanonicalCheckerContextError::GlobalInitialization(
+                    CanonicalGlobalInitializationError::GlobalTypes(
+                        CanonicalGlobalTypeInitializationError::InvalidGlobalObjectBaseResolution(
+                            type_id,
+                        ),
                     ),
                 ),
             ),
