@@ -7,8 +7,9 @@ use ts_ast::{
     CallSignatureDeclarationData, CaseBlockData, CaseOrDefaultClauseData, CatchClauseData,
     ClassDeclarationData, ClassExpressionData, ClassStaticBlockDeclarationData,
     ComputedPropertyNameData, ConditionalExpressionData, ConditionalTypeNodeData,
-    ConstructSignatureDeclarationData, ConstructorTypeNodeData, ContinueStatementData,
-    DebuggerStatementData, DecoratorData, DeleteExpressionData, DoStatementData,
+    ConstructSignatureDeclarationData, ConstructorDeclarationData, ConstructorTypeNodeData,
+    ContinueStatementData, DebuggerStatementData, DecoratorData, DeleteExpressionData,
+    DoStatementData,
     ElementAccessExpressionData, EmptyStatementData, EnumDeclarationData, EnumMemberData,
     ExportAssignmentData, ExportDeclarationData, ExportSpecifierData, ExpressionStatementData,
     ExpressionWithTypeArgumentsData, ExternalModuleReferenceData, ForInOrOfStatementData,
@@ -2489,6 +2490,9 @@ impl<'a> Parser<'a> {
         {
             return self.parse_class_accessor(start, modifiers, modifier_nodes, false);
         }
+        if self.current_token_starts_constructor_declaration() {
+            return self.parse_constructor_declaration(start, modifiers, modifier_nodes);
+        }
         let asterisk_token = if self.current.kind == SyntaxKind::AsteriskToken {
             Some(self.consume_token_node())
         } else {
@@ -2641,6 +2645,96 @@ impl<'a> Parser<'a> {
                 &children,
             )
         }
+    }
+
+    fn current_token_starts_constructor_declaration(&mut self) -> bool {
+        if self.current.kind == SyntaxKind::ConstructorKeyword {
+            return true;
+        }
+        self.current.kind == SyntaxKind::StringLiteral
+            && token_value(&self.current) == "constructor"
+            && self.next_token_kind() == SyntaxKind::OpenParenToken
+    }
+
+    fn parse_constructor_declaration(
+        &mut self,
+        start: TextPos,
+        modifiers: Option<ModifierList>,
+        modifier_nodes: Vec<NodeId>,
+    ) -> NodeId {
+        // The constructor name is syntax, not an AST child. This is true even for the
+        // quoted spelling accepted by TypeScript's parser.
+        self.bump();
+        let previous_await_context = self.await_context;
+        let previous_await_identifier_context = self.await_identifier_context;
+        self.await_context = false;
+        self.await_identifier_context = false;
+        let type_parameters = self.parse_type_parameters();
+        let parameters = self.parse_parameter_list();
+        let return_type = self.parse_optional_type_annotation();
+        let fallback_end = return_type.map_or(parameters.range.end, |id| self.node_end(id));
+        let (body, end) = if self.current.kind == SyntaxKind::OpenBraceToken {
+            let body = self.parse_class_member_block();
+            (Some(body), self.node_end(body))
+        } else if !matches!(
+            self.current.kind,
+            SyntaxKind::SemicolonToken | SyntaxKind::CloseBraceToken | SyntaxKind::EndOfFile
+        ) && !self.current_token_can_start_class_member()
+        {
+            self.error_current("Expected '{'.");
+            let recovered_comma = self.current.kind == SyntaxKind::CommaToken;
+            let position = self.current.full_start;
+            let body = self.alloc_node(
+                SyntaxKind::Block,
+                TextRange::new(position, position),
+                NodeData::Block(Box::new(BlockData {
+                    flow_node: None,
+                    locals: SymbolTable,
+                    multi_line: false,
+                    next_container: None,
+                    statements: NodeList {
+                        range: TextRange::new(position, position),
+                        nodes: Vec::new(),
+                        has_trailing_comma: false,
+                    },
+                    facts: 0,
+                })),
+                &[],
+            );
+            if recovered_comma {
+                self.bump();
+            }
+            (Some(body), self.node_end(body))
+        } else {
+            (None, self.parse_semicolon(fallback_end))
+        };
+        let mut children = modifier_nodes;
+        extend_list_children(&mut children, type_parameters.as_ref());
+        children.extend(parameters.nodes.iter().copied());
+        children.extend(return_type);
+        children.extend(body);
+        self.await_context = previous_await_context;
+        self.await_identifier_context = previous_await_identifier_context;
+        self.alloc_node(
+            SyntaxKind::Constructor,
+            TextRange::new(start, end),
+            NodeData::ConstructorDeclaration(Box::new(ConstructorDeclarationData {
+                asterisk_token: None,
+                body,
+                end_flow_node: None,
+                full_signature: None,
+                locals: SymbolTable,
+                next_container: None,
+                parameters,
+                return_flow_node: None,
+                symbol: None,
+                type_: return_type,
+                type_parameters,
+                facts: 0,
+                modifiers,
+            })),
+            &children,
+        )
     }
 
     fn recover_invalid_class_var_modifier(&mut self, modifier_nodes: &mut Vec<NodeId>) {
@@ -9870,7 +9964,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 SyntaxKind::PropertyDeclaration,
-                SyntaxKind::MethodDeclaration,
+                SyntaxKind::Constructor,
                 SyntaxKind::ClassStaticBlockDeclaration,
             ],
             "{:?}",
@@ -11180,10 +11274,10 @@ mod tests {
         else {
             panic!("expected class declaration");
         };
-        let NodeData::MethodDeclaration(constructor) =
+        let NodeData::ConstructorDeclaration(constructor) =
             &result.arena.get(class.members.nodes[0]).unwrap().data
         else {
-            panic!("expected constructor method");
+            panic!("expected constructor declaration");
         };
         let NodeData::ParameterDeclaration(parameter) = &result
             .arena
@@ -11225,6 +11319,264 @@ mod tests {
     }
 
     #[test]
+    fn parses_constructor_declarations_with_canonical_shape_and_parents() {
+        let source = concat!(
+            "class Example {\n",
+            "  public constructor<T>(value: T): Example;\n",
+            "  protected \"constructor\"(value: string) {}\n",
+            r#"  "\x63onstructor"() {}"#,
+            "\n}",
+        );
+        let result = parse_source_file(source);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let class_id = source_statements(&result)[0];
+        let NodeData::ClassDeclaration(class) =
+            &result.arena.get(class_id).unwrap().data
+        else {
+            panic!("expected class declaration");
+        };
+        assert_eq!(class.members.nodes.len(), 3);
+        for member in &class.members.nodes {
+            let member_node = result.arena.get(*member).unwrap();
+            assert_eq!(member_node.parent, Some(class_id));
+            member_node.for_each_child(|child| {
+                assert_eq!(result.arena.get(child).unwrap().parent, Some(*member));
+            });
+        }
+
+        let overload_id = class.members.nodes[0];
+        let overload_node = result.arena.get(overload_id).unwrap();
+        assert_eq!(overload_node.kind, SyntaxKind::Constructor);
+        let NodeData::ConstructorDeclaration(overload) = &overload_node.data else {
+            panic!("expected constructor declaration");
+        };
+        assert!(overload.body.is_none());
+        assert!(overload.asterisk_token.is_none());
+        assert!(overload.full_signature.is_none());
+        let modifier = overload.modifiers.as_ref().unwrap().list.nodes[0];
+        let type_parameter = overload.type_parameters.as_ref().unwrap().nodes[0];
+        let parameter = overload.parameters.nodes[0];
+        let return_type = overload.type_.unwrap();
+        let mut direct_children = Vec::new();
+        overload_node.for_each_child(|child| direct_children.push(child));
+        assert_eq!(
+            direct_children,
+            [modifier, type_parameter, parameter, return_type]
+        );
+        for child in direct_children {
+            assert_eq!(result.arena.get(child).unwrap().parent, Some(overload_id));
+        }
+        assert_eq!(
+            result.arena.get(modifier).unwrap().kind,
+            SyntaxKind::PublicKeyword
+        );
+        let range = overload_node.range;
+        assert_eq!(
+            &source[range.start.get() as usize..range.end.get() as usize],
+            "public constructor<T>(value: T): Example;"
+        );
+
+        let quoted_id = class.members.nodes[1];
+        let quoted_node = result.arena.get(quoted_id).unwrap();
+        let NodeData::ConstructorDeclaration(quoted) = &quoted_node.data else {
+            panic!("expected quoted constructor declaration");
+        };
+        assert!(quoted.type_parameters.is_none());
+        assert!(quoted.type_.is_none());
+        let quoted_body = quoted.body.expect("constructor implementation body");
+        assert_eq!(result.arena.get(quoted_body).unwrap().parent, Some(quoted_id));
+        assert_eq!(
+            result
+                .arena
+                .get(quoted.modifiers.as_ref().unwrap().list.nodes[0])
+                .unwrap()
+                .kind,
+            SyntaxKind::ProtectedKeyword
+        );
+
+        let escaped_id = class.members.nodes[2];
+        assert!(matches!(
+            &result.arena.get(escaped_id).unwrap().data,
+            NodeData::ConstructorDeclaration(constructor) if constructor.body.is_some()
+        ));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One constructor-name classification matrix.
+    fn constructor_promotion_excludes_other_constructor_named_members() {
+        let result = parse_source_file(
+            r#"
+                class MemberKinds {
+                    static constructor() {}
+                    static() {}
+                    get constructor() { return 1; }
+                    set constructor(value: number) {}
+                    *constructor() {}
+                    ["constructor"]() {}
+                    #constructor() {}
+                    "constructor"<T>() {}
+                    "constructor"?() {}
+                    "constructor" = 1;
+                }
+            "#,
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let NodeData::ClassDeclaration(class) =
+            &result.arena.get(source_statements(&result)[0]).unwrap().data
+        else {
+            panic!("expected class declaration");
+        };
+        assert_eq!(class.members.nodes.len(), 10);
+
+        let NodeData::ConstructorDeclaration(static_constructor) =
+            &result.arena.get(class.members.nodes[0]).unwrap().data
+        else {
+            panic!("expected static constructor syntax to retain constructor shape");
+        };
+        assert_eq!(
+            result
+                .arena
+                .get(
+                    static_constructor
+                        .modifiers
+                        .as_ref()
+                        .unwrap()
+                        .list
+                        .nodes[0]
+                )
+                .unwrap()
+                .kind,
+            SyntaxKind::StaticKeyword
+        );
+
+        let NodeData::MethodDeclaration(static_method) =
+            &result.arena.get(class.members.nodes[1]).unwrap().data
+        else {
+            panic!("expected method named static");
+        };
+        assert!(matches!(
+            &result.arena.get(static_method.name).unwrap().data,
+            NodeData::Identifier(identifier) if identifier.text == "static"
+        ));
+        assert!(matches!(
+            result.arena.get(class.members.nodes[2]).map(|node| &node.data),
+            Some(NodeData::GetAccessorDeclaration(_))
+        ));
+        assert!(matches!(
+            result.arena.get(class.members.nodes[3]).map(|node| &node.data),
+            Some(NodeData::SetAccessorDeclaration(_))
+        ));
+
+        let NodeData::MethodDeclaration(generator) =
+            &result.arena.get(class.members.nodes[4]).unwrap().data
+        else {
+            panic!("expected generator method");
+        };
+        assert!(generator.asterisk_token.is_some());
+        let NodeData::MethodDeclaration(computed) =
+            &result.arena.get(class.members.nodes[5]).unwrap().data
+        else {
+            panic!("expected computed method");
+        };
+        assert_eq!(
+            result.arena.get(computed.name).unwrap().kind,
+            SyntaxKind::ComputedPropertyName
+        );
+        let NodeData::MethodDeclaration(private) =
+            &result.arena.get(class.members.nodes[6]).unwrap().data
+        else {
+            panic!("expected private method");
+        };
+        assert_eq!(
+            result.arena.get(private.name).unwrap().kind,
+            SyntaxKind::PrivateIdentifier
+        );
+        let NodeData::MethodDeclaration(quoted_generic) =
+            &result.arena.get(class.members.nodes[7]).unwrap().data
+        else {
+            panic!("expected quoted generic method");
+        };
+        assert!(quoted_generic.type_parameters.is_some());
+        assert_eq!(
+            result.arena.get(quoted_generic.name).unwrap().kind,
+            SyntaxKind::StringLiteral
+        );
+        let NodeData::MethodDeclaration(quoted_optional) =
+            &result.arena.get(class.members.nodes[8]).unwrap().data
+        else {
+            panic!("expected quoted optional method");
+        };
+        assert!(quoted_optional.postfix_token.is_some());
+        assert_eq!(
+            result.arena.get(quoted_optional.name).unwrap().kind,
+            SyntaxKind::StringLiteral
+        );
+        let NodeData::PropertyDeclaration(quoted_property) =
+            &result.arena.get(class.members.nodes[9]).unwrap().data
+        else {
+            panic!("expected quoted property");
+        };
+        assert_eq!(
+            result.arena.get(quoted_property.name).unwrap().kind,
+            SyntaxKind::StringLiteral
+        );
+    }
+
+    #[test]
+    fn constructor_parameters_and_bodies_clear_outer_await_context() {
+        let result = parse_source_file(
+            "async function outer() { class C { constructor(value = await) { await; } } }",
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let NodeData::FunctionDeclaration(outer) =
+            &result.arena.get(source_statements(&result)[0]).unwrap().data
+        else {
+            panic!("expected outer function");
+        };
+        let NodeData::Block(outer_body) =
+            &result.arena.get(outer.body.unwrap()).unwrap().data
+        else {
+            panic!("expected outer function body");
+        };
+        let NodeData::ClassDeclaration(class) =
+            &result.arena.get(outer_body.statements.nodes[0]).unwrap().data
+        else {
+            panic!("expected nested class");
+        };
+        let NodeData::ConstructorDeclaration(constructor) =
+            &result.arena.get(class.members.nodes[0]).unwrap().data
+        else {
+            panic!("expected constructor declaration");
+        };
+        let NodeData::ParameterDeclaration(parameter) = &result
+            .arena
+            .get(constructor.parameters.nodes[0])
+            .unwrap()
+            .data
+        else {
+            panic!("expected constructor parameter");
+        };
+        assert!(matches!(
+            &result.arena.get(parameter.initializer.unwrap()).unwrap().data,
+            NodeData::Identifier(identifier) if identifier.text == "await"
+        ));
+        let NodeData::Block(body) =
+            &result.arena.get(constructor.body.unwrap()).unwrap().data
+        else {
+            panic!("expected constructor body");
+        };
+        let NodeData::ExpressionStatement(statement) =
+            &result.arena.get(body.statements.nodes[0]).unwrap().data
+        else {
+            panic!("expected expression statement");
+        };
+        assert!(matches!(
+            &result.arena.get(statement.expression).unwrap().data,
+            NodeData::Identifier(identifier) if identifier.text == "await"
+        ));
+    }
+
+    #[test]
     fn invalid_parameter_modifiers_do_not_detach_constructor_bodies() {
         let result = parse_source_file(concat!(
             "class Static { constructor(static a: number) {} }\n",
@@ -11238,10 +11590,10 @@ mod tests {
             else {
                 panic!("expected class declaration");
             };
-            let NodeData::MethodDeclaration(constructor) =
+            let NodeData::ConstructorDeclaration(constructor) =
                 &result.arena.get(class.members.nodes[0]).unwrap().data
             else {
-                panic!("expected constructor method");
+                panic!("expected constructor declaration");
             };
             assert!(constructor.body.is_some());
             let NodeData::ParameterDeclaration(parameter) = &result
@@ -12508,7 +12860,7 @@ mod tests {
             panic!("expected class declaration");
         };
         assert_eq!(class.members.nodes.len(), 2);
-        let NodeData::MethodDeclaration(constructor) =
+        let NodeData::ConstructorDeclaration(constructor) =
             &result.arena.get(class.members.nodes[0]).unwrap().data
         else {
             panic!("expected constructor");
