@@ -11,6 +11,7 @@ ts_diagnostics = { path = "../ts_diagnostics" }
 [dev-dependencies]
 ts_core = { path = "../ts_core" }
 ts_parser = { path = "../ts_parser" }
+ts_scanner = { path = "../ts_scanner" }
 
 [lints]
 workspace = true

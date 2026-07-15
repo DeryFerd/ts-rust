@@ -120,6 +120,12 @@ impl InternalSymbolName {
 #[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct EscapedName(Box<[u8]>);
 
+impl Default for EscapedName {
+    fn default() -> Self {
+        Self::source("")
+    }
+}
+
 impl EscapedName {
     /// Creates a key from decoded TypeScript source text.
     #[must_use]
@@ -298,6 +304,10 @@ impl fmt::Display for EscapedDisplay<'_> {
 mod tests {
     use std::collections::{BTreeMap, HashMap, HashSet};
 
+    use ts_ast::SyntaxKind;
+    use ts_core::SourceText;
+    use ts_scanner::ByteScanner;
+
     use super::{EscapedName, EscapedNameRef, INTERNAL_SYMBOL_NAME_PREFIX, InternalSymbolName};
 
     #[test]
@@ -348,6 +358,32 @@ mod tests {
         assert_eq!(source_lookalike.escaped_display().to_string(), "__call");
         assert_eq!(internal.escaped_display().to_string(), "__call");
         assert_eq!(unicode_thorn.escaped_display().to_string(), "þcall");
+    }
+
+    #[test]
+    fn every_prefixed_internal_name_differs_from_its_source_lookalike() {
+        for internal in InternalSymbolName::ALL
+            .into_iter()
+            .filter(|name| name.as_bytes().starts_with(&[INTERNAL_SYMBOL_NAME_PREFIX]))
+        {
+            let internal = EscapedName::internal(internal);
+            let lookalike = EscapedName::source(internal.escaped_display().to_string());
+            assert_ne!(internal, lookalike);
+            assert_ne!(internal.as_bytes(), lookalike.as_bytes());
+        }
+    }
+
+    #[test]
+    fn raw_internal_prefix_is_rejected_by_the_source_scanner() {
+        let source = SourceText::from_bytes(b"\xFEcall".to_vec());
+        let mut scanner = ByteScanner::new(&source);
+        let invalid = scanner.scan();
+        assert_eq!(invalid.kind, SyntaxKind::Unknown);
+        assert_eq!(invalid.text, &[INTERNAL_SYMBOL_NAME_PREFIX]);
+        let identifier = scanner.scan();
+        assert_eq!(identifier.kind, SyntaxKind::Identifier);
+        assert_eq!(identifier.text, b"call");
+        assert_eq!(scanner.diagnostics().len(), 1);
     }
 
     #[test]
