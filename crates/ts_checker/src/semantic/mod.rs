@@ -27,6 +27,7 @@ pub mod relater;
 pub mod relation;
 pub mod signatures;
 pub mod source;
+mod spelling;
 mod store;
 pub mod type_nodes;
 pub mod type_records;
