@@ -17,9 +17,11 @@ use ts_binder::{
 };
 
 use super::{
-    DeclaredTypeHost,
+    CanonicalGlobalTypeInitializationError, CanonicalGlobalTypes, DeclaredTypeHost,
     bootstrap::LiteralTypeCacheError,
+    declared::type_list_key,
     derived_types::DerivedObjectLiteralValidation,
+    global_types::preflight_generic_global_type_target,
     ids::TypeId,
     links::{MembersOrExportsResolutionKind, ValueSymbolLinks},
     mapper::TypeMapper,
@@ -69,6 +71,9 @@ pub enum RelationUnavailable {
     UnresolvedPropertyType(SemanticSymbolId),
     StrictOptionalProperty(SemanticSymbolId),
     UnresolvedGlobalObject(SemanticSymbolId),
+    CanonicalGlobalType(CanonicalGlobalTypeInitializationError),
+    UnavailableCanonicalArrayTarget(TypeId),
+    MalformedCanonicalArrayReference(TypeId),
     StructuralRelation {
         source: TypeId,
         target: TypeId,
@@ -188,6 +193,20 @@ impl std::fmt::Display for RelationUnavailable {
                 formatter,
                 "global Object symbol {symbol:?} has no resolved declared object type"
             ),
+            Self::CanonicalGlobalType(error) => {
+                write!(
+                    formatter,
+                    "canonical relation global is unavailable: {error}"
+                )
+            }
+            Self::UnavailableCanonicalArrayTarget(type_id) => write!(
+                formatter,
+                "type {type_id:?} is a missing canonical Array target fallback"
+            ),
+            Self::MalformedCanonicalArrayReference(type_id) => write!(
+                formatter,
+                "type {type_id:?} is not a canonical Array reference or array-literal clone"
+            ),
             Self::StructuralRelation {
                 source,
                 target,
@@ -214,6 +233,25 @@ struct RelationBootstrapFacts {
     string_type: TypeId,
     number_type: TypeId,
     bigint_type: TypeId,
+}
+
+#[derive(Clone, Copy)]
+struct RelationGlobalTypes {
+    array_type: TypeId,
+    readonly_array_type: TypeId,
+}
+
+impl RelationGlobalTypes {
+    const fn from_global_types(global_types: &CanonicalGlobalTypes) -> Self {
+        Self {
+            array_type: global_types.array_type,
+            readonly_array_type: global_types.readonly_array_type,
+        }
+    }
+
+    fn contains_array_target(self, target: TypeId) -> bool {
+        target == self.array_type || target == self.readonly_array_type
+    }
 }
 
 const PINNED_RELATION_STACK_DEPTH: usize = 100;
@@ -306,6 +344,8 @@ struct RelaterSession<'store> {
     store: &'store mut SemanticStore<TypeRecord, TypeMapper>,
     relation: RelationKind,
     bootstrap: RelationBootstrapFacts,
+    global_types: Option<RelationGlobalTypes>,
+    validated_array_targets: HashSet<TypeId>,
     validated_unions: HashMap<TypeId, Vec<TypeId>>,
     pending: PendingRelationCache,
     maybe_keys: Vec<CacheHashKey>,
@@ -324,11 +364,21 @@ impl<'store> RelaterSession<'store> {
         relation: RelationKind,
         bootstrap: RelationBootstrapFacts,
     ) -> Self {
+        Self::new_with_global_types(store, relation, bootstrap, None)
+    }
+
+    fn new_with_global_types(
+        store: &'store mut SemanticStore<TypeRecord, TypeMapper>,
+        relation: RelationKind,
+        bootstrap: RelationBootstrapFacts,
+        global_types: Option<RelationGlobalTypes>,
+    ) -> Self {
         let relation_count = store.relation_comparison_budget(relation);
-        Self::new_with_limits(
+        Self::new_with_limits_and_global_types(
             store,
             relation,
             bootstrap,
+            global_types,
             relation_count,
             PINNED_RELATION_STACK_DEPTH,
         )
@@ -341,10 +391,30 @@ impl<'store> RelaterSession<'store> {
         relation_count: isize,
         stack_depth_limit: usize,
     ) -> Self {
+        Self::new_with_limits_and_global_types(
+            store,
+            relation,
+            bootstrap,
+            None,
+            relation_count,
+            stack_depth_limit,
+        )
+    }
+
+    fn new_with_limits_and_global_types(
+        store: &'store mut SemanticStore<TypeRecord, TypeMapper>,
+        relation: RelationKind,
+        bootstrap: RelationBootstrapFacts,
+        global_types: Option<RelationGlobalTypes>,
+        relation_count: isize,
+        stack_depth_limit: usize,
+    ) -> Self {
         Self {
             store,
             relation,
             bootstrap,
+            global_types,
+            validated_array_targets: HashSet::new(),
             validated_unions: HashMap::new(),
             pending: PendingRelationCache::default(),
             maybe_keys: Vec::new(),
@@ -390,6 +460,13 @@ impl<'store> RelaterSession<'store> {
         Ok(result != Ternary::False)
     }
 
+    fn finish_without_specialized_root_cache(self, result: Ternary) -> bool {
+        for (key, value) in self.pending.writes {
+            self.store.relation_cache_set(self.relation, key, value);
+        }
+        result != Ternary::False
+    }
+
     fn cache_get(&self, key: CacheHashKey) -> RelationComparisonResult {
         self.pending.get(self.store, self.relation, key)
     }
@@ -406,6 +483,122 @@ impl<'store> RelaterSession<'store> {
             self.relation,
             RelationKind::Subtype | RelationKind::StrictSubtype
         )
+    }
+
+    fn matching_array_reference_target(
+        &self,
+        source: TypeId,
+        target: TypeId,
+    ) -> Result<Option<TypeId>, RelationUnavailable> {
+        matching_configured_array_reference_target(self.store, self.global_types, source, target)
+    }
+
+    fn validate_canonical_array_target(
+        &mut self,
+        target: TypeId,
+    ) -> Result<(), RelationUnavailable> {
+        if self.validated_array_targets.contains(&target) {
+            return Ok(());
+        }
+        let fallback = preflight_generic_global_type_target(self.store, target)
+            .map_err(RelationUnavailable::CanonicalGlobalType)?;
+        if fallback.is_some() {
+            return Err(RelationUnavailable::UnavailableCanonicalArrayTarget(target));
+        }
+        self.validated_array_targets.insert(target);
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)] // One read-only Array-reference invariant matrix.
+    fn canonical_array_reference_argument(
+        &mut self,
+        type_id: TypeId,
+        target: TypeId,
+    ) -> Result<TypeId, RelationUnavailable> {
+        self.validate_canonical_array_target(target)?;
+
+        let record = self
+            .store
+            .type_payload(type_id)
+            .ok_or(RelationUnavailable::Type(type_id))?;
+        let TypeData::TypeReference(reference) = record.data() else {
+            return Err(RelationUnavailable::MalformedCanonicalArrayReference(
+                type_id,
+            ));
+        };
+        let Some([argument]) = reference.resolved_type_arguments.as_deref() else {
+            return Err(RelationUnavailable::MalformedCanonicalArrayReference(
+                type_id,
+            ));
+        };
+        let argument = *argument;
+        if record.flags() != TypeFlags::OBJECT
+            || reference.object.target != Some(target)
+            || reference.object.mapper.is_some()
+            || reference.object.instantiations != TypeCacheState::Unallocated
+            || reference.node.is_some()
+            || record.alias().is_some()
+            || self.store.type_payload(argument).is_none()
+        {
+            return Err(RelationUnavailable::MalformedCanonicalArrayReference(
+                type_id,
+            ));
+        }
+
+        let target_record = self
+            .store
+            .type_payload(target)
+            .expect("the canonical Array target was preflighted");
+        let TypeData::Interface(interface) = target_record.data() else {
+            unreachable!("the canonical Array target changed after preflight")
+        };
+        let TypeCacheState::Allocated(instantiations) = &interface.reference.object.instantiations
+        else {
+            unreachable!("the canonical Array cache changed after preflight")
+        };
+        let Some(canonical) = instantiations.get(&type_list_key(&[argument])).copied() else {
+            return Err(RelationUnavailable::MalformedCanonicalArrayReference(
+                type_id,
+            ));
+        };
+        if record.symbol() != target_record.symbol() {
+            return Err(RelationUnavailable::MalformedCanonicalArrayReference(
+                type_id,
+            ));
+        }
+
+        if canonical == type_id {
+            return if record.object_flags().intersects(ObjectFlags::ARRAY_LITERAL) {
+                Err(RelationUnavailable::MalformedCanonicalArrayReference(
+                    type_id,
+                ))
+            } else {
+                Ok(argument)
+            };
+        }
+
+        if !record.object_flags().intersects(ObjectFlags::ARRAY_LITERAL) {
+            return Err(RelationUnavailable::MalformedCanonicalArrayReference(
+                type_id,
+            ));
+        }
+        self.store
+            .validate_array_literal_clone(canonical, type_id)
+            .map_err(|_| RelationUnavailable::MalformedCanonicalArrayReference(type_id))?;
+        Ok(argument)
+    }
+
+    fn canonical_array_reference_arguments(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+    ) -> Result<Option<(TypeId, TypeId)>, RelationUnavailable> {
+        let Some(array_target) = self.matching_array_reference_target(source, target)? else {
+            return Ok(None);
+        };
+        let source_argument = self.canonical_array_reference_argument(source, array_target)?;
+        let target_argument = self.canonical_array_reference_argument(target, array_target)?;
+        Ok(Some((source_argument, target_argument)))
     }
 
     fn union_types(&mut self, type_id: TypeId) -> Result<Vec<TypeId>, RelationUnavailable> {
@@ -505,6 +698,16 @@ impl<'store> RelaterSession<'store> {
                     recursion_flags,
                 );
             }
+            if let Some((source_argument, target_argument)) =
+                self.canonical_array_reference_arguments(source, target)?
+            {
+                return self.is_related_to_ex(
+                    source_argument,
+                    target_argument,
+                    RecursionFlags::BOTH,
+                    intersection_state,
+                );
+            }
             if !source_flags.intersects(TypeFlags::STRUCTURED_OR_INSTANTIABLE) {
                 return Ok(Ternary::False);
             }
@@ -577,6 +780,16 @@ impl<'store> RelaterSession<'store> {
         if source_flags.intersects(TypeFlags::STRUCTURED_OR_INSTANTIABLE)
             || target_flags.intersects(TypeFlags::STRUCTURED_OR_INSTANTIABLE)
         {
+            if let Some((source_argument, target_argument)) =
+                self.canonical_array_reference_arguments(source, target)?
+            {
+                return self.is_related_to_ex(
+                    source_argument,
+                    target_argument,
+                    RecursionFlags::BOTH,
+                    intersection_state,
+                );
+            }
             if supports_property_object_relation(self.relation)
                 && source_flags.intersects(TypeFlags::OBJECT)
                 && target_flags.intersects(TypeFlags::OBJECT)
@@ -2280,6 +2493,27 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         self.is_type_related_to(source, target, RelationKind::Identity)
     }
 
+    /// Global-aware [`Self::is_type_identical_to`] for canonical `Array` and
+    /// `ReadonlyArray` references.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RelationUnavailable`] when a required canonical record,
+    /// global target, or unported relation capability is unavailable.
+    pub fn is_type_identical_to_with_global_types(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+        global_types: &CanonicalGlobalTypes,
+    ) -> Result<bool, RelationUnavailable> {
+        self.is_type_related_to_with_global_types(
+            source,
+            target,
+            RelationKind::Identity,
+            global_types,
+        )
+    }
+
     /// Pinned `compareTypesIdentical` for the dependency-closed relation domain.
     ///
     /// # Errors
@@ -2357,6 +2591,27 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         self.is_type_related_to(source, target, RelationKind::Assignable)
     }
 
+    /// Global-aware [`Self::is_type_assignable_to`] for canonical `Array` and
+    /// `ReadonlyArray` references.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RelationUnavailable`] when a required canonical record,
+    /// global target, or unported relation capability is unavailable.
+    pub fn is_type_assignable_to_with_global_types(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+        global_types: &CanonicalGlobalTypes,
+    ) -> Result<bool, RelationUnavailable> {
+        self.is_type_related_to_with_global_types(
+            source,
+            target,
+            RelationKind::Assignable,
+            global_types,
+        )
+    }
+
     /// Pinned `isTypeSubtypeOf`.
     ///
     /// # Errors
@@ -2369,6 +2624,27 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         target: TypeId,
     ) -> Result<bool, RelationUnavailable> {
         self.is_type_related_to(source, target, RelationKind::Subtype)
+    }
+
+    /// Global-aware [`Self::is_type_subtype_of`] for canonical `Array` and
+    /// `ReadonlyArray` references.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RelationUnavailable`] when a required canonical record,
+    /// global target, or unported relation capability is unavailable.
+    pub fn is_type_subtype_of_with_global_types(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+        global_types: &CanonicalGlobalTypes,
+    ) -> Result<bool, RelationUnavailable> {
+        self.is_type_related_to_with_global_types(
+            source,
+            target,
+            RelationKind::Subtype,
+            global_types,
+        )
     }
 
     /// Pinned `isTypeStrictSubtypeOf`.
@@ -2385,6 +2661,27 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         self.is_type_related_to(source, target, RelationKind::StrictSubtype)
     }
 
+    /// Global-aware [`Self::is_type_strict_subtype_of`] for canonical `Array`
+    /// and `ReadonlyArray` references.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RelationUnavailable`] when a required canonical record,
+    /// global target, or unported relation capability is unavailable.
+    pub fn is_type_strict_subtype_of_with_global_types(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+        global_types: &CanonicalGlobalTypes,
+    ) -> Result<bool, RelationUnavailable> {
+        self.is_type_related_to_with_global_types(
+            source,
+            target,
+            RelationKind::StrictSubtype,
+            global_types,
+        )
+    }
+
     /// Pinned `isTypeComparableTo`.
     ///
     /// # Errors
@@ -2397,6 +2694,27 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         target: TypeId,
     ) -> Result<bool, RelationUnavailable> {
         self.is_type_related_to(source, target, RelationKind::Comparable)
+    }
+
+    /// Global-aware [`Self::is_type_comparable_to`] for canonical `Array` and
+    /// `ReadonlyArray` references.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RelationUnavailable`] when a required canonical record,
+    /// global target, or unported relation capability is unavailable.
+    pub fn is_type_comparable_to_with_global_types(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+        global_types: &CanonicalGlobalTypes,
+    ) -> Result<bool, RelationUnavailable> {
+        self.is_type_related_to_with_global_types(
+            source,
+            target,
+            RelationKind::Comparable,
+            global_types,
+        )
     }
 
     /// Pinned `areTypesComparable`, including directional short-circuiting.
@@ -2416,6 +2734,25 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         self.is_type_comparable_to(right, left)
     }
 
+    /// Global-aware [`Self::are_types_comparable`] for canonical `Array` and
+    /// `ReadonlyArray` references.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RelationUnavailable`] when a required canonical record,
+    /// global target, or unported relation capability is unavailable.
+    pub fn are_types_comparable_with_global_types(
+        &mut self,
+        left: TypeId,
+        right: TypeId,
+        global_types: &CanonicalGlobalTypes,
+    ) -> Result<bool, RelationUnavailable> {
+        if self.is_type_comparable_to_with_global_types(left, right, global_types)? {
+            return Ok(true);
+        }
+        self.is_type_comparable_to_with_global_types(right, left, global_types)
+    }
+
     /// Pinned `isTypeRelatedTo` through its exact simple and cache-read paths.
     ///
     /// # Errors
@@ -2427,6 +2764,38 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         source: TypeId,
         target: TypeId,
         relation: RelationKind,
+    ) -> Result<bool, RelationUnavailable> {
+        self.is_type_related_to_with_optional_global_types(source, target, relation, None)
+    }
+
+    /// Pinned `isTypeRelatedTo` with authoritative standard-library identities
+    /// for relation families that require them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RelationUnavailable`] when a required canonical record,
+    /// global target, or unported relation capability is unavailable.
+    pub fn is_type_related_to_with_global_types(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+        relation: RelationKind,
+        global_types: &CanonicalGlobalTypes,
+    ) -> Result<bool, RelationUnavailable> {
+        self.is_type_related_to_with_optional_global_types(
+            source,
+            target,
+            relation,
+            Some(RelationGlobalTypes::from_global_types(global_types)),
+        )
+    }
+
+    fn is_type_related_to_with_optional_global_types(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+        relation: RelationKind,
+        global_types: Option<RelationGlobalTypes>,
     ) -> Result<bool, RelationUnavailable> {
         let bootstrap = self.relation_bootstrap_facts()?;
         let source = self.regular_type_if_fresh(source)?;
@@ -2459,7 +2828,13 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             }
         }
 
-        if source_flags.intersects(TypeFlags::OBJECT) && target_flags.intersects(TypeFlags::OBJECT)
+        let supported_array_relation = source_flags.intersects(TypeFlags::OBJECT)
+            && target_flags.intersects(TypeFlags::OBJECT)
+            && matching_configured_array_reference_target(self, global_types, source, target)?
+                .is_some();
+        if source_flags.intersects(TypeFlags::OBJECT)
+            && target_flags.intersects(TypeFlags::OBJECT)
+            && !supported_array_relation
         {
             let key = self
                 .relation_key_if_available(
@@ -2484,15 +2859,20 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             let supported_object_relation = supports_property_object_relation(relation)
                 && source_flags.intersects(TypeFlags::OBJECT)
                 && target_flags.intersects(TypeFlags::OBJECT);
-            if union_relation || supported_object_relation {
-                let mut session = RelaterSession::new(self, relation, bootstrap);
+            if union_relation || supported_object_relation || supported_array_relation {
+                let mut session =
+                    RelaterSession::new_with_global_types(self, relation, bootstrap, global_types);
                 let result = session.is_related_to_ex(
                     source,
                     target,
                     RecursionFlags::BOTH,
                     IntersectionState::NONE,
                 )?;
-                return session.finish(source, target, result);
+                return if supported_array_relation {
+                    Ok(session.finish_without_specialized_root_cache(result))
+                } else {
+                    session.finish(source, target, result)
+                };
             }
             return Err(RelationUnavailable::StructuralRelation {
                 source,
@@ -2911,6 +3291,34 @@ impl SemanticStore<TypeRecord, TypeMapper> {
     }
 }
 
+fn matching_configured_array_reference_target(
+    store: &SemanticStore<TypeRecord, TypeMapper>,
+    global_types: Option<RelationGlobalTypes>,
+    source: TypeId,
+    target: TypeId,
+) -> Result<Option<TypeId>, RelationUnavailable> {
+    let Some(global_types) = global_types else {
+        return Ok(None);
+    };
+    let source_record = store
+        .type_payload(source)
+        .ok_or(RelationUnavailable::Type(source))?;
+    let target_record = store
+        .type_payload(target)
+        .ok_or(RelationUnavailable::Type(target))?;
+    let (TypeData::TypeReference(source_reference), TypeData::TypeReference(target_reference)) =
+        (source_record.data(), target_record.data())
+    else {
+        return Ok(None);
+    };
+    let Some(reference_target) = source_reference.object.target else {
+        return Ok(None);
+    };
+    Ok((target_reference.object.target == Some(reference_target)
+        && global_types.contains_array_target(reference_target))
+    .then_some(reference_target))
+}
+
 const fn bool_to_ternary(value: bool) -> Ternary {
     if value { Ternary::True } else { Ternary::False }
 }
@@ -2991,11 +3399,13 @@ mod tests {
     use ts_jsnum::{Number, PseudoBigInt};
     use ts_parser::parse_source_file;
 
-    use super::RelationUnavailable;
+    use super::{RelationGlobalTypes, RelationUnavailable};
     use crate::semantic::{
-        CanonicalTypeMapperStore, DeclaredTypeLinks, IntrinsicBootstrapOptions,
-        MembersAndExportsLinks, MembersOrExportsResolutionKind, RelationComparisonResult,
-        RelationKind, TypeAliasLinks, TypeId, ValueSymbolLinks,
+        CanonicalGlobalTypeInitializationError, CanonicalTypeMapperStore, DeclaredTypeLinks,
+        IntrinsicBootstrapOptions, MembersAndExportsLinks, MembersOrExportsResolutionKind,
+        RelationComparisonResult, RelationKind, TypeAliasLinks, TypeId, ValueSymbolLinks,
+        declared::type_list_key,
+        global_types::create_type_from_generic_global_type,
         signatures::{SignatureFlags, Ternary},
         type_records::{LiteralValue, RegularLiteralLink, TypeData},
         types::{ObjectFlags, TypeFlags},
@@ -3404,6 +3814,70 @@ mod tests {
         assert!(store.set_object_target_and_mapper(reference, Some(target), None));
         assert!(store.set_type_reference_resolution(reference, None, Some(arguments)));
         reference
+    }
+
+    #[derive(Clone, Copy)]
+    struct CanonicalArrayTargetFixture {
+        target: TypeId,
+        symbol: SemanticSymbolId,
+    }
+
+    fn alloc_canonical_array_target(
+        store: &mut TestStore,
+        name: &str,
+    ) -> CanonicalArrayTargetFixture {
+        let symbol = alloc_symbol(store, SymbolFlags::INTERFACE, name);
+        let parameter_symbol = alloc_symbol(store, SymbolFlags::TYPE_PARAMETER, "T");
+        let parameter = store.alloc_type_parameter(Some(parameter_symbol)).unwrap();
+        assert!(store.set_declared_type_links(
+            parameter_symbol,
+            DeclaredTypeLinks {
+                declared_type: Some(parameter),
+                ..DeclaredTypeLinks::default()
+            },
+        ));
+        let target = store
+            .alloc_interface_type(ObjectFlags::INTERFACE, Some(symbol))
+            .unwrap();
+        let this_type = store.alloc_type_parameter(Some(symbol)).unwrap();
+        assert!(store.initialize_interface_type_parameters(
+            target,
+            vec![parameter, this_type],
+            0,
+            this_type,
+            type_list_key(&[parameter]),
+        ));
+        CanonicalArrayTargetFixture { target, symbol }
+    }
+
+    fn canonical_array_reference(
+        store: &mut TestStore,
+        target: TypeId,
+        argument: TypeId,
+    ) -> TypeId {
+        create_type_from_generic_global_type(store, target, argument, ObjectFlags::NONE).unwrap()
+    }
+
+    fn alloc_array_literal_clone(
+        store: &mut TestStore,
+        target: CanonicalArrayTargetFixture,
+        argument: TypeId,
+    ) -> TypeId {
+        let base = canonical_array_reference(store, target.target, argument);
+        let flags = (store.type_payload(base).unwrap().object_flags()
+            & !ObjectFlags::MEMBERS_RESOLVED)
+            | ObjectFlags::ARRAY_LITERAL
+            | ObjectFlags::CONTAINS_OBJECT_OR_ARRAY_LITERAL;
+        let clone = store
+            .alloc_type_reference(flags, Some(target.symbol))
+            .unwrap();
+        assert!(store.set_object_target_and_mapper(clone, Some(target.target), None));
+        assert!(store.set_type_reference_resolution(clone, None, Some(vec![argument]),));
+        assert_eq!(
+            store.derived_types.array_literal_types.insert(base, clone),
+            None
+        );
+        clone
     }
 
     fn cache_resolved_members(
@@ -4455,6 +4929,232 @@ mod tests {
             ))
         );
         assert_eq!(store.relation_state_snapshot(), before);
+    }
+
+    #[test]
+    fn explicit_global_array_relations_are_covariant_and_target_local() {
+        let mut store = initialized(true);
+        let (number, string) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.number_type, bootstrap.string_type)
+        };
+        let number_or_string = canonical_union(&mut store, &[number, string]);
+        let array = alloc_canonical_array_target(&mut store, "Array");
+        let readonly_array = alloc_canonical_array_target(&mut store, "ReadonlyArray");
+        let global_types = RelationGlobalTypes {
+            array_type: array.target,
+            readonly_array_type: readonly_array.target,
+        };
+        let array_number = canonical_array_reference(&mut store, array.target, number);
+        let array_union = canonical_array_reference(&mut store, array.target, number_or_string);
+        let readonly_number = canonical_array_reference(&mut store, readonly_array.target, number);
+        let readonly_union =
+            canonical_array_reference(&mut store, readonly_array.target, number_or_string);
+
+        let before_no_globals = store.relation_state_snapshot();
+        assert_eq!(
+            store.is_type_assignable_to(array_number, array_union),
+            Err(RelationUnavailable::UnsupportedStructuredType(array_union))
+        );
+        assert_eq!(store.relation_state_snapshot(), before_no_globals);
+
+        for relation in [
+            RelationKind::Assignable,
+            RelationKind::Subtype,
+            RelationKind::StrictSubtype,
+        ] {
+            assert_eq!(
+                store.is_type_related_to_with_optional_global_types(
+                    array_number,
+                    array_union,
+                    relation,
+                    Some(global_types),
+                ),
+                Ok(true)
+            );
+            assert_eq!(
+                store.is_type_related_to_with_optional_global_types(
+                    array_union,
+                    array_number,
+                    relation,
+                    Some(global_types),
+                ),
+                Ok(false)
+            );
+            assert_eq!(
+                store.is_type_related_to_with_optional_global_types(
+                    readonly_number,
+                    readonly_union,
+                    relation,
+                    Some(global_types),
+                ),
+                Ok(true)
+            );
+        }
+        assert_eq!(
+            store.is_type_related_to_with_optional_global_types(
+                array_number,
+                array_union,
+                RelationKind::Identity,
+                Some(global_types),
+            ),
+            Ok(false)
+        );
+        let after_global_warmup = store.relation_state_snapshot();
+        assert_eq!(
+            store.is_type_assignable_to(array_number, array_union),
+            Err(RelationUnavailable::UnsupportedStructuredType(array_union)),
+            "global-aware Array answers do not leak through the shared legacy cache"
+        );
+        assert_eq!(store.relation_state_snapshot(), after_global_warmup);
+        assert_eq!(
+            store.is_type_related_to_with_optional_global_types(
+                array_number,
+                readonly_union,
+                RelationKind::Assignable,
+                Some(global_types),
+            ),
+            Err(RelationUnavailable::UnsupportedStructuredType(
+                readonly_union
+            )),
+            "different generic targets do not acquire inferred variance"
+        );
+    }
+
+    #[test]
+    fn canonical_array_literal_clones_and_malformed_references_are_distinguished() {
+        let mut store = initialized(true);
+        let number = store.intrinsic_bootstrap().unwrap().number_type;
+        let array = alloc_canonical_array_target(&mut store, "Array");
+        let global_types = RelationGlobalTypes {
+            array_type: array.target,
+            readonly_array_type: array.target,
+        };
+        let base = canonical_array_reference(&mut store, array.target, number);
+        let literal = alloc_array_literal_clone(&mut store, array, number);
+        assert_eq!(
+            store.is_type_related_to_with_optional_global_types(
+                literal,
+                base,
+                RelationKind::Identity,
+                Some(global_types),
+            ),
+            Ok(true)
+        );
+
+        let malformed_literal = store
+            .alloc_type_reference(ObjectFlags::ARRAY_LITERAL, Some(array.symbol))
+            .unwrap();
+        assert!(store.set_object_target_and_mapper(malformed_literal, Some(array.target), None,));
+        assert!(store.set_type_reference_resolution(malformed_literal, None, Some(vec![number]),));
+        let before_malformed = store.relation_state_snapshot();
+        assert_eq!(
+            store.is_type_related_to_with_optional_global_types(
+                base,
+                malformed_literal,
+                RelationKind::Assignable,
+                Some(global_types),
+            ),
+            Err(RelationUnavailable::MalformedCanonicalArrayReference(
+                malformed_literal
+            ))
+        );
+        assert_eq!(store.relation_state_snapshot(), before_malformed);
+
+        let literal_flags = store.type_payload(literal).unwrap().object_flags();
+        let uncached_literal = store
+            .alloc_type_reference(literal_flags, Some(array.symbol))
+            .unwrap();
+        assert!(store.set_object_target_and_mapper(uncached_literal, Some(array.target), None,));
+        assert!(store.set_type_reference_resolution(uncached_literal, None, Some(vec![number]),));
+        let before_uncached_literal = store.relation_state_snapshot();
+        assert_eq!(
+            store.is_type_related_to_with_optional_global_types(
+                base,
+                uncached_literal,
+                RelationKind::Assignable,
+                Some(global_types),
+            ),
+            Err(RelationUnavailable::MalformedCanonicalArrayReference(
+                uncached_literal
+            )),
+            "an exact-shape clone without derived-cache ownership is rejected"
+        );
+        assert_eq!(store.relation_state_snapshot(), before_uncached_literal);
+
+        let forged = store
+            .alloc_type_reference(ObjectFlags::NONE, Some(array.symbol))
+            .unwrap();
+        assert!(store.set_object_target_and_mapper(forged, Some(array.target), None));
+        assert!(store.set_type_reference_resolution(forged, None, Some(vec![number]),));
+        let before_forged = store.relation_state_snapshot();
+        assert_eq!(
+            store.is_type_related_to_with_optional_global_types(
+                base,
+                forged,
+                RelationKind::Assignable,
+                Some(global_types),
+            ),
+            Err(RelationUnavailable::MalformedCanonicalArrayReference(
+                forged
+            ))
+        );
+        assert_eq!(store.relation_state_snapshot(), before_forged);
+    }
+
+    #[test]
+    fn poisoned_or_fallback_array_targets_fail_without_relation_cache_writes() {
+        let mut store = initialized(true);
+        let (number, string, empty_generic) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.number_type,
+                bootstrap.string_type,
+                bootstrap.empty_generic_type,
+            )
+        };
+        let number_or_string = canonical_union(&mut store, &[number, string]);
+        let array = alloc_canonical_array_target(&mut store, "Array");
+        let global_types = RelationGlobalTypes {
+            array_type: array.target,
+            readonly_array_type: array.target,
+        };
+        let array_number = canonical_array_reference(&mut store, array.target, number);
+        let array_union = canonical_array_reference(&mut store, array.target, number_or_string);
+        assert!(store.set_type_reference_resolution(array_union, None, Some(vec![number]),));
+        let before_poisoned = store.relation_state_snapshot();
+        assert_eq!(
+            store.is_type_related_to_with_optional_global_types(
+                array_number,
+                array_union,
+                RelationKind::Assignable,
+                Some(global_types),
+            ),
+            Err(RelationUnavailable::CanonicalGlobalType(
+                CanonicalGlobalTypeInitializationError::InvalidInstantiationCache(array.target)
+            ))
+        );
+        assert_eq!(store.relation_state_snapshot(), before_poisoned);
+
+        let fallback_source = alloc_reference(&mut store, empty_generic, vec![number]);
+        let fallback_target = alloc_reference(&mut store, empty_generic, vec![string]);
+        let fallback_globals = RelationGlobalTypes {
+            array_type: empty_generic,
+            readonly_array_type: empty_generic,
+        };
+        let before_fallback = store.relation_state_snapshot();
+        assert_eq!(
+            store.is_type_related_to_with_optional_global_types(
+                fallback_source,
+                fallback_target,
+                RelationKind::Assignable,
+                Some(fallback_globals),
+            ),
+            Err(RelationUnavailable::UnavailableCanonicalArrayTarget(
+                empty_generic
+            ))
+        );
+        assert_eq!(store.relation_state_snapshot(), before_fallback);
     }
 
     #[test]
