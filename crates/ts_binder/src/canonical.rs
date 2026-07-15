@@ -955,7 +955,6 @@ impl CanonicalBinder {
         let order = bound.traversal_order.clone();
         if let Some(node) = order.iter().copied().find(|node| {
             !declaration_family_supported(arena, *node)
-                || is_misclassified_constructor_method(arena, *node)
                 || declaration_name_shape_unsupported(arena, *node)
         }) {
             return Err(CanonicalDeclarationError::UnsupportedDeclarationFamily(
@@ -2374,30 +2373,6 @@ fn declaration_name_shape_unsupported(arena: &NodeArena, node: NodeId) -> bool {
         .and_then(|name| arena.get(name))
         .is_some_and(|name| name.kind == SyntaxKind::PrivateIdentifier)
         && containing_class(arena, node).is_none()
-}
-
-fn is_misclassified_constructor_method(arena: &NodeArena, node: NodeId) -> bool {
-    let Some(NodeData::MethodDeclaration(method)) = arena.get(node).map(|node| &node.data) else {
-        return false;
-    };
-    let in_class = arena
-        .get(node)
-        .and_then(|node| node.parent)
-        .and_then(|parent| arena.get(parent))
-        .is_some_and(|parent| {
-            matches!(
-                parent.kind,
-                SyntaxKind::ClassDeclaration | SyntaxKind::ClassExpression
-            )
-        });
-    in_class
-        && arena.get(method.name).is_some_and(|name| {
-            matches!(
-                name.kind,
-                SyntaxKind::Identifier | SyntaxKind::StringLiteral
-            )
-        })
-        && node_text(arena, method.name).as_deref() == Some("constructor")
 }
 
 fn root_declaration(arena: &NodeArena, mut node: NodeId) -> NodeId {
@@ -5475,6 +5450,7 @@ const enum CE { B }
 class Model<T> {
     static count: number;
     value?: T;
+    constructor(public id: string, value: T) { this.value = value; }
     method<U>(input: U): U { return input; }
     get item(): T { return this.value; }
     set item(value: T) { this.value = value; }
@@ -5561,7 +5537,7 @@ const object = {};
         let class = node_with_source(
             &parsed.arena,
             SyntaxKind::ClassDeclaration,
-            "class Model<T> {\n    static count: number;\n    value?: T;\n    method<U>(input: U): U { return input; }\n    get item(): T { return this.value; }\n    set item(value: T) { this.value = value; }\n}",
+            "class Model<T> {\n    static count: number;\n    value?: T;\n    constructor(public id: string, value: T) { this.value = value; }\n    method<U>(input: U): U { return input; }\n    get item(): T { return this.value; }\n    set item(value: T) { this.value = value; }\n}",
         );
         let class_symbol = bound.symbol(node_ref(&parsed.arena, file, class)).unwrap();
         let class_record = binder.symbol_store().symbol(class_symbol).unwrap();
@@ -5569,9 +5545,14 @@ const object = {};
             .symbol_store()
             .symbol_table(class_record.members().unwrap())
             .unwrap();
-        for name in ["T", "value", "method", "item"] {
+        for name in ["T", "value", "id", "method", "item"] {
             assert!(class_members.get_source(name).is_some());
         }
+        assert!(
+            class_members
+                .get(InternalSymbolName::Constructor.as_ref())
+                .is_some()
+        );
         let class_exports = binder
             .symbol_store()
             .symbol_table(class_record.exports().unwrap())
@@ -5585,6 +5566,35 @@ const object = {};
         );
         assert_eq!(prototype_record.parent(), Some(class_symbol));
         assert!(prototype_record.declarations().is_none());
+
+        let constructor = nodes_of_kind(&parsed.arena, SyntaxKind::Constructor)[0];
+        let constructor_locals = binder
+            .symbol_store()
+            .symbol_table(
+                bound
+                    .locals(node_ref(&parsed.arena, file, constructor))
+                    .unwrap(),
+            )
+            .unwrap();
+        let NodeData::ConstructorDeclaration(constructor_data) =
+            &parsed.arena.get(constructor).unwrap().data
+        else {
+            unreachable!();
+        };
+        let property_parameter = constructor_data.parameters.nodes[0];
+        let local_parameter = constructor_locals.get_source("id").unwrap();
+        let property = class_members.get_source("id").unwrap();
+        assert_ne!(local_parameter, property);
+        assert_eq!(
+            bound
+                .symbol(node_ref(&parsed.arena, file, property_parameter))
+                .unwrap(),
+            property
+        );
+        assert_eq!(
+            binder.symbol_store().symbol(property).unwrap().flags(),
+            SymbolFlags::PROPERTY
+        );
 
         let function_type = nodes_of_kind(&parsed.arena, SyntaxKind::FunctionType)[0];
         let function_type_symbol = bound
