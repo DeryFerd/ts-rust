@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 
 use ts_ast::NodeRef;
-use ts_binder::{EscapedName, SemanticSymbolId, SymbolTableId};
+use ts_binder::{EscapedName, InternalSymbolName, SemanticSymbolId, SymbolTableId};
 use ts_jsnum::{Number, PseudoBigInt};
 
 use super::{
@@ -758,15 +758,18 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         })
     }
 
-    pub fn alloc_unique_es_symbol_type(
-        &mut self,
-        symbol: Option<SemanticSymbolId>,
-        name: EscapedName,
-    ) -> Option<TypeId> {
+    /// Allocates the identity-bearing unique-symbol type for `symbol`.
+    ///
+    /// Pinned `getESSymbolLikeTypeForNode` derives this name from the symbol's
+    /// immutable name and lazily assigned process-global ID. Keeping that
+    /// derivation here prevents callers from constructing a unique-symbol type
+    /// whose `symbol` and `name` identify different declarations.
+    pub fn alloc_unique_es_symbol_type(&mut self, symbol: SemanticSymbolId) -> Option<TypeId> {
+        let name = self.unique_symbol_name(symbol)?;
         self.alloc_record(
             TypeFlags::UNIQUE_ES_SYMBOL,
             ObjectFlags::NONE,
-            symbol,
+            Some(symbol),
             |_| TypeData::UniqueEsSymbol(UniqueEsSymbolTypeData { name }),
         )
     }
@@ -1102,7 +1105,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
 
     /// Replaces cached/modifier object flags without permitting a payload-kind
     /// transition. Interface `Reference` state is changed atomically by
-    /// [`Self::set_interface_type_parameters`], not through this method.
+    /// [`Self::initialize_interface_type_parameters`], not through this method.
     pub fn set_type_object_flags(&mut self, id: TypeId, object_flags: ObjectFlags) -> bool {
         let Some(record) = self.type_payload(id) else {
             return false;
@@ -1176,7 +1179,10 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
     }
 
     pub fn set_type_symbol(&mut self, id: TypeId, symbol: Option<SemanticSymbolId>) -> bool {
-        if !self.valid_record_symbol(symbol) {
+        let Some(record) = self.type_payload(id) else {
+            return false;
+        };
+        if matches!(record.data, TypeData::UniqueEsSymbol(_)) || !self.valid_record_symbol(symbol) {
             return false;
         }
         let Some(record) = self.type_payload_mut(id) else {
@@ -1284,6 +1290,12 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         if !self.valid_optional_record_type(target) || !self.valid_record_mapper(mapper) {
             return false;
         }
+        if matches!(
+            self.type_payload(id).map(TypeRecord::data),
+            Some(TypeData::Interface(_) | TypeData::Tuple(_))
+        ) {
+            return false;
+        }
         let Some(object) = self
             .type_payload_mut(id)
             .and_then(|record| record.data.object_mut())
@@ -1303,6 +1315,12 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         if !self.valid_type_cache(&instantiations) {
             return false;
         }
+        if matches!(
+            self.type_payload(id).map(TypeRecord::data),
+            Some(TypeData::Interface(_) | TypeData::Tuple(_))
+        ) {
+            return false;
+        }
         let Some(object) = self
             .type_payload_mut(id)
             .and_then(|record| record.data.object_mut())
@@ -1311,6 +1329,52 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         };
         object.instantiations = instantiations;
         true
+    }
+
+    /// Publishes one object instantiation without replacing an existing cache
+    /// entry. Returns the canonical entry for `key`, whether pre-existing or
+    /// newly inserted.
+    ///
+    /// Origin interface and tuple caches are allocated by
+    /// [`Self::initialize_interface_type_parameters`]. Their non-self entries
+    /// must be type references targeting that origin. Other object caches retain
+    /// the broader upstream instantiation value shape.
+    pub fn insert_object_instantiation(
+        &mut self,
+        id: TypeId,
+        key: CacheHashKey,
+        instantiation: TypeId,
+    ) -> Option<TypeId> {
+        if !self.valid_record_type(instantiation) {
+            return None;
+        }
+        let origin_interface = matches!(
+            self.type_payload(id).map(TypeRecord::data),
+            Some(TypeData::Interface(_) | TypeData::Tuple(_))
+        );
+        if origin_interface
+            && instantiation != id
+            && !matches!(
+                self.type_payload(instantiation).map(TypeRecord::data),
+                Some(TypeData::TypeReference(data)) if data.object.target == Some(id)
+            )
+        {
+            return None;
+        }
+        let object = self
+            .type_payload_mut(id)
+            .and_then(|record| record.data.object_mut())?;
+        let TypeCacheState::Allocated(instantiations) = &mut object.instantiations else {
+            return None;
+        };
+        if let Some(existing) = instantiations.get(&key) {
+            return Some(*existing);
+        }
+        if origin_interface && instantiation == id {
+            return None;
+        }
+        instantiations.insert(key, instantiation);
+        Some(instantiation)
     }
 
     pub fn set_type_reference_resolution(
@@ -1324,6 +1388,12 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         {
             return false;
         }
+        if matches!(
+            self.type_payload(id).map(TypeRecord::data),
+            Some(TypeData::Interface(_) | TypeData::Tuple(_))
+        ) {
+            return false;
+        }
         let Some(reference) = self
             .type_payload_mut(id)
             .and_then(|record| record.data.reference_mut())
@@ -1335,60 +1405,104 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         true
     }
 
-    pub fn set_interface_type_parameters(
+    /// Initializes the one recursive `this` edge of a class, interface, or
+    /// tuple target. `self_instantiation_key` is the pinned `getTypeListKey`
+    /// for `all_type_parameters` excluding the final `this_type`.
+    ///
+    /// The pinned constructors allocate a fresh type parameter and publish its
+    /// `isThisType` marker, self constraint, owner target, resolved arguments,
+    /// initial self-instantiation cache, the owner's `thisType`, and its
+    /// `Reference` flag as one initialization sequence. This operation validates
+    /// the complete transition before changing either record and may only be
+    /// performed once. Generic object/reference setters intentionally cannot
+    /// replace those origin-interface fields afterward.
+    pub fn initialize_interface_type_parameters(
         &mut self,
         id: TypeId,
-        all_type_parameters: Option<Vec<TypeId>>,
+        all_type_parameters: Vec<TypeId>,
         outer_type_parameter_count: usize,
-        this_type: Option<TypeId>,
+        this_type: TypeId,
+        self_instantiation_key: CacheHashKey,
     ) -> bool {
         let Some(record) = self.type_payload(id) else {
             return false;
         };
-        let is_tuple = matches!(record.data, TypeData::Tuple(_));
-        if !matches!(record.data, TypeData::Interface(_) | TypeData::Tuple(_)) {
+        let (is_tuple, is_uninitialized) = match &record.data {
+            TypeData::Interface(data) => (
+                false,
+                data.all_type_parameters.is_none()
+                    && data.outer_type_parameter_count == 0
+                    && data.this_type.is_none()
+                    && data.reference.object.target.is_none()
+                    && data.reference.object.mapper.is_none()
+                    && data.reference.object.instantiations == TypeCacheState::Unallocated
+                    && data.reference.node.is_none()
+                    && data.reference.resolved_type_arguments.is_none(),
+            ),
+            TypeData::Tuple(data) => (
+                true,
+                data.interface.all_type_parameters.is_none()
+                    && data.interface.outer_type_parameter_count == 0
+                    && data.interface.this_type.is_none()
+                    && data.interface.reference.object.target.is_none()
+                    && data.interface.reference.object.mapper.is_none()
+                    && data.interface.reference.object.instantiations
+                        == TypeCacheState::Unallocated
+                    && data.interface.reference.node.is_none()
+                    && data.interface.reference.resolved_type_arguments.is_none(),
+            ),
+            _ => return false,
+        };
+        if !is_uninitialized
+            || record.object_flags.contains(ObjectFlags::REFERENCE) != is_tuple
+            || all_type_parameters.is_empty()
+            || all_type_parameters.last().copied() != Some(this_type)
+            || all_type_parameters[..all_type_parameters.len() - 1].contains(&this_type)
+            || outer_type_parameter_count >= all_type_parameters.len()
+            || (is_tuple && outer_type_parameter_count != 0)
+            || !self.valid_record_types(&all_type_parameters)
+            || !all_type_parameters.iter().all(|parameter| {
+                matches!(
+                    self.type_payload(*parameter).map(TypeRecord::data),
+                    Some(TypeData::TypeParameter(_))
+                )
+            })
+            || !matches!(
+                self.type_payload(this_type).map(TypeRecord::data),
+                Some(TypeData::TypeParameter(data)) if data == &TypeParameterData::default()
+            )
+        {
             return false;
         }
 
-        let reference_state = match (&all_type_parameters, this_type) {
-            (None, None) if outer_type_parameter_count == 0 && !is_tuple => false,
-            (Some(parameters), Some(this_type))
-                if !parameters.is_empty()
-                    && parameters.last().copied() == Some(this_type)
-                    && outer_type_parameter_count < parameters.len()
-                    && self.valid_record_types(parameters)
-                    && parameters.iter().all(|parameter| {
-                        matches!(
-                            self.type_payload(*parameter).map(TypeRecord::data),
-                            Some(TypeData::TypeParameter(_))
-                        )
-                    })
-                    && matches!(
-                        self.type_payload(this_type).map(TypeRecord::data),
-                        Some(TypeData::TypeParameter(data))
-                            if data.is_this_type && data.constraint == Some(id)
-                    ) =>
-            {
-                true
-            }
-            _ => return false,
-        };
+        let resolved_type_arguments = all_type_parameters[..all_type_parameters.len() - 1].to_vec();
+        let instantiations =
+            TypeCacheState::Allocated(HashMap::from([(self_instantiation_key, id)]));
 
-        let object_flags = if reference_state {
-            record.object_flags | ObjectFlags::REFERENCE
-        } else {
-            record.object_flags & !ObjectFlags::REFERENCE
+        // Both records and their exact payload kinds were validated above, and
+        // all allocations are complete before the first mutation is made.
+        let Some(TypeData::TypeParameter(this_data)) = self
+            .type_payload_mut(this_type)
+            .map(|record| &mut record.data)
+        else {
+            unreachable!("validated this type parameter disappeared")
         };
+        this_data.constraint = Some(id);
+        this_data.is_this_type = true;
+
         let Some(record) = self.type_payload_mut(id) else {
-            return false;
+            unreachable!("validated interface or tuple disappeared")
         };
         let Some(interface) = record.data.interface_mut() else {
-            return false;
+            unreachable!("validated interface or tuple changed payload kind")
         };
-        interface.all_type_parameters = all_type_parameters;
+        interface.all_type_parameters = Some(all_type_parameters);
         interface.outer_type_parameter_count = outer_type_parameter_count;
-        interface.this_type = this_type;
-        record.object_flags = object_flags;
+        interface.this_type = Some(this_type);
+        interface.reference.object.target = Some(id);
+        interface.reference.object.instantiations = instantiations;
+        interface.reference.resolved_type_arguments = Some(resolved_type_arguments);
+        record.object_flags |= ObjectFlags::REFERENCE;
         true
     }
 
@@ -1588,7 +1702,7 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         if ![resolved_reduced_type, regular_type, origin]
             .into_iter()
             .all(|value| self.valid_optional_record_type(value))
-            || !self.valid_constituent_map(&constituent_map)
+            || !self.valid_union_discriminant_cache(&key_property_name, &constituent_map)
         {
             return false;
         }
@@ -1625,14 +1739,18 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         true
     }
 
-    #[allow(clippy::too_many_arguments)] // Mirrors the complete TypeParameter record.
+    /// Updates lazy resolution fields of an ordinary type parameter.
+    ///
+    /// An initialized interface/tuple `this` parameter may update the other
+    /// lazy fields only while preserving its self constraint. Its identity
+    /// marker can only be established by
+    /// [`Self::initialize_interface_type_parameters`].
     pub fn set_type_parameter_resolution(
         &mut self,
         id: TypeId,
         constraint: Option<TypeId>,
         target: Option<TypeId>,
         mapper: Option<TypeMapperId>,
-        is_this_type: bool,
         resolved_default_type: Option<TypeId>,
     ) -> bool {
         if ![constraint, target, resolved_default_type]
@@ -1647,10 +1765,12 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         else {
             return false;
         };
+        if data.is_this_type && data.constraint != constraint {
+            return false;
+        }
         data.constraint = constraint;
         data.target = target;
         data.mapper = mapper;
-        data.is_this_type = is_this_type;
         data.resolved_default_type = resolved_default_type;
         true
     }
@@ -2006,6 +2126,26 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             .iter()
             .all(|(key, value)| self.valid_record_type(*key) && self.valid_record_type(*value))
     }
+
+    fn valid_union_discriminant_cache(
+        &self,
+        key_property_name: &EscapedName,
+        constituent_map: &ConstituentMapState,
+    ) -> bool {
+        if !self.valid_constituent_map(constituent_map) {
+            return false;
+        }
+        match constituent_map {
+            ConstituentMapState::Unallocated => {
+                key_property_name.is_empty()
+                    || key_property_name.as_ref() == InternalSymbolName::Missing.as_ref()
+            }
+            ConstituentMapState::Allocated(_) => {
+                !key_property_name.is_empty()
+                    && !key_property_name.as_ref().is_reserved_member_name()
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2046,6 +2186,43 @@ mod tests {
             );
         }
         table
+    }
+
+    fn type_parameter_snapshot(store: &TestStore, id: TypeId) -> TypeParameterData {
+        let TypeData::TypeParameter(data) = store.type_payload(id).unwrap().data() else {
+            panic!("expected type parameter")
+        };
+        data.clone()
+    }
+
+    fn interface_snapshot(store: &TestStore, id: TypeId) -> (InterfaceTypeData, ObjectFlags) {
+        let record = store.type_payload(id).unwrap();
+        let TypeData::Interface(data) = record.data() else {
+            panic!("expected interface")
+        };
+        (data.clone(), record.object_flags())
+    }
+
+    fn union_snapshot(store: &TestStore, id: TypeId) -> UnionTypeData {
+        let TypeData::Union(data) = store.type_payload(id).unwrap().data() else {
+            panic!("expected union")
+        };
+        data.clone()
+    }
+
+    fn object_instantiation_snapshot(store: &TestStore, id: TypeId) -> TypeCacheState {
+        let object = match store.type_payload(id).unwrap().data() {
+            TypeData::Object(data) => data,
+            TypeData::TypeReference(data) => &data.object,
+            TypeData::Interface(data) => &data.reference.object,
+            TypeData::Tuple(data) => &data.interface.reference.object,
+            TypeData::InstantiationExpression(data) => &data.object,
+            TypeData::Mapped(data) => &data.object,
+            TypeData::ReverseMapped(data) => &data.object,
+            TypeData::EvolvingArray(data) => &data.object,
+            _ => panic!("expected object type"),
+        };
+        object.instantiations.clone()
     }
 
     struct SeededStore {
@@ -2155,9 +2332,7 @@ mod tests {
                     RegularLiteralLink::SelfType,
                 )
                 .unwrap(),
-            store
-                .alloc_unique_es_symbol_type(Some(seeded.symbol), EscapedName::source("unique"))
-                .unwrap(),
+            store.alloc_unique_es_symbol_type(seeded.symbol).unwrap(),
             store
                 .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(seeded.symbol))
                 .unwrap(),
@@ -2346,20 +2521,27 @@ mod tests {
     }
 
     #[test]
-    fn escaped_names_survive_type_records_without_utf8_coercion() {
+    fn derived_unique_and_union_cache_names_remain_byte_exact() {
         let mut seeded = seeded_store("local");
-        let unique_name = EscapedName::internal(ts_binder::InternalSymbolName::Computed);
         let unique = seeded
             .store
-            .alloc_unique_es_symbol_type(Some(seeded.symbol), unique_name.clone())
+            .alloc_unique_es_symbol_type(seeded.symbol)
             .unwrap();
         let TypeData::UniqueEsSymbol(unique_data) =
             seeded.store.type_payload(unique).unwrap().data()
         else {
             panic!("expected unique symbol type")
         };
-        assert_eq!(unique_data.name, unique_name);
-        assert_eq!(unique_data.name.as_bytes(), b"\xFEcomputed");
+        let unique_name = unique_data.name.clone();
+        assert_eq!(
+            seeded.store.type_payload(unique).unwrap().symbol(),
+            Some(seeded.symbol)
+        );
+        let global_id = seeded.store.global_symbol_id(seeded.symbol).unwrap();
+        let mut expected_unique_name = b"\xFE@local@".to_vec();
+        expected_unique_name.extend_from_slice(global_id.to_string().as_bytes());
+        assert_eq!(unique_name.as_bytes(), expected_unique_name);
+        assert_eq!(unique_name.as_utf8(), None);
 
         let object = seeded
             .store
@@ -2369,20 +2551,156 @@ mod tests {
             .store
             .alloc_union_type(ObjectFlags::NONE, vec![seeded.base, object])
             .unwrap();
-        let key = EscapedName::internal(ts_binder::InternalSymbolName::Call);
+        let key = EscapedName::source("kind");
         assert!(seeded.store.set_union_caches(
             union,
             None,
             None,
             None,
             key.clone(),
-            ConstituentMapState::Unallocated,
+            ConstituentMapState::Allocated(HashMap::from([(seeded.base, object)])),
         ));
         let TypeData::Union(union_data) = seeded.store.type_payload(union).unwrap().data() else {
             panic!("expected union")
         };
         assert_eq!(union_data.key_property_name, key);
-        assert_eq!(union_data.key_property_name.as_bytes(), b"\xFEcall");
+        assert_eq!(union_data.key_property_name.as_bytes(), b"kind");
+
+        let missing_union = seeded
+            .store
+            .alloc_union_type(ObjectFlags::NONE, vec![seeded.base, object])
+            .unwrap();
+        let missing = EscapedName::internal(InternalSymbolName::Missing);
+        assert!(seeded.store.set_union_caches(
+            missing_union,
+            None,
+            None,
+            None,
+            missing.clone(),
+            ConstituentMapState::Unallocated,
+        ));
+        let TypeData::Union(missing_data) =
+            seeded.store.type_payload(missing_union).unwrap().data()
+        else {
+            panic!("expected union")
+        };
+        assert_eq!(missing_data.key_property_name, missing);
+        assert_eq!(missing_data.key_property_name.as_bytes(), b"\xFEmissing");
+    }
+
+    #[test]
+    fn unique_symbol_identity_is_derived_foreign_safe_and_immutable() {
+        let mut first = seeded_store("first");
+        let mut second = seeded_store("second");
+        let second_type_count = second.store.type_len();
+        assert_eq!(second.store.alloc_unique_es_symbol_type(first.symbol), None);
+        assert_eq!(second.store.type_len(), second_type_count);
+
+        let unique = first
+            .store
+            .alloc_unique_es_symbol_type(first.symbol)
+            .unwrap();
+        let replacement = alloc_test_symbol(&mut first.store, "replacement");
+        let TypeData::UniqueEsSymbol(data) = first.store.type_payload(unique).unwrap().data()
+        else {
+            panic!("expected unique symbol type")
+        };
+        let original_name = data.name.clone();
+        assert!(!first.store.set_type_symbol(unique, None));
+        assert!(!first.store.set_type_symbol(unique, Some(first.symbol)));
+        assert!(!first.store.set_type_symbol(unique, Some(replacement)));
+
+        let record = first.store.type_payload(unique).unwrap();
+        let TypeData::UniqueEsSymbol(data) = record.data() else {
+            panic!("expected unique symbol type")
+        };
+        assert_eq!(record.symbol(), Some(first.symbol));
+        assert_eq!(data.name, original_name);
+    }
+
+    #[test]
+    fn union_discriminant_cache_states_are_validated_atomically() {
+        let foreign = seeded_store("foreign");
+        let mut seeded = seeded_store("local");
+        let object = seeded
+            .store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(seeded.symbol))
+            .unwrap();
+        let union = seeded
+            .store
+            .alloc_union_type(ObjectFlags::NONE, vec![seeded.base, object])
+            .unwrap();
+        let initial = union_snapshot(&seeded.store, union);
+        let local_map = || ConstituentMapState::Allocated(HashMap::from([(seeded.base, object)]));
+
+        assert!(!seeded.store.set_union_caches(
+            union,
+            Some(object),
+            Some(seeded.base),
+            Some(object),
+            EscapedName::source(""),
+            local_map(),
+        ));
+        assert!(!seeded.store.set_union_caches(
+            union,
+            Some(object),
+            Some(seeded.base),
+            Some(object),
+            EscapedName::source("kind"),
+            ConstituentMapState::Unallocated,
+        ));
+        assert!(!seeded.store.set_union_caches(
+            union,
+            Some(object),
+            Some(seeded.base),
+            Some(object),
+            EscapedName::internal(InternalSymbolName::Missing),
+            local_map(),
+        ));
+        assert!(!seeded.store.set_union_caches(
+            union,
+            Some(object),
+            Some(seeded.base),
+            Some(object),
+            EscapedName::internal(InternalSymbolName::Call),
+            ConstituentMapState::Unallocated,
+        ));
+        assert!(!seeded.store.set_union_caches(
+            union,
+            Some(object),
+            Some(seeded.base),
+            Some(object),
+            EscapedName::internal(InternalSymbolName::Call),
+            local_map(),
+        ));
+        assert!(!seeded.store.set_union_caches(
+            union,
+            Some(object),
+            Some(seeded.base),
+            Some(object),
+            EscapedName::source("kind"),
+            ConstituentMapState::Allocated(HashMap::from([(foreign.base, object)])),
+        ));
+        assert_eq!(union_snapshot(&seeded.store, union), initial);
+
+        assert!(seeded.store.set_union_caches(
+            union,
+            Some(object),
+            Some(seeded.base),
+            Some(object),
+            EscapedName::source("kind"),
+            local_map(),
+        ));
+        let valid = union_snapshot(&seeded.store, union);
+        assert!(!seeded.store.set_union_caches(
+            union,
+            None,
+            None,
+            None,
+            EscapedName::internal(InternalSymbolName::Call),
+            ConstituentMapState::Unallocated,
+        ));
+        assert_eq!(union_snapshot(&seeded.store, union), valid);
     }
 
     #[test]
@@ -2472,32 +2790,22 @@ mod tests {
             .store
             .alloc_interface_type(ObjectFlags::INTERFACE, Some(seeded.symbol))
             .unwrap();
-        assert!(seeded.store.set_object_target_and_mapper(
-            interface,
-            Some(interface),
-            Some(seeded.mapper)
-        ));
         let outer_type_parameter = seeded.store.alloc_type_parameter(None).unwrap();
         let this_type = seeded.store.alloc_type_parameter(None).unwrap();
-        assert!(seeded.store.set_type_parameter_resolution(
+        let self_instantiation_key = CacheHashKey::new(1);
+        assert!(!seeded.store.initialize_interface_type_parameters(
+            interface,
+            vec![this_type, outer_type_parameter],
+            1,
             this_type,
-            Some(interface),
-            None,
-            None,
-            true,
-            None,
+            self_instantiation_key,
         ));
-        assert!(!seeded.store.set_interface_type_parameters(
+        assert!(seeded.store.initialize_interface_type_parameters(
             interface,
-            Some(vec![this_type, outer_type_parameter]),
+            vec![outer_type_parameter, this_type],
             1,
-            Some(this_type),
-        ));
-        assert!(seeded.store.set_interface_type_parameters(
-            interface,
-            Some(vec![outer_type_parameter, this_type]),
-            1,
-            Some(this_type),
+            this_type,
+            self_instantiation_key,
         ));
         assert!(
             seeded
@@ -2611,12 +2919,7 @@ mod tests {
         };
         assert_eq!(second_literal_data.fresh_type, None);
         assert_eq!(second_literal_data.regular_type, second_literal);
-        assert_eq!(
-            second
-                .store
-                .alloc_unique_es_symbol_type(Some(first.symbol), EscapedName::source("foreign"),),
-            None
-        );
+        assert_eq!(second.store.alloc_unique_es_symbol_type(first.symbol), None);
         assert_eq!(
             second
                 .store
@@ -3299,6 +3602,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // One atomic interface/tuple transition matrix.
     fn interface_reference_initialization_is_exact_and_atomic() {
         let mut seeded = seeded_store("local");
         let count = seeded.store.type_len();
@@ -3316,81 +3620,186 @@ mod tests {
             .alloc_interface_type(ObjectFlags::CLASS, Some(seeded.symbol))
             .unwrap();
         let ordinary = seeded.store.alloc_type_parameter(None).unwrap();
-        let unconstrained_this = seeded.store.alloc_type_parameter(None).unwrap();
-        let wrong_constraint_this = seeded.store.alloc_type_parameter(None).unwrap();
+        let candidate_this = seeded.store.alloc_type_parameter(None).unwrap();
+        let constrained_candidate = seeded.store.alloc_type_parameter(None).unwrap();
         assert!(seeded.store.set_type_parameter_resolution(
-            wrong_constraint_this,
+            constrained_candidate,
             Some(seeded.base),
             None,
             None,
-            true,
             None,
         ));
+        let mut foreign = seeded_store("foreign");
+        let foreign_this = foreign.store.alloc_type_parameter(None).unwrap();
+        let owner_before = interface_snapshot(&seeded.store, interface);
+        let candidate_before = type_parameter_snapshot(&seeded.store, candidate_this);
+        let self_instantiation_key = CacheHashKey::new(41);
 
         assert!(
             !seeded
                 .store
-                .set_interface_type_parameters(interface, Some(Vec::new()), 0, None,)
+                .set_object_target_and_mapper(interface, Some(interface), None,)
         );
-        assert!(!seeded.store.set_interface_type_parameters(
+        assert!(
+            !seeded
+                .store
+                .set_type_reference_resolution(interface, None, Some(vec![ordinary]),)
+        );
+        assert!(!seeded.store.set_object_instantiations(
             interface,
-            Some(vec![ordinary]),
+            TypeCacheState::Allocated(HashMap::from([(self_instantiation_key, interface)])),
+        ));
+
+        assert!(!seeded.store.initialize_interface_type_parameters(
+            interface,
+            Vec::new(),
             0,
-            Some(ordinary),
+            candidate_this,
+            self_instantiation_key,
         ));
-        assert!(!seeded.store.set_interface_type_parameters(
+        assert!(!seeded.store.initialize_interface_type_parameters(
             interface,
-            Some(vec![ordinary, unconstrained_this]),
+            vec![ordinary, candidate_this],
             2,
-            Some(unconstrained_this),
+            candidate_this,
+            self_instantiation_key,
         ));
-        assert!(!seeded.store.set_interface_type_parameters(
+        assert!(!seeded.store.initialize_interface_type_parameters(
             interface,
-            Some(vec![ordinary, wrong_constraint_this]),
+            vec![candidate_this, ordinary],
             1,
-            Some(wrong_constraint_this),
+            candidate_this,
+            self_instantiation_key,
         ));
-        assert!(!seeded.store.set_interface_type_parameters(
+        assert!(!seeded.store.initialize_interface_type_parameters(
             interface,
-            Some(vec![seeded.base, wrong_constraint_this]),
+            vec![ordinary, candidate_this, candidate_this],
             1,
-            Some(wrong_constraint_this),
+            candidate_this,
+            self_instantiation_key,
+        ));
+        assert!(!seeded.store.initialize_interface_type_parameters(
+            interface,
+            vec![ordinary, constrained_candidate],
+            1,
+            constrained_candidate,
+            self_instantiation_key,
+        ));
+        assert!(!seeded.store.initialize_interface_type_parameters(
+            interface,
+            vec![seeded.base, candidate_this],
+            1,
+            candidate_this,
+            self_instantiation_key,
+        ));
+        assert!(!seeded.store.initialize_interface_type_parameters(
+            interface,
+            vec![ordinary, foreign_this],
+            1,
+            foreign_this,
+            self_instantiation_key,
         ));
         assert!(
             !seeded
                 .store
                 .set_type_object_flags(interface, ObjectFlags::CLASS | ObjectFlags::REFERENCE,)
         );
-        let TypeData::Interface(data) = seeded.store.type_payload(interface).unwrap().data() else {
-            panic!("expected interface")
-        };
-        assert_eq!(data.all_type_parameters, None);
-        assert_eq!(data.outer_type_parameter_count, 0);
-        assert_eq!(data.this_type, None);
+        assert_eq!(interface_snapshot(&seeded.store, interface), owner_before);
         assert_eq!(
-            seeded.store.type_payload(interface).unwrap().object_flags(),
-            ObjectFlags::CLASS
+            type_parameter_snapshot(&seeded.store, candidate_this),
+            candidate_before
         );
 
         let this_type = seeded.store.alloc_type_parameter(None).unwrap();
-        assert!(seeded.store.set_type_parameter_resolution(
-            this_type,
-            Some(interface),
-            None,
-            None,
-            true,
-            None,
-        ));
-        assert!(seeded.store.set_interface_type_parameters(
+        assert!(seeded.store.initialize_interface_type_parameters(
             interface,
-            Some(vec![ordinary, this_type]),
+            vec![ordinary, this_type],
             1,
-            Some(this_type),
+            this_type,
+            self_instantiation_key,
         ));
         assert_eq!(
             seeded.store.type_payload(interface).unwrap().object_flags(),
             ObjectFlags::CLASS | ObjectFlags::REFERENCE
         );
+        let initialized_owner = interface_snapshot(&seeded.store, interface);
+        let initialized_this = type_parameter_snapshot(&seeded.store, this_type);
+        assert!(initialized_this.is_this_type);
+        assert_eq!(initialized_this.constraint, Some(interface));
+        assert_eq!(initialized_owner.0.reference.object.target, Some(interface));
+        assert_eq!(initialized_owner.0.reference.object.mapper, None);
+        assert_eq!(initialized_owner.0.reference.node, None);
+        assert_eq!(
+            initialized_owner
+                .0
+                .reference
+                .resolved_type_arguments
+                .as_deref(),
+            Some([ordinary].as_slice())
+        );
+        let TypeCacheState::Allocated(interface_instantiations) =
+            &initialized_owner.0.reference.object.instantiations
+        else {
+            panic!("expected initialized interface instantiations")
+        };
+        assert_eq!(interface_instantiations.len(), 1);
+        assert_eq!(
+            interface_instantiations.get(&self_instantiation_key),
+            Some(&interface)
+        );
+        assert!(!seeded.store.initialize_interface_type_parameters(
+            interface,
+            vec![ordinary, this_type],
+            1,
+            this_type,
+            self_instantiation_key,
+        ));
+        assert!(
+            !seeded
+                .store
+                .set_type_parameter_resolution(this_type, None, None, None, None,)
+        );
+        assert!(!seeded.store.set_type_parameter_resolution(
+            this_type,
+            Some(seeded.base),
+            None,
+            None,
+            None,
+        ));
+        assert!(!seeded.store.set_object_target_and_mapper(
+            interface,
+            Some(seeded.base),
+            Some(seeded.mapper),
+        ));
+        assert!(!seeded.store.set_type_reference_resolution(
+            interface,
+            Some(seeded.reference_node),
+            Some(vec![seeded.base]),
+        ));
+        assert!(!seeded.store.set_object_instantiations(
+            interface,
+            TypeCacheState::Allocated(HashMap::from([(CacheHashKey::new(99), seeded.base)])),
+        ));
+        assert_eq!(
+            interface_snapshot(&seeded.store, interface),
+            initialized_owner
+        );
+        assert_eq!(
+            type_parameter_snapshot(&seeded.store, this_type),
+            initialized_this
+        );
+
+        assert!(seeded.store.set_type_parameter_resolution(
+            this_type,
+            Some(interface),
+            Some(ordinary),
+            Some(seeded.mapper),
+            Some(seeded.base),
+        ));
+        let resolved_this = type_parameter_snapshot(&seeded.store, this_type);
+        assert!(resolved_this.is_this_type);
+        assert_eq!(resolved_this.constraint, Some(interface));
+
         assert!(seeded.store.add_type_object_flags(
             interface,
             ObjectFlags::CONTAINS_WIDENING_TYPE
@@ -3426,6 +3835,234 @@ mod tests {
                         | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
                         | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES,
                 )
+        );
+
+        let element = seeded
+            .store
+            .create_tuple_element_info(ElementFlags::REQUIRED, Some(seeded.tuple_label_node))
+            .unwrap();
+        let metadata = seeded
+            .store
+            .create_tuple_metadata(vec![element], false)
+            .unwrap();
+        let tuple = seeded
+            .store
+            .alloc_tuple_type(ObjectFlags::NONE, None, metadata)
+            .unwrap();
+        let tuple_parameter = seeded.store.alloc_type_parameter(None).unwrap();
+        let tuple_this = seeded.store.alloc_type_parameter(None).unwrap();
+        let tuple_this_before = type_parameter_snapshot(&seeded.store, tuple_this);
+        let tuple_self_instantiation_key = CacheHashKey::new(42);
+        assert!(!seeded.store.initialize_interface_type_parameters(
+            tuple,
+            vec![tuple_parameter, tuple_this],
+            1,
+            tuple_this,
+            tuple_self_instantiation_key,
+        ));
+        assert_eq!(
+            type_parameter_snapshot(&seeded.store, tuple_this),
+            tuple_this_before
+        );
+        assert!(seeded.store.initialize_interface_type_parameters(
+            tuple,
+            vec![tuple_parameter, tuple_this],
+            0,
+            tuple_this,
+            tuple_self_instantiation_key,
+        ));
+        let tuple_record = seeded.store.type_payload(tuple).unwrap();
+        let TypeData::Tuple(tuple_data) = tuple_record.data() else {
+            panic!("expected tuple")
+        };
+        assert_eq!(
+            tuple_data.interface.all_type_parameters,
+            Some(vec![tuple_parameter, tuple_this])
+        );
+        assert_eq!(tuple_data.interface.outer_type_parameter_count, 0);
+        assert_eq!(tuple_data.interface.this_type, Some(tuple_this));
+        assert_eq!(tuple_data.interface.reference.object.target, Some(tuple));
+        assert_eq!(
+            tuple_data
+                .interface
+                .reference
+                .resolved_type_arguments
+                .as_deref(),
+            Some([tuple_parameter].as_slice())
+        );
+        let TypeCacheState::Allocated(tuple_instantiations) =
+            &tuple_data.interface.reference.object.instantiations
+        else {
+            panic!("expected initialized tuple instantiations")
+        };
+        assert_eq!(tuple_instantiations.len(), 1);
+        assert_eq!(
+            tuple_instantiations.get(&tuple_self_instantiation_key),
+            Some(&tuple)
+        );
+        assert!(tuple_record.object_flags().contains(ObjectFlags::REFERENCE));
+        let tuple_this_data = type_parameter_snapshot(&seeded.store, tuple_this);
+        assert!(tuple_this_data.is_this_type);
+        assert_eq!(tuple_this_data.constraint, Some(tuple));
+        assert!(!seeded.store.set_object_target_and_mapper(
+            tuple,
+            Some(seeded.base),
+            Some(seeded.mapper),
+        ));
+        assert!(!seeded.store.set_type_reference_resolution(
+            tuple,
+            Some(seeded.reference_node),
+            Some(vec![seeded.base]),
+        ));
+        assert!(!seeded.store.set_object_instantiations(
+            tuple,
+            TypeCacheState::Allocated(HashMap::from([(CacheHashKey::new(100), seeded.base)])),
+        ));
+        assert!(!seeded.store.initialize_interface_type_parameters(
+            tuple,
+            vec![tuple_parameter, tuple_this],
+            0,
+            tuple_this,
+            tuple_self_instantiation_key,
+        ));
+        assert!(
+            !seeded
+                .store
+                .set_type_parameter_resolution(tuple_this, None, None, None, None,)
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One cache-growth and provenance transition matrix.
+    fn object_instantiation_cache_growth_preserves_origin_identity_and_provenance() {
+        let mut seeded = seeded_store("local");
+        let interface = seeded
+            .store
+            .alloc_interface_type(ObjectFlags::INTERFACE, Some(seeded.symbol))
+            .unwrap();
+        let parameter = seeded.store.alloc_type_parameter(None).unwrap();
+        let this_type = seeded.store.alloc_type_parameter(None).unwrap();
+        let self_key = CacheHashKey::new(1);
+        assert!(seeded.store.initialize_interface_type_parameters(
+            interface,
+            vec![parameter, this_type],
+            0,
+            this_type,
+            self_key,
+        ));
+
+        let reference = seeded
+            .store
+            .alloc_type_reference(ObjectFlags::NONE, Some(seeded.symbol))
+            .unwrap();
+        assert!(
+            seeded
+                .store
+                .set_object_target_and_mapper(reference, Some(interface), None)
+        );
+        assert!(seeded.store.set_type_reference_resolution(
+            reference,
+            None,
+            Some(vec![seeded.base]),
+        ));
+        let reference_key = CacheHashKey::new(2);
+        assert_eq!(
+            seeded
+                .store
+                .insert_object_instantiation(interface, reference_key, reference),
+            Some(reference)
+        );
+        let TypeCacheState::Allocated(cache) =
+            object_instantiation_snapshot(&seeded.store, interface)
+        else {
+            panic!("expected allocated interface cache")
+        };
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.get(&self_key), Some(&interface));
+        assert_eq!(cache.get(&reference_key), Some(&reference));
+
+        let replacement = seeded
+            .store
+            .alloc_type_reference(ObjectFlags::NONE, Some(seeded.symbol))
+            .unwrap();
+        assert!(
+            seeded
+                .store
+                .set_object_target_and_mapper(replacement, Some(interface), None)
+        );
+        let stable_cache = object_instantiation_snapshot(&seeded.store, interface);
+        assert_eq!(
+            seeded
+                .store
+                .insert_object_instantiation(interface, reference_key, replacement),
+            Some(reference)
+        );
+        assert_eq!(
+            seeded
+                .store
+                .insert_object_instantiation(interface, self_key, replacement),
+            Some(interface)
+        );
+        assert_eq!(
+            seeded
+                .store
+                .insert_object_instantiation(interface, CacheHashKey::new(3), interface,),
+            None
+        );
+
+        let wrong_target = seeded
+            .store
+            .alloc_type_reference(ObjectFlags::NONE, Some(seeded.symbol))
+            .unwrap();
+        assert!(
+            seeded
+                .store
+                .set_object_target_and_mapper(wrong_target, Some(seeded.base), None)
+        );
+        assert_eq!(
+            seeded
+                .store
+                .insert_object_instantiation(interface, CacheHashKey::new(4), wrong_target,),
+            None
+        );
+        let foreign = seeded_store("foreign");
+        assert_eq!(
+            seeded
+                .store
+                .insert_object_instantiation(interface, CacheHashKey::new(5), foreign.base,),
+            None
+        );
+        assert_eq!(
+            object_instantiation_snapshot(&seeded.store, interface),
+            stable_cache
+        );
+
+        let object = seeded
+            .store
+            .alloc_plain_object_type(ObjectFlags::ANONYMOUS, Some(seeded.symbol))
+            .unwrap();
+        assert_eq!(
+            seeded
+                .store
+                .insert_object_instantiation(object, CacheHashKey::new(6), seeded.base,),
+            None
+        );
+        assert!(
+            seeded
+                .store
+                .set_object_instantiations(object, TypeCacheState::Allocated(HashMap::new()),)
+        );
+        assert_eq!(
+            seeded
+                .store
+                .insert_object_instantiation(object, CacheHashKey::new(6), seeded.base,),
+            Some(seeded.base)
+        );
+        assert_eq!(
+            seeded
+                .store
+                .insert_object_instantiation(object, CacheHashKey::new(6), interface,),
+            Some(seeded.base)
         );
     }
 
