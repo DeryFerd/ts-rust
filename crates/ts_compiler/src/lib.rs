@@ -359,6 +359,7 @@ fn source_check_error_is_unsupported(error: &SourceCheckError) -> bool {
         SourceCheckError::TypeDisplayUnavailable(error) => display_error_is_unsupported(error),
         SourceCheckError::Provenance(_)
         | SourceCheckError::LiteralCache(_)
+        | SourceCheckError::ObjectLiteral(_)
         | SourceCheckError::MissingDiagnostic(_) => false,
     }
 }
@@ -6451,8 +6452,9 @@ mod tests {
         CanonicalCheckerContextError, CanonicalGlobalInitializationError,
         CanonicalGlobalTypeInitializationError, CanonicalTypeMapperStore, DeclaredTypeError,
         DeclaredTypeUnavailable, IntrinsicBootstrapOptions, RelationKind, RelationUnavailable,
-        SourceCheckError, SourceCheckProvenanceError, SourceLiteralCacheError, SymbolMergeError,
-        TypeDataKind, TypeDisplayUnavailable, TypeNodeUnavailable, UnsupportedSourceSyntax,
+        SourceCheckError, SourceCheckProvenanceError, SourceLiteralCacheError,
+        SourceObjectLiteralError, SymbolMergeError, TypeDataKind, TypeDisplayUnavailable,
+        TypeNodeUnavailable, UnsupportedSourceSyntax,
     };
     use ts_diagnostics::{Category, Diagnostic, message_by_code};
     use ts_options::{
@@ -6723,6 +6725,33 @@ mod tests {
                 .iter()
                 .all(|error| !error.is_unsupported_boundary())
         );
+    }
+
+    #[test]
+    fn canonical_program_classifies_object_literal_cache_errors_as_invariants() {
+        let parsed = parse_source_file("const value = {};");
+        let file = FileId::new(7);
+        let node = ts_ast::NodeRef::new(parsed.arena.id(), file, parsed.source_file);
+        let mut store = CanonicalTypeMapperStore::new();
+        let type_id = store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap()
+            .any_type;
+        let errors = [
+            SourceObjectLiteralError::Capacity(node),
+            SourceObjectLiteralError::InvalidCache {
+                node,
+                type_: Some(type_id),
+            },
+        ];
+
+        assert!(errors.into_iter().all(|error| {
+            !CanonicalProgramCheckError::SourceCheck {
+                file_name: "/project/input.ts".to_owned(),
+                error: SourceCheckError::ObjectLiteral(error),
+            }
+            .is_unsupported_boundary()
+        }));
     }
 
     #[test]
