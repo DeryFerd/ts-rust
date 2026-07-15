@@ -402,15 +402,16 @@ remains the cluster-level source of truth.
   TS2322 paths, spans, messages, and order. Program-level diagnostic
   sorting/deduplication and related-information ownership, full modern module
   facts, and canonical emit remain explicit follow-up work.
-- The first canonical corpus tranche now completes instead of aborting on an
+- The first broad canonical corpus tranche now completes instead of aborting on an
   AST invariant. `cb6cdaf` makes optional-parameter ranges contain their `?`,
   and `0a54a21` parses expression-position `undefined` as the pinned identifier
-  while retaining keyword-type shape in type position. The first 100 selected
-  cases execute 102 variants with zero fatal invariants, zero exact matches,
-  and 102 explicit unsupported results. This alphabetically biased tranche is
-  dominated by functions (21), untyped variables (15), JavaScript (12), enums
-  (10), classes (9), modules and interfaces (5 each), and imports and TSX (4
-  each). It is a root-algorithm queue, not a parity percentage.
+  while retaining keyword-type shape in type position. The first 500 selected
+  cases execute 536 variants with zero fatal invariants, two exact matches,
+  533 explicit unsupported results, and one supported-path mismatch: lossy
+  lone-surrogate string identity. This ordering-biased tranche is dominated by
+  JavaScript (84), classes (79), functions (69), untyped variables (46),
+  modules (32), interfaces (29), import-equals (28), enums and TSX (19 each),
+  and imports (15). It is a root-algorithm queue, not a parity percentage.
 
 No percentage in this section is a whole-corpus parity claim. A score is
 publishable only when its variant manifest and complete artifact comparison are
