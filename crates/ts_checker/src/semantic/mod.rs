@@ -21,6 +21,7 @@ pub mod mapper;
 mod merge;
 pub mod module_resolution;
 pub mod name_resolution;
+mod object_diagnostics;
 mod object_members;
 pub mod production;
 pub mod relater;

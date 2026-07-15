@@ -15,17 +15,14 @@ use std::collections::HashSet;
 use ts_ast::{FileId, ModifierList, Node, NodeArena, NodeData, NodeId, NodeRef, SyntaxKind};
 use ts_binder::{BoundFile, SemanticSymbolId};
 use ts_core::TextRange;
-use ts_diagnostics::{Diagnostic, message_by_code};
 use ts_jsnum::{Number, PseudoBigInt};
 
 use super::{
-    AssignabilityErrorDisplay, CanonicalCheckerDiagnostic, CanonicalCheckerDiagnostics,
-    CanonicalCheckerOptions, CanonicalTypeFormatFlags, CanonicalTypeMapperStore, DeclaredTypeError,
-    DeclaredTypeHost, RelationUnavailable, SourceFileLinks, SourceFileRef, TypeDisplayUnavailable,
-    TypeId,
+    CanonicalCheckerDiagnostic, CanonicalCheckerDiagnostics, CanonicalCheckerOptions,
+    CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, RelationUnavailable,
+    SourceFileLinks, SourceFileRef, TypeDisplayUnavailable, TypeId,
     bootstrap::LiteralTypeCacheError,
     contextual::{LiteralTreatment, PreparedExpression, prepare_expression_context},
-    formatter::get_type_names_for_assignability_error_with_host_and_flags,
     type_nodes::{CanonicalTypeQuery, normalize_bigint_literal, normalize_numeric_separators},
 };
 
@@ -1372,14 +1369,6 @@ pub(super) fn merge_retry_diagnostics(
     }
 }
 
-fn assignability_display_flags(options: CanonicalCheckerOptions) -> CanonicalTypeFormatFlags {
-    if options.no_error_truncation {
-        CanonicalTypeFormatFlags::NO_TRUNCATION
-    } else {
-        CanonicalTypeFormatFlags::NONE
-    }
-}
-
 /// Checks one already-retained source into context-owned private staging.
 pub(super) fn check_source_file(
     arena: &NodeArena,
@@ -1428,20 +1417,18 @@ pub(super) fn check_source_file(
                         prepare_expression_context(store, host, &variable.initializer, target)?;
                     let source_type = expression_type(store, &variable.initializer, &prepared)?;
                     if !store.is_type_assignable_to(source_type, target)? {
-                        let AssignabilityErrorDisplay { source, target } =
-                            get_type_names_for_assignability_error_with_host_and_flags(
-                                store,
-                                host,
-                                source_type,
-                                target,
-                                assignability_display_flags(options),
-                            )?;
-                        let message = message_by_code(2322)
-                            .ok_or(SourceCheckError::MissingDiagnostic(2322))?;
-                        diagnostics.lookup_or_issue(
-                            Some(variable.name),
-                            Diagnostic::with_arguments(message, [source, target]),
-                        );
+                        let staged = super::object_diagnostics::diagnostics_for_failed_assignment(
+                            store,
+                            host,
+                            &variable.initializer,
+                            source_type,
+                            target,
+                            variable.name,
+                            options,
+                        )?;
+                        for diagnostic in staged {
+                            merge_retry_diagnostic(diagnostics, diagnostic);
+                        }
                     }
                 }
             }
@@ -1621,6 +1608,33 @@ mod tests {
             })
             .unwrap_or_else(|| panic!("missing type node for variable {expected}"));
         NodeRef::new(parsed.arena.id(), file, type_node)
+    }
+
+    fn node_text<'arena>(parsed: &'arena ParseResult, node: NodeRef) -> &'arena str {
+        let range = parsed.arena.get(node.node).unwrap().range;
+        let source = parsed.arena.source_text().unwrap();
+        &source
+            [usize::try_from(range.start.get()).unwrap()..usize::try_from(range.end.get()).unwrap()]
+    }
+
+    fn assert_property_name_span(
+        parsed: &ParseResult,
+        node: NodeRef,
+        expected: &str,
+        source_property: bool,
+    ) {
+        let record = parsed.arena.get(node.node).unwrap();
+        assert_eq!(record.kind, SyntaxKind::Identifier);
+        assert_eq!(node_text(parsed, node), expected);
+        let parent = parsed.arena.get(record.parent.unwrap()).unwrap();
+        if source_property {
+            assert_eq!(parent.kind, SyntaxKind::PropertyAssignment);
+        } else {
+            assert!(matches!(
+                parent.kind,
+                SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature
+            ));
+        }
     }
 
     fn object_property_initializer(
@@ -2214,8 +2228,36 @@ mod tests {
             ],
             [regular_wrong, regular_wrong, string, regular_true]
         );
-        assert_eq!(context.diagnostics().len(), 1);
-        assert_eq!(context.diagnostics().as_slice()[0].diagnostic.code(), 2322);
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 2);
+        for (diagnostic, property, source_display, target) in [
+            (&diagnostics[0], "exact", "\"wrong\"", "\"expected\""),
+            (
+                &diagnostics[1],
+                "literalOrNumber",
+                "string",
+                "number | \"expected\"",
+            ),
+        ] {
+            assert_eq!(diagnostic.diagnostic.code(), 2322);
+            assert_eq!(
+                diagnostic.diagnostic.arguments,
+                [source_display.to_owned(), target.to_owned()]
+            );
+            assert_property_name_span(&source, diagnostic.node.unwrap(), property, true);
+            assert_eq!(diagnostic.related_information.len(), 1);
+            assert_eq!(diagnostic.related_information[0].diagnostic.code(), 6500);
+            assert_property_name_span(
+                &source,
+                diagnostic.related_information[0].node.unwrap(),
+                property,
+                false,
+            );
+            assert_eq!(
+                diagnostic.related_information[0].diagnostic.arguments,
+                [property.to_owned(), "Context".to_owned()]
+            );
+        }
         assert!(is_type_checked(&context, file));
     }
 
@@ -2465,29 +2507,507 @@ mod tests {
         );
         let diagnostics = context.diagnostics().as_slice();
         assert_eq!(diagnostics.len(), 2);
-        assert_eq!(
-            diagnostics[0].node,
-            Some(variable_name(&source, file, "first"))
-        );
+        assert_eq!(node_text(&source, diagnostics[0].node.unwrap()), "value");
         assert_eq!(diagnostics[0].diagnostic.code(), 2322);
         assert_eq!(
             diagnostics[0].diagnostic.render().unwrap(),
-            "Type '{ value: number; }' is not assignable to type 'TextValue'."
+            "Type 'number' is not assignable to type 'string'."
+        );
+        assert_eq!(diagnostics[0].related_information.len(), 1);
+        assert_eq!(
+            node_text(&source, diagnostics[0].related_information[0].node.unwrap()),
+            "value"
         );
         assert_eq!(
-            diagnostics[1].node,
-            Some(variable_name(&source, file, "second"))
+            diagnostics[0].related_information[0].diagnostic.code(),
+            6500
         );
+        assert_eq!(
+            diagnostics[0].related_information[0]
+                .diagnostic
+                .render()
+                .unwrap(),
+            "The expected type comes from property 'value' which is declared here on type 'TextValue'"
+        );
+
+        assert_eq!(node_text(&source, diagnostics[1].node.unwrap()), "value");
         assert_eq!(diagnostics[1].diagnostic.code(), 2322);
         assert_eq!(
             diagnostics[1].diagnostic.render().unwrap(),
-            "Type '{ value: string; }' is not assignable to type 'NumberValue'."
+            "Type 'string' is not assignable to type 'number'."
+        );
+        assert_eq!(diagnostics[1].related_information.len(), 1);
+        assert_eq!(
+            node_text(&source, diagnostics[1].related_information[0].node.unwrap()),
+            "value"
+        );
+        assert_eq!(
+            diagnostics[1].related_information[0].diagnostic.code(),
+            6500
+        );
+        assert_eq!(
+            diagnostics[1].related_information[0]
+                .diagnostic
+                .render()
+                .unwrap(),
+            "The expected type comes from property 'value' which is declared here on type 'NumberValue'"
         );
         assert!(is_type_checked(&context, file));
 
         let warm = observable_state(&context, file);
         context.check_source_file(file).unwrap();
         assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn object_literal_excess_properties_use_exact_names_and_pinned_messages_in_source_order() {
+        let source = parsed(concat!(
+            "interface Child { id: number; value: string } ",
+            "type Config = { count: number }; ",
+            r#"const child: Child = { id: 1, value: "ok", extra: true }; "#,
+            "const config: Config = { count: 1, surplus: false };",
+        ));
+        let file = FileId::new(96);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2353, 2353]
+        );
+        assert_eq!(node_text(&source, diagnostics[0].node.unwrap()), "extra");
+        assert_eq!(node_text(&source, diagnostics[1].node.unwrap()), "surplus");
+        assert_eq!(
+            diagnostics[0].diagnostic.render().unwrap(),
+            "Object literal may only specify known properties, and 'extra' does not exist in type 'Child'."
+        );
+        assert_eq!(
+            diagnostics[1].diagnostic.render().unwrap(),
+            "Object literal may only specify known properties, and 'surplus' does not exist in type 'Config'."
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.related_information.is_empty())
+        );
+
+        let warm = observable_state(&context, file);
+        context.check_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+        assert_eq!(context.diagnostics().len(), 2);
+    }
+
+    #[test]
+    fn fresh_object_literals_accept_empty_object_targets() {
+        let source = parsed("const empty: {} = { extra: 1 };");
+        let file = FileId::new(106);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        assert!(context.diagnostics().is_empty());
+        assert!(is_type_checked(&context, file));
+        assert!(
+            context
+                .store()
+                .type_node_links(variable_initializer(&source, file, "empty"))
+                .and_then(|links| links.resolved_type)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn excess_property_suggestion_ties_follow_target_declaration_order() {
+        let source = parsed(concat!(
+            "type First = { foo: number; foooo: number }; ",
+            "type Reversed = { foooo: number; foo: number }; ",
+            "const first: First = { fooo: 1 }; ",
+            "const reversed: Reversed = { fooo: 1 };",
+        ));
+        let file = FileId::new(97);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(diagnostics[0].diagnostic.code(), 2561);
+        assert_eq!(diagnostics[1].diagnostic.code(), 2561);
+        assert_property_name_span(&source, diagnostics[0].node.unwrap(), "fooo", true);
+        assert_property_name_span(&source, diagnostics[1].node.unwrap(), "fooo", true);
+        assert_eq!(
+            diagnostics[0].diagnostic.arguments,
+            ["fooo", "First", "foo"]
+        );
+        assert_eq!(
+            diagnostics[1].diagnostic.arguments,
+            ["fooo", "Reversed", "foooo"]
+        );
+        assert_eq!(
+            diagnostics[0].diagnostic.render().unwrap(),
+            "Object literal may only specify known properties, but 'fooo' does not exist in type 'First'. Did you mean to write 'foo'?"
+        );
+        assert_eq!(
+            diagnostics[1].diagnostic.render().unwrap(),
+            "Object literal may only specify known properties, but 'fooo' does not exist in type 'Reversed'. Did you mean to write 'foooo'?"
+        );
+    }
+
+    #[test]
+    fn first_excess_in_source_order_suppresses_later_excess_and_missing_fallbacks() {
+        let source = parsed(concat!(
+            "type Target = { required: string }; ",
+            "const actual: Target = { first: true, second: false };",
+        ));
+        let file = FileId::new(104);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected exactly one first-excess diagnostic")
+        };
+        assert_eq!(diagnostic.diagnostic.code(), 2353);
+        assert_eq!(diagnostic.diagnostic.arguments, ["first", "Target"]);
+        assert_property_name_span(&source, diagnostic.node.unwrap(), "first", true);
+        assert!(diagnostic.related_information.is_empty());
+    }
+
+    #[test]
+    fn known_property_mismatches_recurse_in_source_order_and_suppress_shape_fallbacks() {
+        let source = parsed(concat!(
+            "type Leaf = { value: string }; ",
+            "type Root = { scalar: string; nested: Leaf; required: number }; ",
+            "const actual: Root = { scalar: 1, nested: { value: 2, extra: true }, ",
+            "unexpected: false };",
+        ));
+        let file = FileId::new(98);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 2);
+        for (diagnostic, property, target) in [
+            (&diagnostics[0], "scalar", "Root"),
+            (&diagnostics[1], "value", "Leaf"),
+        ] {
+            assert_eq!(diagnostic.diagnostic.code(), 2322);
+            assert_eq!(
+                diagnostic.diagnostic.render().unwrap(),
+                "Type 'number' is not assignable to type 'string'."
+            );
+            assert_property_name_span(&source, diagnostic.node.unwrap(), property, true);
+            assert_eq!(diagnostic.related_information.len(), 1);
+            let related = &diagnostic.related_information[0];
+            assert_eq!(related.diagnostic.code(), 6500);
+            assert_property_name_span(&source, related.node.unwrap(), property, false);
+            assert_eq!(
+                related.diagnostic.arguments,
+                [property.to_owned(), target.to_owned()]
+            );
+        }
+        assert!(diagnostics.iter().all(|diagnostic| {
+            !matches!(
+                diagnostic.diagnostic.code(),
+                2353 | 2561 | 2739 | 2740 | 2741
+            )
+        }));
+    }
+
+    #[test]
+    fn multi_property_diagnostics_stage_atomically_before_later_display_failure() {
+        let split_literal = format!("{}é{}", "x".repeat(315), "x".repeat(10));
+        let source = parsed(&format!(
+            "type Target = {{ first: string; second: \"{split_literal}\" }}; \
+             const actual: Target = {{ first: 1, second: 2 }};"
+        ));
+        let file = FileId::new(107);
+        let mut truncated = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let mut complete = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                no_error_truncation: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+        let target = truncated
+            .get_type_from_type_node(variable_type_node(&source, file, "actual"))
+            .unwrap();
+        let second = declared_object_property_symbol(&truncated, target, "second");
+        let split_target = truncated
+            .store()
+            .value_symbol_links(second)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+
+        assert_eq!(
+            truncated.check_source_file(file),
+            Err(SourceCheckError::TypeDisplayUnavailable(
+                TypeDisplayUnavailable::Utf8TruncationBoundary {
+                    type_id: split_target,
+                    boundary: 317,
+                }
+            ))
+        );
+        assert!(truncated.diagnostics().is_empty());
+        assert!(!is_type_checked(&truncated, file));
+
+        complete.check_source_file(file).unwrap();
+
+        let diagnostics = complete.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 2);
+        for (diagnostic, property, target_display) in [
+            (&diagnostics[0], "first", "string".to_owned()),
+            (&diagnostics[1], "second", format!("\"{split_literal}\"")),
+        ] {
+            assert_eq!(diagnostic.diagnostic.code(), 2322);
+            assert_eq!(
+                diagnostic.diagnostic.arguments,
+                ["number".to_owned(), target_display]
+            );
+            assert_property_name_span(&source, diagnostic.node.unwrap(), property, true);
+            assert_eq!(diagnostic.related_information.len(), 1);
+            let related = &diagnostic.related_information[0];
+            assert_eq!(related.diagnostic.code(), 6500);
+            assert_eq!(related.diagnostic.arguments, [property, "Target"]);
+            assert_property_name_span(&source, related.node.unwrap(), property, false);
+        }
+        assert!(is_type_checked(&complete, file));
+    }
+
+    #[test]
+    fn nested_shape_errors_attach_only_the_immediate_containing_property() {
+        let source = parsed(concat!(
+            "type ExcessInner = { known: string }; ",
+            "type ExcessRoot = { outer: ExcessInner }; ",
+            r#"const excess: ExcessRoot = { outer: { known: "ok", extra: true } }; "#,
+            "type SingleInner = { inner: string }; ",
+            "type SingleRoot = { outer: SingleInner }; ",
+            "const single: SingleRoot = { outer: {} }; ",
+            "type MultiInner = { first: string; second: number }; ",
+            "type MultiRoot = { outer: MultiInner }; ",
+            "const multi: MultiRoot = { outer: {} };",
+        ));
+        let file = FileId::new(99);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 3);
+
+        let excess = &diagnostics[0];
+        assert_eq!(excess.diagnostic.code(), 2353);
+        assert_eq!(excess.diagnostic.arguments, ["extra", "ExcessInner"]);
+        assert_property_name_span(&source, excess.node.unwrap(), "extra", true);
+        assert_eq!(excess.related_information.len(), 1);
+        assert_eq!(excess.related_information[0].diagnostic.code(), 6500);
+        assert_eq!(
+            excess.related_information[0].diagnostic.arguments,
+            ["outer", "ExcessRoot"]
+        );
+        assert_property_name_span(
+            &source,
+            excess.related_information[0].node.unwrap(),
+            "outer",
+            false,
+        );
+
+        let single = &diagnostics[1];
+        assert_eq!(single.diagnostic.code(), 2741);
+        assert_eq!(single.diagnostic.arguments, ["inner", "{}", "SingleInner"]);
+        assert_property_name_span(&source, single.node.unwrap(), "outer", true);
+        assert_eq!(
+            single
+                .related_information
+                .iter()
+                .map(|related| related.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2728, 6500]
+        );
+        assert_property_name_span(
+            &source,
+            single.related_information[0].node.unwrap(),
+            "inner",
+            false,
+        );
+        assert_property_name_span(
+            &source,
+            single.related_information[1].node.unwrap(),
+            "outer",
+            false,
+        );
+        assert_eq!(
+            single.related_information[1].diagnostic.arguments,
+            ["outer", "SingleRoot"]
+        );
+
+        let multi = &diagnostics[2];
+        assert_eq!(multi.diagnostic.code(), 2739);
+        assert_eq!(
+            multi.diagnostic.arguments,
+            ["{}", "MultiInner", "first, second"]
+        );
+        assert_property_name_span(&source, multi.node.unwrap(), "outer", true);
+        assert_eq!(multi.related_information.len(), 1);
+        assert_eq!(multi.related_information[0].diagnostic.code(), 6500);
+        assert_eq!(
+            multi.related_information[0].diagnostic.arguments,
+            ["outer", "MultiRoot"]
+        );
+        assert_property_name_span(
+            &source,
+            multi.related_information[0].node.unwrap(),
+            "outer",
+            false,
+        );
+    }
+
+    #[test]
+    fn missing_required_properties_use_target_order_and_pinned_count_thresholds() {
+        let source = parsed(concat!(
+            "type One = { a: string }; ",
+            "type Two = { a: string; b: number }; ",
+            "type Five = { a: string; b: number; c: boolean; d: string; e: number }; ",
+            "type Six = { a: string; b: number; c: boolean; d: string; e: number; f: boolean }; ",
+            "type Optional = { maybe?: string }; ",
+            "const one: One = {}; const two: Two = {}; const five: Five = {}; ",
+            "const six: Six = {}; const optional: Optional = {};",
+        ));
+        let file = FileId::new(100);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 4);
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2741, 2739, 2739, 2740]
+        );
+        for (diagnostic, variable) in diagnostics.iter().zip(["one", "two", "five", "six"]) {
+            assert_eq!(
+                diagnostic.node,
+                Some(variable_name(&source, file, variable))
+            );
+        }
+        assert_eq!(diagnostics[0].diagnostic.arguments, ["a", "{}", "One"]);
+        assert_eq!(diagnostics[0].related_information.len(), 1);
+        assert_eq!(
+            diagnostics[0].related_information[0].diagnostic.code(),
+            2728
+        );
+        assert_property_name_span(
+            &source,
+            diagnostics[0].related_information[0].node.unwrap(),
+            "a",
+            false,
+        );
+        assert_eq!(diagnostics[1].diagnostic.arguments, ["{}", "Two", "a, b"]);
+        assert_eq!(
+            diagnostics[2].diagnostic.arguments,
+            ["{}", "Five", "a, b, c, d, e"]
+        );
+        assert_eq!(
+            diagnostics[3].diagnostic.arguments,
+            ["{}", "Six", "a, b, c, d", "2"]
+        );
+        assert!(
+            diagnostics[1..]
+                .iter()
+                .all(|diagnostic| diagnostic.related_information.is_empty())
+        );
+        assert!(is_type_checked(&context, file));
+    }
+
+    #[test]
+    fn no_error_truncation_controls_object_diagnostic_type_arguments() {
+        let declarations = (0..20)
+            .map(|index| format!("property{index}: number"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let assignments = (0..20)
+            .map(|index| format!("property{index}: {index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let source = parsed(&format!(
+            "const value: {{ {declarations} }} = {{ {assignments}, extra: true }};"
+        ));
+        let file = FileId::new(101);
+        let mut truncated = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let mut complete = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                no_error_truncation: true,
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        truncated.check_source_file(file).unwrap();
+        complete.check_source_file(file).unwrap();
+
+        let truncated = &truncated.diagnostics().as_slice()[0];
+        let complete = &complete.diagnostics().as_slice()[0];
+        assert_eq!(truncated.diagnostic.code(), 2353);
+        assert_eq!(complete.diagnostic.code(), 2353);
+        assert_property_name_span(&source, truncated.node.unwrap(), "extra", true);
+        assert_property_name_span(&source, complete.node.unwrap(), "extra", true);
+        assert!(truncated.diagnostic.arguments[1].contains("..."));
+        assert!(!complete.diagnostic.arguments[1].contains("..."));
+        assert!(complete.diagnostic.arguments[1].contains("property19: number"));
+    }
+
+    #[test]
+    fn cross_file_target_info_is_conservative_only_for_ts6500() {
+        let usage = parsed(concat!(
+            "const mismatch: Target = { value: 1 }; ",
+            "const missing: Missing = {};",
+        ));
+        let declarations = parsed(concat!(
+            "interface Target { value: string } ",
+            "interface Missing { required: number }",
+        ));
+        let usage_file = FileId::new(102);
+        let declarations_file = FileId::new(103);
+        let mut context = context(
+            &[(usage_file, &usage), (declarations_file, &declarations)],
+            CanonicalCheckerOptions::default(),
+        );
+
+        context.check_source_file(usage_file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(diagnostics[0].diagnostic.code(), 2322);
+        assert!(diagnostics[0].related_information.is_empty());
+        assert_eq!(diagnostics[1].diagnostic.code(), 2741);
+        assert_eq!(diagnostics[1].related_information.len(), 1);
+        assert_eq!(
+            diagnostics[1].related_information[0].diagnostic.code(),
+            2728
+        );
+        assert_eq!(
+            diagnostics[1].related_information[0]
+                .node
+                .map(|node| node.file),
+            Some(declarations_file)
+        );
+        assert_property_name_span(
+            &declarations,
+            diagnostics[1].related_information[0].node.unwrap(),
+            "required",
+            false,
+        );
     }
 
     #[test]
