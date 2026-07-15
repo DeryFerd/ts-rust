@@ -8,6 +8,7 @@
 
 pub mod alias;
 pub mod alias_flags;
+pub mod alias_provider;
 pub mod bootstrap;
 pub mod declared;
 pub mod diagnostics;
@@ -33,6 +34,7 @@ pub use bootstrap::{
     CheckerLinkCounts, CheckerStateSnapshot, IntrinsicBootstrap, IntrinsicBootstrapError,
     IntrinsicBootstrapOptions, SemanticArenaCounts, TypeResolutionStateSnapshot,
 };
+pub use alias_provider::{ProductionAliasTargetHost, ProductionAliasTargetHostError};
 pub use declared::{
     DeclaredTypeError, DeclaredTypeHost, DeclaredTypeHostError, DeclaredTypeUnavailable,
     UnsupportedDeclaredTypeKind, UnsupportedOuterTypeParameterContext,

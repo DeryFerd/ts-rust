@@ -6,7 +6,8 @@
 //! capability: an unsupported declaration family fails explicitly and never
 //! becomes a cached missing target.
 
-use ts_binder::{SemanticSymbolId, SymbolFlags};
+use ts_ast::{FileId, NodeRef};
+use ts_binder::{SemanticStoreId, SemanticSymbolId, SymbolFlags};
 
 use super::{
     AliasSymbolLinks, AliasTargetState, CanonicalSemanticStore, TypeResolutionTarget,
@@ -32,6 +33,83 @@ pub enum CanonicalAliasTargetUnavailable {
     /// The declaration family is known, but one of its semantic providers is
     /// not installed yet.
     TargetProviderUnavailable,
+    /// The Program did not install module-resolution capability for this
+    /// exact module-specifier node.
+    ModuleResolutionCapabilityUnavailable(NodeRef),
+    /// Module-resolution capability is installed, but has no entry for this
+    /// exact module-specifier node.
+    ModuleResolutionEntryAbsent(NodeRef),
+    /// The Program attempted and failed resolution for this exact module-
+    /// specifier node.
+    ModuleResolutionUnresolved(NodeRef),
+    /// The selected alias declaration is outside the production provider's
+    /// dependency-closed syntax slice.
+    UnsupportedAliasDeclaration(NodeRef),
+    /// Default imports and re-exports require the default/export-equals
+    /// interoperability path, which is not part of the plain-ESM slice.
+    UnsupportedDefaultAlias(NodeRef),
+    /// A named export without a module specifier needs lexical name
+    /// resolution instead of module-resolution facts.
+    UnsupportedLocalExport(NodeRef),
+    /// The requested member is not a direct export and the module contains
+    /// export-star declarations whose resolved export table is unavailable.
+    ExportStarResolutionUnsupported {
+        declaration: NodeRef,
+        module: SemanticSymbolId,
+    },
+    /// The target module contains an `export =` entry and needs CommonJS/ESM
+    /// interoperability semantics.
+    ExportEqualsResolutionUnsupported {
+        declaration: NodeRef,
+        module: SemanticSymbolId,
+    },
+    /// The declaration or target uses `CommonJS` resolution semantics.
+    CommonJsModuleUnsupported { declaration: NodeRef, file: FileId },
+    /// JavaScript declaration semantics are not installed in this provider.
+    JavaScriptModuleUnsupported { declaration: NodeRef, file: FileId },
+    /// The resolved module needs a synthetic ESM namespace/interoperability
+    /// wrapper rather than a direct source-file module symbol.
+    SyntheticModuleResolutionUnsupported {
+        declaration: NodeRef,
+        module: SemanticSymbolId,
+    },
+    /// A retained declaration no longer has the exact shape that was bound.
+    MalformedDeclaration(NodeRef),
+    /// A retained AST arena changed after declaration binding completed.
+    StaleSourceFile(FileId),
+    /// The callback was invoked with a semantic store other than the one used
+    /// to construct the production provider.
+    ForeignStore {
+        expected: SemanticStoreId,
+        actual: SemanticStoreId,
+    },
+    /// A declaration or resolved target belongs to an unretained/foreign AST
+    /// source.
+    ForeignDeclaration(NodeRef),
+    /// A resolved module names a Program file that was not retained by this
+    /// production host.
+    ForeignModuleTarget { declaration: NodeRef, file: FileId },
+    /// Binder declaration ownership does not agree with the alias selected by
+    /// the canonical symbol's reverse declaration search.
+    AliasDeclarationOwnerMismatch {
+        alias: SemanticSymbolId,
+        declaration: NodeRef,
+    },
+    /// The retained module source symbol or its direct export table is
+    /// malformed for this Program.
+    MalformedModuleSymbol {
+        declaration: NodeRef,
+        module: SemanticSymbolId,
+    },
+    /// A direct, byte-exact export with the requested module-export name is
+    /// absent. Diagnostics, rather than a cached missing alias, own this case.
+    MissingExport {
+        declaration: NodeRef,
+        module: SemanticSymbolId,
+    },
+    /// The alias checker-links record needed for a syntactic type-only marker
+    /// was not available or rejected the exact declaration node.
+    InvalidAliasLinks(SemanticSymbolId),
 }
 
 /// Syntax-specific callback required by the dependency-closed alias kernel.
