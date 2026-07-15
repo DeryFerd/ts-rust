@@ -54,6 +54,12 @@ impl PreparedEntityName {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SourceNodeFacts {
+    kind: SyntaxKind,
+    signature_links_eligible: bool,
+}
+
 /// Sole allocator and owner of one canonical program's semantic graph.
 ///
 /// Every semantic handle is branded with this store's identity. Record writes
@@ -71,7 +77,7 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     entity_names: Vec<EntityNameNode>,
     source_files: BTreeMap<FileId, SourceFileRef>,
     source_files_by_arena: BTreeMap<NodeArenaId, SourceFileRef>,
-    source_node_kinds: BTreeMap<NodeArenaId, Vec<Option<SyntaxKind>>>,
+    source_node_facts: BTreeMap<NodeArenaId, Vec<Option<SourceNodeFacts>>>,
     links: CheckerLinkStores,
     type_resolutions: TypeResolutionStack,
     relations: RelationCaches,
@@ -115,7 +121,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             entity_names: Vec::new(),
             source_files: BTreeMap::new(),
             source_files_by_arena: BTreeMap::new(),
-            source_node_kinds: BTreeMap::new(),
+            source_node_facts: BTreeMap::new(),
             links: CheckerLinkStores::default(),
             type_resolutions: TypeResolutionStack::new(id),
             relations: RelationCaches::default(),
@@ -157,7 +163,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         }
 
         let source = SourceFileRef::new(NodeRef::new(arena.id(), file, source_file));
-        let node_kinds = Self::validated_source_node_kinds(arena, source_file)?;
+        let node_facts = Self::validated_source_node_facts(arena, source_file)?;
         if self
             .source_files
             .get(&file)
@@ -167,11 +173,11 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 .get(&arena.id())
                 .is_some_and(|registered| *registered != source)
             || self
-                .source_node_kinds
+                .source_node_facts
                 .get(&arena.id())
                 .is_some_and(|registered| {
-                    node_kinds.len() < registered.len()
-                        || node_kinds[..registered.len()] != registered[..]
+                    node_facts.len() < registered.len()
+                        || node_facts[..registered.len()] != registered[..]
                 })
         {
             return None;
@@ -182,7 +188,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
         }
         self.source_files.insert(file, source);
         self.source_files_by_arena.insert(arena.id(), source);
-        self.source_node_kinds.insert(arena.id(), node_kinds);
+        self.source_node_facts.insert(arena.id(), node_facts);
         Some(source)
     }
 
@@ -591,13 +597,13 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
 
     #[must_use]
     pub fn signature_links(&self, node: NodeRef) -> Option<&SignatureLinks> {
-        self.node_has_kind(node, Self::is_signature_link_kind)
+        self.node_is_signature_links_eligible(node)
             .then(|| self.links.signature.try_get(&node))
             .flatten()
     }
 
     pub fn ensure_signature_links(&mut self, node: NodeRef) -> bool {
-        if !self.node_has_kind(node, Self::is_signature_link_kind) {
+        if !self.node_is_signature_links_eligible(node) {
             return false;
         }
         self.links.signature.get(node);
@@ -622,7 +628,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 links.decorator_signature = DecoratorSignatureState::NotApplicable;
             }
         }
-        if !self.node_has_kind(node, Self::is_signature_link_kind)
+        if !self.node_is_signature_links_eligible(node)
             || !self.valid_optional_signature(links.resolved_signature.signature())
             || !self.valid_optional_signature(links.effects_signature.signature())
             || !self.valid_optional_signature(links.decorator_signature.signature())
@@ -1797,28 +1803,37 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     }
 
     fn node_is_source_reachable(&self, node: NodeRef) -> bool {
-        self.source_node_kind(node).is_some()
+        self.source_node_fact(node).is_some()
+    }
+
+    fn node_is_signature_links_eligible(&self, node: NodeRef) -> bool {
+        self.source_node_fact(node)
+            .is_some_and(|facts| facts.signature_links_eligible)
     }
 
     fn source_node_kind(&self, node: NodeRef) -> Option<SyntaxKind> {
+        self.source_node_fact(node).map(|facts| facts.kind)
+    }
+
+    fn source_node_fact(&self, node: NodeRef) -> Option<SourceNodeFacts> {
         if !self.contains_node_ref(node) {
             return None;
         }
-        self.source_node_kinds
+        self.source_node_facts
             .get(&node.arena)
-            .and_then(|kinds| kinds.get(node.node.index()))
+            .and_then(|facts| facts.get(node.node.index()))
             .copied()
             .flatten()
     }
 
-    fn validated_source_node_kinds(
+    fn validated_source_node_facts(
         arena: &NodeArena,
         source_file: NodeId,
-    ) -> Option<Vec<Option<SyntaxKind>>> {
-        let mut kinds = vec![None; arena.len()];
+    ) -> Option<Vec<Option<SourceNodeFacts>>> {
+        let mut facts = vec![None; arena.len()];
         let mut pending = vec![(source_file, None)];
         while let Some((node_id, expected_parent)) = pending.pop() {
-            let slot = kinds.get_mut(node_id.index())?;
+            let slot = facts.get_mut(node_id.index())?;
             if slot.is_some() {
                 return None;
             }
@@ -1826,15 +1841,23 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             if node.parent != expected_parent || !node.data.matches_syntax_kind(node.kind) {
                 return None;
             }
-            *slot = Some(node.kind);
+            *slot = Some(SourceNodeFacts {
+                kind: node.kind,
+                signature_links_eligible: Self::is_signature_links_eligible(arena, node),
+            });
             node.for_each_child(|child| pending.push((child, Some(node_id))));
         }
-        Some(kinds)
+        Some(facts)
     }
 
-    fn is_signature_link_kind(kind: SyntaxKind) -> bool {
+    fn is_signature_links_eligible(arena: &NodeArena, node: &ts_ast::Node) -> bool {
+        if let NodeData::BinaryExpression(binary) = &node.data {
+            return arena
+                .get(binary.operator_token)
+                .is_some_and(|operator| operator.kind == SyntaxKind::InstanceOfKeyword);
+        }
         matches!(
-            kind,
+            node.kind,
             SyntaxKind::MethodSignature
                 | SyntaxKind::MethodDeclaration
                 | SyntaxKind::Constructor
@@ -1856,7 +1879,6 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
                 | SyntaxKind::NewExpression
                 | SyntaxKind::TaggedTemplateExpression
                 | SyntaxKind::Decorator
-                | SyntaxKind::BinaryExpression
                 | SyntaxKind::ClassDeclaration
                 | SyntaxKind::ClassExpression
                 | SyntaxKind::Parameter
@@ -2795,7 +2817,8 @@ mod tests {
         let parsed = parse_source_file(
             "enum E { A } const asserted = value as string; \
              const angled = <string>value; const array = [...items]; \
-             switch (value) { case 0: break; } factory();",
+             switch (value) { case 0: break; } factory(); \
+             const sum = left + right; const test = value instanceof Factory;",
         );
         let file = FileId::new(37);
         let mut store = TestStore::new();
@@ -2813,6 +2836,24 @@ mod tests {
         let array = node_ref_of_kind(&parsed.arena, file, SyntaxKind::ArrayLiteralExpression);
         let switch = node_ref_of_kind(&parsed.arena, file, SyntaxKind::SwitchStatement);
         let call = node_ref_of_kind(&parsed.arena, file, SyntaxKind::CallExpression);
+        let binary_with_operator = |operator_kind| {
+            parsed
+                .arena
+                .iter()
+                .find_map(|(id, node)| {
+                    let NodeData::BinaryExpression(binary) = &node.data else {
+                        return None;
+                    };
+                    parsed
+                        .arena
+                        .get(binary.operator_token)
+                        .is_some_and(|operator| operator.kind == operator_kind)
+                        .then_some(NodeRef::new(parsed.arena.id(), file, id))
+                })
+                .unwrap_or_else(|| panic!("parsed source must contain {operator_kind:?}"))
+        };
+        let addition = binary_with_operator(SyntaxKind::PlusToken);
+        let instance_of = binary_with_operator(SyntaxKind::InstanceOfKeyword);
 
         let before = store.checker_link_allocated_lengths();
         assert!(!store.ensure_enum_member_links(ordinary));
@@ -2825,6 +2866,8 @@ mod tests {
         assert!(!store.set_switch_statement_links(ordinary, SwitchStatementLinks::default()));
         assert!(!store.ensure_signature_links(ordinary));
         assert!(!store.set_signature_links(ordinary, SignatureLinks::default()));
+        assert!(!store.ensure_signature_links(addition));
+        assert!(!store.set_signature_links(addition, SignatureLinks::default()));
         assert_eq!(store.checker_link_allocated_lengths(), before);
 
         assert!(store.ensure_enum_member_links(enum_member));
@@ -2833,6 +2876,7 @@ mod tests {
         assert!(store.ensure_array_literal_links(array));
         assert!(store.ensure_switch_statement_links(switch));
         assert!(store.ensure_signature_links(call));
+        assert!(store.ensure_signature_links(instance_of));
         assert!(
             store.ensure_jsx_element_links(ordinary),
             "JSX namespace caching accepts arbitrary source locations upstream"

@@ -139,8 +139,7 @@ pub fn parse_javascript_source_file(source: &str) -> ParseResult {
 /// tokens and every scanner or parser diagnostic reject the entire result.
 #[must_use]
 pub fn parse_isolated_entity_name(source: &str) -> Option<IsolatedEntityName> {
-    Parser::new_with_variant_and_javascript(source, LanguageVariant::Standard, true)
-        .parse_isolated_entity_name()
+    Parser::new_isolated_entity_name(source).parse_isolated_entity_name()
 }
 
 fn parse_amd_pragmas(source: &str) -> (Vec<AmdDependency>, Vec<AmdModuleName>, Vec<Diagnostic>) {
@@ -412,7 +411,24 @@ impl<'a> Parser<'a> {
         variant: LanguageVariant,
         javascript_file: bool,
     ) -> Self {
-        let (amd_dependencies, amd_module_names, diagnostics) = parse_amd_pragmas(source);
+        Self::new_with_context(source, variant, javascript_file, true)
+    }
+
+    fn new_isolated_entity_name(source: &'a str) -> Self {
+        Self::new_with_context(source, LanguageVariant::Standard, true, false)
+    }
+
+    fn new_with_context(
+        source: &'a str,
+        variant: LanguageVariant,
+        javascript_file: bool,
+        parse_source_file_pragmas: bool,
+    ) -> Self {
+        let (amd_dependencies, amd_module_names, diagnostics) = if parse_source_file_pragmas {
+            parse_amd_pragmas(source)
+        } else {
+            (Vec::new(), Vec::new(), Vec::new())
+        };
         let mut scanner = Scanner::new(source);
         scanner.set_language_variant(variant);
         let current = scanner.scan();
@@ -9706,6 +9722,7 @@ mod tests {
             "default.class",
             "await.yield",
             "R\\u0065act.createElement",
+            "/// <amd-module name='first'/>\n/// <amd-module name='second'/>\nReact.createElement",
         ] {
             assert!(
                 parse_isolated_entity_name(valid).is_some(),
