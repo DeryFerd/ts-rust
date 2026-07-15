@@ -2078,6 +2078,7 @@ mod tests {
     struct SeededStore {
         store: TestStore,
         conditional_node: NodeRef,
+        instantiation_node: NodeRef,
         mapped_node: NodeRef,
         reference_node: NodeRef,
         tuple_label_node: NodeRef,
@@ -2096,7 +2097,8 @@ mod tests {
              type Mapping<T> = { [K in keyof T]: T[K] };\n\
              type Reference = Array<string>;\n\
              type Tuple = [label: string];\n\
-             declare function f(parameter: string): void;",
+             declare function f<T>(parameter: T): void;\n\
+             const instantiated = f<string>;",
         );
         let scope = AstScope::new(FileId::new(0), &parsed.arena);
         let node_of_kind = |kind| {
@@ -2108,6 +2110,7 @@ mod tests {
             scope.node_ref(node).unwrap()
         };
         let conditional_node = node_of_kind(SyntaxKind::ConditionalType);
+        let instantiation_node = node_of_kind(SyntaxKind::ExpressionWithTypeArguments);
         let mapped_node = node_of_kind(SyntaxKind::MappedType);
         let reference_node = node_of_kind(SyntaxKind::TypeReference);
         let tuple_label_node = node_of_kind(SyntaxKind::NamedTupleMember);
@@ -2147,6 +2150,7 @@ mod tests {
         SeededStore {
             store,
             conditional_node,
+            instantiation_node,
             mapped_node,
             reference_node,
             tuple_label_node,
@@ -2197,7 +2201,7 @@ mod tests {
                 .alloc_instantiation_expression_type(
                     ObjectFlags::NONE,
                     Some(seeded.symbol),
-                    Some(seeded.reference_node),
+                    Some(seeded.instantiation_node),
                 )
                 .unwrap(),
             store
@@ -3015,7 +3019,7 @@ mod tests {
             .unwrap();
         assert!(!second
             .store
-            .set_instantiation_expression_node(expression, Some(first.reference_node)));
+            .set_instantiation_expression_node(expression, Some(first.instantiation_node)));
         let TypeData::InstantiationExpression(expression_data) =
             second.store.type_payload(expression).unwrap().data()
         else {
