@@ -2229,7 +2229,13 @@ mod tests {
     use crate::semantic::{
         CanonicalCheckerContext, DeclaredTypeHostError, IntrinsicBootstrapOptions,
         RelationStateSnapshot, TypeNodeUnavailable, ValueSymbolLinks,
-        production::GlobalMergeCompletion, type_records::TypeData, types::ObjectFlags,
+        object_members::{
+            DeclaredPropertyObjectProof, DeclaredPropertyObjectValidation,
+            validate_resolved_declared_property_object,
+        },
+        production::GlobalMergeCompletion,
+        type_records::TypeData,
+        types::ObjectFlags,
     };
 
     type ObservableSourceState = (
@@ -2563,6 +2569,35 @@ mod tests {
             .symbol_table(structured.members.unwrap())
             .and_then(|members| members.get_source(expected))
             .unwrap_or_else(|| panic!("missing declared object property {expected}"))
+    }
+
+    fn global_symbol(context: &CanonicalCheckerContext<'_>, expected: &str) -> SemanticSymbolId {
+        context
+            .store()
+            .symbol_table(context.globals())
+            .and_then(|globals| globals.get_source(expected))
+            .unwrap_or_else(|| panic!("missing global symbol {expected}"))
+    }
+
+    fn array_element_in_union(
+        context: &CanonicalCheckerContext<'_>,
+        union: TypeId,
+    ) -> (TypeId, TypeId) {
+        let TypeData::Union(data) = context.store().type_payload(union).unwrap().data() else {
+            panic!("expected canonical union {union:?}")
+        };
+        data.union
+            .types
+            .iter()
+            .find_map(|constituent| {
+                context
+                    .store()
+                    .canonical_array_reference(context.global_types(), *constituent)
+                    .ok()
+                    .flatten()
+                    .map(|array| (*constituent, array.element_type))
+            })
+            .unwrap_or_else(|| panic!("union {union:?} has no canonical array constituent"))
     }
 
     fn resolved_node_type(context: &CanonicalCheckerContext<'_>, node: NodeRef) -> TypeId {
@@ -3580,6 +3615,418 @@ mod tests {
         let warm = observable_state(&context, file);
         assert_eq!(context.get_type_from_type_node(body), Ok(union));
         assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn declared_property_objects_are_array_union_elements_cold_warm_and_recursive() {
+        let library = parsed("interface Array<T> {}");
+        let source = parsed(concat!(
+            "interface Foo { value: string } ",
+            "type Shape = { value: number }; ",
+            "interface Node { next?: Node; payload: Shape } ",
+            "type FooMaybe = Foo[] | null; ",
+            "type ShapeMaybe = Shape[] | null; ",
+            "type InlineMaybe = ({ enabled: boolean })[] | null; ",
+            "type EmptyMaybe = {}[] | null; ",
+            "type NodeMaybe = Node[] | null; ",
+            "let foo: FooMaybe = null; ",
+            "let shape: ShapeMaybe = null; ",
+            "let inline: InlineMaybe = null; ",
+            "let empty: EmptyMaybe = null; ",
+            "let node: NodeMaybe = null;",
+        ));
+        let library_file = FileId::new(143);
+        let file = FileId::new(144);
+        let mut context = context(
+            &[(library_file, &library), (file, &source)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    exact_optional_property_types: false,
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let mut unions = Vec::new();
+        let mut node_element = None;
+        for (alias, expected_proof) in [
+            ("FooMaybe", DeclaredPropertyObjectProof::Interface),
+            ("ShapeMaybe", DeclaredPropertyObjectProof::TypeLiteral),
+            ("InlineMaybe", DeclaredPropertyObjectProof::TypeLiteral),
+            ("EmptyMaybe", DeclaredPropertyObjectProof::TypeLiteral),
+            ("NodeMaybe", DeclaredPropertyObjectProof::Interface),
+        ] {
+            let body = type_alias_body(&source, file, alias);
+            let union = context.get_type_from_type_node(body).unwrap();
+            let (_, element) = array_element_in_union(&context, union);
+            assert_eq!(
+                validate_resolved_declared_property_object(context.store(), element),
+                DeclaredPropertyObjectValidation::Valid(expected_proof),
+            );
+            unions.push((body, union));
+            if alias == "NodeMaybe" {
+                node_element = Some(element);
+            }
+        }
+        let node = node_element.unwrap();
+        let next = declared_object_property_symbol(&context, node, "next");
+        assert_eq!(
+            context
+                .store()
+                .value_symbol_links(next)
+                .and_then(|links| links.resolved_type),
+            Some(node),
+            "recursive declared properties remain opaque store-owned identities",
+        );
+        assert!(context.diagnostics().is_empty());
+        assert!(is_type_checked(&context, file));
+
+        let warm = observable_state(&context, file);
+        for (body, union) in unions {
+            assert_eq!(context.get_type_from_type_node(body), Ok(union));
+        }
+        context.check_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn declared_array_union_cache_poison_rescans_atomically_and_retries() {
+        #[derive(Clone, Copy, Debug)]
+        enum Poison {
+            Shell,
+            OwnerMembers,
+            PropertyOrder,
+            AliasOwner,
+            PropertyLinks,
+        }
+
+        let library = parsed("interface Array<T> {}");
+        let source = parsed(concat!(
+            "type Item = { first: string; second: number }; ",
+            "type Items = Item[] | null; ",
+            "type Probe = string | number;",
+        ));
+        let library_file = FileId::new(145);
+        let file = FileId::new(146);
+        for poison in [
+            Poison::Shell,
+            Poison::OwnerMembers,
+            Poison::PropertyOrder,
+            Poison::AliasOwner,
+            Poison::PropertyLinks,
+        ] {
+            let mut context = context(
+                &[(library_file, &library), (file, &source)],
+                CanonicalCheckerOptions {
+                    intrinsic: IntrinsicBootstrapOptions {
+                        strict_null_checks: true,
+                        exact_optional_property_types: false,
+                    },
+                    ..CanonicalCheckerOptions::default()
+                },
+            );
+            let items_body = type_alias_body(&source, file, "Items");
+            let items = context.get_type_from_type_node(items_body).unwrap();
+            let (_, item) = array_element_in_union(&context, items);
+            assert_eq!(
+                validate_resolved_declared_property_object(context.store(), item),
+                DeclaredPropertyObjectValidation::Valid(DeclaredPropertyObjectProof::TypeLiteral,),
+            );
+            let (flags, owner, alias_symbol, members, properties, property, property_links) = {
+                let record = context.store().type_payload(item).unwrap();
+                let structured = record.data().structured().unwrap();
+                let owner = record.symbol().unwrap();
+                let alias_symbol = record
+                    .alias()
+                    .and_then(|alias| context.store().type_alias(alias))
+                    .and_then(|alias| alias.symbol())
+                    .unwrap();
+                let properties = structured.properties.clone().unwrap();
+                let property = properties[0];
+                (
+                    record.object_flags(),
+                    owner,
+                    alias_symbol,
+                    structured.members,
+                    properties,
+                    property,
+                    context
+                        .store()
+                        .value_symbol_links(property)
+                        .cloned()
+                        .unwrap(),
+                )
+            };
+            match poison {
+                Poison::Shell => assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_type_object_flags(item, ObjectFlags::ANONYMOUS)
+                ),
+                Poison::OwnerMembers => assert!(
+                    context
+                        .store_mut_for_test()
+                        .set_symbol_relationships(owner, None, None, None, None)
+                ),
+                Poison::PropertyOrder => {
+                    let mut reversed = properties.clone();
+                    reversed.reverse();
+                    assert!(context.store_mut_for_test().set_structured_type_members(
+                        item,
+                        members,
+                        Some(reversed),
+                        None,
+                        None,
+                        None,
+                    ));
+                }
+                Poison::AliasOwner => {
+                    assert!(context.store_mut_for_test().set_symbol_relationships(
+                        alias_symbol,
+                        None,
+                        None,
+                        Some(owner),
+                        None
+                    ))
+                }
+                Poison::PropertyLinks => {
+                    let mut links = property_links.clone();
+                    links.write_type =
+                        Some(context.store().intrinsic_bootstrap().unwrap().string_type);
+                    assert!(
+                        context
+                            .store_mut_for_test()
+                            .set_value_symbol_links(property, links)
+                    );
+                }
+            }
+            context
+                .store_mut_for_test()
+                .mark_union_cache_validation_dirty();
+            let scans = context.store().union_cache_validation_scan_count();
+            let poisoned_state = observable_state(&context, file);
+            let probe_body = type_alias_body(&source, file, "Probe");
+
+            assert!(
+                matches!(
+                    context.get_type_from_type_node(probe_body),
+                    Err(DeclaredTypeError::TypeNodeUnavailable(
+                        TypeNodeUnavailable::InvalidCachedUnionType(type_)
+                    )) if type_ == item
+                ),
+                "poison: {poison:?}"
+            );
+            assert_eq!(
+                context.store().union_cache_validation_scan_count(),
+                scans + 1,
+                "poison: {poison:?}",
+            );
+            assert_eq!(
+                observable_state(&context, file),
+                poisoned_state,
+                "poison: {poison:?}",
+            );
+
+            match poison {
+                Poison::Shell => {
+                    assert!(
+                        context
+                            .store_mut_for_test()
+                            .set_type_object_flags(item, flags)
+                    );
+                }
+                Poison::OwnerMembers => {
+                    assert!(
+                        context
+                            .store_mut_for_test()
+                            .set_symbol_relationships(owner, members, None, None, None,)
+                    );
+                }
+                Poison::PropertyOrder => {
+                    assert!(context.store_mut_for_test().set_structured_type_members(
+                        item,
+                        members,
+                        Some(properties.clone()),
+                        None,
+                        None,
+                        None,
+                    ));
+                }
+                Poison::AliasOwner => {
+                    assert!(context.store_mut_for_test().set_symbol_relationships(
+                        alias_symbol,
+                        None,
+                        None,
+                        None,
+                        None,
+                    ));
+                }
+                Poison::PropertyLinks => {
+                    assert!(
+                        context
+                            .store_mut_for_test()
+                            .set_value_symbol_links(property, property_links)
+                    );
+                }
+            }
+            let probe = context.get_type_from_type_node(probe_body).unwrap();
+            assert_eq!(context.type_to_string(probe).unwrap(), "Probe");
+            assert_eq!(context.get_type_from_type_node(items_body), Ok(items));
+            assert_eq!(
+                validate_resolved_declared_property_object(context.store(), item),
+                DeclaredPropertyObjectValidation::Valid(DeclaredPropertyObjectProof::TypeLiteral,),
+            );
+            assert_eq!(
+                context.store().union_cache_validation_scan_count(),
+                scans + 2,
+                "poison: {poison:?}",
+            );
+            assert!(context.diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    fn declared_recursive_interface_array_union_cache_poison_is_invariant_and_retryable() {
+        let library = parsed("interface Array<T> {}");
+        let source = parsed(concat!(
+            "interface Node { next?: Node } ",
+            "type Nodes = Node[] | null; ",
+            "type Probe = string | number;",
+        ));
+        let library_file = FileId::new(147);
+        let file = FileId::new(148);
+        let mut context = context(
+            &[(library_file, &library), (file, &source)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    exact_optional_property_types: false,
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+        let nodes_body = type_alias_body(&source, file, "Nodes");
+        let nodes = context.get_type_from_type_node(nodes_body).unwrap();
+        let (_, node) = array_element_in_union(&context, nodes);
+        let next = declared_object_property_symbol(&context, node, "next");
+        let links = context.store().value_symbol_links(next).cloned().unwrap();
+        let mut poisoned_links = links.clone();
+        poisoned_links.write_type =
+            Some(context.store().intrinsic_bootstrap().unwrap().string_type);
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(next, poisoned_links)
+        );
+        context
+            .store_mut_for_test()
+            .mark_union_cache_validation_dirty();
+        let scans = context.store().union_cache_validation_scan_count();
+        let poisoned_state = observable_state(&context, file);
+        let probe_body = type_alias_body(&source, file, "Probe");
+
+        assert!(matches!(
+            context.get_type_from_type_node(probe_body),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::InvalidCachedUnionType(type_)
+            )) if type_ == node
+        ));
+        assert_eq!(
+            context.store().union_cache_validation_scan_count(),
+            scans + 1,
+        );
+        assert_eq!(observable_state(&context, file), poisoned_state);
+
+        assert!(
+            context
+                .store_mut_for_test()
+                .set_value_symbol_links(next, links)
+        );
+        let probe = context.get_type_from_type_node(probe_body).unwrap();
+        assert_eq!(context.type_to_string(probe).unwrap(), "Probe");
+        assert_eq!(context.get_type_from_type_node(nodes_body), Ok(nodes));
+        assert_eq!(
+            validate_resolved_declared_property_object(context.store(), node),
+            DeclaredPropertyObjectValidation::Valid(DeclaredPropertyObjectProof::Interface),
+        );
+        assert_eq!(
+            context.store().union_cache_validation_scan_count(),
+            scans + 2,
+        );
+        assert!(context.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn declared_method_signature_and_generic_array_elements_remain_typed_boundaries() {
+        let library = parsed("interface Array<T> {}");
+        let library_file = FileId::new(149);
+        for (index, declaration) in [
+            "interface Callable { run(): string }",
+            "interface Callable { (): string }",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = parsed(declaration);
+            let file = FileId::new(150 + u32::try_from(index).unwrap());
+            let mut context = context(
+                &[(library_file, &library), (file, &source)],
+                CanonicalCheckerOptions::default(),
+            );
+            let callable = global_symbol(&context, "Callable");
+            let global_types = context.global_types().clone();
+            let callable_type = context
+                .store_mut_for_test()
+                .alloc_interface_type(ObjectFlags::INTERFACE, Some(callable))
+                .unwrap();
+            let array = context
+                .store_mut_for_test()
+                .create_canonical_array_type(&global_types, callable_type, false)
+                .unwrap();
+
+            assert_eq!(
+                validate_resolved_declared_property_object(context.store(), callable_type),
+                DeclaredPropertyObjectValidation::NotDeclared,
+                "source: {declaration}",
+            );
+            assert_eq!(
+                context
+                    .store()
+                    .validate_union_constituent_with_global_types(&global_types, array),
+                Err(LiteralTypeCacheError::UnsupportedUnionConstituent(
+                    callable_type,
+                )),
+                "source: {declaration}",
+            );
+        }
+
+        let source = parsed(concat!(
+            "interface Box<T> { value: T } ",
+            "type Instantiated = Box<number>[] | null;",
+        ));
+        let file = FileId::new(152);
+        let mut context = context(
+            &[(library_file, &library), (file, &source)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    exact_optional_property_types: false,
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+        let before = observable_state(&context, file);
+        assert!(matches!(
+            context.get_type_from_type_node(type_alias_body(&source, file, "Instantiated")),
+            Err(DeclaredTypeError::TypeNodeUnavailable(
+                TypeNodeUnavailable::TypeArgumentsUnsupported(_)
+            )),
+        ));
+        assert_eq!(observable_state(&context, file), before);
+        assert!(context.diagnostics().is_empty());
     }
 
     #[test]

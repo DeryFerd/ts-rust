@@ -19,7 +19,9 @@
 //!   bootstrap cases below encode its pinned normalized results. Literal and
 //!   dependency-closed union cache ownership stays here; the expression-union
 //!   prefix additionally admits recursively canonical unions and fresh,
-//!   property-only object literals for exact array-literal subtype reduction.
+//!   property-only object literals for exact array-literal subtype reduction,
+//!   plus resolved nongeneric declared property objects as canonical array
+//!   elements.
 
 use std::{
     cmp::Ordering,
@@ -39,6 +41,7 @@ use super::{
     ids::{IndexInfoId, SignatureId, TypeAliasId, TypeId, TypePredicateId},
     links::ValueSymbolLinks,
     mapper::TypeMapper,
+    object_members,
     relation::RelationStateSnapshot,
     signatures::{SignatureFlags, TypePredicateKind},
     store::SemanticStore,
@@ -1597,6 +1600,24 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         result
     }
 
+    fn validate_supported_unknown_empty_object(
+        &self,
+        type_: TypeId,
+        record: &TypeRecord,
+        object: &ObjectTypeData,
+    ) -> bool {
+        self.intrinsic_bootstrap.as_ref().is_some_and(|bootstrap| {
+            type_ == bootstrap.unknown_empty_object_type
+                && record.flags() == TypeFlags::OBJECT
+                && record.object_flags() == ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
+                && record.symbol().is_none()
+                && record.alias().is_none()
+                && Self::valid_supported_property_object_tail(object)
+                && object.structured.members.is_none()
+                && object.structured.properties.is_none()
+        })
+    }
+
     fn valid_supported_property_object_tail(object: &ObjectTypeData) -> bool {
         object.target.is_none()
             && object.mapper.is_none()
@@ -1642,8 +1663,9 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             });
         }
         // The element remains inside the installed union domain. In
-        // particular, declared interface elements such as `Foo[] | null`
-        // still wait on declared-object constituent validation.
+        // particular, declared interface and type-literal elements are proved
+        // by their resolved property shells without recursively forcing legal
+        // self-references such as `Node.next: Node` through this domain.
         let result = self.validate_union_constituent_worker(
             reference.element_type,
             array_validation,
@@ -1736,13 +1758,36 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 self.validate_supported_literal_identity(type_, regular, fresh, &data.value)?;
                 Ok(())
             }
-            TypeData::Object(object) => self.validate_supported_fresh_property_object(
-                type_,
-                record,
-                object,
-                array_validation,
-                visiting,
-            ),
+            TypeData::Object(object) => {
+                if self.validate_supported_unknown_empty_object(type_, record, object) {
+                    return Ok(());
+                }
+                match object_members::validate_resolved_declared_property_object(self, type_) {
+                    object_members::DeclaredPropertyObjectValidation::Valid(_) => Ok(()),
+                    object_members::DeclaredPropertyObjectValidation::NotDeclared => self
+                        .validate_supported_fresh_property_object(
+                            type_,
+                            record,
+                            object,
+                            array_validation,
+                            visiting,
+                        ),
+                    object_members::DeclaredPropertyObjectValidation::Malformed => {
+                        Err(LiteralTypeCacheError::InvalidCachedUnion(type_))
+                    }
+                }
+            }
+            TypeData::Interface(_) => {
+                match object_members::validate_resolved_declared_property_object(self, type_) {
+                    object_members::DeclaredPropertyObjectValidation::Valid(_) => Ok(()),
+                    object_members::DeclaredPropertyObjectValidation::NotDeclared => {
+                        Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_))
+                    }
+                    object_members::DeclaredPropertyObjectValidation::Malformed => {
+                        Err(LiteralTypeCacheError::InvalidCachedUnion(type_))
+                    }
+                }
+            }
             TypeData::TypeReference(_) => {
                 self.validate_supported_canonical_array(type_, array_validation, visiting)
             }

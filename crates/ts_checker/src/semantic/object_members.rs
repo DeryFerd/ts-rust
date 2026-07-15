@@ -80,6 +80,28 @@ pub(super) enum PropertyObjectState {
     Resolved(TypeId),
 }
 
+/// Read-only evidence that a resolved object belongs to the installed,
+/// nongeneric declared-property prefix.
+///
+/// This is intentionally distinct from expression object literals. Declared
+/// properties may refer back to their owner (for example `Node.next: Node`),
+/// so callers validate each property type as a store-owned identity without
+/// recursively requiring it to belong to a narrower construction domain.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum DeclaredPropertyObjectProof {
+    Interface,
+    TypeLiteral,
+}
+
+/// Distinguishes a supported proof from an intentional coverage boundary and
+/// a corrupt cache that claimed to be a supported declared property object.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum DeclaredPropertyObjectValidation {
+    Valid(DeclaredPropertyObjectProof),
+    NotDeclared,
+    Malformed,
+}
+
 impl PropertyObjectState {
     pub(super) const fn type_id(self) -> TypeId {
         match self {
@@ -873,6 +895,468 @@ fn validate_interface_record(
         return Some(PropertyObjectState::Resolved(type_));
     }
     None
+}
+
+/// Proves that `type_` is a fully resolved, nongeneric interface or declared
+/// type literal whose only members are ordered properties.
+///
+/// The proof is semantic-only so cache validators can use it without retaining
+/// an AST host. Source provenance is still checked through registered node
+/// facts and the exact owner/property symbol edges published by the binder.
+pub(super) fn validate_resolved_declared_property_object(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+) -> DeclaredPropertyObjectValidation {
+    use DeclaredPropertyObjectValidation::{Malformed, NotDeclared, Valid};
+
+    let Some(record) = store.type_payload(type_) else {
+        return NotDeclared;
+    };
+    if record.flags() != TypeFlags::OBJECT {
+        return if matches!(record.data(), TypeData::Interface(_) | TypeData::Object(_)) {
+            Malformed
+        } else {
+            NotDeclared
+        };
+    }
+    if store
+        .intrinsic_bootstrap()
+        .is_some_and(|bootstrap| type_ == bootstrap.empty_type_literal_type)
+    {
+        return if validate_empty_type_literal_identity(store, type_, record) {
+            Valid(DeclaredPropertyObjectProof::TypeLiteral)
+        } else {
+            Malformed
+        };
+    }
+    match record.data() {
+        TypeData::Interface(interface) => {
+            let Some(owner) = record.symbol() else {
+                return Malformed;
+            };
+            let Some(owner_record) = store.symbol(owner) else {
+                return Malformed;
+            };
+            if owner_record.flags() != SymbolFlags::INTERFACE {
+                return NotDeclared;
+            }
+            if interface.all_type_parameters.is_some()
+                || interface.outer_type_parameter_count != 0
+                || interface.this_type.is_some()
+                || interface.reference.object.target.is_some()
+                || interface.reference.object.mapper.is_some()
+                || interface.reference.object.instantiations != TypeCacheState::Unallocated
+                || interface.reference.node.is_some()
+                || interface.reference.resolved_type_arguments.is_some()
+                || record.object_flags().intersects(ObjectFlags::REFERENCE)
+            {
+                return NotDeclared;
+            }
+            match classify_declared_owner_members(store, owner) {
+                DeclaredOwnerMemberDomain::PropertyOnly => {}
+                DeclaredOwnerMemberDomain::Unsupported => return NotDeclared,
+                DeclaredOwnerMemberDomain::Malformed => return Malformed,
+            }
+            if interface.resolved_base_constructor_type.is_some()
+                || interface.resolved_base_types.is_some()
+                || interface.declared_call_signatures.is_some()
+                || interface.declared_construct_signatures.is_some()
+                || interface.declared_index_infos.is_some()
+                || interface.reference.object.structured.signatures.is_some()
+                || interface.reference.object.structured.call_signature_count != 0
+                || interface.reference.object.structured.index_infos.is_some()
+            {
+                return NotDeclared;
+            }
+            if validate_resolved_property_interface(store, type_, record, interface) {
+                Valid(DeclaredPropertyObjectProof::Interface)
+            } else {
+                Malformed
+            }
+        }
+        TypeData::Object(object) => {
+            let Some(owner) = record.symbol() else {
+                return NotDeclared;
+            };
+            let Some(owner_record) = store.symbol(owner) else {
+                return Malformed;
+            };
+            if owner_record.flags() != SymbolFlags::TYPE_LITERAL {
+                return NotDeclared;
+            }
+            match classify_declared_owner_members(store, owner) {
+                DeclaredOwnerMemberDomain::PropertyOnly => {}
+                DeclaredOwnerMemberDomain::Unsupported => return NotDeclared,
+                DeclaredOwnerMemberDomain::Malformed => return Malformed,
+            }
+            if record
+                .alias()
+                .is_some_and(|alias| declared_property_alias_is_generic(store, alias))
+                || store
+                    .symbol(owner)
+                    .and_then(|owner| owner.declarations())
+                    .filter(|declarations| declarations.len() == 1)
+                    .and_then(|declarations| store.type_node_links(declarations[0]))
+                    .is_some_and(|links| links.outer_type_parameters.is_some())
+            {
+                return NotDeclared;
+            }
+            if object.structured.signatures.is_some()
+                || object.structured.call_signature_count != 0
+                || object.structured.index_infos.is_some()
+            {
+                return NotDeclared;
+            }
+            if validate_resolved_property_type_literal(store, type_, record, object) {
+                Valid(DeclaredPropertyObjectProof::TypeLiteral)
+            } else {
+                Malformed
+            }
+        }
+        _ => NotDeclared,
+    }
+}
+
+fn validate_empty_type_literal_identity(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    record: &TypeRecord,
+) -> bool {
+    let Some(bootstrap) = store.intrinsic_bootstrap() else {
+        return false;
+    };
+    let TypeData::Object(object) = record.data() else {
+        return false;
+    };
+    let Some(symbol) = store.symbol(bootstrap.empty_type_literal_symbol) else {
+        return false;
+    };
+    type_ == bootstrap.empty_type_literal_type
+        && record.object_flags() == ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
+        && record.symbol() == Some(bootstrap.empty_type_literal_symbol)
+        && record.alias().is_none()
+        && valid_resolved_declared_structured_shell(object)
+        && object.structured.members.is_none()
+        && object.structured.properties.is_none()
+        && store.get_merged_symbol(bootstrap.empty_type_literal_symbol)
+            == Some(bootstrap.empty_type_literal_symbol)
+        && symbol.flags() == SymbolFlags::TYPE_LITERAL | SymbolFlags::TRANSIENT
+        && symbol.check_flags() == CheckFlags::NONE
+        && symbol.name() == InternalSymbolName::Type.as_ref()
+        && symbol.declarations().is_none()
+        && symbol.value_declaration().is_none()
+        && symbol.members().is_none()
+        && symbol.exports().is_none()
+        && symbol.parent().is_none()
+        && symbol.export_symbol().is_none()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeclaredOwnerMemberDomain {
+    PropertyOnly,
+    Unsupported,
+    Malformed,
+}
+
+fn classify_declared_owner_members(
+    store: &CanonicalTypeMapperStore,
+    owner: SemanticSymbolId,
+) -> DeclaredOwnerMemberDomain {
+    let Some(owner) = store.symbol(owner) else {
+        return DeclaredOwnerMemberDomain::Malformed;
+    };
+    let Some(members) = owner.members() else {
+        return DeclaredOwnerMemberDomain::PropertyOnly;
+    };
+    let Some(table) = store.symbol_table(members) else {
+        return DeclaredOwnerMemberDomain::Malformed;
+    };
+    let allowed_flags = SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL;
+    let unsupported_flags = SymbolFlags::METHOD
+        | SymbolFlags::SIGNATURE
+        | SymbolFlags::ACCESSOR
+        | SymbolFlags::CONSTRUCTOR;
+    let mut domain = DeclaredOwnerMemberDomain::PropertyOnly;
+    for (_, property) in table.iter() {
+        let Some(property) = store.symbol(property) else {
+            return DeclaredOwnerMemberDomain::Malformed;
+        };
+        if property.flags().contains(SymbolFlags::PROPERTY)
+            && property.flags().without(allowed_flags) == SymbolFlags::NONE
+        {
+            if !matches!(
+                property
+                    .declarations()
+                    .filter(|declarations| declarations.len() == 1)
+                    .and_then(|declarations| store.source_node_kind(declarations[0])),
+                Some(SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature)
+            ) {
+                return DeclaredOwnerMemberDomain::Malformed;
+            }
+        } else if property.flags().intersects(unsupported_flags) {
+            domain = DeclaredOwnerMemberDomain::Unsupported;
+        } else {
+            return DeclaredOwnerMemberDomain::Malformed;
+        }
+    }
+    domain
+}
+
+fn declared_property_alias_is_generic(
+    store: &CanonicalTypeMapperStore,
+    alias: super::TypeAliasId,
+) -> bool {
+    store
+        .type_alias(alias)
+        .and_then(|alias| alias.symbol())
+        .and_then(|symbol| store.type_alias_links(symbol))
+        .is_some_and(|links| links.type_parameters.is_some() || links.instantiations.is_some())
+}
+
+fn validate_resolved_property_interface(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    record: &TypeRecord,
+    interface: &InterfaceTypeData,
+) -> bool {
+    let structured = &interface.reference.object.structured;
+    if record.object_flags() != ObjectFlags::INTERFACE | ObjectFlags::MEMBERS_RESOLVED
+        || record.alias().is_some()
+        || !valid_thisless_interface_identity(interface)
+        || !interface.base_types_resolved
+        || interface.resolved_base_constructor_type.is_some()
+        || interface.resolved_base_types.is_some()
+        || !interface.declared_members_resolved
+        || interface.declared_members != structured.members
+        || interface.declared_call_signatures.is_some()
+        || interface.declared_construct_signatures.is_some()
+        || interface.declared_index_infos.is_some()
+        || !valid_resolved_declared_structured_shell(&interface.reference.object)
+    {
+        return false;
+    }
+    let Some(owner) = record.symbol() else {
+        return false;
+    };
+    let Some(declaration) = validate_declared_property_owner(
+        store,
+        type_,
+        owner,
+        structured.members,
+        DeclaredPropertyObjectProof::Interface,
+    ) else {
+        return false;
+    };
+    validate_declared_property_members(store, owner, declaration, structured)
+}
+
+fn validate_resolved_property_type_literal(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    record: &TypeRecord,
+    object: &ObjectTypeData,
+) -> bool {
+    if record.object_flags() != ObjectFlags::ANONYMOUS | ObjectFlags::MEMBERS_RESOLVED
+        || !valid_resolved_declared_structured_shell(object)
+        || record
+            .alias()
+            .is_some_and(|alias| !valid_declared_property_alias(store, type_, alias))
+    {
+        return false;
+    }
+    let Some(owner) = record.symbol() else {
+        return false;
+    };
+    let Some(declaration) = validate_declared_property_owner(
+        store,
+        type_,
+        owner,
+        object.structured.members,
+        DeclaredPropertyObjectProof::TypeLiteral,
+    ) else {
+        return false;
+    };
+    validate_declared_property_members(store, owner, declaration, &object.structured)
+}
+
+fn valid_resolved_declared_structured_shell(object: &ObjectTypeData) -> bool {
+    valid_object_tail(object)
+        && object.structured.constrained == ConstrainedTypeData::default()
+        && object.structured.signatures.is_none()
+        && object.structured.call_signature_count == 0
+        && object.structured.index_infos.is_none()
+        && object
+            .structured
+            .object_type_without_abstract_construct_signatures
+            .is_none()
+}
+
+fn validate_declared_property_owner(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    owner: SemanticSymbolId,
+    members: Option<SymbolTableId>,
+    proof: DeclaredPropertyObjectProof,
+) -> Option<NodeRef> {
+    let owner_record = store.symbol(owner)?;
+    let [declaration] = owner_record.declarations().unwrap_or_default() else {
+        return None;
+    };
+    let (expected_flags, expected_kind, valid_name) = match proof {
+        DeclaredPropertyObjectProof::Interface => (
+            SymbolFlags::INTERFACE,
+            SyntaxKind::InterfaceDeclaration,
+            owner_record.name().as_utf8().is_some(),
+        ),
+        DeclaredPropertyObjectProof::TypeLiteral => (
+            SymbolFlags::TYPE_LITERAL,
+            SyntaxKind::TypeLiteral,
+            owner_record.name() == InternalSymbolName::Type.as_ref(),
+        ),
+    };
+    if store.get_merged_symbol(owner) != Some(owner)
+        || owner_record.flags() != expected_flags
+        || owner_record.check_flags() != CheckFlags::NONE
+        || !valid_name
+        || owner_record.value_declaration().is_some()
+        || owner_record.parent().is_some()
+        || owner_record.members() != members
+        || owner_record.exports().is_some()
+        || owner_record.export_symbol().is_some()
+        || store.source_node_kind(*declaration) != Some(expected_kind)
+    {
+        return None;
+    }
+    let valid_identity_cache = match proof {
+        DeclaredPropertyObjectProof::Interface => store
+            .declared_type_links(owner)
+            .is_some_and(|links| links.declared_type == Some(type_)),
+        DeclaredPropertyObjectProof::TypeLiteral => {
+            store.type_node_links(*declaration).is_some_and(|links| {
+                links.resolved_type == Some(type_) && links.outer_type_parameters.is_none()
+            })
+        }
+    };
+    valid_identity_cache.then_some(*declaration)
+}
+
+fn valid_declared_property_alias(
+    store: &CanonicalTypeMapperStore,
+    type_: TypeId,
+    alias: super::TypeAliasId,
+) -> bool {
+    let Some(alias_record) = store.type_alias(alias) else {
+        return false;
+    };
+    let Some(symbol) = alias_record.symbol() else {
+        return false;
+    };
+    let Some(symbol_record) = store.symbol(symbol) else {
+        return false;
+    };
+    let [declaration] = symbol_record.declarations().unwrap_or_default() else {
+        return false;
+    };
+    alias_record.type_arguments().is_none()
+        && store.get_merged_symbol(symbol) == Some(symbol)
+        && symbol_record.flags() == SymbolFlags::TYPE_ALIAS
+        && symbol_record.check_flags() == CheckFlags::NONE
+        && symbol_record.value_declaration().is_none()
+        && symbol_record.parent().is_none()
+        && symbol_record.exports().is_none()
+        && symbol_record.export_symbol().is_none()
+        && store.source_node_kind(*declaration) == Some(SyntaxKind::TypeAliasDeclaration)
+        && store.type_alias_links(symbol).is_some_and(|links| {
+            links.declared_type == Some(type_)
+                && links.type_parameters.is_none()
+                && links.instantiations.is_none()
+                && !links.is_constructor_declared_property
+        })
+}
+
+fn validate_declared_property_members(
+    store: &CanonicalTypeMapperStore,
+    owner: SemanticSymbolId,
+    owner_declaration: NodeRef,
+    structured: &StructuredTypeData,
+) -> bool {
+    let properties = match structured.properties.as_deref() {
+        None => &[][..],
+        Some(properties) if !properties.is_empty() => properties,
+        Some(_) => return false,
+    };
+    let table = match (structured.members, properties.is_empty()) {
+        (None, true) => None,
+        (Some(members), false) => match store.symbol_table(members) {
+            Some(table) if table.len() == properties.len() => Some(table),
+            _ => return false,
+        },
+        _ => return false,
+    };
+    let mut seen_properties = HashSet::with_capacity(properties.len());
+    let mut seen_declarations = HashSet::with_capacity(properties.len());
+    let mut previous_declaration = None;
+    for property in properties {
+        if !seen_properties.insert(*property) {
+            return false;
+        }
+        let Some(property_record) = store.symbol(*property) else {
+            return false;
+        };
+        let [declaration] = property_record.declarations().unwrap_or_default() else {
+            return false;
+        };
+        let allowed_flags = SymbolFlags::PROPERTY | SymbolFlags::OPTIONAL;
+        if !property_record.flags().contains(SymbolFlags::PROPERTY)
+            || property_record.flags().without(allowed_flags) != SymbolFlags::NONE
+            || property_record.check_flags() != CheckFlags::NONE
+            || property_record.name().is_reserved_member_name()
+            || property_record.name().is_private_identifier()
+            || property_record.name().is_late_bound()
+            || property_record.name().as_utf8().is_none()
+            || property_record.value_declaration() != Some(*declaration)
+            || property_record.parent() != Some(owner)
+            || property_record.members().is_some()
+            || property_record.exports().is_some()
+            || property_record.export_symbol().is_some()
+            || store.get_merged_symbol(*property) != Some(*property)
+            || !matches!(
+                store.source_node_kind(*declaration),
+                Some(SyntaxKind::PropertyDeclaration | SyntaxKind::PropertySignature)
+            )
+            || !declaration.is_for(owner_declaration.arena, owner_declaration.file)
+            || *declaration >= owner_declaration
+            || previous_declaration.is_some_and(|previous| previous >= *declaration)
+            || !seen_declarations.insert(*declaration)
+            || table.and_then(|table| table.get(property_record.name())) != Some(*property)
+        {
+            return false;
+        }
+        let Some(links) = store.value_symbol_links(*property) else {
+            return false;
+        };
+        let Some(property_type) = links.resolved_type else {
+            return false;
+        };
+        if links
+            != &(ValueSymbolLinks {
+                resolved_type: Some(property_type),
+                ..ValueSymbolLinks::default()
+            })
+            || store.type_payload(property_type).is_none()
+        {
+            return false;
+        }
+        previous_declaration = Some(*declaration);
+    }
+    table.is_none_or(|table| {
+        table.iter().all(|(name, property)| {
+            seen_properties.contains(&property)
+                && store
+                    .symbol(property)
+                    .is_some_and(|record| record.name() == name)
+        })
+    })
 }
 
 fn valid_alias(
