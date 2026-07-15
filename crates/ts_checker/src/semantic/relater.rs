@@ -1,8 +1,9 @@
-//! Exact dependency-closed fast, simple, and property-only object relations.
+//! Exact dependency-closed fast, primitive-union, and property-only relations.
 //!
 //! This module ports `isTypeRelatedTo`, `isSimpleTypeRelatedTo`, and their
-//! no-diagnostic entry points plus the required-property object slice of
-//! `recursiveTypeRelatedTo` from pinned `internal/checker/relater.go` at
+//! no-diagnostic entry points plus primitive/literal/nullable unions and the
+//! required-property object slice of `recursiveTypeRelatedTo` from pinned
+//! `internal/checker/relater.go` at
 //! `dc37b5249ab60e2bbce936f71b883e6c8136167e`. Unsupported structural paths
 //! return [`RelationUnavailable`] instead of being misreported as unrelated.
 
@@ -11,8 +12,10 @@ use std::collections::{HashMap, HashSet};
 use ts_binder::{CheckFlags, SemanticSymbolId, SymbolFlags, SymbolTableId};
 
 use super::{
+    bootstrap::LiteralTypeCacheError,
     ids::TypeId,
     links::MembersOrExportsResolutionKind,
+    mapper::TypeMapper,
     relation::{
         ExpandingFlags, IntersectionState, RecursionFlags, RecursionIdentityUnavailable,
         RelationComparisonResult, RelationKeyUnavailable, RelationKind,
@@ -31,6 +34,11 @@ pub enum RelationUnavailable {
     Type(TypeId),
     Symbol(SemanticSymbolId),
     MalformedLiteral(TypeId),
+    MalformedUnion(TypeId),
+    UnsupportedUnionConstituent(TypeId),
+    InvalidUnionAlias(SemanticSymbolId),
+    InvalidUnionPreparation(TypeId),
+    UnionValidationCapacity(TypeId),
     MalformedStructuredType(TypeId),
     MalformedEnumType(TypeId),
     EnumRelation {
@@ -72,6 +80,25 @@ impl std::fmt::Display for RelationUnavailable {
             Self::MalformedLiteral(type_id) => {
                 write!(formatter, "type {type_id:?} has an invalid literal payload")
             }
+            Self::MalformedUnion(type_id) => {
+                write!(formatter, "type {type_id:?} is not a canonical union")
+            }
+            Self::UnsupportedUnionConstituent(type_id) => write!(
+                formatter,
+                "type {type_id:?} is outside the canonical primitive-union relation domain"
+            ),
+            Self::InvalidUnionAlias(symbol) => write!(
+                formatter,
+                "union alias {symbol:?} is not a canonical non-generic alias"
+            ),
+            Self::InvalidUnionPreparation(type_id) => write!(
+                formatter,
+                "union relation for {type_id:?} received an invalid prepared query"
+            ),
+            Self::UnionValidationCapacity(type_id) => write!(
+                formatter,
+                "validating union type {type_id:?} exceeded representable capacity"
+            ),
             Self::MalformedStructuredType(type_id) => {
                 write!(
                     formatter,
@@ -173,6 +200,9 @@ struct RelationBootstrapFacts {
     strict_null_checks: bool,
     wildcard_type: TypeId,
     any_function_type: TypeId,
+    string_type: TypeId,
+    number_type: TypeId,
+    bigint_type: TypeId,
 }
 
 const PINNED_RELATION_STACK_DEPTH: usize = 100;
@@ -208,10 +238,11 @@ impl PendingRelationCache {
     }
 }
 
-struct RelaterSession<'store, MapperPayload> {
-    store: &'store mut SemanticStore<TypeRecord, MapperPayload>,
+struct RelaterSession<'store> {
+    store: &'store mut SemanticStore<TypeRecord, TypeMapper>,
     relation: RelationKind,
     bootstrap: RelationBootstrapFacts,
+    validated_unions: HashMap<TypeId, Vec<TypeId>>,
     pending: PendingRelationCache,
     maybe_keys: Vec<CacheHashKey>,
     maybe_keys_set: HashSet<CacheHashKey>,
@@ -223,9 +254,9 @@ struct RelaterSession<'store, MapperPayload> {
     stack_depth_limit: usize,
 }
 
-impl<'store, MapperPayload> RelaterSession<'store, MapperPayload> {
+impl<'store> RelaterSession<'store> {
     fn new(
-        store: &'store mut SemanticStore<TypeRecord, MapperPayload>,
+        store: &'store mut SemanticStore<TypeRecord, TypeMapper>,
         relation: RelationKind,
         bootstrap: RelationBootstrapFacts,
     ) -> Self {
@@ -240,7 +271,7 @@ impl<'store, MapperPayload> RelaterSession<'store, MapperPayload> {
     }
 
     fn new_with_limits(
-        store: &'store mut SemanticStore<TypeRecord, MapperPayload>,
+        store: &'store mut SemanticStore<TypeRecord, TypeMapper>,
         relation: RelationKind,
         bootstrap: RelationBootstrapFacts,
         relation_count: isize,
@@ -250,6 +281,7 @@ impl<'store, MapperPayload> RelaterSession<'store, MapperPayload> {
             store,
             relation,
             bootstrap,
+            validated_unions: HashMap::new(),
             pending: PendingRelationCache::default(),
             maybe_keys: Vec::new(),
             maybe_keys_set: HashSet::new(),
@@ -302,19 +334,106 @@ impl<'store, MapperPayload> RelaterSession<'store, MapperPayload> {
         self.pending.set(key, result);
     }
 
+    fn union_types(&mut self, type_id: TypeId) -> Result<Vec<TypeId>, RelationUnavailable> {
+        if let Some(types) = self.validated_unions.get(&type_id) {
+            return Ok(types.clone());
+        }
+        self.store
+            .validate_union_constituent(type_id)
+            .map_err(|error| union_validation_unavailable(type_id, error))?;
+        let record = self
+            .store
+            .type_payload(type_id)
+            .ok_or(RelationUnavailable::Type(type_id))?;
+        if !record.flags().intersects(TypeFlags::UNION) {
+            return Err(RelationUnavailable::MalformedUnion(type_id));
+        }
+        let TypeData::Union(data) = record.data() else {
+            return Err(RelationUnavailable::MalformedUnion(type_id));
+        };
+        let types = data.union.types.clone();
+        self.validated_unions.insert(type_id, types.clone());
+        Ok(types)
+    }
+
+    fn union_length_for_cache_choice(&self, type_id: TypeId) -> Result<usize, RelationUnavailable> {
+        let record = self
+            .store
+            .type_payload(type_id)
+            .ok_or(RelationUnavailable::Type(type_id))?;
+        Ok(match record.data() {
+            TypeData::Union(data) => data.union.types.len(),
+            _ => 4,
+        })
+    }
+
+    #[allow(clippy::too_many_lines)] // Keep the pinned branch order visibly linear.
     fn is_related_to_ex(
         &mut self,
-        source: TypeId,
-        target: TypeId,
+        original_source: TypeId,
+        original_target: TypeId,
         recursion_flags: RecursionFlags,
         intersection_state: IntersectionState,
     ) -> Result<Ternary, RelationUnavailable> {
+        if original_source == original_target {
+            return Ok(Ternary::True);
+        }
+        if intersection_state != IntersectionState::NONE {
+            return Err(RelationUnavailable::StructuralRelation {
+                source: original_source,
+                target: original_target,
+                relation: self.relation,
+            });
+        }
+
+        let original_source_flags = self.store.type_flags(original_source)?;
+        let original_target_flags = self.store.type_flags(original_target)?;
+        if original_source_flags.intersects(TypeFlags::OBJECT)
+            && original_target_flags.intersects(TypeFlags::PRIMITIVE)
+        {
+            let related = (self.relation == RelationKind::Comparable
+                && !original_target_flags.intersects(TypeFlags::NEVER)
+                && self.store.is_simple_type_related_to(
+                    original_target,
+                    original_source,
+                    self.relation,
+                    self.bootstrap,
+                )?)
+                || self.store.is_simple_type_related_to(
+                    original_source,
+                    original_target,
+                    self.relation,
+                    self.bootstrap,
+                )?;
+            return Ok(bool_to_ternary(related));
+        }
+
+        let source = self.store.regular_type_if_fresh(original_source)?;
+        let mut target = self.store.regular_type_if_fresh(original_target)?;
         if source == target {
             return Ok(Ternary::True);
         }
-        if intersection_state != IntersectionState::NONE
-            || self.relation != RelationKind::Assignable
-        {
+        let source_flags = self.store.type_flags(source)?;
+        let mut target_flags = self.store.type_flags(target)?;
+
+        if self.relation.is_identity() {
+            if source_flags != target_flags {
+                return Ok(Ternary::False);
+            }
+            if source_flags.intersects(TypeFlags::SINGLETON) {
+                return Ok(Ternary::True);
+            }
+            if source_flags.intersects(TypeFlags::UNION) {
+                return self.recursive_type_related_to(
+                    source,
+                    target,
+                    IntersectionState::NONE,
+                    recursion_flags,
+                );
+            }
+            if !source_flags.intersects(TypeFlags::STRUCTURED_OR_INSTANTIABLE) {
+                return Ok(Ternary::False);
+            }
             return Err(RelationUnavailable::StructuralRelation {
                 source,
                 target,
@@ -322,46 +441,115 @@ impl<'store, MapperPayload> RelaterSession<'store, MapperPayload> {
             });
         }
 
-        let source = self.store.regular_type_if_fresh(source)?;
-        let target = self.store.regular_type_if_fresh(target)?;
-        if source == target {
-            return Ok(Ternary::True);
-        }
-        let source_flags = self.store.type_flags(source)?;
-        let target_flags = self.store.type_flags(target)?;
-
-        // Pinned pre-normalization object-to-primitive fast path. The current
-        // supported object records need no further normalization.
-        if source_flags.intersects(TypeFlags::OBJECT)
-            && target_flags.intersects(TypeFlags::PRIMITIVE)
+        if source_flags.intersects(TypeFlags::DEFINITELY_NON_NULLABLE)
+            && target_flags.intersects(TypeFlags::UNION)
         {
-            return self
-                .store
-                .is_simple_type_related_to(source, target, self.relation, self.bootstrap)
-                .map(bool_to_ternary);
-        }
-        if self
-            .store
-            .is_simple_type_related_to(source, target, self.relation, self.bootstrap)?
-        {
-            return Ok(Ternary::True);
-        }
-
-        if source_flags.intersects(TypeFlags::OBJECT) && target_flags.intersects(TypeFlags::OBJECT)
-        {
-            if self.weak_target_lacks_common_properties(source, target)? {
-                return Ok(Ternary::False);
+            let target_types = self.union_types(target)?;
+            let candidate = match target_types.as_slice() {
+                [nullable, candidate]
+                    if self
+                        .store
+                        .type_flags(*nullable)?
+                        .intersects(TypeFlags::NULLABLE) =>
+                {
+                    Some(*candidate)
+                }
+                [first_nullable, second_nullable, candidate]
+                    if self
+                        .store
+                        .type_flags(*first_nullable)?
+                        .intersects(TypeFlags::NULLABLE)
+                        && self
+                            .store
+                            .type_flags(*second_nullable)?
+                            .intersects(TypeFlags::NULLABLE) =>
+                {
+                    Some(*candidate)
+                }
+                _ => None,
+            };
+            if let Some(candidate) = candidate
+                && !self
+                    .store
+                    .type_flags(candidate)?
+                    .intersects(TypeFlags::NULLABLE)
+            {
+                target = self.store.regular_type_if_fresh(candidate)?;
+                if source == target {
+                    return Ok(Ternary::True);
+                }
+                target_flags = self.store.type_flags(target)?;
             }
-            return self.recursive_type_related_to(
+        }
+
+        if (self.relation == RelationKind::Comparable
+            && !target_flags.intersects(TypeFlags::NEVER)
+            && self.store.is_simple_type_related_to(
+                target,
+                source,
+                self.relation,
+                self.bootstrap,
+            )?)
+            || self.store.is_simple_type_related_to(
                 source,
                 target,
-                intersection_state,
-                recursion_flags,
-            );
+                self.relation,
+                self.bootstrap,
+            )?
+        {
+            return Ok(Ternary::True);
         }
+
         if source_flags.intersects(TypeFlags::STRUCTURED_OR_INSTANTIABLE)
             || target_flags.intersects(TypeFlags::STRUCTURED_OR_INSTANTIABLE)
         {
+            if self.relation == RelationKind::Assignable
+                && source_flags.intersects(TypeFlags::OBJECT)
+                && target_flags.intersects(TypeFlags::OBJECT)
+            {
+                if self.weak_target_lacks_common_properties(source, target)? {
+                    return Ok(Ternary::False);
+                }
+                return self.recursive_type_related_to(
+                    source,
+                    target,
+                    intersection_state,
+                    recursion_flags,
+                );
+            }
+
+            let source_is_union = source_flags.intersects(TypeFlags::UNION);
+            let target_is_union = target_flags.intersects(TypeFlags::UNION);
+            if source_is_union || target_is_union {
+                let source_union_len = if source_is_union {
+                    Some(self.union_length_for_cache_choice(source)?)
+                } else {
+                    None
+                };
+                let target_union_len = if target_is_union {
+                    Some(self.union_length_for_cache_choice(target)?)
+                } else {
+                    None
+                };
+                let skip_caching = source_union_len.is_some_and(|length| length < 4)
+                    && !target_is_union
+                    || target_union_len.is_some_and(|length| length < 4)
+                        && !source_flags.intersects(TypeFlags::STRUCTURED_OR_INSTANTIABLE);
+                if skip_caching {
+                    return self.union_or_intersection_related_to(
+                        source,
+                        target,
+                        intersection_state,
+                    );
+                }
+                return self.recursive_type_related_to(
+                    source,
+                    target,
+                    intersection_state,
+                    recursion_flags,
+                );
+            }
+
             return Err(RelationUnavailable::StructuralRelation {
                 source,
                 target,
@@ -432,8 +620,7 @@ impl<'store, MapperPayload> RelaterSession<'store, MapperPayload> {
         // Capability validation is side-effect free. It is intentionally after
         // the pinned cache/active/depth checks, so cached answers remain usable
         // even for structural families outside this slice.
-        self.ensure_supported_object_kind(source)?;
-        self.ensure_supported_object_kind(target)?;
+        self.ensure_supported_recursive_pair(source, target)?;
 
         let maybe_start = self.maybe_keys.len();
         self.maybe_keys.push(key);
@@ -563,9 +750,294 @@ impl<'store, MapperPayload> RelaterSession<'store, MapperPayload> {
                 relation: self.relation,
             });
         }
+        let source_flags = self.store.type_flags(source)?;
+        let target_flags = self.store.type_flags(target)?;
+        if self.relation.is_identity() {
+            if source_flags.intersects(TypeFlags::UNION) {
+                let mut result = self.each_type_related_to_some_type(source, target)?;
+                if result != Ternary::False {
+                    result &= self.each_type_related_to_some_type(target, source)?;
+                }
+                return Ok(result);
+            }
+            return Err(RelationUnavailable::StructuralRelation {
+                source,
+                target,
+                relation: self.relation,
+            });
+        }
+        if source_flags.intersects(TypeFlags::UNION) || target_flags.intersects(TypeFlags::UNION) {
+            return self.union_or_intersection_related_to(source, target, intersection_state);
+        }
+        if self.relation != RelationKind::Assignable
+            || !source_flags.intersects(TypeFlags::OBJECT)
+            || !target_flags.intersects(TypeFlags::OBJECT)
+        {
+            return Err(RelationUnavailable::StructuralRelation {
+                source,
+                target,
+                relation: self.relation,
+            });
+        }
         let source_members = self.resolved_object_members(source)?;
         let target_members = self.resolved_object_members(target)?;
         self.properties_related_to(source, target, &source_members, &target_members)
+    }
+
+    fn union_or_intersection_related_to(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+        intersection_state: IntersectionState,
+    ) -> Result<Ternary, RelationUnavailable> {
+        let source_flags = self.store.type_flags(source)?;
+        let target_flags = self.store.type_flags(target)?;
+        if source_flags.intersects(TypeFlags::INTERSECTION)
+            || target_flags.intersects(TypeFlags::INTERSECTION)
+        {
+            return Err(RelationUnavailable::StructuralRelation {
+                source,
+                target,
+                relation: self.relation,
+            });
+        }
+        if source_flags.intersects(TypeFlags::UNION) {
+            self.union_types(source)?;
+            if target_flags.intersects(TypeFlags::UNION) {
+                self.union_types(target)?;
+                if self.union_origin_contains_aliased_source(target, source)? {
+                    return Ok(Ternary::True);
+                }
+            }
+            if self.relation == RelationKind::Comparable {
+                return self.some_type_related_to_type(source, target, intersection_state);
+            }
+            return self.each_type_related_to_type(source, target, intersection_state);
+        }
+        if target_flags.intersects(TypeFlags::UNION) {
+            return self.type_related_to_some_type(source, target, intersection_state);
+        }
+        Err(RelationUnavailable::StructuralRelation {
+            source,
+            target,
+            relation: self.relation,
+        })
+    }
+
+    fn union_origin_contains_aliased_source(
+        &mut self,
+        target: TypeId,
+        source: TypeId,
+    ) -> Result<bool, RelationUnavailable> {
+        if self
+            .store
+            .type_payload(source)
+            .ok_or(RelationUnavailable::Type(source))?
+            .alias()
+            .is_none()
+        {
+            return Ok(false);
+        }
+        let target_record = self
+            .store
+            .type_payload(target)
+            .ok_or(RelationUnavailable::Type(target))?;
+        let TypeData::Union(target_data) = target_record.data() else {
+            return Err(RelationUnavailable::MalformedUnion(target));
+        };
+        let Some(origin) = target_data.origin else {
+            return Ok(false);
+        };
+        let origin_record = self
+            .store
+            .type_payload(origin)
+            .ok_or(RelationUnavailable::Type(origin))?;
+        let TypeData::Union(origin_data) = origin_record.data() else {
+            return Err(RelationUnavailable::MalformedUnion(target));
+        };
+        Ok(origin_data.union.types.contains(&source))
+    }
+
+    fn some_type_related_to_type(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+        intersection_state: IntersectionState,
+    ) -> Result<Ternary, RelationUnavailable> {
+        let source_types = self.union_types(source)?;
+        if source_types.contains(&target) {
+            return Ok(Ternary::True);
+        }
+        for source_type in source_types {
+            let related = self.is_related_to_ex(
+                source_type,
+                target,
+                RecursionFlags::SOURCE,
+                intersection_state,
+            )?;
+            if related != Ternary::False {
+                return Ok(related);
+            }
+        }
+        Ok(Ternary::False)
+    }
+
+    fn each_type_related_to_type(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+        intersection_state: IntersectionState,
+    ) -> Result<Ternary, RelationUnavailable> {
+        let source_types = self.union_types(source)?;
+        let target_types = if self.store.type_flags(target)?.intersects(TypeFlags::UNION) {
+            Some(self.union_types(target)?)
+        } else {
+            None
+        };
+        let stripped_target_types = if let Some(target_types) = target_types.as_ref()
+            && !self
+                .store
+                .type_flags(source_types[0])?
+                .intersects(TypeFlags::UNDEFINED)
+            && self
+                .store
+                .type_flags(target_types[0])?
+                .intersects(TypeFlags::UNDEFINED)
+        {
+            let stripped = target_types
+                .iter()
+                .copied()
+                .filter(|candidate| {
+                    self.store
+                        .type_payload(*candidate)
+                        .is_some_and(|record| !record.flags().intersects(TypeFlags::UNDEFINED))
+                })
+                .collect::<Vec<_>>();
+            (stripped.len() >= 2).then_some(stripped)
+        } else {
+            target_types
+        };
+
+        let mut result = Ternary::True;
+        for (index, source_type) in source_types.iter().copied().enumerate() {
+            if let Some(stripped_types) = stripped_target_types.as_ref()
+                && source_types.len() >= stripped_types.len()
+                && source_types.len() % stripped_types.len() == 0
+            {
+                let related = self.is_related_to_ex(
+                    source_type,
+                    stripped_types[index % stripped_types.len()],
+                    RecursionFlags::BOTH,
+                    intersection_state,
+                )?;
+                if related != Ternary::False {
+                    result &= related;
+                    continue;
+                }
+            }
+            let related = self.is_related_to_ex(
+                source_type,
+                target,
+                RecursionFlags::SOURCE,
+                intersection_state,
+            )?;
+            if related == Ternary::False {
+                return Ok(Ternary::False);
+            }
+            result &= related;
+        }
+        Ok(result)
+    }
+
+    fn type_related_to_some_type(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+        intersection_state: IntersectionState,
+    ) -> Result<Ternary, RelationUnavailable> {
+        let target_types = self.union_types(target)?;
+        if target_types.contains(&source) {
+            return Ok(Ternary::True);
+        }
+
+        let source_flags = self.store.type_flags(source)?;
+        let target_record = self
+            .store
+            .type_payload(target)
+            .ok_or(RelationUnavailable::Type(target))?;
+        let primitive_union = target_record
+            .object_flags()
+            .intersects(ObjectFlags::PRIMITIVE_UNION);
+        let literal_fast_path = self.relation != RelationKind::Comparable
+            && primitive_union
+            && !source_flags.intersects(TypeFlags::ENUM_LITERAL)
+            && (source_flags.intersects(
+                TypeFlags::STRING_LITERAL | TypeFlags::BOOLEAN_LITERAL | TypeFlags::BIG_INT_LITERAL,
+            ) || matches!(
+                self.relation,
+                RelationKind::Subtype | RelationKind::StrictSubtype
+            ) && source_flags.intersects(TypeFlags::NUMBER_LITERAL));
+        if literal_fast_path {
+            let source_record = self
+                .store
+                .type_payload(source)
+                .ok_or(RelationUnavailable::Type(source))?;
+            let TypeData::Literal(literal) = source_record.data() else {
+                return Err(RelationUnavailable::MalformedLiteral(source));
+            };
+            let alternate = if source == literal.regular_type {
+                literal.fresh_type
+            } else {
+                Some(literal.regular_type)
+            };
+            let primitive = if source_flags.intersects(TypeFlags::STRING_LITERAL) {
+                Some(self.bootstrap.string_type)
+            } else if source_flags.intersects(TypeFlags::NUMBER_LITERAL) {
+                Some(self.bootstrap.number_type)
+            } else if source_flags.intersects(TypeFlags::BIG_INT_LITERAL) {
+                Some(self.bootstrap.bigint_type)
+            } else {
+                None
+            };
+            if primitive.is_some_and(|primitive| target_types.contains(&primitive))
+                || alternate.is_some_and(|alternate| target_types.contains(&alternate))
+            {
+                return Ok(Ternary::True);
+            }
+            return Ok(Ternary::False);
+        }
+
+        for target_type in target_types {
+            let related = self.is_related_to_ex(
+                source,
+                target_type,
+                RecursionFlags::TARGET,
+                intersection_state,
+            )?;
+            if related != Ternary::False {
+                return Ok(related);
+            }
+        }
+        Ok(Ternary::False)
+    }
+
+    fn each_type_related_to_some_type(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+    ) -> Result<Ternary, RelationUnavailable> {
+        let source_types = self.union_types(source)?;
+        self.union_types(target)?;
+        let mut result = Ternary::True;
+        for source_type in source_types {
+            let related =
+                self.type_related_to_some_type(source_type, target, IntersectionState::NONE)?;
+            if related == Ternary::False {
+                return Ok(Ternary::False);
+            }
+            result &= related;
+        }
+        Ok(result)
     }
 
     fn weak_target_lacks_common_properties(
@@ -876,6 +1348,39 @@ impl<'store, MapperPayload> RelaterSession<'store, MapperPayload> {
         Ok(record)
     }
 
+    fn ensure_supported_recursive_pair(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+    ) -> Result<(), RelationUnavailable> {
+        let source_flags = self.store.type_flags(source)?;
+        let target_flags = self.store.type_flags(target)?;
+        let source_is_union = source_flags.intersects(TypeFlags::UNION);
+        let target_is_union = target_flags.intersects(TypeFlags::UNION);
+        if source_is_union {
+            self.union_types(source)?;
+        }
+        if target_is_union {
+            self.union_types(target)?;
+        }
+        if source_is_union || target_is_union {
+            return Ok(());
+        }
+        if self.relation == RelationKind::Assignable
+            && source_flags.intersects(TypeFlags::OBJECT)
+            && target_flags.intersects(TypeFlags::OBJECT)
+        {
+            self.ensure_supported_object_kind(source)?;
+            self.ensure_supported_object_kind(target)?;
+            return Ok(());
+        }
+        Err(RelationUnavailable::StructuralRelation {
+            source,
+            target,
+            relation: self.relation,
+        })
+    }
+
     fn ensure_supported_object_kind(&self, type_id: TypeId) -> Result<(), RelationUnavailable> {
         let record = self
             .store
@@ -992,7 +1497,7 @@ impl<'store, MapperPayload> RelaterSession<'store, MapperPayload> {
     }
 }
 
-impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
+impl SemanticStore<TypeRecord, TypeMapper> {
     /// Pinned `isTypeIdenticalTo` for the dependency-closed relation domain.
     ///
     /// # Errors
@@ -1206,10 +1711,12 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         if source_flags.intersects(TypeFlags::STRUCTURED_OR_INSTANTIABLE)
             || target_flags.intersects(TypeFlags::STRUCTURED_OR_INSTANTIABLE)
         {
-            if relation == RelationKind::Assignable
+            let union_relation = source_flags.intersects(TypeFlags::UNION)
+                || target_flags.intersects(TypeFlags::UNION);
+            let supported_object_relation = relation == RelationKind::Assignable
                 && source_flags.intersects(TypeFlags::OBJECT)
-                && target_flags.intersects(TypeFlags::OBJECT)
-            {
+                && target_flags.intersects(TypeFlags::OBJECT);
+            if union_relation || supported_object_relation {
                 let mut session = RelaterSession::new(self, relation, bootstrap);
                 let result = session.is_related_to_ex(
                     source,
@@ -1389,6 +1896,9 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             strict_null_checks: bootstrap.options.strict_null_checks,
             wildcard_type: bootstrap.wildcard_type,
             any_function_type: bootstrap.any_function_type,
+            string_type: bootstrap.string_type,
+            number_type: bootstrap.number_type,
+            bigint_type: bootstrap.bigint_type,
         })
     }
 
@@ -1633,6 +2143,31 @@ const fn bool_to_ternary(value: bool) -> Ternary {
     if value { Ternary::True } else { Ternary::False }
 }
 
+const fn union_validation_unavailable(
+    union: TypeId,
+    error: LiteralTypeCacheError,
+) -> RelationUnavailable {
+    match error {
+        LiteralTypeCacheError::BootstrapUninitialized => RelationUnavailable::MissingBootstrap,
+        LiteralTypeCacheError::InvalidValue | LiteralTypeCacheError::InvalidCachedUnion(_) => {
+            RelationUnavailable::MalformedUnion(union)
+        }
+        LiteralTypeCacheError::InvalidCachedLiteral(type_id) => {
+            RelationUnavailable::MalformedLiteral(type_id)
+        }
+        LiteralTypeCacheError::UnsupportedUnionConstituent(type_id) => {
+            RelationUnavailable::UnsupportedUnionConstituent(type_id)
+        }
+        LiteralTypeCacheError::InvalidUnionAlias(symbol) => {
+            RelationUnavailable::InvalidUnionAlias(symbol)
+        }
+        LiteralTypeCacheError::InvalidPreparedQuery => {
+            RelationUnavailable::InvalidUnionPreparation(union)
+        }
+        LiteralTypeCacheError::Capacity => RelationUnavailable::UnionValidationCapacity(union),
+    }
+}
+
 const fn relation_key_unavailable(error: RelationKeyUnavailable) -> RelationUnavailable {
     match error {
         RelationKeyUnavailable::Type(type_id) => RelationUnavailable::RelationKeyType(type_id),
@@ -1702,6 +2237,15 @@ mod tests {
         store
             .alloc_literal_type(flags, value, RegularLiteralLink::SelfType)
             .unwrap()
+    }
+
+    fn canonical_union(store: &mut TestStore, types: &[TypeId]) -> TypeId {
+        store.literal_union_type(types, None).unwrap()
+    }
+
+    fn named_canonical_union(store: &mut TestStore, name: &str, types: &[TypeId]) -> TypeId {
+        let symbol = alloc_symbol(store, SymbolFlags::TYPE_ALIAS, name);
+        store.literal_union_type(types, Some(symbol)).unwrap()
     }
 
     fn alloc_resolved_object(
@@ -1878,12 +2422,270 @@ mod tests {
             .unwrap();
         assert_eq!(
             store.is_type_identical_to(left, right),
-            Err(RelationUnavailable::StructuralRelation {
-                source: left,
-                target: right,
-                relation: RelationKind::Identity,
-            })
+            Err(RelationUnavailable::MalformedUnion(left))
         );
+    }
+
+    #[test]
+    fn canonical_primitive_unions_follow_pinned_some_each_and_identity_rules() {
+        let mut store = initialized(true);
+        let (any, unknown, never, string, number, bigint, boolean) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.any_type,
+                bootstrap.unknown_type,
+                bootstrap.never_type,
+                bootstrap.string_type,
+                bootstrap.number_type,
+                bootstrap.bigint_type,
+                bootstrap.boolean_type,
+            )
+        };
+        let string_number = canonical_union(&mut store, &[string, number]);
+
+        assert_eq!(store.is_type_assignable_to(string, string_number), Ok(true));
+        assert_eq!(
+            store.is_type_strict_subtype_of(string, string_number),
+            Ok(true)
+        );
+        assert_eq!(
+            store.is_type_assignable_to(bigint, string_number),
+            Ok(false)
+        );
+        assert_eq!(
+            store.is_type_assignable_to(string_number, string),
+            Ok(false)
+        );
+        assert_eq!(
+            store.is_type_strict_subtype_of(string_number, string),
+            Ok(false)
+        );
+        assert_eq!(store.is_type_comparable_to(string_number, number), Ok(true));
+        assert_eq!(
+            store.is_type_comparable_to(string_number, boolean),
+            Ok(false)
+        );
+        assert_eq!(
+            store.is_type_assignable_to(string_number, unknown),
+            Ok(true)
+        );
+        assert_eq!(store.is_type_assignable_to(never, string_number), Ok(true));
+        assert_eq!(store.is_type_assignable_to(any, string_number), Ok(true));
+        assert_eq!(
+            store.is_type_assignable_to(unknown, string_number),
+            Ok(false)
+        );
+
+        let string_literal = store.regular_string_literal_type("value".into()).unwrap();
+        let other_string_literal = store.regular_string_literal_type("other".into()).unwrap();
+        let literal_target = canonical_union(&mut store, &[other_string_literal, number]);
+        assert_eq!(
+            store.is_type_assignable_to(string_literal, string_number),
+            Ok(true),
+            "the primitive-union literal fast path recognizes the base primitive"
+        );
+        assert_eq!(
+            store.is_type_assignable_to(string_literal, literal_target),
+            Ok(false),
+            "an unrelated literal has neither a base primitive nor alternate form in the target"
+        );
+
+        let left = named_canonical_union(&mut store, "Left", &[string, number]);
+        let right = named_canonical_union(&mut store, "Right", &[string, number]);
+        let different = named_canonical_union(&mut store, "Different", &[string, bigint]);
+        assert_ne!(left, right);
+        assert_eq!(store.is_type_identical_to(left, right), Ok(true));
+        assert_eq!(store.is_type_identical_to(left, different), Ok(false));
+        assert_eq!(store.is_type_assignable_to(left, right), Ok(true));
+
+        let one = store.regular_number_literal_type(Number::new(1.0)).unwrap();
+        let two = store.regular_number_literal_type(Number::new(2.0)).unwrap();
+        let three = store.regular_number_literal_type(Number::new(3.0)).unwrap();
+        let numeric_left = named_canonical_union(&mut store, "NumericLeft", &[one, two]);
+        let numeric_right = named_canonical_union(&mut store, "NumericRight", &[one, three]);
+        assert_eq!(
+            store.is_type_identical_to(numeric_left, numeric_right),
+            Ok(false),
+            "different number literals are exact negative identity results"
+        );
+    }
+
+    #[test]
+    fn nullable_primitive_unions_preserve_strict_and_loose_branch_order() {
+        let mut strict = initialized(true);
+        let (undefined, null, string, number) = {
+            let bootstrap = strict.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.undefined_type,
+                bootstrap.null_type,
+                bootstrap.string_type,
+                bootstrap.number_type,
+            )
+        };
+        let nullable_string = canonical_union(&mut strict, &[null, string]);
+        let optional_string = canonical_union(&mut strict, &[undefined, string]);
+        let nullish_string = canonical_union(&mut strict, &[undefined, null, string]);
+        let string_number = canonical_union(&mut strict, &[string, number]);
+
+        assert_eq!(
+            strict.is_type_assignable_to(string, nullable_string),
+            Ok(true)
+        );
+        assert_eq!(
+            strict.is_type_assignable_to(string, nullish_string),
+            Ok(true)
+        );
+        assert_eq!(
+            strict.is_type_assignable_to(number, nullable_string),
+            Ok(false)
+        );
+        assert_eq!(
+            strict.is_type_assignable_to(nullable_string, string),
+            Ok(false)
+        );
+        assert_eq!(
+            strict.is_type_assignable_to(undefined, optional_string),
+            Ok(true)
+        );
+        assert_eq!(
+            strict.is_type_assignable_to(undefined, string_number),
+            Ok(false)
+        );
+        assert_eq!(strict.relation_cache_size(RelationKind::Assignable), 0);
+
+        let mut loose = initialized(false);
+        let (undefined, string, number) = {
+            let bootstrap = loose.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.undefined_type,
+                bootstrap.string_type,
+                bootstrap.number_type,
+            )
+        };
+        let string_number = canonical_union(&mut loose, &[string, number]);
+        assert_eq!(
+            loose.is_type_assignable_to(undefined, string_number),
+            Ok(true)
+        );
+        assert_eq!(loose.relation_cache_size(RelationKind::Assignable), 0);
+    }
+
+    #[test]
+    fn primitive_union_cache_policy_is_directional_symmetric_and_owner_isolated() {
+        let mut store = initialized(true);
+        let (undefined, null, string, number, bigint, boolean) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.undefined_type,
+                bootstrap.null_type,
+                bootstrap.string_type,
+                bootstrap.number_type,
+                bootstrap.bigint_type,
+                bootstrap.boolean_type,
+            )
+        };
+        let small = canonical_union(&mut store, &[string, number]);
+        assert_eq!(store.is_type_assignable_to(small, string), Ok(false));
+        assert_eq!(store.is_type_assignable_to(string, small), Ok(true));
+        assert_eq!(store.relation_cache_size(RelationKind::Assignable), 0);
+
+        let large = canonical_union(&mut store, &[undefined, null, string, number]);
+        assert_eq!(store.is_type_assignable_to(large, bigint), Ok(false));
+        assert_eq!(store.relation_cache_size(RelationKind::Assignable), 1);
+        let after_large = store.relation_state_snapshot();
+        assert_eq!(store.is_type_assignable_to(large, bigint), Ok(false));
+        assert_eq!(store.relation_state_snapshot(), after_large);
+
+        let left = named_canonical_union(&mut store, "CacheLeft", &[string, boolean]);
+        let right = named_canonical_union(&mut store, "CacheRight", &[string, boolean]);
+        assert_eq!(store.is_type_assignable_to(left, right), Ok(true));
+        assert_eq!(store.relation_cache_size(RelationKind::Assignable), 2);
+        assert_eq!(store.relation_cache_size(RelationKind::Subtype), 0);
+        assert_eq!(store.is_type_subtype_of(left, right), Ok(true));
+        assert_eq!(store.relation_cache_size(RelationKind::Assignable), 2);
+        assert_eq!(store.relation_cache_size(RelationKind::Subtype), 1);
+        assert_eq!(store.relation_cache_size(RelationKind::StrictSubtype), 0);
+        assert_eq!(store.is_type_strict_subtype_of(left, right), Ok(true));
+        assert_eq!(store.relation_cache_size(RelationKind::StrictSubtype), 1);
+        assert_eq!(store.relation_cache_size(RelationKind::Comparable), 0);
+        assert_eq!(store.is_type_comparable_to(left, right), Ok(true));
+        assert_eq!(store.relation_cache_size(RelationKind::Comparable), 1);
+
+        assert_eq!(store.is_type_identical_to(left, right), Ok(true));
+        assert_eq!(store.relation_cache_size(RelationKind::Identity), 1);
+        let after_identity = store.relation_state_snapshot();
+        assert_eq!(store.is_type_identical_to(right, left), Ok(true));
+        assert_eq!(store.relation_state_snapshot(), after_identity);
+    }
+
+    #[test]
+    fn malformed_union_errors_are_atomic_but_existing_cache_entries_win() {
+        let mut store = initialized(true);
+        let (string, number) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.string_type, bootstrap.number_type)
+        };
+        let malformed_source = store
+            .alloc_union_type(ObjectFlags::PRIMITIVE_UNION, vec![string, number])
+            .unwrap();
+        let malformed_target = store
+            .alloc_union_type(ObjectFlags::PRIMITIVE_UNION, vec![string, number])
+            .unwrap();
+        let before = store.relation_state_snapshot();
+        assert_eq!(
+            store.is_type_assignable_to(malformed_source, malformed_target),
+            Err(RelationUnavailable::MalformedUnion(malformed_source))
+        );
+        assert_eq!(store.relation_state_snapshot(), before);
+
+        let key = store
+            .relation_key_if_available(
+                malformed_source,
+                malformed_target,
+                super::IntersectionState::NONE,
+                false,
+                false,
+            )
+            .unwrap()
+            .key();
+        store.relation_cache_set(
+            RelationKind::Assignable,
+            key,
+            RelationComparisonResult::SUCCEEDED,
+        );
+        let cached = store.relation_state_snapshot();
+        assert_eq!(
+            store.is_type_assignable_to(malformed_source, malformed_target),
+            Ok(true)
+        );
+        assert_eq!(store.relation_state_snapshot(), cached);
+    }
+
+    #[test]
+    fn union_structural_escape_rolls_back_the_root_pending_relation() {
+        let mut store = initialized(true);
+        let (undefined, null, string, number) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (
+                bootstrap.undefined_type,
+                bootstrap.null_type,
+                bootstrap.string_type,
+                bootstrap.number_type,
+            )
+        };
+        let source = canonical_union(&mut store, &[undefined, null, string, number]);
+        let target = alloc_property_object(&mut store, Vec::new());
+        let before = store.relation_state_snapshot();
+        let result = store.is_type_assignable_to(source, target);
+        assert!(matches!(
+            result,
+            Err(RelationUnavailable::StructuralRelation {
+                target: found_target,
+                relation: RelationKind::Assignable,
+                ..
+            }) if found_target == target
+        ));
+        assert_eq!(store.relation_state_snapshot(), before);
     }
 
     #[test]
@@ -2045,11 +2847,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             loose.is_type_assignable_to(undefined, union),
-            Err(RelationUnavailable::StructuralRelation {
-                source: undefined,
-                target: union,
-                relation: RelationKind::Assignable,
-            })
+            Err(RelationUnavailable::MalformedUnion(union))
         );
     }
 
@@ -2330,11 +3128,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             store.is_type_assignable_to(string, ordinary_union),
-            Err(RelationUnavailable::StructuralRelation {
-                source: string,
-                target: ordinary_union,
-                relation: RelationKind::Assignable,
-            })
+            Err(RelationUnavailable::MalformedUnion(ordinary_union))
         );
         let flags = store.type_payload(ordinary_union).unwrap().object_flags();
         assert!(flags.intersects(ObjectFlags::IS_UNKNOWN_LIKE_UNION_COMPUTED));
