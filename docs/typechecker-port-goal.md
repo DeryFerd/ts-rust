@@ -209,16 +209,19 @@ remains the cluster-level source of truth.
   and fail-closed cache validation. Twenty focused tests and all 279 checker
   tests pass, and the final independent audit found no P0-P2 issue. Alias,
   enum, reverse-mapped, and JSDoc declared types remain explicit later T05
-  slices; cross-file canonical identity still depends on T04's Program-wide
-  merged-symbol redirects.
+  slices. Program-wide merged-symbol identity is closed by the later T04B1
+  consumer work described below.
 - T05B's dependency-closed interface declared types are verified through
-  `e83f0df`. Generic and direct-`this` interfaces publish the exact recursive
-  reference shell and synthetic `this`; definitely `this`-less interfaces use
-  the plain interface identity; merged outer and local parameters preserve
-  pinned ordering and symbol identity; invalid non-entity heritage is ignored;
-  and unresolved entity-name heritage fails explicitly before cache mutation.
-  Thirty-one focused tests and all 299 checker tests pass. An independent
-  pinned-source audit found no P0-P2 issue. Heritage resolution and the
+  `e83f0df`, with merged-symbol consumer canonicalization in `aafbdbe`. Generic
+  and direct-`this` interfaces publish the exact recursive reference shell and
+  synthetic `this`; definitely `this`-less interfaces use the plain interface
+  identity; merged outer and local parameters preserve pinned ordering and
+  symbol identity; invalid non-entity heritage is ignored; unresolved
+  entity-name heritage fails explicitly before cache mutation; and every raw
+  merged class/interface symbol shares the canonical transient's exact declared
+  `TypeId` and cache entry. Thirty-one interface-focused tests and the expanded
+  333-test checker suite pass. An independent pinned-source audit found no P0-P2
+  issue. Heritage resolution and the
   remaining alias, enum, reverse-mapped, and JSDoc families stay explicit
   follow-up work rather than being approximated.
 - T04B0's production construction boundary is verified through `21e69fb`,
@@ -230,9 +233,21 @@ remains the cluster-level source of truth.
   construction, declared-type hosts, and canonical name-resolution hosts all
   reject stale snapshots before semantic writes or host callbacks. The repair
   and consumer audit are clean, 160 binder and 299 checker tests pass, and the
-  all-target workspace check is green. Ordered global merging, merged-symbol
-  redirects, augmentations, ambient modules, and library global initialization
-  remain T04B1+ work.
+  all-target workspace check is green. T04B1's dependency-closed global merge
+  phase is integrated through `42cf18f`, `aafbdbe`, `f87d457`, and `513e7e4`.
+  It ports exact symbol clone/merge/table semantics, validated one-hop
+  merged-symbol redirects, explicit Program-order script globals, deferred
+  ambient-module and wildcard queues, UMD globals, global-scope augmentations,
+  and the `undefined`/`globalThis` initialization branches. Declared
+  class/interface consumers and the production name resolver canonicalize
+  through those redirects, and only a completed checker context can construct
+  the resolver host. Three local bundled-library fixtures are byte-identical to
+  the pin and exercise the same production path. The merge substrate's
+  independent audit found no P0-P2 issue; 162 binder tests, 333 checker tests,
+  the checker compile-fail doctest, strict targeted Clippy, and the all-target
+  workspace check pass. T04 remains in progress: alias targets, late ambient
+  module merging, non-global augmentations, diagnostic callback ownership, and
+  standard-library global type initialization are explicit later slices.
 
 No percentage in this section is a whole-corpus parity claim. A score is
 publishable only when its variant manifest and complete artifact comparison are
