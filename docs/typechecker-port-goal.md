@@ -137,8 +137,10 @@ remains the cluster-level source of truth.
   exact defaults, nil-versus-allocated-empty states, byte-backed name keys, and
   atomic provenance validation for every ID-bearing slot. Bootstrap pristine
   checks include every landed store, all 229 checker tests pass, and targeted
-  Clippy is clean with only the recorded baseline allowances. Enum-member,
-  containing-symbol, and source-file links remain explicit richer follow-ups.
+  Clippy is clean with only the recorded baseline allowances after moving one
+  enlarged test collection off the stack in `670a20e`. An independent final
+  audit found no P0-P2 semantic issue. Enum-member, containing-symbol, and
+  source-file links remain explicit richer follow-ups.
 - B02b's source contract is integrated as `d58d523`: canonical binding now
   retains a caller-derived byte-backed source symbol name plus explicit
   JavaScript, declaration-file, external-module, and CommonJS facts. It never
