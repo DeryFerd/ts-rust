@@ -512,6 +512,26 @@ impl<'store> RelaterSession<'store> {
         matching_configured_array_reference_target(self.store, self.global_types, source, target)
     }
 
+    fn configured_array_reference_target(
+        &self,
+        type_id: TypeId,
+    ) -> Result<Option<TypeId>, RelationUnavailable> {
+        let Some(global_types) = self.global_types else {
+            return Ok(None);
+        };
+        let record = self
+            .store
+            .type_payload(type_id)
+            .ok_or(RelationUnavailable::Type(type_id))?;
+        let TypeData::TypeReference(reference) = record.data() else {
+            return Ok(None);
+        };
+        Ok(reference
+            .object
+            .target
+            .filter(|target| global_types.contains_array_target(*target)))
+    }
+
     fn validate_canonical_array_target(
         &mut self,
         target: TypeId,
@@ -618,6 +638,192 @@ impl<'store> RelaterSession<'store> {
         let source_argument = self.canonical_array_reference_argument(source, array_target)?;
         let target_argument = self.canonical_array_reference_argument(target, array_target)?;
         Ok(Some((source_argument, target_argument)))
+    }
+
+    /// The only mixed Array/property-object relation that is independent of
+    /// instantiating generic Array members.
+    ///
+    /// The pinned oracle is surface-sensitive: a sole empty `Array<T>` shell
+    /// makes `[[1], {}]` infer `number[][]`, while a shell with required
+    /// `length` and the default library infer `{}[]`. Array -> regularized
+    /// empty object is always true. The reverse direction is false only when
+    /// the authoritative raw target proves a required own property; otherwise
+    /// it remains unavailable rather than guessing that a cold shell is empty.
+    fn canonical_array_empty_object_relation(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+    ) -> Result<Option<Ternary>, RelationUnavailable> {
+        if self.relation != RelationKind::StrictSubtype {
+            return Ok(None);
+        }
+        let source_array = self.configured_array_reference_target(source)?;
+        let target_array = self.configured_array_reference_target(target)?;
+        let (array, object, result, reverse_requires_property) = match (source_array, target_array)
+        {
+            (Some(_), None) => (source, target, Ternary::True, false),
+            (None, Some(_)) => (target, source, Ternary::False, true),
+            _ => return Ok(None),
+        };
+        let array_target = source_array.or(target_array).expect("one side is an Array");
+        self.canonical_array_reference_argument(array, array_target)?;
+        let members = self.resolved_object_members(object, true)?;
+        if !members.properties.is_empty() {
+            return Err(RelationUnavailable::StructuralRelation {
+                source,
+                target,
+                relation: self.relation,
+            });
+        }
+        if reverse_requires_property
+            && !self.canonical_array_target_has_required_own_property(array_target)?
+        {
+            return Err(RelationUnavailable::UnsupportedStructuredType(array_target));
+        }
+        Ok(Some(result))
+    }
+
+    fn canonical_array_target_has_required_own_property(
+        &self,
+        target: TypeId,
+    ) -> Result<bool, RelationUnavailable> {
+        let target_record = self
+            .store
+            .type_payload(target)
+            .ok_or(RelationUnavailable::Type(target))?;
+        if !target_record
+            .object_flags()
+            .contains(ObjectFlags::INTERFACE | ObjectFlags::REFERENCE)
+        {
+            return Ok(false);
+        }
+        let target_symbol = target_record
+            .symbol()
+            .ok_or(RelationUnavailable::InvalidStructuredMembers(target))?;
+        let symbol = self
+            .store
+            .symbol(target_symbol)
+            .ok_or(RelationUnavailable::Symbol(target_symbol))?;
+        if self.store.get_merged_symbol(target_symbol) != Some(target_symbol)
+            || !symbol.flags().intersects(SymbolFlags::INTERFACE)
+            || symbol.check_flags() != CheckFlags::NONE
+        {
+            return Err(RelationUnavailable::InvalidStructuredMembers(target));
+        }
+        let Some(table_id) = symbol.members() else {
+            return Ok(false);
+        };
+        let table = self
+            .store
+            .symbol_table(table_id)
+            .ok_or(RelationUnavailable::InvalidSymbolMembers(target_symbol))?;
+        let mut seen = HashSet::with_capacity(table.len());
+        let mut required = Vec::new();
+        for (name, member) in table.iter() {
+            if !seen.insert(member) {
+                return Err(RelationUnavailable::InvalidStructuredMembers(target));
+            }
+            let record = self
+                .store
+                .symbol(member)
+                .ok_or(RelationUnavailable::Symbol(member))?;
+            if record.name() != name
+                || record
+                    .parent()
+                    .and_then(|parent| self.store.get_merged_symbol(parent))
+                    != Some(target_symbol)
+            {
+                return Err(RelationUnavailable::InvalidStructuredMembers(target));
+            }
+            // Optional properties and callable/member-like symbols are valid
+            // raw surface entries but cannot prove this relation. In
+            // particular, overload symbols may legally canonicalize through
+            // a merge, so proof-only invariants belong inside this branch.
+            if record.flags() == SymbolFlags::PROPERTY {
+                if self.store.get_merged_symbol(member) != Some(member)
+                    || record.check_flags() != CheckFlags::NONE
+                    || record.members().is_some()
+                    || record.exports().is_some()
+                    || record.export_symbol().is_some()
+                {
+                    return Err(RelationUnavailable::InvalidStructuredMembers(target));
+                }
+                required.push(member);
+            }
+        }
+        for property in required {
+            let name = self
+                .store
+                .symbol(property)
+                .expect("the raw target table was shallow-validated")
+                .name();
+            if self.global_object_property(name)?.is_none() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn preflight_expression_union_array_object_pairs(
+        &mut self,
+        types: &[TypeId],
+    ) -> Result<(), LiteralTypeCacheError> {
+        let mut arrays = Vec::with_capacity(types.len());
+        for type_id in types {
+            let target = self
+                .configured_array_reference_target(*type_id)
+                .map_err(|_| LiteralTypeCacheError::UnsupportedUnionConstituent(*type_id))?;
+            if let Some(target) = target {
+                self.canonical_array_reference_argument(*type_id, target)
+                    .map_err(|error| array_relation_preflight_error(*type_id, error))?;
+            }
+            arrays.push(target);
+        }
+
+        for left in 0..types.len() {
+            for right in left + 1..types.len() {
+                match (arrays[left], arrays[right]) {
+                    (Some(left_target), Some(right_target)) => {
+                        if left_target != right_target {
+                            return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(
+                                types[right],
+                            ));
+                        }
+                    }
+                    (Some(_), None) | (None, Some(_)) => {
+                        let (array, object, array_target) = if let Some(target) = arrays[left] {
+                            (types[left], types[right], target)
+                        } else {
+                            (
+                                types[right],
+                                types[left],
+                                arrays[right].expect("one side is an Array"),
+                            )
+                        };
+                        let flags = self.store.type_flags(object).map_err(|_| {
+                            LiteralTypeCacheError::UnsupportedUnionConstituent(object)
+                        })?;
+                        if !flags.intersects(TypeFlags::OBJECT) {
+                            continue;
+                        }
+                        let members = self.resolved_object_members(object, true).map_err(|_| {
+                            LiteralTypeCacheError::UnsupportedUnionConstituent(object)
+                        })?;
+                        if !members.properties.is_empty() {
+                            return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(object));
+                        }
+                        let required_property = self
+                            .canonical_array_target_has_required_own_property(array_target)
+                            .map_err(|error| array_surface_preflight_error(array, error))?;
+                        if !required_property {
+                            return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(array));
+                        }
+                    }
+                    (None, None) => {}
+                }
+            }
+        }
+        Ok(())
     }
 
     fn union_types(&mut self, type_id: TypeId) -> Result<Vec<TypeId>, RelationUnavailable> {
@@ -825,6 +1031,12 @@ impl<'store> RelaterSession<'store> {
                     RecursionFlags::BOTH,
                     intersection_state,
                 );
+            }
+            if source_flags.intersects(TypeFlags::OBJECT)
+                && target_flags.intersects(TypeFlags::OBJECT)
+                && let Some(related) = self.canonical_array_empty_object_relation(source, target)?
+            {
+                return Ok(related);
             }
             if supports_property_object_relation(self.relation)
                 && source_flags.intersects(TypeFlags::OBJECT)
@@ -2515,6 +2727,29 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         }))
     }
 
+    /// Validates every canonical-Array/property-object pair in one expression
+    /// union before subtype reduction can publish any directional cache entry.
+    ///
+    /// The current mixed relation domain contains only empty property objects;
+    /// malformed canonical arrays retain their typed invariant error, while a
+    /// nonempty property surface remains an unsupported union constituent.
+    pub(super) fn preflight_expression_union_array_object_pairs(
+        &mut self,
+        types: &[TypeId],
+        global_types: &CanonicalGlobalTypes,
+    ) -> Result<(), LiteralTypeCacheError> {
+        let bootstrap = self
+            .relation_bootstrap_facts()
+            .map_err(|_| LiteralTypeCacheError::BootstrapUninitialized)?;
+        let mut session = RelaterSession::new_with_global_types(
+            self,
+            RelationKind::StrictSubtype,
+            bootstrap,
+            Some(RelationGlobalTypes::from_global_types(global_types)),
+        );
+        session.preflight_expression_union_array_object_pairs(types)
+    }
+
     /// Pinned `isTypeIdenticalTo` for the dependency-closed relation domain.
     ///
     /// # Errors
@@ -3373,6 +3608,47 @@ fn matching_configured_array_reference_target(
     .then_some(reference_target))
 }
 
+const fn array_relation_preflight_error(
+    type_: TypeId,
+    error: RelationUnavailable,
+) -> LiteralTypeCacheError {
+    match error {
+        RelationUnavailable::CanonicalGlobalType(error) => LiteralTypeCacheError::ArrayType {
+            type_,
+            error: ArrayTypeError::GlobalType(error),
+        },
+        RelationUnavailable::MalformedCanonicalArrayReference(malformed) => {
+            LiteralTypeCacheError::ArrayType {
+                type_: malformed,
+                error: ArrayTypeError::InvalidReference(malformed),
+            }
+        }
+        RelationUnavailable::UnavailableCanonicalArrayTarget(_) | RelationUnavailable::Type(_) => {
+            LiteralTypeCacheError::ArrayType {
+                type_,
+                error: ArrayTypeError::InvalidReference(type_),
+            }
+        }
+        _ => LiteralTypeCacheError::UnsupportedUnionConstituent(type_),
+    }
+}
+
+const fn array_surface_preflight_error(
+    type_: TypeId,
+    error: RelationUnavailable,
+) -> LiteralTypeCacheError {
+    match error {
+        RelationUnavailable::Type(_)
+        | RelationUnavailable::Symbol(_)
+        | RelationUnavailable::InvalidSymbolMembers(_)
+        | RelationUnavailable::InvalidStructuredMembers(_) => LiteralTypeCacheError::ArrayType {
+            type_,
+            error: ArrayTypeError::InvalidReference(type_),
+        },
+        _ => LiteralTypeCacheError::UnsupportedUnionConstituent(type_),
+    }
+}
+
 const fn bool_to_ternary(value: bool) -> Ternary {
     if value { Ternary::True } else { Ternary::False }
 }
@@ -3461,7 +3737,7 @@ mod tests {
     use ts_jsnum::{Number, PseudoBigInt};
     use ts_parser::parse_source_file;
 
-    use super::{RelationGlobalTypes, RelationUnavailable};
+    use super::{ArrayTypeError, LiteralTypeCacheError, RelationGlobalTypes, RelationUnavailable};
     use crate::semantic::{
         CanonicalGlobalTypeInitializationError, CanonicalTypeMapperStore, DeclaredTypeLinks,
         IntrinsicBootstrapOptions, MembersAndExportsLinks, MembersOrExportsResolutionKind,
@@ -3911,6 +4187,22 @@ mod tests {
             type_list_key(&[parameter]),
         ));
         CanonicalArrayTargetFixture { target, symbol }
+    }
+
+    fn add_required_array_property(
+        store: &mut TestStore,
+        target: CanonicalArrayTargetFixture,
+        name: &str,
+    ) -> SemanticSymbolId {
+        let property = alloc_symbol(store, SymbolFlags::PROPERTY, name);
+        assert!(store.set_symbol_relationships(property, None, None, Some(target.symbol), None,));
+        let members = store.alloc_symbol_table();
+        assert_eq!(
+            store.insert_symbol(members, EscapedName::source(name), property),
+            Some(None)
+        );
+        assert!(store.set_symbol_relationships(target.symbol, Some(members), None, None, None,));
+        property
     }
 
     fn canonical_array_reference(
@@ -5169,6 +5461,197 @@ mod tests {
             )),
             "different generic targets do not acquire inferred variance"
         );
+    }
+
+    #[test]
+    fn canonical_arrays_only_reduce_against_empty_objects_with_required_surface_proof() {
+        let mut store = initialized(true);
+        let (number, empty_object) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.number_type, bootstrap.empty_object_type)
+        };
+        let array = alloc_canonical_array_target(&mut store, "Array");
+        let global_types = RelationGlobalTypes {
+            array_targets: CanonicalArrayTargets::for_test(array.target, array.target),
+            string_wrapper: empty_object,
+            number_wrapper: empty_object,
+            boolean_wrapper: empty_object,
+        };
+        let array_number = canonical_array_reference(&mut store, array.target, number);
+        let empty = alloc_property_object(&mut store, Vec::new());
+        let id = alloc_typed_property(&mut store, "id", number, false);
+        let nonempty = alloc_property_object(&mut store, vec![id]);
+
+        let before = store.relation_state_snapshot();
+        assert_eq!(
+            store.is_type_related_to_with_optional_global_types(
+                array_number,
+                empty,
+                RelationKind::StrictSubtype,
+                Some(global_types),
+            ),
+            Ok(true)
+        );
+        assert_eq!(store.relation_state_snapshot(), before);
+        assert_eq!(
+            store.is_type_related_to_with_optional_global_types(
+                empty,
+                array_number,
+                RelationKind::StrictSubtype,
+                Some(global_types),
+            ),
+            Err(RelationUnavailable::UnsupportedStructuredType(array.target))
+        );
+        assert_eq!(store.relation_state_snapshot(), before);
+
+        {
+            let bootstrap = store.relation_bootstrap_facts().unwrap();
+            let mut session = super::RelaterSession::new_with_global_types(
+                &mut store,
+                RelationKind::StrictSubtype,
+                bootstrap,
+                Some(global_types),
+            );
+            assert_eq!(
+                session.preflight_expression_union_array_object_pairs(&[array_number, empty]),
+                Err(LiteralTypeCacheError::UnsupportedUnionConstituent(
+                    array_number
+                )),
+                "an empty Array shell cannot prove the reverse subtype result"
+            );
+        }
+        assert_eq!(store.relation_state_snapshot(), before);
+
+        let length = add_required_array_property(&mut store, array, "length");
+        assert_eq!(
+            store.is_type_related_to_with_optional_global_types(
+                empty,
+                array_number,
+                RelationKind::StrictSubtype,
+                Some(global_types),
+            ),
+            Ok(false)
+        );
+        assert_eq!(store.relation_state_snapshot(), before);
+
+        for (source, target) in [(array_number, nonempty), (nonempty, array_number)] {
+            assert!(matches!(
+                store.is_type_related_to_with_optional_global_types(
+                    source,
+                    target,
+                    RelationKind::StrictSubtype,
+                    Some(global_types),
+                ),
+                Err(RelationUnavailable::StructuralRelation {
+                    source: actual_source,
+                    target: actual_target,
+                    relation: RelationKind::StrictSubtype,
+                }) if actual_source == source && actual_target == target
+            ));
+            assert_eq!(store.relation_state_snapshot(), before);
+        }
+
+        {
+            let bootstrap = store.relation_bootstrap_facts().unwrap();
+            let mut session = super::RelaterSession::new_with_global_types(
+                &mut store,
+                RelationKind::StrictSubtype,
+                bootstrap,
+                Some(global_types),
+            );
+            assert_eq!(
+                session.preflight_expression_union_array_object_pairs(&[array_number, empty]),
+                Ok(())
+            );
+            assert_eq!(
+                session.preflight_expression_union_array_object_pairs(&[empty, array_number]),
+                Ok(())
+            );
+            assert_eq!(
+                session.preflight_expression_union_array_object_pairs(&[
+                    empty,
+                    array_number,
+                    nonempty,
+                ]),
+                Err(LiteralTypeCacheError::UnsupportedUnionConstituent(nonempty)),
+                "all mixed pairs are rejected before directional comparisons begin"
+            );
+        }
+        assert_eq!(store.relation_state_snapshot(), before);
+
+        assert!(store.set_type_reference_resolution(array_number, None, Some(vec![empty])));
+        {
+            let bootstrap = store.relation_bootstrap_facts().unwrap();
+            let mut poisoned = super::RelaterSession::new_with_global_types(
+                &mut store,
+                RelationKind::StrictSubtype,
+                bootstrap,
+                Some(global_types),
+            );
+            assert_eq!(
+                poisoned.preflight_expression_union_array_object_pairs(&[array_number, empty]),
+                Err(LiteralTypeCacheError::ArrayType {
+                    type_: array_number,
+                    error: ArrayTypeError::GlobalType(
+                        CanonicalGlobalTypeInitializationError::InvalidInstantiationCache(
+                            array.target
+                        )
+                    ),
+                })
+            );
+        }
+        assert_eq!(store.relation_state_snapshot(), before);
+
+        assert!(store.set_type_reference_resolution(array_number, None, Some(vec![number])));
+        {
+            let bootstrap = store.relation_bootstrap_facts().unwrap();
+            let mut repaired = super::RelaterSession::new_with_global_types(
+                &mut store,
+                RelationKind::StrictSubtype,
+                bootstrap,
+                Some(global_types),
+            );
+            assert_eq!(
+                repaired.preflight_expression_union_array_object_pairs(&[array_number, empty]),
+                Ok(())
+            );
+        }
+        assert_eq!(store.relation_state_snapshot(), before);
+
+        assert!(store.set_symbol_relationships(length, None, None, None, None));
+        {
+            let bootstrap = store.relation_bootstrap_facts().unwrap();
+            let mut poisoned = super::RelaterSession::new_with_global_types(
+                &mut store,
+                RelationKind::StrictSubtype,
+                bootstrap,
+                Some(global_types),
+            );
+            assert_eq!(
+                poisoned.preflight_expression_union_array_object_pairs(&[array_number, empty]),
+                Err(LiteralTypeCacheError::ArrayType {
+                    type_: array_number,
+                    error: ArrayTypeError::InvalidReference(array_number),
+                })
+            );
+        }
+        assert_eq!(store.relation_state_snapshot(), before);
+
+        assert!(store.set_symbol_relationships(length, None, None, Some(array.symbol), None,));
+        {
+            let bootstrap = store.relation_bootstrap_facts().unwrap();
+            let mut repaired = super::RelaterSession::new_with_global_types(
+                &mut store,
+                RelationKind::StrictSubtype,
+                bootstrap,
+                Some(global_types),
+            );
+            assert_eq!(
+                repaired.preflight_expression_union_array_object_pairs(&[empty, array_number]),
+                Ok(())
+            );
+        }
+        assert_eq!(store.relation_state_snapshot(), before);
     }
 
     #[test]
