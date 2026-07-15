@@ -94,6 +94,10 @@ impl CanonicalSyntheticScopeId {
     fn is_for(self, store: SemanticStoreId) -> bool {
         self.store == store
     }
+
+    fn is_allocated_parent_of(self, child: Self) -> bool {
+        self.store == child.store && self.owner == child.owner && self.local < child.local
+    }
 }
 
 static LAST_SYNTHETIC_SCOPE_OWNER: AtomicU64 = AtomicU64::new(0);
@@ -1537,7 +1541,7 @@ impl<'a, H: CanonicalNameResolverHost> CanonicalNameResolver<'a, H> {
                     self.validate_location(parent)?;
                 }
                 Some(CanonicalResolutionLocation::SyntheticScope(parent))
-                    if !parent.is_for(self.symbols.id()) =>
+                    if !parent.is_allocated_parent_of(scope) =>
                 {
                     return Err(CanonicalNameResolutionError::InvalidSyntheticScope(parent));
                 }
@@ -1910,7 +1914,11 @@ fn find_constructor(arena: &NodeArena, class: NodeId) -> Option<NodeId> {
     members.iter().copied().find(|member| {
         matches!(
             arena.get(*member).map(|member| &member.data),
-            Some(NodeData::ConstructorDeclaration(constructor)) if constructor.body.is_some()
+            Some(NodeData::ConstructorDeclaration(constructor))
+                if constructor
+                    .body
+                    .and_then(|body| arena.get(body))
+                    .is_some_and(|body| !body.range.is_empty())
         )
     })
 }
@@ -2068,6 +2076,20 @@ mod tests {
     ) -> BoundSource {
         let parsed = parse_source_file(source);
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        finish_bind(parsed, module_state, is_declaration_file)
+    }
+
+    fn bind_recovered(source: &str, module_state: CanonicalModuleState) -> BoundSource {
+        let parsed = parse_source_file(source);
+        assert!(!parsed.diagnostics.is_empty());
+        finish_bind(parsed, module_state, false)
+    }
+
+    fn finish_bind(
+        parsed: ParseResult,
+        module_state: CanonicalModuleState,
+        is_declaration_file: bool,
+    ) -> BoundSource {
         let mut binder = CanonicalBinder::new();
         binder
             .bind_source_file_with_facts(
@@ -3250,13 +3272,65 @@ function outer<T>() {
                 true,
                 false,
             ),
-            Err(CanonicalNameResolutionError::SyntheticScopeCycle(first))
+            Err(CanonicalNameResolutionError::InvalidSyntheticScope(second))
         );
         assert!(host.events.is_empty());
+        assert!(host.failed.is_empty());
         assert!(host.succeeded.is_empty());
         assert!(host.referenced.is_empty());
 
         let mut other_scopes = CanonicalSyntheticScopeStore::new(symbols);
+        let cross_owner_parent = other_scopes
+            .alloc_scope(symbols, source_locals, None)
+            .unwrap();
+        let cross_owner_child = host
+            .synthetic_scopes
+            .as_mut()
+            .unwrap()
+            .alloc_scope(symbols, source_locals, None)
+            .unwrap();
+        host.synthetic_scope_overrides.insert(
+            cross_owner_parent,
+            CanonicalSyntheticScope {
+                locals: source_locals,
+                parent: None,
+            },
+        );
+        host.synthetic_scope_overrides.insert(
+            cross_owner_child,
+            CanonicalSyntheticScope {
+                locals: source_locals,
+                parent: Some(CanonicalResolutionLocation::SyntheticScope(
+                    cross_owner_parent,
+                )),
+            },
+        );
+        host.events.clear();
+        host.failed.clear();
+        host.succeeded.clear();
+        host.referenced.clear();
+        assert_eq!(
+            resolve_from(
+                &source,
+                &mut host,
+                Some(CanonicalResolutionLocation::SyntheticScope(
+                    cross_owner_child,
+                )),
+                "missing",
+                SymbolFlags::VALUE,
+                Some(not_found_message()),
+                true,
+                false,
+            ),
+            Err(CanonicalNameResolutionError::InvalidSyntheticScope(
+                cross_owner_parent
+            ))
+        );
+        assert!(host.events.is_empty());
+        assert!(host.failed.is_empty());
+        assert!(host.succeeded.is_empty());
+        assert!(host.referenced.is_empty());
+
         let missing = other_scopes
             .alloc_scope(symbols, source_locals, None)
             .unwrap();
@@ -3352,6 +3426,68 @@ class C {
         );
         assert_eq!(host.invalid_properties.len(), 1);
         assert_eq!(host.invalid_properties[0].1, "local");
+        assert_eq!(host.invalid_properties[0].2, node_ref(&source, property));
+        assert!(host.failed.is_empty());
+    }
+
+    #[test]
+    fn recovered_zero_width_constructor_body_does_not_hide_later_implementation() {
+        let source = bind_recovered(
+            r"
+class C {
+    field = local;
+    constructor(),
+    constructor() { var local = 1; }
+}
+",
+            CanonicalModuleState::Script,
+        );
+        let constructors = source
+            .parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::Constructor).then_some(node)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(constructors.len(), 2);
+        let constructor_body = |constructor| {
+            let NodeData::ConstructorDeclaration(constructor) =
+                &source.parsed.arena.get(constructor).unwrap().data
+            else {
+                unreachable!("selected node is a constructor")
+            };
+            constructor.body.unwrap()
+        };
+        assert!(
+            source
+                .parsed
+                .arena
+                .get(constructor_body(constructors[0]))
+                .unwrap()
+                .range
+                .is_empty()
+        );
+        assert!(
+            !source
+                .parsed
+                .arena
+                .get(constructor_body(constructors[1]))
+                .unwrap()
+                .range
+                .is_empty()
+        );
+
+        let use_site = identifier_in(&source, "field = local", "local");
+        let property = first_kind(&source, SyntaxKind::PropertyDeclaration);
+        let mut host = TestHost::for_source(&source);
+        host.invalid_property_result = true;
+
+        assert_eq!(
+            resolve(&source, &mut host, use_site, "local", SymbolFlags::VALUE),
+            Ok(None)
+        );
+        assert_eq!(host.invalid_properties.len(), 1);
         assert_eq!(host.invalid_properties[0].2, node_ref(&source, property));
         assert!(host.failed.is_empty());
     }
