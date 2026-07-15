@@ -4717,6 +4717,7 @@ impl<'a> Parser<'a> {
                 SyntaxKind::FunctionKeyword
                     | SyntaxKind::ClassKeyword
                     | SyntaxKind::InterfaceKeyword
+                    | SyntaxKind::AtToken
                     | SyntaxKind::AbstractKeyword
             ) || (self.current.kind == SyntaxKind::AsyncKeyword
                 && self.next_token_kind() == SyntaxKind::FunctionKeyword)
@@ -11839,6 +11840,7 @@ mod tests {
             "export default interface Shape {}\n",
             "export default class Model {}\n",
             "export default function make() {}\n",
+            "export default @sealed class Decorated {}\n",
         ));
         assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
         let statements = source_statements(&result);
@@ -11851,9 +11853,10 @@ mod tests {
                 SyntaxKind::InterfaceDeclaration,
                 SyntaxKind::ClassDeclaration,
                 SyntaxKind::FunctionDeclaration,
+                SyntaxKind::ClassDeclaration,
             ]
         );
-        for statement in statements {
+        for (index, statement) in statements.iter().enumerate() {
             let modifiers = match &result.arena.get(*statement).unwrap().data {
                 NodeData::InterfaceDeclaration(declaration) => declaration.modifiers.as_ref(),
                 NodeData::ClassDeclaration(declaration) => declaration.modifiers.as_ref(),
@@ -11861,15 +11864,27 @@ mod tests {
                 _ => None,
             }
             .unwrap();
-            assert_eq!(
-                modifiers
-                    .list
-                    .nodes
-                    .iter()
-                    .map(|modifier| result.arena.get(*modifier).unwrap().kind)
-                    .collect::<Vec<_>>(),
-                [SyntaxKind::ExportKeyword, SyntaxKind::DefaultKeyword]
-            );
+            let actual = modifiers
+                .list
+                .nodes
+                .iter()
+                .map(|modifier| result.arena.get(*modifier).unwrap().kind)
+                .collect::<Vec<_>>();
+            if index == 3 {
+                assert_eq!(
+                    actual,
+                    [
+                        SyntaxKind::ExportKeyword,
+                        SyntaxKind::DefaultKeyword,
+                        SyntaxKind::Decorator,
+                    ]
+                );
+            } else {
+                assert_eq!(
+                    actual,
+                    [SyntaxKind::ExportKeyword, SyntaxKind::DefaultKeyword]
+                );
+            }
         }
     }
 
