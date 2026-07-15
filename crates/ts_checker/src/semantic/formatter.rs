@@ -1,17 +1,18 @@
 //! Dependency-closed canonical semantic type display.
 //!
-//! This is the primitive and literal prefix of pinned
+//! This is the primitive, literal, and canonical-union prefix of pinned
 //! `internal/checker/printer.go::typeToString`,
 //! `internal/checker/nodebuilderimpl.go::typeToTypeNode`, and
 //! `internal/checker/relater.go::reportRelationError` at
 //! `dc37b5249ab60e2bbce936f71b883e6c8136167e`. It deliberately stops before
-//! symbol naming, alias accessibility, and general union serialization. Those
+//! general symbol naming and structural/advanced type serialization. Those
 //! families return [`TypeDisplayUnavailable`] rather than placeholder text.
 
-use std::{fmt::Write as _, ops};
+use std::{collections::HashSet, fmt::Write as _, ops};
 
 use super::{
     CanonicalTypeMapperStore, TypeAliasId, TypeId,
+    bootstrap::LiteralTypeCacheError,
     type_records::{LiteralTypeData, LiteralValue, TypeData, TypeDataKind, TypeRecord},
     types::TypeFlags,
 };
@@ -21,7 +22,7 @@ const NO_TRUNCATION_MAXIMUM_TRUNCATION_LENGTH: usize = 1_000_000;
 const ELLIPSIS: &str = "...";
 
 /// The pinned `TypeFormatFlags` subset observable for dependency-closed
-/// primitive and literal display.
+/// primitive, literal, and canonical-union display.
 ///
 /// Numeric values intentionally match typescript-go. Unsupported flag
 /// families are absent rather than silently ignored.
@@ -35,7 +36,8 @@ impl CanonicalTypeFormatFlags {
     /// output cutoff still applies at two million bytes.
     pub const NO_TRUNCATION: Self = Self(1 << 0);
     /// Permit an alias defined outside the current scope to retain its name.
-    /// Alias naming itself remains an explicit dependency boundary in this cut.
+    /// Context-free formatting has no enclosing declaration, so canonical
+    /// unqualified union aliases are accessible with or without this flag.
     pub const USE_ALIAS_DEFINED_OUTSIDE_CURRENT_SCOPE: Self = Self(1 << 14);
     /// Permit the context-free `unique symbol` representation.
     pub const ALLOW_UNIQUE_ES_SYMBOL_TYPE: Self = Self(1 << 20);
@@ -80,6 +82,9 @@ pub enum TypeDisplayUnavailable {
     Alias { type_id: TypeId, alias: TypeAliasId },
     UnsupportedType { type_id: TypeId, kind: TypeDataKind },
     MalformedType(TypeId),
+    InvalidUnion(TypeId),
+    UnsupportedUnionConstituent { union: TypeId, constituent: TypeId },
+    CyclicType(TypeId),
     InvalidLiteralLinks(TypeId),
     UniqueSymbolName(TypeId),
     MissingBootstrap,
@@ -101,6 +106,19 @@ impl std::fmt::Display for TypeDisplayUnavailable {
             ),
             Self::MalformedType(type_id) => {
                 write!(formatter, "type {type_id:?} has an invalid display payload")
+            }
+            Self::InvalidUnion(type_id) => {
+                write!(
+                    formatter,
+                    "type {type_id:?} is not a canonical display union"
+                )
+            }
+            Self::UnsupportedUnionConstituent { union, constituent } => write!(
+                formatter,
+                "union {union:?} contains unsupported display constituent {constituent:?}"
+            ),
+            Self::CyclicType(type_id) => {
+                write!(formatter, "type {type_id:?} has a cyclic display graph")
             }
             Self::InvalidLiteralLinks(type_id) => write!(
                 formatter,
@@ -156,7 +174,7 @@ pub fn type_to_string(
 }
 
 /// Pinned context-free `TypeToStringEx` behavior for flags observable in the
-/// installed primitive/literal prefix.
+/// installed primitive/literal/canonical-union prefix.
 ///
 /// # Errors
 ///
@@ -167,7 +185,9 @@ pub fn type_to_string_with_flags(
     type_id: TypeId,
     flags: CanonicalTypeFormatFlags,
 ) -> Result<String, TypeDisplayUnavailable> {
-    let displayed = display_type_worker(store, type_id, flags)?;
+    let mut state = DisplayState::default();
+    let mut visiting = HashSet::new();
+    let displayed = display_type_worker(store, type_id, flags, &mut state, &mut visiting)?;
     truncate_display(type_id, displayed, flags)
 }
 
@@ -261,6 +281,8 @@ fn display_type_worker(
     store: &CanonicalTypeMapperStore,
     type_id: TypeId,
     flags: CanonicalTypeFormatFlags,
+    state: &mut DisplayState,
+    visiting: &mut HashSet<TypeId>,
 ) -> Result<String, TypeDisplayUnavailable> {
     let record = store
         .type_payload(type_id)
@@ -277,9 +299,11 @@ fn display_type_worker(
                 return Ok("/*unresolved*/ any".to_owned());
             }
             if type_id == bootstrap.intrinsic_marker_type {
+                state.add(3);
                 return Ok("intrinsic".to_owned());
             }
         }
+        state.add(3);
         return Ok("any".to_owned());
     }
     if type_flags.intersects(TypeFlags::UNKNOWN) {
@@ -288,21 +312,23 @@ fn display_type_worker(
     }
     if type_flags.intersects(TypeFlags::STRING) {
         require_data_kind(type_id, record, TypeDataKind::Intrinsic)?;
+        state.add(6);
         return Ok("string".to_owned());
     }
     if type_flags.intersects(TypeFlags::NUMBER) {
         require_data_kind(type_id, record, TypeDataKind::Intrinsic)?;
+        state.add(6);
         return Ok("number".to_owned());
     }
     if type_flags.intersects(TypeFlags::BIG_INT) {
         require_data_kind(type_id, record, TypeDataKind::Intrinsic)?;
+        state.add(6);
         return Ok("bigint".to_owned());
     }
-    if type_flags.intersects(TypeFlags::BOOLEAN) {
-        if let Some(alias) = record.alias() {
-            return Err(TypeDisplayUnavailable::Alias { type_id, alias });
-        }
+    if type_flags.intersects(TypeFlags::BOOLEAN) && record.alias().is_none() {
         require_data_kind(type_id, record, TypeDataKind::Union)?;
+        validate_display_union(store, type_id)?;
+        state.add(7);
         return Ok("boolean".to_owned());
     }
     if type_flags.intersects(TypeFlags::ENUM_LIKE) {
@@ -324,6 +350,7 @@ fn display_type_worker(
         } else {
             '"'
         };
+        state.add(value.len().saturating_add(2));
         return Ok(quote_string_literal(value, quote));
     }
     if type_flags.intersects(TypeFlags::NUMBER_LITERAL) {
@@ -332,7 +359,9 @@ fn display_type_worker(
         let LiteralValue::Number(value) = &literal.value else {
             return Err(TypeDisplayUnavailable::MalformedType(type_id));
         };
-        return Ok(value.to_string());
+        let value = value.to_string();
+        state.add(value.len());
+        return Ok(value);
     }
     if type_flags.intersects(TypeFlags::BIG_INT_LITERAL) {
         let literal = literal_data(type_id, record)?;
@@ -340,7 +369,9 @@ fn display_type_worker(
         let LiteralValue::BigInt(value) = &literal.value else {
             return Err(TypeDisplayUnavailable::MalformedType(type_id));
         };
-        return Ok(format!("{value}n"));
+        let value = format!("{value}n");
+        state.add(value.len());
+        return Ok(value);
     }
     if type_flags.intersects(TypeFlags::BOOLEAN_LITERAL) {
         let literal = literal_data(type_id, record)?;
@@ -348,6 +379,7 @@ fn display_type_worker(
         let LiteralValue::Boolean(value) = &literal.value else {
             return Err(TypeDisplayUnavailable::MalformedType(type_id));
         };
+        state.add(if *value { 4 } else { 5 });
         return Ok(value.to_string());
     }
     if type_flags.intersects(TypeFlags::UNIQUE_ES_SYMBOL) {
@@ -355,31 +387,41 @@ fn display_type_worker(
         if !flags.contains(CanonicalTypeFormatFlags::ALLOW_UNIQUE_ES_SYMBOL_TYPE) {
             return Err(TypeDisplayUnavailable::UniqueSymbolName(type_id));
         }
+        state.add(13);
         return Ok("unique symbol".to_owned());
     }
     if type_flags.intersects(TypeFlags::VOID) {
         require_data_kind(type_id, record, TypeDataKind::Intrinsic)?;
+        state.add(4);
         return Ok("void".to_owned());
     }
     if type_flags.intersects(TypeFlags::UNDEFINED) {
         require_data_kind(type_id, record, TypeDataKind::Intrinsic)?;
+        state.add(9);
         return Ok("undefined".to_owned());
     }
     if type_flags.intersects(TypeFlags::NULL) {
         require_data_kind(type_id, record, TypeDataKind::Intrinsic)?;
+        state.add(4);
         return Ok("null".to_owned());
     }
     if type_flags.intersects(TypeFlags::NEVER) {
         require_data_kind(type_id, record, TypeDataKind::Intrinsic)?;
+        state.add(5);
         return Ok("never".to_owned());
     }
     if type_flags.intersects(TypeFlags::ES_SYMBOL) {
         require_data_kind(type_id, record, TypeDataKind::Intrinsic)?;
+        state.add(6);
         return Ok("symbol".to_owned());
     }
     if type_flags.intersects(TypeFlags::NON_PRIMITIVE) {
         require_data_kind(type_id, record, TypeDataKind::Intrinsic)?;
+        state.add(6);
         return Ok("object".to_owned());
+    }
+    if type_flags.intersects(TypeFlags::UNION) {
+        return display_union_type(store, type_id, flags, state, visiting);
     }
     if let Some(alias) = record.alias() {
         return Err(TypeDisplayUnavailable::Alias { type_id, alias });
@@ -388,6 +430,299 @@ fn display_type_worker(
         type_id,
         kind: record.data().kind(),
     })
+}
+
+#[derive(Default)]
+struct DisplayState {
+    approximate_length: usize,
+    truncating: bool,
+}
+
+impl DisplayState {
+    fn add(&mut self, amount: usize) {
+        self.approximate_length = self.approximate_length.saturating_add(amount);
+    }
+
+    fn check_truncation(&mut self, flags: CanonicalTypeFormatFlags) -> bool {
+        if self.truncating {
+            return true;
+        }
+        let maximum = if flags.contains(CanonicalTypeFormatFlags::NO_TRUNCATION) {
+            NO_TRUNCATION_MAXIMUM_TRUNCATION_LENGTH
+        } else {
+            DEFAULT_MAXIMUM_TRUNCATION_LENGTH
+        };
+        self.truncating = self.approximate_length > maximum;
+        self.truncating
+    }
+}
+
+fn display_union_type(
+    store: &CanonicalTypeMapperStore,
+    type_id: TypeId,
+    flags: CanonicalTypeFormatFlags,
+    state: &mut DisplayState,
+    visiting: &mut HashSet<TypeId>,
+) -> Result<String, TypeDisplayUnavailable> {
+    ensure_acyclic_union_graph(store, type_id)?;
+    validate_display_union(store, type_id)?;
+    if !visiting.insert(type_id) {
+        return Err(TypeDisplayUnavailable::CyclicType(type_id));
+    }
+    let result = (|| {
+        let record = store
+            .type_payload(type_id)
+            .ok_or(TypeDisplayUnavailable::Type(type_id))?;
+        if let Some(alias) = record.alias() {
+            return display_union_alias(store, type_id, alias, state);
+        }
+        let TypeData::Union(data) = record.data() else {
+            return Err(TypeDisplayUnavailable::InvalidUnion(type_id));
+        };
+        let display_union = data.origin.unwrap_or(type_id);
+        let display_record = store
+            .type_payload(display_union)
+            .ok_or(TypeDisplayUnavailable::Type(display_union))?;
+        let TypeData::Union(display_data) = display_record.data() else {
+            return Err(TypeDisplayUnavailable::InvalidUnion(type_id));
+        };
+        let types = format_union_types(store, type_id, &display_data.union.types)?;
+        display_union_list(store, type_id, &types, flags, state, visiting)
+    })();
+    visiting.remove(&type_id);
+    result
+}
+
+fn display_union_alias(
+    store: &CanonicalTypeMapperStore,
+    type_id: TypeId,
+    alias: TypeAliasId,
+    state: &mut DisplayState,
+) -> Result<String, TypeDisplayUnavailable> {
+    let alias_record = store
+        .type_alias(alias)
+        .ok_or(TypeDisplayUnavailable::Alias { type_id, alias })?;
+    let symbol = alias_record
+        .symbol()
+        .and_then(|symbol| store.symbol(symbol))
+        .ok_or(TypeDisplayUnavailable::Alias { type_id, alias })?;
+    let escaped_name = symbol.name();
+    if escaped_name.is_reserved_member_name() {
+        return Err(TypeDisplayUnavailable::Alias { type_id, alias });
+    }
+    let name = escaped_name
+        .as_utf8()
+        .filter(|name| !name.is_empty() && !escaped_name.is_internal())
+        .ok_or(TypeDisplayUnavailable::Alias { type_id, alias })?;
+    // Pinned single-symbol entity naming accounts for the initial identifier
+    // and the completed access segment separately.
+    state.add(name.len().saturating_add(1).saturating_mul(2));
+    Ok(name.to_owned())
+}
+
+fn format_union_types(
+    store: &CanonicalTypeMapperStore,
+    union: TypeId,
+    types: &[TypeId],
+) -> Result<Vec<TypeId>, TypeDisplayUnavailable> {
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(TypeDisplayUnavailable::MissingBootstrap)?;
+    let boolean_types = union_payload_types(store, bootstrap.boolean_type)?;
+    let boolean_last = boolean_types
+        .last()
+        .copied()
+        .ok_or(TypeDisplayUnavailable::InvalidUnion(bootstrap.boolean_type))?;
+    let boolean_last = regular_literal_type(store, boolean_last)?;
+
+    let mut result = Vec::with_capacity(types.len());
+    let mut combined_flags = TypeFlags::NONE;
+    let mut index = 0;
+    while index < types.len() {
+        let type_id = types[index];
+        let record = store.type_payload(type_id).ok_or(
+            TypeDisplayUnavailable::UnsupportedUnionConstituent {
+                union,
+                constituent: type_id,
+            },
+        )?;
+        combined_flags |= record.flags();
+        if !record.flags().intersects(TypeFlags::NULLABLE) {
+            if record.flags().intersects(TypeFlags::BOOLEAN_LITERAL) {
+                let count = boolean_types.len();
+                if index + count <= types.len()
+                    && regular_literal_type(store, types[index + count - 1])? == boolean_last
+                {
+                    result.push(bootstrap.boolean_type);
+                    index += count;
+                    continue;
+                }
+            }
+            result.push(type_id);
+        }
+        index += 1;
+    }
+    if combined_flags.intersects(TypeFlags::NULL) {
+        result.push(bootstrap.null_type);
+    }
+    if combined_flags.intersects(TypeFlags::UNDEFINED) {
+        result.push(bootstrap.undefined_type);
+    }
+    if result.is_empty() {
+        return Err(TypeDisplayUnavailable::InvalidUnion(union));
+    }
+    Ok(result)
+}
+
+fn display_union_list(
+    store: &CanonicalTypeMapperStore,
+    union: TypeId,
+    types: &[TypeId],
+    flags: CanonicalTypeFormatFlags,
+    state: &mut DisplayState,
+    visiting: &mut HashSet<TypeId>,
+) -> Result<String, TypeDisplayUnavailable> {
+    if types.len() == 1 {
+        return display_type_worker(store, types[0], flags, state, visiting);
+    }
+    if state.check_truncation(flags) && types.len() > 2 {
+        let first = display_type_worker(store, types[0], flags, state, visiting)?;
+        let last = display_type_worker(
+            store,
+            *types
+                .last()
+                .ok_or(TypeDisplayUnavailable::InvalidUnion(union))?,
+            flags,
+            state,
+            visiting,
+        )?;
+        return Ok(format!(
+            "{first} | {} | {last}",
+            union_elision(types.len() - 2, flags)
+        ));
+    }
+
+    let mut displayed = Vec::with_capacity(types.len());
+    for (index, type_id) in types.iter().copied().enumerate() {
+        let display_index = index + 1;
+        if state.check_truncation(flags) && display_index + 2 < types.len() - 1 {
+            displayed.push(union_elision(types.len() - display_index, flags));
+            displayed.push(display_type_worker(
+                store,
+                *types
+                    .last()
+                    .ok_or(TypeDisplayUnavailable::InvalidUnion(union))?,
+                flags,
+                state,
+                visiting,
+            )?);
+            break;
+        }
+        state.add(2);
+        displayed.push(display_type_worker(store, type_id, flags, state, visiting)?);
+    }
+    Ok(displayed.join(" | "))
+}
+
+fn union_elision(count: usize, flags: CanonicalTypeFormatFlags) -> String {
+    if flags.contains(CanonicalTypeFormatFlags::NO_TRUNCATION) {
+        format!("/*... {count} more elided ...*/ any")
+    } else {
+        format!("... {count} more ...")
+    }
+}
+
+fn union_payload_types(
+    store: &CanonicalTypeMapperStore,
+    type_id: TypeId,
+) -> Result<&[TypeId], TypeDisplayUnavailable> {
+    let record = store
+        .type_payload(type_id)
+        .ok_or(TypeDisplayUnavailable::Type(type_id))?;
+    let TypeData::Union(data) = record.data() else {
+        return Err(TypeDisplayUnavailable::InvalidUnion(type_id));
+    };
+    Ok(&data.union.types)
+}
+
+fn regular_literal_type(
+    store: &CanonicalTypeMapperStore,
+    type_id: TypeId,
+) -> Result<TypeId, TypeDisplayUnavailable> {
+    let record = store
+        .type_payload(type_id)
+        .ok_or(TypeDisplayUnavailable::Type(type_id))?;
+    Ok(match record.data() {
+        TypeData::Literal(literal) if record.flags().intersects(TypeFlags::FRESHABLE) => {
+            literal.regular_type
+        }
+        _ => type_id,
+    })
+}
+
+fn ensure_acyclic_union_graph(
+    store: &CanonicalTypeMapperStore,
+    root: TypeId,
+) -> Result<(), TypeDisplayUnavailable> {
+    fn visit(
+        store: &CanonicalTypeMapperStore,
+        type_id: TypeId,
+        visiting: &mut HashSet<TypeId>,
+        visited: &mut HashSet<TypeId>,
+    ) -> Result<(), TypeDisplayUnavailable> {
+        if visited.contains(&type_id) {
+            return Ok(());
+        }
+        let record = store
+            .type_payload(type_id)
+            .ok_or(TypeDisplayUnavailable::Type(type_id))?;
+        let TypeData::Union(data) = record.data() else {
+            return Ok(());
+        };
+        if !visiting.insert(type_id) {
+            return Err(TypeDisplayUnavailable::CyclicType(type_id));
+        }
+        for constituent in &data.union.types {
+            visit(store, *constituent, visiting, visited)?;
+        }
+        if let Some(origin) = data.origin {
+            visit(store, origin, visiting, visited)?;
+        }
+        visiting.remove(&type_id);
+        visited.insert(type_id);
+        Ok(())
+    }
+
+    visit(store, root, &mut HashSet::new(), &mut HashSet::new())
+}
+
+fn validate_display_union(
+    store: &CanonicalTypeMapperStore,
+    union: TypeId,
+) -> Result<(), TypeDisplayUnavailable> {
+    store
+        .validate_union_constituent(union)
+        .map_err(|error| union_display_unavailable(union, error))
+}
+
+const fn union_display_unavailable(
+    union: TypeId,
+    error: LiteralTypeCacheError,
+) -> TypeDisplayUnavailable {
+    match error {
+        LiteralTypeCacheError::BootstrapUninitialized => TypeDisplayUnavailable::MissingBootstrap,
+        LiteralTypeCacheError::InvalidCachedLiteral(type_id) => {
+            TypeDisplayUnavailable::InvalidLiteralLinks(type_id)
+        }
+        LiteralTypeCacheError::UnsupportedUnionConstituent(constituent) => {
+            TypeDisplayUnavailable::UnsupportedUnionConstituent { union, constituent }
+        }
+        LiteralTypeCacheError::InvalidValue
+        | LiteralTypeCacheError::InvalidCachedUnion(_)
+        | LiteralTypeCacheError::InvalidUnionAlias(_)
+        | LiteralTypeCacheError::InvalidPreparedQuery
+        | LiteralTypeCacheError::Capacity => TypeDisplayUnavailable::InvalidUnion(union),
+    }
 }
 
 fn require_data_kind(
@@ -593,7 +928,8 @@ mod tests {
     use super::*;
     use crate::semantic::{
         CanonicalCheckerContext, CanonicalCheckerOptions, IntrinsicBootstrapOptions,
-        type_records::{LiteralValue, RegularLiteralLink},
+        type_records::{ConstituentMapState, LiteralValue, RegularLiteralLink},
+        types::ObjectFlags,
     };
 
     fn bootstrapped_store() -> CanonicalTypeMapperStore {
@@ -602,6 +938,35 @@ mod tests {
             .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
             .unwrap();
         store
+    }
+
+    fn strict_bootstrapped_store() -> CanonicalTypeMapperStore {
+        let mut store = CanonicalTypeMapperStore::default();
+        store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                exact_optional_property_types: false,
+            })
+            .unwrap();
+        store
+    }
+
+    fn canonical_union(store: &mut CanonicalTypeMapperStore, types: &[TypeId]) -> TypeId {
+        store.literal_union_type(types, None).unwrap()
+    }
+
+    fn named_canonical_union(
+        store: &mut CanonicalTypeMapperStore,
+        name: &str,
+        types: &[TypeId],
+    ) -> TypeId {
+        let symbol = store
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::TYPE_ALIAS,
+                EscapedName::source(name),
+            ))
+            .unwrap();
+        store.literal_union_type(types, Some(symbol)).unwrap()
     }
 
     fn fresh_literal(store: &CanonicalTypeMapperStore, regular: TypeId) -> TypeId {
@@ -720,20 +1085,25 @@ mod tests {
     #[test]
     fn preserves_pinned_alias_branch_order() {
         let mut store = bootstrapped_store();
-        let (any_type, boolean_type, string_type) = store
+        let (any_type, string_type, regular_false_type, regular_true_type) = store
             .intrinsic_bootstrap()
             .map(|bootstrap| {
                 (
                     bootstrap.any_type,
-                    bootstrap.boolean_type,
                     bootstrap.string_type,
+                    bootstrap.regular_false_type,
+                    bootstrap.regular_true_type,
                 )
             })
             .unwrap();
         let literal_type = store.regular_string_literal_type("value".into()).unwrap();
 
         let any_alias = attach_type_alias(&mut store, any_type, "AnyAlias");
-        let boolean_alias = attach_type_alias(&mut store, boolean_type, "BooleanAlias");
+        let boolean_alias = named_canonical_union(
+            &mut store,
+            "BooleanAlias",
+            &[regular_false_type, regular_true_type],
+        );
         attach_type_alias(&mut store, string_type, "StringAlias");
         attach_type_alias(&mut store, literal_type, "LiteralAlias");
 
@@ -745,11 +1115,8 @@ mod tests {
             })
         );
         assert_eq!(
-            type_to_string(&store, boolean_type),
-            Err(TypeDisplayUnavailable::Alias {
-                type_id: boolean_type,
-                alias: boolean_alias,
-            })
+            type_to_string(&store, boolean_alias).unwrap(),
+            "BooleanAlias"
         );
         assert_eq!(type_to_string(&store, string_type).unwrap(), "string");
         assert_eq!(type_to_string(&store, literal_type).unwrap(), "\"value\"");
@@ -784,6 +1151,235 @@ mod tests {
             assert_eq!(type_to_string(&store, regular).unwrap(), expected);
             assert_eq!(type_to_string(&store, fresh).unwrap(), expected);
         }
+    }
+
+    #[test]
+    fn displays_canonical_primitive_literal_and_nullable_unions_in_pinned_order() {
+        let mut store = strict_bootstrapped_store();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let (undefined, null, string, number) = (
+            bootstrap.undefined_type,
+            bootstrap.null_type,
+            bootstrap.string_type,
+            bootstrap.number_type,
+        );
+        let primitive = canonical_union(&mut store, &[number, string]);
+        assert_eq!(
+            type_to_string(&store, primitive).unwrap(),
+            "string | number"
+        );
+
+        let text = store.regular_string_literal_type("x".into()).unwrap();
+        let one = store.regular_number_literal_type(Number::new(1.0)).unwrap();
+        let two = store
+            .regular_bigint_literal_type(PseudoBigInt::parse_valid("2n"))
+            .unwrap();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let (regular_false, regular_true) =
+            (bootstrap.regular_false_type, bootstrap.regular_true_type);
+        let literal_nullable = canonical_union(
+            &mut store,
+            &[regular_true, null, two, text, undefined, regular_false, one],
+        );
+        assert_eq!(
+            type_to_string(&store, literal_nullable).unwrap(),
+            "\"x\" | 1 | 2n | boolean | null | undefined"
+        );
+    }
+
+    #[test]
+    fn preserves_named_union_aliases_and_denormalized_cache_origins_without_writes() {
+        let mut store = bootstrapped_store();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let (string, number, bigint) = (
+            bootstrap.string_type,
+            bootstrap.number_type,
+            bootstrap.bigint_type,
+        );
+        let anonymous = canonical_union(&mut store, &[number, string]);
+        let scalar = named_canonical_union(&mut store, "Scalar", &[number, string]);
+        let outer = canonical_union(&mut store, &[scalar, bigint]);
+        let repeated = canonical_union(&mut store, &[bigint, scalar]);
+
+        assert_ne!(anonymous, scalar);
+        assert_eq!(outer, repeated);
+        assert!(matches!(
+            store.type_payload(outer).unwrap().data(),
+            TypeData::Union(data) if data.origin.is_some()
+        ));
+
+        let before = (
+            store.type_len(),
+            store.symbol_len(),
+            store.type_alias_len(),
+            store.mapper_len(),
+            store.union_cache_validation_scan_count(),
+            store.relation_state_snapshot(),
+        );
+        assert_eq!(
+            type_to_string(&store, anonymous).unwrap(),
+            "string | number"
+        );
+        assert_eq!(type_to_string(&store, scalar).unwrap(), "Scalar");
+        assert_eq!(
+            type_to_string_with_flags(&store, scalar, CanonicalTypeFormatFlags::NONE).unwrap(),
+            "Scalar"
+        );
+        assert_eq!(type_to_string(&store, outer).unwrap(), "bigint | Scalar");
+        assert_eq!(
+            (
+                store.type_len(),
+                store.symbol_len(),
+                store.type_alias_len(),
+                store.mapper_len(),
+                store.union_cache_validation_scan_count(),
+                store.relation_state_snapshot(),
+            ),
+            before
+        );
+    }
+
+    #[test]
+    fn canonical_union_display_flows_through_assignability_diagnostics() {
+        let mut store = bootstrapped_store();
+        let bootstrap = store.intrinsic_bootstrap().unwrap();
+        let (number, bigint) = (bootstrap.number_type, bootstrap.bigint_type);
+        let source = store
+            .regular_string_literal_type("not numeric".into())
+            .unwrap();
+        let anonymous = canonical_union(&mut store, &[bigint, number]);
+        let named = named_canonical_union(&mut store, "Numeric", &[bigint, number]);
+
+        assert_eq!(
+            get_type_names_for_assignability_error(&store, source, anonymous).unwrap(),
+            AssignabilityErrorDisplay {
+                source: "string".into(),
+                target: "number | bigint".into(),
+            }
+        );
+        assert_eq!(
+            get_type_names_for_assignability_error(&store, source, named).unwrap(),
+            AssignabilityErrorDisplay {
+                source: "string".into(),
+                target: "Numeric".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn long_canonical_union_uses_pinned_elision_and_no_truncation() {
+        let mut store = bootstrapped_store();
+        let values: Vec<_> = (0..40).map(|index| format!("v{index:03}")).collect();
+        let literals: Vec<_> = values
+            .iter()
+            .map(|value| store.regular_string_literal_type(value.clone()).unwrap())
+            .collect();
+        let union = canonical_union(&mut store, &literals);
+        let never = store.intrinsic_bootstrap().unwrap().never_type;
+
+        let full_parts: Vec<_> = values.iter().map(|value| format!("\"{value}\"")).collect();
+        let full = full_parts.join(" | ");
+        let mut truncated_parts = full_parts[..21].to_vec();
+        truncated_parts.push("... 18 more ...".into());
+        truncated_parts.push(full_parts.last().unwrap().clone());
+        let truncated = truncated_parts.join(" | ");
+
+        assert_eq!(type_to_string(&store, union).unwrap(), truncated);
+        let no_truncation = CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT
+            | CanonicalTypeFormatFlags::NO_TRUNCATION;
+        assert_eq!(
+            type_to_string_with_flags(&store, union, no_truncation).unwrap(),
+            full
+        );
+        assert_eq!(
+            get_type_names_for_assignability_error(&store, never, union).unwrap(),
+            AssignabilityErrorDisplay {
+                source: "never".into(),
+                target: truncated,
+            }
+        );
+        assert_eq!(
+            get_type_names_for_assignability_error_with_flags(
+                &store,
+                never,
+                union,
+                CanonicalTypeFormatFlags::NO_TRUNCATION,
+            )
+            .unwrap(),
+            AssignabilityErrorDisplay {
+                source: "never".into(),
+                target: full,
+            }
+        );
+    }
+
+    #[test]
+    fn malformed_and_cyclic_unions_fail_typed_without_formatter_writes() {
+        let mut invalid_store = bootstrapped_store();
+        let bootstrap = invalid_store.intrinsic_bootstrap().unwrap();
+        let (string, number) = (bootstrap.string_type, bootstrap.number_type);
+        let invalid = invalid_store
+            .alloc_union_type(ObjectFlags::PRIMITIVE_UNION, vec![string, number])
+            .unwrap();
+        let invalid_before = (
+            invalid_store.type_len(),
+            invalid_store.symbol_len(),
+            invalid_store.type_alias_len(),
+            invalid_store.mapper_len(),
+            invalid_store.union_cache_validation_scan_count(),
+            invalid_store.relation_state_snapshot(),
+        );
+        assert_eq!(
+            type_to_string(&invalid_store, invalid),
+            Err(TypeDisplayUnavailable::InvalidUnion(invalid))
+        );
+        assert_eq!(
+            (
+                invalid_store.type_len(),
+                invalid_store.symbol_len(),
+                invalid_store.type_alias_len(),
+                invalid_store.mapper_len(),
+                invalid_store.union_cache_validation_scan_count(),
+                invalid_store.relation_state_snapshot(),
+            ),
+            invalid_before
+        );
+
+        let mut cyclic_store = bootstrapped_store();
+        let bootstrap = cyclic_store.intrinsic_bootstrap().unwrap();
+        let (string, number) = (bootstrap.string_type, bootstrap.number_type);
+        let cyclic = canonical_union(&mut cyclic_store, &[string, number]);
+        assert!(cyclic_store.set_union_caches(
+            cyclic,
+            None,
+            None,
+            Some(cyclic),
+            EscapedName::default(),
+            ConstituentMapState::Unallocated,
+        ));
+        let cyclic_before = (
+            cyclic_store.type_len(),
+            cyclic_store.symbol_len(),
+            cyclic_store.type_alias_len(),
+            cyclic_store.mapper_len(),
+            cyclic_store.union_cache_validation_scan_count(),
+            cyclic_store.relation_state_snapshot(),
+        );
+        assert_eq!(
+            type_to_string(&cyclic_store, cyclic),
+            Err(TypeDisplayUnavailable::CyclicType(cyclic))
+        );
+        assert_eq!(
+            (
+                cyclic_store.type_len(),
+                cyclic_store.symbol_len(),
+                cyclic_store.type_alias_len(),
+                cyclic_store.mapper_len(),
+                cyclic_store.union_cache_validation_scan_count(),
+                cyclic_store.relation_state_snapshot(),
+            ),
+            cyclic_before
+        );
     }
 
     #[test]
@@ -1029,7 +1625,7 @@ mod tests {
     }
 
     #[test]
-    fn unique_symbol_is_flag_gated_and_general_unions_are_unavailable() {
+    fn unique_symbol_is_flag_gated_and_noncanonical_unions_are_rejected() {
         let mut store = bootstrapped_store();
         let symbol = store
             .alloc_symbol(SymbolData::new(
@@ -1060,10 +1656,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             type_to_string(&store, union),
-            Err(TypeDisplayUnavailable::UnsupportedType {
-                type_id: union,
-                kind: TypeDataKind::Union,
-            })
+            Err(TypeDisplayUnavailable::InvalidUnion(union))
         );
     }
 
