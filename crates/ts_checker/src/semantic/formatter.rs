@@ -1968,6 +1968,9 @@ const fn union_display_unavailable(
         LiteralTypeCacheError::UnsupportedUnionConstituent(constituent) => {
             TypeDisplayUnavailable::UnsupportedUnionConstituent { union, constituent }
         }
+        LiteralTypeCacheError::ArrayType { error, .. } => {
+            TypeDisplayUnavailable::ArrayType(error)
+        }
         LiteralTypeCacheError::InvalidValue
         | LiteralTypeCacheError::InvalidCachedUnion(_)
         | LiteralTypeCacheError::InvalidUnionAlias(_)

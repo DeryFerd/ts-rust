@@ -119,6 +119,7 @@ pub enum TypeNodeUnavailable {
     UnsupportedUnionConstituent(NodeRef),
     UnsupportedUnionConstituentType(TypeId),
     InvalidCachedUnionType(TypeId),
+    InvalidCachedArrayType(TypeId),
     InvalidUnionAlias(SemanticSymbolId),
     InvalidPreparedTypeQuery,
     LiteralTypeCapacity,
@@ -284,6 +285,9 @@ fn type_construction_error(error: LiteralTypeCacheError) -> DeclaredTypeError {
         }
         LiteralTypeCacheError::UnsupportedUnionConstituent(type_) => {
             type_node_unavailable(TypeNodeUnavailable::UnsupportedUnionConstituentType(type_))
+        }
+        LiteralTypeCacheError::ArrayType { type_, .. } => {
+            type_node_unavailable(TypeNodeUnavailable::InvalidCachedArrayType(type_))
         }
         LiteralTypeCacheError::InvalidUnionAlias(symbol) => {
             type_node_unavailable(TypeNodeUnavailable::InvalidUnionAlias(symbol))
@@ -1181,8 +1185,7 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
                 Some(TypeData::Intrinsic(_) | TypeData::Literal(_) | TypeData::Union(_))
             )
         {
-            self.store
-                .validate_cached_union_result(declared_type, None)
+            self.validate_cached_union_result(declared_type, None)
                 .map_err(type_construction_error)?;
         }
 
@@ -1244,8 +1247,7 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
                         ));
                     }
                     if remains_union {
-                        self.store
-                            .validate_cached_union_result(declared_type, Some(symbol))
+                        self.validate_cached_union_result(declared_type, Some(symbol))
                             .map_err(type_construction_error)?;
                     }
                     return Ok(());

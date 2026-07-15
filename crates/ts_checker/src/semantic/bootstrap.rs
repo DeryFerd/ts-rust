@@ -35,6 +35,7 @@ use ts_jsnum::{Number, PseudoBigInt};
 
 use super::{
     CanonicalGlobalTypes,
+    array_types::ArrayTypeError,
     ids::{IndexInfoId, SignatureId, TypeAliasId, TypeId, TypePredicateId},
     links::ValueSymbolLinks,
     mapper::TypeMapper,
@@ -221,9 +222,53 @@ pub(super) enum LiteralTypeCacheError {
     InvalidCachedLiteral(TypeId),
     InvalidCachedUnion(TypeId),
     UnsupportedUnionConstituent(TypeId),
+    ArrayType {
+        type_: TypeId,
+        error: ArrayTypeError,
+    },
     InvalidUnionAlias(SemanticSymbolId),
     InvalidPreparedQuery,
     Capacity,
+}
+
+impl std::fmt::Display for LiteralTypeCacheError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BootstrapUninitialized => {
+                formatter.write_str("literal type cache requires intrinsic bootstrap")
+            }
+            Self::InvalidValue => {
+                formatter.write_str("literal type cache received an invalid value")
+            }
+            Self::InvalidCachedLiteral(type_id) => {
+                write!(formatter, "literal type {type_id:?} has invalid cache links")
+            }
+            Self::InvalidCachedUnion(type_id) => {
+                write!(formatter, "union type {type_id:?} has an invalid cache entry")
+            }
+            Self::UnsupportedUnionConstituent(type_id) => write!(
+                formatter,
+                "type {type_id:?} is outside the installed union constituent domain"
+            ),
+            Self::ArrayType { error, .. } => error.fmt(formatter),
+            Self::InvalidUnionAlias(symbol) => {
+                write!(formatter, "union alias {symbol:?} is invalid")
+            }
+            Self::InvalidPreparedQuery => {
+                formatter.write_str("literal type cache received an invalid prepared query")
+            }
+            Self::Capacity => formatter.write_str("literal type cache capacity was exhausted"),
+        }
+    }
+}
+
+impl std::error::Error for LiteralTypeCacheError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ArrayType { error, .. } => Some(error),
+            _ => None,
+        }
+    }
 }
 
 /// Pinned `UnionReduction` modes supported by canonical union construction.
@@ -1584,14 +1629,17 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             UnionArrayValidation::None => None,
             UnionArrayValidation::GlobalTypes(global_types) => self
                 .canonical_array_reference(global_types, type_)
-                .map_err(|_| LiteralTypeCacheError::UnsupportedUnionConstituent(type_))?,
+                .map_err(|error| LiteralTypeCacheError::ArrayType { type_, error })?,
             UnionArrayValidation::Targets(targets) => self
                 .canonical_array_reference_with_targets(targets, type_)
-                .map_err(|_| LiteralTypeCacheError::UnsupportedUnionConstituent(type_))?,
+                .map_err(|error| LiteralTypeCacheError::ArrayType { type_, error })?,
         }
         .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(type_))?;
         if !visiting.insert(type_) {
-            return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_));
+            return Err(LiteralTypeCacheError::ArrayType {
+                type_,
+                error: ArrayTypeError::InvalidReference(type_),
+            });
         }
         // The element remains inside the installed union domain. In
         // particular, declared interface elements such as `Foo[] | null`

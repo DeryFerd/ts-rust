@@ -575,14 +575,29 @@ mod tests {
             .unwrap();
         assert!(store.set_object_target_and_mapper(forged, outer_target, None));
         assert!(store.set_type_reference_resolution(forged, None, outer_arguments));
-        assert_eq!(
-            store.expression_union_type_with_global_types(
+        let forged_error = store
+            .expression_union_type_with_global_types(
                 &global_types,
                 &[forged, string],
                 UnionReduction::None,
-            ),
-            Err(LiteralTypeCacheError::UnsupportedUnionConstituent(forged)),
+            )
+            .unwrap_err();
+        let expected_forged_error = ArrayTypeError::InvalidArrayLiteralCache {
+            base: outer_base,
+            cached: forged,
+        };
+        assert_eq!(
+            forged_error,
+            LiteralTypeCacheError::ArrayType {
+                type_: forged,
+                error: expected_forged_error,
+            },
             "an exact-shape clone without derived-cache ownership is rejected",
+        );
+        assert_eq!(
+            std::error::Error::source(&forged_error)
+                .and_then(|error| error.downcast_ref::<ArrayTypeError>()),
+            Some(&expected_forged_error),
         );
 
         store
@@ -600,9 +615,13 @@ mod tests {
                 &[outer_literal, string],
                 UnionReduction::None,
             ),
-            Err(LiteralTypeCacheError::UnsupportedUnionConstituent(
-                inner_literal
-            )),
+            Err(LiteralTypeCacheError::ArrayType {
+                type_: inner_literal,
+                error: ArrayTypeError::InvalidArrayLiteralCache {
+                    base: inner_base,
+                    cached: inner_literal,
+                },
+            }),
         );
         assert_eq!(
             (

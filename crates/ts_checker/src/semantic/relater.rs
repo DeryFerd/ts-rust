@@ -18,7 +18,7 @@ use ts_binder::{
 
 use super::{
     CanonicalGlobalTypeInitializationError, CanonicalGlobalTypes, DeclaredTypeHost,
-    array_types::CanonicalArrayTargets,
+    array_types::{ArrayTypeError, CanonicalArrayTargets},
     bootstrap::LiteralTypeCacheError,
     declared::type_list_key,
     derived_types::DerivedObjectLiteralValidation,
@@ -3402,6 +3402,14 @@ pub(super) const fn union_validation_unavailable(
         LiteralTypeCacheError::UnsupportedUnionConstituent(type_id) => {
             RelationUnavailable::UnsupportedUnionConstituent(type_id)
         }
+        LiteralTypeCacheError::ArrayType { error, .. } => match error {
+            ArrayTypeError::GlobalType(error) => RelationUnavailable::CanonicalGlobalType(error),
+            ArrayTypeError::InvalidReference(type_id)
+            | ArrayTypeError::InvalidArrayLiteralCache {
+                cached: type_id, ..
+            } => RelationUnavailable::MalformedCanonicalArrayReference(type_id),
+            ArrayTypeError::Capacity(_) => RelationUnavailable::UnionValidationCapacity(union),
+        },
         LiteralTypeCacheError::InvalidUnionAlias(symbol) => {
             RelationUnavailable::InvalidUnionAlias(symbol)
         }

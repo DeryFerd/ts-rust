@@ -136,6 +136,7 @@ pub enum SourceLiteralCacheError {
     InvalidCachedLiteral(TypeId),
     InvalidCachedUnion(TypeId),
     UnsupportedUnionConstituent(TypeId),
+    ArrayType(ArrayTypeError),
     InvalidUnionAlias(SemanticSymbolId),
     InvalidPreparedQuery,
     Capacity,
@@ -179,6 +180,7 @@ impl From<LiteralTypeCacheError> for SourceLiteralCacheError {
             LiteralTypeCacheError::UnsupportedUnionConstituent(type_id) => {
                 Self::UnsupportedUnionConstituent(type_id)
             }
+            LiteralTypeCacheError::ArrayType { error, .. } => Self::ArrayType(error),
             LiteralTypeCacheError::InvalidUnionAlias(symbol) => Self::InvalidUnionAlias(symbol),
             LiteralTypeCacheError::InvalidPreparedQuery => Self::InvalidPreparedQuery,
             LiteralTypeCacheError::Capacity => Self::Capacity,
@@ -232,8 +234,9 @@ impl std::error::Error for SourceCheckError {
             Self::DeclaredType(error) => Some(error),
             Self::RelationUnavailable(error) => Some(error),
             Self::TypeDisplayUnavailable(error) => Some(error),
+            Self::LiteralCache(SourceLiteralCacheError::ArrayType(error))
+            | Self::ArrayType(error) => Some(error),
             Self::DerivedType(error) => Some(error),
-            Self::ArrayType(error) => Some(error),
             Self::Provenance(_)
             | Self::Unsupported(_)
             | Self::LiteralCache(_)
@@ -3577,6 +3580,71 @@ mod tests {
         let warm = observable_state(&context, file);
         assert_eq!(context.get_type_from_type_node(body), Ok(union));
         assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn cached_array_aliases_remain_global_aware_union_constituents_in_every_query_order() {
+        let library = parsed("interface Array<T> {}");
+        let source = parsed(
+            "type ArrayAlias = number[];\
+             type Outer = ArrayAlias | string;\
+             type ArrayUnion = number[] | string;\
+             type NestedUnion = ArrayUnion | boolean;",
+        );
+        let library_file = FileId::new(141);
+        let file = FileId::new(142);
+
+        let mut cold = context(
+            &[(library_file, &library), (file, &source)],
+            CanonicalCheckerOptions::default(),
+        );
+        let outer_body = type_alias_body(&source, file, "Outer");
+        let outer = cold.get_type_from_type_node(outer_body).unwrap();
+        assert_eq!(cold.type_to_string(outer).unwrap(), "Outer");
+        let cold_warm = observable_state(&cold, file);
+        assert_eq!(cold.get_type_from_type_node(outer_body), Ok(outer));
+        assert_eq!(observable_state(&cold, file), cold_warm);
+
+        let mut ordered = context(
+            &[(library_file, &library), (file, &source)],
+            CanonicalCheckerOptions::default(),
+        );
+        let array_alias_body = type_alias_body(&source, file, "ArrayAlias");
+        let array_alias = ordered
+            .get_type_from_type_node(array_alias_body)
+            .unwrap();
+        assert_eq!(ordered.type_to_string(array_alias).unwrap(), "number[]");
+        let ordered_outer = ordered.get_type_from_type_node(outer_body).unwrap();
+        assert_eq!(ordered.type_to_string(ordered_outer).unwrap(), "Outer");
+
+        let array_union_body = type_alias_body(&source, file, "ArrayUnion");
+        let nested_union_body = type_alias_body(&source, file, "NestedUnion");
+        let array_union = ordered
+            .get_type_from_type_node(array_union_body)
+            .unwrap();
+        assert_eq!(ordered.type_to_string(array_union).unwrap(), "ArrayUnion");
+        let nested_union = ordered
+            .get_type_from_type_node(nested_union_body)
+            .unwrap();
+        assert_eq!(
+            ordered.type_to_string(nested_union).unwrap(),
+            "NestedUnion",
+        );
+
+        let ordered_warm = observable_state(&ordered, file);
+        assert_eq!(
+            ordered.get_type_from_type_node(outer_body),
+            Ok(ordered_outer),
+        );
+        assert_eq!(
+            ordered.get_type_from_type_node(array_union_body),
+            Ok(array_union),
+        );
+        assert_eq!(
+            ordered.get_type_from_type_node(nested_union_body),
+            Ok(nested_union),
+        );
+        assert_eq!(observable_state(&ordered, file), ordered_warm);
     }
 
     #[test]
