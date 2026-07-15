@@ -361,6 +361,7 @@ struct Parser<'a> {
     amd_module_names: Vec<AmdModuleName>,
     disallow_in: bool,
     await_context: bool,
+    yield_context: bool,
     await_identifier_context: bool,
     next_function_is_async: bool,
     type_parse_context: TypeParseContext,
@@ -398,6 +399,7 @@ impl<'a> Parser<'a> {
             amd_module_names,
             disallow_in: false,
             await_context: false,
+            yield_context: false,
             await_identifier_context: false,
             next_function_is_async: false,
             type_parse_context: TypeParseContext::Normal,
@@ -1308,6 +1310,7 @@ impl<'a> Parser<'a> {
         let is_async = self.next_function_is_async;
         self.next_function_is_async = false;
         let previous_await_context = self.await_context;
+        let previous_yield_context = self.yield_context;
         self.await_context = is_async;
         let start = self.consume().range.start;
         let asterisk_token = if self.current.kind == SyntaxKind::AsteriskToken {
@@ -1315,6 +1318,7 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
+        self.yield_context = asterisk_token.is_some();
         let name = if self.current.kind == SyntaxKind::Identifier || self.current.kind.is_keyword()
         {
             Some(self.parse_identifier_name("Expected a function name."))
@@ -1363,6 +1367,7 @@ impl<'a> Parser<'a> {
         children.extend(return_type);
         children.extend(body);
         self.await_context = previous_await_context;
+        self.yield_context = previous_yield_context;
         self.alloc_node(
             SyntaxKind::FunctionDeclaration,
             TextRange::new(start, end),
@@ -2205,7 +2210,7 @@ impl<'a> Parser<'a> {
             // class body and following declarations during parser recovery.
             self.parse_identifier_name("Expected a heritage name.")
         } else {
-            self.parse_entity_name()
+            self.parse_entity_name(true)
         };
         while self.current.kind == SyntaxKind::QuestionDotToken {
             let question_dot_token = self.consume_token_node();
@@ -2498,6 +2503,11 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
+        let is_async_method = modifier_nodes.iter().any(|modifier| {
+            self.arena
+                .get(*modifier)
+                .is_some_and(|modifier| modifier.kind == SyntaxKind::AsyncKeyword)
+        });
         let name = self.parse_property_name("Expected a member name.");
         let postfix_token = if matches!(
             self.current.kind,
@@ -2509,6 +2519,10 @@ impl<'a> Parser<'a> {
         };
         let type_parameters = self.parse_type_parameters();
         if type_parameters.is_some() || self.current.kind == SyntaxKind::OpenParenToken {
+            let previous_await_context = self.await_context;
+            let previous_yield_context = self.yield_context;
+            self.await_context = is_async_method;
+            self.yield_context = asterisk_token.is_some();
             let parameters = self.parse_parameter_list();
             let return_type = self.parse_optional_type_annotation();
             let body = if !signature_only && self.current.kind == SyntaxKind::OpenBraceToken {
@@ -2561,6 +2575,8 @@ impl<'a> Parser<'a> {
             children.extend(parameters.nodes.iter().copied());
             children.extend(return_type);
             children.extend(body);
+            self.await_context = previous_await_context;
+            self.yield_context = previous_yield_context;
             self.alloc_node(
                 SyntaxKind::MethodDeclaration,
                 TextRange::new(start, end),
@@ -2666,8 +2682,10 @@ impl<'a> Parser<'a> {
         // quoted spelling accepted by TypeScript's parser.
         self.bump();
         let previous_await_context = self.await_context;
+        let previous_yield_context = self.yield_context;
         let previous_await_identifier_context = self.await_identifier_context;
         self.await_context = false;
+        self.yield_context = false;
         self.await_identifier_context = false;
         let type_parameters = self.parse_type_parameters();
         let parameters = self.parse_parameter_list();
@@ -2714,6 +2732,7 @@ impl<'a> Parser<'a> {
         children.extend(return_type);
         children.extend(body);
         self.await_context = previous_await_context;
+        self.yield_context = previous_yield_context;
         self.await_identifier_context = previous_await_identifier_context;
         self.alloc_node(
             SyntaxKind::Constructor,
@@ -2789,6 +2808,10 @@ impl<'a> Parser<'a> {
         modifier_nodes: Vec<NodeId>,
         body_required: bool,
     ) -> NodeId {
+        let previous_await_context = self.await_context;
+        let previous_yield_context = self.yield_context;
+        self.await_context = false;
+        self.yield_context = false;
         let kind = self.consume().kind;
         let name = self.parse_property_name("Expected an accessor name.");
         let parameters = self.parse_parameter_list();
@@ -2850,6 +2873,8 @@ impl<'a> Parser<'a> {
                 name,
             }))
         };
+        self.await_context = previous_await_context;
+        self.yield_context = previous_yield_context;
         self.alloc_node(
             if kind == SyntaxKind::GetKeyword {
                 SyntaxKind::GetAccessor
@@ -2871,9 +2896,15 @@ impl<'a> Parser<'a> {
 
     fn parse_class_static_block(&mut self, start: TextPos) -> NodeId {
         let static_modifier = self.consume_token_node();
+        let previous_await_context = self.await_context;
+        let previous_yield_context = self.yield_context;
         let previous_await_identifier_context = self.await_identifier_context;
+        self.await_context = true;
+        self.yield_context = false;
         self.await_identifier_context = true;
         let body = self.parse_block();
+        self.await_context = previous_await_context;
+        self.yield_context = previous_yield_context;
         self.await_identifier_context = previous_await_identifier_context;
         self.alloc_node(
             SyntaxKind::ClassStaticBlockDeclaration,
@@ -4206,7 +4237,7 @@ impl<'a> Parser<'a> {
             if phase_modifier.is_some() {
                 self.bump();
             }
-            let name = if self.import_token_is_identifier(self.current.kind) {
+            let name = if self.token_is_identifier_in_current_context(self.current.kind) {
                 Some(self.parse_identifier_name("Expected an import binding."))
             } else {
                 None
@@ -4271,10 +4302,10 @@ impl<'a> Parser<'a> {
         if import_clause.is_some() {
             self.expect_and_bump(SyntaxKind::FromKeyword, "Expected 'from'.");
         }
-        let module_specifier = self.parse_import_module_specifier(import_clause.is_none());
+        let module_specifier = self.parse_import_module_specifier();
         children.extend(import_clause);
         children.push(module_specifier);
-        let attributes = self.parse_import_attributes();
+        let attributes = self.parse_import_attributes(true);
         children.extend(attributes);
         let fallback = attributes.map_or_else(
             || self.node_end(module_specifier),
@@ -4300,13 +4331,13 @@ impl<'a> Parser<'a> {
     fn import_phase_modifier(&mut self) -> Option<SyntaxKind> {
         // `type` and `defer` are contextual: keep them as binding names at the
         // exact comma, equals, and `from "module"` ambiguity boundaries.
-        if !self.import_token_is_identifier(self.current.kind) {
+        if !self.token_is_identifier_in_current_context(self.current.kind) {
             return None;
         }
         let spelling = token_value(&self.current);
         let next = self.next_token_kind();
         if spelling == "type" {
-            let next_is_identifier = self.import_token_is_identifier(next);
+            let next_is_identifier = self.token_is_identifier_in_current_context(next);
             let from_starts_phase_binding = if next == SyntaxKind::FromKeyword {
                 next_is_identifier
                     && (self.next_tokens_are(
@@ -4339,89 +4370,120 @@ impl<'a> Parser<'a> {
         None
     }
 
-    fn import_token_is_identifier(&self, kind: SyntaxKind) -> bool {
+    fn token_is_identifier_in_current_context(&self, kind: SyntaxKind) -> bool {
         // The pinned parser ignores strict-mode reserved words here and leaves
         // their grammar diagnostics to the checker.
         kind == SyntaxKind::Identifier
             || ((kind as u16) > (SyntaxKind::LAST_RESERVED_WORD as u16)
                 && (kind as u16) <= (SyntaxKind::LAST_KEYWORD as u16)
-                && !(kind == SyntaxKind::AwaitKeyword && self.await_context))
+                && !(kind == SyntaxKind::AwaitKeyword && self.await_context)
+                && !(kind == SyntaxKind::YieldKeyword && self.yield_context))
     }
 
-    fn parse_import_module_specifier(&mut self, import_clause_is_missing: bool) -> NodeId {
+    fn parse_import_module_specifier(&mut self) -> NodeId {
         if self.current.kind == SyntaxKind::StringLiteral {
             return self.parse_string_literal();
         }
-        self.error_current("Expected a module specifier.");
-        if import_clause_is_missing && self.current.kind == SyntaxKind::CommaToken {
-            self.missing_identifier(self.current.range.start)
-        } else {
-            self.parse_binary_expression(0)
-        }
+        // The grammar checker owns the string-literal restriction. Keeping the
+        // complete expression here is important for parser recovery and mirrors
+        // parseModuleSpecifier in the pinned parser.
+        self.parse_binary_expression(0)
     }
 
-    fn parse_import_attributes(&mut self) -> Option<NodeId> {
-        if !matches!(
-            self.current.kind,
-            SyntaxKind::WithKeyword | SyntaxKind::AssertKeyword
-        ) {
-            return None;
-        }
-        let keyword = self.consume();
-        self.expect_and_bump(SyntaxKind::OpenBraceToken, "Expected '{'.");
-        let list_start = self.current.range.start;
-        let mut attributes = Vec::new();
-        while !matches!(
-            self.current.kind,
-            SyntaxKind::CloseBraceToken | SyntaxKind::EndOfFile
-        ) {
-            let start = self.current.range.start;
-            let name = self.parse_property_name("Expected an import attribute name.");
-            self.expect_and_bump(SyntaxKind::ColonToken, "Expected ':'.");
-            let value = if self.current.kind == SyntaxKind::StringLiteral {
-                self.parse_string_literal()
-            } else {
-                let value = self.parse_binary_expression(2);
-                let range = self
-                    .arena
-                    .get(value)
-                    .map_or(TextRange::new(start, start), |node| node.range);
-                self.error_code_at(range, 2858, []);
-                value
-            };
-            attributes.push(self.alloc_node(
-                SyntaxKind::ImportAttribute,
-                TextRange::new(start, self.node_end(value)),
-                NodeData::ImportAttribute(Box::new(ImportAttributeData {
-                    value,
-                    facts: 0,
-                    name,
-                })),
-                &[name, value],
-            ));
-            if self.current.kind != SyntaxKind::CommaToken {
-                break;
+    fn parse_import_attributes(
+        &mut self,
+        allow_with_preceding_line_break: bool,
+    ) -> Option<NodeId> {
+        let has_preceding_line_break = self
+            .current
+            .flags
+            .contains(ScannerTokenFlags::PRECEDING_LINE_BREAK);
+        match self.current.kind {
+            SyntaxKind::WithKeyword
+                if allow_with_preceding_line_break || !has_preceding_line_break => {}
+            SyntaxKind::AssertKeyword if !has_preceding_line_break => {
+                self.error_code_at(self.current.range, 2880, []);
             }
-            self.bump();
+            _ => return None,
         }
-        let end = if self.current.kind == SyntaxKind::CloseBraceToken {
-            self.consume().range.end
+
+        let keyword = self.consume();
+        let mut attributes = Vec::new();
+        let mut has_trailing_comma = false;
+        let mut multi_line = false;
+        let list_start;
+        let list_end;
+        let end;
+
+        if self.current.kind == SyntaxKind::OpenBraceToken {
+            self.bump();
+            list_start = self.current.range.start;
+            multi_line = self
+                .current
+                .flags
+                .contains(ScannerTokenFlags::PRECEDING_LINE_BREAK);
+            loop {
+                if matches!(
+                    self.current.kind,
+                    SyntaxKind::CloseBraceToken | SyntaxKind::EndOfFile
+                ) {
+                    break;
+                }
+                if !(self.current.kind == SyntaxKind::Identifier
+                    || self.current.kind.is_keyword()
+                    || self.current.kind == SyntaxKind::StringLiteral)
+                {
+                    self.error_code_at(self.current.range, 1478, []);
+                    break;
+                }
+
+                attributes.push(self.parse_import_attribute());
+
+                if self.current.kind == SyntaxKind::CommaToken {
+                    self.bump();
+                    has_trailing_comma = self.current.kind == SyntaxKind::CloseBraceToken;
+                    continue;
+                }
+                if matches!(
+                    self.current.kind,
+                    SyntaxKind::CloseBraceToken | SyntaxKind::EndOfFile
+                ) {
+                    break;
+                }
+                self.error_current("Expected ','.");
+                if self.current.kind == SyntaxKind::SemicolonToken
+                    && !self
+                        .current
+                        .flags
+                        .contains(ScannerTokenFlags::PRECEDING_LINE_BREAK)
+                {
+                    self.bump();
+                }
+            }
+            list_end = self.current.range.start;
+            end = if self.current.kind == SyntaxKind::CloseBraceToken {
+                self.consume().range.end
+            } else {
+                self.error_current("Expected '}'.");
+                self.current.range.start
+            };
         } else {
-            self.error_current("Expected '}'.");
-            attributes
-                .last()
-                .map_or(list_start, |node| self.node_end(*node))
-        };
+            list_start = self.current.range.start;
+            list_end = list_start;
+            self.error_current("Expected '{'.");
+            end = self.current.range.start;
+        }
+
         Some(self.alloc_node(
             SyntaxKind::ImportAttributes,
             TextRange::new(keyword.range.start, end),
             NodeData::ImportAttributes(Box::new(ImportAttributesData {
                 attributes: NodeList {
-                    range: TextRange::new(list_start, end),
+                    range: TextRange::new(list_start, list_end),
                     nodes: attributes.clone(),
-                    has_trailing_comma: false,
+                    has_trailing_comma,
                 },
-                multi_line: false,
+                multi_line,
                 token: keyword.kind,
                 facts: 0,
             })),
@@ -4429,10 +4491,33 @@ impl<'a> Parser<'a> {
         ))
     }
 
+    fn parse_import_attribute(&mut self) -> NodeId {
+        let start = self.current.range.start;
+        let name = if self.current.kind == SyntaxKind::StringLiteral {
+            self.parse_string_literal()
+        } else {
+            self.parse_identifier_name("Expected an import attribute name.")
+        };
+        self.expect_and_bump(SyntaxKind::ColonToken, "Expected ':'.");
+        // Import-attribute values are parsed as assignment expressions; the
+        // grammar checker reports non-string values.
+        let value = self.parse_binary_expression(2);
+        self.alloc_node(
+            SyntaxKind::ImportAttribute,
+            TextRange::new(start, self.node_end(value)),
+            NodeData::ImportAttribute(Box::new(ImportAttributeData {
+                value,
+                facts: 0,
+                name,
+            })),
+            &[name, value],
+        )
+    }
+
     fn parse_namespace_import(&mut self) -> NodeId {
         let start = self.consume().range.start;
         self.expect_and_bump(SyntaxKind::AsKeyword, "Expected 'as'.");
-        let name = self.parse_import_binding_identifier("Expected a namespace import name.");
+        let name = self.parse_identifier_in_current_context("Expected a namespace import name.");
         self.alloc_node(
             SyntaxKind::NamespaceImport,
             TextRange::new(start, self.node_end(name)),
@@ -4452,15 +4537,12 @@ impl<'a> Parser<'a> {
         is_type_only: bool,
     ) -> NodeId {
         self.expect_and_bump(SyntaxKind::EqualsToken, "Expected '='.");
-        let module_reference = if self.current.kind == SyntaxKind::RequireKeyword {
+        let module_reference = if self.current.kind == SyntaxKind::RequireKeyword
+            && self.next_token_kind() == SyntaxKind::OpenParenToken
+        {
             let reference_start = self.consume().range.start;
             self.expect_and_bump(SyntaxKind::OpenParenToken, "Expected '('.");
-            let expression = if self.current.kind == SyntaxKind::StringLiteral {
-                self.parse_string_literal()
-            } else {
-                self.error_current("Expected a module specifier.");
-                self.missing_identifier(self.current.range.start)
-            };
+            let expression = self.parse_import_module_specifier();
             let end = if self.current.kind == SyntaxKind::CloseParenToken {
                 self.consume().range.end
             } else {
@@ -4476,7 +4558,7 @@ impl<'a> Parser<'a> {
                 &[expression],
             )
         } else {
-            self.parse_entity_name()
+            self.parse_entity_name(false)
         };
         let end = self.parse_semicolon(self.node_end(module_reference));
         self.alloc_node(
@@ -4496,11 +4578,15 @@ impl<'a> Parser<'a> {
         )
     }
 
-    fn parse_entity_name(&mut self) -> NodeId {
-        let mut entity = if self.current.kind.is_keyword() {
+    fn parse_entity_name(&mut self, allow_reserved_words: bool) -> NodeId {
+        let mut entity = if allow_reserved_words
+            || self.token_is_identifier_in_current_context(self.current.kind)
+        {
             self.parse_identifier_name("Expected a module reference.")
         } else {
-            self.parse_identifier("Expected a module reference.")
+            let position = self.current.range.start;
+            self.error_current("Expected a module reference.");
+            self.missing_identifier(position)
         };
         while self.current.kind == SyntaxKind::DotToken {
             self.bump();
@@ -4521,7 +4607,12 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_named_imports(&mut self) -> NodeId {
-        let start = self.consume().range.start;
+        let start = self.current.range.start;
+        if self.current.kind != SyntaxKind::OpenBraceToken {
+            self.error_current("Expected '{'.");
+            return self.missing_named_imports(start);
+        }
+        self.bump();
         let mut elements = Vec::new();
         let mut has_trailing_comma = false;
         while self.current.kind != SyntaxKind::CloseBraceToken
@@ -4551,18 +4642,8 @@ impl<'a> Parser<'a> {
                     self.parse_import_binding_identifier("Expected a local import name."),
                 )
             } else {
-                if !is_import_binding_identifier_kind(first_kind) {
-                    let range = self
-                        .arena
-                        .get(first)
-                        .map_or(TextRange::new(specifier_start, specifier_start), |node| {
-                            node.range
-                        });
-                    self.diagnostics
-                        .push(parser_diagnostic(range, "Expected a local import name."));
-                    if let Some(node) = self.arena.get_mut(first) {
-                        node.flags.0 |= NODE_FLAG_HAS_ERROR.0;
-                    }
+                if !self.token_is_identifier_in_current_context(first_kind) {
+                    self.mark_invalid_import_binding(first, specifier_start);
                 }
                 (None, first)
             };
@@ -4622,6 +4703,36 @@ impl<'a> Parser<'a> {
                 facts: 0,
             })),
             &elements,
+        )
+    }
+
+    fn mark_invalid_import_binding(&mut self, name: NodeId, position: TextPos) {
+        let range = self
+            .arena
+            .get(name)
+            .map_or(TextRange::new(position, position), |node| node.range);
+        self.diagnostics.push(parser_diagnostic(
+            range,
+            "Expected a local import name.",
+        ));
+        if let Some(node) = self.arena.get_mut(name) {
+            node.flags.0 |= NODE_FLAG_HAS_ERROR.0;
+        }
+    }
+
+    fn missing_named_imports(&mut self, position: TextPos) -> NodeId {
+        self.alloc_node(
+            SyntaxKind::NamedImports,
+            TextRange::new(position, position),
+            NodeData::NamedImports(Box::new(NamedImportsData {
+                elements: NodeList {
+                    range: TextRange::new(position, position),
+                    nodes: Vec::new(),
+                    has_trailing_comma: false,
+                },
+                facts: 0,
+            })),
+            &[],
         )
     }
 
@@ -4845,7 +4956,8 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        let attributes = self.parse_import_attributes();
+        let attributes = module_specifier
+            .and_then(|_| self.parse_import_attributes(false));
         let fallback = attributes
             .or(module_specifier)
             .or(export_clause)
@@ -6499,10 +6611,13 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_arrow_function_body_in_await_context(&mut self, await_context: bool) -> NodeId {
-        let previous = self.await_context;
+        let previous_await_context = self.await_context;
+        let previous_yield_context = self.yield_context;
         self.await_context = await_context;
+        self.yield_context = false;
         let body = self.parse_arrow_function_body();
-        self.await_context = previous;
+        self.await_context = previous_await_context;
+        self.yield_context = previous_yield_context;
         body
     }
 
@@ -6875,6 +6990,11 @@ impl<'a> Parser<'a> {
             } else {
                 None
             };
+            let is_async_method = modifier_nodes.iter().any(|modifier| {
+                self.arena
+                    .get(*modifier)
+                    .is_some_and(|modifier| modifier.kind == SyntaxKind::AsyncKeyword)
+            });
             let name = self.parse_property_name("Expected a property name.");
             let recovered_object_index_signature = self.current.kind == SyntaxKind::ColonToken
                 && matches!(
@@ -6891,6 +7011,10 @@ impl<'a> Parser<'a> {
                 self.current.kind,
                 SyntaxKind::LessThanToken | SyntaxKind::OpenParenToken
             ) {
+                let previous_await_context = self.await_context;
+                let previous_yield_context = self.yield_context;
+                self.await_context = is_async_method;
+                self.yield_context = asterisk_token.is_some();
                 let type_parameters = self.parse_type_parameters();
                 let parameters = self.parse_parameter_list();
                 let return_type = self.parse_optional_type_annotation();
@@ -6909,6 +7033,8 @@ impl<'a> Parser<'a> {
                 children.extend(parameters.nodes.iter().copied());
                 children.extend(return_type);
                 children.extend(body);
+                self.await_context = previous_await_context;
+                self.yield_context = previous_yield_context;
                 properties.push(self.alloc_node(
                     SyntaxKind::MethodDeclaration,
                     TextRange::new(property_start, end),
@@ -7611,8 +7737,17 @@ impl<'a> Parser<'a> {
         )
     }
 
+    fn parse_identifier_in_current_context(&mut self, message: &str) -> NodeId {
+        if self.token_is_identifier_in_current_context(self.current.kind) {
+            return self.parse_identifier_name(message);
+        }
+        let position = self.current.range.start;
+        self.error_current(message);
+        self.missing_identifier(position)
+    }
+
     fn parse_import_binding_identifier(&mut self, message: &str) -> NodeId {
-        if is_import_binding_identifier_kind(self.current.kind) {
+        if self.token_is_identifier_in_current_context(self.current.kind) {
             return self.parse_identifier_name(message);
         }
         if self.current.kind.is_keyword() {
@@ -7811,10 +7946,12 @@ impl<'a> Parser<'a> {
         let is_async = self.next_function_is_async;
         self.next_function_is_async = false;
         let previous_await_context = self.await_context;
+        let previous_yield_context = self.yield_context;
         self.await_context = is_async;
         let start = self.consume().range.start;
         let asterisk_token =
             (self.current.kind == SyntaxKind::AsteriskToken).then(|| self.consume_token_node());
+        self.yield_context = asterisk_token.is_some();
         let name = (self.current.kind == SyntaxKind::Identifier || self.current.kind.is_keyword())
             .then(|| self.parse_identifier_name("Expected a function name."));
         let type_parameters = self.parse_type_parameters();
@@ -7851,6 +7988,7 @@ impl<'a> Parser<'a> {
         children.extend(return_type);
         children.push(body);
         self.await_context = previous_await_context;
+        self.yield_context = previous_yield_context;
         self.alloc_node(
             SyntaxKind::FunctionExpression,
             TextRange::new(start, self.node_end(body)),
@@ -8477,7 +8615,7 @@ impl<'a> Parser<'a> {
             import.is_type_of = true;
             return import_type;
         }
-        let expr_name = self.parse_entity_name();
+        let expr_name = self.parse_entity_name(true);
         let type_arguments = self.parse_type_arguments_of_type_reference();
         let end = type_arguments
             .as_ref()
@@ -8508,7 +8646,7 @@ impl<'a> Parser<'a> {
         self.expect_and_bump(SyntaxKind::CloseParenToken, "Expected ')'.");
         let qualifier = if self.current.kind == SyntaxKind::DotToken {
             self.bump();
-            Some(self.parse_entity_name())
+            Some(self.parse_entity_name(true))
         } else {
             None
         };
@@ -13815,6 +13953,299 @@ export as namespace GlobalName;
                 .any(|diagnostic| diagnostic.message == "'from' expected."),
             "{:?}",
             equals.diagnostics
+        );
+    }
+
+    #[test]
+    fn import_equals_distinguishes_require_entities_from_external_references() {
+        let result = parse_source_file(concat!(
+            "import qualified = require.member;",
+            "import bare = require;",
+            "import expression = require(moduleName);",
+            "import literal = require(\"pkg\");",
+        ));
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let statements = source_statements(&result);
+        assert_eq!(statements.len(), 4);
+
+        let qualified = import_equals_declaration(&result, statements[0]);
+        let NodeData::QualifiedName(qualified_name) =
+            &result.arena.get(qualified.module_reference).unwrap().data
+        else {
+            panic!("expected qualified require entity name");
+        };
+        assert_eq!(identifier_text(&result, qualified_name.left), "require");
+        assert_eq!(identifier_text(&result, qualified_name.right), "member");
+
+        let bare = import_equals_declaration(&result, statements[1]);
+        assert_eq!(identifier_text(&result, bare.module_reference), "require");
+
+        for (statement, expected) in [(statements[2], "moduleName"), (statements[3], "pkg")] {
+            let declaration = import_equals_declaration(&result, statement);
+            let NodeData::ExternalModuleReference(reference) =
+                &result.arena.get(declaration.module_reference).unwrap().data
+            else {
+                panic!("expected external module reference");
+            };
+            let actual = match &result.arena.get(reference.expression).unwrap().data {
+                NodeData::Identifier(identifier) => identifier.text.as_str(),
+                NodeData::StringLiteral(literal) => literal.text.as_str(),
+                data => panic!("unexpected module reference expression: {data:?}"),
+            };
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn missing_named_import_brace_does_not_consume_the_from_clause_or_next_statement() {
+        let result = parse_source_file(
+            "import value, from \"pkg\"; const survived = 1;",
+        );
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == Some(1005)
+                    && diagnostic.message == "'{' expected."),
+            "{:?}",
+            result.diagnostics
+        );
+        let statements = source_statements(&result);
+        assert_eq!(statements.len(), 2, "{:?}", result.diagnostics);
+        let declaration = import_declaration(&result, statements[0]);
+        let clause = import_clause(&result, declaration.import_clause.unwrap());
+        let NodeData::NamedImports(imports) = &result
+            .arena
+            .get(clause.named_bindings.unwrap())
+            .unwrap()
+            .data
+        else {
+            panic!("expected recovered named imports");
+        };
+        assert!(imports.elements.nodes.is_empty());
+        assert_eq!(
+            result.arena.get(statements[1]).unwrap().kind,
+            SyntaxKind::VariableStatement
+        );
+    }
+
+    #[test]
+    fn import_attributes_obey_assert_and_with_line_break_boundaries() {
+        let inline_assert =
+            parse_source_file("import value from \"pkg\" assert { type: \"json\" };");
+        assert!(
+            inline_assert
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == Some(2880)),
+            "{:?}",
+            inline_assert.diagnostics
+        );
+        let declaration = import_declaration(
+            &inline_assert,
+            source_statements(&inline_assert)[0],
+        );
+        let NodeData::ImportAttributes(attributes) = &inline_assert
+            .arena
+            .get(declaration.attributes.unwrap())
+            .unwrap()
+            .data
+        else {
+            panic!("expected import assertions");
+        };
+        assert_eq!(attributes.token, SyntaxKind::AssertKeyword);
+
+        let separated_assert = parse_source_file(
+            "import value from \"pkg\"\nassert { type: \"json\" };",
+        );
+        let declaration = import_declaration(
+            &separated_assert,
+            source_statements(&separated_assert)[0],
+        );
+        assert!(declaration.attributes.is_none());
+
+        let separated_with = parse_source_file(
+            "import value from \"pkg\"\nwith { type: \"json\" };",
+        );
+        assert!(
+            separated_with.diagnostics.is_empty(),
+            "{:?}",
+            separated_with.diagnostics
+        );
+        let declaration = import_declaration(
+            &separated_with,
+            source_statements(&separated_with)[0],
+        );
+        assert!(declaration.attributes.is_some());
+
+        let export = parse_source_file(
+            "export { value } from \"pkg\"\nwith { type: \"json\" };",
+        );
+        let NodeData::ExportDeclaration(declaration) =
+            &export.arena.get(source_statements(&export)[0]).unwrap().data
+        else {
+            panic!("expected export declaration");
+        };
+        assert!(declaration.attributes.is_none());
+    }
+
+    #[test]
+    fn import_attributes_preserve_list_shape_and_defer_value_grammar_checks() {
+        let result = parse_source_file(
+            "import value from \"pkg\" with {\n type: \"json\",\n mode: runtimeValue,\n};",
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let declaration = import_declaration(&result, source_statements(&result)[0]);
+        let NodeData::ImportAttributes(attributes) =
+            &result.arena.get(declaration.attributes.unwrap()).unwrap().data
+        else {
+            panic!("expected import attributes");
+        };
+        assert!(attributes.multi_line);
+        assert!(attributes.attributes.has_trailing_comma);
+        assert_eq!(attributes.attributes.nodes.len(), 2);
+        let NodeData::ImportAttribute(mode) = &result
+            .arena
+            .get(attributes.attributes.nodes[1])
+            .unwrap()
+            .data
+        else {
+            panic!("expected mode import attribute");
+        };
+        assert_eq!(
+            result.arena.get(mode.value).unwrap().kind,
+            SyntaxKind::Identifier
+        );
+
+        let invalid =
+            parse_source_file("import value from \"pkg\" with { 0: \"json\" };");
+        assert!(
+            invalid
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == Some(1478)),
+            "{:?}",
+            invalid.diagnostics
+        );
+        let declaration = import_declaration(&invalid, source_statements(&invalid)[0]);
+        let NodeData::ImportAttributes(attributes) = &invalid
+            .arena
+            .get(declaration.attributes.unwrap())
+            .unwrap()
+            .data
+        else {
+            panic!("expected recovered import attributes");
+        };
+        assert!(attributes.attributes.nodes.is_empty());
+    }
+
+    #[test]
+    fn import_bindings_use_await_and_yield_identifier_contexts() {
+        let generator =
+            parse_source_file("function* g() { import type yield from \"pkg\"; }");
+        assert!(!generator.diagnostics.is_empty());
+        let declaration = generator.arena.iter().find_map(|(_, node)| {
+            let NodeData::ImportEqualsDeclaration(declaration) = &node.data else {
+                return None;
+            };
+            Some(declaration)
+        });
+        let declaration = declaration.expect("expected recovered import-equals declaration");
+        assert!(!declaration.is_type_only);
+        assert_eq!(identifier_text(&generator, declaration.name), "type");
+
+        let namespace =
+            parse_source_file("async function f() { import * as await from \"pkg\"; }");
+        assert!(
+            namespace
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == Some(1003)),
+            "{:?}",
+            namespace.diagnostics
+        );
+        let namespace_name = namespace.arena.iter().find_map(|(_, node)| {
+            let NodeData::NamespaceImport(namespace) = &node.data else {
+                return None;
+            };
+            Some(namespace.name)
+        });
+        assert_eq!(
+            namespace.arena.get(namespace_name.unwrap()).unwrap().flags,
+            NODE_FLAG_HAS_ERROR
+        );
+
+        let named = parse_source_file(
+            "async function f() { import { value as await } from \"pkg\"; }",
+        );
+        assert!(
+            named
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == Some(1003)),
+            "{:?}",
+            named.diagnostics
+        );
+        let local_name = named.arena.iter().find_map(|(_, node)| {
+            let NodeData::ImportSpecifier(specifier) = &node.data else {
+                return None;
+            };
+            Some(specifier.name)
+        });
+        assert_eq!(
+            named.arena.get(local_name.unwrap()).unwrap().flags,
+            NODE_FLAG_HAS_ERROR
+        );
+    }
+
+    #[test]
+    fn import_equals_entity_names_restrict_only_the_first_segment() {
+        let valid =
+            parse_source_file("function* g() { import Alias = namespace.yield; }");
+        assert!(valid.diagnostics.is_empty(), "{:?}", valid.diagnostics);
+        let declaration = valid.arena.iter().find_map(|(_, node)| {
+            let NodeData::ImportEqualsDeclaration(declaration) = &node.data else {
+                return None;
+            };
+            Some(declaration)
+        });
+        let declaration = declaration.expect("expected import-equals declaration");
+        let NodeData::QualifiedName(name) =
+            &valid.arena.get(declaration.module_reference).unwrap().data
+        else {
+            panic!("expected qualified entity name");
+        };
+        assert_eq!(identifier_text(&valid, name.left), "namespace");
+        assert_eq!(identifier_text(&valid, name.right), "yield");
+
+        let invalid = parse_source_file("import Alias = class.member;");
+        assert!(
+            invalid
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == Some(1003)),
+            "{:?}",
+            invalid.diagnostics
+        );
+        let declaration = import_equals_declaration(&invalid, source_statements(&invalid)[0]);
+        let reference = invalid.arena.get(declaration.module_reference).unwrap();
+        assert_eq!(reference.kind, SyntaxKind::Identifier);
+        assert_eq!(reference.flags, NODE_FLAG_HAS_ERROR);
+        assert_eq!(reference.range.start, reference.range.end);
+    }
+
+    #[test]
+    fn import_module_specifier_preserves_non_string_expressions_for_grammar_checking() {
+        let result = parse_source_file("import value from moduleName;");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let declaration = import_declaration(&result, source_statements(&result)[0]);
+        assert_eq!(
+            result.arena.get(declaration.module_specifier).unwrap().kind,
+            SyntaxKind::Identifier
+        );
+        assert_eq!(
+            identifier_text(&result, declaration.module_specifier),
+            "moduleName"
         );
     }
 
