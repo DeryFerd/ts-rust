@@ -265,16 +265,30 @@ remains the cluster-level source of truth.
   A private global-merge completion brand prevents heritage name resolution
   from escaping before its phase. The independent eager-global audit found and
   closed that phase hole plus the auto-array resolved-members mismatch, then
-  reported no remaining P0-P2 issue. 162 binder tests, 339 checker tests, the
-  checker compile-fail doctest, strict targeted Clippy, and the all-target
-  workspace check pass. Compiler-option normalization now retains explicit
-  `strictBindCallApply` provenance and exact inheritance through `653017f`, and
-  binder output retains whether each module augmentation was declared in an
-  ambient context through `aaeb11f`. T04 remains in progress: alias targets,
-  late ambient-module merging, non-global augmentation execution, full
-  diagnostic callback/spelling elaboration, callback mappers, lazy global
-  families, and compiler-to-canonical option plumbing are explicit later
-  slices.
+  reported no remaining P0-P2 issue. The prior milestone passed 162 binder
+  tests, 339 checker tests, the checker compile-fail doctest, strict targeted
+  Clippy, and the all-target workspace check. Compiler-option normalization now
+  retains explicit `strictBindCallApply` provenance and exact inheritance
+  through `653017f`; `strictBuiltinIteratorReturn` has the same normalized
+  strict inheritance, explicit-option provenance, canonical-context retention,
+  and CLI routing through `1fdb98b` and `837ff93`. Binder output retains whether
+  each module augmentation was declared in an ambient context through
+  `aaeb11f`. The canonical merge diagnostic host is integrated through
+  `55b7213` and `680ec4b`, preserving each pinned branch's unconditional Add
+  versus Lookup ownership, related-information equality, and raw issuance
+  order. AST-adjusted diagnostic locations, JavaScript suppression, checker
+  symbol spelling, and final compiler sorting remain owned by later Program
+  diagnostics. The declaration-provider-independent alias kernel is integrated
+  through `653272f`, `270c984`, and `c4c316a`: immediate and transitive caches,
+  missing-target negative caching, pure and assignment indirection, merged
+  targets, type-only propagation, TS2303 unwind events, retry semantics, and
+  transactional resolution-stack rollback all passed two independent reviews.
+  Fourteen focused alias tests and all 376 merged checker tests pass. T04
+  remains in progress: the production alias-declaration target provider and its
+  name-resolution/merge wiring, late ambient-module merging, non-global
+  augmentation execution, full Program diagnostic elaboration, callback
+  mappers, lazy global families, and complete compiler-to-canonical option
+  plumbing are explicit later slices.
 
 No percentage in this section is a whole-corpus parity claim. A score is
 publishable only when its variant manifest and complete artifact comparison are
