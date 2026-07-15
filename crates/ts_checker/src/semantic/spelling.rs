@@ -20,6 +20,11 @@ use std::cmp::Ordering;
 /// Equal-distance candidates are ordered by `compare`. If the comparator also
 /// reports equality, the first candidate in input order is retained.
 #[allow(dead_code)] // Installed ahead of the property-diagnostic consumer.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)] // Preserve the pinned Go float64-to-int threshold arithmetic exactly.
 pub(super) fn get_spelling_suggestion<'name, Candidate, Candidates, GetName, Compare>(
     name: &str,
     candidates: Candidates,
@@ -84,12 +89,7 @@ pub(super) fn get_spelling_suggestion_for_strings<'candidate>(
     name: &str,
     candidates: impl IntoIterator<Item = &'candidate str>,
 ) -> Option<&'candidate str> {
-    get_spelling_suggestion(
-        name,
-        candidates,
-        |candidate| Some(*candidate),
-        |left, right| left.cmp(right),
-    )
+    get_spelling_suggestion(name, candidates, |candidate| Some(*candidate), Ord::cmp)
 }
 
 #[derive(Default)]
@@ -100,6 +100,11 @@ struct LevenshteinBuffers {
 
 /// Computes the pinned weighted Levenshtein distance, stopping once the active
 /// band proves that the result cannot return below `maximum`.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)] // Preserve the pinned Go float64 band calculations exactly.
 fn levenshtein_with_max(
     buffers: &mut LevenshteinBuffers,
     left: &[char],
@@ -348,6 +353,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::unicode_not_nfc)] // Kelvin sign is an intentional SimpleFold probe.
     fn names_shorter_than_three_bytes_require_unicode_case_equality() {
         assert_eq!(
             get_spelling_suggestion_for_strings("ab", ["ac", "AB"]),
