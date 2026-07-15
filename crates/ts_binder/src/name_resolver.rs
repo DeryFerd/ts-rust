@@ -390,6 +390,13 @@ pub trait CanonicalNameResolverHost {
     fn get_local_symbol_of_declaration(&mut self, declaration: NodeRef)
     -> Option<SemanticSymbolId>;
 
+    /// Applies checker-owned merged-symbol and alias semantics to one table
+    /// lookup.
+    ///
+    /// # Errors
+    ///
+    /// Returns a capability or provenance error when exact checker lookup
+    /// semantics cannot be supplied. An ordinary missing name is `Ok(None)`.
     fn lookup(
         &mut self,
         store: &SymbolStore,
