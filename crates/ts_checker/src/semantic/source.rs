@@ -24,7 +24,7 @@ use super::{
     DeclaredTypeHost, RelationUnavailable, SourceFileLinks, SourceFileRef, TypeDisplayUnavailable,
     TypeId,
     bootstrap::LiteralTypeCacheError,
-    formatter::get_type_names_for_assignability_error_with_flags,
+    formatter::get_type_names_for_assignability_error_with_host_and_flags,
     type_nodes::{CanonicalTypeQuery, normalize_bigint_literal, normalize_numeric_separators},
 };
 
@@ -1374,8 +1374,9 @@ pub(super) fn check_source_file(
                     let source_type = expression_type(store, &variable.initializer)?;
                     if !store.is_type_assignable_to(source_type, target)? {
                         let AssignabilityErrorDisplay { source, target } =
-                            get_type_names_for_assignability_error_with_flags(
+                            get_type_names_for_assignability_error_with_host_and_flags(
                                 store,
+                                host,
                                 source_type,
                                 target,
                                 assignability_display_flags(options),
@@ -1425,9 +1426,7 @@ mod tests {
     use crate::semantic::{
         CanonicalCheckerContext, DeclaredTypeHostError, IntrinsicBootstrapOptions,
         RelationStateSnapshot, TypeNodeUnavailable, ValueSymbolLinks,
-        production::GlobalMergeCompletion,
-        type_records::{TypeData, TypeDataKind},
-        types::ObjectFlags,
+        production::GlobalMergeCompletion, type_records::TypeData, types::ObjectFlags,
     };
 
     type ObservableSourceState = (
@@ -1922,7 +1921,7 @@ mod tests {
     }
 
     #[test]
-    fn interface_object_assignability_stops_at_typed_object_display_boundary() {
+    fn interface_object_assignability_uses_property_object_display() {
         let source = parsed(concat!(
             "interface TextValue { value: string } ",
             "interface NumberValue { value: number } ",
@@ -1934,45 +1933,47 @@ mod tests {
         let first = variable_initializer(&source, file, "first");
         let second = variable_initializer(&source, file, "second");
 
-        let error = context.check_source_file(file).unwrap_err();
-        let displayed_type = match error {
-            SourceCheckError::TypeDisplayUnavailable(TypeDisplayUnavailable::UnsupportedType {
-                type_id,
-                kind: TypeDataKind::Object,
-            }) => type_id,
-            other => panic!("unexpected source-check boundary: {other:?}"),
-        };
-        assert_eq!(
+        context.check_source_file(file).unwrap();
+
+        assert!(
             context
                 .store()
                 .type_node_links(first)
-                .and_then(|links| links.resolved_type),
-            Some(displayed_type)
+                .and_then(|links| links.resolved_type)
+                .is_some()
         );
         assert!(
             context
                 .store()
                 .type_node_links(second)
                 .and_then(|links| links.resolved_type)
-                .is_none(),
-            "the first display failure must stop source execution before the second initializer"
+                .is_some()
         );
-        assert!(context.diagnostics().is_empty());
-        assert!(!is_type_checked(&context, file));
-
-        let retained = observable_state(&context, file);
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 2);
         assert_eq!(
-            context.check_source_file(file),
-            Err(SourceCheckError::TypeDisplayUnavailable(
-                TypeDisplayUnavailable::UnsupportedType {
-                    type_id: displayed_type,
-                    kind: TypeDataKind::Object,
-                }
-            ))
+            diagnostics[0].node,
+            Some(variable_name(&source, file, "first"))
         );
-        assert_eq!(observable_state(&context, file), retained);
-        assert!(context.diagnostics().is_empty());
-        assert!(!is_type_checked(&context, file));
+        assert_eq!(diagnostics[0].diagnostic.code(), 2322);
+        assert_eq!(
+            diagnostics[0].diagnostic.render().unwrap(),
+            "Type '{ value: 1; }' is not assignable to type 'TextValue'."
+        );
+        assert_eq!(
+            diagnostics[1].node,
+            Some(variable_name(&source, file, "second"))
+        );
+        assert_eq!(diagnostics[1].diagnostic.code(), 2322);
+        assert_eq!(
+            diagnostics[1].diagnostic.render().unwrap(),
+            "Type '{ value: \"wrong\"; }' is not assignable to type 'NumberValue'."
+        );
+        assert!(is_type_checked(&context, file));
+
+        let warm = observable_state(&context, file);
+        context.check_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
     }
 
     #[test]
