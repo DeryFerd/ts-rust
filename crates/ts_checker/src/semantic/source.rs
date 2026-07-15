@@ -1209,6 +1209,53 @@ mod tests {
     }
 
     #[test]
+    fn source_union_assignments_preserve_alias_display_and_nullable_order() {
+        let source = parsed(concat!(
+            "type Scalar = string | number; ",
+            r#"const namedOk: Scalar = "ok"; "#,
+            "const anonymousOk: string | number = 1; ",
+            "const nullableOk: string | number | null = null; ",
+            "const namedBad: Scalar = false; ",
+            "const anonymousBad: string | number | null = false;",
+        ));
+        let file = FileId::new(55);
+        let mut context = context(
+            &[(file, &source)],
+            CanonicalCheckerOptions {
+                intrinsic: IntrinsicBootstrapOptions {
+                    strict_null_checks: true,
+                    exact_optional_property_types: false,
+                },
+                ..CanonicalCheckerOptions::default()
+            },
+        );
+
+        context.check_source_file(file).unwrap();
+
+        let diagnostics = context.diagnostics().as_slice();
+        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(
+            diagnostics[0].node,
+            Some(variable_name(&source, file, "namedBad"))
+        );
+        assert_eq!(diagnostics[0].diagnostic.code(), 2322);
+        assert_eq!(
+            diagnostics[0].diagnostic.render().unwrap(),
+            "Type 'boolean' is not assignable to type 'Scalar'."
+        );
+        assert_eq!(
+            diagnostics[1].node,
+            Some(variable_name(&source, file, "anonymousBad"))
+        );
+        assert_eq!(diagnostics[1].diagnostic.code(), 2322);
+        assert_eq!(
+            diagnostics[1].diagnostic.render().unwrap(),
+            "Type 'boolean' is not assignable to type 'string | number | null'."
+        );
+        assert!(is_type_checked(&context, file));
+    }
+
+    #[test]
     fn expression_literals_use_fresh_booleans_and_null_widening_identity() {
         let source = parsed("");
         let file = FileId::new(43);
