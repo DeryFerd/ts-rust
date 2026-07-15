@@ -3,6 +3,7 @@
 mod canonical;
 mod escaped_name;
 mod flow_builder;
+mod name_resolver;
 pub mod semantic;
 
 pub use canonical::{
@@ -13,6 +14,10 @@ pub use canonical::{
 };
 pub use escaped_name::{
     EscapedDisplay, EscapedName, EscapedNameRef, INTERNAL_SYMBOL_NAME_PREFIX, InternalSymbolName,
+};
+pub use name_resolver::{
+    CanonicalNameResolutionError, CanonicalNameResolver, CanonicalNameResolverHost,
+    CanonicalNameResolverOptions, CanonicalResolvedName, CanonicalScopeChangeState,
 };
 pub use semantic::{
     AstScope, CheckFlags, SemanticStoreId, SemanticSymbolId, SymbolData, SymbolStore, SymbolTableId,

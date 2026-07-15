@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 ts_ast = { path = "../ts_ast" }
 ts_diagnostics = { path = "../ts_diagnostics" }
+ts_options = { path = "../ts_options" }
 
 [dev-dependencies]
 ts_core = { path = "../ts_core" }
