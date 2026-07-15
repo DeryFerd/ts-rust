@@ -472,6 +472,24 @@ remains the cluster-level source of truth.
   the first two prove zero diagnostics and the sole TS2353 over `name` at
   `[46,50)` respectively. Arrays/assertions, calls, functions, and broader
   assignment targets are the next dependency clusters.
+- The assertion and canonical-array substrate is integrated through `54101e4`,
+  `561382e`, `7df90aa`, `141e802`, `324d1b8`, and `331f156`. `T[]` now resolves
+  through the Program-owned canonical `Array<T>` target with target-local
+  instantiation identity, fail-closed global capability checks, poisoned warm
+  cache rejection, and atomic retry. Property-only fresh object literals now
+  have stable regular and widened derived identities, and Comparable admits
+  validated declared, fresh, regular, and widened property objects without
+  weakening fresh excess-property rules. Root type assertions check their
+  operands without the asserted contextual type, publish the asserted result,
+  enqueue the comparison for the deferred pass, and emit the exact TS2352
+  diagnostic for non-overlapping types. Raw literal links remain fresh while
+  enclosing mutable locations consume their regular/widened result types, and
+  assignment expressions publish the right-hand result identity needed by
+  `.types` baselines. `contextualTyping18` is exact; nested and const
+  assertions, structured derived unions, array literal expressions, array
+  display/relation, spreads, holes, tuples, and readonly-array syntax remain
+  explicit boundaries. The combined checker passes 671/671 library tests,
+  strict all-target checker Clippy, and doctest.
 
 No percentage in this section is a whole-corpus parity claim. A score is
 publishable only when its variant manifest and complete artifact comparison are
