@@ -4699,17 +4699,14 @@ impl<'a> Parser<'a> {
                 NodeData::NamespaceExportDeclaration(Box::new(NamespaceExportDeclarationData {
                     flow_node: None,
                     symbol: None,
-                    modifiers: Some(ModifierList {
-                        list: NodeList {
-                            range: TextRange::new(start, self.node_start(name)),
-                            nodes: vec![export_modifier],
-                            has_trailing_comma: false,
-                        },
-                        flags: ts_ast::ModifierFlags::default(),
-                    }),
+                    // The leading `export` is mandatory syntax, not a
+                    // modifier. Pinned binder diagnostics reserve this slot
+                    // for illegal decorators/modifiers preceding the
+                    // declaration.
+                    modifiers: None,
                     name,
                 })),
-                &[export_modifier, name],
+                &[name],
             );
         }
         if self.current.kind == SyntaxKind::DefaultKeyword {
@@ -11783,18 +11780,7 @@ mod tests {
             result.arena.get(namespace.name).unwrap().parent,
             Some(namespace_id)
         );
-        assert_eq!(
-            namespace
-                .modifiers
-                .as_ref()
-                .unwrap()
-                .list
-                .nodes
-                .iter()
-                .map(|modifier| result.arena.get(*modifier).unwrap().kind)
-                .collect::<Vec<_>>(),
-            [SyntaxKind::ExportKeyword]
-        );
+        assert!(namespace.modifiers.is_none());
         let NodeData::ModuleDeclaration(module) = &result.arena.get(statements[2]).unwrap().data
         else {
             panic!("expected ambient module");
