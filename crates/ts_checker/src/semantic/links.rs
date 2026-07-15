@@ -472,8 +472,7 @@ impl<K: Eq + Hash, V> LinkStore<K, V> {
         }
     }
 
-    #[cfg(test)]
-    fn allocated_len(&self) -> usize {
+    pub(super) fn allocated_len(&self) -> usize {
         self.arena.len()
     }
 }
@@ -590,6 +589,16 @@ impl TypeResolutionStack {
     #[must_use]
     pub(super) const fn resolution_start(&self) -> usize {
         self.resolution_start
+    }
+
+    #[must_use]
+    pub(super) fn boundary_len(&self) -> usize {
+        self.boundaries.len()
+    }
+
+    #[must_use]
+    pub(super) const fn next_boundary_serial(&self) -> u64 {
+        self.next_boundary_serial
     }
 
     /// Temporarily starts cycle scanning at the current stack depth.
@@ -735,6 +744,23 @@ pub(super) struct CheckerLinkStores {
     pub(super) alias_symbol: LinkStore<SemanticSymbolId, AliasSymbolLinks>,
     pub(super) type_alias: LinkStore<SemanticSymbolId, TypeAliasLinks>,
     pub(super) declared_type: LinkStore<SemanticSymbolId, DeclaredTypeLinks>,
+}
+
+impl CheckerLinkStores {
+    #[must_use]
+    pub(super) fn allocated_lengths(&self) -> [usize; 9] {
+        [
+            self.node.allocated_len(),
+            self.symbol_node.allocated_len(),
+            self.type_node.allocated_len(),
+            self.signature.allocated_len(),
+            self.symbol_reference.allocated_len(),
+            self.value_symbol.allocated_len(),
+            self.alias_symbol.allocated_len(),
+            self.type_alias.allocated_len(),
+            self.declared_type.allocated_len(),
+        ]
+    }
 }
 
 #[cfg(test)]

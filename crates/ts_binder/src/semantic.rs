@@ -390,6 +390,15 @@ impl SymbolStore {
         self.symbols.len()
     }
 
+    /// Number of checker-transient symbols already allocated in this owner.
+    #[must_use]
+    pub fn checker_created_symbol_len(&self) -> usize {
+        self.checker_created_symbols
+            .iter()
+            .filter(|created| **created)
+            .count()
+    }
+
     #[must_use]
     pub fn symbol_table_len(&self) -> usize {
         self.tables.len()

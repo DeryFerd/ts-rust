@@ -6,6 +6,7 @@
 //! branded by their aggregate [`SemanticStore`]; they have no conversion to
 //! same-named legacy checker IDs.
 
+pub mod bootstrap;
 pub mod ids;
 pub mod links;
 pub mod mapper;
@@ -16,6 +17,10 @@ pub mod types;
 
 pub use ts_binder::{AstScope, SemanticStoreId, SemanticSymbolId, SymbolTableId};
 
+pub use bootstrap::{
+    CheckerLinkCounts, CheckerStateSnapshot, IntrinsicBootstrap, IntrinsicBootstrapError,
+    IntrinsicBootstrapOptions, SemanticArenaCounts, TypeResolutionStateSnapshot,
+};
 pub use ids::{
     ConditionalRootId, IndexInfoId, SignatureId, TypeAliasId, TypeId, TypeMapperId, TypePredicateId,
 };

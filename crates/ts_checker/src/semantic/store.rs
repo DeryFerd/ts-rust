@@ -8,6 +8,7 @@ use ts_binder::{
 };
 
 use super::{
+    bootstrap::IntrinsicBootstrap,
     ids::{
         ConditionalRootId, IndexInfoId, SignatureId, TypeAliasId, TypeId, TypeMapperId,
         TypePredicateId, TypedArena,
@@ -41,6 +42,7 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     conditional_roots: TypedArena<ConditionalRootId, ConditionalRoot>,
     links: CheckerLinkStores,
     type_resolutions: TypeResolutionStack,
+    pub(super) intrinsic_bootstrap: Option<IntrinsicBootstrap>,
 }
 
 impl<TypePayload, MapperPayload> Default for SemanticStore<TypePayload, MapperPayload> {
@@ -79,6 +81,7 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
             conditional_roots: TypedArena::new(id),
             links: CheckerLinkStores::default(),
             type_resolutions: TypeResolutionStack::new(id),
+            intrinsic_bootstrap: None,
         }
     }
 
@@ -569,6 +572,19 @@ impl<TypePayload, MapperPayload> SemanticStore<TypePayload, MapperPayload> {
     #[must_use]
     pub const fn type_resolution_start(&self) -> usize {
         self.type_resolutions.resolution_start()
+    }
+
+    pub(super) fn checker_link_allocated_lengths(&self) -> [usize; 9] {
+        self.links.allocated_lengths()
+    }
+
+    pub(super) fn type_resolution_internal_state(&self) -> (usize, usize, usize, u64) {
+        (
+            self.type_resolutions.len(),
+            self.type_resolutions.resolution_start(),
+            self.type_resolutions.boundary_len(),
+            self.type_resolutions.next_boundary_serial(),
+        )
     }
 
     /// Starts cycle scanning at the current depth and returns an opaque,
