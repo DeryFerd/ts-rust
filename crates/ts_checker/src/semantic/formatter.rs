@@ -81,7 +81,6 @@ pub enum TypeDisplayUnavailable {
     UnsupportedType { type_id: TypeId, kind: TypeDataKind },
     MalformedType(TypeId),
     InvalidLiteralLinks(TypeId),
-    InvalidNumberLiteral(TypeId),
     UniqueSymbolName(TypeId),
     MissingBootstrap,
     FullyQualifiedName { source: TypeId, target: TypeId },
@@ -106,10 +105,6 @@ impl std::fmt::Display for TypeDisplayUnavailable {
             Self::InvalidLiteralLinks(type_id) => write!(
                 formatter,
                 "literal type {type_id:?} has invalid fresh/regular links"
-            ),
-            Self::InvalidNumberLiteral(type_id) => write!(
-                formatter,
-                "number literal type {type_id:?} has no source-literal spelling"
             ),
             Self::UniqueSymbolName(type_id) => write!(
                 formatter,
@@ -337,9 +332,6 @@ fn display_type_worker(
         let LiteralValue::Number(value) = &literal.value else {
             return Err(TypeDisplayUnavailable::MalformedType(type_id));
         };
-        if value.is_nan() {
-            return Err(TypeDisplayUnavailable::InvalidNumberLiteral(type_id));
-        }
         return Ok(value.to_string());
     }
     if type_flags.intersects(TypeFlags::BIG_INT_LITERAL) {
@@ -824,16 +816,26 @@ mod tests {
     }
 
     #[test]
-    fn canonicalizes_signed_zero_and_rejects_nan() {
+    fn formats_the_complete_pinned_number_literal_domain() {
         let mut store = bootstrapped_store();
-        let negative_zero = store
-            .alloc_literal_type(
-                TypeFlags::NUMBER_LITERAL,
-                LiteralValue::Number(Number::new(-0.0)),
-                RegularLiteralLink::SelfType,
-            )
-            .unwrap();
-        assert_eq!(type_to_string(&store, negative_zero).unwrap(), "0");
+        let cases = [
+            (Number::new(-0.0), "0"),
+            (Number::nan(), "NaN"),
+            (Number::infinity(1), "Infinity"),
+            (Number::infinity(-1), "-Infinity"),
+            (Number::new(1e21), "1e+21"),
+            (Number::new(5e-324), "5e-324"),
+        ];
+        for (value, expected) in cases {
+            let literal = store
+                .alloc_literal_type(
+                    TypeFlags::NUMBER_LITERAL,
+                    LiteralValue::Number(value),
+                    RegularLiteralLink::SelfType,
+                )
+                .unwrap();
+            assert_eq!(type_to_string(&store, literal).unwrap(), expected);
+        }
 
         let nan = store
             .alloc_literal_type(
@@ -842,9 +844,13 @@ mod tests {
                 RegularLiteralLink::SelfType,
             )
             .unwrap();
+        let string_type = store.intrinsic_bootstrap().unwrap().string_type;
         assert_eq!(
-            type_to_string(&store, nan),
-            Err(TypeDisplayUnavailable::InvalidNumberLiteral(nan))
+            get_type_names_for_assignability_error(&store, nan, string_type).unwrap(),
+            AssignabilityErrorDisplay {
+                source: "number".into(),
+                target: "string".into(),
+            }
         );
     }
 
@@ -906,6 +912,37 @@ mod tests {
                 boundary: 317,
             })
         );
+    }
+
+    #[test]
+    fn truncation_uses_the_exact_ordinary_and_hard_byte_boundaries() {
+        let mut store = bootstrapped_store();
+        let ordinary_below = store.regular_string_literal_type("x".repeat(317)).unwrap();
+        let ordinary_at = store.regular_string_literal_type("x".repeat(318)).unwrap();
+        assert_eq!(
+            type_to_string(&store, ordinary_below).unwrap(),
+            format!("\"{}\"", "x".repeat(317))
+        );
+        assert_eq!(
+            type_to_string(&store, ordinary_at).unwrap(),
+            format!("\"{}...", "x".repeat(316))
+        );
+
+        let hard_below = store
+            .regular_string_literal_type("x".repeat(1_999_997))
+            .unwrap();
+        let hard_at = store
+            .regular_string_literal_type("x".repeat(1_999_998))
+            .unwrap();
+        let no_truncation = CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT
+            | CanonicalTypeFormatFlags::NO_TRUNCATION;
+        assert_eq!(
+            type_to_string_with_flags(&store, hard_below, no_truncation).unwrap(),
+            format!("\"{}\"", "x".repeat(1_999_997))
+        );
+        let hard_display = type_to_string_with_flags(&store, hard_at, no_truncation).unwrap();
+        assert_eq!(hard_display.len(), 2_000_000);
+        assert_eq!(hard_display, format!("\"{}...", "x".repeat(1_999_996)));
     }
 
     #[test]
