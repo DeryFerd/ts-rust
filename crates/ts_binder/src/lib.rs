@@ -1,9 +1,13 @@
 //! Declaration binding and lexical symbol tables.
 
-mod flow_builder;
+mod canonical;
 mod escaped_name;
+mod flow_builder;
 pub mod semantic;
 
+pub use canonical::{
+    BindingPhase, BoundFile, CanonicalBindError, CanonicalBinder, CanonicalProgramBindings,
+};
 pub use escaped_name::{
     EscapedDisplay, EscapedName, EscapedNameRef, INTERNAL_SYMBOL_NAME_PREFIX, InternalSymbolName,
 };
@@ -492,6 +496,23 @@ impl BoundFlowGraph {
     #[must_use]
     pub fn unsupported(&self) -> &[UnsupportedFlow] {
         &self.unsupported
+    }
+
+    /// Returns the control-flow container associated with `node` by the flow
+    /// builder, including containers later marked incomplete.
+    ///
+    /// This is distinct from the binder's semantic container association. A
+    /// module block, for example, starts a control-flow container without
+    /// becoming the semantic declaration container.
+    #[must_use]
+    pub fn flow_container(&self, node: NodeRef) -> Option<NodeRef> {
+        if !node.is_for(self.node_arena_id(), self.file_id()) {
+            return None;
+        }
+        self.node_containers
+            .get(&node.node)
+            .copied()
+            .map(|container| NodeRef::new(self.node_arena_id(), self.file_id(), container))
     }
 }
 
