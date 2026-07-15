@@ -7,15 +7,13 @@ license.workspace = true
 [dependencies]
 ts_ast = { path = "../ts_ast" }
 ts_binder = { path = "../ts_binder" }
+ts_core = { path = "../ts_core" }
 ts_diagnostics = { path = "../ts_diagnostics" }
 ts_evaluator = { path = "../ts_evaluator" }
 ts_jsnum = { path = "../ts_jsnum" }
 ts_parser = { path = "../ts_parser" }
 ts_path = { path = "../ts_path" }
 xxhash-rust = { version = "=0.8.15", features = ["xxh3"] }
-
-[dev-dependencies]
-ts_core = { path = "../ts_core" }
 
 [lints]
 workspace = true

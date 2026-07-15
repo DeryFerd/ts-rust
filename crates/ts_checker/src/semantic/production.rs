@@ -25,8 +25,8 @@ use super::{
     CanonicalGlobalTypes, CanonicalModuleResolutionLookup, CanonicalModuleResolutionManifest,
     CanonicalModuleResolutionManifestError, CanonicalModuleResolutionManifestInput,
     CanonicalTypeFormatFlags, CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost,
-    DeclaredTypeHostError, IntrinsicBootstrapError, IntrinsicBootstrapOptions, SourceFileRef,
-    SymbolMergeError, TypeDisplayUnavailable, TypeId,
+    DeclaredTypeHostError, IntrinsicBootstrapError, IntrinsicBootstrapOptions, SourceCheckError,
+    SourceCheckProvenanceError, SourceFileRef, SymbolMergeError, TypeDisplayUnavailable, TypeId,
     alias::{CanonicalAliasResolution, CanonicalAliasResolutionError, CanonicalAliasResolver},
     alias_flags::{
         CanonicalSymbolFlagsError, CanonicalSymbolFlagsResolution, CanonicalSymbolFlagsResolver,
@@ -37,6 +37,7 @@ use super::{
     global_types::initialize_global_library_types,
     module_resolution::validate_module_resolution_manifest,
     name_resolution::{ProductionNameResolverHost, ProductionNameResolverHostError},
+    source,
     type_nodes::CanonicalTypeQuery,
 };
 
@@ -88,6 +89,30 @@ impl GlobalMergeCompletion {
     }
 }
 
+fn diagnostic_owners(
+    files: &ProductionAliasSourceRegistry<'_>,
+    initiating: SourceFileRef,
+    diagnostics: &CanonicalCheckerDiagnostics,
+) -> Result<Vec<SourceFileRef>, SourceCheckError> {
+    diagnostics
+        .as_slice()
+        .iter()
+        .map(|diagnostic| {
+            let Some(node) = diagnostic.node else {
+                return Ok(initiating);
+            };
+            let owner = files.snapshot(node.file).filter(|(arena, bound)| {
+                node.is_for(arena.id(), bound.file_id()) && bound.contains(node)
+            });
+            owner
+                .and_then(|_| files.source_file(node.file))
+                .ok_or(SourceCheckError::Provenance(
+                    SourceCheckProvenanceError::InvalidDiagnosticNode(node),
+                ))
+        })
+        .collect()
+}
+
 /// A dependency-closed, production-ready canonical checker foundation.
 ///
 /// The context is the sole owner of the binder's canonical symbol graph after
@@ -105,6 +130,7 @@ pub struct CanonicalCheckerContext<'arena> {
     global_types: CanonicalGlobalTypes,
     module_resolutions: CanonicalModuleResolutionManifest,
     diagnostics: CanonicalCheckerDiagnostics,
+    source_diagnostic_staging: BTreeMap<SourceFileRef, CanonicalCheckerDiagnostics>,
     pending_ambient_modules: Vec<SemanticSymbolId>,
     pattern_ambient_modules: Vec<CanonicalPatternAmbientModule>,
 }
@@ -303,6 +329,7 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             global_types: initialized.global_types,
             module_resolutions,
             diagnostics: CanonicalCheckerDiagnostics::default(),
+            source_diagnostic_staging: BTreeMap::new(),
             pending_ambient_modules: initialized.pending_ambient_modules,
             pattern_ambient_modules: initialized.pattern_ambient_modules,
         })
@@ -336,6 +363,11 @@ impl<'arena> CanonicalCheckerContext<'arena> {
     #[must_use]
     pub const fn store(&self) -> &CanonicalTypeMapperStore {
         &self.store
+    }
+
+    #[cfg(test)]
+    pub(super) fn store_mut_for_test(&mut self) -> &mut CanonicalTypeMapperStore {
+        &mut self.store
     }
 
     /// Formats one context-owned type through the dependency-closed canonical
@@ -537,6 +569,87 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             GlobalMergeCompletion::new(options.name_resolution),
         )?;
         CanonicalTypeQuery::new(store, &host, *options, diagnostics)?.get_type_from_type_node(node)
+    }
+
+    /// Checks the supported statements in one retained source file.
+    ///
+    /// The complete source is validated before semantic execution. Checker
+    /// diagnostics and the source's `type_checked` marker are committed only
+    /// after every supported statement completes, so a typed failure can be
+    /// repaired and retried without exposing a partial source result. Safe
+    /// canonical memo caches may survive a rejected attempt; diagnostics tied
+    /// to those caches stay in context-private retry staging until success.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SourceCheckError`] for a foreign file, stale or malformed AST,
+    /// unsupported source syntax, unavailable declared type or relation, type
+    /// display boundary, or malformed literal cache.
+    pub fn check_source_file(&mut self, file: FileId) -> Result<(), SourceCheckError> {
+        let Self {
+            options,
+            files,
+            store,
+            diagnostics,
+            source_diagnostic_staging,
+            ..
+        } = self;
+        let (arena, bound) = files.snapshot(file).ok_or(SourceCheckError::Provenance(
+            SourceCheckProvenanceError::MissingFile(file),
+        ))?;
+        let source_file = files.source_file(file).ok_or(SourceCheckError::Provenance(
+            SourceCheckProvenanceError::MissingFile(file),
+        ))?;
+        let host = DeclaredTypeHost::from_registry(
+            store,
+            files,
+            GlobalMergeCompletion::new(options.name_resolution),
+        )
+        .map_err(DeclaredTypeError::from)?;
+        let mut staged = source_diagnostic_staging
+            .remove(&source_file)
+            .unwrap_or_default();
+        let result = source::check_source_file(
+            arena,
+            bound,
+            source_file,
+            &host,
+            store,
+            *options,
+            &mut staged,
+        );
+        let owners = match diagnostic_owners(files, source_file, &staged) {
+            Ok(owners) => owners,
+            Err(error) => {
+                source::merge_retry_diagnostics(
+                    source_diagnostic_staging.entry(source_file).or_default(),
+                    staged,
+                );
+                return Err(error);
+            }
+        };
+        let result = result.and_then(|()| source::publish_type_checked(store, source_file));
+        let mut partitioned = BTreeMap::<SourceFileRef, CanonicalCheckerDiagnostics>::new();
+        for (owner, diagnostic) in owners.into_iter().zip(staged.into_vec()) {
+            source::merge_retry_diagnostic(partitioned.entry(owner).or_default(), diagnostic);
+        }
+        for (owner, retained) in partitioned {
+            let checked = store
+                .source_file_links(owner)
+                .is_some_and(|links| links.type_checked);
+            if checked {
+                if let Some(previous) = source_diagnostic_staging.remove(&owner) {
+                    source::merge_retry_diagnostics(diagnostics, previous);
+                }
+                source::merge_retry_diagnostics(diagnostics, retained);
+            } else {
+                source::merge_retry_diagnostics(
+                    source_diagnostic_staging.entry(owner).or_default(),
+                    retained,
+                );
+            }
+        }
+        result
     }
 
     /// Quoted ambient-module symbols deferred until global library types exist.
@@ -1893,6 +2006,17 @@ mod tests {
         );
         assert_eq!(after_resolver_hosts.validation_passes, 1);
         assert_eq!(after_resolver_hosts.snapshot_iterations, 0);
+
+        for &(file, _) in &files {
+            context.check_source_file(file).unwrap();
+        }
+        let after_source_checks = context.files.instrumentation();
+        assert_eq!(
+            after_source_checks.declared_type_views,
+            after_resolver_hosts.declared_type_views + files.len()
+        );
+        assert_eq!(after_source_checks.validation_passes, 1);
+        assert_eq!(after_source_checks.snapshot_iterations, 0);
     }
 
     #[test]

@@ -643,6 +643,33 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         Ok(regular)
     }
 
+    /// Returns the validated fresh half of one regular literal pair.
+    ///
+    /// Expression checking calls this only after one of the regular literal
+    /// interning entry points above. Keeping the validation in the store makes
+    /// a malformed global literal cache a typed failure instead of allowing a
+    /// foreign or stale fresh identity to escape.
+    pub(super) fn fresh_type_of_literal_type(
+        &self,
+        regular: TypeId,
+    ) -> Result<TypeId, LiteralTypeCacheError> {
+        let Some(record) = self.type_payload(regular) else {
+            return Err(LiteralTypeCacheError::InvalidCachedLiteral(regular));
+        };
+        let TypeData::Literal(literal) = record.data() else {
+            return Err(LiteralTypeCacheError::InvalidCachedLiteral(regular));
+        };
+        if literal.regular_type != regular
+            || self.validate_regular_literal_cache_entry(regular, record.flags(), &literal.value)?
+                != 0
+        {
+            return Err(LiteralTypeCacheError::InvalidCachedLiteral(regular));
+        }
+        literal
+            .fresh_type
+            .ok_or(LiteralTypeCacheError::InvalidCachedLiteral(regular))
+    }
+
     fn validate_regular_literal_cache_entry(
         &self,
         regular: TypeId,

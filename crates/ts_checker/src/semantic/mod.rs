@@ -21,9 +21,10 @@ mod merge;
 pub mod module_resolution;
 pub mod name_resolution;
 pub mod production;
-pub mod relation;
 pub mod relater;
+pub mod relation;
 pub mod signatures;
+pub mod source;
 mod store;
 pub mod type_nodes;
 pub mod type_records;
@@ -31,11 +32,11 @@ pub mod types;
 
 pub use ts_binder::{AstScope, SemanticStoreId, SemanticSymbolId, SymbolTableId};
 
+pub use alias_provider::{ProductionAliasTargetHost, ProductionAliasTargetHostError};
 pub use bootstrap::{
     CheckerLinkCounts, CheckerStateSnapshot, IntrinsicBootstrap, IntrinsicBootstrapError,
     IntrinsicBootstrapOptions, SemanticArenaCounts, TypeResolutionStateSnapshot,
 };
-pub use alias_provider::{ProductionAliasTargetHost, ProductionAliasTargetHostError};
 pub use declared::{
     DeclaredTypeError, DeclaredTypeHost, DeclaredTypeHostError, DeclaredTypeUnavailable,
     UnsupportedDeclaredTypeKind, UnsupportedOuterTypeParameterContext,
@@ -83,12 +84,16 @@ pub use production::{
     CanonicalAliasQueryError, CanonicalCheckerContext, CanonicalCheckerContextError,
     CanonicalCheckerOptions, CanonicalGlobalInitializationError,
 };
+pub use relater::RelationUnavailable;
 pub use relation::{
     ExpandingFlags, IntersectionState, MinArgumentCountFlags, RecursionFlags,
     RelationCacheSnapshot, RelationComparisonResult, RelationKind, RelationStateSnapshot,
     SignatureCheckMode,
 };
-pub use relater::RelationUnavailable;
+pub use source::{
+    SourceCheckError, SourceCheckProvenanceError, SourceLiteralCacheError, SourceSyntaxRole,
+    UnsupportedSourceSyntax,
+};
 pub use store::SemanticStore;
 pub use type_nodes::TypeNodeUnavailable;
 pub use type_records::{CacheHashKey, CanonicalSemanticStore, TypeData, TypeDataKind, TypeRecord};

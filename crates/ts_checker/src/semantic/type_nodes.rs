@@ -181,7 +181,7 @@ fn type_construction_error(error: LiteralTypeCacheError) -> DeclaredTypeError {
     }
 }
 
-fn normalize_numeric_separators(text: &str) -> Option<String> {
+pub(super) fn normalize_numeric_separators(text: &str) -> Option<String> {
     if text.is_empty() || text.starts_with(['+', '-']) || text.ends_with('n') {
         return None;
     }
@@ -197,7 +197,7 @@ fn normalize_numeric_separators(text: &str) -> Option<String> {
         .then_some(normalized)
 }
 
-fn normalize_bigint_literal(text: &str) -> Option<String> {
+pub(super) fn normalize_bigint_literal(text: &str) -> Option<String> {
     let body = text.strip_suffix('n')?;
     if body.is_empty() || body.starts_with(['+', '-']) {
         return None;

@@ -85,6 +85,26 @@ impl CanonicalCheckerDiagnostics {
         self.append_entry(candidate)
     }
 
+    /// Returns a diagnostic with the same primary node and payload, ignoring
+    /// related information accumulated by an earlier retry, or issues it.
+    ///
+    /// This is intentionally checker-internal: only retry staging may collapse
+    /// the same primary emission while unioning its related information.
+    pub(super) fn lookup_primary_or_issue(
+        &mut self,
+        node: Option<NodeRef>,
+        diagnostic: Diagnostic,
+    ) -> &mut CanonicalCheckerDiagnostic {
+        if let Some(index) = self
+            .diagnostics
+            .iter()
+            .position(|current| current.node == node && current.diagnostic == diagnostic)
+        {
+            return &mut self.diagnostics[index];
+        }
+        self.add(node, diagnostic)
+    }
+
     fn append_entry(
         &mut self,
         diagnostic: CanonicalCheckerDiagnostic,
@@ -208,5 +228,25 @@ mod tests {
         diagnostic.append_related(related.clone());
 
         assert_eq!(diagnostic.related_information, [related.clone(), related]);
+    }
+
+    #[test]
+    fn primary_lookup_ignores_related_information_for_retry_staging() {
+        let mut diagnostics = CanonicalCheckerDiagnostics::default();
+        let primary = Diagnostic::with_arguments(message_by_code(2300).unwrap(), ["item"]);
+        let related = CanonicalCheckerRelatedInformation {
+            node: None,
+            diagnostic: Diagnostic::new(message_by_code(6204).unwrap()),
+        };
+        diagnostics
+            .lookup_primary_or_issue(None, primary.clone())
+            .append_related(related.clone());
+        let retry = diagnostics.lookup_primary_or_issue(None, primary);
+        if !retry.related_information.contains(&related) {
+            retry.append_related(related.clone());
+        }
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics.as_slice()[0].related_information, [related]);
     }
 }
