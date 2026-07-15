@@ -432,6 +432,25 @@ remains the cluster-level source of truth.
   elaboration (property-local incompatible, excess, and missing diagnostics)
   are the next active dependency cluster; unions, indexes, spreads, computed
   names, generic object bodies, and interface heritage remain typed boundaries.
+- Contextual object-property typing is integrated as `b1f6922`, with the
+  independently reviewed spelling-suggestion kernel in
+  `e1d8388..fa75449`. Object initializers now preflight the complete
+  host-validated target graph before publishing a source object; mutable
+  property locations widen fresh literals to primitives unless a same-kind
+  literal context preserves the regular literal, including canonical boolean
+  unions and recursive interface contexts. The shared ordered property view
+  validates owner, declaration, alias, member-table, and link provenance and
+  is frozen for diagnostic elaboration. The spelling kernel retains the
+  pinned Go byte-versus-rune gates, weighted distance, stable tie ordering,
+  and Unicode 15 behavior; independent review found and pinned all 55 newer
+  Rust Unicode 17 case pairs. The combined branch passes 628 checker library
+  tests, strict all-target Clippy, rustdoc with warnings denied, and doctest.
+  A bounded seven-case property-object corpus probe found two exact artifacts,
+  three honest syntax boundaries, and two remaining supported-path mismatches;
+  both mismatches are now isolated to generic TS2322 versus pinned
+  property-local excess diagnostics. Exact object-literal diagnostic
+  elaboration is therefore the active cluster, with simple assignment-statement
+  dispatch being traced independently behind the same frozen contracts.
 
 No percentage in this section is a whole-corpus parity claim. A score is
 publishable only when its variant manifest and complete artifact comparison are
