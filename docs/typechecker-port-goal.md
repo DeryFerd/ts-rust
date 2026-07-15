@@ -64,8 +64,12 @@ remains the cluster-level source of truth.
   relation ternary values are pinned to the audited upstream commit.
 - Program-wide node and flow references are branded by both `NodeArenaId` and
   `FileId`, so equal dense IDs from rebuilt Programs fail closed. Complete
-  symbol masks and the typed flow substrate are integrated as well; the
-  combined foundation passed 209 focused tests and adds no Clippy regression.
+  symbol masks, the typed flow substrate, and the first exact binder-created
+  CFG slice are integrated as well. Sequential flow, branches, returns,
+  mutations, calls, unreachable traversal, and detached function containers
+  are active; loops, switch, try/finally, jumps, optional/logical chains,
+  destructuring, IIFEs, and static blocks remain explicit incomplete
+  boundaries rather than guessed graphs.
 - Canonical semantic IDs plus signature, predicate, index, and tuple records
   are integrated behind a store-branded aggregate. AST scope growth is
   monotonic, raw payload allocation is crate-private, and independent review
