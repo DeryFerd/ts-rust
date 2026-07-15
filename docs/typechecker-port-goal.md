@@ -314,7 +314,7 @@ remains the cluster-level source of truth.
   still fail typed rather than becoming false relations. The independent audit
   found no P0-P2 issue, and all 29 focused relater tests pass on the merged tree.
 - T05/T06 now resolve useful declared aliases and source type nodes through
-  `8c2dc7d`, `22801bd`, `5938420`, and `aed8638`. The context-owned query
+  `8c2dc7d`, `22801bd`, `5938420`, `aed8638`, and `42fef2b`. The context-owned query
   session supports intrinsic keyword and parenthesized nodes, non-generic
   direct identifier references, recursive generic and non-generic type aliases
   inside the installed boundary, and exact string/template, number, bigint,
@@ -323,10 +323,13 @@ remains the cluster-level source of truth.
   allocation, `+0`/`-0` cache identity, signed bigint behavior, null's link
   bypass, checked batch capacity, and atomic retry. The literal audit found no
   P0-P2 issue under the parser/binder/revision-validated production contract.
-  After integrating this alias/provider, relation, and literal wave, all 460
-  checker library tests, the checker compile-fail doctest, and scoped
-  all-target Clippy pass. Union/intersection, object/function, qualified and
-  import-alias type nodes remain explicit follow-up work.
+  Direct generic aliases now substitute dependency-closed primitive, literal,
+  union, and type-parameter arguments through nested aliases and earlier or
+  outer-lexical defaults. Their provided-arity/owner cache keys match the
+  pinned encoding, warm caches are validated without mutation, and TS2314,
+  TS2707, and TS2315 preserve nested-argument-first order. Structured generic
+  bodies, constraints, intersections, object/function types, qualified/import
+  aliases, and circular-default TS2716 remain explicit follow-up work.
 - T04's production query boundary now has one retained alias/source registry
   through `7b0712a`, `17b12f2`, and `85e5005`. It owns the validated Program
   snapshots, module-resolution manifest, alias target facade, and store-branded
@@ -352,19 +355,29 @@ remains the cluster-level source of truth.
   order for identity, subtype, strict subtype, assignability, and comparability,
   plus nullable correspondence, literal-to-primitive shortcuts, named-union
   identity, cache thresholds, and transactional publication.
+- The independently reviewed direct-generic slice is integrated as `42fef2b`
+  with exhaustive capability/invariant classification in `38ba576`. Review
+  found and repaired exact-key poisoning, cached forward-default validation,
+  recursive-default stack overflow, a double merged-symbol redirect, and an
+  immutable-validation attempt to allocate a global symbol ID. The final
+  merged stack passes 560/560 checker tests; checker, parser, binder, and
+  compiler scoped Clippy/rustdoc/doctest gates are green. Circular defaults
+  intentionally remain a typed capability boundary instead of emitting
+  pinned TS2716.
 - E00's first production source-checking slice is integrated through `625c143`,
-  `101fb48`, and `0afc838`. One context checks retained source files after a
+  `101fb48`, `0afc838`, and `42fef2b`. One context checks retained source files after a
   complete-tree provenance preflight, supporting unmodified type aliases,
   exact empty `export {}` module markers, and explicitly typed ordinary
   variables (optionally exported) whose initializers are primitive literals.
-  Target types include named, anonymous, nullable, and literal unions.
+  Target types include named, anonymous, nullable, and literal unions plus
+  dependency-closed direct generic aliases and defaults.
   Successful checks publish an idempotent source marker and exact TS2322 nodes,
   order, alias display, and strict-null behavior; failed plans publish neither
   marker nor diagnostics, and retry diagnostics stay privately partitioned by
   their owning source. Export syntax requires a retained external-module fact,
   preventing a caller from silently checking it in global Script scope.
   Unsupported statements and expressions remain typed boundaries with no
-  legacy fallback. The combined stack passes all 539 checker library tests;
+  legacy fallback. The combined stack passes all 560 checker library tests;
   its formatter and export-source reviews found no remaining P0-P2 issue, and
   rustdoc, the compile-fail doctest, and scoped all-target Clippy are green.
 - C00's first whole-Program route is integrated through `32d22b7` and exposed
@@ -380,7 +393,7 @@ remains the cluster-level source of truth.
   declarations; TSX, fixed `.mts`/`.cts` formats, `import.meta`, Node implied
   formats, and unskipped non-default declarations fail typed before canonical
   binding. The independent facts re-review found no remaining P0-P2 issue, and
-  all ten canonical Program tests pass on the merged branch. The diagnostics
+  all eleven canonical Program tests pass on the merged branch. The diagnostics
   runner's explicit `--canonical-checker` mode never emits or falls back to the
   legacy checker. It records genuine capability gaps as unsupported coverage,
   aborts on provenance/cache/phase invariants, and writes schema-3 scorecards
@@ -389,6 +402,15 @@ remains the cluster-level source of truth.
   TS2322 paths, spans, messages, and order. Program-level diagnostic
   sorting/deduplication and related-information ownership, full modern module
   facts, and canonical emit remain explicit follow-up work.
+- The first canonical corpus tranche now completes instead of aborting on an
+  AST invariant. `cb6cdaf` makes optional-parameter ranges contain their `?`,
+  and `0a54a21` parses expression-position `undefined` as the pinned identifier
+  while retaining keyword-type shape in type position. The first 100 selected
+  cases execute 102 variants with zero fatal invariants, zero exact matches,
+  and 102 explicit unsupported results. This alphabetically biased tranche is
+  dominated by functions (21), untyped variables (15), JavaScript (12), enums
+  (10), classes (9), modules and interfaces (5 each), and imports and TSX (4
+  each). It is a root-algorithm queue, not a parity percentage.
 
 No percentage in this section is a whole-corpus parity claim. A score is
 publishable only when its variant manifest and complete artifact comparison are
