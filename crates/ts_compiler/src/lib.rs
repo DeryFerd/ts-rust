@@ -12,10 +12,11 @@ use ts_binder::{
     CanonicalSourceLanguage, EscapedName, SymbolFlags, bind_source_file_in_file,
 };
 use ts_checker::semantic::{
-    CanonicalCheckerContext, CanonicalCheckerContextError, CanonicalCheckerOptions,
+    ArrayTypeError, CanonicalCheckerContext, CanonicalCheckerContextError, CanonicalCheckerOptions,
     CanonicalGlobalInitializationError, CanonicalGlobalTypeInitializationError, DeclaredTypeError,
-    DeclaredTypeUnavailable, IntrinsicBootstrapOptions, RelationUnavailable, SourceCheckError,
-    SymbolMergeError, TypeDisplayUnavailable, TypeNodeUnavailable,
+    DeclaredTypeUnavailable, DerivedTypeError, IntrinsicBootstrapOptions, RelationUnavailable,
+    SourceCheckError, SourceLiteralCacheError, SymbolMergeError, TypeDisplayUnavailable,
+    TypeNodeUnavailable,
 };
 use ts_checker::{
     CheckDiagnostic, CheckResult, CheckerOptions, EnumConstantValue as CheckerConstantValue,
@@ -357,12 +358,38 @@ fn source_check_error_is_unsupported(error: &SourceCheckError) -> bool {
         SourceCheckError::DeclaredType(error) => declared_type_error_is_unsupported(error),
         SourceCheckError::RelationUnavailable(error) => relation_error_is_unsupported(error),
         SourceCheckError::TypeDisplayUnavailable(error) => display_error_is_unsupported(error),
+        SourceCheckError::LiteralCache(error) => literal_cache_error_is_unsupported(error),
+        SourceCheckError::ArrayType(error) => array_type_error_is_unsupported(error),
+        SourceCheckError::DerivedType(error) => derived_type_error_is_unsupported(error),
         SourceCheckError::Provenance(_)
-        | SourceCheckError::LiteralCache(_)
         | SourceCheckError::ObjectLiteral(_)
+        | SourceCheckError::Assertion(_)
         | SourceCheckError::Assignment(_)
         | SourceCheckError::MissingDiagnostic(_) => false,
     }
+}
+
+fn literal_cache_error_is_unsupported(error: &SourceLiteralCacheError) -> bool {
+    matches!(
+        error,
+        SourceLiteralCacheError::UnsupportedUnionConstituent(_)
+    )
+}
+
+fn array_type_error_is_unsupported(error: &ArrayTypeError) -> bool {
+    match error {
+        ArrayTypeError::GlobalType(error) => global_type_initialization_error_is_unsupported(error),
+        ArrayTypeError::InvalidReference(_)
+        | ArrayTypeError::InvalidArrayLiteralCache { .. }
+        | ArrayTypeError::Capacity(_) => false,
+    }
+}
+
+fn derived_type_error_is_unsupported(error: &DerivedTypeError) -> bool {
+    matches!(
+        error,
+        DerivedTypeError::UnsupportedWideningType(_) | DerivedTypeError::RecursiveObjectLiteral(_)
+    )
 }
 
 fn declared_type_error_is_unsupported(error: &DeclaredTypeError) -> bool {
@@ -482,6 +509,9 @@ fn relation_error_is_unsupported(error: &RelationUnavailable) -> bool {
         | RelationUnavailable::StrictOptionalProperty(_)
         | RelationUnavailable::UnresolvedGlobalObject(_)
         | RelationUnavailable::StructuralRelation { .. } => true,
+        RelationUnavailable::CanonicalGlobalType(error) => {
+            global_type_initialization_error_is_unsupported(error)
+        }
         RelationUnavailable::MissingBootstrap
         | RelationUnavailable::Type(_)
         | RelationUnavailable::Symbol(_)
@@ -495,7 +525,9 @@ fn relation_error_is_unsupported(error: &RelationUnavailable) -> bool {
         | RelationUnavailable::InvalidSymbolMembers(_)
         | RelationUnavailable::RelationKeyType(_)
         | RelationUnavailable::InvalidUnknownLikeUnionState(_)
-        | RelationUnavailable::InvalidStructuredMembers(_) => false,
+        | RelationUnavailable::InvalidStructuredMembers(_)
+        | RelationUnavailable::UnavailableCanonicalArrayTarget(_)
+        | RelationUnavailable::MalformedCanonicalArrayReference(_) => false,
     }
 }
 
@@ -513,6 +545,7 @@ fn display_error_is_unsupported(error: &TypeDisplayUnavailable) -> bool {
         | TypeDisplayUnavailable::InvalidUnion(_)
         | TypeDisplayUnavailable::InvalidLiteralLinks(_)
         | TypeDisplayUnavailable::MissingBootstrap => false,
+        TypeDisplayUnavailable::ArrayType(error) => array_type_error_is_unsupported(error),
     }
 }
 
@@ -6451,9 +6484,10 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use ts_checker::semantic::{
-        AssignmentInvariant, CanonicalCheckerContextError, CanonicalGlobalInitializationError,
-        CanonicalGlobalTypeInitializationError, CanonicalTypeMapperStore, DeclaredTypeError,
-        DeclaredTypeUnavailable, IntrinsicBootstrapOptions, RelationKind, RelationUnavailable,
+        ArrayTypeError, AssignmentInvariant, CanonicalCheckerContextError,
+        CanonicalGlobalInitializationError, CanonicalGlobalTypeInitializationError,
+        CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeUnavailable, DerivedTypeError,
+        IntrinsicBootstrapOptions, RelationKind, RelationUnavailable, SourceAssertionError,
         SourceCheckError, SourceCheckProvenanceError, SourceLiteralCacheError,
         SourceObjectLiteralError, SymbolMergeError, TypeDataKind, TypeDisplayUnavailable,
         TypeNodeUnavailable, UnsupportedSourceSyntax,
@@ -6563,6 +6597,18 @@ mod tests {
                         kind: TypeDataKind::Conditional,
                     },
                 ),
+            },
+            CanonicalProgramCheckError::SourceCheck {
+                file_name: "/project/input.ts".to_owned(),
+                error: SourceCheckError::LiteralCache(
+                    SourceLiteralCacheError::UnsupportedUnionConstituent(type_id),
+                ),
+            },
+            CanonicalProgramCheckError::SourceCheck {
+                file_name: "/project/input.ts".to_owned(),
+                error: SourceCheckError::DerivedType(DerivedTypeError::UnsupportedWideningType(
+                    type_id,
+                )),
             },
         ];
         assert!(
@@ -6724,6 +6770,37 @@ mod tests {
             CanonicalProgramCheckError::SourceCheck {
                 file_name: "/project/input.ts".to_owned(),
                 error: SourceCheckError::Assignment(AssignmentInvariant::MissingNode(node)),
+            },
+            CanonicalProgramCheckError::SourceCheck {
+                file_name: "/project/input.ts".to_owned(),
+                error: SourceCheckError::ArrayType(ArrayTypeError::InvalidReference(type_id)),
+            },
+            CanonicalProgramCheckError::SourceCheck {
+                file_name: "/project/input.ts".to_owned(),
+                error: SourceCheckError::DerivedType(DerivedTypeError::InvalidWidenedTypeCache {
+                    source: type_id,
+                    cached: type_id,
+                }),
+            },
+            CanonicalProgramCheckError::SourceCheck {
+                file_name: "/project/input.ts".to_owned(),
+                error: SourceCheckError::Assertion(SourceAssertionError::InvalidOperandCache {
+                    node,
+                    cached: None,
+                    expected: type_id,
+                }),
+            },
+            CanonicalProgramCheckError::SourceCheck {
+                file_name: "/project/input.ts".to_owned(),
+                error: SourceCheckError::RelationUnavailable(
+                    RelationUnavailable::MalformedCanonicalArrayReference(type_id),
+                ),
+            },
+            CanonicalProgramCheckError::SourceCheck {
+                file_name: "/project/input.ts".to_owned(),
+                error: SourceCheckError::TypeDisplayUnavailable(TypeDisplayUnavailable::ArrayType(
+                    ArrayTypeError::InvalidReference(type_id),
+                )),
             },
         ];
         assert!(
