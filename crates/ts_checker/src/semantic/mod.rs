@@ -16,6 +16,7 @@ pub mod ids;
 pub mod links;
 pub mod mapper;
 mod merge;
+pub mod module_resolution;
 pub mod name_resolution;
 pub mod production;
 pub mod relation;
@@ -61,6 +62,12 @@ pub use mapper::{CanonicalTypeMapperStore, TypeMapper, TypeMapperKind};
 pub use merge::{
     CheckerDiagnosticMergeHost, FailClosedSymbolMergeHost, SymbolMergeDiagnostic,
     SymbolMergeDiagnosticKind, SymbolMergeError, SymbolMergeHost, get_excluded_symbol_flags,
+};
+pub use module_resolution::{
+    CanonicalModuleResolutionEntry, CanonicalModuleResolutionInput,
+    CanonicalModuleResolutionLookup, CanonicalModuleResolutionManifest,
+    CanonicalModuleResolutionManifestError, CanonicalModuleResolutionManifestInput,
+    CanonicalModuleResolutionMode, CanonicalResolvedModule, CanonicalResolvedModuleInput,
 };
 pub use name_resolution::{ProductionNameResolverHost, ProductionNameResolverHostError};
 pub use production::{

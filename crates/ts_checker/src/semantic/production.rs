@@ -21,10 +21,13 @@ use ts_binder::{
 };
 
 use super::{
-    CanonicalGlobalTypeInitializationError, CanonicalGlobalTypes, CanonicalTypeMapperStore,
-    DeclaredTypeHost, DeclaredTypeHostError, IntrinsicBootstrapError, IntrinsicBootstrapOptions,
-    SourceFileRef, SymbolMergeError,
+    CanonicalGlobalTypeInitializationError, CanonicalGlobalTypes, CanonicalModuleResolutionLookup,
+    CanonicalModuleResolutionManifest, CanonicalModuleResolutionManifestError,
+    CanonicalModuleResolutionManifestInput, CanonicalTypeMapperStore, DeclaredTypeHost,
+    DeclaredTypeHostError, IntrinsicBootstrapError, IntrinsicBootstrapOptions, SourceFileRef,
+    SymbolMergeError,
     global_types::initialize_global_library_types,
+    module_resolution::validate_module_resolution_manifest,
     name_resolution::{ProductionNameResolverHost, ProductionNameResolverHostError},
 };
 
@@ -95,6 +98,7 @@ pub struct CanonicalCheckerContext<'arena> {
     store: CanonicalTypeMapperStore,
     globals: SymbolTableId,
     global_types: CanonicalGlobalTypes,
+    module_resolutions: CanonicalModuleResolutionManifest,
     pending_ambient_modules: Vec<SemanticSymbolId>,
     pattern_ambient_modules: Vec<CanonicalPatternAmbientModule>,
 }
@@ -120,12 +124,65 @@ impl<'arena> CanonicalCheckerContext<'arena> {
         ordered_arenas: Vec<(FileId, &'arena NodeArena)>,
         options: impl Into<CanonicalCheckerOptions>,
     ) -> Result<Self, CanonicalCheckerContextError> {
-        let options = options.into();
+        Self::new_internal(bindings, ordered_arenas, options.into(), None)
+    }
+
+    /// Constructs a context with an explicitly available, one-shot module-
+    /// resolution manifest.
+    ///
+    /// An empty `module_resolutions` value remains observably different from
+    /// [`Self::new`]: lookups report an available provider with an absent entry
+    /// instead of an unavailable capability. Every entry is validated against
+    /// the exact retained binder/arena snapshot before checker state exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CanonicalCheckerContextError::ModuleResolutions`] for a
+    /// foreign, stale, duplicate, malformed, or invalid-target manifest entry,
+    /// in addition to the errors documented by [`Self::new`].
+    pub fn new_with_module_resolutions(
+        bindings: CanonicalProgramBindings,
+        ordered_arenas: Vec<(FileId, &'arena NodeArena)>,
+        options: impl Into<CanonicalCheckerOptions>,
+        module_resolutions: CanonicalModuleResolutionManifestInput,
+    ) -> Result<Self, CanonicalCheckerContextError> {
+        Self::new_internal(
+            bindings,
+            ordered_arenas,
+            options.into(),
+            Some(module_resolutions),
+        )
+    }
+
+    fn new_internal(
+        bindings: CanonicalProgramBindings,
+        ordered_arenas: Vec<(FileId, &'arena NodeArena)>,
+        options: CanonicalCheckerOptions,
+        module_resolutions: Option<CanonicalModuleResolutionManifestInput>,
+    ) -> Result<Self, CanonicalCheckerContextError> {
         let (symbols, mut bound_files) = bindings
             .try_into_parts()
             .map_err(CanonicalCheckerContextError::Extraction)?;
 
         preflight_program(&symbols, &bound_files, &ordered_arenas)?;
+
+        let module_resolutions = match module_resolutions {
+            Some(input) => validate_module_resolution_manifest(
+                input,
+                &symbols,
+                ordered_arenas.iter().map(|(file, arena)| {
+                    (
+                        *file,
+                        *arena,
+                        bound_files
+                            .get(file)
+                            .expect("preflight established exact Program correspondence"),
+                    )
+                }),
+            )
+            .map_err(CanonicalCheckerContextError::ModuleResolutions)?,
+            None => CanonicalModuleResolutionManifest::unavailable(),
+        };
 
         let file_order = ordered_arenas
             .iter()
@@ -182,6 +239,7 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             store,
             globals: initialized.globals,
             global_types: initialized.global_types,
+            module_resolutions,
             pending_ambient_modules: initialized.pending_ambient_modules,
             pattern_ambient_modules: initialized.pattern_ambient_modules,
         })
@@ -230,6 +288,18 @@ impl<'arena> CanonicalCheckerContext<'arena> {
     #[must_use]
     pub const fn global_types(&self) -> &CanonicalGlobalTypes {
         &self.global_types
+    }
+
+    /// The immutable, checker-owned module-resolution capability.
+    #[must_use]
+    pub const fn module_resolutions(&self) -> &CanonicalModuleResolutionManifest {
+        &self.module_resolutions
+    }
+
+    /// Looks up one exact module-specifier identity.
+    #[must_use]
+    pub fn module_resolution(&self, specifier: NodeRef) -> CanonicalModuleResolutionLookup {
+        self.module_resolutions.lookup(specifier)
     }
 
     /// Quoted ambient-module symbols deferred until global library types exist.
@@ -954,6 +1024,8 @@ pub enum CanonicalCheckerContextError {
     SourceRegistrationFailed(FileId),
     /// Intrinsic singleton initialization rejected the adopted store.
     Bootstrap(IntrinsicBootstrapError),
+    /// The explicit checker-owned module-resolution manifest was invalid.
+    ModuleResolutions(CanonicalModuleResolutionManifestError),
     /// The supported `initializeChecker` global prefix could not complete.
     GlobalInitialization(CanonicalGlobalInitializationError),
 }
@@ -1046,6 +1118,9 @@ impl std::fmt::Display for CanonicalCheckerContextError {
             Self::Bootstrap(error) => {
                 write!(formatter, "checker intrinsic bootstrap failed: {error:?}")
             }
+            Self::ModuleResolutions(error) => {
+                write!(formatter, "checker module resolutions are invalid: {error}")
+            }
             Self::GlobalInitialization(error) => {
                 write!(formatter, "checker global initialization failed: {error}")
             }
@@ -1057,6 +1132,7 @@ impl std::error::Error for CanonicalCheckerContextError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Extraction(error) => Some(error),
+            Self::ModuleResolutions(error) => Some(error),
             Self::GlobalInitialization(error) => Some(error),
             _ => None,
         }
@@ -1072,6 +1148,12 @@ impl From<CanonicalExtractionError> for CanonicalCheckerContextError {
 impl From<IntrinsicBootstrapError> for CanonicalCheckerContextError {
     fn from(error: IntrinsicBootstrapError) -> Self {
         Self::Bootstrap(error)
+    }
+}
+
+impl From<CanonicalModuleResolutionManifestError> for CanonicalCheckerContextError {
+    fn from(error: CanonicalModuleResolutionManifestError) -> Self {
+        Self::ModuleResolutions(error)
     }
 }
 
