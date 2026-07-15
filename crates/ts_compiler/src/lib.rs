@@ -395,6 +395,10 @@ fn type_node_error_is_unsupported(error: &TypeNodeUnavailable) -> bool {
         | TypeNodeUnavailable::ImportAliasTypeReference { .. }
         | TypeNodeUnavailable::UnsupportedReferenceTarget { .. }
         | TypeNodeUnavailable::GenericReferenceUnsupported { .. }
+        | TypeNodeUnavailable::GenericAliasConstraintUnsupported { .. }
+        | TypeNodeUnavailable::GenericAliasInstantiationUnsupported { .. }
+        | TypeNodeUnavailable::GenericAliasDefaultReferenceUnsupported { .. }
+        | TypeNodeUnavailable::CircularGenericAliasDefault { .. }
         | TypeNodeUnavailable::JsDocTypeAlias(_)
         | TypeNodeUnavailable::UnsupportedUnionConstituent(_)
         | TypeNodeUnavailable::UnsupportedUnionConstituentType(_) => true,
@@ -405,6 +409,8 @@ fn type_node_error_is_unsupported(error: &TypeNodeUnavailable) -> bool {
         | TypeNodeUnavailable::InvalidTypeAliasDeclaration(_)
         | TypeNodeUnavailable::InvalidCachedTypeAlias(_)
         | TypeNodeUnavailable::InvalidCachedSymbol { .. }
+        | TypeNodeUnavailable::MissingGenericAliasMetadata(_)
+        | TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(_)
         | TypeNodeUnavailable::CheckerOptionMismatch { .. }
         | TypeNodeUnavailable::DiagnosticOwnerRequired(_)
         | TypeNodeUnavailable::MissingPlannedTypeAlias(_)
@@ -6493,6 +6499,60 @@ mod tests {
             unsupported
                 .iter()
                 .all(CanonicalProgramCheckError::is_unsupported_boundary)
+        );
+    }
+
+    #[test]
+    fn canonical_program_error_classification_separates_generic_alias_boundaries() {
+        let parsed = parse_source_file("type Id<T> = T;");
+        let file = FileId::new(7);
+        let node = ts_ast::NodeRef::new(parsed.arena.id(), file, parsed.source_file);
+        let mut store = CanonicalTypeMapperStore::new();
+        let bootstrap = store
+            .initialize_intrinsic_bootstrap(IntrinsicBootstrapOptions::default())
+            .unwrap();
+        let symbol = bootstrap.undefined_symbol;
+        let type_id = bootstrap.any_type;
+        let source_error = |error| CanonicalProgramCheckError::SourceCheck {
+            file_name: "/project/input.ts".to_owned(),
+            error: SourceCheckError::DeclaredType(DeclaredTypeError::TypeNodeUnavailable(error)),
+        };
+
+        let unsupported = [
+            TypeNodeUnavailable::GenericAliasConstraintUnsupported {
+                alias: symbol,
+                parameter: node,
+            },
+            TypeNodeUnavailable::GenericAliasInstantiationUnsupported {
+                alias: symbol,
+                declared_type: type_id,
+            },
+            TypeNodeUnavailable::GenericAliasDefaultReferenceUnsupported {
+                alias: symbol,
+                default_type: node,
+                referenced_parameter: symbol,
+            },
+            TypeNodeUnavailable::CircularGenericAliasDefault {
+                alias: symbol,
+                default_type: node,
+            },
+        ];
+        assert!(
+            unsupported
+                .into_iter()
+                .map(source_error)
+                .all(|error| error.is_unsupported_boundary())
+        );
+
+        let invariant = [
+            TypeNodeUnavailable::MissingGenericAliasMetadata(symbol),
+            TypeNodeUnavailable::InvalidGenericAliasInstantiationCache(symbol),
+        ];
+        assert!(
+            invariant
+                .into_iter()
+                .map(source_error)
+                .all(|error| !error.is_unsupported_boundary())
         );
     }
 
