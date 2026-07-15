@@ -9,6 +9,7 @@
 pub mod alias;
 pub mod alias_flags;
 pub mod alias_provider;
+mod assignment;
 pub mod bootstrap;
 mod contextual;
 pub mod declared;
