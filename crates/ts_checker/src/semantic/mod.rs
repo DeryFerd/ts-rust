@@ -99,7 +99,7 @@ pub use relation::{
     SignatureCheckMode,
 };
 pub use source::{
-    SourceCheckError, SourceCheckProvenanceError, SourceLiteralCacheError,
+    SourceAssertionError, SourceCheckError, SourceCheckProvenanceError, SourceLiteralCacheError,
     SourceObjectLiteralError, SourceSyntaxRole, UnsupportedSourceSyntax,
 };
 pub use store::SemanticStore;

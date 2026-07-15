@@ -10,7 +10,7 @@ use std::collections::HashSet;
 
 use super::{
     CanonicalTypeMapperStore, DeclaredTypeHost, RelationUnavailable, TypeId,
-    source::{PlannedExpression, PlannedExpressionKind, SourceCheckError},
+    source::{PlannedExpression, PlannedExpressionKind, SourceCheckError, UnsupportedSourceSyntax},
     type_records::{TypeData, TypeRecord},
     types::TypeFlags,
 };
@@ -71,6 +71,18 @@ pub(super) fn prepare_expression_context(
         Some(contextual_type),
         ExpressionLocation::Cached,
     )
+}
+
+/// Prepares an expression that is checked without a contextual type.
+///
+/// Assertion operands use this path: the asserted type controls the result of
+/// the assertion, but it does not contextually type the operand.
+pub(super) fn prepare_expression_without_context(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    expression: &PlannedExpression,
+) -> Result<PreparedExpression, SourceCheckError> {
+    prepare_expression(store, host, expression, None, ExpressionLocation::Cached)
 }
 
 /// Validates every type reachable from the contextual target before source
@@ -159,6 +171,11 @@ fn prepare_expression(
         PlannedExpressionKind::Parenthesized(inner) => PreparedExpression::Parenthesized(Box::new(
             prepare_expression(store, host, inner, contextual_type, location)?,
         )),
+        PlannedExpressionKind::Assertion { .. } => {
+            return Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::NestedAssertion(expression.node),
+            ));
+        }
         PlannedExpressionKind::Object { plan, properties } => {
             debug_assert_eq!(plan.properties.len(), properties.len());
             let contextual = contextual_object(store, host, contextual_type)?;

@@ -538,6 +538,7 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             files,
             store,
             diagnostics,
+            global_types,
             ..
         } = self;
         let host = DeclaredTypeHost::from_registry(
@@ -545,8 +546,14 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             files,
             GlobalMergeCompletion::new(options.name_resolution),
         )?;
-        CanonicalTypeQuery::new(store, &host, *options, diagnostics)?
-            .get_declared_type_of_symbol(symbol)
+        CanonicalTypeQuery::new_with_global_types(
+            store,
+            &host,
+            global_types,
+            *options,
+            diagnostics,
+        )?
+        .get_declared_type_of_symbol(symbol)
     }
 
     /// Resolves one type node through the context-owned query session.
@@ -561,6 +568,7 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             files,
             store,
             diagnostics,
+            global_types,
             ..
         } = self;
         let host = DeclaredTypeHost::from_registry(
@@ -568,7 +576,14 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             files,
             GlobalMergeCompletion::new(options.name_resolution),
         )?;
-        CanonicalTypeQuery::new(store, &host, *options, diagnostics)?.get_type_from_type_node(node)
+        CanonicalTypeQuery::new_with_global_types(
+            store,
+            &host,
+            global_types,
+            *options,
+            diagnostics,
+        )?
+        .get_type_from_type_node(node)
     }
 
     /// Checks the supported statements in one retained source file.
@@ -592,6 +607,7 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             store,
             diagnostics,
             source_diagnostic_staging,
+            global_types,
             ..
         } = self;
         let (arena, bound) = files.snapshot(file).ok_or(SourceCheckError::Provenance(
@@ -614,6 +630,7 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             bound,
             source_file,
             &host,
+            global_types,
             store,
             *options,
             &mut staged,
@@ -1976,6 +1993,44 @@ mod tests {
             Some(true)
         );
         assert_eq!(context.diagnostics().len(), 2);
+    }
+
+    #[test]
+    fn context_queries_thread_the_authoritative_array_target() {
+        let source = parsed("interface Array<T> {} type Values = number[];");
+        let file = FileId::new(804);
+        let body = type_alias_body(&source, file, "Values");
+        let mut context = CanonicalCheckerContext::new(
+            completed_bindings(&[(file, &source)]),
+            vec![(file, &source.arena)],
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap();
+        let array_target = context.global_types().array_type;
+        let number_type = context.store().intrinsic_bootstrap().unwrap().number_type;
+
+        let array = context.get_type_from_type_node(body).unwrap();
+
+        let TypeData::TypeReference(reference) =
+            context.store().type_payload(array).unwrap().data()
+        else {
+            panic!("array syntax must resolve to the canonical Array reference")
+        };
+        assert_eq!(reference.object.target, Some(array_target));
+        assert_eq!(
+            reference.resolved_type_arguments.as_deref(),
+            Some(&[number_type][..])
+        );
+        assert!(
+            context
+                .store()
+                .type_payload(array)
+                .unwrap()
+                .object_flags()
+                .contains(ObjectFlags::REFERENCE | ObjectFlags::FROM_TYPE_NODE)
+        );
+        let values = global_symbol(&context, "Values").unwrap();
+        assert_eq!(context.get_declared_type_of_symbol(values), Ok(array));
     }
 
     #[test]

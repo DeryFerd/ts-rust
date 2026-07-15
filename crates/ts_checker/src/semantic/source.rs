@@ -16,16 +16,25 @@ use std::collections::HashSet;
 use ts_ast::{FileId, ModifierList, Node, NodeArena, NodeData, NodeId, NodeRef, SyntaxKind};
 use ts_binder::{BoundFile, SemanticSymbolId};
 use ts_core::TextRange;
+use ts_diagnostics::{Diagnostic, message_by_code};
 use ts_jsnum::{Number, PseudoBigInt};
 
 use super::{
-    AssignmentInvariant, AssignmentUnsupported, CanonicalCheckerDiagnostic,
-    CanonicalCheckerDiagnostics, CanonicalCheckerOptions, CanonicalTypeMapperStore,
-    DeclaredTypeError, DeclaredTypeHost, RelationUnavailable, SourceFileLinks, SourceFileRef,
-    TypeDisplayUnavailable, TypeId,
+    AssertionLinks, AssignmentInvariant, AssignmentUnsupported, CanonicalCheckerDiagnostic,
+    CanonicalCheckerDiagnostics, CanonicalCheckerOptions, CanonicalGlobalTypes,
+    CanonicalTypeMapperStore, DeclaredTypeError, DeclaredTypeHost, DerivedTypeError,
+    RelationUnavailable, SourceFileLinks, SourceFileRef, TypeDisplayUnavailable, TypeId,
     bootstrap::LiteralTypeCacheError,
-    contextual::{LiteralTreatment, PreparedExpression, prepare_expression_context},
+    contextual::{
+        LiteralTreatment, PreparedExpression, prepare_expression_context,
+        prepare_expression_without_context,
+    },
+    formatter::{
+        CanonicalTypeFormatFlags, get_type_names_for_assignability_error_with_host_and_flags,
+    },
     type_nodes::{CanonicalTypeQuery, normalize_bigint_literal, normalize_numeric_separators},
+    type_records::TypeRecord,
+    types::TypeFlags,
 };
 
 const NODE_FLAG_JSDOC: u32 = 1 << 22;
@@ -49,6 +58,8 @@ pub enum SourceSyntaxRole {
     VariableType,
     VariableInitializer,
     PrefixUnaryOperand,
+    AssertionType,
+    AssertionOperand,
     ObjectLiteral,
     ObjectProperty,
 }
@@ -76,6 +87,8 @@ pub enum UnsupportedSourceSyntax {
         node: NodeRef,
         operator: SyntaxKind,
     },
+    ConstAssertion(NodeRef),
+    NestedAssertion(NodeRef),
     Assignment(AssignmentUnsupported),
 }
 
@@ -134,6 +147,22 @@ pub enum SourceObjectLiteralError {
     Capacity(NodeRef),
 }
 
+/// Assertion-expression cache or deferred-queue state rejected atomically.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SourceAssertionError {
+    InvalidOperandCache {
+        node: NodeRef,
+        cached: Option<TypeId>,
+        expected: TypeId,
+    },
+    InvalidExpressionCache {
+        node: NodeRef,
+        cached: Option<TypeId>,
+        expected: TypeId,
+    },
+    InvalidDeferredNodes(SourceFileRef),
+}
+
 impl From<LiteralTypeCacheError> for SourceLiteralCacheError {
     fn from(error: LiteralTypeCacheError) -> Self {
         match error {
@@ -163,6 +192,8 @@ pub enum SourceCheckError {
     TypeDisplayUnavailable(TypeDisplayUnavailable),
     LiteralCache(SourceLiteralCacheError),
     ObjectLiteral(SourceObjectLiteralError),
+    DerivedType(DerivedTypeError),
+    Assertion(SourceAssertionError),
     Assignment(AssignmentInvariant),
     MissingDiagnostic(u32),
 }
@@ -179,6 +210,8 @@ impl std::fmt::Display for SourceCheckError {
             Self::TypeDisplayUnavailable(error) => write!(formatter, "{error}"),
             Self::LiteralCache(error) => write!(formatter, "literal cache failed: {error:?}"),
             Self::ObjectLiteral(error) => write!(formatter, "object literal failed: {error:?}"),
+            Self::DerivedType(error) => write!(formatter, "{error}"),
+            Self::Assertion(error) => write!(formatter, "assertion checking failed: {error:?}"),
             Self::Assignment(error) => write!(formatter, "assignment planning failed: {error:?}"),
             Self::MissingDiagnostic(code) => {
                 write!(formatter, "diagnostic TS{code} is absent from the catalog")
@@ -193,10 +226,12 @@ impl std::error::Error for SourceCheckError {
             Self::DeclaredType(error) => Some(error),
             Self::RelationUnavailable(error) => Some(error),
             Self::TypeDisplayUnavailable(error) => Some(error),
+            Self::DerivedType(error) => Some(error),
             Self::Provenance(_)
             | Self::Unsupported(_)
             | Self::LiteralCache(_)
             | Self::ObjectLiteral(_)
+            | Self::Assertion(_)
             | Self::Assignment(_)
             | Self::MissingDiagnostic(_) => None,
         }
@@ -224,6 +259,12 @@ impl From<TypeDisplayUnavailable> for SourceCheckError {
 impl From<LiteralTypeCacheError> for SourceCheckError {
     fn from(error: LiteralTypeCacheError) -> Self {
         Self::LiteralCache(error.into())
+    }
+}
+
+impl From<DerivedTypeError> for SourceCheckError {
+    fn from(error: DerivedTypeError) -> Self {
+        Self::DerivedType(error)
     }
 }
 
@@ -262,6 +303,10 @@ pub(super) enum PlannedExpressionKind {
     Boolean(bool),
     GlobalUndefined,
     Parenthesized(Box<PlannedExpression>),
+    Assertion {
+        type_node: NodeRef,
+        operand: Box<PlannedExpression>,
+    },
     Object {
         plan: super::object_members::PropertyObjectPlan,
         properties: Vec<PlannedExpression>,
@@ -277,9 +322,17 @@ struct PlannedVariable {
 
 #[derive(Clone, Debug)]
 struct PlannedAssignment {
+    expression: NodeRef,
     left: NodeRef,
     target_type_node: NodeRef,
     right: PlannedExpression,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DeferredAssertion {
+    node: NodeRef,
+    operand_type: TypeId,
+    target_type: TypeId,
 }
 
 #[derive(Clone, Debug)]
@@ -499,6 +552,7 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                     .map_err(Self::assignment_plan_error)?;
                     let right = self.plan_expression(assignment.right)?;
                     statements.push(PlannedStatement::Assignment(PlannedAssignment {
+                        expression: assignment.expression,
                         left: assignment.left,
                         target_type_node: assignment.target_type_node,
                         right,
@@ -981,9 +1035,84 @@ impl<'arena, 'semantic, 'sources> SourcePlanner<'arena, 'semantic, 'sources> {
                 ))
             }
             SyntaxKind::PrefixUnaryExpression => self.plan_prefix_unary(expression),
+            SyntaxKind::TypeAssertionExpression | SyntaxKind::AsExpression => {
+                self.plan_assertion(expression)
+            }
             SyntaxKind::ObjectLiteralExpression => self.plan_object_literal(expression),
             _ => Err(self.unsupported(expression, kind, SourceSyntaxRole::VariableInitializer)),
         }
+    }
+
+    fn plan_assertion(
+        &mut self,
+        expression: NodeRef,
+    ) -> Result<PlannedExpression, SourceCheckError> {
+        let (type_id, operand_id) = {
+            let node = self.node(expression)?;
+            match (&node.data, node.kind) {
+                (NodeData::TypeAssertion(assertion), SyntaxKind::TypeAssertionExpression) => {
+                    (assertion.type_, assertion.expression)
+                }
+                (NodeData::AsExpression(assertion), SyntaxKind::AsExpression) => {
+                    (assertion.type_, assertion.expression)
+                }
+                _ => {
+                    return Err(self.unsupported(
+                        expression,
+                        node.kind,
+                        SourceSyntaxRole::VariableInitializer,
+                    ));
+                }
+            }
+        };
+        let type_node = self.reference(type_id);
+        let operand = self.reference(operand_id);
+        let type_record = self.node(type_node)?;
+        if type_record.parent != Some(expression.node) {
+            return Err(self.unsupported(
+                type_node,
+                type_record.kind,
+                SourceSyntaxRole::AssertionType,
+            ));
+        }
+        let operand_record = self.node(operand)?;
+        if operand_record.parent != Some(expression.node) {
+            return Err(self.unsupported(
+                operand,
+                operand_record.kind,
+                SourceSyntaxRole::AssertionOperand,
+            ));
+        }
+        if self.is_const_assertion_type(type_node)? {
+            return Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::ConstAssertion(expression),
+            ));
+        }
+        Ok(PlannedExpression::new(
+            expression,
+            PlannedExpressionKind::Assertion {
+                type_node,
+                operand: Box::new(self.plan_expression(operand)?),
+            },
+        ))
+    }
+
+    fn is_const_assertion_type(&self, type_node: NodeRef) -> Result<bool, SourceCheckError> {
+        let record = self.node(type_node)?;
+        let NodeData::TypeReferenceNode(reference) = &record.data else {
+            return Ok(false);
+        };
+        if record.kind != SyntaxKind::TypeReference || reference.type_arguments.is_some() {
+            return Ok(false);
+        }
+        let name = self.reference(reference.type_name);
+        let name_record = self.node(name)?;
+        let NodeData::Identifier(identifier) = &name_record.data else {
+            return Ok(false);
+        };
+        Ok(name_record.kind == SyntaxKind::Identifier
+            && name_record.parent == Some(type_node.node)
+            && identifier.text == "const")
     }
 
     fn is_global_undefined(&self) -> bool {
@@ -1289,16 +1418,34 @@ fn valid_range(
     source_text.is_none_or(|text| usize::try_from(end).is_ok_and(|end| end <= text.len()))
 }
 
+#[cfg(test)]
 fn expression_type(
     store: &mut CanonicalTypeMapperStore,
     expression: &PlannedExpression,
     prepared: &PreparedExpression,
 ) -> Result<TypeId, SourceCheckError> {
-    match (&expression.kind, prepared) {
+    Ok(execute_expression_types(store, expression, prepared)?.result)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CheckedExpressionTypes {
+    raw: TypeId,
+    result: TypeId,
+}
+
+fn execute_expression_types(
+    store: &mut CanonicalTypeMapperStore,
+    expression: &PlannedExpression,
+    prepared: &PreparedExpression,
+) -> Result<CheckedExpressionTypes, SourceCheckError> {
+    let types = match (&expression.kind, prepared) {
         (PlannedExpressionKind::Null, PreparedExpression::Literal(LiteralTreatment::Identity)) => {
             store
                 .intrinsic_bootstrap()
-                .map(|bootstrap| bootstrap.null_widening_type)
+                .map(|bootstrap| CheckedExpressionTypes {
+                    raw: bootstrap.null_widening_type,
+                    result: bootstrap.null_widening_type,
+                })
                 .ok_or(SourceCheckError::LiteralCache(
                     SourceLiteralCacheError::BootstrapUninitialized,
                 ))
@@ -1319,14 +1466,17 @@ fn expression_type(
                 .ok_or(SourceCheckError::LiteralCache(
                     SourceLiteralCacheError::BootstrapUninitialized,
                 ))?;
-            prepared_literal_type(store, regular, widened, *treatment)
+            checked_literal_types(store, regular, widened, *treatment)
         }
         (
             PlannedExpressionKind::GlobalUndefined,
             PreparedExpression::Literal(LiteralTreatment::Identity),
         ) => store
             .intrinsic_bootstrap()
-            .map(|bootstrap| bootstrap.undefined_widening_type)
+            .map(|bootstrap| CheckedExpressionTypes {
+                raw: bootstrap.undefined_widening_type,
+                result: bootstrap.undefined_widening_type,
+            })
             .ok_or(SourceCheckError::LiteralCache(
                 SourceLiteralCacheError::BootstrapUninitialized,
             )),
@@ -1338,7 +1488,7 @@ fn expression_type(
                 .ok_or(SourceCheckError::LiteralCache(
                     SourceLiteralCacheError::BootstrapUninitialized,
                 ))?;
-            prepared_literal_type(store, regular, widened, *treatment)
+            checked_literal_types(store, regular, widened, *treatment)
         }
         (
             PlannedExpressionKind::Number {
@@ -1357,7 +1507,7 @@ fn expression_type(
                 .ok_or(SourceCheckError::LiteralCache(
                     SourceLiteralCacheError::BootstrapUninitialized,
                 ))?;
-            prepared_literal_type(store, regular, widened, *treatment)
+            checked_literal_types(store, regular, widened, *treatment)
         }
         (
             PlannedExpressionKind::BigInt {
@@ -1376,12 +1526,12 @@ fn expression_type(
                 .ok_or(SourceCheckError::LiteralCache(
                     SourceLiteralCacheError::BootstrapUninitialized,
                 ))?;
-            prepared_literal_type(store, regular, widened, *treatment)
+            checked_literal_types(store, regular, widened, *treatment)
         }
         (
             PlannedExpressionKind::Parenthesized(inner),
             PreparedExpression::Parenthesized(prepared),
-        ) => expression_type(store, inner, prepared),
+        ) => execute_expression_types(store, inner, prepared),
         (
             PlannedExpressionKind::Object { plan, properties },
             PreparedExpression::Object(prepared_properties),
@@ -1392,13 +1542,31 @@ fn expression_type(
                 .map_err(source_object_execution_error)?;
             let mut property_types = Vec::with_capacity(properties.len());
             for (property, prepared) in properties.iter().zip(prepared_properties) {
-                property_types.push(expression_type(store, property, prepared)?);
+                property_types.push(execute_expression_types(store, property, prepared)?.result);
             }
-            super::object_members::publish_object_literal(store, plan, &property_types)
-                .map_err(source_object_execution_error)
+            let object =
+                super::object_members::publish_object_literal(store, plan, &property_types)
+                    .map_err(source_object_execution_error)?;
+            Ok(CheckedExpressionTypes {
+                raw: object,
+                result: object,
+            })
         }
         _ => unreachable!("a prepared expression must retain its planned expression shape"),
-    }
+    }?;
+    publish_expression_type(store, expression.node, types.raw)?;
+    Ok(types)
+}
+
+fn checked_literal_types(
+    store: &CanonicalTypeMapperStore,
+    regular: TypeId,
+    widened: TypeId,
+    treatment: LiteralTreatment,
+) -> Result<CheckedExpressionTypes, SourceCheckError> {
+    let raw = store.fresh_type_of_literal_type(regular)?;
+    let result = prepared_literal_type(store, regular, widened, treatment)?;
+    Ok(CheckedExpressionTypes { raw, result })
 }
 
 fn prepared_literal_type(
@@ -1454,6 +1622,265 @@ fn source_object_execution_error(
     }
 }
 
+fn publish_expression_type(
+    store: &mut CanonicalTypeMapperStore,
+    node: NodeRef,
+    type_: TypeId,
+) -> Result<(), SourceCheckError> {
+    let mut links = store.type_node_links(node).cloned().unwrap_or_default();
+    if let Some(cached) = links.resolved_type {
+        return if cached == type_ {
+            Ok(())
+        } else {
+            Err(SourceCheckError::Assertion(
+                SourceAssertionError::InvalidExpressionCache {
+                    node,
+                    cached: Some(cached),
+                    expected: type_,
+                },
+            ))
+        };
+    }
+    links.resolved_type = Some(type_);
+    if !store.set_type_node_links(node, links) {
+        return Err(SourceCheckError::Assertion(
+            SourceAssertionError::InvalidExpressionCache {
+                node,
+                cached: None,
+                expected: type_,
+            },
+        ));
+    }
+    Ok(())
+}
+
+fn publish_assertion_operand(
+    store: &mut CanonicalTypeMapperStore,
+    node: NodeRef,
+    operand_type: TypeId,
+) -> Result<(), SourceCheckError> {
+    if let Some(links) = store.assertion_links(node) {
+        return if links.expr_type == Some(operand_type) {
+            Ok(())
+        } else if links.expr_type.is_some() {
+            Err(SourceCheckError::Assertion(
+                SourceAssertionError::InvalidOperandCache {
+                    node,
+                    cached: links.expr_type,
+                    expected: operand_type,
+                },
+            ))
+        } else if store.set_assertion_links(
+            node,
+            AssertionLinks {
+                expr_type: Some(operand_type),
+            },
+        ) {
+            Ok(())
+        } else {
+            Err(SourceCheckError::Assertion(
+                SourceAssertionError::InvalidOperandCache {
+                    node,
+                    cached: None,
+                    expected: operand_type,
+                },
+            ))
+        };
+    }
+    if !store.set_assertion_links(
+        node,
+        AssertionLinks {
+            expr_type: Some(operand_type),
+        },
+    ) {
+        return Err(SourceCheckError::Assertion(
+            SourceAssertionError::InvalidOperandCache {
+                node,
+                cached: None,
+                expected: operand_type,
+            },
+        ));
+    }
+    Ok(())
+}
+
+fn enqueue_deferred_assertion(
+    store: &mut CanonicalTypeMapperStore,
+    source: SourceFileRef,
+    node: NodeRef,
+) -> Result<(), SourceCheckError> {
+    let mut links = store.source_file_links(source).cloned().unwrap_or_default();
+    links.deferred_nodes.insert(node);
+    if !store.set_source_file_links(source, links) {
+        return Err(SourceCheckError::Provenance(
+            SourceCheckProvenanceError::SourceLinkPublication(source),
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_expression_type(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source: SourceFileRef,
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    expression: &PlannedExpression,
+    contextual_type: Option<TypeId>,
+    deferred: &mut Vec<DeferredAssertion>,
+) -> Result<CheckedExpressionTypes, SourceCheckError> {
+    match &expression.kind {
+        PlannedExpressionKind::Parenthesized(inner) => {
+            let types = check_expression_type(
+                store,
+                host,
+                global_types,
+                source,
+                options,
+                diagnostics,
+                inner,
+                contextual_type,
+                deferred,
+            )?;
+            publish_expression_type(store, expression.node, types.raw)?;
+            Ok(types)
+        }
+        PlannedExpressionKind::Assertion { type_node, operand } => {
+            let operand_types = check_expression_type(
+                store,
+                host,
+                global_types,
+                source,
+                options,
+                diagnostics,
+                operand,
+                None,
+                deferred,
+            )?;
+            publish_assertion_operand(store, expression.node, operand_types.result)?;
+            let mut assertion_diagnostics = CanonicalCheckerDiagnostics::default();
+            let target = CanonicalTypeQuery::new_with_global_types(
+                store,
+                host,
+                global_types,
+                options,
+                &mut assertion_diagnostics,
+            )?
+            .get_type_from_type_node(*type_node);
+            merge_retry_diagnostics(diagnostics, assertion_diagnostics);
+            let target = target?;
+            publish_expression_type(store, expression.node, target)?;
+            enqueue_deferred_assertion(store, source, expression.node)?;
+            deferred.push(DeferredAssertion {
+                node: expression.node,
+                operand_type: operand_types.result,
+                target_type: target,
+            });
+            Ok(CheckedExpressionTypes {
+                raw: target,
+                result: target,
+            })
+        }
+        _ => {
+            let prepared = if let Some(contextual_type) = contextual_type {
+                prepare_expression_context(store, host, expression, contextual_type)?
+            } else {
+                prepare_expression_without_context(store, host, expression)?
+            };
+            execute_expression_types(store, expression, &prepared)
+        }
+    }
+}
+
+fn validate_deferred_assertions(
+    store: &CanonicalTypeMapperStore,
+    source: SourceFileRef,
+    deferred: &[DeferredAssertion],
+) -> Result<(), SourceCheckError> {
+    let actual = store
+        .source_file_links(source)
+        .map(|links| links.deferred_nodes.iter().copied().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let expected = deferred
+        .iter()
+        .map(|assertion| assertion.node)
+        .collect::<Vec<_>>();
+    if actual != expected {
+        return Err(SourceCheckError::Assertion(
+            SourceAssertionError::InvalidDeferredNodes(source),
+        ));
+    }
+    Ok(())
+}
+
+fn assertion_operand_types(
+    store: &mut CanonicalTypeMapperStore,
+    operand: TypeId,
+) -> Result<(TypeId, TypeId), SourceCheckError> {
+    let flags = store
+        .type_payload(operand)
+        .map(TypeRecord::flags)
+        .ok_or(DerivedTypeError::Type(operand))?;
+    let bootstrap = store
+        .intrinsic_bootstrap()
+        .ok_or(DerivedTypeError::BootstrapUninitialized)?;
+    let base = if flags.intersects(TypeFlags::STRING_LITERAL) {
+        bootstrap.string_type
+    } else if flags.intersects(TypeFlags::NUMBER_LITERAL) {
+        bootstrap.number_type
+    } else if flags.intersects(TypeFlags::BIG_INT_LITERAL) {
+        bootstrap.bigint_type
+    } else if flags.intersects(TypeFlags::BOOLEAN_LITERAL) {
+        bootstrap.boolean_type
+    } else {
+        operand
+    };
+    let regular = store.get_regular_type_of_object_literal(base)?;
+    let widened = store.get_widened_type(regular)?;
+    Ok((regular, widened))
+}
+
+fn check_deferred_assertions(
+    store: &mut CanonicalTypeMapperStore,
+    host: &DeclaredTypeHost<'_>,
+    options: CanonicalCheckerOptions,
+    diagnostics: &mut CanonicalCheckerDiagnostics,
+    deferred: &[DeferredAssertion],
+) -> Result<(), SourceCheckError> {
+    let mut flags = CanonicalTypeFormatFlags::TYPE_TO_STRING_DEFAULT;
+    if options.no_error_truncation {
+        flags |= CanonicalTypeFormatFlags::NO_TRUNCATION;
+    }
+    for assertion in deferred {
+        let (operand, widened) = assertion_operand_types(store, assertion.operand_type)?;
+        if store.is_type_comparable_to(assertion.target_type, widened)? {
+            continue;
+        }
+        let display = get_type_names_for_assignability_error_with_host_and_flags(
+            store,
+            host,
+            operand,
+            assertion.target_type,
+            flags,
+        )?;
+        let diagnostic = Diagnostic::with_arguments(
+            message_by_code(2352).ok_or(SourceCheckError::MissingDiagnostic(2352))?,
+            [display.source, display.target],
+        );
+        merge_retry_diagnostic(
+            diagnostics,
+            CanonicalCheckerDiagnostic {
+                node: Some(assertion.node),
+                diagnostic,
+                related_information: Vec::new(),
+            },
+        );
+    }
+    Ok(())
+}
+
 pub(super) fn merge_retry_diagnostic(
     destination: &mut CanonicalCheckerDiagnostics,
     diagnostic: CanonicalCheckerDiagnostic,
@@ -1480,22 +1907,49 @@ pub(super) fn merge_retry_diagnostics(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Keeps the source execution capabilities explicit.
 fn check_planned_assignment(
     store: &mut CanonicalTypeMapperStore,
     host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
+    source: SourceFileRef,
     options: CanonicalCheckerOptions,
     diagnostics: &mut CanonicalCheckerDiagnostics,
+    deferred: &mut Vec<DeferredAssertion>,
     target_type_node: NodeRef,
     expression: &PlannedExpression,
     fallback_node: NodeRef,
+    assignment_expression: Option<NodeRef>,
 ) -> Result<(), SourceCheckError> {
     let mut statement_diagnostics = CanonicalCheckerDiagnostics::default();
-    let target = CanonicalTypeQuery::new(store, host, options, &mut statement_diagnostics)?
-        .get_type_from_type_node(target_type_node);
+    let target = CanonicalTypeQuery::new_with_global_types(
+        store,
+        host,
+        global_types,
+        options,
+        &mut statement_diagnostics,
+    )?
+    .get_type_from_type_node(target_type_node);
     merge_retry_diagnostics(diagnostics, statement_diagnostics);
     let target = target?;
-    let prepared = prepare_expression_context(store, host, expression, target)?;
-    let source_type = expression_type(store, expression, &prepared)?;
+    if assignment_expression.is_some() {
+        publish_expression_type(store, fallback_node, target)?;
+    }
+    let source_types = check_expression_type(
+        store,
+        host,
+        global_types,
+        source,
+        options,
+        diagnostics,
+        expression,
+        Some(target),
+        deferred,
+    )?;
+    if let Some(assignment_expression) = assignment_expression {
+        publish_expression_type(store, assignment_expression, source_types.result)?;
+    }
+    let source_type = source_types.result;
     if !store.is_type_assignable_to(source_type, target)? {
         let staged = super::object_diagnostics::diagnostics_for_failed_assignment(
             store,
@@ -1514,11 +1968,13 @@ fn check_planned_assignment(
 }
 
 /// Checks one already-retained source into context-owned private staging.
+#[allow(clippy::too_many_arguments)] // Mirrors the context-owned source execution boundary.
 pub(super) fn check_source_file(
     arena: &NodeArena,
     bound: &BoundFile,
     source: SourceFileRef,
     host: &DeclaredTypeHost<'_>,
+    global_types: &CanonicalGlobalTypes,
     store: &mut CanonicalTypeMapperStore,
     options: CanonicalCheckerOptions,
     diagnostics: &mut CanonicalCheckerDiagnostics,
@@ -1537,14 +1993,20 @@ pub(super) fn check_source_file(
 
     let plan = SourcePlanner::new_semantic(arena, bound, source, store, host).finish()?;
     store.prepare_regular_literal_types(&plan.strings, &plan.numbers, &plan.bigints)?;
+    let mut deferred = Vec::new();
 
     for statement in plan.statements {
         match statement {
             PlannedStatement::TypeAlias(symbol) | PlannedStatement::Interface(symbol) => {
                 let mut statement_diagnostics = CanonicalCheckerDiagnostics::default();
-                let result =
-                    CanonicalTypeQuery::new(store, host, options, &mut statement_diagnostics)
-                        .and_then(|mut query| query.get_declared_type_of_symbol(symbol));
+                let result = CanonicalTypeQuery::new_with_global_types(
+                    store,
+                    host,
+                    global_types,
+                    options,
+                    &mut statement_diagnostics,
+                )
+                .and_then(|mut query| query.get_declared_type_of_symbol(symbol));
                 merge_retry_diagnostics(diagnostics, statement_diagnostics);
                 result?;
             }
@@ -1554,25 +2016,36 @@ pub(super) fn check_source_file(
                     check_planned_assignment(
                         store,
                         host,
+                        global_types,
+                        source,
                         options,
                         diagnostics,
+                        &mut deferred,
                         variable.type_node,
                         &variable.initializer,
                         variable.name,
+                        None,
                     )?;
                 }
             }
             PlannedStatement::Assignment(assignment) => check_planned_assignment(
                 store,
                 host,
+                global_types,
+                source,
                 options,
                 diagnostics,
+                &mut deferred,
                 assignment.target_type_node,
                 &assignment.right,
                 assignment.left,
+                Some(assignment.expression),
             )?,
         }
     }
+
+    validate_deferred_assertions(store, source, &deferred)?;
+    check_deferred_assertions(store, host, options, diagnostics, &deferred)?;
 
     Ok(())
 }
@@ -2076,7 +2549,12 @@ mod tests {
         let source = parsed(r#"var target: number = 0; target = "wrong";"#);
         let file = FileId::new(112);
         let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
-        let (left, _) = assignment_parts(&source, file, 0);
+        let (left, right) = assignment_parts(&source, file, 0);
+        let expression = NodeRef::new(
+            source.arena.id(),
+            file,
+            source.arena.get(left.node).unwrap().parent.unwrap(),
+        );
 
         context.check_source_file(file).unwrap();
 
@@ -2087,7 +2565,173 @@ mod tests {
         assert_eq!(diagnostic.diagnostic.code(), 2322);
         assert_eq!(diagnostic.diagnostic.arguments, ["string", "number"]);
         assert!(diagnostic.related_information.is_empty());
+        assert_eq!(
+            resolved_node_type(&context, left),
+            context.store().intrinsic_bootstrap().unwrap().number_type,
+        );
+        assert_eq!(
+            resolved_node_type(&context, expression),
+            resolved_node_type(&context, right),
+            "a simple assignment expression has the checked RHS type",
+        );
         assert!(is_type_checked(&context, file));
+    }
+
+    #[test]
+    fn assertion_context_and_deferred_comparison_match_contextual_typing_18() {
+        let source = parsed("var foo: {id:number;} = <{id:number;}>({ }); foo = {id: 5};");
+        let file = FileId::new(114);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let assertion = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::TypeAssertionExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+        let NodeData::TypeAssertion(assertion_data) =
+            &source.arena.get(assertion.node).unwrap().data
+        else {
+            panic!("expected a type assertion")
+        };
+        let target_node = NodeRef::new(source.arena.id(), file, assertion_data.type_);
+        let parenthesized = NodeRef::new(source.arena.id(), file, assertion_data.expression);
+        let NodeData::ParenthesizedExpression(parenthesized_data) =
+            &source.arena.get(parenthesized.node).unwrap().data
+        else {
+            panic!("expected a parenthesized assertion operand")
+        };
+        let operand = NodeRef::new(source.arena.id(), file, parenthesized_data.expression);
+
+        context.check_source_file(file).unwrap();
+
+        assert!(context.diagnostics().is_empty());
+        let store = context.store();
+        let target_type = store
+            .type_node_links(target_node)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let assertion_type = store
+            .type_node_links(assertion)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        let operand_type = store
+            .type_node_links(operand)
+            .and_then(|links| links.resolved_type)
+            .unwrap();
+        assert_eq!(assertion_type, target_type);
+        assert_ne!(operand_type, target_type);
+        assert_eq!(
+            store
+                .type_node_links(parenthesized)
+                .and_then(|links| links.resolved_type),
+            Some(operand_type)
+        );
+        assert_eq!(
+            store.assertion_links(assertion),
+            Some(&AssertionLinks {
+                expr_type: Some(operand_type),
+            })
+        );
+        let source_ref = context.source_file(file).unwrap();
+        assert_eq!(
+            store
+                .source_file_links(source_ref)
+                .unwrap()
+                .deferred_nodes
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            [assertion]
+        );
+        assert!(is_type_checked(&context, file));
+
+        let warm = observable_state(&context, file);
+        context.check_source_file(file).unwrap();
+        assert_eq!(observable_state(&context, file), warm);
+    }
+
+    #[test]
+    fn asserted_types_do_not_contextually_type_object_operands() {
+        let source = parsed("var value: {id: 1} = ({id: 1} as {id: 1});");
+        let file = FileId::new(117);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let operand = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::ObjectLiteralExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+
+        context.check_source_file(file).unwrap();
+
+        assert!(context.diagnostics().is_empty());
+        assert_eq!(
+            object_property_type(&context, operand, "id"),
+            context.store().intrinsic_bootstrap().unwrap().number_type,
+        );
+        assert!(is_type_checked(&context, file));
+    }
+
+    #[test]
+    fn nonoverlapping_assertions_issue_exact_ts2352_at_the_assertion() {
+        let source = parsed(r#"var value: number = "x" as number;"#);
+        let file = FileId::new(115);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let assertion = source
+            .arena
+            .iter()
+            .find_map(|(node, record)| {
+                (record.kind == SyntaxKind::AsExpression).then_some(NodeRef::new(
+                    source.arena.id(),
+                    file,
+                    node,
+                ))
+            })
+            .unwrap();
+
+        context.check_source_file(file).unwrap();
+
+        let [diagnostic] = context.diagnostics().as_slice() else {
+            panic!("expected one assertion diagnostic")
+        };
+        assert_eq!(diagnostic.node, Some(assertion));
+        assert_eq!(diagnostic.diagnostic.code(), 2352);
+        assert_eq!(diagnostic.diagnostic.arguments, ["string", "number"]);
+        assert_eq!(
+            diagnostic.diagnostic.render().unwrap(),
+            "Conversion of type 'string' to type 'number' may be a mistake because neither type sufficiently overlaps with the other. If this was intentional, convert the expression to 'unknown' first."
+        );
+        assert!(diagnostic.related_information.is_empty());
+        assert_eq!(node_text(&source, assertion), r#""x" as number"#);
+        assert!(is_type_checked(&context, file));
+    }
+
+    #[test]
+    fn const_assertions_remain_an_atomic_typed_boundary() {
+        let source = parsed(r#"var value: "x" = "x" as const;"#);
+        let file = FileId::new(116);
+        let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
+        let before = observable_state(&context, file);
+
+        assert!(matches!(
+            context.check_source_file(file),
+            Err(SourceCheckError::Unsupported(
+                UnsupportedSourceSyntax::ConstAssertion(_)
+            ))
+        ));
+        assert_eq!(observable_state(&context, file), before);
+        assert!(context.diagnostics().is_empty());
+        assert!(!is_type_checked(&context, file));
     }
 
     #[test]
@@ -2445,6 +3089,10 @@ mod tests {
         );
         let contextual = variable_initializer(&source, file, "contextual");
         let uncontextual = variable_initializer(&source, file, "uncontextual");
+        let exact_string = object_property_initializer(&source, file, contextual, "exactString");
+        let broad_string = object_property_initializer(&source, file, contextual, "broadString");
+        let exact_number = object_property_initializer(&source, file, contextual, "exactNumber");
+        let broad_number = object_property_initializer(&source, file, contextual, "broadNumber");
 
         context.check_source_file(file).unwrap();
 
@@ -2521,6 +3169,24 @@ mod tests {
                 null_widening,
                 undefined_widening,
             ]
+        );
+        let fresh_x = context
+            .store()
+            .fresh_type_of_literal_type(regular_x)
+            .unwrap();
+        let fresh_one = context
+            .store()
+            .fresh_type_of_literal_type(regular_one)
+            .unwrap();
+        assert_eq!(
+            [
+                resolved_node_type(&context, exact_string),
+                resolved_node_type(&context, broad_string),
+                resolved_node_type(&context, exact_number),
+                resolved_node_type(&context, broad_number),
+            ],
+            [fresh_x, fresh_x, fresh_one, fresh_one],
+            "expression links retain raw literal identity while mutable property results are transformed",
         );
         assert!(context.diagnostics().is_empty());
         assert!(is_type_checked(&context, file));
@@ -3835,7 +4501,8 @@ mod tests {
 
     #[test]
     fn expression_literals_use_fresh_booleans_and_null_widening_identity() {
-        let source = parsed("");
+        let source =
+            parsed("const yes: any = true; const no: any = false; const none: any = null;");
         let file = FileId::new(43);
         let mut context = context(&[(file, &source)], CanonicalCheckerOptions::default());
         let (true_type, regular_true, false_type, regular_false, null_type, null_widening) = {
@@ -3851,11 +4518,13 @@ mod tests {
         };
 
         let store = context.store_mut_for_test();
-        let node = NodeRef::new(source.arena.id(), file, source.source_file);
+        let yes = variable_initializer(&source, file, "yes");
+        let no = variable_initializer(&source, file, "no");
+        let none = variable_initializer(&source, file, "none");
         assert_eq!(
             expression_type(
                 store,
-                &PlannedExpression::new(node, PlannedExpressionKind::Boolean(true)),
+                &PlannedExpression::new(yes, PlannedExpressionKind::Boolean(true)),
                 &PreparedExpression::Literal(LiteralTreatment::Fresh),
             ),
             Ok(true_type)
@@ -3863,7 +4532,7 @@ mod tests {
         assert_eq!(
             expression_type(
                 store,
-                &PlannedExpression::new(node, PlannedExpressionKind::Boolean(false)),
+                &PlannedExpression::new(no, PlannedExpressionKind::Boolean(false)),
                 &PreparedExpression::Literal(LiteralTreatment::Fresh),
             ),
             Ok(false_type)
@@ -3871,7 +4540,7 @@ mod tests {
         assert_eq!(
             expression_type(
                 store,
-                &PlannedExpression::new(node, PlannedExpressionKind::Null),
+                &PlannedExpression::new(none, PlannedExpressionKind::Null),
                 &PreparedExpression::Literal(LiteralTreatment::Identity),
             ),
             Ok(null_widening)

@@ -23,6 +23,7 @@ const NODE_FLAG_CONST: u32 = 1 << 1;
 /// The source nodes needed by assignment contextual typing and execution.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct SimpleAssignmentPlan {
+    pub expression: NodeRef,
     pub left: NodeRef,
     pub right: NodeRef,
     pub target_type_node: NodeRef,
@@ -385,6 +386,7 @@ impl AssignmentPlanner<'_, '_> {
         self.validate_declaration_symbol(left, declaration, target, export_local, &name)?;
         let target_type_node = self.validate_variable_declaration(left, declaration, &name)?;
         Ok(SimpleAssignmentPlan {
+            expression,
             left,
             right,
             target_type_node,
@@ -999,7 +1001,7 @@ mod tests {
         NodeRef::new(parsed.arena.id(), declaration.file, variable.type_.unwrap())
     }
 
-    fn assignment_parts(parsed: &ParseResult, statement: NodeRef) -> (NodeRef, NodeRef) {
+    fn assignment_parts(parsed: &ParseResult, statement: NodeRef) -> (NodeRef, NodeRef, NodeRef) {
         let NodeData::ExpressionStatement(statement_data) =
             &parsed.arena.get(statement.node).unwrap().data
         else {
@@ -1011,6 +1013,7 @@ mod tests {
             panic!("expected binary expression")
         };
         (
+            NodeRef::new(parsed.arena.id(), statement.file, statement_data.expression),
             NodeRef::new(parsed.arena.id(), statement.file, binary.left),
             NodeRef::new(parsed.arena.id(), statement.file, binary.right),
         )
@@ -1036,13 +1039,14 @@ mod tests {
     fn plans_initialized_typed_var_without_semantic_writes() {
         let fixture = Fixture::new("var target: number = 0; target = 1;");
         let statement = fixture.expression_statement(0);
-        let (left, right) = assignment_parts(&fixture.parsed, statement);
+        let (expression, left, right) = assignment_parts(&fixture.parsed, statement);
         let declaration = fixture.variable_declaration("target");
         let before = observable_state(&fixture.store);
 
         assert_eq!(
             fixture.plan(0),
             Ok(SimpleAssignmentPlan {
+                expression,
                 left,
                 right,
                 target_type_node: variable_type(&fixture.parsed, declaration),
@@ -1202,7 +1206,7 @@ mod tests {
     #[test]
     fn deferred_source_families_are_capability_boundaries_from_resolver_construction() {
         let fixture = Fixture::new("var target: number = 0; target = 1;");
-        let (left, _) = assignment_parts(&fixture.parsed, fixture.expression_statement(0));
+        let (_, left, _) = assignment_parts(&fixture.parsed, fixture.expression_statement(0));
 
         for error in [
             CanonicalNameResolutionError::JavaScriptDeferred(fixture.file),

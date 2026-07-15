@@ -6,8 +6,6 @@
 //! source object's symbol, clone only properties whose type changes, and keep
 //! the upstream cache identities stable across warm queries.
 
-#![allow(dead_code)] // Production callers land in the sibling assertion-dispatch integration.
-
 use std::collections::{HashMap, HashSet};
 
 use ts_ast::{NodeRef, SyntaxKind};
@@ -293,30 +291,6 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             .widened_types
             .get(&type_)
             .expect("the root widened type plan was published"))
-    }
-
-    /// Exact object-literal entry point used by assertion checking.
-    pub(super) fn get_widened_type_of_object_literal(
-        &mut self,
-        type_: TypeId,
-    ) -> Result<TypeId, DerivedTypeError> {
-        let record = self
-            .type_payload(type_)
-            .ok_or(DerivedTypeError::Type(type_))?;
-        if !record.object_flags().contains(ObjectFlags::OBJECT_LITERAL) {
-            return Err(DerivedTypeError::MalformedObjectLiteral(type_));
-        }
-        if self.intrinsic_bootstrap().is_none() {
-            return Err(DerivedTypeError::BootstrapUninitialized);
-        }
-        let mut regular_visiting = HashSet::new();
-        if self
-            .validated_widening_object_shape(type_, &mut regular_visiting)
-            .is_none()
-        {
-            return Err(DerivedTypeError::MalformedObjectLiteral(type_));
-        }
-        self.get_widened_type(type_)
     }
 
     /// Validates a relation operand that may be a cached regular or widened
@@ -1287,13 +1261,6 @@ mod tests {
             context
                 .store_mut_for_test()
                 .get_widened_type(regular)
-                .unwrap(),
-            widened
-        );
-        assert_eq!(
-            context
-                .store_mut_for_test()
-                .get_widened_type_of_object_literal(regular)
                 .unwrap(),
             widened
         );

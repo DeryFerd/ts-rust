@@ -760,7 +760,13 @@ impl<'store, 'host, 'arena> TypeQueryPlanner<'store, 'host, 'arena> {
         // A missing or malformed global Array resolves directly to the empty
         // object fallback before the element type is consulted upstream.
         if fallback.is_none() {
-            if let Some(alias) = alias_owner {
+            if let Some(alias) = alias_owner
+                && self
+                    .plan
+                    .aliases
+                    .get(&alias)
+                    .is_some_and(|plan| !plan.type_parameters.is_empty())
+            {
                 return Err(type_node_unavailable(
                     TypeNodeUnavailable::GenericReferenceUnsupported {
                         node,
@@ -2646,7 +2652,6 @@ impl<'store, 'host, 'arena, 'diagnostics> CanonicalTypeQuery<'store, 'host, 'are
     /// Opens a query with the context-owned standard-library identities. Only
     /// this capability may enable `T[]`; an ordinary query continues to fail
     /// closed instead of discovering or synthesizing an `Array` lookalike.
-    #[allow(dead_code)] // The integration branch owns threading globals into production queries.
     pub(super) fn new_with_global_types(
         store: &'store mut CanonicalTypeMapperStore,
         host: &'host DeclaredTypeHost<'arena>,

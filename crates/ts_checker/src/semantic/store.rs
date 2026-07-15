@@ -128,7 +128,6 @@ pub struct SemanticStore<TypePayload, MapperPayload> {
     declared_types_in_progress: HashSet<SemanticSymbolId>,
     type_resolutions: TypeResolutionStack,
     relations: RelationCaches,
-    #[allow(dead_code)] // Read by the sibling assertion-dispatch integration.
     pub(super) derived_types: DerivedTypeCaches,
     pub(super) intrinsic_bootstrap: Option<IntrinsicBootstrap>,
     claimed_strict_builtin_iterator_return: Option<bool>,
