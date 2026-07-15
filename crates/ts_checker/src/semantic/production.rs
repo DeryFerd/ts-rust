@@ -1,10 +1,12 @@
 //! Production construction boundary for the canonical checker core.
 //!
 //! This module adopts declaration-complete canonical binder output into one
-//! checker-owned semantic store. Construction stops immediately after ordered
-//! source-file registration and intrinsic bootstrap. In particular, this is
-//! intentionally before typescript-go's `initializeChecker` global merge,
-//! alias resolution, and compiler-host adapter work.
+//! checker-owned semantic store. Construction includes the dependency-closed
+//! prefix of typescript-go's `initializeChecker`: ordered global merging,
+//! deferred ambient-module collection, UMD globals, global-scope
+//! augmentations, and the built-in `undefined` conflict rule. Alias-dependent
+//! merging, checker diagnostics, global library types, and non-global module
+//! augmentations remain explicit typed boundaries.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -12,11 +14,13 @@ use ts_ast::{
     FileId, NodeArena, NodeArenaId, NodeArenaRevision, NodeData, NodeId, NodeRef, SyntaxKind,
 };
 use ts_binder::{
-    BoundFile, CanonicalExtractionError, CanonicalProgramBindings, SemanticStoreId, SymbolStore,
+    BoundFile, CanonicalExtractionError, CanonicalPatternAmbientModule, CanonicalProgramBindings,
+    EscapedName, SemanticStoreId, SemanticSymbolId, SymbolFlags, SymbolStore, SymbolTableId,
 };
 
 use super::{
     CanonicalTypeMapperStore, IntrinsicBootstrapError, IntrinsicBootstrapOptions, SourceFileRef,
+    SymbolMergeError,
 };
 
 #[derive(Debug)]
@@ -38,6 +42,9 @@ pub struct CanonicalCheckerContext<'arena> {
     file_order: Vec<FileId>,
     files: BTreeMap<FileId, CanonicalCheckerFile<'arena>>,
     store: CanonicalTypeMapperStore,
+    globals: SymbolTableId,
+    pending_ambient_modules: Vec<SemanticSymbolId>,
+    pattern_ambient_modules: Vec<CanonicalPatternAmbientModule>,
 }
 
 impl<'arena> CanonicalCheckerContext<'arena> {
@@ -46,14 +53,16 @@ impl<'arena> CanonicalCheckerContext<'arena> {
     ///
     /// Binder extraction, exact Program correspondence, and source-root
     /// validation run before a checker store is created. Full-tree source
-    /// registration and bootstrap then write only to a local store, which is
-    /// dropped on failure, so callers can never observe a partial context.
+    /// registration, bootstrap, and global initialization then write only to a
+    /// local store, which is dropped on failure, so callers can never observe a
+    /// partial context.
     ///
     /// # Errors
     ///
     /// Returns [`CanonicalCheckerContextError`] when declaration extraction,
     /// the exact file/arena correspondence, source-root provenance, source
-    /// registration, or intrinsic bootstrap fails.
+    /// registration, intrinsic bootstrap, or the supported global-
+    /// initialization prefix fails.
     pub fn new(
         bindings: CanonicalProgramBindings,
         ordered_arenas: Vec<(FileId, &'arena NodeArena)>,
@@ -65,7 +74,10 @@ impl<'arena> CanonicalCheckerContext<'arena> {
 
         preflight_program(&symbols, &bound_files, &ordered_arenas)?;
 
-        let file_order = ordered_arenas.iter().map(|(file, _)| *file).collect();
+        let file_order = ordered_arenas
+            .iter()
+            .map(|(file, _)| *file)
+            .collect::<Vec<_>>();
         let mut store = CanonicalTypeMapperStore::from_symbol_store(symbols);
         let mut registered = Vec::with_capacity(ordered_arenas.len());
         for (file, arena) in ordered_arenas {
@@ -101,10 +113,16 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             return Err(CanonicalCheckerContextError::SourceRegistrationFailed(file));
         }
 
+        let initialized = initialize_globals(&mut store, &file_order, &files)
+            .map_err(CanonicalCheckerContextError::GlobalInitialization)?;
+
         Ok(Self {
             file_order,
             files,
             store,
+            globals: initialized.globals,
+            pending_ambient_modules: initialized.pending_ambient_modules,
+            pattern_ambient_modules: initialized.pattern_ambient_modules,
         })
     }
 
@@ -134,10 +152,349 @@ impl<'arena> CanonicalCheckerContext<'arena> {
         &self.store
     }
 
+    /// The bootstrap-owned global symbol table after the supported
+    /// `initializeChecker` prefix completed.
+    #[must_use]
+    pub const fn globals(&self) -> SymbolTableId {
+        self.globals
+    }
+
+    /// Quoted ambient-module symbols deferred until global library types exist.
+    /// Entries follow Program order and escaped-byte name order within a file.
+    #[must_use]
+    pub fn pending_ambient_modules(&self) -> &[SemanticSymbolId] {
+        &self.pending_ambient_modules
+    }
+
+    /// Wildcard ambient modules retained in Program/declaration order.
+    #[must_use]
+    pub fn pattern_ambient_modules(&self) -> &[CanonicalPatternAmbientModule] {
+        &self.pattern_ambient_modules
+    }
+
     /// The brand shared by adopted binder symbols and checker-owned records.
     #[must_use]
     pub fn id(&self) -> SemanticStoreId {
         self.store.id()
+    }
+}
+
+#[derive(Debug)]
+struct GlobalInitialization {
+    globals: SymbolTableId,
+    pending_ambient_modules: Vec<SemanticSymbolId>,
+    pattern_ambient_modules: Vec<CanonicalPatternAmbientModule>,
+}
+
+#[allow(clippy::too_many_lines)] // Preserves pinned initializeChecker phase order visibly.
+fn initialize_globals(
+    store: &mut CanonicalTypeMapperStore,
+    file_order: &[FileId],
+    files: &BTreeMap<FileId, CanonicalCheckerFile<'_>>,
+) -> Result<GlobalInitialization, CanonicalGlobalInitializationError> {
+    let (globals, undefined_symbol) = store
+        .intrinsic_bootstrap()
+        .map(|bootstrap| (bootstrap.globals, bootstrap.undefined_symbol))
+        .ok_or(CanonicalGlobalInitializationError::MissingBootstrap)?;
+    let mut pending_ambient_modules = Vec::new();
+    let mut pattern_ambient_modules = Vec::new();
+
+    // Preserve the explicit Program order. Every symbol-table pass below
+    // sorts by escaped bytes because the canonical table intentionally uses a
+    // hash map and must never become an implicit source of nondeterminism.
+    for &file in file_order {
+        let entry = files
+            .get(&file)
+            .ok_or(CanonicalGlobalInitializationError::MissingFile(file))?;
+        let facts = entry.bound.source_facts().ok_or(
+            CanonicalGlobalInitializationError::MissingSourceFileFacts(file),
+        )?;
+
+        if !facts.is_external_or_common_js_module()
+            && let Some(locals) = entry.bound.locals(entry.bound.source_file())
+        {
+            if let Some(global_this) = table_symbol(store, file, locals, "globalThis")? {
+                let record = store.symbol(global_this).ok_or(
+                    CanonicalGlobalInitializationError::InvalidSymbol(global_this),
+                )?;
+                if let Some(declaration) = record
+                    .declarations()
+                    .and_then(|declarations| declarations.first())
+                    .copied()
+                {
+                    return Err(
+                        CanonicalGlobalInitializationError::ScriptGlobalThisDeclaration {
+                            file,
+                            declaration,
+                        },
+                    );
+                }
+            }
+
+            for (name, symbol) in ordered_table_entries(store, file, locals)? {
+                let flags = store
+                    .symbol(symbol)
+                    .ok_or(CanonicalGlobalInitializationError::InvalidSymbol(symbol))?
+                    .flags();
+                if flags.intersects(SymbolFlags::MODULE)
+                    && is_ambient_module_symbol_name(name.as_bytes())
+                {
+                    pending_ambient_modules.push(symbol);
+                } else {
+                    store.merge_global_symbol(globals, symbol)?;
+                }
+            }
+        }
+
+        pattern_ambient_modules.extend_from_slice(entry.bound.pattern_ambient_modules());
+
+        if let Some(global_exports) = entry.bound.global_exports() {
+            if entry.bound.symbol(entry.bound.source_file()).is_none() {
+                return Err(CanonicalGlobalInitializationError::MissingSourceFileSymbol(
+                    file,
+                ));
+            }
+            for (name, symbol) in ordered_table_entries(store, file, global_exports)? {
+                let present = store
+                    .symbol_table(globals)
+                    .ok_or(CanonicalGlobalInitializationError::InvalidTable {
+                        file,
+                        table: globals,
+                    })?
+                    .get(name.as_ref())
+                    .is_some();
+                if !present {
+                    match store.insert_symbol(globals, name, symbol) {
+                        Some(None) => {}
+                        Some(Some(_)) => {
+                            return Err(
+                                CanonicalGlobalInitializationError::UnexpectedUmdCollision {
+                                    file,
+                                    symbol,
+                                },
+                            );
+                        }
+                        None => {
+                            return Err(CanonicalGlobalInitializationError::InvalidUmdInsertion {
+                                file,
+                                symbol,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Global-scope augmentations run only after every ordinary global and UMD
+    // export is indexed, and before the built-in `undefined` rule.
+    for &file in file_order {
+        let entry = files
+            .get(&file)
+            .ok_or(CanonicalGlobalInitializationError::MissingFile(file))?;
+        for &augmentation_name in entry.bound.module_augmentations() {
+            let module = validate_augmentation_name(entry, file, augmentation_name)?;
+            let Some(NodeData::ModuleDeclaration(module_data)) =
+                entry.arena.get(module.node).map(|node| &node.data)
+            else {
+                return Err(CanonicalGlobalInitializationError::InvalidAugmentationName(
+                    augmentation_name,
+                ));
+            };
+            if module_data.keyword != SyntaxKind::GlobalKeyword {
+                continue;
+            }
+            let symbol = entry
+                .bound
+                .symbol(module)
+                .ok_or(CanonicalGlobalInitializationError::MissingAugmentationSymbol(module))?;
+            let record = store
+                .symbol(symbol)
+                .ok_or(CanonicalGlobalInitializationError::InvalidSymbol(symbol))?;
+            let Some(first_declaration) = record
+                .declarations()
+                .and_then(|declarations| declarations.first())
+                .copied()
+            else {
+                return Err(
+                    CanonicalGlobalInitializationError::MissingAugmentationDeclaration(symbol),
+                );
+            };
+            if first_declaration != module {
+                continue;
+            }
+            if let Some(exports) = record.exports() {
+                store.merge_symbol_table(globals, exports, false, None)?;
+            }
+        }
+    }
+
+    add_undefined_to_globals(store, files, globals, undefined_symbol)?;
+
+    Ok(GlobalInitialization {
+        globals,
+        pending_ambient_modules,
+        pattern_ambient_modules,
+    })
+}
+
+fn table_symbol(
+    store: &CanonicalTypeMapperStore,
+    file: FileId,
+    table: SymbolTableId,
+    name: &str,
+) -> Result<Option<SemanticSymbolId>, CanonicalGlobalInitializationError> {
+    Ok(store
+        .symbol_table(table)
+        .ok_or(CanonicalGlobalInitializationError::InvalidTable { file, table })?
+        .get_source(name))
+}
+
+fn ordered_table_entries(
+    store: &CanonicalTypeMapperStore,
+    file: FileId,
+    table: SymbolTableId,
+) -> Result<Vec<(EscapedName, SemanticSymbolId)>, CanonicalGlobalInitializationError> {
+    let mut entries = store
+        .symbol_table(table)
+        .ok_or(CanonicalGlobalInitializationError::InvalidTable { file, table })?
+        .iter()
+        .map(|(name, symbol)| (name.to_owned(), symbol))
+        .collect::<Vec<_>>();
+    entries.sort_unstable_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+    Ok(entries)
+}
+
+fn is_ambient_module_symbol_name(name: &[u8]) -> bool {
+    name.len() >= 2 && name.first() == Some(&b'"') && name.last() == Some(&b'"')
+}
+
+fn validate_augmentation_name(
+    entry: &CanonicalCheckerFile<'_>,
+    file: FileId,
+    name: NodeRef,
+) -> Result<NodeRef, CanonicalGlobalInitializationError> {
+    if !name.is_for(entry.arena.id(), file) || !entry.bound.contains(name) {
+        return Err(CanonicalGlobalInitializationError::InvalidAugmentationName(
+            name,
+        ));
+    }
+    let Some(name_node) = entry.arena.get(name.node) else {
+        return Err(CanonicalGlobalInitializationError::InvalidAugmentationName(
+            name,
+        ));
+    };
+    let Some(module_id) = name_node.parent else {
+        return Err(CanonicalGlobalInitializationError::InvalidAugmentationName(
+            name,
+        ));
+    };
+    let module = NodeRef::new(entry.arena.id(), file, module_id);
+    let Some(NodeData::ModuleDeclaration(module_data)) =
+        entry.arena.get(module_id).map(|node| &node.data)
+    else {
+        return Err(CanonicalGlobalInitializationError::InvalidAugmentationName(
+            name,
+        ));
+    };
+    if module_data.name != name.node || !entry.bound.contains(module) {
+        return Err(CanonicalGlobalInitializationError::InvalidAugmentationName(
+            name,
+        ));
+    }
+    Ok(module)
+}
+
+fn add_undefined_to_globals(
+    store: &mut CanonicalTypeMapperStore,
+    files: &BTreeMap<FileId, CanonicalCheckerFile<'_>>,
+    globals: SymbolTableId,
+    undefined_symbol: SemanticSymbolId,
+) -> Result<(), CanonicalGlobalInitializationError> {
+    let existing = store
+        .symbol_table(globals)
+        .ok_or(CanonicalGlobalInitializationError::InvalidGlobals(globals))?
+        .get_source("undefined");
+    if let Some(existing) = existing {
+        let record = store
+            .symbol(existing)
+            .ok_or(CanonicalGlobalInitializationError::InvalidSymbol(existing))?;
+        if let Some(declarations) = record.declarations() {
+            for &declaration in declarations {
+                if !is_type_declaration(files, declaration)? {
+                    return Err(
+                        CanonicalGlobalInitializationError::UndefinedValueDeclaration(declaration),
+                    );
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    match store.insert_symbol(globals, EscapedName::source("undefined"), undefined_symbol) {
+        Some(None) => Ok(()),
+        Some(Some(_)) => Err(CanonicalGlobalInitializationError::UnexpectedUndefinedCollision),
+        None => Err(
+            CanonicalGlobalInitializationError::InvalidUndefinedInsertion {
+                globals,
+                undefined_symbol,
+            },
+        ),
+    }
+}
+
+fn is_type_declaration(
+    files: &BTreeMap<FileId, CanonicalCheckerFile<'_>>,
+    declaration: NodeRef,
+) -> Result<bool, CanonicalGlobalInitializationError> {
+    let entry = files
+        .get(&declaration.file)
+        .ok_or(CanonicalGlobalInitializationError::InvalidDeclarationProvenance(declaration))?;
+    if !declaration.is_for(entry.arena.id(), declaration.file) || !entry.bound.contains(declaration)
+    {
+        return Err(CanonicalGlobalInitializationError::InvalidDeclarationProvenance(declaration));
+    }
+    let node = entry
+        .arena
+        .get(declaration.node)
+        .ok_or(CanonicalGlobalInitializationError::InvalidDeclarationProvenance(declaration))?;
+    match node.kind {
+        SyntaxKind::TypeParameter
+        | SyntaxKind::ClassDeclaration
+        | SyntaxKind::InterfaceDeclaration
+        | SyntaxKind::TypeAliasDeclaration
+        | SyntaxKind::JsTypeAliasDeclaration
+        | SyntaxKind::EnumDeclaration => Ok(true),
+        SyntaxKind::ImportClause => {
+            let NodeData::ImportClause(clause) = &node.data else {
+                return Err(
+                    CanonicalGlobalInitializationError::InvalidDeclarationProvenance(declaration),
+                );
+            };
+            Ok(clause.phase_modifier == Some(SyntaxKind::TypeKeyword))
+        }
+        SyntaxKind::ImportSpecifier | SyntaxKind::ExportSpecifier => {
+            let Some(parent) = node.parent.and_then(|parent| entry.arena.get(parent)) else {
+                return Err(
+                    CanonicalGlobalInitializationError::InvalidDeclarationProvenance(declaration),
+                );
+            };
+            let Some(container) = parent.parent.and_then(|parent| entry.arena.get(parent)) else {
+                return Err(
+                    CanonicalGlobalInitializationError::InvalidDeclarationProvenance(declaration),
+                );
+            };
+            match &container.data {
+                NodeData::ImportClause(clause) => {
+                    Ok(clause.phase_modifier == Some(SyntaxKind::TypeKeyword))
+                }
+                NodeData::ExportDeclaration(export) => Ok(export.is_type_only),
+                _ => Err(
+                    CanonicalGlobalInitializationError::InvalidDeclarationProvenance(declaration),
+                ),
+            }
+        }
+        _ => Ok(false),
     }
 }
 
@@ -262,6 +619,155 @@ fn root_reachable_nodes(arena: &NodeArena, source_file: NodeId) -> BTreeSet<Node
     reachable
 }
 
+/// Why the supported `initializeChecker` global prefix could not complete.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CanonicalGlobalInitializationError {
+    /// Intrinsic bootstrap was not present at the internal sequencing boundary.
+    MissingBootstrap,
+    /// Program order referred to a file missing from the prepared context.
+    MissingFile(FileId),
+    /// A prepared file unexpectedly lost its required source facts.
+    MissingSourceFileFacts(FileId),
+    /// A binder-owned symbol table failed store-provenance validation.
+    InvalidTable { file: FileId, table: SymbolTableId },
+    /// The bootstrap-owned globals table failed store-provenance validation.
+    InvalidGlobals(SymbolTableId),
+    /// A binder-owned symbol failed store-provenance validation.
+    InvalidSymbol(SemanticSymbolId),
+    /// A script declaration requires the pinned TS2397 diagnostic owner.
+    ScriptGlobalThisDeclaration { file: FileId, declaration: NodeRef },
+    /// `GlobalExports` existed without the external source-file symbol that
+    /// owns its alias entries.
+    MissingSourceFileSymbol(FileId),
+    /// A UMD first-in-wins insertion failed store validation.
+    InvalidUmdInsertion {
+        file: FileId,
+        symbol: SemanticSymbolId,
+    },
+    /// A UMD slot changed after the preceding absence check.
+    UnexpectedUmdCollision {
+        file: FileId,
+        symbol: SemanticSymbolId,
+    },
+    /// A retained module-augmentation name has invalid AST/binder provenance.
+    InvalidAugmentationName(NodeRef),
+    /// A retained global augmentation has no canonical declaration symbol.
+    MissingAugmentationSymbol(NodeRef),
+    /// A global-augmentation symbol has no first declaration for the pinned
+    /// combined-symbol once-only check.
+    MissingAugmentationDeclaration(SemanticSymbolId),
+    /// A declaration reached through a merged symbol is not readable from its
+    /// exact registered file/arena snapshot.
+    InvalidDeclarationProvenance(NodeRef),
+    /// A value declaration of `undefined` requires the pinned TS2397
+    /// diagnostic owner.
+    UndefinedValueDeclaration(NodeRef),
+    /// The `undefined` slot changed after the preceding absence check.
+    UnexpectedUndefinedCollision,
+    /// Installing the intrinsic `undefined` symbol failed store validation.
+    InvalidUndefinedInsertion {
+        globals: SymbolTableId,
+        undefined_symbol: SemanticSymbolId,
+    },
+    /// The exact symbol merge requires an unsupported dependency or rejected
+    /// malformed provenance.
+    Merge(SymbolMergeError),
+}
+
+impl std::fmt::Display for CanonicalGlobalInitializationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingBootstrap => {
+                formatter.write_str("checker global initialization ran before intrinsic bootstrap")
+            }
+            Self::MissingFile(file) => write!(
+                formatter,
+                "global initialization is missing prepared file {}",
+                file.index()
+            ),
+            Self::MissingSourceFileFacts(file) => write!(
+                formatter,
+                "global initialization file {} has no source facts",
+                file.index()
+            ),
+            Self::InvalidTable { file, .. } => write!(
+                formatter,
+                "file {} references a foreign or missing symbol table",
+                file.index()
+            ),
+            Self::InvalidGlobals(_) => {
+                formatter.write_str("bootstrap globals table is foreign or missing")
+            }
+            Self::InvalidSymbol(symbol) => {
+                write!(
+                    formatter,
+                    "global initialization cannot read symbol {symbol:?}"
+                )
+            }
+            Self::ScriptGlobalThisDeclaration { file, declaration } => write!(
+                formatter,
+                "script file {} declares built-in globalThis at {declaration:?}",
+                file.index()
+            ),
+            Self::MissingSourceFileSymbol(file) => write!(
+                formatter,
+                "file {} has UMD exports but no source-file symbol",
+                file.index()
+            ),
+            Self::InvalidUmdInsertion { file, symbol } => write!(
+                formatter,
+                "file {} cannot install UMD symbol {symbol:?}",
+                file.index()
+            ),
+            Self::UnexpectedUmdCollision { file, symbol } => write!(
+                formatter,
+                "file {} observed a late UMD collision for {symbol:?}",
+                file.index()
+            ),
+            Self::InvalidAugmentationName(name) => {
+                write!(formatter, "invalid module-augmentation name {name:?}")
+            }
+            Self::MissingAugmentationSymbol(module) => {
+                write!(formatter, "global augmentation {module:?} has no symbol")
+            }
+            Self::MissingAugmentationDeclaration(symbol) => write!(
+                formatter,
+                "global-augmentation symbol {symbol:?} has no declaration"
+            ),
+            Self::InvalidDeclarationProvenance(declaration) => write!(
+                formatter,
+                "global declaration {declaration:?} has invalid provenance"
+            ),
+            Self::UndefinedValueDeclaration(declaration) => write!(
+                formatter,
+                "value declaration {declaration:?} conflicts with built-in undefined"
+            ),
+            Self::UnexpectedUndefinedCollision => {
+                formatter.write_str("undefined appeared after the preceding absence check")
+            }
+            Self::InvalidUndefinedInsertion { .. } => {
+                formatter.write_str("cannot install the intrinsic undefined global")
+            }
+            Self::Merge(error) => write!(formatter, "global symbol merge failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for CanonicalGlobalInitializationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Merge(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<SymbolMergeError> for CanonicalGlobalInitializationError {
+    fn from(error: SymbolMergeError) -> Self {
+        Self::Merge(error)
+    }
+}
+
 /// Why canonical binder output could not become a complete checker context.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CanonicalCheckerContextError {
@@ -316,6 +822,8 @@ pub enum CanonicalCheckerContextError {
     SourceRegistrationFailed(FileId),
     /// Intrinsic singleton initialization rejected the adopted store.
     Bootstrap(IntrinsicBootstrapError),
+    /// The supported `initializeChecker` global prefix could not complete.
+    GlobalInitialization(CanonicalGlobalInitializationError),
 }
 
 impl std::fmt::Display for CanonicalCheckerContextError {
@@ -406,6 +914,9 @@ impl std::fmt::Display for CanonicalCheckerContextError {
             Self::Bootstrap(error) => {
                 write!(formatter, "checker intrinsic bootstrap failed: {error:?}")
             }
+            Self::GlobalInitialization(error) => {
+                write!(formatter, "checker global initialization failed: {error}")
+            }
         }
     }
 }
@@ -414,6 +925,7 @@ impl std::error::Error for CanonicalCheckerContextError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Extraction(error) => Some(error),
+            Self::GlobalInitialization(error) => Some(error),
             _ => None,
         }
     }
@@ -428,6 +940,12 @@ impl From<CanonicalExtractionError> for CanonicalCheckerContextError {
 impl From<IntrinsicBootstrapError> for CanonicalCheckerContextError {
     fn from(error: IntrinsicBootstrapError) -> Self {
         Self::Bootstrap(error)
+    }
+}
+
+impl From<CanonicalGlobalInitializationError> for CanonicalCheckerContextError {
+    fn from(error: CanonicalGlobalInitializationError) -> Self {
+        Self::GlobalInitialization(error)
     }
 }
 
@@ -448,11 +966,19 @@ mod tests {
     }
 
     fn source_facts(file: FileId) -> CanonicalSourceFileFacts {
+        source_facts_with(file, false, CanonicalModuleState::Script)
+    }
+
+    fn source_facts_with(
+        file: FileId,
+        is_declaration_file: bool,
+        module_state: CanonicalModuleState,
+    ) -> CanonicalSourceFileFacts {
         CanonicalSourceFileFacts::new(
             EscapedName::source(format!("\"/project/{}.ts\"", file.index())),
             CanonicalSourceLanguage::TypeScript,
-            false,
-            CanonicalModuleState::Script,
+            is_declaration_file,
+            module_state,
         )
     }
 
@@ -474,6 +1000,75 @@ mod tests {
                 .unwrap();
         }
         binder.finish()
+    }
+
+    fn completed_bindings_with_facts(
+        files: &[(FileId, &ParseResult, bool, CanonicalModuleState)],
+    ) -> CanonicalProgramBindings {
+        let mut binder = CanonicalBinder::new();
+        for &(file, parsed, is_declaration_file, module_state) in files {
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    source_facts_with(file, is_declaration_file, module_state),
+                )
+                .unwrap();
+        }
+        for &(file, parsed, _, _) in files {
+            binder
+                .bind_typescript_declaration_slice(&parsed.arena, file)
+                .unwrap();
+        }
+        binder.finish()
+    }
+
+    fn global_symbol(
+        context: &CanonicalCheckerContext<'_>,
+        name: &str,
+    ) -> Option<SemanticSymbolId> {
+        context
+            .store()
+            .symbol_table(context.globals())
+            .unwrap()
+            .get_source(name)
+    }
+
+    type NormalizedGlobalSnapshot = Vec<(Vec<u8>, u32, usize)>;
+    type NormalizedRedirectSnapshot = Vec<(usize, Vec<u8>, bool)>;
+
+    fn normalized_global_and_redirect_snapshot(
+        context: &CanonicalCheckerContext<'_>,
+    ) -> (NormalizedGlobalSnapshot, NormalizedRedirectSnapshot) {
+        let mut globals = context
+            .store()
+            .symbol_table(context.globals())
+            .unwrap()
+            .iter()
+            .map(|(name, symbol)| {
+                let record = context.store().symbol(symbol).unwrap();
+                (
+                    name.as_bytes().to_vec(),
+                    record.flags().bits(),
+                    record.declarations().map_or(0, <[NodeRef]>::len),
+                )
+            })
+            .collect::<Vec<_>>();
+        globals.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+
+        let mut redirects = Vec::new();
+        for &file in context.file_order() {
+            let (_, bound) = context.file(file).unwrap();
+            if let Some(locals) = bound.locals(bound.source_file()) {
+                for (name, symbol) in context.store().symbol_table(locals).unwrap().iter() {
+                    let merged = context.store().get_merged_symbol(symbol).unwrap();
+                    redirects.push((file.index(), name.as_bytes().to_vec(), merged != symbol));
+                }
+            }
+        }
+        redirects.sort_unstable();
+        (globals, redirects)
     }
 
     fn allocate_unattached_empty_statement(source: &mut ParseResult) -> NodeId {
@@ -557,6 +1152,439 @@ mod tests {
                 .store()
                 .symbol(bootstrap.global_this_symbol)
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn merges_script_globals_skips_external_locals_and_installs_undefined() {
+        let first = parsed("interface Shared { left: string } interface Alpha { value: string }");
+        let external = parsed("export interface Hidden { value: boolean }");
+        let second = parsed("interface Shared { right: number } interface Alpha { other: number }");
+        let first_file = FileId::new(101);
+        let external_file = FileId::new(102);
+        let second_file = FileId::new(103);
+        let bindings = completed_bindings_with_facts(&[
+            (first_file, &first, false, CanonicalModuleState::Script),
+            (
+                external_file,
+                &external,
+                false,
+                CanonicalModuleState::External,
+            ),
+            (second_file, &second, false, CanonicalModuleState::Script),
+        ]);
+        let context = CanonicalCheckerContext::new(
+            bindings,
+            vec![
+                (first_file, &first.arena),
+                (external_file, &external.arena),
+                (second_file, &second.arena),
+            ],
+            IntrinsicBootstrapOptions::default(),
+        )
+        .unwrap();
+
+        let bootstrap = context.store().intrinsic_bootstrap().unwrap();
+        assert_eq!(context.globals(), bootstrap.globals);
+        assert_eq!(
+            global_symbol(&context, "undefined"),
+            Some(bootstrap.undefined_symbol)
+        );
+        assert!(global_symbol(&context, "Hidden").is_none());
+
+        for name in ["Alpha", "Shared"] {
+            let merged = global_symbol(&context, name).unwrap();
+            let record = context.store().symbol(merged).unwrap();
+            assert!(record.flags().contains(SymbolFlags::INTERFACE));
+            assert!(record.flags().contains(SymbolFlags::TRANSIENT));
+            let declarations = record.declarations().unwrap();
+            assert_eq!(declarations.len(), 2);
+            assert_eq!(declarations[0].file, first_file);
+            assert_eq!(declarations[1].file, second_file);
+        }
+    }
+
+    #[test]
+    fn defers_quoted_ambient_modules_and_retains_patterns_in_stable_order() {
+        let source = parsed(
+            r#"
+declare module "z" { export interface Z {} }
+declare module "*.css" { const classes: object; export = classes; }
+declare module "a" { export interface A {} }
+interface Visible {}
+"#,
+        );
+        let file = FileId::new(104);
+        let context = CanonicalCheckerContext::new(
+            completed_bindings_with_facts(&[(file, &source, true, CanonicalModuleState::Script)]),
+            vec![(file, &source.arena)],
+            IntrinsicBootstrapOptions::default(),
+        )
+        .unwrap();
+
+        assert!(global_symbol(&context, "Visible").is_some());
+        for name in ["\"*.css\"", "\"a\"", "\"z\""] {
+            assert!(global_symbol(&context, name).is_none());
+        }
+        let pending_names = context
+            .pending_ambient_modules()
+            .iter()
+            .map(|symbol| {
+                context
+                    .store()
+                    .symbol(*symbol)
+                    .unwrap()
+                    .name()
+                    .as_utf8()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(pending_names, ["\"*.css\"", "\"a\"", "\"z\""]);
+        assert_eq!(context.pattern_ambient_modules().len(), 1);
+        assert_eq!(context.pattern_ambient_modules()[0].pattern(), "*.css");
+        assert_eq!(
+            context.pattern_ambient_modules()[0].symbol(),
+            context.pending_ambient_modules()[0]
+        );
+    }
+
+    #[test]
+    fn inserts_umd_exports_first_in_wins_without_overwriting_script_globals() {
+        let script = parsed("interface Occupied { script: true }");
+        let first =
+            parsed("export as namespace SharedUmd; export as namespace Occupied; export {};");
+        let second = parsed("export as namespace SharedUmd; export {};");
+        let script_file = FileId::new(105);
+        let first_file = FileId::new(106);
+        let second_file = FileId::new(107);
+        let context = CanonicalCheckerContext::new(
+            completed_bindings_with_facts(&[
+                (script_file, &script, true, CanonicalModuleState::Script),
+                (first_file, &first, true, CanonicalModuleState::External),
+                (second_file, &second, true, CanonicalModuleState::External),
+            ]),
+            vec![
+                (script_file, &script.arena),
+                (first_file, &first.arena),
+                (second_file, &second.arena),
+            ],
+            IntrinsicBootstrapOptions::default(),
+        )
+        .unwrap();
+
+        let (_, first_bound) = context.file(first_file).unwrap();
+        let first_exports = context
+            .store()
+            .symbol_table(first_bound.global_exports().unwrap())
+            .unwrap();
+        assert_eq!(
+            global_symbol(&context, "SharedUmd"),
+            first_exports.get_source("SharedUmd")
+        );
+        assert_ne!(
+            global_symbol(&context, "Occupied"),
+            first_exports.get_source("Occupied")
+        );
+        assert!(
+            context
+                .store()
+                .symbol(global_symbol(&context, "Occupied").unwrap())
+                .unwrap()
+                .flags()
+                .contains(SymbolFlags::INTERFACE)
+        );
+    }
+
+    #[test]
+    fn merges_global_augmentations_once_and_leaves_nonglobal_augmentations_pending() {
+        let source = parsed(
+            r#"
+export {};
+declare global { interface Augmented { first: string } }
+declare module "pkg" { interface NotGlobal {} }
+declare global { interface Augmented { second: number } }
+"#,
+        );
+        let file = FileId::new(108);
+        let context = CanonicalCheckerContext::new(
+            completed_bindings_with_facts(&[(file, &source, true, CanonicalModuleState::External)]),
+            vec![(file, &source.arena)],
+            IntrinsicBootstrapOptions::default(),
+        )
+        .unwrap();
+
+        let augmented = global_symbol(&context, "Augmented").unwrap();
+        assert_eq!(
+            context
+                .store()
+                .symbol(augmented)
+                .unwrap()
+                .declarations()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(global_symbol(&context, "NotGlobal").is_none());
+        assert_eq!(
+            context.file(file).unwrap().1.module_augmentations().len(),
+            3
+        );
+    }
+
+    #[test]
+    fn undefined_preserves_type_only_globals_and_rejects_value_declarations() {
+        // The grammar reports TS2427 for this reserved interface name, but the
+        // pinned checker still classifies the recovered declaration as
+        // type-only and must not add a second TS2397-style conflict.
+        let type_only = parse_source_file("interface undefined { marker: true }");
+        assert_eq!(
+            type_only
+                .diagnostics
+                .iter()
+                .filter_map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [2427]
+        );
+        let type_file = FileId::new(109);
+        let type_context = CanonicalCheckerContext::new(
+            completed_bindings(&[(type_file, &type_only)]),
+            vec![(type_file, &type_only.arena)],
+            IntrinsicBootstrapOptions::default(),
+        )
+        .unwrap();
+        let bootstrap_undefined = type_context
+            .store()
+            .intrinsic_bootstrap()
+            .unwrap()
+            .undefined_symbol;
+        let global_undefined = global_symbol(&type_context, "undefined").unwrap();
+        assert_ne!(global_undefined, bootstrap_undefined);
+        assert!(
+            type_context
+                .store()
+                .symbol(global_undefined)
+                .unwrap()
+                .flags()
+                .contains(SymbolFlags::INTERFACE)
+        );
+
+        let value = parsed("var undefined: number;");
+        let value_file = FileId::new(110);
+        let error = CanonicalCheckerContext::new(
+            completed_bindings(&[(value_file, &value)]),
+            vec![(value_file, &value.arena)],
+            IntrinsicBootstrapOptions::default(),
+        )
+        .unwrap_err();
+        let CanonicalCheckerContextError::GlobalInitialization(
+            CanonicalGlobalInitializationError::UndefinedValueDeclaration(declaration),
+        ) = error
+        else {
+            panic!("unexpected error: {error:?}");
+        };
+        assert_eq!(declaration.file, value_file);
+        assert_eq!(
+            value.arena.get(declaration.node).unwrap().kind,
+            SyntaxKind::VariableDeclaration
+        );
+
+        let augmentation = parsed("export {}; declare global { var undefined: number; }");
+        let augmentation_file = FileId::new(111);
+        let augmentation_error = CanonicalCheckerContext::new(
+            completed_bindings_with_facts(&[(
+                augmentation_file,
+                &augmentation,
+                true,
+                CanonicalModuleState::External,
+            )]),
+            vec![(augmentation_file, &augmentation.arena)],
+            IntrinsicBootstrapOptions::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            augmentation_error,
+            CanonicalCheckerContextError::GlobalInitialization(
+                CanonicalGlobalInitializationError::UndefinedValueDeclaration(_)
+            )
+        ));
+    }
+
+    #[test]
+    fn script_global_this_requires_diagnostics_while_external_locals_are_ignored() {
+        let script = parsed("var globalThis: number;");
+        let script_file = FileId::new(112);
+        let error = CanonicalCheckerContext::new(
+            completed_bindings(&[(script_file, &script)]),
+            vec![(script_file, &script.arena)],
+            IntrinsicBootstrapOptions::default(),
+        )
+        .unwrap_err();
+        let CanonicalCheckerContextError::GlobalInitialization(
+            CanonicalGlobalInitializationError::ScriptGlobalThisDeclaration { file, declaration },
+        ) = error
+        else {
+            panic!("unexpected error: {error:?}");
+        };
+        assert_eq!(file, script_file);
+        assert_eq!(declaration.file, script_file);
+
+        let external = parsed("export {}; declare const globalThis: number;");
+        let external_file = FileId::new(113);
+        let context = CanonicalCheckerContext::new(
+            completed_bindings_with_facts(&[(
+                external_file,
+                &external,
+                true,
+                CanonicalModuleState::External,
+            )]),
+            vec![(external_file, &external.arena)],
+            IntrinsicBootstrapOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            global_symbol(&context, "globalThis"),
+            Some(
+                context
+                    .store()
+                    .intrinsic_bootstrap()
+                    .unwrap()
+                    .global_this_symbol
+            )
+        );
+    }
+
+    #[test]
+    fn escaped_byte_iteration_deterministically_orders_transient_global_merges() {
+        let first = parsed("interface z {} interface a {}");
+        let second = parsed("interface z {} interface a {}");
+        let first_file = FileId::new(114);
+        let second_file = FileId::new(115);
+        let context = CanonicalCheckerContext::new(
+            completed_bindings(&[(first_file, &first), (second_file, &second)]),
+            vec![(first_file, &first.arena), (second_file, &second.arena)],
+            IntrinsicBootstrapOptions::default(),
+        )
+        .unwrap();
+        let repeated = CanonicalCheckerContext::new(
+            completed_bindings(&[(first_file, &first), (second_file, &second)]),
+            vec![(first_file, &first.arena), (second_file, &second.arena)],
+            IntrinsicBootstrapOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            normalized_global_and_redirect_snapshot(&context),
+            normalized_global_and_redirect_snapshot(&repeated)
+        );
+
+        let a = global_symbol(&context, "a").unwrap();
+        let z = global_symbol(&context, "z").unwrap();
+        assert!(a.get() < z.get());
+        assert!(
+            context
+                .store()
+                .symbol(a)
+                .unwrap()
+                .flags()
+                .contains(SymbolFlags::TRANSIENT)
+        );
+        assert!(
+            context
+                .store()
+                .symbol(z)
+                .unwrap()
+                .flags()
+                .contains(SymbolFlags::TRANSIENT)
+        );
+    }
+
+    #[test]
+    fn augmentation_name_mutation_is_rejected_by_the_bound_arena_revision() {
+        let mut source = parsed("export {}; declare global { interface Stale {} }");
+        let file = FileId::new(116);
+        let bindings =
+            completed_bindings_with_facts(&[(file, &source, true, CanonicalModuleState::External)]);
+        let bound = bindings.file(file).unwrap();
+        let expected = bound.node_arena_revision();
+        let augmentation_name = bound.module_augmentations()[0];
+        let NodeData::Identifier(identifier) = &mut source
+            .arena
+            .get_mut(augmentation_name.node)
+            .expect("retained augmentation name exists")
+            .data
+        else {
+            panic!("global augmentation name is an identifier");
+        };
+        identifier.text = "staleGlobal".to_owned();
+        let actual = source.arena.revision();
+
+        let error = CanonicalCheckerContext::new(
+            bindings,
+            vec![(file, &source.arena)],
+            IntrinsicBootstrapOptions::default(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            CanonicalCheckerContextError::ArenaRevisionMismatch {
+                file,
+                expected,
+                actual,
+            }
+        );
+    }
+
+    #[test]
+    fn initializes_real_bundled_es5_core_and_iterator_global_augmentation() {
+        let es5 = parsed(include_str!("../../../ts_bundled/libs/lib.es5.d.ts"));
+        let core = parsed(include_str!(
+            "../../../ts_bundled/libs/lib.es2015.core.d.ts"
+        ));
+        let iterator = parsed(include_str!(
+            "../../../ts_bundled/libs/lib.es2025.iterator.d.ts"
+        ));
+        let es5_file = FileId::new(117);
+        let core_file = FileId::new(118);
+        let iterator_file = FileId::new(119);
+        let context = CanonicalCheckerContext::new(
+            completed_bindings_with_facts(&[
+                (es5_file, &es5, true, CanonicalModuleState::Script),
+                (core_file, &core, true, CanonicalModuleState::Script),
+                (
+                    iterator_file,
+                    &iterator,
+                    true,
+                    CanonicalModuleState::External,
+                ),
+            ]),
+            vec![
+                (es5_file, &es5.arena),
+                (core_file, &core.arena),
+                (iterator_file, &iterator.arena),
+            ],
+            IntrinsicBootstrapOptions::default(),
+        )
+        .unwrap();
+
+        for name in [
+            "Array",
+            "Function",
+            "Object",
+            "Promise",
+            "IteratorObject",
+            "Iterator",
+        ] {
+            assert!(global_symbol(&context, name).is_some(), "missing {name}");
+        }
+        assert_eq!(
+            context
+                .file(iterator_file)
+                .unwrap()
+                .1
+                .module_augmentations()
+                .len(),
+            1
         );
     }
 

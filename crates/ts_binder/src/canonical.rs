@@ -435,6 +435,7 @@ pub struct BoundFile {
     container_chain: Vec<NodeId>,
     diagnostics: Vec<CanonicalBindDiagnostic>,
     pattern_ambient_modules: Vec<CanonicalPatternAmbientModule>,
+    module_augmentations: Vec<NodeRef>,
     global_exports: Option<SymbolTableId>,
     classifiable_names: BTreeSet<EscapedName>,
     not_const_enum_only_modules: BTreeSet<SemanticSymbolId>,
@@ -531,6 +532,17 @@ impl BoundFile {
     #[must_use]
     pub fn pattern_ambient_modules(&self) -> &[CanonicalPatternAmbientModule] {
         &self.pattern_ambient_modules
+    }
+
+    /// Parser-equivalent module-augmentation names in declaration order.
+    ///
+    /// Entries are the exact `ModuleDeclaration.name` nodes consumed by
+    /// `initializeChecker`, including global-scope augmentations. Relative
+    /// nested ambient-module names are excluded exactly as in the pinned
+    /// parser's `collectExternalModuleReferences` pass.
+    #[must_use]
+    pub fn module_augmentations(&self) -> &[NodeRef] {
+        &self.module_augmentations
     }
 
     /// `export as namespace` aliases. Absence remains distinct from an
@@ -1867,7 +1879,22 @@ impl CanonicalBinder {
             if has_syntactic_modifier(arena, node, SyntaxKind::ExportKeyword) {
                 self.push_bind_diagnostic(arena, file, node, 2668, std::iter::empty::<String>());
             }
-            if is_module_augmentation_external(arena, node, facts) {
+            let is_external_augmentation = is_module_augmentation_external(arena, node, facts);
+            if is_external_augmentation
+                && is_parser_collected_module_augmentation(arena, node, facts)
+            {
+                let Some(NodeData::ModuleDeclaration(module)) =
+                    arena.get(node).map(|node| &node.data)
+                else {
+                    unreachable!("ambient-module dispatch is kind checked");
+                };
+                self.files
+                    .get_mut(&file)
+                    .expect("module-augmentation file is registered")
+                    .module_augmentations
+                    .push(NodeRef::new(arena.id(), file, module.name));
+            }
+            if is_external_augmentation {
                 self.declare_module_symbol(arena, file, node, facts, state)?;
             } else {
                 let symbol = self.declare_symbol_and_add_to_symbol_table(
@@ -3557,6 +3584,24 @@ fn is_module_augmentation_external(
     }
 }
 
+fn is_parser_collected_module_augmentation(
+    arena: &NodeArena,
+    node: NodeId,
+    facts: &CanonicalSourceFileFacts,
+) -> bool {
+    if !is_ambient_node(arena, node, facts) {
+        return false;
+    }
+    if facts.is_external_module() {
+        return true;
+    }
+    let Some(NodeData::ModuleDeclaration(module)) = arena.get(node).map(|node| &node.data) else {
+        return false;
+    };
+    let name = node_text(arena, module.name).unwrap_or_default();
+    !ts_path::is_relative(&name) && !ts_path::is_rooted_disk_path(&name)
+}
+
 fn is_ambient_node(arena: &NodeArena, mut node: NodeId, facts: &CanonicalSourceFileFacts) -> bool {
     if facts.is_declaration_file() {
         return true;
@@ -4297,6 +4342,7 @@ impl<'a> FileTraversal<'a> {
             container_chain: self.container_chain,
             diagnostics: Vec::new(),
             pattern_ambient_modules: Vec::new(),
+            module_augmentations: Vec::new(),
             global_exports: None,
             classifiable_names: BTreeSet::new(),
             not_const_enum_only_modules: BTreeSet::new(),
@@ -4589,7 +4635,7 @@ mod tests {
 
     use super::{
         BindingPhase, CanonicalBindError, CanonicalBinder, CanonicalDeclarationError,
-        CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage,
+        CanonicalModuleState, CanonicalSourceFileFacts, CanonicalSourceLanguage, node_text,
     };
     use crate::{EscapedName, InternalSymbolName, SymbolFlags};
 
@@ -7103,6 +7149,102 @@ declare global { interface Window {} }
             bound.diagnostics()[0].diagnostic.arguments,
             ["bad**pattern"]
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Covers both parser collection branches and provenance.
+    fn module_augmentations_preserve_parser_order_and_exact_name_provenance() {
+        let external = parse_source_file(
+            r#"
+declare module "./relative" {}
+declare module "pkg" {}
+declare global { interface Window { marker: true } }
+"#,
+        );
+        assert!(
+            external.diagnostics.is_empty(),
+            "{:?}",
+            external.diagnostics
+        );
+        let external_file = FileId::new(147);
+        let mut external_binder = CanonicalBinder::new();
+        external_binder
+            .bind_source_file_with_facts(
+                &external.arena,
+                external.source_file,
+                external_file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/external\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    true,
+                    CanonicalModuleState::External,
+                ),
+            )
+            .unwrap();
+        external_binder
+            .bind_typescript_declaration_slice(&external.arena, external_file)
+            .unwrap();
+
+        let external_augmentations = external_binder
+            .file(external_file)
+            .unwrap()
+            .module_augmentations();
+        assert_eq!(external_augmentations.len(), 3);
+        assert_eq!(
+            external_augmentations
+                .iter()
+                .map(|name| node_text(&external.arena, name.node).unwrap())
+                .collect::<Vec<_>>(),
+            ["./relative", "pkg", "global"]
+        );
+        for name in external_augmentations {
+            assert!(name.is_for(external.arena.id(), external_file));
+            let module = external.arena.get(name.node).unwrap().parent.unwrap();
+            assert_eq!(
+                external.arena.get(module).unwrap().kind,
+                SyntaxKind::ModuleDeclaration
+            );
+        }
+
+        let script = parse_source_file(
+            r#"
+declare module "outer" {
+    module "nested" {}
+    module "./relative" {}
+    module "C:\\rooted" {}
+}
+"#,
+        );
+        assert!(script.diagnostics.is_empty(), "{:?}", script.diagnostics);
+        let script_file = FileId::new(148);
+        let mut script_binder = CanonicalBinder::new();
+        script_binder
+            .bind_source_file_with_facts(
+                &script.arena,
+                script.source_file,
+                script_file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source("\"/project/script\""),
+                    CanonicalSourceLanguage::TypeScript,
+                    true,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        script_binder
+            .bind_typescript_declaration_slice(&script.arena, script_file)
+            .unwrap();
+
+        let script_augmentations = script_binder
+            .file(script_file)
+            .unwrap()
+            .module_augmentations();
+        assert_eq!(script_augmentations.len(), 1);
+        assert_eq!(
+            node_text(&script.arena, script_augmentations[0].node).as_deref(),
+            Some("nested")
+        );
+        assert!(script_augmentations[0].is_for(script.arena.id(), script_file));
     }
 
     #[test]

@@ -48,7 +48,9 @@ pub use links::{
 };
 pub use mapper::{CanonicalTypeMapperStore, TypeMapper, TypeMapperKind};
 pub use merge::{SymbolMergeDiagnosticKind, SymbolMergeError, get_excluded_symbol_flags};
-pub use production::{CanonicalCheckerContext, CanonicalCheckerContextError};
+pub use production::{
+    CanonicalCheckerContext, CanonicalCheckerContextError, CanonicalGlobalInitializationError,
+};
 pub use relation::{
     ExpandingFlags, IntersectionState, MinArgumentCountFlags, RecursionFlags,
     RelationCacheSnapshot, RelationComparisonResult, RelationKind, RelationStateSnapshot,

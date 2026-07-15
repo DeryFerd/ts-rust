@@ -288,6 +288,7 @@ dependencies = [
  "ts_diagnostics",
  "ts_options",
  "ts_parser",
+ "ts_path",
  "ts_scanner",
 ]
 
