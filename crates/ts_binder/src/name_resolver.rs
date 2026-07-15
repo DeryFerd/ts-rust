@@ -6,15 +6,20 @@
 //! reads would change TypeScript semantics. JavaScript, `JSDoc`, and `CommonJS`
 //! paths are deliberately outside this dependency closure.
 
-use std::ops::ControlFlow;
+use std::{
+    collections::{HashMap, HashSet},
+    num::{NonZeroU32, NonZeroU64},
+    ops::ControlFlow,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use ts_ast::{FileId, ModifierList, NodeArena, NodeData, NodeId, NodeRef, SyntaxKind};
 use ts_diagnostics::{Diagnostic, Message, message_by_code};
 use ts_options::{CompilerOptions, ScriptTarget};
 
 use crate::{
-    BindingPhase, BoundFile, EscapedNameRef, InternalSymbolName, SemanticSymbolId, SymbolFlags,
-    SymbolStore, SymbolTableId,
+    BindingPhase, BoundFile, EscapedNameRef, InternalSymbolName, SemanticStoreId, SemanticSymbolId,
+    SymbolFlags, SymbolStore, SymbolTableId,
 };
 
 const NODE_FLAG_SYNTHESIZED: u32 = 1 << 4;
@@ -66,13 +71,188 @@ pub enum CanonicalScopeChangeState {
     True,
 }
 
+/// Store-branded identity of one checker-owned synthetic `Block` scope.
+///
+/// The pinned checker inserts these scopes while building type nodes so an
+/// inferred signature's parameters and type parameters participate in normal
+/// lexical lookup. [`CanonicalSyntheticScopeStore`] exclusively allocates
+/// these identities and prevents collisions across arenas for the same store.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct CanonicalSyntheticScopeId {
+    store: SemanticStoreId,
+    owner: NonZeroU64,
+    local: NonZeroU32,
+}
+
+impl CanonicalSyntheticScopeId {
+    /// Returns the one-based identity within the allocating scope store.
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.local.get()
+    }
+
+    fn is_for(self, store: SemanticStoreId) -> bool {
+        self.store == store
+    }
+}
+
+static LAST_SYNTHETIC_SCOPE_OWNER: AtomicU64 = AtomicU64::new(0);
+
+fn allocate_synthetic_scope_owner() -> NonZeroU64 {
+    let previous = LAST_SYNTHETIC_SCOPE_OWNER
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_add(1)
+        })
+        .unwrap_or_else(|_| panic!("synthetic scope owner identity space exhausted"));
+    NonZeroU64::new(previous + 1).expect("successful allocation is nonzero")
+}
+
+/// Exact location domain accepted by canonical name resolution.
+///
+/// `None` at the `resolve` boundary is the pinned nil/global location. A
+/// synthetic scope is deliberately narrower than arbitrary host AST: it is
+/// always a synthesized `Block` and exposes only locals plus a parent.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum CanonicalResolutionLocation {
+    Bound(NodeRef),
+    SyntheticScope(CanonicalSyntheticScopeId),
+}
+
+impl From<NodeRef> for CanonicalResolutionLocation {
+    fn from(value: NodeRef) -> Self {
+        Self::Bound(value)
+    }
+}
+
+/// Validated host facts for one synthetic `Block` scope.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CanonicalSyntheticScope {
+    pub locals: SymbolTableId,
+    pub parent: Option<CanonicalResolutionLocation>,
+}
+
+/// Construction failure for a checker-owned synthetic-scope arena.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CanonicalSyntheticScopeStoreError {
+    WrongSymbolStore,
+    InvalidLocals(SymbolTableId),
+    InvalidBoundParent(NodeRef),
+    UnknownSyntheticParent(CanonicalSyntheticScopeId),
+}
+
+impl std::fmt::Display for CanonicalSyntheticScopeStoreError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WrongSymbolStore => {
+                formatter.write_str("synthetic scope arena belongs to another symbol store")
+            }
+            Self::InvalidLocals(_) => {
+                formatter.write_str("synthetic scope locals belong to another symbol store")
+            }
+            Self::InvalidBoundParent(_) => {
+                formatter.write_str("synthetic scope parent is not registered in the symbol store")
+            }
+            Self::UnknownSyntheticParent(_) => {
+                formatter.write_str("synthetic scope parent is not owned by this scope arena")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CanonicalSyntheticScopeStoreError {}
+
+/// Collision-free owner and validator for checker-created synthetic scopes.
+///
+/// IDs cannot be forged or minted from caller-supplied integers. Each arena
+/// has a process-unique owner identity, so two safe arenas over the same
+/// [`SymbolStore`] cannot collide. Requiring an already-allocated synthetic
+/// parent also makes every safely constructed parent graph acyclic.
+#[derive(Debug)]
+pub struct CanonicalSyntheticScopeStore {
+    store: SemanticStoreId,
+    owner: NonZeroU64,
+    scopes: Vec<CanonicalSyntheticScope>,
+}
+
+impl CanonicalSyntheticScopeStore {
+    #[must_use]
+    pub fn new(symbols: &SymbolStore) -> Self {
+        Self {
+            store: symbols.id(),
+            owner: allocate_synthetic_scope_owner(),
+            scopes: Vec::new(),
+        }
+    }
+
+    /// Allocates a synthesized `Block` scope after validating all handles.
+    ///
+    /// # Errors
+    ///
+    /// Returns a provenance error for a foreign symbol store, locals table,
+    /// bound parent, or synthetic parent.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the synthetic-scope identity space is exhausted.
+    pub fn alloc_scope(
+        &mut self,
+        symbols: &SymbolStore,
+        locals: SymbolTableId,
+        parent: Option<CanonicalResolutionLocation>,
+    ) -> Result<CanonicalSyntheticScopeId, CanonicalSyntheticScopeStoreError> {
+        if symbols.id() != self.store {
+            return Err(CanonicalSyntheticScopeStoreError::WrongSymbolStore);
+        }
+        if !symbols.contains_symbol_table(locals) {
+            return Err(CanonicalSyntheticScopeStoreError::InvalidLocals(locals));
+        }
+        match parent {
+            Some(CanonicalResolutionLocation::Bound(parent))
+                if !symbols.contains_node_ref(parent) =>
+            {
+                return Err(CanonicalSyntheticScopeStoreError::InvalidBoundParent(
+                    parent,
+                ));
+            }
+            Some(CanonicalResolutionLocation::SyntheticScope(parent))
+                if self.scope(parent).is_none() =>
+            {
+                return Err(CanonicalSyntheticScopeStoreError::UnknownSyntheticParent(
+                    parent,
+                ));
+            }
+            _ => {}
+        }
+        let zero_based = u32::try_from(self.scopes.len())
+            .unwrap_or_else(|_| panic!("synthetic scope identity space exhausted"));
+        let local = zero_based
+            .checked_add(1)
+            .and_then(NonZeroU32::new)
+            .unwrap_or_else(|| panic!("synthetic scope identity space exhausted"));
+        let id = CanonicalSyntheticScopeId {
+            store: self.store,
+            owner: self.owner,
+            local,
+        };
+        self.scopes.push(CanonicalSyntheticScope { locals, parent });
+        Ok(id)
+    }
+
+    #[must_use]
+    pub fn scope(&self, id: CanonicalSyntheticScopeId) -> Option<CanonicalSyntheticScope> {
+        (id.store == self.store && id.owner == self.owner)
+            .then(|| self.scopes.get((id.get() - 1) as usize).copied())
+            .flatten()
+    }
+}
+
 /// Successful resolution facts passed to the pinned success callback.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CanonicalResolvedName {
-    pub location: NodeRef,
+    pub location: Option<CanonicalResolutionLocation>,
     pub symbol: SemanticSymbolId,
     pub meaning: SymbolFlags,
-    pub last_location: Option<NodeRef>,
+    pub last_location: Option<CanonicalResolutionLocation>,
     pub associated_declaration_for_containing_initializer_or_binding_name: Option<NodeRef>,
     pub within_deferred_context: bool,
 }
@@ -93,6 +273,9 @@ pub enum CanonicalNameResolutionError {
     MissingDeclarationSymbol(NodeRef),
     MissingArgumentsSymbol,
     ForeignDeclarationAstUnavailable(NodeRef),
+    InvalidSyntheticScope(CanonicalSyntheticScopeId),
+    MissingSyntheticScope(CanonicalSyntheticScopeId),
+    SyntheticScopeCycle(CanonicalSyntheticScopeId),
 }
 
 impl std::fmt::Display for CanonicalNameResolutionError {
@@ -157,6 +340,15 @@ impl std::fmt::Display for CanonicalNameResolutionError {
                 "name-resolution host cannot inspect foreign declaration {:?}",
                 node.node
             ),
+            Self::InvalidSyntheticScope(_) => {
+                formatter.write_str("synthetic name-resolution scope belongs to another store")
+            }
+            Self::MissingSyntheticScope(_) => {
+                formatter.write_str("name-resolution host omitted a synthetic scope")
+            }
+            Self::SyntheticScopeCycle(_) => {
+                formatter.write_str("synthetic name-resolution scope parents contain a cycle")
+            }
         }
     }
 }
@@ -187,6 +379,16 @@ pub trait CanonicalNameResolverHost {
 
     fn arguments_symbol(&mut self, store: &SymbolStore) -> Option<SemanticSymbolId>;
 
+    /// Returns the exact locals and parent of one checker-created synthetic
+    /// `Block`. The resolver validates the scope brand, table, parent, and
+    /// parent-chain acyclicity before observing them.
+    fn synthetic_scope(
+        &mut self,
+        _scope: CanonicalSyntheticScopeId,
+    ) -> Option<CanonicalSyntheticScope> {
+        None
+    }
+
     /// Retained for the later JavaScript closure. It is not called by this
     /// TypeScript-only resolver.
     fn require_symbol(&mut self, _store: &SymbolStore) -> Option<SemanticSymbolId> {
@@ -211,7 +413,7 @@ pub trait CanonicalNameResolverHost {
         None
     }
 
-    fn error(&mut self, _location: NodeRef, _diagnostic: Diagnostic) {}
+    fn error(&mut self, _location: CanonicalResolutionLocation, _diagnostic: Diagnostic) {}
 
     fn symbol_referenced(&mut self, _symbol: SemanticSymbolId, _meaning: SymbolFlags) {}
 
@@ -231,7 +433,7 @@ pub trait CanonicalNameResolverHost {
 
     fn on_property_with_invalid_initializer(
         &mut self,
-        _location: NodeRef,
+        _location: CanonicalResolutionLocation,
         _name: &str,
         _declaration: NodeRef,
         _result: Option<SemanticSymbolId>,
@@ -241,7 +443,7 @@ pub trait CanonicalNameResolverHost {
 
     fn on_failed_to_resolve_symbol(
         &mut self,
-        _location: NodeRef,
+        _location: Option<CanonicalResolutionLocation>,
         _name: &str,
         _meaning: SymbolFlags,
         _name_not_found_message: &'static Message,
@@ -249,6 +451,54 @@ pub trait CanonicalNameResolverHost {
     }
 
     fn on_successfully_resolved_symbol(&mut self, _resolved: CanonicalResolvedName) {}
+}
+
+/// Resolves from the pinned nil location without requiring a parsed or bound
+/// source file.
+///
+/// This is the checker bootstrap path used by global lookups. In the pinned
+/// resolver, reference notification occurs before the global-table fallback,
+/// so `is_use` intentionally does not notify a symbol found here. Failure and
+/// success callbacks still run with a `None` location in their exact order.
+///
+/// # Errors
+///
+/// Returns a provenance error before any resolution callback when the host
+/// supplies a foreign globals table or lookup result.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_global_name<H: CanonicalNameResolverHost>(
+    symbols: &SymbolStore,
+    host: &mut H,
+    name: &str,
+    meaning: SymbolFlags,
+    name_not_found_message: Option<&'static Message>,
+    _is_use: bool,
+    exclude_globals: bool,
+) -> Result<Option<SemanticSymbolId>, CanonicalNameResolutionError> {
+    let mut result = None;
+    if !exclude_globals && let Some(globals) = host.globals() {
+        result = lookup_with_host(
+            symbols,
+            host,
+            globals,
+            name,
+            meaning | SymbolFlags::GLOBAL_LOOKUP,
+        )?;
+    }
+    if let Some(message) = name_not_found_message {
+        match result {
+            None => host.on_failed_to_resolve_symbol(None, name, meaning, message),
+            Some(symbol) => host.on_successfully_resolved_symbol(CanonicalResolvedName {
+                location: None,
+                symbol,
+                meaning,
+                last_location: None,
+                associated_declaration_for_containing_initializer_or_binding_name: None,
+                within_deferred_context: false,
+            }),
+        }
+    }
+    Ok(result)
 }
 
 /// Exact non-JavaScript lexical/module name resolver over one bound file.
@@ -319,15 +569,15 @@ impl<'a, H: CanonicalNameResolverHost> CanonicalNameResolver<'a, H> {
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub fn resolve(
         &mut self,
-        original_location: NodeRef,
+        original_location: Option<CanonicalResolutionLocation>,
         name: &str,
         meaning: SymbolFlags,
         name_not_found_message: Option<&'static Message>,
         is_use: bool,
         exclude_globals: bool,
     ) -> Result<Option<SemanticSymbolId>, CanonicalNameResolutionError> {
-        self.validate_location(original_location)?;
-        let mut location = Some(original_location.node);
+        let synthetic_scopes = self.preflight_location(original_location)?;
+        let mut location = original_location;
         let mut result = None;
         let mut last_location = None;
         let mut last_self_reference_location = None;
@@ -336,22 +586,42 @@ impl<'a, H: CanonicalNameResolverHost> CanonicalNameResolver<'a, H> {
         let mut within_deferred_context = false;
         let name_is_const = name == "const";
 
-        while let Some(mut current) = location {
+        while let Some(current_location) = location {
+            if let CanonicalResolutionLocation::SyntheticScope(scope) = current_location {
+                let facts = synthetic_scopes
+                    .get(&scope)
+                    .copied()
+                    .expect("synthetic scope chain was preflighted");
+                if let Some(candidate) = self.lookup(facts.locals, name, meaning)? {
+                    result = Some(candidate);
+                    break;
+                }
+                last_location = Some(current_location);
+                location = facts.parent;
+                continue;
+            }
+
+            let CanonicalResolutionLocation::Bound(current_ref) = current_location else {
+                unreachable!("synthetic locations continue above");
+            };
+            let mut current = current_ref.node;
             self.reject_jsdoc(current)?;
             if name_is_const && is_const_assertion(self.arena, current) {
                 return Ok(None);
             }
 
+            let mut last_bound = last_location.and_then(|last| self.bound_node(last));
             if is_module_or_enum_declaration(self.arena, current)
                 && last_location.is_some()
-                && declaration_name(self.arena, current) == last_location
+                && declaration_name(self.arena, current) == last_bound
             {
-                last_location = Some(current);
+                last_location = Some(CanonicalResolutionLocation::Bound(self.node_ref(current)));
                 current = self
                     .arena
                     .get(current)
                     .and_then(|node| node.parent)
                     .expect("bound non-root declaration has a parent");
+                last_bound = last_location.and_then(|last| self.bound_node(last));
             }
 
             if let Some(locals) = self.bound.locals(self.node_ref(current))
@@ -366,16 +636,16 @@ impl<'a, H: CanonicalNameResolverHost> CanonicalNameResolver<'a, H> {
                         .expect("lookup result was validated");
                     if is_function_like(self.kind(current))
                         && let Some(last) = last_location
-                        && Some(last) != function_body(self.arena, current)
+                        && last_bound != function_body(self.arena, current)
                     {
                         if meaning.intersects(record.flags() & SymbolFlags::TYPE)
-                            && self.kind(last) != SyntaxKind::JsDoc
+                            && self.location_kind(last) != SyntaxKind::JsDoc
                         {
                             use_result = record.flags().contains(SymbolFlags::TYPE_PARAMETER)
-                                && (self.is_synthesized(last)
-                                    || Some(last) == function_type(self.arena, current)
+                                && (self.location_is_synthesized(last)
+                                    || last_bound == function_type(self.arena, current)
                                     || matches!(
-                                        self.kind(last),
+                                        self.location_kind(last),
                                         SyntaxKind::Parameter
                                             | SyntaxKind::JsDocParameterTag
                                             | SyntaxKind::JsDocReturnTag
@@ -383,16 +653,17 @@ impl<'a, H: CanonicalNameResolverHost> CanonicalNameResolver<'a, H> {
                                     ));
                         }
                         if meaning.intersects(record.flags() & SymbolFlags::VARIABLE) {
-                            if self.use_outer_variable_scope_in_parameter(candidate, current, last)
-                            {
+                            if last_bound.is_some_and(|last| {
+                                self.use_outer_variable_scope_in_parameter(candidate, current, last)
+                            }) {
                                 use_result = false;
                             } else if record
                                 .flags()
                                 .contains(SymbolFlags::FUNCTION_SCOPED_VARIABLE)
                             {
-                                use_result = self.kind(last) == SyntaxKind::Parameter
-                                    || self.is_synthesized(last)
-                                    || Some(last) == function_type(self.arena, current)
+                                use_result = self.location_kind(last) == SyntaxKind::Parameter
+                                    || self.location_is_synthesized(last)
+                                    || last_bound == function_type(self.arena, current)
                                         && record.value_declaration().is_some_and(|declaration| {
                                             self.find_ancestor_kind(
                                                 declaration,
@@ -406,7 +677,7 @@ impl<'a, H: CanonicalNameResolverHost> CanonicalNameResolver<'a, H> {
                         else {
                             unreachable!("bound kind/data agreement was preflighted");
                         };
-                        use_result = last_location == Some(conditional.true_type);
+                        use_result = last_bound == Some(conditional.true_type);
                     }
                     if use_result {
                         result = Some(candidate);
@@ -415,7 +686,7 @@ impl<'a, H: CanonicalNameResolverHost> CanonicalNameResolver<'a, H> {
                 }
             }
 
-            within_deferred_context |= self.get_is_deferred_context(current, last_location);
+            within_deferred_context |= self.get_is_deferred_context(current, last_bound);
 
             match self.kind(current) {
                 SyntaxKind::SourceFile => {
@@ -448,7 +719,7 @@ impl<'a, H: CanonicalNameResolverHost> CanonicalNameResolver<'a, H> {
                         }
                         if let Some(member) = result {
                             self.report_cross_file_enum_reference(
-                                original_location,
+                                original_location.expect("bound traversal has an origin"),
                                 current,
                                 enum_symbol,
                                 member,
@@ -489,9 +760,13 @@ impl<'a, H: CanonicalNameResolverHost> CanonicalNameResolver<'a, H> {
                     if let Some(type_parameter) = result {
                         if !self.type_parameter_declared_in_container(type_parameter, current)? {
                             result = None;
-                        } else if last_location.is_some_and(|last| is_static(self.arena, last)) {
+                        } else if last_location.is_some_and(|last| self.location_is_static(last)) {
                             if name_not_found_message.is_some() {
-                                self.error(original_location, 2302, std::iter::empty::<String>());
+                                self.error(
+                                    original_location.expect("bound traversal has an origin"),
+                                    2302,
+                                    std::iter::empty::<String>(),
+                                );
                             }
                             return Ok(None);
                         } else {
@@ -515,7 +790,7 @@ impl<'a, H: CanonicalNameResolverHost> CanonicalNameResolver<'a, H> {
                     else {
                         unreachable!("bound kind/data agreement was preflighted");
                     };
-                    if last_location == Some(expression.expression)
+                    if last_bound == Some(expression.expression)
                         && self.node(current).parent.is_some_and(|heritage| {
                             matches!(
                                 &self.node(heritage).data,
@@ -542,7 +817,7 @@ impl<'a, H: CanonicalNameResolverHost> CanonicalNameResolver<'a, H> {
                             if result.is_some() {
                                 if name_not_found_message.is_some() {
                                     self.error(
-                                        original_location,
+                                        original_location.expect("bound traversal has an origin"),
                                         2562,
                                         std::iter::empty::<String>(),
                                     );
@@ -575,7 +850,11 @@ impl<'a, H: CanonicalNameResolverHost> CanonicalNameResolver<'a, H> {
                         }
                         if result.is_some() {
                             if name_not_found_message.is_some() {
-                                self.error(original_location, 2467, std::iter::empty::<String>());
+                                self.error(
+                                    original_location.expect("bound traversal has an origin"),
+                                    2467,
+                                    std::iter::empty::<String>(),
+                                );
                             }
                             return Ok(None);
                         }
@@ -625,7 +904,7 @@ impl<'a, H: CanonicalNameResolverHost> CanonicalNameResolver<'a, H> {
                     let NodeData::ParameterDeclaration(parameter) = &self.node(current).data else {
                         unreachable!("bound kind/data agreement was preflighted");
                     };
-                    if last_location.is_some_and(|last| {
+                    if last_bound.is_some_and(|last| {
                         Some(last) == parameter.initializer
                             || last == parameter.name && is_binding_pattern(self.kind(last))
                     }) && associated_declaration.is_none()
@@ -637,7 +916,7 @@ impl<'a, H: CanonicalNameResolverHost> CanonicalNameResolver<'a, H> {
                     let NodeData::BindingElement(element) = &self.node(current).data else {
                         unreachable!("bound kind/data agreement was preflighted");
                     };
-                    if last_location.is_some_and(|last| {
+                    if last_bound.is_some_and(|last| {
                         Some(last) == element.initializer
                             || Some(last) == element.name && is_binding_pattern(self.kind(last))
                     }) && self.is_part_of_parameter_declaration(current)
@@ -667,7 +946,7 @@ impl<'a, H: CanonicalNameResolverHost> CanonicalNameResolver<'a, H> {
                     let NodeData::ExportSpecifier(specifier) = &self.node(current).data else {
                         unreachable!("bound kind/data agreement was preflighted");
                     };
-                    if last_location == specifier.property_name {
+                    if last_bound.is_some() && last_bound == specifier.property_name {
                         let named_exports =
                             self.node(current).parent.expect("specifier has parent");
                         let export_declaration = self
@@ -688,11 +967,14 @@ impl<'a, H: CanonicalNameResolverHost> CanonicalNameResolver<'a, H> {
                 _ => {}
             }
 
-            if is_self_reference_location(self.arena, current, last_location) {
+            if is_self_reference_location(self.arena, current, last_bound) {
                 last_self_reference_location = Some(current);
             }
-            last_location = Some(current);
-            location = self.node(current).parent;
+            last_location = Some(CanonicalResolutionLocation::Bound(self.node_ref(current)));
+            location = self
+                .node(current)
+                .parent
+                .map(|parent| CanonicalResolutionLocation::Bound(self.node_ref(parent)));
         }
 
         if is_use
@@ -715,7 +997,7 @@ impl<'a, H: CanonicalNameResolverHost> CanonicalNameResolver<'a, H> {
         if let Some(message) = name_not_found_message {
             if let Some(property) = property_with_invalid_initializer
                 && self.host.on_property_with_invalid_initializer(
-                    original_location,
+                    original_location.expect("property traversal has an origin"),
                     name,
                     self.node_ref(property),
                     result,
@@ -738,7 +1020,7 @@ impl<'a, H: CanonicalNameResolverHost> CanonicalNameResolver<'a, H> {
                             location: original_location,
                             symbol,
                             meaning,
-                            last_location: last_location.map(|node| self.node_ref(node)),
+                            last_location,
                             associated_declaration_for_containing_initializer_or_binding_name:
                                 associated_declaration.map(|node| self.node_ref(node)),
                             within_deferred_context,
@@ -898,7 +1180,7 @@ impl<'a, H: CanonicalNameResolverHost> CanonicalNameResolver<'a, H> {
 
     fn report_cross_file_enum_reference(
         &mut self,
-        original_location: NodeRef,
+        original_location: CanonicalResolutionLocation,
         enum_declaration: NodeId,
         enum_symbol: SemanticSymbolId,
         member: SemanticSymbolId,
@@ -1086,9 +1368,7 @@ impl<'a, H: CanonicalNameResolverHost> CanonicalNameResolver<'a, H> {
             return true;
         }
         loop {
-            if has_syntactic_modifier(self.arena, node, SyntaxKind::DeclareKeyword)
-                || is_ambient_module(self.arena, node)
-            {
+            if has_syntactic_modifier(self.arena, node, SyntaxKind::DeclareKeyword) {
                 return true;
             }
             let Some(parent) = self.node(node).parent else {
@@ -1159,12 +1439,7 @@ impl<'a, H: CanonicalNameResolverHost> CanonicalNameResolver<'a, H> {
         name: &str,
         meaning: SymbolFlags,
     ) -> Result<Option<SemanticSymbolId>, CanonicalNameResolutionError> {
-        self.validate_table(table)?;
-        let symbol = self
-            .host
-            .lookup(self.symbols, table, EscapedNameRef::source(name), meaning);
-        self.validate_optional_symbol(symbol)?;
-        Ok(symbol)
+        lookup_with_host(self.symbols, self.host, table, name, meaning)
     }
 
     fn declaration_kind(
@@ -1227,6 +1502,53 @@ impl<'a, H: CanonicalNameResolverHost> CanonicalNameResolver<'a, H> {
             .ok_or(CanonicalNameResolutionError::ForeignDeclarationAstUnavailable(declaration))
     }
 
+    fn preflight_location(
+        &mut self,
+        location: Option<CanonicalResolutionLocation>,
+    ) -> Result<
+        HashMap<CanonicalSyntheticScopeId, CanonicalSyntheticScope>,
+        CanonicalNameResolutionError,
+    > {
+        let Some(location) = location else {
+            return Ok(HashMap::new());
+        };
+        if let CanonicalResolutionLocation::Bound(location) = location {
+            self.validate_location(location)?;
+            return Ok(HashMap::new());
+        }
+
+        let mut scopes = HashMap::new();
+        let mut seen = HashSet::new();
+        let mut location = Some(location);
+        while let Some(CanonicalResolutionLocation::SyntheticScope(scope)) = location {
+            if !scope.is_for(self.symbols.id()) {
+                return Err(CanonicalNameResolutionError::InvalidSyntheticScope(scope));
+            }
+            if !seen.insert(scope) {
+                return Err(CanonicalNameResolutionError::SyntheticScopeCycle(scope));
+            }
+            let facts = self
+                .host
+                .synthetic_scope(scope)
+                .ok_or(CanonicalNameResolutionError::MissingSyntheticScope(scope))?;
+            self.validate_table(facts.locals)?;
+            match facts.parent {
+                Some(CanonicalResolutionLocation::Bound(parent)) => {
+                    self.validate_location(parent)?;
+                }
+                Some(CanonicalResolutionLocation::SyntheticScope(parent))
+                    if !parent.is_for(self.symbols.id()) =>
+                {
+                    return Err(CanonicalNameResolutionError::InvalidSyntheticScope(parent));
+                }
+                _ => {}
+            }
+            scopes.insert(scope, facts);
+            location = facts.parent;
+        }
+        Ok(scopes)
+    }
+
     fn validate_location(&self, location: NodeRef) -> Result<(), CanonicalNameResolutionError> {
         if !self.bound.contains(location) || !self.symbols.contains_node_ref(location) {
             return Err(CanonicalNameResolutionError::UnboundLocation(location));
@@ -1271,7 +1593,12 @@ impl<'a, H: CanonicalNameResolverHost> CanonicalNameResolver<'a, H> {
         Ok(())
     }
 
-    fn error(&mut self, location: NodeRef, code: u32, arguments: impl IntoIterator<Item = String>) {
+    fn error(
+        &mut self,
+        location: CanonicalResolutionLocation,
+        code: u32,
+        arguments: impl IntoIterator<Item = String>,
+    ) {
         let message = message_by_code(code).expect("pinned name-resolver diagnostic exists");
         self.host
             .error(location, Diagnostic::with_arguments(message, arguments));
@@ -1291,9 +1618,55 @@ impl<'a, H: CanonicalNameResolverHost> CanonicalNameResolver<'a, H> {
         self.node(node).kind
     }
 
+    fn bound_node(&self, location: CanonicalResolutionLocation) -> Option<NodeId> {
+        match location {
+            CanonicalResolutionLocation::Bound(location)
+                if location.is_for(self.arena.id(), self.bound.file_id()) =>
+            {
+                Some(location.node)
+            }
+            CanonicalResolutionLocation::Bound(_)
+            | CanonicalResolutionLocation::SyntheticScope(_) => None,
+        }
+    }
+
+    fn location_kind(&self, location: CanonicalResolutionLocation) -> SyntaxKind {
+        self.bound_node(location)
+            .map_or(SyntaxKind::Block, |node| self.kind(node))
+    }
+
+    fn location_is_synthesized(&self, location: CanonicalResolutionLocation) -> bool {
+        self.bound_node(location)
+            .is_none_or(|node| self.is_synthesized(node))
+    }
+
+    fn location_is_static(&self, location: CanonicalResolutionLocation) -> bool {
+        self.bound_node(location)
+            .is_some_and(|node| is_static(self.arena, node))
+    }
+
     fn is_synthesized(&self, node: NodeId) -> bool {
         self.node(node).flags.0 & NODE_FLAG_SYNTHESIZED != 0
     }
+}
+
+fn lookup_with_host<H: CanonicalNameResolverHost>(
+    symbols: &SymbolStore,
+    host: &mut H,
+    table: SymbolTableId,
+    name: &str,
+    meaning: SymbolFlags,
+) -> Result<Option<SemanticSymbolId>, CanonicalNameResolutionError> {
+    if !symbols.contains_symbol_table(table) {
+        return Err(CanonicalNameResolutionError::InvalidHostTable(table));
+    }
+    let symbol = host.lookup(symbols, table, EscapedNameRef::source(name), meaning);
+    if let Some(symbol) = symbol
+        && !symbols.contains_symbol(symbol)
+    {
+        return Err(CanonicalNameResolutionError::InvalidHostSymbol(symbol));
+    }
+    Ok(symbol)
 }
 
 fn is_module_or_enum_declaration(arena: &NodeArena, node: NodeId) -> bool {
@@ -1521,16 +1894,6 @@ fn is_binding_pattern(kind: SyntaxKind) -> bool {
     )
 }
 
-fn is_ambient_module(arena: &NodeArena, node: NodeId) -> bool {
-    let Some(NodeData::ModuleDeclaration(module)) = arena.get(node).map(|node| &node.data) else {
-        return false;
-    };
-    module.keyword == SyntaxKind::GlobalKeyword
-        || arena
-            .get(module.name)
-            .is_some_and(|name| name.kind == SyntaxKind::StringLiteral)
-}
-
 fn is_global_scope_augmentation(arena: &NodeArena, node: NodeId) -> bool {
     matches!(
         arena.get(node).map(|node| &node.data),
@@ -1545,9 +1908,10 @@ fn find_constructor(arena: &NodeArena, class: NodeId) -> Option<NodeId> {
         _ => return None,
     };
     members.iter().copied().find(|member| {
-        arena
-            .get(*member)
-            .is_some_and(|member| member.kind == SyntaxKind::Constructor)
+        matches!(
+            arena.get(*member).map(|member| &member.data),
+            Some(NodeData::ConstructorDeclaration(constructor)) if constructor.body.is_some()
+        )
     })
 }
 
@@ -1676,7 +2040,9 @@ mod tests {
 
     use super::{
         CanonicalNameResolutionError, CanonicalNameResolver, CanonicalNameResolverHost,
-        CanonicalNameResolverOptions, CanonicalResolvedName, CanonicalScopeChangeState,
+        CanonicalNameResolverOptions, CanonicalResolutionLocation, CanonicalResolvedName,
+        CanonicalScopeChangeState, CanonicalSyntheticScope, CanonicalSyntheticScopeId,
+        CanonicalSyntheticScopeStore, resolve_global_name,
     };
     use crate::{
         BindingPhase, CanonicalBinder, CanonicalModuleState, CanonicalProgramBindings,
@@ -1692,6 +2058,14 @@ mod tests {
     }
 
     fn bind(source: &str, module_state: CanonicalModuleState) -> BoundSource {
+        bind_with_declaration_file(source, module_state, false)
+    }
+
+    fn bind_with_declaration_file(
+        source: &str,
+        module_state: CanonicalModuleState,
+        is_declaration_file: bool,
+    ) -> BoundSource {
         let parsed = parse_source_file(source);
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         let mut binder = CanonicalBinder::new();
@@ -1703,7 +2077,7 @@ mod tests {
                 CanonicalSourceFileFacts::new(
                     EscapedName::source("\"/project/name-resolver.ts\""),
                     CanonicalSourceLanguage::TypeScript,
-                    false,
+                    is_declaration_file,
                     module_state,
                 ),
             )
@@ -1783,15 +2157,30 @@ mod tests {
         globals: Option<SymbolTableId>,
         arguments: Option<SemanticSymbolId>,
         lookup_override: Option<SemanticSymbolId>,
+        synthetic_scopes: Option<CanonicalSyntheticScopeStore>,
+        synthetic_scope_overrides: HashMap<CanonicalSyntheticScopeId, CanonicalSyntheticScope>,
         foreign_kinds: HashMap<NodeRef, SyntaxKind>,
         foreign_parents: HashMap<NodeRef, NodeRef>,
         foreign_modifiers: HashMap<(NodeRef, SyntaxKind), bool>,
-        diagnostics: Vec<(NodeRef, Diagnostic)>,
+        diagnostics: Vec<(CanonicalResolutionLocation, Diagnostic)>,
         referenced: Vec<(SemanticSymbolId, SymbolFlags)>,
+        events: Vec<&'static str>,
+        lookup_meanings: Vec<SymbolFlags>,
         cache: HashMap<NodeRef, CanonicalScopeChangeState>,
-        failed: Vec<(NodeRef, String, SymbolFlags, u32)>,
+        failed: Vec<(
+            Option<CanonicalResolutionLocation>,
+            String,
+            SymbolFlags,
+            u32,
+        )>,
         succeeded: Vec<CanonicalResolvedName>,
         invalid_property_result: bool,
+        invalid_properties: Vec<(
+            CanonicalResolutionLocation,
+            String,
+            NodeRef,
+            Option<SemanticSymbolId>,
+        )>,
     }
 
     impl TestHost {
@@ -1799,6 +2188,9 @@ mod tests {
             let file = bound(source);
             let mut host = Self {
                 globals: file.locals(file.source_file()),
+                synthetic_scopes: Some(CanonicalSyntheticScopeStore::new(
+                    source.bindings.symbol_store(),
+                )),
                 ..Self::default()
             };
             for node in file.traversal_order() {
@@ -1837,6 +2229,8 @@ mod tests {
             name: EscapedNameRef<'_>,
             meaning: SymbolFlags,
         ) -> Option<SemanticSymbolId> {
+            self.events.push("lookup");
+            self.lookup_meanings.push(meaning);
             if let Some(symbol) = self.lookup_override {
                 return Some(symbol);
             }
@@ -1859,6 +2253,16 @@ mod tests {
             self.arguments
         }
 
+        fn synthetic_scope(
+            &mut self,
+            scope: CanonicalSyntheticScopeId,
+        ) -> Option<CanonicalSyntheticScope> {
+            self.synthetic_scope_overrides
+                .get(&scope)
+                .copied()
+                .or_else(|| self.synthetic_scopes.as_ref()?.scope(scope))
+        }
+
         fn foreign_declaration_kind(&mut self, declaration: NodeRef) -> Option<SyntaxKind> {
             self.foreign_kinds.get(&declaration).copied()
         }
@@ -1877,11 +2281,12 @@ mod tests {
                 .copied()
         }
 
-        fn error(&mut self, location: NodeRef, diagnostic: Diagnostic) {
+        fn error(&mut self, location: CanonicalResolutionLocation, diagnostic: Diagnostic) {
             self.diagnostics.push((location, diagnostic));
         }
 
         fn symbol_referenced(&mut self, symbol: SemanticSymbolId, meaning: SymbolFlags) {
+            self.events.push("referenced");
             self.referenced.push((symbol, meaning));
         }
 
@@ -1902,21 +2307,25 @@ mod tests {
 
         fn on_property_with_invalid_initializer(
             &mut self,
-            _location: NodeRef,
-            _name: &str,
-            _declaration: NodeRef,
-            _result: Option<SemanticSymbolId>,
+            location: CanonicalResolutionLocation,
+            name: &str,
+            declaration: NodeRef,
+            result: Option<SemanticSymbolId>,
         ) -> bool {
+            self.events.push("invalid_property");
+            self.invalid_properties
+                .push((location, name.to_owned(), declaration, result));
             self.invalid_property_result
         }
 
         fn on_failed_to_resolve_symbol(
             &mut self,
-            location: NodeRef,
+            location: Option<CanonicalResolutionLocation>,
             name: &str,
             meaning: SymbolFlags,
             name_not_found_message: &'static Message,
         ) {
+            self.events.push("failed");
             self.failed.push((
                 location,
                 name.to_owned(),
@@ -1926,6 +2335,7 @@ mod tests {
         }
 
         fn on_successfully_resolved_symbol(&mut self, resolved: CanonicalResolvedName) {
+            self.events.push("succeeded");
             self.succeeded.push(resolved);
         }
     }
@@ -1937,6 +2347,29 @@ mod tests {
         name: &str,
         meaning: SymbolFlags,
     ) -> Result<Option<SemanticSymbolId>, CanonicalNameResolutionError> {
+        resolve_from(
+            source,
+            host,
+            Some(node_ref(source, location).into()),
+            name,
+            meaning,
+            Some(not_found_message()),
+            true,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_from(
+        source: &BoundSource,
+        host: &mut TestHost,
+        location: Option<CanonicalResolutionLocation>,
+        name: &str,
+        meaning: SymbolFlags,
+        name_not_found_message: Option<&'static Message>,
+        is_use: bool,
+        exclude_globals: bool,
+    ) -> Result<Option<SemanticSymbolId>, CanonicalNameResolutionError> {
         CanonicalNameResolver::new(
             &source.parsed.arena,
             bound(source),
@@ -1944,12 +2377,12 @@ mod tests {
             host,
         )?
         .resolve(
-            node_ref(source, location),
+            location,
             name,
             meaning,
-            Some(not_found_message()),
-            true,
-            false,
+            name_not_found_message,
+            is_use,
+            exclude_globals,
         )
     }
 
@@ -2426,6 +2859,640 @@ const immediate = (function () { return outer; })();
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn nil_location_resolves_globals_without_any_bound_file() {
+        let mut symbols = SymbolStore::new();
+        let value = symbols
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::BLOCK_SCOPED_VARIABLE,
+                EscapedName::source("value"),
+            ))
+            .unwrap();
+        let globals = symbols.alloc_symbol_table();
+        symbols
+            .insert_symbol(globals, EscapedName::source("value"), value)
+            .unwrap();
+        let mut host = TestHost {
+            globals: Some(globals),
+            ..TestHost::default()
+        };
+
+        assert_eq!(
+            resolve_global_name(
+                &symbols,
+                &mut host,
+                "value",
+                SymbolFlags::VALUE,
+                Some(not_found_message()),
+                true,
+                false,
+            ),
+            Ok(Some(value))
+        );
+        assert_eq!(host.events, ["lookup", "succeeded"]);
+        assert_eq!(
+            host.lookup_meanings,
+            [SymbolFlags::VALUE | SymbolFlags::GLOBAL_LOOKUP]
+        );
+        assert!(host.referenced.is_empty());
+        assert_eq!(
+            host.succeeded,
+            [CanonicalResolvedName {
+                location: None,
+                symbol: value,
+                meaning: SymbolFlags::VALUE,
+                last_location: None,
+                associated_declaration_for_containing_initializer_or_binding_name: None,
+                within_deferred_context: false,
+            }]
+        );
+
+        host.events.clear();
+        host.succeeded.clear();
+        host.lookup_meanings.clear();
+        assert_eq!(
+            resolve_global_name(
+                &symbols,
+                &mut host,
+                "value",
+                SymbolFlags::VALUE,
+                None,
+                true,
+                false,
+            ),
+            Ok(Some(value))
+        );
+        assert_eq!(host.events, ["lookup"]);
+        assert_eq!(
+            host.lookup_meanings,
+            [SymbolFlags::VALUE | SymbolFlags::GLOBAL_LOOKUP]
+        );
+        assert!(host.failed.is_empty());
+        assert!(host.succeeded.is_empty());
+
+        host.events.clear();
+        host.lookup_meanings.clear();
+        assert_eq!(
+            resolve_global_name(
+                &symbols,
+                &mut host,
+                "missing",
+                SymbolFlags::TYPE,
+                None,
+                true,
+                false,
+            ),
+            Ok(None)
+        );
+        assert_eq!(host.events, ["lookup"]);
+        assert_eq!(
+            host.lookup_meanings,
+            [SymbolFlags::TYPE | SymbolFlags::GLOBAL_LOOKUP]
+        );
+        assert!(host.failed.is_empty());
+        assert!(host.succeeded.is_empty());
+
+        host.events.clear();
+        host.lookup_meanings.clear();
+        assert_eq!(
+            resolve_global_name(
+                &symbols,
+                &mut host,
+                "missing",
+                SymbolFlags::TYPE,
+                Some(not_found_message()),
+                true,
+                false,
+            ),
+            Ok(None)
+        );
+        assert_eq!(host.events, ["lookup", "failed"]);
+        assert_eq!(host.failed[0].0, None);
+
+        host.events.clear();
+        host.failed.clear();
+        assert_eq!(
+            resolve_global_name(
+                &symbols,
+                &mut host,
+                "value",
+                SymbolFlags::VALUE,
+                Some(not_found_message()),
+                true,
+                true,
+            ),
+            Ok(None)
+        );
+        assert_eq!(host.events, ["failed"]);
+        assert_eq!(host.failed[0].0, None);
+
+        let mut foreign = SymbolStore::new();
+        let foreign_symbol = foreign
+            .alloc_symbol(SymbolData::new(
+                SymbolFlags::BLOCK_SCOPED_VARIABLE,
+                EscapedName::source("foreign"),
+            ))
+            .unwrap();
+        let foreign_table = foreign.alloc_symbol_table();
+
+        host.events.clear();
+        host.failed.clear();
+        host.globals = Some(foreign_table);
+        assert_eq!(
+            resolve_global_name(
+                &symbols,
+                &mut host,
+                "value",
+                SymbolFlags::VALUE,
+                Some(not_found_message()),
+                false,
+                false,
+            ),
+            Err(CanonicalNameResolutionError::InvalidHostTable(
+                foreign_table
+            ))
+        );
+        assert!(host.events.is_empty());
+        assert!(host.failed.is_empty());
+
+        host.globals = Some(globals);
+        host.lookup_override = Some(foreign_symbol);
+        assert_eq!(
+            resolve_global_name(
+                &symbols,
+                &mut host,
+                "value",
+                SymbolFlags::VALUE,
+                Some(not_found_message()),
+                false,
+                false,
+            ),
+            Err(CanonicalNameResolutionError::InvalidHostSymbol(
+                foreign_symbol
+            ))
+        );
+        assert_eq!(host.events, ["lookup"]);
+        assert!(host.failed.is_empty());
+        assert!(host.succeeded.is_empty());
+    }
+
+    #[test]
+    fn file_independent_global_resolution_accepts_empty_and_deferred_stores() {
+        let empty = SymbolStore::new();
+        let mut host = TestHost::default();
+        assert_eq!(
+            resolve_global_name(
+                &empty,
+                &mut host,
+                "missing",
+                SymbolFlags::VALUE,
+                Some(not_found_message()),
+                true,
+                false,
+            ),
+            Ok(None)
+        );
+        assert_eq!(host.events, ["failed"]);
+        assert_eq!(host.failed[0].0, None);
+
+        for (parsed, file, language, state, path) in [
+            (
+                parse_javascript_source_file("const value = 1;"),
+                FileId::new(420),
+                CanonicalSourceLanguage::JavaScript,
+                CanonicalModuleState::Script,
+                "input.js",
+            ),
+            (
+                parse_source_file("const value = 1;"),
+                FileId::new(421),
+                CanonicalSourceLanguage::TypeScript,
+                CanonicalModuleState::CommonJs,
+                "input.cts",
+            ),
+        ] {
+            let mut binder = CanonicalBinder::new();
+            binder
+                .bind_source_file_with_facts(
+                    &parsed.arena,
+                    parsed.source_file,
+                    file,
+                    CanonicalSourceFileFacts::new(
+                        EscapedName::source(format!("\"/project/{path}\"")),
+                        language,
+                        false,
+                        state,
+                    ),
+                )
+                .unwrap();
+            let bindings = binder.finish();
+            let mut host = TestHost::default();
+            assert_eq!(
+                resolve_global_name(
+                    bindings.symbol_store(),
+                    &mut host,
+                    "missing",
+                    SymbolFlags::TYPE,
+                    Some(not_found_message()),
+                    true,
+                    false,
+                ),
+                Ok(None)
+            );
+            assert_eq!(host.events, ["failed"]);
+            assert_eq!(host.failed[0].0, None);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn synthetic_block_scope_preserves_generic_arrow_lookup_semantics() {
+        let source = bind(
+            r"
+function outer<T>() {
+    const arrow = <U,>(value: U) => value;
+}
+",
+            CanonicalModuleState::Script,
+        );
+        let arrow = first_kind(&source, SyntaxKind::ArrowFunction);
+        let arrow_locals = bound(&source).locals(node_ref(&source, arrow)).unwrap();
+        let type_parameter = table_symbol(&source, arrow_locals, "U");
+        let parameter = table_symbol(&source, arrow_locals, "value");
+        let source_locals = bound(&source).locals(bound(&source).source_file()).unwrap();
+        let symbols = source.bindings.symbol_store();
+        let mut host = TestHost::for_source(&source);
+        let synthetic = host
+            .synthetic_scopes
+            .as_mut()
+            .unwrap()
+            .alloc_scope(
+                symbols,
+                source_locals,
+                Some(CanonicalResolutionLocation::Bound(node_ref(&source, arrow))),
+            )
+            .unwrap();
+        let nodebuilder_scope = host
+            .synthetic_scopes
+            .as_mut()
+            .unwrap()
+            .alloc_scope(
+                symbols,
+                arrow_locals,
+                Some(CanonicalResolutionLocation::Bound(node_ref(&source, arrow))),
+            )
+            .unwrap();
+
+        assert_eq!(
+            resolve_from(
+                &source,
+                &mut host,
+                Some(CanonicalResolutionLocation::SyntheticScope(
+                    nodebuilder_scope,
+                )),
+                "U",
+                SymbolFlags::TYPE,
+                Some(not_found_message()),
+                true,
+                false,
+            ),
+            Ok(Some(type_parameter))
+        );
+        assert_eq!(host.events, ["lookup", "referenced", "succeeded"]);
+        assert_eq!(
+            host.succeeded[0].location,
+            Some(CanonicalResolutionLocation::SyntheticScope(
+                nodebuilder_scope
+            ))
+        );
+        assert_eq!(host.succeeded[0].last_location, None);
+        host.events.clear();
+        host.succeeded.clear();
+        host.referenced.clear();
+
+        assert_eq!(
+            resolve_from(
+                &source,
+                &mut host,
+                Some(CanonicalResolutionLocation::SyntheticScope(synthetic)),
+                "U",
+                SymbolFlags::TYPE,
+                Some(not_found_message()),
+                true,
+                false,
+            ),
+            Ok(Some(type_parameter))
+        );
+        assert_eq!(host.events, ["lookup", "lookup", "referenced", "succeeded"]);
+        assert_eq!(host.referenced, [(type_parameter, SymbolFlags::TYPE)]);
+        assert_eq!(
+            host.succeeded[0].location,
+            Some(CanonicalResolutionLocation::SyntheticScope(synthetic))
+        );
+        assert_eq!(
+            host.succeeded[0].last_location,
+            Some(CanonicalResolutionLocation::SyntheticScope(synthetic))
+        );
+        assert!(!host.succeeded[0].within_deferred_context);
+
+        host.events.clear();
+        host.succeeded.clear();
+        host.referenced.clear();
+        assert_eq!(
+            resolve_from(
+                &source,
+                &mut host,
+                Some(CanonicalResolutionLocation::SyntheticScope(synthetic)),
+                "value",
+                SymbolFlags::VALUE,
+                Some(not_found_message()),
+                true,
+                false,
+            ),
+            Ok(Some(parameter))
+        );
+        assert_eq!(host.referenced, [(parameter, SymbolFlags::VALUE)]);
+
+        let first = host
+            .synthetic_scopes
+            .as_mut()
+            .unwrap()
+            .alloc_scope(symbols, source_locals, None)
+            .unwrap();
+        let second = host
+            .synthetic_scopes
+            .as_mut()
+            .unwrap()
+            .alloc_scope(
+                symbols,
+                source_locals,
+                Some(CanonicalResolutionLocation::SyntheticScope(first)),
+            )
+            .unwrap();
+        host.synthetic_scope_overrides.insert(
+            first,
+            CanonicalSyntheticScope {
+                locals: source_locals,
+                parent: Some(CanonicalResolutionLocation::SyntheticScope(second)),
+            },
+        );
+        host.events.clear();
+        host.succeeded.clear();
+        host.referenced.clear();
+        assert_eq!(
+            resolve_from(
+                &source,
+                &mut host,
+                Some(CanonicalResolutionLocation::SyntheticScope(first)),
+                "missing",
+                SymbolFlags::VALUE,
+                Some(not_found_message()),
+                true,
+                false,
+            ),
+            Err(CanonicalNameResolutionError::SyntheticScopeCycle(first))
+        );
+        assert!(host.events.is_empty());
+        assert!(host.succeeded.is_empty());
+        assert!(host.referenced.is_empty());
+
+        let mut other_scopes = CanonicalSyntheticScopeStore::new(symbols);
+        let missing = other_scopes
+            .alloc_scope(symbols, source_locals, None)
+            .unwrap();
+        assert_ne!(first, missing);
+        assert_eq!(
+            resolve_from(
+                &source,
+                &mut host,
+                Some(CanonicalResolutionLocation::SyntheticScope(missing)),
+                "missing",
+                SymbolFlags::VALUE,
+                None,
+                false,
+                false,
+            ),
+            Err(CanonicalNameResolutionError::MissingSyntheticScope(missing))
+        );
+
+        let mut foreign_symbols = SymbolStore::new();
+        let foreign_locals = foreign_symbols.alloc_symbol_table();
+        let mut foreign_scopes = CanonicalSyntheticScopeStore::new(&foreign_symbols);
+        let foreign = foreign_scopes
+            .alloc_scope(&foreign_symbols, foreign_locals, None)
+            .unwrap();
+        assert_eq!(
+            resolve_from(
+                &source,
+                &mut host,
+                Some(CanonicalResolutionLocation::SyntheticScope(foreign)),
+                "missing",
+                SymbolFlags::VALUE,
+                None,
+                false,
+                false,
+            ),
+            Err(CanonicalNameResolutionError::InvalidSyntheticScope(foreign))
+        );
+
+        let tampered = host
+            .synthetic_scopes
+            .as_mut()
+            .unwrap()
+            .alloc_scope(symbols, source_locals, None)
+            .unwrap();
+        host.synthetic_scope_overrides.insert(
+            tampered,
+            CanonicalSyntheticScope {
+                locals: foreign_locals,
+                parent: None,
+            },
+        );
+        host.events.clear();
+        assert_eq!(
+            resolve_from(
+                &source,
+                &mut host,
+                Some(CanonicalResolutionLocation::SyntheticScope(tampered)),
+                "missing",
+                SymbolFlags::VALUE,
+                Some(not_found_message()),
+                false,
+                false,
+            ),
+            Err(CanonicalNameResolutionError::InvalidHostTable(
+                foreign_locals
+            ))
+        );
+        assert!(host.events.is_empty());
+        assert!(host.failed.is_empty());
+        assert!(host.succeeded.is_empty());
+    }
+
+    #[test]
+    fn property_initializer_uses_first_constructor_with_a_body() {
+        let source = bind(
+            r"
+class C {
+    field = local;
+    constructor();
+    constructor() { var local = 1; }
+}
+",
+            CanonicalModuleState::Script,
+        );
+        let use_site = identifier_in(&source, "field = local", "local");
+        let property = first_kind(&source, SyntaxKind::PropertyDeclaration);
+        let mut host = TestHost::for_source(&source);
+        host.invalid_property_result = true;
+
+        assert_eq!(
+            resolve(&source, &mut host, use_site, "local", SymbolFlags::VALUE),
+            Ok(None)
+        );
+        assert_eq!(host.invalid_properties.len(), 1);
+        assert_eq!(host.invalid_properties[0].1, "local");
+        assert_eq!(host.invalid_properties[0].2, node_ref(&source, property));
+        assert!(host.failed.is_empty());
+    }
+
+    #[test]
+    fn bodyless_constructors_do_not_trigger_the_specialized_property_path() {
+        for text in [
+            r"declare class C {
+    field = local;
+    constructor();
+}",
+            r"class C {
+    field = local;
+    constructor();
+}",
+        ] {
+            let source = bind(text, CanonicalModuleState::Script);
+            let use_site = identifier_in(&source, "field = local", "local");
+            let mut host = TestHost::for_source(&source);
+            host.invalid_property_result = true;
+
+            assert_eq!(
+                resolve(&source, &mut host, use_site, "local", SymbolFlags::VALUE),
+                Ok(None)
+            );
+            assert!(host.invalid_properties.is_empty());
+            assert_eq!(host.failed.len(), 1);
+        }
+    }
+
+    #[test]
+    fn multiple_constructor_bodies_use_the_first_implementation_in_source_order() {
+        let source = bind(
+            r"
+class C {
+    firstField = first;
+    secondField = second;
+    constructor() { var first = 1; }
+    constructor() { var second = 1; }
+}
+",
+            CanonicalModuleState::Script,
+        );
+        let first_use = identifier_in(&source, "firstField = first", "first");
+        let second_use = identifier_in(&source, "secondField = second", "second");
+        let mut host = TestHost::for_source(&source);
+        host.invalid_property_result = true;
+
+        assert_eq!(
+            resolve(&source, &mut host, first_use, "first", SymbolFlags::VALUE,),
+            Ok(None)
+        );
+        assert_eq!(host.invalid_properties.len(), 1);
+        assert!(host.failed.is_empty());
+
+        host.invalid_properties.clear();
+        host.failed.clear();
+        assert_eq!(
+            resolve(&source, &mut host, second_use, "second", SymbolFlags::VALUE,),
+            Ok(None)
+        );
+        assert!(host.invalid_properties.is_empty());
+        assert_eq!(host.failed.len(), 1);
+    }
+
+    #[test]
+    fn ambient_module_semantics_require_declaration_context() {
+        let source = bind(
+            r#"
+module "recovery" { interface Hidden {} }
+declare module "declared" { interface Visible {} }
+global { interface BareGlobal {} }
+declare global { interface DeclaredGlobal {} }
+declare namespace Outer { namespace Nested { interface NestedVisible {} } }
+"#,
+            CanonicalModuleState::Script,
+        );
+        let mut modules = source
+            .parsed
+            .arena
+            .iter()
+            .filter_map(|(node, record)| {
+                (record.kind == SyntaxKind::ModuleDeclaration).then_some(node)
+            })
+            .collect::<Vec<_>>();
+        modules.sort_by_key(|node| source.parsed.arena.get(*node).unwrap().range.start);
+        assert_eq!(modules.len(), 6);
+        let mut host = TestHost::for_source(&source);
+        let resolver = CanonicalNameResolver::new(
+            &source.parsed.arena,
+            bound(&source),
+            source.bindings.symbol_store(),
+            &mut host,
+        )
+        .unwrap();
+        assert!(!resolver.is_ambient_node(modules[0]));
+        assert!(resolver.is_ambient_node(modules[1]));
+        assert!(!resolver.is_ambient_node(modules[2]));
+        assert!(resolver.is_ambient_node(modules[3]));
+        assert!(resolver.is_ambient_node(modules[4]));
+        assert!(resolver.is_ambient_node(modules[5]));
+
+        let declarations = bind_with_declaration_file(
+            r#"module "file-context" { interface Visible {} }"#,
+            CanonicalModuleState::Script,
+            true,
+        );
+        let module = first_kind(&declarations, SyntaxKind::ModuleDeclaration);
+        let mut host = TestHost::for_source(&declarations);
+        let resolver = CanonicalNameResolver::new(
+            &declarations.parsed.arena,
+            bound(&declarations),
+            declarations.bindings.symbol_store(),
+            &mut host,
+        )
+        .unwrap();
+        assert!(resolver.is_ambient_node(module));
+    }
+
+    #[test]
+    fn shorthand_reexport_only_jumps_after_visiting_its_property_name() {
+        let source = bind(
+            r#"
+const remote = 1;
+export { remote } from "pkg";
+"#,
+            CanonicalModuleState::External,
+        );
+        let specifier = first_kind(&source, SyntaxKind::ExportSpecifier);
+        let source_locals = bound(&source).locals(bound(&source).source_file()).unwrap();
+        let remote = table_symbol(&source, source_locals, "remote");
+        let mut host = TestHost::for_source(&source);
+        host.globals = None;
+
+        assert_eq!(
+            resolve(&source, &mut host, specifier, "remote", SymbolFlags::VALUE,),
+            Ok(Some(remote))
+        );
+    }
+
+    #[test]
     fn provenance_and_host_failures_are_rejected_before_notifications() {
         let source = bind(
             "const value = 1; function read() { return value; }",
@@ -2474,7 +3541,7 @@ const immediate = (function () { return outer; })();
         .unwrap();
         assert_eq!(
             resolver.resolve(
-                foreign_location,
+                Some(foreign_location.into()),
                 "value",
                 SymbolFlags::VALUE,
                 None,
@@ -2562,6 +3629,7 @@ const immediate = (function () { return outer; })();
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn foreign_declaration_ast_queries_are_explicitly_capability_gated() {
         let parsed = parse_source_file("const value = 1;");
         let foreign_parsed = parse_source_file("interface Foreign {}");
@@ -2630,31 +3698,63 @@ const immediate = (function () { return outer; })();
         host.foreign_parents.insert(foreign, foreign_parent);
         host.foreign_modifiers
             .insert((foreign, SyntaxKind::DefaultKeyword), false);
-        let mut resolver = CanonicalNameResolver::new(
-            &source.parsed.arena,
-            bound(&source),
-            source.bindings.symbol_store(),
-            &mut host,
-        )
-        .unwrap();
-        assert_eq!(
-            resolver.declaration_kind(foreign),
-            Ok(SyntaxKind::InterfaceDeclaration)
-        );
-        assert_eq!(resolver.declaration_parent(foreign), Ok(foreign_parent));
-        assert_eq!(
-            resolver.declaration_has_modifier(foreign, SyntaxKind::DefaultKeyword),
-            Ok(false)
-        );
-
         let unregistered = NodeRef::new(
             foreign_parsed.arena.id(),
             FileId::new(411),
             foreign_declaration,
         );
+        {
+            let mut resolver = CanonicalNameResolver::new(
+                &source.parsed.arena,
+                bound(&source),
+                source.bindings.symbol_store(),
+                &mut host,
+            )
+            .unwrap();
+            assert_eq!(
+                resolver.declaration_kind(foreign),
+                Ok(SyntaxKind::InterfaceDeclaration)
+            );
+            assert_eq!(resolver.declaration_parent(foreign), Ok(foreign_parent));
+            assert_eq!(
+                resolver.declaration_has_modifier(foreign, SyntaxKind::DefaultKeyword),
+                Ok(false)
+            );
+            assert_eq!(
+                resolver.declaration_kind(unregistered),
+                Err(CanonicalNameResolutionError::UnboundLocation(unregistered))
+            );
+        }
+
+        let current_locals = bound(&source).locals(bound(&source).source_file()).unwrap();
+        let synthetic = host
+            .synthetic_scopes
+            .as_mut()
+            .unwrap()
+            .alloc_scope(
+                source.bindings.symbol_store(),
+                current_locals,
+                Some(CanonicalResolutionLocation::Bound(foreign_parent)),
+            )
+            .unwrap();
+        host.events.clear();
         assert_eq!(
-            resolver.declaration_kind(unregistered),
-            Err(CanonicalNameResolutionError::UnboundLocation(unregistered))
+            resolve_from(
+                &source,
+                &mut host,
+                Some(CanonicalResolutionLocation::SyntheticScope(synthetic)),
+                "value",
+                SymbolFlags::VALUE,
+                Some(not_found_message()),
+                true,
+                false,
+            ),
+            Err(CanonicalNameResolutionError::UnboundLocation(
+                foreign_parent
+            ))
         );
+        assert!(host.events.is_empty());
+        assert!(host.failed.is_empty());
+        assert!(host.succeeded.is_empty());
     }
 }

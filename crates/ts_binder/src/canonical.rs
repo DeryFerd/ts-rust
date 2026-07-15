@@ -6571,6 +6571,7 @@ declare global { interface Window {} }
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn export_context_uses_ambient_flags_not_recovered_module_shape() {
         let parsed = parse_source_file(
             r#"

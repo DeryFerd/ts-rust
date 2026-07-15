@@ -17,7 +17,9 @@ pub use escaped_name::{
 };
 pub use name_resolver::{
     CanonicalNameResolutionError, CanonicalNameResolver, CanonicalNameResolverHost,
-    CanonicalNameResolverOptions, CanonicalResolvedName, CanonicalScopeChangeState,
+    CanonicalNameResolverOptions, CanonicalResolutionLocation, CanonicalResolvedName,
+    CanonicalScopeChangeState, CanonicalSyntheticScope, CanonicalSyntheticScopeId,
+    CanonicalSyntheticScopeStore, CanonicalSyntheticScopeStoreError, resolve_global_name,
 };
 pub use semantic::{
     AstScope, CheckFlags, SemanticStoreId, SemanticSymbolId, SymbolData, SymbolStore, SymbolTableId,
