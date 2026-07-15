@@ -1156,11 +1156,18 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
         if !Self::valid_object_flag_transition(record, object_flags) {
             return false;
         }
+        if record.object_flags == object_flags {
+            return true;
+        }
+        let preserves_union_cache_identity = matches!(record.data, TypeData::Union(_))
+            && Self::union_cache_lazy_object_flag_transition(record.object_flags, object_flags);
         let Some(record) = self.type_payload_mut(id) else {
             return false;
         };
         record.object_flags = object_flags;
-        self.mark_union_cache_validation_dirty();
+        if !preserves_union_cache_identity {
+            self.mark_union_cache_validation_dirty();
+        }
         true
     }
 
@@ -2011,6 +2018,40 @@ impl<MapperPayload> SemanticStore<TypeRecord, MapperPayload> {
             | ObjectFlags::IS_UNKNOWN_LIKE_UNION_COMPUTED
             | ObjectFlags::IS_UNKNOWN_LIKE_UNION;
         Self::object_flags_are_subset(flags, allowed)
+            && Self::valid_union_cache_lazy_object_flags(
+                flags & Self::union_cache_lazy_object_flags(),
+            )
+    }
+
+    pub(super) fn union_cache_lazy_object_flags() -> ObjectFlags {
+        ObjectFlags::MEMBERS_RESOLVED
+            | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
+            | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES
+            | ObjectFlags::IS_GENERIC_TYPE_COMPUTED
+            | ObjectFlags::IS_GENERIC_TYPE
+            | ObjectFlags::IS_UNKNOWN_LIKE_UNION_COMPUTED
+            | ObjectFlags::IS_UNKNOWN_LIKE_UNION
+    }
+
+    pub(super) fn valid_union_cache_lazy_object_flags(flags: ObjectFlags) -> bool {
+        let allowed = Self::union_cache_lazy_object_flags();
+        Self::object_flags_are_subset(flags, allowed)
+            && (!flags.intersects(ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES)
+                || flags.intersects(ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED))
+            && (!flags.intersects(ObjectFlags::IS_GENERIC_TYPE)
+                || flags.intersects(ObjectFlags::IS_GENERIC_TYPE_COMPUTED))
+            && (!flags.intersects(ObjectFlags::IS_UNKNOWN_LIKE_UNION)
+                || flags.intersects(ObjectFlags::IS_UNKNOWN_LIKE_UNION_COMPUTED))
+    }
+
+    fn union_cache_lazy_object_flag_transition(
+        current: ObjectFlags,
+        candidate: ObjectFlags,
+    ) -> bool {
+        let lazy = Self::union_cache_lazy_object_flags();
+        (current.bits() ^ candidate.bits()) & !lazy.bits() == 0
+            && Self::valid_union_cache_lazy_object_flags(current & lazy)
+            && Self::valid_union_cache_lazy_object_flags(candidate & lazy)
     }
 
     fn valid_intersection_object_flags(flags: ObjectFlags) -> bool {

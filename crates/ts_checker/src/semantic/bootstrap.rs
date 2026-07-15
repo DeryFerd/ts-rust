@@ -874,19 +874,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
     }
 
     fn valid_union_lazy_object_flags(flags: ObjectFlags) -> bool {
-        let allowed = ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED
-            | ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES
-            | ObjectFlags::IS_GENERIC_TYPE_COMPUTED
-            | ObjectFlags::IS_GENERIC_TYPE
-            | ObjectFlags::IS_UNKNOWN_LIKE_UNION_COMPUTED
-            | ObjectFlags::IS_UNKNOWN_LIKE_UNION;
-        flags.bits() & !allowed.bits() == 0
-            && (!flags.intersects(ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES)
-                || flags.intersects(ObjectFlags::COULD_CONTAIN_TYPE_VARIABLES_COMPUTED))
-            && (!flags.intersects(ObjectFlags::IS_GENERIC_TYPE)
-                || flags.intersects(ObjectFlags::IS_GENERIC_TYPE_COMPUTED))
-            && (!flags.intersects(ObjectFlags::IS_UNKNOWN_LIKE_UNION)
-                || flags.intersects(ObjectFlags::IS_UNKNOWN_LIKE_UNION_COMPUTED))
+        Self::valid_union_cache_lazy_object_flags(flags)
     }
 
     fn expected_union_type_flags(
@@ -4200,6 +4188,57 @@ mod tests {
         cache.remove(&malformed_key);
         cache.insert(repaired_key, repaired);
         assert!(store.prepare_type_query_types(&[], &[], &[], 1, 1).is_ok());
+    }
+
+    #[test]
+    fn lazy_union_memo_and_member_flags_do_not_rescan_a_growing_union_cache() {
+        let mut store = initialized(IntrinsicBootstrapOptions {
+            strict_null_checks: true,
+            ..IntrinsicBootstrapOptions::default()
+        });
+        let number_type = store.intrinsic_bootstrap().unwrap().number_type;
+        let baseline_scans = store.union_cache_validation_scan_count();
+        let baseline_unions = store.intrinsic_bootstrap().unwrap().union_cache_len();
+
+        for index in 0..32 {
+            let literal = store
+                .regular_string_literal_type(format!("memo-{index}"))
+                .unwrap();
+            let union = store
+                .literal_union_type(&[literal, number_type], None)
+                .unwrap();
+            let flags = store.type_payload(union).unwrap().object_flags();
+
+            assert!(
+                !store.set_type_object_flags(union, flags | ObjectFlags::IS_UNKNOWN_LIKE_UNION,)
+            );
+            let _ = store.is_type_assignable_to(number_type, union);
+            assert!(
+                store
+                    .type_payload(union)
+                    .unwrap()
+                    .object_flags()
+                    .intersects(ObjectFlags::IS_UNKNOWN_LIKE_UNION_COMPUTED)
+            );
+            assert_eq!(
+                store.literal_union_type(&[literal, number_type], None),
+                Ok(union),
+            );
+            assert!(store.set_structured_type_members(union, None, None, None, None, None));
+            assert_eq!(
+                store.literal_union_type(&[literal, number_type], None),
+                Ok(union),
+            );
+            assert!(!store.union_cache_needs_validation);
+        }
+
+        assert_eq!(store.union_cache_validation_scan_count(), baseline_scans);
+        assert_eq!(
+            store.intrinsic_bootstrap().unwrap().union_cache_len(),
+            baseline_unions + 32,
+        );
+        assert!(store.prepare_type_query_types(&[], &[], &[], 1, 0).is_ok());
+        assert_eq!(store.union_cache_validation_scan_count(), baseline_scans);
     }
 
     #[test]
