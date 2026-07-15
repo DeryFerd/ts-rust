@@ -32,11 +32,13 @@ use super::{
 ///
 /// The intrinsic pair controls bootstrap identity. `strict_bind_call_apply`
 /// selects the pinned `CallableFunction`/`NewableFunction` globals instead of
-/// aliasing both fields to `Function`.
+/// aliasing both fields to `Function`. `strict_builtin_iterator_return` is
+/// retained for declared type-alias construction.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CanonicalCheckerOptions {
     pub intrinsic: IntrinsicBootstrapOptions,
     pub strict_bind_call_apply: bool,
+    pub strict_builtin_iterator_return: bool,
     pub name_resolution: CanonicalNameResolverOptions,
 }
 
@@ -45,6 +47,7 @@ impl From<IntrinsicBootstrapOptions> for CanonicalCheckerOptions {
         Self {
             intrinsic,
             strict_bind_call_apply: false,
+            strict_builtin_iterator_return: false,
             name_resolution: CanonicalNameResolverOptions::default(),
         }
     }
@@ -86,6 +89,7 @@ struct CanonicalCheckerFile<'arena> {
 /// Program order.
 #[derive(Debug)]
 pub struct CanonicalCheckerContext<'arena> {
+    options: CanonicalCheckerOptions,
     file_order: Vec<FileId>,
     files: BTreeMap<FileId, CanonicalCheckerFile<'arena>>,
     store: CanonicalTypeMapperStore,
@@ -172,6 +176,7 @@ impl<'arena> CanonicalCheckerContext<'arena> {
         .map_err(CanonicalCheckerContextError::GlobalInitialization)?;
 
         Ok(Self {
+            options,
             file_order,
             files,
             store,
@@ -180,6 +185,12 @@ impl<'arena> CanonicalCheckerContext<'arena> {
             pending_ambient_modules: initialized.pending_ambient_modules,
             pattern_ambient_modules: initialized.pattern_ambient_modules,
         })
+    }
+
+    /// The complete checker options retained for later semantic queries.
+    #[must_use]
+    pub const fn options(&self) -> CanonicalCheckerOptions {
+        self.options
     }
 
     /// The exact caller-supplied Program order used for source registration.
@@ -1220,6 +1231,19 @@ mod tests {
     }
 
     #[test]
+    fn checker_option_defaults_leave_strict_builtin_iterator_return_disabled() {
+        assert!(!CanonicalCheckerOptions::default().strict_builtin_iterator_return);
+
+        let intrinsic = IntrinsicBootstrapOptions {
+            strict_null_checks: true,
+            exact_optional_property_types: true,
+        };
+        let options = CanonicalCheckerOptions::from(intrinsic);
+        assert_eq!(options.intrinsic, intrinsic);
+        assert!(!options.strict_builtin_iterator_return);
+    }
+
+    #[test]
     fn preserves_explicit_non_map_order_registers_all_roots_and_keeps_store_brand() {
         let low = parsed("interface Low { value: string }");
         let middle = parsed("interface Middle { value: number }");
@@ -1230,9 +1254,13 @@ mod tests {
         let bindings =
             completed_bindings(&[(low_file, &low), (middle_file, &middle), (high_file, &high)]);
         let binder_brand = bindings.symbol_store().id();
-        let options = IntrinsicBootstrapOptions {
-            strict_null_checks: true,
-            exact_optional_property_types: true,
+        let options = CanonicalCheckerOptions {
+            intrinsic: IntrinsicBootstrapOptions {
+                strict_null_checks: true,
+                exact_optional_property_types: true,
+            },
+            strict_builtin_iterator_return: true,
+            ..CanonicalCheckerOptions::default()
         };
 
         let context = CanonicalCheckerContext::new(
@@ -1247,6 +1275,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(context.file_order(), &[high_file, low_file, middle_file]);
+        assert_eq!(context.options(), options);
         assert_eq!(context.id(), binder_brand);
         assert_eq!(context.store().id(), binder_brand);
 
@@ -1267,7 +1296,7 @@ mod tests {
         }
 
         let bootstrap = context.store().intrinsic_bootstrap().unwrap();
-        assert_eq!(bootstrap.options, options);
+        assert_eq!(bootstrap.options, options.intrinsic);
         assert!(context.store().symbol_table(bootstrap.globals).is_some());
         assert!(
             context

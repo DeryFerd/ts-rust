@@ -128,6 +128,10 @@ pub struct CompilerOptions {
     /// Whether `strictBindCallApply` was explicitly supplied rather than
     /// inherited from `strict`.
     pub strict_bind_call_apply_specified: bool,
+    pub strict_builtin_iterator_return: bool,
+    /// Whether `strictBuiltinIteratorReturn` was explicitly supplied rather
+    /// than inherited from `strict`.
+    pub strict_builtin_iterator_return_specified: bool,
     pub strict_null_checks: bool,
     /// Whether `strictNullChecks` was explicitly supplied rather than inherited
     /// from `strict`.
@@ -217,6 +221,8 @@ impl Default for CompilerOptions {
             strict_specified: false,
             strict_bind_call_apply: true,
             strict_bind_call_apply_specified: false,
+            strict_builtin_iterator_return: true,
+            strict_builtin_iterator_return_specified: false,
             strict_null_checks: true,
             strict_null_checks_specified: false,
             strict_property_initialization: true,
@@ -405,6 +411,12 @@ impl CompilerOptions {
                     {
                         self.strict_bind_call_apply = overrides.strict_bind_call_apply;
                     }
+                    if !names.contains("strictbuiltiniteratorreturn")
+                        && !self.strict_builtin_iterator_return_specified
+                    {
+                        self.strict_builtin_iterator_return =
+                            overrides.strict_builtin_iterator_return;
+                    }
                     if !names.contains("noimplicitany") && !self.no_implicit_any_specified {
                         self.no_implicit_any = overrides.no_implicit_any;
                     }
@@ -427,6 +439,10 @@ impl CompilerOptions {
                 "strictbindcallapply" => {
                     self.strict_bind_call_apply = overrides.strict_bind_call_apply;
                     self.strict_bind_call_apply_specified = true;
+                }
+                "strictbuiltiniteratorreturn" => {
+                    self.strict_builtin_iterator_return = overrides.strict_builtin_iterator_return;
+                    self.strict_builtin_iterator_return_specified = true;
                 }
                 "strictnullchecks" => {
                     self.strict_null_checks = overrides.strict_null_checks;
@@ -672,6 +688,10 @@ pub fn parse_compiler_options_map(options: &BTreeMap<String, JsonValue>) -> Pars
             "strictbindcallapply" => {
                 parsed.strict_bind_call_apply = boolean(original_name, value, &mut diagnostics);
             }
+            "strictbuiltiniteratorreturn" => {
+                parsed.strict_builtin_iterator_return =
+                    boolean(original_name, value, &mut diagnostics);
+            }
             "strictnullchecks" => {
                 parsed.strict_null_checks = boolean(original_name, value, &mut diagnostics);
             }
@@ -788,6 +808,7 @@ struct PartialOptions {
     strip_internal: Option<bool>,
     strict: Option<bool>,
     strict_bind_call_apply: Option<bool>,
+    strict_builtin_iterator_return: Option<bool>,
     strict_null_checks: Option<bool>,
     strict_property_initialization: Option<bool>,
     use_define_for_class_fields: Option<bool>,
@@ -828,6 +849,8 @@ impl PartialOptions {
         let no_implicit_any_specified = self.no_implicit_any.is_some();
         let strict_specified = self.strict.is_some();
         let strict_bind_call_apply_specified = self.strict_bind_call_apply.is_some();
+        let strict_builtin_iterator_return_specified =
+            self.strict_builtin_iterator_return.is_some();
         let strict_null_checks_specified = self.strict_null_checks.is_some();
         let strict_property_initialization_specified =
             self.strict_property_initialization.is_some();
@@ -902,6 +925,8 @@ impl PartialOptions {
             strict_specified,
             strict_bind_call_apply: self.strict_bind_call_apply.unwrap_or(strict),
             strict_bind_call_apply_specified,
+            strict_builtin_iterator_return: self.strict_builtin_iterator_return.unwrap_or(strict),
+            strict_builtin_iterator_return_specified,
             strict_null_checks: self.strict_null_checks.unwrap_or(strict),
             strict_null_checks_specified,
             strict_property_initialization: self.strict_property_initialization.unwrap_or(strict),
@@ -1462,12 +1487,14 @@ mod tests {
         assert!(defaults.strict);
         assert!(defaults.no_implicit_any);
         assert!(defaults.strict_bind_call_apply);
+        assert!(defaults.strict_builtin_iterator_return);
         assert!(defaults.strict_null_checks);
         assert!(defaults.strict_property_initialization);
         assert!(defaults.use_unknown_in_catch_variables);
         assert!(!defaults.strict_specified);
         assert!(!defaults.no_implicit_any_specified);
         assert!(!defaults.strict_bind_call_apply_specified);
+        assert!(!defaults.strict_builtin_iterator_return_specified);
         assert!(!defaults.strict_null_checks_specified);
         assert!(!defaults.strict_property_initialization_specified);
         assert!(!defaults.use_unknown_in_catch_variables_specified);
@@ -1477,12 +1504,14 @@ mod tests {
         assert!(!disabled.strict);
         assert!(!disabled.no_implicit_any);
         assert!(!disabled.strict_bind_call_apply);
+        assert!(!disabled.strict_builtin_iterator_return);
         assert!(!disabled.strict_null_checks);
         assert!(!disabled.strict_property_initialization);
         assert!(!disabled.use_unknown_in_catch_variables);
 
         let mut inherited = parse_compiler_options(&object([
             ("strictBindCallApply", JsonValue::Bool(true)),
+            ("strictBuiltinIteratorReturn", JsonValue::Bool(true)),
             ("strictNullChecks", JsonValue::Bool(true)),
             ("strictPropertyInitialization", JsonValue::Bool(true)),
         ]))
@@ -1491,6 +1520,8 @@ mod tests {
         assert!(!inherited.strict);
         assert!(inherited.strict_bind_call_apply);
         assert!(inherited.strict_bind_call_apply_specified);
+        assert!(inherited.strict_builtin_iterator_return);
+        assert!(inherited.strict_builtin_iterator_return_specified);
         assert!(inherited.strict_null_checks);
         assert!(inherited.strict_property_initialization);
 
@@ -1498,6 +1529,7 @@ mod tests {
         implied.apply_overrides(&disabled, &BTreeSet::from(["strict".to_owned()]));
         assert!(!implied.no_implicit_any);
         assert!(!implied.strict_bind_call_apply);
+        assert!(!implied.strict_builtin_iterator_return);
         assert!(!implied.strict_null_checks);
         assert!(!implied.strict_property_initialization);
         assert!(!implied.use_unknown_in_catch_variables);
@@ -1509,6 +1541,19 @@ mod tests {
         assert!(explicit_false.is_ok(), "{:?}", explicit_false.diagnostics);
         assert!(!explicit_false.options.strict_bind_call_apply);
         assert!(explicit_false.options.strict_bind_call_apply_specified);
+
+        let mut iterator_explicit_false = parse_compiler_options(&object([
+            ("strict", JsonValue::Bool(false)),
+            ("strictBuiltinIteratorReturn", JsonValue::Bool(false)),
+        ]))
+        .options;
+        iterator_explicit_false.apply_overrides(
+            &CompilerOptions::default(),
+            &BTreeSet::from(["strict".to_owned()]),
+        );
+        assert!(iterator_explicit_false.strict);
+        assert!(!iterator_explicit_false.strict_builtin_iterator_return);
+        assert!(iterator_explicit_false.strict_builtin_iterator_return_specified);
     }
 
     #[test]
