@@ -2494,6 +2494,60 @@ mod tests {
     }
 
     #[test]
+    fn recursive_interface_this_is_order_sensitive_like_published_go_shells() {
+        let source = "interface Left extends Right {} interface Left { current: this } interface Right extends Left {}";
+
+        let mut left_first = fixture(source);
+        merge_fixture_globals(&mut left_first);
+        let left = named_symbol(&left_first, SyntaxKind::InterfaceDeclaration, "Left");
+        let right = named_symbol(&left_first, SyntaxKind::InterfaceDeclaration, "Right");
+        let bound = left_first.files.get(&left_first.file).unwrap();
+        let host = post_global_host(&left_first.parsed.arena, bound);
+        let left_type = left_first
+            .store
+            .get_declared_type_of_symbol(&host, left)
+            .unwrap();
+        let right_type = left_first
+            .store
+            .declared_type_links(right)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        assert!(
+            interface_data(&left_first.store, left_type)
+                .this_type
+                .is_some()
+        );
+        assert!(
+            interface_data(&left_first.store, right_type)
+                .this_type
+                .is_none()
+        );
+
+        let mut right_first = fixture(source);
+        merge_fixture_globals(&mut right_first);
+        let left = named_symbol(&right_first, SyntaxKind::InterfaceDeclaration, "Left");
+        let right = named_symbol(&right_first, SyntaxKind::InterfaceDeclaration, "Right");
+        let bound = right_first.files.get(&right_first.file).unwrap();
+        let host = post_global_host(&right_first.parsed.arena, bound);
+        let right_type = right_first
+            .store
+            .get_declared_type_of_symbol(&host, right)
+            .unwrap();
+        let left_type = right_first
+            .store
+            .declared_type_links(left)
+            .and_then(|links| links.declared_type)
+            .unwrap();
+        for declared_type in [right_type, left_type] {
+            assert!(
+                interface_data(&right_first.store, declared_type)
+                    .this_type
+                    .is_some()
+            );
+        }
+    }
+
+    #[test]
     fn an_uncached_generic_base_adds_this_to_itself_and_the_derived_interface() {
         let mut fixture =
             fixture("interface Generic<T> {} interface Derived extends Generic<string> {}");
@@ -2594,6 +2648,28 @@ mod tests {
                 .this_type
                 .is_some()
         );
+    }
+
+    #[test]
+    fn a_pure_class_base_forces_this_without_allocating_the_class_identity() {
+        let mut fixture = fixture("class Base {} interface Derived extends Base {}");
+        merge_fixture_globals(&mut fixture);
+        let base = named_symbol(&fixture, SyntaxKind::ClassDeclaration, "Base");
+        let derived = named_symbol(&fixture, SyntaxKind::InterfaceDeclaration, "Derived");
+        let bound = fixture.files.get(&fixture.file).unwrap();
+        let host = post_global_host(&fixture.parsed.arena, bound);
+
+        let derived_type = fixture
+            .store
+            .get_declared_type_of_symbol(&host, derived)
+            .unwrap();
+
+        assert!(
+            interface_data(&fixture.store, derived_type)
+                .this_type
+                .is_some()
+        );
+        assert!(fixture.store.declared_type_links(base).is_none());
     }
 
     #[test]
