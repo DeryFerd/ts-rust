@@ -2845,10 +2845,8 @@ mod tests {
         let mut assignments = parsed
             .arena
             .iter()
-            .filter_map(|(node, record)| {
-                (record.kind == SyntaxKind::PropertyAssignment)
-                    .then(|| (record.range.start, scope.node_ref(node).unwrap()))
-            })
+            .filter(|(_, record)| record.kind == SyntaxKind::PropertyAssignment)
+            .map(|(node, record)| (record.range.start, scope.node_ref(node).unwrap()))
             .collect::<Vec<_>>();
         assignments.sort_by_key(|(start, _)| *start);
         assert_eq!(assignments.len(), properties.len());
