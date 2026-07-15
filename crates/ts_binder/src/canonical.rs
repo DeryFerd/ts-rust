@@ -1453,7 +1453,9 @@ fn assignment_name_requires_javascript_file_kind(arena: &NodeArena, declaration:
                 return false;
             };
             !is_entity_name_expression(arena, base)
-                && is_entity_name_expression_ex(arena, base, true)
+                && (is_entity_name_expression_ex(arena, base, true)
+                    || (is_module_exports_access(arena, base)
+                        && has_static_access_name(arena, binary.left)))
         }
         NodeData::CallExpression(_) => is_bindable_object_define_property_call(arena, declaration),
         _ => false,
@@ -1465,6 +1467,20 @@ fn access_expression_base(arena: &NodeArena, node: NodeId) -> Option<NodeId> {
         NodeData::PropertyAccessExpression(access) => Some(access.expression),
         NodeData::ElementAccessExpression(access) => Some(access.expression),
         _ => None,
+    }
+}
+
+fn has_static_access_name(arena: &NodeArena, node: NodeId) -> bool {
+    match arena.get(node).map(|node| &node.data) {
+        Some(NodeData::PropertyAccessExpression(access)) => arena
+            .get(access.name)
+            .is_some_and(|name| name.kind == SyntaxKind::Identifier),
+        Some(NodeData::ElementAccessExpression(access)) => {
+            skip_parentheses(arena, access.argument_expression)
+                .and_then(|name| arena.get(name))
+                .is_some_and(|name| is_string_or_numeric_literal_like(name.kind))
+        }
+        _ => false,
     }
 }
 
@@ -3105,7 +3121,7 @@ mod tests {
     #[test]
     fn javascript_only_assignment_names_wait_for_a_canonical_file_kind() {
         let parsed = parse_source_file(
-            "this.field = 1; module.exports = value; module[\"exports\"] = value; Object.defineProperty(exports, \"name\", {});",
+            "this.field = 1; module.exports = value; module[\"exports\"] = value; module[(\"exports\")].field = value; module[(\"exports\")][\"field\"] = value; Object.defineProperty(exports, \"name\", {});",
         );
         let this_assignment = node_with_source(
             &parsed.arena,
@@ -3122,6 +3138,16 @@ mod tests {
             SyntaxKind::BinaryExpression,
             "module[\"exports\"] = value",
         );
+        let module_element_property_assignment = node_with_source(
+            &parsed.arena,
+            SyntaxKind::BinaryExpression,
+            "module[(\"exports\")].field = value",
+        );
+        let nested_module_element_assignment = node_with_source(
+            &parsed.arena,
+            SyntaxKind::BinaryExpression,
+            "module[(\"exports\")][\"field\"] = value",
+        );
         let define_property = node_with_source(
             &parsed.arena,
             SyntaxKind::CallExpression,
@@ -3137,6 +3163,8 @@ mod tests {
             this_assignment,
             module_assignment,
             module_element_assignment,
+            module_element_property_assignment,
+            nested_module_element_assignment,
             define_property,
         ] {
             assert_eq!(
