@@ -6,8 +6,9 @@ mod flow_builder;
 pub mod semantic;
 
 pub use canonical::{
-    BindingPhase, BoundFile, CanonicalBindError, CanonicalBinder, CanonicalExtractionError,
-    CanonicalProgramBindings,
+    BindingPhase, BoundFile, CanonicalBindDiagnostic, CanonicalBindError, CanonicalBinder,
+    CanonicalDeclarationError, CanonicalExtractionError, CanonicalProgramBindings,
+    CanonicalRelatedInformation,
 };
 pub use escaped_name::{
     EscapedDisplay, EscapedName, EscapedNameRef, INTERNAL_SYMBOL_NAME_PREFIX, InternalSymbolName,
@@ -18,7 +19,7 @@ pub use semantic::{
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
-    ops::{BitOr, BitOrAssign},
+    ops::{BitAnd, BitOr, BitOrAssign},
 };
 
 use ts_ast::{
@@ -184,6 +185,12 @@ impl SymbolFlags {
     pub const fn intersects(self, other: Self) -> bool {
         self.0 & other.0 != 0
     }
+
+    /// Returns these flags with every bit in `other` cleared.
+    #[must_use]
+    pub const fn without(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
 }
 
 impl BitOr for SymbolFlags {
@@ -197,6 +204,14 @@ impl BitOr for SymbolFlags {
 impl BitOrAssign for SymbolFlags {
     fn bitor_assign(&mut self, rhs: Self) {
         self.0 |= rhs.0;
+    }
+}
+
+impl BitAnd for SymbolFlags {
+    type Output = Self;
+
+    fn bitand(self, rhs: Self) -> Self::Output {
+        Self(self.0 & rhs.0)
     }
 }
 

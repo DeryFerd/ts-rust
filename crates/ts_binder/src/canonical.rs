@@ -3,17 +3,20 @@
 //! TypeScript-Go writes binder results directly onto mutable AST nodes. Rust
 //! keeps the parse tree immutable, so [`BoundFile`] is the provenance-bearing
 //! equivalent of those node slots. This slice freezes the traversal, container,
-//! locals, and flow contracts. Declaration creation and merge diagnostics are
-//! deliberately the next phase; callers can observe that boundary through
-//! [`BindingPhase`] rather than mistaking an empty symbol slot for a completed
-//! declaration pass.
+//! locals, and flow contracts and exposes the dependency-closed declaration
+//! primitive used by the pinned binder. Full declaration dispatch is still a
+//! later phase; callers can observe that boundary through [`BindingPhase`].
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use ts_ast::{FileId, FlowRef, NodeArena, NodeArenaId, NodeData, NodeId, NodeRef, SyntaxKind};
+use ts_ast::{
+    FileId, FlowRef, ModifierList, NodeArena, NodeArenaId, NodeData, NodeId, NodeRef, SyntaxKind,
+};
+use ts_diagnostics::{Diagnostic, message_by_code};
 
 use crate::{
-    AstScope, BoundFlowGraph, SemanticSymbolId, SymbolStore, SymbolTableId,
+    AstScope, BoundFlowGraph, EscapedName, InternalSymbolName, SemanticSymbolId, SymbolData,
+    SymbolFlags, SymbolStore, SymbolTableId,
     flow_builder::{FlowTraversalHooks, build_flow_graph_with_hooks},
 };
 
@@ -133,6 +136,93 @@ impl std::fmt::Display for CanonicalBindError {
 
 impl std::error::Error for CanonicalBindError {}
 
+/// An invariant or provenance failure rejected before declaration state is
+/// changed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CanonicalDeclarationError {
+    /// The declaration's file has not completed canonical traversal.
+    UnboundFile(FileId),
+    /// The supplied arena is not the snapshot registered for this file.
+    WrongArena {
+        file: FileId,
+        expected: NodeArenaId,
+        actual: NodeArenaId,
+    },
+    /// The declaration is not reachable from the registered source file.
+    UnboundNode(NodeRef),
+    /// The table belongs to another store or was never allocated.
+    InvalidSymbolTable(SymbolTableId),
+    /// The parent belongs to another store or was never allocated.
+    InvalidParent(SemanticSymbolId),
+    /// A local-symbol write references a symbol outside this store.
+    InvalidLocalSymbol(SemanticSymbolId),
+    /// An exported-symbol link references a symbol outside this store.
+    InvalidExportSymbol(SemanticSymbolId),
+    /// A dynamic computed name must take the explicit computed-name path.
+    DynamicNameRequiresComputed(NodeRef),
+    /// Declaration naming depends on the not-yet-canonicalized JS file-kind
+    /// fact, so the TypeScript-only primitive cannot choose a table key.
+    JavaScriptFileKindRequired(NodeRef),
+    /// A private declaration was reached before its containing class symbol.
+    MissingContainingClassSymbol(NodeRef),
+}
+
+impl std::fmt::Display for CanonicalDeclarationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnboundFile(file) => write!(
+                formatter,
+                "Program file slot {} has not been canonically traversed",
+                file.index()
+            ),
+            Self::WrongArena { file, .. } => write!(
+                formatter,
+                "declaration arena does not match Program file slot {}",
+                file.index()
+            ),
+            Self::UnboundNode(node) => {
+                write!(formatter, "AST node {:?} is not bound", node.node)
+            }
+            Self::InvalidSymbolTable(_) => formatter.write_str("invalid canonical symbol table"),
+            Self::InvalidParent(_) => formatter.write_str("invalid canonical parent symbol"),
+            Self::InvalidLocalSymbol(_) => formatter.write_str("invalid canonical local symbol"),
+            Self::InvalidExportSymbol(_) => formatter.write_str("invalid canonical export symbol"),
+            Self::DynamicNameRequiresComputed(node) => write!(
+                formatter,
+                "dynamic name on AST node {:?} requires the computed-name declaration path",
+                node.node
+            ),
+            Self::JavaScriptFileKindRequired(node) => write!(
+                formatter,
+                "AST node {:?} requires a canonical JavaScript file-kind fact",
+                node.node
+            ),
+            Self::MissingContainingClassSymbol(node) => write!(
+                formatter,
+                "private declaration {:?} has no bound containing class symbol",
+                node.node
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CanonicalDeclarationError {}
+
+/// Related information attached to one canonical binder diagnostic.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CanonicalRelatedInformation {
+    pub node: NodeRef,
+    pub diagnostic: Diagnostic,
+}
+
+/// A canonical binder diagnostic with exact related-information order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CanonicalBindDiagnostic {
+    pub node: NodeRef,
+    pub diagnostic: Diagnostic,
+    pub related_information: Vec<CanonicalRelatedInformation>,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct NodeBinding {
     visited: bool,
@@ -159,6 +249,10 @@ pub struct BoundFile {
     nodes: Vec<NodeBinding>,
     traversal_order: Vec<NodeId>,
     container_chain: Vec<NodeId>,
+    diagnostics: Vec<CanonicalBindDiagnostic>,
+    classifiable_names: BTreeSet<EscapedName>,
+    not_const_enum_only_modules: BTreeSet<SemanticSymbolId>,
+    symbol_count: u32,
     flow: BoundFlowGraph,
 }
 
@@ -195,10 +289,9 @@ impl BoundFile {
             .is_some_and(|binding| binding.visited)
     }
 
-    /// Canonical declaration symbol written by the declaration phase.
-    ///
-    /// This is always `None` while [`Self::phase`] is
-    /// [`BindingPhase::Traversal`].
+    /// Canonical declaration symbol written by declaration binding. A focused
+    /// declaration primitive may populate this while the file remains in the
+    /// traversal phase; only full dispatch advances [`Self::phase`].
     #[must_use]
     pub fn symbol(&self, node: NodeRef) -> Option<SemanticSymbolId> {
         self.node_binding(node)?.symbol
@@ -208,6 +301,31 @@ impl BoundFile {
     #[must_use]
     pub fn local_symbol(&self, node: NodeRef) -> Option<SemanticSymbolId> {
         self.node_binding(node)?.local_symbol
+    }
+
+    /// Binder diagnostics in append order, including exact related-info order.
+    #[must_use]
+    pub fn diagnostics(&self) -> &[CanonicalBindDiagnostic] {
+        &self.diagnostics
+    }
+
+    /// Names observed with a classifiable declaration meaning.
+    #[must_use]
+    pub fn classifiable_names(&self) -> impl ExactSizeIterator<Item = crate::EscapedNameRef<'_>> {
+        self.classifiable_names.iter().map(EscapedName::as_ref)
+    }
+
+    /// Symbols whose const-enum-only marker was permanently cleared.
+    #[must_use]
+    pub fn is_not_const_enum_only_module(&self, symbol: SemanticSymbolId) -> bool {
+        self.not_const_enum_only_modules.contains(&symbol)
+    }
+
+    /// Symbols allocated while binding this file, including detached and
+    /// missing-name symbols.
+    #[must_use]
+    pub const fn symbol_count(&self) -> u32 {
+        self.symbol_count
     }
 
     /// The node's locals table. Absence and an allocated empty table remain
@@ -289,6 +407,12 @@ impl BoundFile {
             .flatten()
     }
 
+    fn node_binding_mut(&mut self, node: NodeRef) -> Option<&mut NodeBinding> {
+        (node.is_for(self.arena, self.file) && node.node.index() < self.node_count)
+            .then(|| self.nodes.get_mut(node.node.index()))
+            .flatten()
+    }
+
     fn node_ref(&self, node: NodeId) -> Option<NodeRef> {
         (node.index() < self.node_count).then(|| NodeRef::new(self.arena, self.file, node))
     }
@@ -350,13 +474,30 @@ impl CanonicalProgramBindings {
 
 /// Owns the one canonical symbol store while Program files are bound.
 ///
-/// There is intentionally no mutable `SymbolStore` escape hatch. B02 will add
-/// declaration operations on this owner, then [`Self::finish`] transfers the
-/// fully bound store to checker construction.
+/// There is intentionally no mutable `SymbolStore` escape hatch. Declaration
+/// operations validate identities through this owner before changing state.
+#[derive(Clone, Debug)]
+struct DeclarationFacts {
+    kind: SyntaxKind,
+    diagnostic_node: NodeRef,
+    display_name: String,
+    is_assignment: bool,
+    is_effective_module: bool,
+}
+
+struct PreparedDeclaration {
+    name: EscapedName,
+    facts: DeclarationFacts,
+    is_default_export: bool,
+    is_export_assignment_default: bool,
+    export_type_suggestion: Option<CanonicalRelatedInformation>,
+}
+
 #[derive(Debug, Default)]
 pub struct CanonicalBinder {
     symbols: SymbolStore,
     files: BTreeMap<FileId, BoundFile>,
+    declaration_facts: HashMap<NodeRef, DeclarationFacts>,
 }
 
 impl CanonicalBinder {
@@ -373,6 +514,627 @@ impl CanonicalBinder {
     #[must_use]
     pub fn file(&self, file: FileId) -> Option<&BoundFile> {
         self.files.get(&file)
+    }
+
+    /// Allocates one observable empty symbol table without exposing mutable
+    /// access to the Program's symbol store.
+    #[must_use]
+    pub fn create_symbol_table(&mut self) -> SymbolTableId {
+        self.symbols.alloc_symbol_table()
+    }
+
+    /// Pinned `declareSymbol`: derives the declaration name, then performs the
+    /// exact table insert/merge/conflict operation.
+    ///
+    /// # Errors
+    ///
+    /// Foreign arenas, nodes, tables, and parent symbols are rejected before
+    /// any declaration state changes.
+    ///
+    /// # Panics
+    ///
+    /// Like the pinned binder, a parent mismatch is checked after
+    /// `addDeclarationToSymbol` and therefore panics after those mutations.
+    #[allow(clippy::too_many_arguments)]
+    pub fn declare_symbol(
+        &mut self,
+        arena: &NodeArena,
+        file: FileId,
+        symbol_table: SymbolTableId,
+        parent: Option<SemanticSymbolId>,
+        node: NodeId,
+        includes: SymbolFlags,
+        excludes: SymbolFlags,
+    ) -> Result<SemanticSymbolId, CanonicalDeclarationError> {
+        self.declare_symbol_ex(
+            arena,
+            file,
+            symbol_table,
+            parent,
+            node,
+            includes,
+            excludes,
+            false,
+            false,
+        )
+    }
+
+    /// Pinned `declareSymbolEx`, including replaceable-property and explicit
+    /// computed-name behavior.
+    ///
+    /// # Errors
+    ///
+    /// Foreign arenas, nodes, tables, and parent symbols are rejected before
+    /// any declaration state changes. A dynamic computed name must use
+    /// `is_computed_name`.
+    ///
+    /// # Panics
+    ///
+    /// Like the pinned binder, a parent mismatch is checked after
+    /// `addDeclarationToSymbol` and therefore panics after those mutations.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub fn declare_symbol_ex(
+        &mut self,
+        arena: &NodeArena,
+        file: FileId,
+        symbol_table: SymbolTableId,
+        parent: Option<SemanticSymbolId>,
+        node: NodeId,
+        includes: SymbolFlags,
+        excludes: SymbolFlags,
+        is_replaceable_by_method: bool,
+        is_computed_name: bool,
+    ) -> Result<SemanticSymbolId, CanonicalDeclarationError> {
+        let node_ref = self.preflight_declaration(arena, file, symbol_table, parent, node)?;
+        let prepared = self.prepare_declaration(arena, node_ref, parent, is_computed_name)?;
+        let is_missing = prepared.name.as_ref() == InternalSymbolName::Missing.as_ref();
+
+        let symbol = if is_missing {
+            self.new_symbol(file, prepared.name.clone())
+        } else {
+            if includes.intersects(SymbolFlags::CLASSIFIABLE) {
+                self.files
+                    .get_mut(&file)
+                    .expect("declaration file was preflighted")
+                    .classifiable_names
+                    .insert(prepared.name.clone());
+            }
+
+            let existing = self
+                .symbols
+                .symbol_table(symbol_table)
+                .expect("declaration table was preflighted")
+                .get(prepared.name.as_ref());
+            match existing {
+                None => {
+                    let symbol = self.new_symbol(file, prepared.name.clone());
+                    let replaced = self
+                        .symbols
+                        .insert_symbol(symbol_table, prepared.name.clone(), symbol)
+                        .expect("declaration table and symbol were preflighted");
+                    assert_eq!(
+                        replaced, None,
+                        "new declaration must not replace a table entry"
+                    );
+                    if is_replaceable_by_method {
+                        self.or_symbol_flags(symbol, SymbolFlags::REPLACEABLE_BY_METHOD);
+                    }
+                    symbol
+                }
+                Some(existing)
+                    if is_replaceable_by_method
+                        && !self
+                            .symbols
+                            .symbol(existing)
+                            .expect("table entries are store-owned")
+                            .flags()
+                            .intersects(SymbolFlags::REPLACEABLE_BY_METHOD) =>
+                {
+                    // Pinned early return: no node symbol, declaration, parent,
+                    // or value-declaration write.
+                    return Ok(existing);
+                }
+                Some(existing) => {
+                    let existing_flags = self
+                        .symbols
+                        .symbol(existing)
+                        .expect("table entries are store-owned")
+                        .flags();
+                    if !existing_flags.intersects(excludes) {
+                        existing
+                    } else if existing_flags.intersects(SymbolFlags::REPLACEABLE_BY_METHOD) {
+                        let replacement = self.new_symbol(file, prepared.name.clone());
+                        assert_eq!(
+                            self.symbols.insert_symbol(
+                                symbol_table,
+                                prepared.name.clone(),
+                                replacement,
+                            ),
+                            Some(Some(existing)),
+                            "only replaceable-by-method displacement replaces a table entry",
+                        );
+                        replacement
+                    } else if assignment_variable_merge(includes, existing_flags) {
+                        existing
+                    } else {
+                        self.report_declaration_conflict(
+                            file, arena, existing, node_ref, includes, &prepared,
+                        );
+                        let existing_accessor = existing_flags & SymbolFlags::ACCESSOR;
+                        let incoming_accessor = includes & SymbolFlags::ACCESSOR;
+                        if existing_accessor != SymbolFlags::NONE
+                            && existing_accessor != incoming_accessor
+                        {
+                            self.or_symbol_flags(existing, SymbolFlags::ACCESSOR);
+                        }
+                        // Ordinary conflicts are detached: the table keeps the
+                        // first symbol and the current node receives a fresh one.
+                        self.new_symbol(file, prepared.name.clone())
+                    }
+                }
+            }
+        };
+
+        self.add_declaration_to_symbol(symbol, node_ref, includes, prepared.facts);
+
+        let record = self
+            .symbols
+            .symbol(symbol)
+            .expect("declared symbol is store-owned");
+        if record.parent().is_none() {
+            let (members, exports, export_symbol) =
+                (record.members(), record.exports(), record.export_symbol());
+            assert!(self.symbols.set_symbol_relationships(
+                symbol,
+                members,
+                exports,
+                parent,
+                export_symbol,
+            ));
+        } else if record.parent() != parent {
+            panic!("Existing symbol parent should match new one");
+        }
+        Ok(symbol)
+    }
+
+    /// Links the two symbols created for an exported declaration and writes
+    /// the dedicated AST `LocalSymbol` side slot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CanonicalDeclarationError`] if the node or either symbol has
+    /// foreign or otherwise invalid provenance.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if store ownership changes after the complete provenance
+    /// preflight, which would violate `CanonicalBinder`'s sealed ownership.
+    pub fn link_exported_declaration(
+        &mut self,
+        node: NodeRef,
+        local: SemanticSymbolId,
+        export: SemanticSymbolId,
+    ) -> Result<(), CanonicalDeclarationError> {
+        if !self.symbols.contains_symbol(local) {
+            return Err(CanonicalDeclarationError::InvalidLocalSymbol(local));
+        }
+        if !self.symbols.contains_symbol(export) {
+            return Err(CanonicalDeclarationError::InvalidExportSymbol(export));
+        }
+        let Some(file) = self.files.get_mut(&node.file) else {
+            return Err(CanonicalDeclarationError::UnboundFile(node.file));
+        };
+        let Some(binding) = file
+            .node_binding_mut(node)
+            .filter(|binding| binding.visited)
+        else {
+            return Err(CanonicalDeclarationError::UnboundNode(node));
+        };
+        let local_record = self
+            .symbols
+            .symbol(local)
+            .expect("local symbol was preflighted");
+        let (members, exports, parent) = (
+            local_record.members(),
+            local_record.exports(),
+            local_record.parent(),
+        );
+        assert!(self.symbols.set_symbol_relationships(
+            local,
+            members,
+            exports,
+            parent,
+            Some(export),
+        ));
+        binding.local_symbol = Some(local);
+        Ok(())
+    }
+
+    fn preflight_declaration(
+        &self,
+        arena: &NodeArena,
+        file: FileId,
+        symbol_table: SymbolTableId,
+        parent: Option<SemanticSymbolId>,
+        node: NodeId,
+    ) -> Result<NodeRef, CanonicalDeclarationError> {
+        let Some(bound) = self.files.get(&file) else {
+            return Err(CanonicalDeclarationError::UnboundFile(file));
+        };
+        if bound.arena != arena.id() {
+            return Err(CanonicalDeclarationError::WrongArena {
+                file,
+                expected: bound.arena,
+                actual: arena.id(),
+            });
+        }
+        let node_ref = NodeRef::new(arena.id(), file, node);
+        if !bound.contains(node_ref)
+            || !arena
+                .get(node)
+                .is_some_and(|node| node.data.matches_syntax_kind(node.kind))
+        {
+            return Err(CanonicalDeclarationError::UnboundNode(node_ref));
+        }
+        if !self.symbols.contains_symbol_table(symbol_table) {
+            return Err(CanonicalDeclarationError::InvalidSymbolTable(symbol_table));
+        }
+        if let Some(parent) = parent.filter(|parent| !self.symbols.contains_symbol(*parent)) {
+            return Err(CanonicalDeclarationError::InvalidParent(parent));
+        }
+        Ok(node_ref)
+    }
+
+    fn prepare_declaration(
+        &mut self,
+        arena: &NodeArena,
+        node: NodeRef,
+        parent: Option<SemanticSymbolId>,
+        is_computed_name: bool,
+    ) -> Result<PreparedDeclaration, CanonicalDeclarationError> {
+        if assignment_name_requires_javascript_file_kind(arena, node.node) {
+            return Err(CanonicalDeclarationError::JavaScriptFileKindRequired(node));
+        }
+        if !is_computed_name && has_dynamic_name(arena, node.node) {
+            return Err(CanonicalDeclarationError::DynamicNameRequiresComputed(node));
+        }
+        let declaration = arena
+            .get(node.node)
+            .expect("bound declaration was preflighted");
+        let is_default_export =
+            has_syntactic_modifier(arena, node.node, SyntaxKind::DefaultKeyword)
+                || matches!(
+                    &declaration.data,
+                    NodeData::ExportSpecifier(specifier)
+                        if node_text(arena, specifier.name).as_deref() == Some("default")
+                );
+        let name = if is_computed_name {
+            EscapedName::internal(InternalSymbolName::Computed)
+        } else if is_default_export && parent.is_some() {
+            EscapedName::internal(InternalSymbolName::Default)
+        } else {
+            self.get_declaration_name(arena, node)?
+        };
+        let diagnostic_node = get_name_of_declaration(arena, node.node)
+            .map_or(node, |name| NodeRef::new(node.arena, node.file, name));
+        let display_name = schema_declaration_name(&declaration.data).map_or_else(
+            || {
+                if name.as_ref() == InternalSymbolName::Missing.as_ref() {
+                    "(Missing)".to_owned()
+                } else {
+                    name.escaped_display().to_string()
+                }
+            },
+            |name| declaration_name_to_string(arena, name),
+        );
+        let export_type_suggestion = export_type_suggestion(arena, node);
+        Ok(PreparedDeclaration {
+            name,
+            facts: DeclarationFacts {
+                kind: declaration.kind,
+                diagnostic_node,
+                display_name,
+                is_assignment: is_assignment_declaration(declaration.kind),
+                is_effective_module: matches!(
+                    declaration.kind,
+                    SyntaxKind::ModuleDeclaration | SyntaxKind::Identifier
+                ),
+            },
+            is_default_export,
+            is_export_assignment_default: matches!(
+                &declaration.data,
+                NodeData::ExportAssignment(assignment) if !assignment.is_export_equals
+            ),
+            export_type_suggestion,
+        })
+    }
+
+    fn get_declaration_name(
+        &mut self,
+        arena: &NodeArena,
+        declaration: NodeRef,
+    ) -> Result<EscapedName, CanonicalDeclarationError> {
+        let node = arena
+            .get(declaration.node)
+            .expect("bound declaration was preflighted");
+        if let NodeData::ExportAssignment(assignment) = &node.data {
+            return Ok(EscapedName::internal(if assignment.is_export_equals {
+                InternalSymbolName::ExportEquals
+            } else {
+                InternalSymbolName::Default
+            }));
+        }
+
+        if let Some(name_id) = get_name_of_declaration(arena, declaration.node) {
+            let name = arena
+                .get(name_id)
+                .expect("bound declaration names are reachable");
+            if let NodeData::ModuleDeclaration(module) = &node.data {
+                if module.keyword == SyntaxKind::GlobalKeyword {
+                    return Ok(EscapedName::internal(InternalSymbolName::Global));
+                }
+                if name.kind == SyntaxKind::StringLiteral {
+                    let text = node_text(arena, name_id).unwrap_or_default();
+                    return Ok(EscapedName::source(format!("\"{text}\"")));
+                }
+            }
+            if let NodeData::PrivateIdentifier(private) = &name.data {
+                let Some(containing_class) = containing_class(arena, declaration.node) else {
+                    return Ok(EscapedName::internal(InternalSymbolName::Missing));
+                };
+                let class_ref = NodeRef::new(declaration.arena, declaration.file, containing_class);
+                let class_symbol = self
+                    .files
+                    .get(&declaration.file)
+                    .and_then(|file| file.symbol(class_ref))
+                    .ok_or(CanonicalDeclarationError::MissingContainingClassSymbol(
+                        declaration,
+                    ))?;
+                return self
+                    .symbols
+                    .private_identifier_name(class_symbol, &private.text)
+                    .ok_or(CanonicalDeclarationError::MissingContainingClassSymbol(
+                        declaration,
+                    ));
+            }
+            if is_property_name_literal(name.kind) {
+                return Ok(EscapedName::source(
+                    node_text(arena, name_id).unwrap_or_default(),
+                ));
+            }
+            if name.kind == SyntaxKind::JsxNamespacedName {
+                return Ok(EscapedName::source(
+                    node_text(arena, name_id).unwrap_or_default(),
+                ));
+            }
+            if let NodeData::ComputedPropertyName(computed) = &name.data {
+                let expression = arena
+                    .get(computed.expression)
+                    .expect("computed-name expression is reachable");
+                if is_string_or_numeric_literal_like(expression.kind) {
+                    return Ok(EscapedName::source(
+                        node_text(arena, computed.expression).unwrap_or_default(),
+                    ));
+                }
+                if let NodeData::PrefixUnaryExpression(unary) = &expression.data
+                    && matches!(
+                        unary.operator,
+                        SyntaxKind::PlusToken | SyntaxKind::MinusToken
+                    )
+                    && arena
+                        .get(unary.operand)
+                        .is_some_and(|operand| operand.kind == SyntaxKind::NumericLiteral)
+                {
+                    let operator = if unary.operator == SyntaxKind::PlusToken {
+                        "+"
+                    } else {
+                        "-"
+                    };
+                    return Ok(EscapedName::source(format!(
+                        "{operator}{}",
+                        node_text(arena, unary.operand).unwrap_or_default()
+                    )));
+                }
+                return Err(CanonicalDeclarationError::DynamicNameRequiresComputed(
+                    declaration,
+                ));
+            }
+            return Ok(EscapedName::internal(InternalSymbolName::Missing));
+        }
+
+        Ok(EscapedName::internal(match node.kind {
+            SyntaxKind::Constructor => InternalSymbolName::Constructor,
+            SyntaxKind::FunctionType | SyntaxKind::CallSignature => InternalSymbolName::Call,
+            SyntaxKind::ConstructorType | SyntaxKind::ConstructSignature => InternalSymbolName::New,
+            SyntaxKind::IndexSignature => InternalSymbolName::Index,
+            SyntaxKind::ExportDeclaration => InternalSymbolName::ExportStar,
+            SyntaxKind::SourceFile | SyntaxKind::BinaryExpression => {
+                InternalSymbolName::ExportEquals
+            }
+            _ => InternalSymbolName::Missing,
+        }))
+    }
+
+    fn new_symbol(&mut self, file: FileId, name: EscapedName) -> SemanticSymbolId {
+        let count = &mut self
+            .files
+            .get_mut(&file)
+            .expect("symbol allocation file was preflighted")
+            .symbol_count;
+        *count = count.checked_add(1).expect("binder symbol count exhausted");
+        self.symbols
+            .alloc_symbol(SymbolData::new(SymbolFlags::NONE, name))
+            .expect("reference-free binder symbol allocation is valid")
+    }
+
+    fn or_symbol_flags(&mut self, symbol: SemanticSymbolId, flags: SymbolFlags) {
+        let record = self
+            .symbols
+            .symbol(symbol)
+            .expect("declared symbol is store-owned");
+        let (combined, check_flags) = (record.flags() | flags, record.check_flags());
+        assert!(self.symbols.set_symbol_flags(symbol, combined, check_flags));
+    }
+
+    fn add_declaration_to_symbol(
+        &mut self,
+        symbol: SemanticSymbolId,
+        node: NodeRef,
+        includes: SymbolFlags,
+        facts: DeclarationFacts,
+    ) {
+        let record = self
+            .symbols
+            .symbol(symbol)
+            .expect("declared symbol is store-owned");
+        let mut flags = record.flags() | includes;
+        let check_flags = record.check_flags();
+        let mut declarations = record.declarations().map(<[NodeRef]>::to_vec);
+        let mut value_declaration = record.value_declaration();
+
+        match &mut declarations {
+            None => declarations = Some(vec![node]),
+            Some(declarations) if !declarations.contains(&node) => declarations.push(node),
+            Some(_) => {}
+        }
+
+        let no_longer_const_enum_only = flags.intersects(SymbolFlags::CONST_ENUM_ONLY_MODULE)
+            && flags
+                .intersects(SymbolFlags::FUNCTION | SymbolFlags::CLASS | SymbolFlags::REGULAR_ENUM);
+        if no_longer_const_enum_only {
+            flags = flags.without(SymbolFlags::CONST_ENUM_ONLY_MODULE);
+        }
+
+        if includes.intersects(SymbolFlags::VALUE) {
+            let replace = value_declaration.is_none_or(|current| {
+                let current_facts = if current == node {
+                    &facts
+                } else {
+                    self.declaration_facts
+                        .get(&current)
+                        .expect("value declarations were added by this binder")
+                };
+                current_facts.is_assignment && !facts.is_assignment
+                    || current_facts.kind != facts.kind && current_facts.is_effective_module
+            });
+            if replace {
+                value_declaration = Some(node);
+            }
+        }
+
+        assert!(self.symbols.set_symbol_flags(symbol, flags, check_flags));
+        assert!(
+            self.symbols
+                .set_symbol_declarations(symbol, declarations, value_declaration,)
+        );
+        self.files
+            .get_mut(&node.file)
+            .expect("declaration file was preflighted")
+            .node_binding_mut(node)
+            .expect("declaration node was preflighted")
+            .symbol = Some(symbol);
+        self.declaration_facts.entry(node).or_insert(facts);
+        if no_longer_const_enum_only {
+            self.files
+                .get_mut(&node.file)
+                .expect("declaration file was preflighted")
+                .not_const_enum_only_modules
+                .insert(symbol);
+        }
+    }
+
+    fn report_declaration_conflict(
+        &mut self,
+        file: FileId,
+        _arena: &NodeArena,
+        existing: SemanticSymbolId,
+        node: NodeRef,
+        includes: SymbolFlags,
+        prepared: &PreparedDeclaration,
+    ) {
+        let record = self
+            .symbols
+            .symbol(existing)
+            .expect("conflicting symbol is store-owned");
+        let existing_flags = record.flags();
+        let declarations = record.declarations().unwrap_or_default().to_vec();
+        let mut code = if existing_flags.intersects(SymbolFlags::BLOCK_SCOPED_VARIABLE) {
+            2451
+        } else {
+            2300
+        };
+        let mut message_needs_name = true;
+        if existing_flags.intersects(SymbolFlags::ENUM) || includes.intersects(SymbolFlags::ENUM) {
+            code = 2567;
+            message_needs_name = false;
+        }
+        let multiple_default_exports = !declarations.is_empty()
+            && (prepared.is_default_export || prepared.is_export_assignment_default);
+        if multiple_default_exports {
+            code = 2528;
+            message_needs_name = false;
+        }
+
+        let current_args = message_needs_name
+            .then(|| [prepared.facts.display_name.clone()])
+            .into_iter()
+            .flatten();
+        let mut current = CanonicalBindDiagnostic {
+            node: prepared.facts.diagnostic_node,
+            diagnostic: make_diagnostic(code, current_args),
+            related_information: Vec::new(),
+        };
+        if existing_flags
+            .intersects(SymbolFlags::ALIAS | SymbolFlags::TYPE | SymbolFlags::NAMESPACE)
+            && let Some(suggestion) = prepared.export_type_suggestion.clone()
+        {
+            current.related_information.push(suggestion);
+        }
+
+        for (index, declaration) in declarations.into_iter().enumerate() {
+            let previous = self
+                .declaration_facts
+                .get(&declaration)
+                .expect("conflicting declarations were added by this binder");
+            let previous_args = message_needs_name
+                .then(|| [previous.display_name.clone()])
+                .into_iter()
+                .flatten();
+            let mut diagnostic = CanonicalBindDiagnostic {
+                node: previous.diagnostic_node,
+                diagnostic: make_diagnostic(code, previous_args),
+                related_information: Vec::new(),
+            };
+            if multiple_default_exports {
+                diagnostic
+                    .related_information
+                    .push(CanonicalRelatedInformation {
+                        node: prepared.facts.diagnostic_node,
+                        diagnostic: make_diagnostic(
+                            if index == 0 { 2753 } else { 6204 },
+                            std::iter::empty::<String>(),
+                        ),
+                    });
+                current
+                    .related_information
+                    .push(CanonicalRelatedInformation {
+                        node: previous.diagnostic_node,
+                        diagnostic: make_diagnostic(2752, std::iter::empty::<String>()),
+                    });
+            }
+            self.files
+                .get_mut(&file)
+                .expect("declaration file was preflighted")
+                .diagnostics
+                .push(diagnostic);
+        }
+        self.files
+            .get_mut(&file)
+            .expect("declaration file was preflighted")
+            .diagnostics
+            .push(current);
+
+        let _ = node;
     }
 
     /// Traverses one Program source file into canonical side data.
@@ -438,6 +1200,477 @@ impl CanonicalBinder {
             files: self.files,
         }
     }
+}
+
+fn assignment_variable_merge(incoming: SymbolFlags, existing: SymbolFlags) -> bool {
+    incoming.intersects(SymbolFlags::VARIABLE) && existing.intersects(SymbolFlags::ASSIGNMENT)
+        || incoming.intersects(SymbolFlags::ASSIGNMENT)
+            && existing.intersects(SymbolFlags::VARIABLE)
+}
+
+fn make_diagnostic<I, S>(code: u32, arguments: I) -> Diagnostic
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let message = message_by_code(code).expect("pinned binder diagnostic is in the catalog");
+    Diagnostic::with_arguments(message, arguments)
+}
+
+fn is_assignment_declaration(kind: SyntaxKind) -> bool {
+    matches!(
+        kind,
+        SyntaxKind::BinaryExpression
+            | SyntaxKind::PropertyAccessExpression
+            | SyntaxKind::ElementAccessExpression
+            | SyntaxKind::Identifier
+            | SyntaxKind::CallExpression
+    )
+}
+
+fn is_property_name_literal(kind: SyntaxKind) -> bool {
+    matches!(
+        kind,
+        SyntaxKind::Identifier
+            | SyntaxKind::StringLiteral
+            | SyntaxKind::NoSubstitutionTemplateLiteral
+            | SyntaxKind::NumericLiteral
+    )
+}
+
+fn is_string_or_numeric_literal_like(kind: SyntaxKind) -> bool {
+    matches!(
+        kind,
+        SyntaxKind::StringLiteral
+            | SyntaxKind::NoSubstitutionTemplateLiteral
+            | SyntaxKind::NumericLiteral
+    )
+}
+
+fn node_text(arena: &NodeArena, node: NodeId) -> Option<String> {
+    let node = arena.get(node)?;
+    match &node.data {
+        NodeData::Identifier(data) => Some(data.text.clone()),
+        NodeData::PrivateIdentifier(data) => Some(data.text.clone()),
+        NodeData::StringLiteral(data) => Some(data.text.clone()),
+        NodeData::NoSubstitutionTemplateLiteral(data) => Some(data.text.clone()),
+        NodeData::NumericLiteral(data) => Some(data.text.clone()),
+        NodeData::JsxNamespacedName(data) => Some(format!(
+            "{}:{}",
+            node_text(arena, data.namespace)?,
+            node_text(arena, data.name)?
+        )),
+        _ => source_text_of_node(arena, node).map(str::to_owned),
+    }
+}
+
+fn source_text_of_node<'a>(arena: &'a NodeArena, node: &ts_ast::Node) -> Option<&'a str> {
+    let text = arena.source_text()?;
+    text.get(node.range.start.get() as usize..node.range.end.get() as usize)
+}
+
+fn declaration_name_to_string(arena: &NodeArena, name: NodeId) -> String {
+    let node = arena
+        .get(name)
+        .expect("declaration name is reachable from a bound node");
+    if node.range.is_empty() {
+        "(Missing)".to_owned()
+    } else {
+        source_text_of_node(arena, node)
+            .map_or_else(|| node_text(arena, name).unwrap_or_default(), str::to_owned)
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn schema_declaration_name(data: &NodeData) -> Option<NodeId> {
+    match data {
+        NodeData::BindingElement(data) => data.name,
+        NodeData::ClassDeclaration(data) => data.name,
+        NodeData::ClassExpression(data) => data.name,
+        NodeData::EnumDeclaration(data) => Some(data.name),
+        NodeData::EnumMember(data) => Some(data.name),
+        NodeData::ExportSpecifier(data) => Some(data.name),
+        NodeData::FunctionDeclaration(data) => data.name,
+        NodeData::FunctionExpression(data) => data.name,
+        NodeData::GetAccessorDeclaration(data) => Some(data.name),
+        NodeData::ImportAttribute(data) => Some(data.name),
+        NodeData::ImportClause(data) => data.name,
+        NodeData::ImportEqualsDeclaration(data) => Some(data.name),
+        NodeData::ImportSpecifier(data) => Some(data.name),
+        NodeData::InterfaceDeclaration(data) => Some(data.name),
+        NodeData::JsDocCallbackTag(data) => data.name,
+        NodeData::JsDocLink(data) => data.name,
+        NodeData::JsDocLinkCode(data) => data.name,
+        NodeData::JsDocLinkPlain(data) => data.name,
+        NodeData::JsDocNameReference(data) => Some(data.name),
+        NodeData::JsDocParameterOrPropertyTag(data) => Some(data.name),
+        NodeData::JsDocTypedefTag(data) => data.name,
+        NodeData::JsxAttribute(data) => Some(data.name),
+        NodeData::JsxNamespacedName(data) => Some(data.name),
+        NodeData::MetaProperty(data) => Some(data.name),
+        NodeData::MethodDeclaration(data) => Some(data.name),
+        NodeData::MethodSignatureDeclaration(data) => Some(data.name),
+        NodeData::ModuleDeclaration(data) => Some(data.name),
+        NodeData::NamedTupleMember(data) => Some(data.name),
+        NodeData::NamespaceExport(data) => Some(data.name),
+        NodeData::NamespaceExportDeclaration(data) => Some(data.name),
+        NodeData::NamespaceImport(data) => Some(data.name),
+        NodeData::ParameterDeclaration(data) => Some(data.name),
+        NodeData::PropertyAssignment(data) => Some(data.name),
+        NodeData::PropertyAccessExpression(data) => Some(data.name),
+        NodeData::PropertyDeclaration(data) => Some(data.name),
+        NodeData::PropertySignatureDeclaration(data) => Some(data.name),
+        NodeData::SetAccessorDeclaration(data) => Some(data.name),
+        NodeData::ShorthandPropertyAssignment(data) => Some(data.name),
+        NodeData::TypeAliasDeclaration(data) => Some(data.name),
+        NodeData::TypeParameterDeclaration(data) => Some(data.name),
+        NodeData::VariableDeclaration(data) => Some(data.name),
+        _ => None,
+    }
+}
+
+fn get_name_of_declaration(arena: &NodeArena, declaration: NodeId) -> Option<NodeId> {
+    let node = arena.get(declaration)?;
+    let non_assigned = match &node.data {
+        NodeData::BinaryExpression(_) | NodeData::CallExpression(_) => {
+            assignment_declaration_name(arena, declaration)
+        }
+        NodeData::ExportAssignment(assignment) => arena
+            .get(assignment.expression)
+            .is_some_and(|expression| expression.kind == SyntaxKind::Identifier)
+            .then_some(assignment.expression),
+        _ => schema_declaration_name(&node.data),
+    };
+    if non_assigned.is_some() {
+        return non_assigned;
+    }
+    matches!(
+        node.kind,
+        SyntaxKind::FunctionExpression | SyntaxKind::ArrowFunction | SyntaxKind::ClassExpression
+    )
+    .then(|| get_assigned_name(arena, declaration))
+    .flatten()
+}
+
+fn get_assigned_name(arena: &NodeArena, declaration: NodeId) -> Option<NodeId> {
+    let parent_id = arena.get(declaration)?.parent?;
+    let parent = arena.get(parent_id)?;
+    match &parent.data {
+        NodeData::PropertyAssignment(data) => Some(data.name),
+        NodeData::BindingElement(data) => data.name,
+        NodeData::BinaryExpression(data) if data.right == declaration => {
+            let left = arena.get(data.left)?;
+            match &left.data {
+                NodeData::Identifier(_) => Some(data.left),
+                NodeData::PropertyAccessExpression(access) => Some(access.name),
+                NodeData::ElementAccessExpression(access) => {
+                    let argument = skip_parentheses(arena, access.argument_expression)?;
+                    arena
+                        .get(argument)
+                        .is_some_and(|argument| is_string_or_numeric_literal_like(argument.kind))
+                        .then_some(argument)
+                }
+                _ => None,
+            }
+        }
+        NodeData::VariableDeclaration(data) => arena
+            .get(data.name)
+            .is_some_and(|name| name.kind == SyntaxKind::Identifier)
+            .then_some(data.name),
+        _ => None,
+    }
+}
+
+fn assignment_declaration_name(arena: &NodeArena, declaration: NodeId) -> Option<NodeId> {
+    let node = arena.get(declaration)?;
+    match &node.data {
+        NodeData::BinaryExpression(binary)
+            if arena
+                .get(binary.operator_token)
+                .is_some_and(|operator| operator.kind == SyntaxKind::EqualsToken) =>
+        {
+            let left = arena.get(binary.left)?;
+            match &left.data {
+                NodeData::PropertyAccessExpression(access)
+                    if is_entity_name_expression(arena, access.expression)
+                        && arena
+                            .get(access.name)
+                            .is_some_and(|name| name.kind == SyntaxKind::Identifier) =>
+                {
+                    Some(access.name)
+                }
+                NodeData::ElementAccessExpression(access)
+                    if is_entity_name_expression(arena, access.expression) =>
+                {
+                    let argument = skip_parentheses(arena, access.argument_expression)?;
+                    arena
+                        .get(argument)
+                        .is_some_and(|argument| is_string_or_numeric_literal_like(argument.kind))
+                        .then_some(argument)
+                        .or(Some(binary.left))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn assignment_name_requires_javascript_file_kind(arena: &NodeArena, declaration: NodeId) -> bool {
+    let Some(node) = arena.get(declaration) else {
+        return false;
+    };
+    match &node.data {
+        NodeData::BinaryExpression(binary)
+            if arena
+                .get(binary.operator_token)
+                .is_some_and(|operator| operator.kind == SyntaxKind::EqualsToken) =>
+        {
+            if is_module_exports_access(arena, binary.left)
+                && !is_exports_identifier(arena, binary.right)
+            {
+                return true;
+            }
+            let Some(base) = access_expression_base(arena, binary.left) else {
+                return false;
+            };
+            !is_entity_name_expression(arena, base)
+                && is_entity_name_expression_ex(arena, base, true)
+        }
+        NodeData::CallExpression(_) => is_bindable_object_define_property_call(arena, declaration),
+        _ => false,
+    }
+}
+
+fn access_expression_base(arena: &NodeArena, node: NodeId) -> Option<NodeId> {
+    match &arena.get(node)?.data {
+        NodeData::PropertyAccessExpression(access) => Some(access.expression),
+        NodeData::ElementAccessExpression(access) => Some(access.expression),
+        _ => None,
+    }
+}
+
+fn is_exports_identifier(arena: &NodeArena, node: NodeId) -> bool {
+    arena
+        .get(node)
+        .is_some_and(|node| node.kind == SyntaxKind::Identifier)
+        && node_text(arena, node).as_deref() == Some("exports")
+}
+
+fn is_module_exports_access(arena: &NodeArena, node: NodeId) -> bool {
+    matches!(
+        arena.get(node).map(|node| &node.data),
+        Some(NodeData::PropertyAccessExpression(access))
+            if arena
+                .get(access.expression)
+                .is_some_and(|base| base.kind == SyntaxKind::Identifier)
+                && node_text(arena, access.expression).as_deref() == Some("module")
+                && node_text(arena, access.name).as_deref() == Some("exports")
+    )
+}
+
+fn is_bindable_object_define_property_call(arena: &NodeArena, node: NodeId) -> bool {
+    let Some(NodeData::CallExpression(call)) = arena.get(node).map(|node| &node.data) else {
+        return false;
+    };
+    if call.arguments.nodes.len() != 3 {
+        return false;
+    }
+    let Some(NodeData::PropertyAccessExpression(expression)) =
+        arena.get(call.expression).map(|node| &node.data)
+    else {
+        return false;
+    };
+    arena
+        .get(expression.expression)
+        .is_some_and(|base| base.kind == SyntaxKind::Identifier)
+        && node_text(arena, expression.expression).as_deref() == Some("Object")
+        && node_text(arena, expression.name).as_deref() == Some("defineProperty")
+        && arena
+            .get(call.arguments.nodes[1])
+            .is_some_and(|name| is_string_or_numeric_literal_like(name.kind))
+        && is_bindable_static_name_expression(arena, call.arguments.nodes[0], true)
+}
+
+fn is_bindable_static_name_expression(
+    arena: &NodeArena,
+    node: NodeId,
+    exclude_this_keyword: bool,
+) -> bool {
+    is_entity_name_expression(arena, node)
+        || is_bindable_static_access_expression(arena, node, exclude_this_keyword)
+}
+
+fn is_bindable_static_access_expression(
+    arena: &NodeArena,
+    node: NodeId,
+    exclude_this_keyword: bool,
+) -> bool {
+    let Some(base) = (match arena.get(node).map(|node| &node.data) {
+        Some(NodeData::PropertyAccessExpression(access)) => Some(access.expression),
+        Some(NodeData::ElementAccessExpression(access))
+            if arena
+                .get(access.argument_expression)
+                .is_some_and(|argument| is_string_or_numeric_literal_like(argument.kind)) =>
+        {
+            Some(access.expression)
+        }
+        _ => None,
+    }) else {
+        return false;
+    };
+    (!exclude_this_keyword
+        && arena
+            .get(base)
+            .is_some_and(|base| base.kind == SyntaxKind::ThisKeyword))
+        || is_entity_name_expression(arena, base)
+        || is_bindable_static_access_expression(arena, base, true)
+}
+
+fn is_entity_name_expression(arena: &NodeArena, node: NodeId) -> bool {
+    is_entity_name_expression_ex(arena, node, false)
+}
+
+fn is_entity_name_expression_ex(arena: &NodeArena, node: NodeId, allow_js: bool) -> bool {
+    arena.get(node).is_some_and(|node| match &node.data {
+        NodeData::Identifier(_) => true,
+        NodeData::PropertyAccessExpression(access) => {
+            arena
+                .get(access.name)
+                .is_some_and(|name| name.kind == SyntaxKind::Identifier)
+                && is_entity_name_expression_ex(arena, access.expression, allow_js)
+        }
+        NodeData::ElementAccessExpression(access) if allow_js => {
+            arena
+                .get(access.argument_expression)
+                .is_some_and(|argument| is_string_or_numeric_literal_like(argument.kind))
+                && is_entity_name_expression_ex(arena, access.expression, true)
+        }
+        NodeData::KeywordExpression(_) if allow_js && node.kind == SyntaxKind::ThisKeyword => true,
+        _ => false,
+    })
+}
+
+fn skip_parentheses(arena: &NodeArena, mut node: NodeId) -> Option<NodeId> {
+    while let NodeData::ParenthesizedExpression(parenthesized) = &arena.get(node)?.data {
+        node = parenthesized.expression;
+    }
+    Some(node)
+}
+
+fn has_dynamic_name(arena: &NodeArena, declaration: NodeId) -> bool {
+    let Some(name) = get_name_of_declaration(arena, declaration) else {
+        return false;
+    };
+    let Some(name_node) = arena.get(name) else {
+        return false;
+    };
+    let expression = match &name_node.data {
+        NodeData::ComputedPropertyName(computed) => computed.expression,
+        NodeData::ElementAccessExpression(access) => {
+            let Some(argument) = skip_parentheses(arena, access.argument_expression) else {
+                return true;
+            };
+            argument
+        }
+        _ => return false,
+    };
+    let Some(expression) = arena.get(expression) else {
+        return true;
+    };
+    !(is_string_or_numeric_literal_like(expression.kind)
+        || matches!(
+            &expression.data,
+            NodeData::PrefixUnaryExpression(unary)
+                if matches!(unary.operator, SyntaxKind::PlusToken | SyntaxKind::MinusToken)
+                    && arena
+                        .get(unary.operand)
+                        .is_some_and(|operand| operand.kind == SyntaxKind::NumericLiteral)
+        ))
+}
+
+fn containing_class(arena: &NodeArena, declaration: NodeId) -> Option<NodeId> {
+    let mut current = arena.get(declaration)?.parent;
+    while let Some(node) = current {
+        let record = arena.get(node)?;
+        if matches!(
+            record.kind,
+            SyntaxKind::ClassDeclaration | SyntaxKind::ClassExpression
+        ) {
+            return Some(node);
+        }
+        current = record.parent;
+    }
+    None
+}
+
+fn modifier_list(data: &NodeData) -> Option<&ModifierList> {
+    match data {
+        NodeData::ArrowFunction(data) => data.modifiers.as_ref(),
+        NodeData::BinaryExpression(data) => data.modifiers.as_ref(),
+        NodeData::ClassDeclaration(data) => data.modifiers.as_ref(),
+        NodeData::ClassExpression(data) => data.modifiers.as_ref(),
+        NodeData::ClassStaticBlockDeclaration(data) => data.modifiers.as_ref(),
+        NodeData::ConstructorDeclaration(data) => data.modifiers.as_ref(),
+        NodeData::ConstructorTypeNode(data) => data.modifiers.as_ref(),
+        NodeData::EnumDeclaration(data) => data.modifiers.as_ref(),
+        NodeData::EnumMember(data) => data.modifiers.as_ref(),
+        NodeData::ExportAssignment(data) => data.modifiers.as_ref(),
+        NodeData::ExportDeclaration(data) => data.modifiers.as_ref(),
+        NodeData::FunctionDeclaration(data) => data.modifiers.as_ref(),
+        NodeData::FunctionExpression(data) => data.modifiers.as_ref(),
+        NodeData::FunctionTypeNode(data) => data.modifiers.as_ref(),
+        NodeData::GetAccessorDeclaration(data) => data.modifiers.as_ref(),
+        NodeData::ImportDeclaration(data) => data.modifiers.as_ref(),
+        NodeData::ImportEqualsDeclaration(data) => data.modifiers.as_ref(),
+        NodeData::IndexSignatureDeclaration(data) => data.modifiers.as_ref(),
+        NodeData::InterfaceDeclaration(data) => data.modifiers.as_ref(),
+        NodeData::MethodDeclaration(data) => data.modifiers.as_ref(),
+        NodeData::MethodSignatureDeclaration(data) => data.modifiers.as_ref(),
+        NodeData::MissingDeclaration(data) => data.modifiers.as_ref(),
+        NodeData::ModuleDeclaration(data) => data.modifiers.as_ref(),
+        NodeData::NamespaceExportDeclaration(data) => data.modifiers.as_ref(),
+        NodeData::ParameterDeclaration(data) => data.modifiers.as_ref(),
+        NodeData::PropertyAssignment(data) => data.modifiers.as_ref(),
+        NodeData::PropertyDeclaration(data) => data.modifiers.as_ref(),
+        NodeData::PropertySignatureDeclaration(data) => data.modifiers.as_ref(),
+        NodeData::SetAccessorDeclaration(data) => data.modifiers.as_ref(),
+        NodeData::ShorthandPropertyAssignment(data) => data.modifiers.as_ref(),
+        NodeData::TypeAliasDeclaration(data) => data.modifiers.as_ref(),
+        NodeData::TypeParameterDeclaration(data) => data.modifiers.as_ref(),
+        NodeData::VariableStatement(data) => data.modifiers.as_ref(),
+        _ => None,
+    }
+}
+
+fn has_syntactic_modifier(arena: &NodeArena, node: NodeId, modifier: SyntaxKind) -> bool {
+    arena
+        .get(node)
+        .and_then(|node| modifier_list(&node.data))
+        .is_some_and(|modifiers| {
+            modifiers
+                .list
+                .nodes
+                .iter()
+                .any(|node| arena.get(*node).is_some_and(|node| node.kind == modifier))
+        })
+}
+
+fn export_type_suggestion(arena: &NodeArena, node: NodeRef) -> Option<CanonicalRelatedInformation> {
+    let declaration = arena.get(node.node)?;
+    let NodeData::TypeAliasDeclaration(alias) = &declaration.data else {
+        return None;
+    };
+    if !arena.get(alias.type_)?.range.is_empty()
+        || !has_syntactic_modifier(arena, node.node, SyntaxKind::ExportKeyword)
+    {
+        return None;
+    }
+    let name = node_text(arena, alias.name)?;
+    Some(CanonicalRelatedInformation {
+        node,
+        diagnostic: make_diagnostic(1369, [format!("export type {{ {name} }}")]),
+    })
 }
 
 fn collect_children(
@@ -557,6 +1790,10 @@ impl<'a> FileTraversal<'a> {
             nodes: self.nodes,
             traversal_order: self.traversal_order,
             container_chain: self.container_chain,
+            diagnostics: Vec::new(),
+            classifiable_names: BTreeSet::new(),
+            not_const_enum_only_modules: BTreeSet::new(),
+            symbol_count: 0,
             flow,
         }
     }
@@ -794,12 +2031,13 @@ fn is_function_like_kind(kind: SyntaxKind) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::{collections::BTreeSet, panic::AssertUnwindSafe};
 
     use ts_ast::{FileId, NodeData, NodeId, NodeRef, SyntaxKind};
     use ts_parser::parse_source_file;
 
-    use super::{BindingPhase, CanonicalBindError, CanonicalBinder};
+    use super::{BindingPhase, CanonicalBindError, CanonicalBinder, CanonicalDeclarationError};
+    use crate::{InternalSymbolName, SymbolFlags};
 
     fn position(order: &[NodeRef], node: NodeId) -> usize {
         order
@@ -819,6 +2057,1629 @@ mod tests {
                 .for_each_child(|child| pending.push(child));
         }
         reachable
+    }
+
+    fn nodes_of_kind(arena: &ts_ast::NodeArena, kind: SyntaxKind) -> Vec<NodeId> {
+        arena
+            .iter()
+            .filter_map(|(id, node)| (node.kind == kind).then_some(id))
+            .collect()
+    }
+
+    fn node_ref(arena: &ts_ast::NodeArena, file: FileId, node: NodeId) -> NodeRef {
+        NodeRef::new(arena.id(), file, node)
+    }
+
+    fn node_with_source(arena: &ts_ast::NodeArena, kind: SyntaxKind, source: &str) -> NodeId {
+        arena
+            .iter()
+            .find_map(|(id, node)| {
+                (node.kind == kind && super::source_text_of_node(arena, node) == Some(source))
+                    .then_some(id)
+            })
+            .unwrap_or_else(|| panic!("missing {kind:?} with source {source:?}"))
+    }
+
+    #[test]
+    fn declaration_primitive_inserts_merges_and_deduplicates_exactly() {
+        let parsed = parse_source_file("let same; let same;");
+        let declarations = nodes_of_kind(&parsed.arena, SyntaxKind::VariableDeclaration);
+        assert_eq!(declarations.len(), 2);
+        let file = FileId::new(20);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file(&parsed.arena, parsed.source_file, file)
+            .unwrap();
+        let table = binder.create_symbol_table();
+        assert!(
+            binder
+                .symbol_store()
+                .symbol_table(table)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            binder
+                .file(file)
+                .unwrap()
+                .locals(node_ref(&parsed.arena, file, parsed.source_file)),
+            None
+        );
+
+        let first = binder
+            .declare_symbol(
+                &parsed.arena,
+                file,
+                table,
+                None,
+                declarations[0],
+                SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+                SymbolFlags::FUNCTION_SCOPED_VARIABLE_EXCLUDES,
+            )
+            .unwrap();
+        let second = binder
+            .declare_symbol(
+                &parsed.arena,
+                file,
+                table,
+                None,
+                declarations[1],
+                SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+                SymbolFlags::FUNCTION_SCOPED_VARIABLE_EXCLUDES,
+            )
+            .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            binder
+                .symbol_store()
+                .symbol_table(table)
+                .unwrap()
+                .get_source("same"),
+            Some(first)
+        );
+        let symbol = binder.symbol_store().symbol(first).unwrap();
+        assert_eq!(
+            symbol.declarations(),
+            Some(
+                [
+                    node_ref(&parsed.arena, file, declarations[0]),
+                    node_ref(&parsed.arena, file, declarations[1]),
+                ]
+                .as_slice()
+            )
+        );
+        assert_eq!(
+            symbol.value_declaration(),
+            Some(node_ref(&parsed.arena, file, declarations[0]))
+        );
+        assert_eq!(binder.file(file).unwrap().symbol_count(), 1);
+        assert!(binder.file(file).unwrap().diagnostics().is_empty());
+
+        let repeated = binder
+            .declare_symbol(
+                &parsed.arena,
+                file,
+                table,
+                None,
+                declarations[1],
+                SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+                SymbolFlags::FUNCTION_SCOPED_VARIABLE_EXCLUDES,
+            )
+            .unwrap();
+        assert_eq!(repeated, first);
+        assert_eq!(
+            binder
+                .symbol_store()
+                .symbol(first)
+                .unwrap()
+                .declarations()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(binder.file(file).unwrap().symbol_count(), 1);
+        assert_eq!(binder.file(file).unwrap().phase(), BindingPhase::Traversal);
+    }
+
+    #[test]
+    fn missing_names_allocate_detached_symbols_without_touching_the_table() {
+        let parsed = parse_source_file("{} {}");
+        let blocks = nodes_of_kind(&parsed.arena, SyntaxKind::Block);
+        assert_eq!(blocks.len(), 2);
+        let file = FileId::new(21);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file(&parsed.arena, parsed.source_file, file)
+            .unwrap();
+        let table = binder.create_symbol_table();
+        let first = binder
+            .declare_symbol(
+                &parsed.arena,
+                file,
+                table,
+                None,
+                blocks[0],
+                SymbolFlags::NONE,
+                SymbolFlags::NONE,
+            )
+            .unwrap();
+        let second = binder
+            .declare_symbol(
+                &parsed.arena,
+                file,
+                table,
+                None,
+                blocks[1],
+                SymbolFlags::NONE,
+                SymbolFlags::NONE,
+            )
+            .unwrap();
+        assert_ne!(first, second);
+        assert!(
+            binder
+                .symbol_store()
+                .symbol_table(table)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            binder.symbol_store().symbol(first).unwrap().name(),
+            InternalSymbolName::Missing.as_ref()
+        );
+        assert_eq!(binder.file(file).unwrap().symbol_count(), 2);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn replaceable_method_branches_preserve_pinned_early_return_and_displacement() {
+        let parsed = parse_source_file("class C { same() {} same = 1; same() {} same = 2; }");
+        let methods = nodes_of_kind(&parsed.arena, SyntaxKind::MethodDeclaration);
+        let properties = nodes_of_kind(&parsed.arena, SyntaxKind::PropertyDeclaration);
+        assert_eq!((methods.len(), properties.len()), (2, 2));
+        let file = FileId::new(22);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file(&parsed.arena, parsed.source_file, file)
+            .unwrap();
+
+        let early_table = binder.create_symbol_table();
+        let retained = binder
+            .declare_symbol(
+                &parsed.arena,
+                file,
+                early_table,
+                None,
+                methods[0],
+                SymbolFlags::METHOD,
+                SymbolFlags::NONE,
+            )
+            .unwrap();
+        let before_count = binder.file(file).unwrap().symbol_count();
+        let skipped = binder
+            .declare_symbol_ex(
+                &parsed.arena,
+                file,
+                early_table,
+                None,
+                properties[0],
+                SymbolFlags::PROPERTY | SymbolFlags::CLASS,
+                SymbolFlags::METHOD,
+                true,
+                false,
+            )
+            .unwrap();
+        assert_eq!(skipped, retained);
+        assert_eq!(binder.file(file).unwrap().symbol_count(), before_count);
+        assert_eq!(
+            binder
+                .file(file)
+                .unwrap()
+                .symbol(node_ref(&parsed.arena, file, properties[0])),
+            None
+        );
+        assert_eq!(
+            binder
+                .symbol_store()
+                .symbol(retained)
+                .unwrap()
+                .declarations()
+                .unwrap(),
+            [node_ref(&parsed.arena, file, methods[0])]
+        );
+        assert!(
+            binder
+                .file(file)
+                .unwrap()
+                .classifiable_names()
+                .any(|name| name.as_utf8() == Some("same"))
+        );
+
+        let displacement_table = binder.create_symbol_table();
+        let discarded = binder
+            .declare_symbol_ex(
+                &parsed.arena,
+                file,
+                displacement_table,
+                None,
+                properties[1],
+                SymbolFlags::PROPERTY,
+                SymbolFlags::NONE,
+                true,
+                false,
+            )
+            .unwrap();
+        let replacement = binder
+            .declare_symbol(
+                &parsed.arena,
+                file,
+                displacement_table,
+                None,
+                methods[1],
+                SymbolFlags::METHOD,
+                SymbolFlags::PROPERTY,
+            )
+            .unwrap();
+        assert_ne!(replacement, discarded);
+        assert_eq!(
+            binder
+                .symbol_store()
+                .symbol_table(displacement_table)
+                .unwrap()
+                .get_source("same"),
+            Some(replacement)
+        );
+        assert!(
+            binder
+                .symbol_store()
+                .symbol(discarded)
+                .unwrap()
+                .flags()
+                .intersects(SymbolFlags::REPLACEABLE_BY_METHOD)
+        );
+        assert!(binder.file(file).unwrap().diagnostics().is_empty());
+        assert_eq!(binder.file(file).unwrap().symbol_count(), 3);
+    }
+
+    #[test]
+    fn ordinary_conflicts_diagnose_old_then_new_and_keep_the_table_entry() {
+        let parsed = parse_source_file("let clash; class clash {}");
+        let variable = nodes_of_kind(&parsed.arena, SyntaxKind::VariableDeclaration)[0];
+        let class = nodes_of_kind(&parsed.arena, SyntaxKind::ClassDeclaration)[0];
+        let file = FileId::new(23);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file(&parsed.arena, parsed.source_file, file)
+            .unwrap();
+        let table = binder.create_symbol_table();
+        let retained = binder
+            .declare_symbol(
+                &parsed.arena,
+                file,
+                table,
+                None,
+                variable,
+                SymbolFlags::BLOCK_SCOPED_VARIABLE,
+                SymbolFlags::BLOCK_SCOPED_VARIABLE_EXCLUDES,
+            )
+            .unwrap();
+        let detached = binder
+            .declare_symbol(
+                &parsed.arena,
+                file,
+                table,
+                None,
+                class,
+                SymbolFlags::CLASS,
+                SymbolFlags::CLASS_EXCLUDES,
+            )
+            .unwrap();
+        assert_ne!(retained, detached);
+        assert_eq!(
+            binder
+                .symbol_store()
+                .symbol_table(table)
+                .unwrap()
+                .get_source("clash"),
+            Some(retained)
+        );
+        assert_eq!(
+            binder
+                .file(file)
+                .unwrap()
+                .symbol(node_ref(&parsed.arena, file, class)),
+            Some(detached)
+        );
+        let diagnostics = binder.file(file).unwrap().diagnostics();
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2451, 2451]
+        );
+        assert_eq!(diagnostics[0].diagnostic.arguments, ["clash"]);
+        assert_eq!(diagnostics[1].diagnostic.arguments, ["clash"]);
+        assert_eq!(
+            diagnostics[0].node.node,
+            super::schema_declaration_name(&parsed.arena.get(variable).unwrap().data).unwrap()
+        );
+        assert_eq!(
+            diagnostics[1].node.node,
+            super::schema_declaration_name(&parsed.arena.get(class).unwrap().data).unwrap()
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.related_information.is_empty())
+        );
+        assert_eq!(binder.file(file).unwrap().symbol_count(), 2);
+    }
+
+    #[test]
+    fn assignment_and_variable_flags_merge_in_both_directions() {
+        let parsed = parse_source_file("let merge; let merge;");
+        let declarations = nodes_of_kind(&parsed.arena, SyntaxKind::VariableDeclaration);
+        let file = FileId::new(24);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file(&parsed.arena, parsed.source_file, file)
+            .unwrap();
+
+        let assignment_first = binder.create_symbol_table();
+        let first = binder
+            .declare_symbol(
+                &parsed.arena,
+                file,
+                assignment_first,
+                None,
+                declarations[0],
+                SymbolFlags::ASSIGNMENT | SymbolFlags::PROPERTY,
+                SymbolFlags::NONE,
+            )
+            .unwrap();
+        let merged = binder
+            .declare_symbol(
+                &parsed.arena,
+                file,
+                assignment_first,
+                None,
+                declarations[1],
+                SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+                SymbolFlags::PROPERTY,
+            )
+            .unwrap();
+        assert_eq!(merged, first);
+
+        let variable_first = binder.create_symbol_table();
+        let first = binder
+            .declare_symbol(
+                &parsed.arena,
+                file,
+                variable_first,
+                None,
+                declarations[0],
+                SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+                SymbolFlags::NONE,
+            )
+            .unwrap();
+        let merged = binder
+            .declare_symbol(
+                &parsed.arena,
+                file,
+                variable_first,
+                None,
+                declarations[1],
+                SymbolFlags::ASSIGNMENT | SymbolFlags::PROPERTY,
+                SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+            )
+            .unwrap();
+        assert_eq!(merged, first);
+        assert!(binder.file(file).unwrap().diagnostics().is_empty());
+        assert_eq!(binder.file(file).unwrap().symbol_count(), 2);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn const_enum_only_clearing_and_value_declaration_precedence_match_pinned() {
+        let parsed = parse_source_file(
+            "namespace N {} function N() {} function M() {} namespace M {} identifier; let value;",
+        );
+        let modules = nodes_of_kind(&parsed.arena, SyntaxKind::ModuleDeclaration);
+        let functions = nodes_of_kind(&parsed.arena, SyntaxKind::FunctionDeclaration);
+        let variable = nodes_of_kind(&parsed.arena, SyntaxKind::VariableDeclaration)[0];
+        let identifier_expression =
+            match &parsed.arena.get(parsed.source_file).expect("source").data {
+                NodeData::SourceFile(source) => {
+                    let statement = source.statements.nodes[4];
+                    match &parsed.arena.get(statement).unwrap().data {
+                        NodeData::ExpressionStatement(statement) => statement.expression,
+                        _ => unreachable!(),
+                    }
+                }
+                _ => unreachable!(),
+            };
+        let file = FileId::new(25);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file(&parsed.arena, parsed.source_file, file)
+            .unwrap();
+        let named = binder.create_symbol_table();
+
+        let n = binder
+            .declare_symbol(
+                &parsed.arena,
+                file,
+                named,
+                None,
+                modules[0],
+                SymbolFlags::VALUE_MODULE | SymbolFlags::CONST_ENUM_ONLY_MODULE,
+                SymbolFlags::NONE,
+            )
+            .unwrap();
+        assert_eq!(
+            binder.symbol_store().symbol(n).unwrap().value_declaration(),
+            Some(node_ref(&parsed.arena, file, modules[0]))
+        );
+        assert_eq!(
+            binder
+                .declare_symbol(
+                    &parsed.arena,
+                    file,
+                    named,
+                    None,
+                    functions[0],
+                    SymbolFlags::FUNCTION,
+                    SymbolFlags::NONE,
+                )
+                .unwrap(),
+            n
+        );
+        let n_record = binder.symbol_store().symbol(n).unwrap();
+        assert!(
+            !n_record
+                .flags()
+                .intersects(SymbolFlags::CONST_ENUM_ONLY_MODULE)
+        );
+        assert_eq!(
+            n_record.value_declaration(),
+            Some(node_ref(&parsed.arena, file, functions[0]))
+        );
+        assert!(binder.file(file).unwrap().is_not_const_enum_only_module(n));
+
+        let m = binder
+            .declare_symbol(
+                &parsed.arena,
+                file,
+                named,
+                None,
+                functions[1],
+                SymbolFlags::FUNCTION,
+                SymbolFlags::NONE,
+            )
+            .unwrap();
+        assert_eq!(
+            binder
+                .declare_symbol(
+                    &parsed.arena,
+                    file,
+                    named,
+                    None,
+                    modules[1],
+                    SymbolFlags::VALUE_MODULE,
+                    SymbolFlags::NONE,
+                )
+                .unwrap(),
+            m
+        );
+        assert_eq!(
+            binder.symbol_store().symbol(m).unwrap().value_declaration(),
+            Some(node_ref(&parsed.arena, file, functions[1]))
+        );
+
+        let computed = binder.create_symbol_table();
+        let assignment = binder
+            .declare_symbol_ex(
+                &parsed.arena,
+                file,
+                computed,
+                None,
+                identifier_expression,
+                SymbolFlags::PROPERTY,
+                SymbolFlags::NONE,
+                false,
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            binder
+                .declare_symbol_ex(
+                    &parsed.arena,
+                    file,
+                    computed,
+                    None,
+                    variable,
+                    SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+                    SymbolFlags::NONE,
+                    false,
+                    true,
+                )
+                .unwrap(),
+            assignment
+        );
+        assert_eq!(
+            binder
+                .symbol_store()
+                .symbol(assignment)
+                .unwrap()
+                .value_declaration(),
+            Some(node_ref(&parsed.arena, file, variable))
+        );
+    }
+
+    #[test]
+    fn accessor_widening_and_enum_conflicts_preserve_diagnostic_facts() {
+        let parsed = parse_source_file(
+            "class C { get x() { return 1; } x = 1; set x(v) {} } enum E {} class E {}",
+        );
+        let getter = nodes_of_kind(&parsed.arena, SyntaxKind::GetAccessor)[0];
+        let setter = nodes_of_kind(&parsed.arena, SyntaxKind::SetAccessor)[0];
+        let property = nodes_of_kind(&parsed.arena, SyntaxKind::PropertyDeclaration)[0];
+        let enumeration = nodes_of_kind(&parsed.arena, SyntaxKind::EnumDeclaration)[0];
+        let classes = nodes_of_kind(&parsed.arena, SyntaxKind::ClassDeclaration);
+        let conflicting_class = classes[1];
+        let file = FileId::new(26);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file(&parsed.arena, parsed.source_file, file)
+            .unwrap();
+
+        let members = binder.create_symbol_table();
+        let accessor = binder
+            .declare_symbol(
+                &parsed.arena,
+                file,
+                members,
+                None,
+                getter,
+                SymbolFlags::GET_ACCESSOR,
+                SymbolFlags::NONE,
+            )
+            .unwrap();
+        let property_symbol = binder
+            .declare_symbol(
+                &parsed.arena,
+                file,
+                members,
+                None,
+                property,
+                SymbolFlags::PROPERTY,
+                SymbolFlags::GET_ACCESSOR,
+            )
+            .unwrap();
+        assert_ne!(property_symbol, accessor);
+        assert!(
+            binder
+                .symbol_store()
+                .symbol(accessor)
+                .unwrap()
+                .flags()
+                .contains(SymbolFlags::ACCESSOR)
+        );
+        let setter_symbol = binder
+            .declare_symbol(
+                &parsed.arena,
+                file,
+                members,
+                None,
+                setter,
+                SymbolFlags::SET_ACCESSOR,
+                SymbolFlags::ACCESSOR,
+            )
+            .unwrap();
+        assert_ne!(setter_symbol, accessor);
+        assert_eq!(
+            binder
+                .symbol_store()
+                .symbol_table(members)
+                .unwrap()
+                .get_source("x"),
+            Some(accessor)
+        );
+
+        let declarations = binder.create_symbol_table();
+        let enum_symbol = binder
+            .declare_symbol(
+                &parsed.arena,
+                file,
+                declarations,
+                None,
+                enumeration,
+                SymbolFlags::REGULAR_ENUM,
+                SymbolFlags::NONE,
+            )
+            .unwrap();
+        let class_symbol = binder
+            .declare_symbol(
+                &parsed.arena,
+                file,
+                declarations,
+                None,
+                conflicting_class,
+                SymbolFlags::CLASS,
+                SymbolFlags::REGULAR_ENUM,
+            )
+            .unwrap();
+        assert_ne!(enum_symbol, class_symbol);
+        let diagnostics = binder.file(file).unwrap().diagnostics();
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2300, 2300, 2300, 2300, 2567, 2567]
+        );
+        assert!(diagnostics[4].diagnostic.arguments.is_empty());
+        assert!(diagnostics[5].diagnostic.arguments.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn default_export_conflicts_keep_related_information_in_exact_order() {
+        let parsed = parse_source_file(
+            "export default function first() {} export default function second() {} export default class third {}",
+        );
+        let functions = nodes_of_kind(&parsed.arena, SyntaxKind::FunctionDeclaration);
+        let class = nodes_of_kind(&parsed.arena, SyntaxKind::ClassDeclaration)[0];
+        let file = FileId::new(27);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file(&parsed.arena, parsed.source_file, file)
+            .unwrap();
+
+        let parent_table = binder.create_symbol_table();
+        let parent = binder
+            .declare_symbol(
+                &parsed.arena,
+                file,
+                parent_table,
+                None,
+                parsed.source_file,
+                SymbolFlags::VALUE_MODULE,
+                SymbolFlags::NONE,
+            )
+            .unwrap();
+        let local_table = binder.create_symbol_table();
+        let local = binder
+            .declare_symbol(
+                &parsed.arena,
+                file,
+                local_table,
+                None,
+                functions[0],
+                SymbolFlags::FUNCTION,
+                SymbolFlags::NONE,
+            )
+            .unwrap();
+        assert_eq!(
+            binder
+                .symbol_store()
+                .symbol_table(local_table)
+                .unwrap()
+                .get_source("first"),
+            Some(local)
+        );
+
+        let exports = binder.create_symbol_table();
+        let first = binder
+            .declare_symbol(
+                &parsed.arena,
+                file,
+                exports,
+                Some(parent),
+                functions[0],
+                SymbolFlags::FUNCTION,
+                SymbolFlags::NONE,
+            )
+            .unwrap();
+        binder
+            .link_exported_declaration(node_ref(&parsed.arena, file, functions[0]), local, first)
+            .unwrap();
+        assert_eq!(
+            binder.symbol_store().symbol(local).unwrap().export_symbol(),
+            Some(first)
+        );
+        let merged = binder
+            .declare_symbol(
+                &parsed.arena,
+                file,
+                exports,
+                Some(parent),
+                functions[1],
+                SymbolFlags::FUNCTION,
+                SymbolFlags::NONE,
+            )
+            .unwrap();
+        assert_eq!(merged, first);
+        let detached = binder
+            .declare_symbol(
+                &parsed.arena,
+                file,
+                exports,
+                Some(parent),
+                class,
+                SymbolFlags::CLASS,
+                SymbolFlags::FUNCTION,
+            )
+            .unwrap();
+        assert_ne!(detached, first);
+        assert_eq!(
+            binder
+                .symbol_store()
+                .symbol_table(exports)
+                .unwrap()
+                .get(InternalSymbolName::Default.as_ref()),
+            Some(first)
+        );
+        let bound = binder.file(file).unwrap();
+        assert_eq!(
+            bound.symbol(node_ref(&parsed.arena, file, functions[0])),
+            Some(first)
+        );
+        assert_eq!(
+            bound.local_symbol(node_ref(&parsed.arena, file, functions[0])),
+            Some(local)
+        );
+        let diagnostics = bound.diagnostics();
+        assert_eq!(diagnostics.len(), 3);
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.diagnostic.code() == 2528)
+        );
+        assert_eq!(
+            diagnostics[0]
+                .related_information
+                .iter()
+                .map(|related| related.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2753]
+        );
+        assert_eq!(
+            diagnostics[1]
+                .related_information
+                .iter()
+                .map(|related| related.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [6204]
+        );
+        assert_eq!(
+            diagnostics[2]
+                .related_information
+                .iter()
+                .map(|related| related.diagnostic.code())
+                .collect::<Vec<_>>(),
+            [2752, 2752]
+        );
+    }
+
+    #[test]
+    fn parent_mismatch_panics_only_after_pinned_add_declaration_mutations() {
+        let parsed = parse_source_file("{} {} let same; let same;");
+        let blocks = nodes_of_kind(&parsed.arena, SyntaxKind::Block);
+        let declarations = nodes_of_kind(&parsed.arena, SyntaxKind::VariableDeclaration);
+        let file = FileId::new(28);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file(&parsed.arena, parsed.source_file, file)
+            .unwrap();
+        let parent_table = binder.create_symbol_table();
+        let first_parent = binder
+            .declare_symbol(
+                &parsed.arena,
+                file,
+                parent_table,
+                None,
+                blocks[0],
+                SymbolFlags::NONE,
+                SymbolFlags::NONE,
+            )
+            .unwrap();
+        let second_parent = binder
+            .declare_symbol(
+                &parsed.arena,
+                file,
+                parent_table,
+                None,
+                blocks[1],
+                SymbolFlags::NONE,
+                SymbolFlags::NONE,
+            )
+            .unwrap();
+        let table = binder.create_symbol_table();
+        let symbol = binder
+            .declare_symbol(
+                &parsed.arena,
+                file,
+                table,
+                Some(first_parent),
+                declarations[0],
+                SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+                SymbolFlags::FUNCTION_SCOPED_VARIABLE_EXCLUDES,
+            )
+            .unwrap();
+
+        let mismatch = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _ = binder.declare_symbol(
+                &parsed.arena,
+                file,
+                table,
+                Some(second_parent),
+                declarations[1],
+                SymbolFlags::FUNCTION_SCOPED_VARIABLE,
+                SymbolFlags::FUNCTION_SCOPED_VARIABLE_EXCLUDES,
+            );
+        }));
+        assert!(mismatch.is_err());
+        let record = binder.symbol_store().symbol(symbol).unwrap();
+        assert_eq!(record.parent(), Some(first_parent));
+        assert_eq!(
+            record.declarations().unwrap(),
+            [
+                node_ref(&parsed.arena, file, declarations[0]),
+                node_ref(&parsed.arena, file, declarations[1]),
+            ]
+        );
+        assert_eq!(
+            binder
+                .file(file)
+                .unwrap()
+                .symbol(node_ref(&parsed.arena, file, declarations[1])),
+            Some(symbol)
+        );
+        assert_eq!(binder.file(file).unwrap().symbol_count(), 3);
+    }
+
+    #[test]
+    fn foreign_declaration_provenance_is_rejected_atomically() {
+        let parsed = parse_source_file("class Local {}");
+        let foreign = parse_source_file("class Foreign {}");
+        let local_class = nodes_of_kind(&parsed.arena, SyntaxKind::ClassDeclaration)[0];
+        let foreign_class = nodes_of_kind(&foreign.arena, SyntaxKind::ClassDeclaration)[0];
+        let file = FileId::new(29);
+        let foreign_file = FileId::new(30);
+
+        let mut foreign_binder = CanonicalBinder::new();
+        foreign_binder
+            .bind_source_file(&foreign.arena, foreign.source_file, foreign_file)
+            .unwrap();
+        let foreign_table = foreign_binder.create_symbol_table();
+        let foreign_symbol = foreign_binder
+            .declare_symbol(
+                &foreign.arena,
+                foreign_file,
+                foreign_table,
+                None,
+                foreign_class,
+                SymbolFlags::CLASS,
+                SymbolFlags::NONE,
+            )
+            .unwrap();
+
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file(&parsed.arena, parsed.source_file, file)
+            .unwrap();
+        let table = binder.create_symbol_table();
+        assert_eq!(
+            binder.declare_symbol(
+                &parsed.arena,
+                file,
+                foreign_table,
+                None,
+                local_class,
+                SymbolFlags::CLASS,
+                SymbolFlags::NONE,
+            ),
+            Err(CanonicalDeclarationError::InvalidSymbolTable(foreign_table))
+        );
+        assert_eq!(
+            binder.declare_symbol(
+                &parsed.arena,
+                file,
+                table,
+                Some(foreign_symbol),
+                local_class,
+                SymbolFlags::CLASS,
+                SymbolFlags::NONE,
+            ),
+            Err(CanonicalDeclarationError::InvalidParent(foreign_symbol))
+        );
+        assert!(matches!(
+            binder.declare_symbol(
+                &foreign.arena,
+                file,
+                table,
+                None,
+                local_class,
+                SymbolFlags::CLASS,
+                SymbolFlags::NONE,
+            ),
+            Err(CanonicalDeclarationError::WrongArena { .. })
+        ));
+        assert_eq!(
+            binder.link_exported_declaration(
+                node_ref(&parsed.arena, file, local_class),
+                foreign_symbol,
+                foreign_symbol,
+            ),
+            Err(CanonicalDeclarationError::InvalidLocalSymbol(
+                foreign_symbol
+            ))
+        );
+        let bound = binder.file(file).unwrap();
+        assert_eq!(bound.symbol_count(), 0);
+        assert!(bound.diagnostics().is_empty());
+        assert_eq!(bound.classifiable_names().count(), 0);
+        assert_eq!(
+            bound.symbol(node_ref(&parsed.arena, file, local_class)),
+            None
+        );
+        assert_eq!(
+            bound.local_symbol(node_ref(&parsed.arena, file, local_class)),
+            None
+        );
+        assert!(
+            binder
+                .symbol_store()
+                .symbol_table(table)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn javascript_only_assignment_names_wait_for_a_canonical_file_kind() {
+        let parsed = parse_source_file(
+            "this.field = 1; module.exports = value; Object.defineProperty(exports, \"name\", {});",
+        );
+        let this_assignment = node_with_source(
+            &parsed.arena,
+            SyntaxKind::BinaryExpression,
+            "this.field = 1",
+        );
+        let module_assignment = node_with_source(
+            &parsed.arena,
+            SyntaxKind::BinaryExpression,
+            "module.exports = value",
+        );
+        let define_property = node_with_source(
+            &parsed.arena,
+            SyntaxKind::CallExpression,
+            "Object.defineProperty(exports, \"name\", {})",
+        );
+        let file = FileId::new(34);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file(&parsed.arena, parsed.source_file, file)
+            .unwrap();
+        let table = binder.create_symbol_table();
+        for declaration in [this_assignment, module_assignment, define_property] {
+            assert_eq!(
+                binder.declare_symbol(
+                    &parsed.arena,
+                    file,
+                    table,
+                    None,
+                    declaration,
+                    SymbolFlags::ASSIGNMENT | SymbolFlags::CLASS,
+                    SymbolFlags::NONE,
+                ),
+                Err(CanonicalDeclarationError::JavaScriptFileKindRequired(
+                    node_ref(&parsed.arena, file, declaration)
+                ))
+            );
+        }
+        let bound = binder.file(file).unwrap();
+        assert_eq!(bound.symbol_count(), 0);
+        assert_eq!(bound.classifiable_names().count(), 0);
+        assert!(bound.diagnostics().is_empty());
+        assert!(
+            binder
+                .symbol_store()
+                .symbol_table(table)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn malformed_export_type_conflict_carries_the_exact_suggestion() {
+        let parsed = parse_source_file("type Existing = string; export type Existing;");
+        let aliases = nodes_of_kind(&parsed.arena, SyntaxKind::TypeAliasDeclaration);
+        assert_eq!(aliases.len(), 2);
+        let file = FileId::new(31);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file(&parsed.arena, parsed.source_file, file)
+            .unwrap();
+        let table = binder.create_symbol_table();
+        binder
+            .declare_symbol(
+                &parsed.arena,
+                file,
+                table,
+                None,
+                aliases[0],
+                SymbolFlags::TYPE_ALIAS,
+                SymbolFlags::NONE,
+            )
+            .unwrap();
+        binder
+            .declare_symbol(
+                &parsed.arena,
+                file,
+                table,
+                None,
+                aliases[1],
+                SymbolFlags::TYPE_ALIAS,
+                SymbolFlags::TYPE_ALIAS_EXCLUDES,
+            )
+            .unwrap();
+        let diagnostics = binder.file(file).unwrap().diagnostics();
+        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(diagnostics[0].diagnostic.code(), 2300);
+        assert!(diagnostics[0].related_information.is_empty());
+        assert_eq!(diagnostics[1].diagnostic.code(), 2300);
+        assert_eq!(diagnostics[1].related_information.len(), 1);
+        let suggestion = &diagnostics[1].related_information[0];
+        assert_eq!(suggestion.node.node, aliases[1]);
+        assert_eq!(suggestion.diagnostic.code(), 1369);
+        assert_eq!(
+            suggestion.diagnostic.arguments,
+            ["export type { Existing }"]
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn computed_private_and_ambient_names_use_exact_table_keys() {
+        let parsed = parse_source_file(
+            r#"
+                declare module "pkg" {}
+                declare global {}
+                class Names {
+                    ["text"]() {}
+                    [1]() {}
+                    [+2]() {}
+                    [-3]() {}
+                    [dynamic]() {}
+                    #private = 1;
+                }
+            "#,
+        );
+        let modules = nodes_of_kind(&parsed.arena, SyntaxKind::ModuleDeclaration);
+        let class = nodes_of_kind(&parsed.arena, SyntaxKind::ClassDeclaration)[0];
+        let methods = nodes_of_kind(&parsed.arena, SyntaxKind::MethodDeclaration);
+        let private_property = nodes_of_kind(&parsed.arena, SyntaxKind::PropertyDeclaration)[0];
+        assert_eq!((modules.len(), methods.len()), (2, 5));
+        let file = FileId::new(32);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file(&parsed.arena, parsed.source_file, file)
+            .unwrap();
+
+        let declarations = binder.create_symbol_table();
+        let class_symbol = binder
+            .declare_symbol(
+                &parsed.arena,
+                file,
+                declarations,
+                None,
+                class,
+                SymbolFlags::CLASS,
+                SymbolFlags::NONE,
+            )
+            .unwrap();
+        for module in &modules {
+            binder
+                .declare_symbol(
+                    &parsed.arena,
+                    file,
+                    declarations,
+                    None,
+                    *module,
+                    SymbolFlags::NAMESPACE_MODULE,
+                    SymbolFlags::NONE,
+                )
+                .unwrap();
+        }
+        let declaration_table = binder.symbol_store().symbol_table(declarations).unwrap();
+        assert!(declaration_table.get_source("\"pkg\"").is_some());
+        assert!(
+            declaration_table
+                .get(InternalSymbolName::Global.as_ref())
+                .is_some()
+        );
+
+        let members = binder.create_symbol_table();
+        for (method, key) in methods[..4].iter().zip(["text", "1", "+2", "-3"]) {
+            let symbol = binder
+                .declare_symbol(
+                    &parsed.arena,
+                    file,
+                    members,
+                    Some(class_symbol),
+                    *method,
+                    SymbolFlags::METHOD,
+                    SymbolFlags::NONE,
+                )
+                .unwrap();
+            assert_eq!(
+                binder
+                    .symbol_store()
+                    .symbol_table(members)
+                    .unwrap()
+                    .get_source(key),
+                Some(symbol)
+            );
+        }
+        let before = binder.file(file).unwrap().symbol_count();
+        assert_eq!(
+            binder.declare_symbol(
+                &parsed.arena,
+                file,
+                members,
+                Some(class_symbol),
+                methods[4],
+                SymbolFlags::METHOD | SymbolFlags::CLASS,
+                SymbolFlags::NONE,
+            ),
+            Err(CanonicalDeclarationError::DynamicNameRequiresComputed(
+                node_ref(&parsed.arena, file, methods[4])
+            ))
+        );
+        assert_eq!(binder.file(file).unwrap().symbol_count(), before);
+        assert_eq!(
+            binder
+                .file(file)
+                .unwrap()
+                .symbol(node_ref(&parsed.arena, file, methods[4])),
+            None
+        );
+        let computed = binder
+            .declare_symbol_ex(
+                &parsed.arena,
+                file,
+                members,
+                Some(class_symbol),
+                methods[4],
+                SymbolFlags::METHOD,
+                SymbolFlags::NONE,
+                false,
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            binder
+                .symbol_store()
+                .symbol_table(members)
+                .unwrap()
+                .get(InternalSymbolName::Computed.as_ref()),
+            Some(computed)
+        );
+        let private = binder
+            .declare_symbol(
+                &parsed.arena,
+                file,
+                members,
+                Some(class_symbol),
+                private_property,
+                SymbolFlags::PROPERTY,
+                SymbolFlags::NONE,
+            )
+            .unwrap();
+        let private_name = binder.symbol_store().symbol(private).unwrap().name();
+        assert!(private_name.is_private_identifier());
+        assert!(private_name.as_bytes().ends_with(b"@#private"));
+        assert_eq!(
+            binder
+                .symbol_store()
+                .symbol_table(members)
+                .unwrap()
+                .get(private_name),
+            Some(private)
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn special_and_assigned_declaration_names_cover_the_typescript_closure() {
+        let mut parsed = parse_source_file(
+            r#"
+                interface I {
+                    (): void;
+                    new (): object;
+                    [key: string]: unknown;
+                }
+                class C { constructor() {} }
+                type F = () => void;
+                type K = new () => object;
+                export * from "m";
+                export default 1;
+                export = value;
+                module.exports = exports;
+                left + right;
+                const assignedFunction = function() {};
+                const assignedArrow = () => {};
+                const assignedClass = class {};
+                const object = { property: function() {} };
+                holder.method = function() {};
+                holder["element"] = class {};
+                holder.literal = 1;
+                holder[dynamic] = 1;
+            "#,
+        );
+        // Constructor declarations are not produced by the current parser
+        // slice yet. Re-shape its method payload so this primitive-level probe
+        // can exercise the pinned nameless constructor key.
+        let constructor = node_with_source(
+            &parsed.arena,
+            SyntaxKind::MethodDeclaration,
+            "constructor() {}",
+        );
+        let constructor_data = match &parsed.arena.get(constructor).unwrap().data {
+            NodeData::MethodDeclaration(data) => ts_ast::ConstructorDeclarationData {
+                asterisk_token: data.asterisk_token,
+                body: data.body,
+                end_flow_node: data.end_flow_node,
+                full_signature: data.full_signature,
+                locals: data.locals.clone(),
+                next_container: data.next_container,
+                parameters: data.parameters.clone(),
+                return_flow_node: None,
+                symbol: data.symbol,
+                type_: data.type_,
+                type_parameters: data.type_parameters.clone(),
+                facts: data.facts,
+                modifiers: data.modifiers.clone(),
+            },
+            _ => unreachable!(),
+        };
+        let constructor_node = parsed.arena.get_mut(constructor).unwrap();
+        constructor_node.kind = SyntaxKind::Constructor;
+        constructor_node.data = NodeData::ConstructorDeclaration(Box::new(constructor_data));
+        // The current parser aliases ExportAssignment.expression into its
+        // generated `type_` slot. Canonical traversal correctly rejects that
+        // DAG, so give this focused binder probe distinct but equivalent leaf
+        // nodes until the parser schema slice fixes the alias.
+        for assignment in nodes_of_kind(&parsed.arena, SyntaxKind::ExportAssignment) {
+            let expression = match &parsed.arena.get(assignment).unwrap().data {
+                NodeData::ExportAssignment(data) => data.expression,
+                _ => unreachable!(),
+            };
+            let mut duplicate = parsed.arena.get(expression).unwrap().clone();
+            duplicate.parent = Some(assignment);
+            let duplicate = parsed.arena.alloc(duplicate);
+            match &mut parsed.arena.get_mut(assignment).unwrap().data {
+                NodeData::ExportAssignment(data) => data.type_ = duplicate,
+                _ => unreachable!(),
+            }
+        }
+        for property in nodes_of_kind(&parsed.arena, SyntaxKind::PropertyAssignment) {
+            let name = match &parsed.arena.get(property).unwrap().data {
+                NodeData::PropertyAssignment(data) => data.name,
+                _ => unreachable!(),
+            };
+            let mut duplicate = parsed.arena.get(name).unwrap().clone();
+            duplicate.parent = Some(property);
+            let duplicate = parsed.arena.alloc(duplicate);
+            match &mut parsed.arena.get_mut(property).unwrap().data {
+                NodeData::PropertyAssignment(data) => data.type_ = duplicate,
+                _ => unreachable!(),
+            }
+        }
+        let file = FileId::new(33);
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file(&parsed.arena, parsed.source_file, file)
+            .unwrap();
+
+        let internals = binder.create_symbol_table();
+        let call_signature = nodes_of_kind(&parsed.arena, SyntaxKind::CallSignature)[0];
+        let function_type = nodes_of_kind(&parsed.arena, SyntaxKind::FunctionType)[0];
+        let call = binder
+            .declare_symbol(
+                &parsed.arena,
+                file,
+                internals,
+                None,
+                call_signature,
+                SymbolFlags::SIGNATURE,
+                SymbolFlags::NONE,
+            )
+            .unwrap();
+        assert_eq!(
+            binder
+                .declare_symbol(
+                    &parsed.arena,
+                    file,
+                    internals,
+                    None,
+                    function_type,
+                    SymbolFlags::SIGNATURE,
+                    SymbolFlags::NONE,
+                )
+                .unwrap(),
+            call
+        );
+        assert_eq!(
+            binder
+                .symbol_store()
+                .symbol_table(internals)
+                .unwrap()
+                .get(InternalSymbolName::Call.as_ref()),
+            Some(call)
+        );
+
+        let construct_signature = nodes_of_kind(&parsed.arena, SyntaxKind::ConstructSignature)[0];
+        let constructor_type = nodes_of_kind(&parsed.arena, SyntaxKind::ConstructorType)[0];
+        let construct = binder
+            .declare_symbol(
+                &parsed.arena,
+                file,
+                internals,
+                None,
+                construct_signature,
+                SymbolFlags::SIGNATURE,
+                SymbolFlags::NONE,
+            )
+            .unwrap();
+        assert_eq!(
+            binder
+                .declare_symbol(
+                    &parsed.arena,
+                    file,
+                    internals,
+                    None,
+                    constructor_type,
+                    SymbolFlags::SIGNATURE,
+                    SymbolFlags::NONE,
+                )
+                .unwrap(),
+            construct
+        );
+        assert_eq!(
+            binder
+                .symbol_store()
+                .symbol_table(internals)
+                .unwrap()
+                .get(InternalSymbolName::New.as_ref()),
+            Some(construct)
+        );
+        for (kind, internal) in [
+            (SyntaxKind::Constructor, InternalSymbolName::Constructor),
+            (SyntaxKind::IndexSignature, InternalSymbolName::Index),
+            (
+                SyntaxKind::ExportDeclaration,
+                InternalSymbolName::ExportStar,
+            ),
+        ] {
+            let nodes = nodes_of_kind(&parsed.arena, kind);
+            assert!(!nodes.is_empty(), "missing {kind:?}");
+            let node = nodes[0];
+            let symbol = binder
+                .declare_symbol(
+                    &parsed.arena,
+                    file,
+                    internals,
+                    None,
+                    node,
+                    SymbolFlags::SIGNATURE,
+                    SymbolFlags::NONE,
+                )
+                .unwrap();
+            assert_eq!(
+                binder
+                    .symbol_store()
+                    .symbol_table(internals)
+                    .unwrap()
+                    .get(internal.as_ref()),
+                Some(symbol)
+            );
+        }
+
+        let exports = binder.create_symbol_table();
+        let export_assignments = nodes_of_kind(&parsed.arena, SyntaxKind::ExportAssignment);
+        assert_eq!(export_assignments.len(), 2);
+        for assignment in &export_assignments {
+            binder
+                .declare_symbol(
+                    &parsed.arena,
+                    file,
+                    exports,
+                    None,
+                    *assignment,
+                    SymbolFlags::ALIAS,
+                    SymbolFlags::NONE,
+                )
+                .unwrap();
+        }
+        assert!(
+            binder
+                .symbol_store()
+                .symbol_table(exports)
+                .unwrap()
+                .get(InternalSymbolName::Default.as_ref())
+                .is_some()
+        );
+        assert!(
+            binder
+                .symbol_store()
+                .symbol_table(exports)
+                .unwrap()
+                .get(InternalSymbolName::ExportEquals.as_ref())
+                .is_some()
+        );
+
+        let js_names = binder.create_symbol_table();
+        let module_exports = node_with_source(
+            &parsed.arena,
+            SyntaxKind::BinaryExpression,
+            "module.exports = exports",
+        );
+        let module_exports_property = binder
+            .declare_symbol(
+                &parsed.arena,
+                file,
+                js_names,
+                None,
+                module_exports,
+                SymbolFlags::ASSIGNMENT,
+                SymbolFlags::NONE,
+            )
+            .unwrap();
+        assert_eq!(
+            binder
+                .symbol_store()
+                .symbol_table(js_names)
+                .unwrap()
+                .get_source("exports"),
+            Some(module_exports_property)
+        );
+        let ordinary_binary =
+            node_with_source(&parsed.arena, SyntaxKind::BinaryExpression, "left + right");
+        let export_equals = binder
+            .declare_symbol(
+                &parsed.arena,
+                file,
+                js_names,
+                None,
+                ordinary_binary,
+                SymbolFlags::ASSIGNMENT,
+                SymbolFlags::NONE,
+            )
+            .unwrap();
+        assert_eq!(
+            binder
+                .symbol_store()
+                .symbol_table(js_names)
+                .unwrap()
+                .get(InternalSymbolName::ExportEquals.as_ref()),
+            Some(export_equals)
+        );
+
+        let assigned = binder.create_symbol_table();
+        for (kind, source, key) in [
+            (
+                SyntaxKind::FunctionExpression,
+                "function() {}",
+                "assignedFunction",
+            ),
+            (SyntaxKind::ArrowFunction, "() => {}", "assignedArrow"),
+            (SyntaxKind::ClassExpression, "class {}", "assignedClass"),
+            (SyntaxKind::FunctionExpression, "function() {}", "property"),
+            (SyntaxKind::FunctionExpression, "function() {}", "method"),
+            (SyntaxKind::ClassExpression, "class {}", "element"),
+        ] {
+            let candidates = parsed
+                .arena
+                .iter()
+                .filter_map(|(id, node)| {
+                    (node.kind == kind
+                        && super::source_text_of_node(&parsed.arena, node) == Some(source)
+                        && super::get_name_of_declaration(&parsed.arena, id)
+                            .and_then(|name| super::node_text(&parsed.arena, name))
+                            .as_deref()
+                            == Some(key))
+                    .then_some(id)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(candidates.len(), 1, "assigned key {key}");
+            let symbol = binder
+                .declare_symbol(
+                    &parsed.arena,
+                    file,
+                    assigned,
+                    None,
+                    candidates[0],
+                    SymbolFlags::FUNCTION,
+                    SymbolFlags::NONE,
+                )
+                .unwrap();
+            assert_eq!(
+                binder
+                    .symbol_store()
+                    .symbol_table(assigned)
+                    .unwrap()
+                    .get_source(key),
+                Some(symbol)
+            );
+        }
+        for (source, key) in [
+            ("holder.literal = 1", "literal"),
+            ("holder[\"element\"] = class {}", "element"),
+        ] {
+            let binary = node_with_source(&parsed.arena, SyntaxKind::BinaryExpression, source);
+            let symbol = binder
+                .declare_symbol(
+                    &parsed.arena,
+                    file,
+                    assigned,
+                    None,
+                    binary,
+                    SymbolFlags::ASSIGNMENT | SymbolFlags::PROPERTY,
+                    SymbolFlags::NONE,
+                )
+                .unwrap();
+            assert_eq!(
+                binder
+                    .symbol_store()
+                    .symbol_table(assigned)
+                    .unwrap()
+                    .get_source(key),
+                Some(symbol)
+            );
+        }
+        let dynamic = node_with_source(
+            &parsed.arena,
+            SyntaxKind::BinaryExpression,
+            "holder[dynamic] = 1",
+        );
+        assert_eq!(
+            binder.declare_symbol(
+                &parsed.arena,
+                file,
+                assigned,
+                None,
+                dynamic,
+                SymbolFlags::ASSIGNMENT | SymbolFlags::PROPERTY,
+                SymbolFlags::NONE,
+            ),
+            Err(CanonicalDeclarationError::DynamicNameRequiresComputed(
+                node_ref(&parsed.arena, file, dynamic)
+            ))
+        );
+        let computed = binder
+            .declare_symbol_ex(
+                &parsed.arena,
+                file,
+                assigned,
+                None,
+                dynamic,
+                SymbolFlags::ASSIGNMENT | SymbolFlags::PROPERTY,
+                SymbolFlags::NONE,
+                false,
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            binder
+                .symbol_store()
+                .symbol_table(assigned)
+                .unwrap()
+                .get(InternalSymbolName::Computed.as_ref()),
+            Some(computed)
+        );
     }
 
     #[test]
