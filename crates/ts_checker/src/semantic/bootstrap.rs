@@ -17,15 +17,16 @@
 //!   not.
 //! - template-literal reduction remains outside this module. The closed
 //!   bootstrap cases below encode its pinned normalized results. Literal and
-//!   dependency-closed union cache ownership stays here so type-node queries
-//!   can extend the exact upstream caches without exposing approximate subtype,
-//!   template, or generic reduction APIs.
+//!   dependency-closed union cache ownership stays here; the expression-union
+//!   prefix additionally admits recursively canonical unions and fresh,
+//!   property-only object literals for exact array-literal subtype reduction.
 
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
 };
 
+use ts_ast::SyntaxKind;
 use ts_binder::{
     CheckFlags, EscapedName, InternalSymbolName, SemanticStoreId, SemanticSymbolId, SymbolFlags,
     SymbolTableId,
@@ -34,12 +35,14 @@ use ts_jsnum::{Number, PseudoBigInt};
 
 use super::{
     ids::{IndexInfoId, SignatureId, TypeAliasId, TypeId, TypePredicateId},
+    links::ValueSymbolLinks,
     mapper::TypeMapper,
     relation::RelationStateSnapshot,
     signatures::{SignatureFlags, TypePredicateKind},
     store::SemanticStore,
     type_records::{
-        ConstituentMapState, LiteralValue, RegularLiteralLink, TypeCacheState, TypeData, TypeRecord,
+        ConstituentMapState, ConstrainedTypeData, LiteralValue, ObjectTypeData, RegularLiteralLink,
+        TypeCacheState, TypeData, TypeRecord,
     },
     types::{ObjectFlags, TypeFlags},
 };
@@ -222,6 +225,14 @@ pub(super) enum LiteralTypeCacheError {
     Capacity,
 }
 
+/// Pinned `UnionReduction` modes supported by canonical union construction.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(super) enum UnionReduction {
+    None,
+    Literal,
+    Subtype,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct UnionAliasCacheKey {
     symbol: SemanticSymbolId,
@@ -250,11 +261,12 @@ impl UnionTypeCacheKey {
 struct UnionOfUnionCacheKey {
     first: TypeId,
     second: TypeId,
+    reduction: UnionReduction,
     alias: Option<UnionAliasCacheKey>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum LiteralUnionPlan {
+enum UnionPlan {
     Existing(TypeId),
     Union {
         types: Vec<TypeId>,
@@ -761,15 +773,29 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 .checked_add(1)
                 .ok_or(LiteralTypeCacheError::Capacity)?;
         }
-        let bootstrap = self
-            .intrinsic_bootstrap
-            .as_ref()
-            .ok_or(LiteralTypeCacheError::BootstrapUninitialized)?;
-        for (key, union) in &bootstrap.union_types {
-            self.validate_union_cache_entry(key, *union)?;
+        let (unions, unions_of_unions) = {
+            let bootstrap = self
+                .intrinsic_bootstrap
+                .as_ref()
+                .ok_or(LiteralTypeCacheError::BootstrapUninitialized)?;
+            (
+                bootstrap
+                    .union_types
+                    .iter()
+                    .map(|(key, union)| (key.clone(), *union))
+                    .collect::<Vec<_>>(),
+                bootstrap
+                    .union_of_union_types
+                    .iter()
+                    .map(|(key, result)| (*key, *result))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        for (key, union) in unions {
+            self.validate_union_cache_entry(&key, union)?;
         }
-        for (key, result) in &bootstrap.union_of_union_types {
-            self.validate_union_of_union_cache_entry(*key, *result)?;
+        for (key, result) in unions_of_unions {
+            self.validate_union_of_union_cache_entry(key, result)?;
         }
         Ok(())
     }
@@ -793,11 +819,15 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         {
             return Err(LiteralTypeCacheError::InvalidCachedUnion(union));
         }
+        let mut visiting = HashSet::new();
+        for constituent in &data.union.types {
+            self.validate_union_constituent_worker(*constituent, &mut visiting)?;
+        }
         Ok(())
     }
 
     fn validate_union_of_union_cache_entry(
-        &self,
+        &mut self,
         key: UnionOfUnionCacheKey,
         result: TypeId,
     ) -> Result<(), LiteralTypeCacheError> {
@@ -808,29 +838,30 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             self.validate_union_constituent(candidate)?;
         }
         let alias_symbol = key.alias.map(|alias| alias.symbol);
-        let expected = match self.plan_literal_union_type(&[key.first, key.second], alias_symbol)? {
-            LiteralUnionPlan::Existing(expected) => expected,
-            LiteralUnionPlan::Union {
-                types,
-                object_flags: _,
-                alias_symbol,
-                origin_types,
-            } => {
-                let expected_key = UnionTypeCacheKey {
+        let expected =
+            match self.plan_union_type(&[key.first, key.second], key.reduction, alias_symbol)? {
+                UnionPlan::Existing(expected) => expected,
+                UnionPlan::Union {
                     types,
+                    object_flags: _,
+                    alias_symbol,
                     origin_types,
-                    alias: alias_symbol.map(|symbol| UnionAliasCacheKey { symbol }),
-                };
-                let expected = self
-                    .intrinsic_bootstrap
-                    .as_ref()
-                    .and_then(|bootstrap| bootstrap.union_types.get(&expected_key))
-                    .copied()
-                    .ok_or(LiteralTypeCacheError::InvalidCachedUnion(result))?;
-                self.validate_union_cache_entry(&expected_key, expected)?;
-                expected
-            }
-        };
+                } => {
+                    let expected_key = UnionTypeCacheKey {
+                        types,
+                        origin_types,
+                        alias: alias_symbol.map(|symbol| UnionAliasCacheKey { symbol }),
+                    };
+                    let expected = self
+                        .intrinsic_bootstrap
+                        .as_ref()
+                        .and_then(|bootstrap| bootstrap.union_types.get(&expected_key))
+                        .copied()
+                        .ok_or(LiteralTypeCacheError::InvalidCachedUnion(result))?;
+                    self.validate_union_cache_entry(&expected_key, expected)?;
+                    expected
+                }
+            };
         if result != expected {
             return Err(LiteralTypeCacheError::InvalidCachedUnion(result));
         }
@@ -1159,6 +1190,180 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         self.validate_union_cache_entry(&key, union)
     }
 
+    fn validate_supported_fresh_property_object(
+        &self,
+        type_: TypeId,
+        record: &TypeRecord,
+        object: &ObjectTypeData,
+        visiting: &mut HashSet<TypeId>,
+    ) -> Result<(), LiteralTypeCacheError> {
+        if !visiting.insert(type_) {
+            return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_));
+        }
+        let result = (|| {
+            let owner = record
+                .symbol()
+                .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(type_))?;
+            let owner_record = self
+                .symbol(owner)
+                .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(type_))?;
+            let [owner_declaration] = owner_record.declarations().unwrap_or_default() else {
+                return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_));
+            };
+            if record.flags() != TypeFlags::OBJECT
+                || record.alias().is_some()
+                || !Self::valid_supported_property_object_tail(object)
+                || self.get_merged_symbol(owner) != Some(owner)
+                || owner_record.flags() != SymbolFlags::OBJECT_LITERAL
+                || owner_record.check_flags() != CheckFlags::NONE
+                || owner_record.name() != InternalSymbolName::Object.as_ref()
+                || owner_record.value_declaration() != Some(*owner_declaration)
+                || owner_record.parent().is_some()
+                || owner_record.exports().is_some()
+                || owner_record.export_symbol().is_some()
+                || self.source_node_kind(*owner_declaration)
+                    != Some(SyntaxKind::ObjectLiteralExpression)
+            {
+                return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_));
+            }
+
+            let members = object
+                .structured
+                .members
+                .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(type_))?;
+            if owner_record.members() == Some(members) {
+                return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_));
+            }
+            let table = self
+                .symbol_table(members)
+                .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(type_))?;
+            let properties =
+                Self::supported_nonempty_cache_slice(object.structured.properties.as_deref())
+                    .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(type_))?;
+            if table.len() != properties.len()
+                || owner_record.members().is_some() != !properties.is_empty()
+            {
+                return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_));
+            }
+            let raw_table = match owner_record.members() {
+                Some(raw_members) => Some(
+                    self.symbol_table(raw_members)
+                        .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(type_))?,
+                ),
+                None => None,
+            };
+            if raw_table.is_some_and(|raw| raw.len() != properties.len()) {
+                return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_));
+            }
+
+            let mut expected_flags = ObjectFlags::ANONYMOUS
+                | ObjectFlags::OBJECT_LITERAL
+                | ObjectFlags::FRESH_LITERAL
+                | ObjectFlags::CONTAINS_OBJECT_OR_ARRAY_LITERAL
+                | ObjectFlags::MEMBERS_RESOLVED;
+            let mut seen_properties = HashSet::with_capacity(properties.len());
+            let mut seen_raw = HashSet::with_capacity(properties.len());
+            for property in properties {
+                if !seen_properties.insert(*property) {
+                    return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_));
+                }
+                let property_record = self
+                    .symbol(*property)
+                    .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(type_))?;
+                let property_links = self
+                    .value_symbol_links(*property)
+                    .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(type_))?;
+                let property_type = property_links
+                    .resolved_type
+                    .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(type_))?;
+                let property_type_record = self
+                    .type_payload(property_type)
+                    .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(type_))?;
+                let raw = property_links
+                    .target
+                    .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(type_))?;
+                if raw == *property || !seen_raw.insert(raw) {
+                    return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_));
+                }
+                let raw_record = self
+                    .symbol(raw)
+                    .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(type_))?;
+                let expected_links = ValueSymbolLinks {
+                    resolved_type: Some(property_type),
+                    target: Some(raw),
+                    ..ValueSymbolLinks::default()
+                };
+                if property_links != &expected_links
+                    || property_record.flags() != (SymbolFlags::PROPERTY | SymbolFlags::TRANSIENT)
+                    || property_record.check_flags() != CheckFlags::NONE
+                    || property_record.parent() != Some(owner)
+                    || property_record.members().is_some()
+                    || property_record.exports().is_some()
+                    || property_record.export_symbol().is_some()
+                    || self.get_merged_symbol(*property) != Some(*property)
+                    || raw_record.flags() != SymbolFlags::PROPERTY
+                    || raw_record.check_flags() != CheckFlags::NONE
+                    || raw_record.name() != property_record.name()
+                    || raw_record.declarations() != property_record.declarations()
+                    || raw_record.value_declaration() != property_record.value_declaration()
+                    || raw_record.parent() != Some(owner)
+                    || raw_record.members().is_some()
+                    || raw_record.exports().is_some()
+                    || raw_record.export_symbol().is_some()
+                    || self.get_merged_symbol(raw) != Some(raw)
+                    || self
+                        .value_symbol_links(raw)
+                        .is_some_and(|links| links != &ValueSymbolLinks::default())
+                {
+                    return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_));
+                }
+                let [declaration] = property_record.declarations().unwrap_or_default() else {
+                    return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_));
+                };
+                if property_record.value_declaration() != Some(*declaration)
+                    || self.source_node_kind(*declaration) != Some(SyntaxKind::PropertyAssignment)
+                    || table.get(property_record.name()) != Some(*property)
+                    || raw_table.and_then(|raw| raw.get(raw_record.name())) != Some(raw)
+                {
+                    return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_));
+                }
+                self.validate_union_constituent_worker(property_type, visiting)?;
+                expected_flags |=
+                    property_type_record.object_flags() & ObjectFlags::PROPAGATING_FLAGS;
+            }
+            if record.object_flags() != expected_flags
+                || raw_table.is_some_and(|raw| raw.iter().any(|(_, id)| !seen_raw.contains(&id)))
+            {
+                return Err(LiteralTypeCacheError::UnsupportedUnionConstituent(type_));
+            }
+            Ok(())
+        })();
+        visiting.remove(&type_);
+        result
+    }
+
+    fn valid_supported_property_object_tail(object: &ObjectTypeData) -> bool {
+        object.target.is_none()
+            && object.mapper.is_none()
+            && object.instantiations == TypeCacheState::Unallocated
+            && object.structured.constrained == ConstrainedTypeData::default()
+            && object.structured.signatures.is_none()
+            && object.structured.call_signature_count == 0
+            && object.structured.index_infos.is_none()
+            && object
+                .structured
+                .object_type_without_abstract_construct_signatures
+                .is_none()
+    }
+
+    fn supported_nonempty_cache_slice<T>(value: Option<&[T]>) -> Option<&[T]> {
+        match value {
+            None => Some(&[]),
+            Some(value) if !value.is_empty() => Some(value),
+            Some(_) => None,
+        }
+    }
+
     fn validate_union_constituent_worker(
         &self,
         type_: TypeId,
@@ -1240,6 +1445,9 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 }
                 self.validate_supported_literal_identity(type_, regular, fresh, &data.value)?;
                 Ok(())
+            }
+            TypeData::Object(object) => {
+                self.validate_supported_fresh_property_object(type_, record, object, visiting)
             }
             TypeData::Union(data) => {
                 if !visiting.insert(type_) {
@@ -1508,7 +1716,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         Ok(())
     }
 
-    fn add_types_to_literal_union(
+    fn add_types_to_union(
         &self,
         type_set: &mut Vec<TypeId>,
         includes: &mut TypeFlags,
@@ -1526,7 +1734,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 if record.alias().is_some() || data.origin.is_some() {
                     *includes |= TypeFlags::UNION;
                 }
-                self.add_types_to_literal_union(type_set, includes, &data.union.types)?;
+                self.add_types_to_union(type_set, includes, &data.union.types)?;
                 continue;
             }
             let flags = record.flags();
@@ -1560,6 +1768,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         &self,
         types: &mut Vec<TypeId>,
         includes: TypeFlags,
+        reduce_void_undefined: bool,
     ) -> Result<(), LiteralTypeCacheError> {
         let mut index = types.len();
         while index != 0 {
@@ -1581,9 +1790,82 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                     && includes.intersects(TypeFlags::NUMBER)
                 || flags.intersects(TypeFlags::BIG_INT_LITERAL)
                     && includes.intersects(TypeFlags::BIG_INT)
+                || reduce_void_undefined
+                    && flags.intersects(TypeFlags::UNDEFINED)
+                    && includes.intersects(TypeFlags::VOID)
                 || fresh_redundant
             {
                 types.remove(index);
+            }
+        }
+        Ok(())
+    }
+
+    fn is_supported_empty_property_object(&self, type_: TypeId) -> bool {
+        self.type_payload(type_).is_some_and(|record| {
+            record.flags().intersects(TypeFlags::OBJECT)
+                && matches!(
+                    record.data(),
+                    TypeData::Object(object) if object.structured.properties.is_none()
+                )
+        })
+    }
+
+    fn remove_union_subtypes(
+        &mut self,
+        types: &mut Vec<TypeId>,
+        has_object_types: bool,
+    ) -> Result<(), LiteralTypeCacheError> {
+        // This is the dependency-closed `removeSubtypes` prefix for expression
+        // unions. The validator admits primitives, literals, recursively
+        // canonical unions, and fresh property objects, so the upstream type
+        // parameter, discriminant fast path, and class-derivation branches are
+        // unreachable here.
+        if types.len() < 2 {
+            return Ok(());
+        }
+        let has_empty_object = has_object_types
+            && types
+                .iter()
+                .copied()
+                .any(|type_| self.is_supported_empty_property_object(type_));
+        let original_length = types.len();
+        let mut index = original_length;
+        let mut comparison_count = 0usize;
+        while index != 0 {
+            index -= 1;
+            let source = types[index];
+            let source_flags = self
+                .type_payload(source)
+                .ok_or(LiteralTypeCacheError::UnsupportedUnionConstituent(source))?
+                .flags();
+            if !has_empty_object && !source_flags.intersects(TypeFlags::STRUCTURED_OR_INSTANTIABLE)
+            {
+                continue;
+            }
+
+            let candidates = types.clone();
+            for target in candidates {
+                if source == target {
+                    continue;
+                }
+                if comparison_count == 100_000 {
+                    let processed = original_length - index;
+                    let estimated_count = (comparison_count / processed) * original_length;
+                    if estimated_count > 1_000_000 {
+                        return Err(LiteralTypeCacheError::Capacity);
+                    }
+                }
+                comparison_count = comparison_count
+                    .checked_add(1)
+                    .ok_or(LiteralTypeCacheError::Capacity)?;
+                let related = self
+                    .is_type_strict_subtype_of(source, target)
+                    .map_err(|_| LiteralTypeCacheError::UnsupportedUnionConstituent(source))?;
+                if related {
+                    types.remove(index);
+                    break;
+                }
             }
         }
         Ok(())
@@ -1645,6 +1927,18 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         }) & ObjectFlags::PROPAGATING_FLAGS
     }
 
+    /// Constructs an anonymous expression union using the requested pinned
+    /// reduction mode. Empty inputs reduce to the canonical `never` identity.
+    #[allow(dead_code)] // Consumed by the companion array-expression source slice.
+    pub(super) fn expression_union_type(
+        &mut self,
+        types: &[TypeId],
+        reduction: UnionReduction,
+    ) -> Result<TypeId, LiteralTypeCacheError> {
+        let mut prepared = self.prepare_type_query_types(&[], &[], &[], 1, 0)?;
+        self.union_type_prepared(types, reduction, None, &mut prepared)
+    }
+
     #[cfg(test)]
     pub(super) fn literal_union_type(
         &mut self,
@@ -1659,6 +1953,16 @@ impl SemanticStore<TypeRecord, TypeMapper> {
     pub(super) fn literal_union_type_prepared(
         &mut self,
         types: &[TypeId],
+        alias_symbol: Option<SemanticSymbolId>,
+        prepared: &mut PreparedTypeQueryTypes,
+    ) -> Result<TypeId, LiteralTypeCacheError> {
+        self.union_type_prepared(types, UnionReduction::Literal, alias_symbol, prepared)
+    }
+
+    fn union_type_prepared(
+        &mut self,
+        types: &[TypeId],
+        reduction: UnionReduction,
         alias_symbol: Option<SemanticSymbolId>,
         prepared: &mut PreparedTypeQueryTypes,
     ) -> Result<TypeId, LiteralTypeCacheError> {
@@ -1700,6 +2004,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 UnionOfUnionCacheKey {
                     first,
                     second,
+                    reduction,
                     alias,
                 }
             });
@@ -1714,7 +2019,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
             return Ok(cached);
         }
 
-        let result = self.literal_union_type_worker(types, alias_symbol)?;
+        let result = self.union_type_worker(types, reduction, alias_symbol)?;
         if let Some(key) = union_of_union_key {
             let bootstrap = self
                 .intrinsic_bootstrap
@@ -1725,14 +2030,15 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         Ok(result)
     }
 
-    fn literal_union_type_worker(
+    fn union_type_worker(
         &mut self,
         types: &[TypeId],
+        reduction: UnionReduction,
         alias_symbol: Option<SemanticSymbolId>,
     ) -> Result<TypeId, LiteralTypeCacheError> {
-        match self.plan_literal_union_type(types, alias_symbol)? {
-            LiteralUnionPlan::Existing(existing) => Ok(existing),
-            LiteralUnionPlan::Union {
+        match self.plan_union_type(types, reduction, alias_symbol)? {
+            UnionPlan::Existing(existing) => Ok(existing),
+            UnionPlan::Union {
                 types,
                 object_flags,
                 alias_symbol,
@@ -1741,67 +2047,103 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         }
     }
 
-    fn plan_literal_union_type(
-        &self,
+    fn plan_union_type(
+        &mut self,
         types: &[TypeId],
+        reduction: UnionReduction,
         alias_symbol: Option<SemanticSymbolId>,
-    ) -> Result<LiteralUnionPlan, LiteralTypeCacheError> {
+    ) -> Result<UnionPlan, LiteralTypeCacheError> {
         let mut type_set = Vec::with_capacity(types.len());
         let mut includes = TypeFlags::NONE;
-        self.add_types_to_literal_union(&mut type_set, &mut includes, types)?;
-        let bootstrap = self
-            .intrinsic_bootstrap
-            .as_ref()
-            .ok_or(LiteralTypeCacheError::BootstrapUninitialized)?;
-        if includes.intersects(TypeFlags::ANY_OR_UNKNOWN) {
-            if includes.intersects(TypeFlags::ANY) {
-                return Ok(LiteralUnionPlan::Existing(
-                    if includes.intersects(TypeFlags::INCLUDES_WILDCARD) {
-                        bootstrap.wildcard_type
-                    } else if includes.intersects(TypeFlags::INCLUDES_ERROR) {
-                        bootstrap.error_type
+        self.add_types_to_union(&mut type_set, &mut includes, types)?;
+        let (
+            wildcard_type,
+            error_type,
+            any_type,
+            unknown_type,
+            undefined_type,
+            missing_type,
+            null_type,
+            null_widening_type,
+            undefined_widening_type,
+            never_type,
+        ) = {
+            let bootstrap = self
+                .intrinsic_bootstrap
+                .as_ref()
+                .ok_or(LiteralTypeCacheError::BootstrapUninitialized)?;
+            (
+                bootstrap.wildcard_type,
+                bootstrap.error_type,
+                bootstrap.any_type,
+                bootstrap.unknown_type,
+                bootstrap.undefined_type,
+                bootstrap.missing_type,
+                bootstrap.null_type,
+                bootstrap.null_widening_type,
+                bootstrap.undefined_widening_type,
+                bootstrap.never_type,
+            )
+        };
+        if reduction != UnionReduction::None {
+            if includes.intersects(TypeFlags::ANY_OR_UNKNOWN) {
+                if includes.intersects(TypeFlags::ANY) {
+                    return Ok(UnionPlan::Existing(
+                        if includes.intersects(TypeFlags::INCLUDES_WILDCARD) {
+                            wildcard_type
+                        } else if includes.intersects(TypeFlags::INCLUDES_ERROR) {
+                            error_type
+                        } else {
+                            any_type
+                        },
+                    ));
+                }
+                return Ok(UnionPlan::Existing(unknown_type));
+            }
+            if includes.intersects(TypeFlags::UNDEFINED)
+                && type_set.len() >= 2
+                && type_set[0] == undefined_type
+                && type_set[1] == missing_type
+            {
+                type_set.remove(1);
+            }
+            if includes.intersects(
+                TypeFlags::ENUM
+                    | TypeFlags::LITERAL
+                    | TypeFlags::UNIQUE_ES_SYMBOL
+                    | TypeFlags::TEMPLATE_LITERAL
+                    | TypeFlags::STRING_MAPPING,
+            ) || includes.intersects(TypeFlags::VOID)
+                && includes.intersects(TypeFlags::UNDEFINED)
+            {
+                self.remove_redundant_literal_union_types(
+                    &mut type_set,
+                    includes,
+                    reduction == UnionReduction::Subtype,
+                )?;
+            }
+            if reduction == UnionReduction::Subtype {
+                self.remove_union_subtypes(&mut type_set, includes.intersects(TypeFlags::OBJECT))?;
+            }
+            if type_set.is_empty() {
+                return Ok(UnionPlan::Existing(
+                    if includes.intersects(TypeFlags::NULL) {
+                        if includes.intersects(TypeFlags::INCLUDES_NON_WIDENING_TYPE) {
+                            null_type
+                        } else {
+                            null_widening_type
+                        }
+                    } else if includes.intersects(TypeFlags::UNDEFINED) {
+                        if includes.intersects(TypeFlags::INCLUDES_NON_WIDENING_TYPE) {
+                            undefined_type
+                        } else {
+                            undefined_widening_type
+                        }
                     } else {
-                        bootstrap.any_type
+                        never_type
                     },
                 ));
             }
-            return Ok(LiteralUnionPlan::Existing(bootstrap.unknown_type));
-        }
-        if includes.intersects(TypeFlags::UNDEFINED)
-            && type_set.len() >= 2
-            && type_set[0] == bootstrap.undefined_type
-            && type_set[1] == bootstrap.missing_type
-        {
-            type_set.remove(1);
-        }
-        if includes.intersects(
-            TypeFlags::ENUM
-                | TypeFlags::LITERAL
-                | TypeFlags::UNIQUE_ES_SYMBOL
-                | TypeFlags::TEMPLATE_LITERAL
-                | TypeFlags::STRING_MAPPING,
-        ) || includes.intersects(TypeFlags::VOID) && includes.intersects(TypeFlags::UNDEFINED)
-        {
-            self.remove_redundant_literal_union_types(&mut type_set, includes)?;
-        }
-        if type_set.is_empty() {
-            return Ok(LiteralUnionPlan::Existing(
-                if includes.intersects(TypeFlags::NULL) {
-                    if includes.intersects(TypeFlags::INCLUDES_NON_WIDENING_TYPE) {
-                        bootstrap.null_type
-                    } else {
-                        bootstrap.null_widening_type
-                    }
-                } else if includes.intersects(TypeFlags::UNDEFINED) {
-                    if includes.intersects(TypeFlags::INCLUDES_NON_WIDENING_TYPE) {
-                        bootstrap.undefined_type
-                    } else {
-                        bootstrap.undefined_widening_type
-                    }
-                } else {
-                    bootstrap.never_type
-                },
-            ));
         }
 
         let mut origin_types = None;
@@ -1818,7 +2160,7 @@ impl SemanticStore<TypeRecord, TypeMapper> {
                 }
             }
             if alias_symbol.is_none() && named.len() == 1 && reduced.is_empty() {
-                return Ok(LiteralUnionPlan::Existing(named[0]));
+                return Ok(UnionPlan::Existing(named[0]));
             }
             let named_type_count = named.iter().try_fold(0usize, |count, union| {
                 let Some(TypeData::Union(data)) = self.type_payload(*union).map(TypeRecord::data)
@@ -1851,9 +2193,9 @@ impl SemanticStore<TypeRecord, TypeMapper> {
         }
         object_flags |= self.union_propagating_flags(&type_set);
         if type_set.len() == 1 {
-            return Ok(LiteralUnionPlan::Existing(type_set[0]));
+            return Ok(UnionPlan::Existing(type_set[0]));
         }
-        Ok(LiteralUnionPlan::Union {
+        Ok(UnionPlan::Union {
             types: type_set,
             object_flags,
             alias_symbol,
@@ -2097,10 +2439,10 @@ impl IntrinsicBootstrap {
             .find_map(|(cached, id)| (cached == value).then_some(*id))
     }
 
-    /// Looks up an already-normalized, sorted bootstrap union key.
+    /// Looks up an already-normalized, sorted canonical union key.
     ///
-    /// Constituent flattening and nullable/literal reduction belong to the
-    /// future general `getUnionType`; this read API never approximates them.
+    /// Callers supply the post-flattening, post-reduction list; this read API
+    /// performs no normalization of its own.
     #[must_use]
     pub fn cached_union_type(&self, normalized_types: &[TypeId]) -> Option<TypeId> {
         self.union_types
@@ -2710,16 +3052,18 @@ fn empty_signature(
 mod tests {
     use std::collections::HashSet;
 
-    use ts_ast::{FileId, NodeRef, SyntaxKind};
+    use ts_ast::{FileId, NodeData, NodeRef, SyntaxKind};
     use ts_binder::{
-        AstScope, CheckFlags, EscapedName, InternalSymbolName, SymbolData, SymbolFlags, SymbolStore,
+        AstScope, CanonicalBinder, CanonicalModuleState, CanonicalProgramBindings,
+        CanonicalSourceFileFacts, CanonicalSourceLanguage, CheckFlags, EscapedName,
+        InternalSymbolName, SymbolData, SymbolFlags, SymbolStore,
     };
-    use ts_parser::parse_source_file;
+    use ts_parser::{ParseResult, parse_source_file};
 
     use super::*;
     use crate::semantic::{
-        AliasSymbolLinks, AliasTargetState, DecoratorSignatureState, EffectsSignatureState,
-        ResolvedSignatureState, SignatureLinks,
+        AliasSymbolLinks, AliasTargetState, CanonicalCheckerContext, CanonicalCheckerOptions,
+        DecoratorSignatureState, EffectsSignatureState, ResolvedSignatureState, SignatureLinks,
         type_records::{LiteralTypeData, TypeData},
     };
 
@@ -2729,6 +3073,67 @@ mod tests {
         let mut store = TestStore::new();
         store.initialize_intrinsic_bootstrap(options).unwrap();
         store
+    }
+
+    fn completed_bindings(file: FileId, parsed: &ParseResult) -> CanonicalProgramBindings {
+        let mut binder = CanonicalBinder::new();
+        binder
+            .bind_source_file_with_facts(
+                &parsed.arena,
+                parsed.source_file,
+                file,
+                CanonicalSourceFileFacts::new(
+                    EscapedName::source(format!("\"/project/{}.ts\"", file.index())),
+                    CanonicalSourceLanguage::TypeScript,
+                    false,
+                    CanonicalModuleState::Script,
+                ),
+            )
+            .unwrap();
+        binder
+            .bind_typescript_declaration_slice(&parsed.arena, file)
+            .unwrap();
+        binder.finish()
+    }
+
+    fn checker_context(file: FileId, parsed: &ParseResult) -> CanonicalCheckerContext<'_> {
+        CanonicalCheckerContext::new(
+            completed_bindings(file, parsed),
+            [(file, &parsed.arena)].into_iter().collect(),
+            CanonicalCheckerOptions::default(),
+        )
+        .unwrap()
+    }
+
+    fn variable_initializer(parsed: &ParseResult, file: FileId, expected: &str) -> NodeRef {
+        let initializer = parsed
+            .arena
+            .iter()
+            .find_map(|(_, node)| {
+                let NodeData::VariableDeclaration(variable) = &node.data else {
+                    return None;
+                };
+                let name = parsed.arena.get(variable.name)?;
+                let NodeData::Identifier(identifier) = &name.data else {
+                    return None;
+                };
+                (identifier.text == expected)
+                    .then_some(variable.initializer)
+                    .flatten()
+            })
+            .unwrap_or_else(|| panic!("missing initializer for variable {expected}"));
+        NodeRef::new(parsed.arena.id(), file, initializer)
+    }
+
+    fn checked_expression_type(
+        context: &CanonicalCheckerContext<'_>,
+        expression: NodeRef,
+    ) -> TypeId {
+        context
+            .store()
+            .type_node_links(expression)
+            .and_then(|links| links.resolved_type)
+            .expect("the expression was checked")
     }
 
     #[test]
@@ -4336,6 +4741,7 @@ mod tests {
         let key = UnionOfUnionCacheKey {
             first,
             second,
+            reduction: UnionReduction::Literal,
             alias: None,
         };
         store
@@ -4368,6 +4774,186 @@ mod tests {
                     .intrinsic_bootstrap()
                     .unwrap()
                     .union_of_union_cache_len(),
+            ),
+            before
+        );
+    }
+
+    #[test]
+    fn structured_expression_unions_flatten_sort_and_reuse_normalized_identity() {
+        let parsed = parse_source_file(concat!(
+            "const first: any = { id: 1 };",
+            "const second: any = { id: 2, name: 'ok' };",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(141);
+        let mut context = checker_context(file, &parsed);
+        context.check_source_file(file).unwrap();
+        let first = checked_expression_type(&context, variable_initializer(&parsed, file, "first"));
+        let second =
+            checked_expression_type(&context, variable_initializer(&parsed, file, "second"));
+        let number = context.store().intrinsic_bootstrap().unwrap().number_type;
+        let store = context.store_mut_for_test();
+
+        let nested = store
+            .expression_union_type(&[second, number], UnionReduction::None)
+            .unwrap();
+        assert_eq!(union_types(store, nested), &[number, second]);
+        let flattened = store
+            .expression_union_type(&[first, nested, first], UnionReduction::None)
+            .unwrap();
+        assert_eq!(union_types(store, flattened), &[number, first, second]);
+        let flags = record(store, flattened).object_flags();
+        assert!(flags.contains(ObjectFlags::CONTAINS_OBJECT_OR_ARRAY_LITERAL));
+        assert!(!flags.intersects(ObjectFlags::PRIMITIVE_UNION));
+
+        let warm = (
+            store.type_len(),
+            store.intrinsic_bootstrap().unwrap().union_cache_len(),
+            store
+                .intrinsic_bootstrap()
+                .unwrap()
+                .union_of_union_cache_len(),
+        );
+        assert_eq!(
+            store
+                .expression_union_type(&[nested, second, first], UnionReduction::None)
+                .unwrap(),
+            flattened
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.intrinsic_bootstrap().unwrap().union_cache_len(),
+                store
+                    .intrinsic_bootstrap()
+                    .unwrap()
+                    .union_of_union_cache_len(),
+            ),
+            warm
+        );
+    }
+
+    #[test]
+    fn structured_expression_subtype_reduction_preserves_fresh_excess_shapes() {
+        let parsed = parse_source_file(concat!(
+            "const first: any = { id: 1 };",
+            "const equal: any = { id: 2 };",
+            "const excess: any = { id: 3, name: 'ok' };",
+        ));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(142);
+        let mut context = checker_context(file, &parsed);
+        context.check_source_file(file).unwrap();
+        let first = checked_expression_type(&context, variable_initializer(&parsed, file, "first"));
+        let equal = checked_expression_type(&context, variable_initializer(&parsed, file, "equal"));
+        let excess =
+            checked_expression_type(&context, variable_initializer(&parsed, file, "excess"));
+        let store = context.store_mut_for_test();
+
+        let reduced = store
+            .expression_union_type(&[first, equal], UnionReduction::Subtype)
+            .unwrap();
+        assert_eq!(
+            reduced, first,
+            "the later structurally identical fresh shape is a redundant strict subtype"
+        );
+        let warm = (
+            store.type_len(),
+            store.intrinsic_bootstrap().unwrap().union_cache_len(),
+            store.relation_state_snapshot(),
+        );
+        assert_eq!(
+            store
+                .expression_union_type(&[equal, first], UnionReduction::Subtype)
+                .unwrap(),
+            reduced
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.intrinsic_bootstrap().unwrap().union_cache_len(),
+                store.relation_state_snapshot(),
+            ),
+            warm
+        );
+        let retained = store
+            .expression_union_type(&[first, excess], UnionReduction::Subtype)
+            .unwrap();
+        assert_eq!(union_types(store, retained), &[first, excess]);
+        assert!(
+            record(store, retained)
+                .object_flags()
+                .contains(ObjectFlags::CONTAINS_OBJECT_OR_ARRAY_LITERAL)
+        );
+    }
+
+    #[test]
+    fn expression_union_reductions_preserve_literals_and_reject_poison_atomically() {
+        let parsed = parse_source_file("const value: any = { id: 1 };");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let file = FileId::new(143);
+        let mut context = checker_context(file, &parsed);
+        context.check_source_file(file).unwrap();
+        let object =
+            checked_expression_type(&context, variable_initializer(&parsed, file, "value"));
+        let store = context.store_mut_for_test();
+        let (number, never) = {
+            let bootstrap = store.intrinsic_bootstrap().unwrap();
+            (bootstrap.number_type, bootstrap.never_type)
+        };
+        let literal = store.regular_number_literal_type(Number::new(1.0)).unwrap();
+
+        let unreduced = store
+            .expression_union_type(&[literal, number], UnionReduction::None)
+            .unwrap();
+        assert_eq!(union_types(store, unreduced), &[number, literal]);
+        assert!(
+            record(store, unreduced)
+                .object_flags()
+                .contains(ObjectFlags::PRIMITIVE_UNION)
+        );
+        assert_eq!(
+            store
+                .expression_union_type(&[literal, number], UnionReduction::Literal)
+                .unwrap(),
+            number
+        );
+        assert_eq!(
+            store
+                .expression_union_type(&[], UnionReduction::Subtype)
+                .unwrap(),
+            never
+        );
+
+        let structured = store
+            .expression_union_type(&[number, object], UnionReduction::None)
+            .unwrap();
+        assert!(store.add_type_object_flags(object, ObjectFlags::NON_INFERRABLE_TYPE));
+        let before = (
+            store.type_len(),
+            store.type_alias_len(),
+            store.intrinsic_bootstrap().unwrap().union_cache_len(),
+            store
+                .intrinsic_bootstrap()
+                .unwrap()
+                .union_of_union_cache_len(),
+            store.relation_state_snapshot(),
+        );
+        assert_eq!(
+            store.expression_union_type(&[number, object], UnionReduction::None),
+            Err(LiteralTypeCacheError::InvalidCachedUnion(structured))
+        );
+        assert_eq!(
+            (
+                store.type_len(),
+                store.type_alias_len(),
+                store.intrinsic_bootstrap().unwrap().union_cache_len(),
+                store
+                    .intrinsic_bootstrap()
+                    .unwrap()
+                    .union_of_union_cache_len(),
+                store.relation_state_snapshot(),
             ),
             before
         );
