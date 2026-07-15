@@ -189,6 +189,8 @@ fn compiler_boolean_name(argument: &str) -> Option<&'static str> {
         "--skiplibcheck" => "skiplibcheck",
         "--sourcemap" => "sourcemap",
         "--strict" => "strict",
+        "--strictbindcallapply" => "strictbindcallapply",
+        "--strictbuiltiniteratorreturn" => "strictbuiltiniteratorreturn",
         "--strictnullchecks" => "strictnullchecks",
         "--strictpropertyinitialization" => "strictpropertyinitialization",
         "--useunknownincatchvariables" => "useunknownincatchvariables",
@@ -414,6 +416,77 @@ mod tests {
         };
         assert!(!options.compiler_options.always_strict);
         assert!(options.specified_options.contains("alwaysstrict"));
+    }
+
+    #[test]
+    fn parses_strict_family_overrides_case_insensitively_with_provenance() {
+        let Command::Compile(disabled) = parse(&[
+            "--strict",
+            "true",
+            "--STRICTBindCallApply",
+            "false",
+            "--StrictBuiltinIteratorReturn",
+            "false",
+            "main.ts",
+        ])
+        .unwrap() else {
+            panic!("expected compile command");
+        };
+        assert!(disabled.compiler_options.strict);
+        assert!(!disabled.compiler_options.strict_bind_call_apply);
+        assert!(disabled.compiler_options.strict_bind_call_apply_specified);
+        assert!(!disabled.compiler_options.strict_builtin_iterator_return);
+        assert!(
+            disabled
+                .compiler_options
+                .strict_builtin_iterator_return_specified
+        );
+        assert_eq!(
+            disabled
+                .specified_options
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            [
+                "strict",
+                "strictbindcallapply",
+                "strictbuiltiniteratorreturn"
+            ]
+        );
+
+        let Command::Compile(enabled) = parse(&[
+            "--STRICT",
+            "false",
+            "--strictBindCallApply",
+            "true",
+            "--STRICTBUILTINITERATORRETURN",
+            "true",
+            "main.ts",
+        ])
+        .unwrap() else {
+            panic!("expected compile command");
+        };
+        assert!(!enabled.compiler_options.strict);
+        assert!(enabled.compiler_options.strict_bind_call_apply);
+        assert!(enabled.compiler_options.strict_bind_call_apply_specified);
+        assert!(enabled.compiler_options.strict_builtin_iterator_return);
+        assert!(
+            enabled
+                .compiler_options
+                .strict_builtin_iterator_return_specified
+        );
+        assert_eq!(
+            enabled
+                .specified_options
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            [
+                "strict",
+                "strictbindcallapply",
+                "strictbuiltiniteratorreturn"
+            ]
+        );
     }
 
     #[test]
