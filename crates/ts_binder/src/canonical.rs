@@ -325,6 +325,14 @@ pub struct CanonicalPatternAmbientModule {
     symbol: SemanticSymbolId,
 }
 
+/// One parser-collected module augmentation plus the ambientness of its
+/// containing context used by checker module-name diagnostics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CanonicalModuleAugmentation {
+    name: NodeRef,
+    in_ambient_context: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ModuleInstanceState {
     Unknown,
@@ -347,6 +355,18 @@ impl CanonicalPatternAmbientModule {
     #[must_use]
     pub const fn symbol(&self) -> SemanticSymbolId {
         self.symbol
+    }
+}
+
+impl CanonicalModuleAugmentation {
+    #[must_use]
+    pub const fn name(self) -> NodeRef {
+        self.name
+    }
+
+    #[must_use]
+    pub const fn in_ambient_context(self) -> bool {
+        self.in_ambient_context
     }
 }
 
@@ -435,7 +455,7 @@ pub struct BoundFile {
     container_chain: Vec<NodeId>,
     diagnostics: Vec<CanonicalBindDiagnostic>,
     pattern_ambient_modules: Vec<CanonicalPatternAmbientModule>,
-    module_augmentations: Vec<NodeRef>,
+    module_augmentations: Vec<CanonicalModuleAugmentation>,
     global_exports: Option<SymbolTableId>,
     classifiable_names: BTreeSet<EscapedName>,
     not_const_enum_only_modules: BTreeSet<SemanticSymbolId>,
@@ -534,14 +554,15 @@ impl BoundFile {
         &self.pattern_ambient_modules
     }
 
-    /// Parser-equivalent module-augmentation names in declaration order.
+    /// Parser-equivalent module augmentations in declaration order.
     ///
-    /// Entries are the exact `ModuleDeclaration.name` nodes consumed by
-    /// `initializeChecker`, including global-scope augmentations. Relative
-    /// nested ambient-module names are excluded exactly as in the pinned
-    /// parser's `collectExternalModuleReferences` pass.
+    /// Each entry retains the exact `ModuleDeclaration.name` node consumed by
+    /// `initializeChecker` and whether its containing context was ambient.
+    /// Global-scope augmentations are included. Relative nested ambient-module
+    /// names are excluded exactly as in the pinned parser's
+    /// `collectExternalModuleReferences` pass.
     #[must_use]
-    pub fn module_augmentations(&self) -> &[NodeRef] {
+    pub fn module_augmentations(&self) -> &[CanonicalModuleAugmentation] {
         &self.module_augmentations
     }
 
@@ -1888,11 +1909,19 @@ impl CanonicalBinder {
                 else {
                     unreachable!("ambient-module dispatch is kind checked");
                 };
+                let container = arena
+                    .get(node)
+                    .and_then(|module| module.parent)
+                    .expect("parser-collected module augmentation has a container");
+                let in_ambient_context = is_ambient_node(arena, container, facts);
                 self.files
                     .get_mut(&file)
                     .expect("module-augmentation file is registered")
                     .module_augmentations
-                    .push(NodeRef::new(arena.id(), file, module.name));
+                    .push(CanonicalModuleAugmentation {
+                        name: NodeRef::new(arena.id(), file, module.name),
+                        in_ambient_context,
+                    });
             }
             if is_external_augmentation {
                 self.declare_module_symbol(arena, file, node, facts, state)?;
@@ -7176,7 +7205,7 @@ declare global { interface Window { marker: true } }
                 CanonicalSourceFileFacts::new(
                     EscapedName::source("\"/project/external\""),
                     CanonicalSourceLanguage::TypeScript,
-                    true,
+                    false,
                     CanonicalModuleState::External,
                 ),
             )
@@ -7193,17 +7222,21 @@ declare global { interface Window { marker: true } }
         assert_eq!(
             external_augmentations
                 .iter()
-                .map(|name| node_text(&external.arena, name.node).unwrap())
+                .map(|augmentation| {
+                    node_text(&external.arena, augmentation.name().node).unwrap()
+                })
                 .collect::<Vec<_>>(),
             ["./relative", "pkg", "global"]
         );
-        for name in external_augmentations {
+        for augmentation in external_augmentations {
+            let name = augmentation.name();
             assert!(name.is_for(external.arena.id(), external_file));
             let module = external.arena.get(name.node).unwrap().parent.unwrap();
             assert_eq!(
                 external.arena.get(module).unwrap().kind,
                 SyntaxKind::ModuleDeclaration
             );
+            assert!(!augmentation.in_ambient_context());
         }
 
         let script = parse_source_file(
@@ -7226,7 +7259,7 @@ declare module "outer" {
                 CanonicalSourceFileFacts::new(
                     EscapedName::source("\"/project/script\""),
                     CanonicalSourceLanguage::TypeScript,
-                    true,
+                    false,
                     CanonicalModuleState::Script,
                 ),
             )
@@ -7241,10 +7274,15 @@ declare module "outer" {
             .module_augmentations();
         assert_eq!(script_augmentations.len(), 1);
         assert_eq!(
-            node_text(&script.arena, script_augmentations[0].node).as_deref(),
+            node_text(&script.arena, script_augmentations[0].name().node).as_deref(),
             Some("nested")
         );
-        assert!(script_augmentations[0].is_for(script.arena.id(), script_file));
+        assert!(
+            script_augmentations[0]
+                .name()
+                .is_for(script.arena.id(), script_file)
+        );
+        assert!(script_augmentations[0].in_ambient_context());
     }
 
     #[test]

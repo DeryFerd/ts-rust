@@ -379,7 +379,8 @@ fn initialize_globals(
         let entry = files
             .get(&file)
             .ok_or(CanonicalGlobalInitializationError::MissingFile(file))?;
-        for &augmentation_name in entry.bound.module_augmentations() {
+        for augmentation in entry.bound.module_augmentations() {
+            let augmentation_name = augmentation.name();
             let module = validate_augmentation_name(entry, file, augmentation_name)?;
             let Some(NodeData::ModuleDeclaration(module_data)) =
                 entry.arena.get(module.node).map(|node| &node.data)
@@ -1644,7 +1645,7 @@ declare global { interface Augmented { second: number } }
             completed_bindings_with_facts(&[(file, &source, true, CanonicalModuleState::External)]);
         let bound = bindings.file(file).unwrap();
         let expected = bound.node_arena_revision();
-        let augmentation_name = bound.module_augmentations()[0];
+        let augmentation_name = bound.module_augmentations()[0].name();
         let NodeData::Identifier(identifier) = &mut source
             .arena
             .get_mut(augmentation_name.node)

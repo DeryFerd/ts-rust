@@ -8,9 +8,9 @@ pub mod semantic;
 
 pub use canonical::{
     BindingPhase, BoundFile, CanonicalBindDiagnostic, CanonicalBindError, CanonicalBinder,
-    CanonicalDeclarationError, CanonicalExtractionError, CanonicalModuleState,
-    CanonicalPatternAmbientModule, CanonicalProgramBindings, CanonicalRelatedInformation,
-    CanonicalSourceFileFacts, CanonicalSourceLanguage,
+    CanonicalDeclarationError, CanonicalExtractionError, CanonicalModuleAugmentation,
+    CanonicalModuleState, CanonicalPatternAmbientModule, CanonicalProgramBindings,
+    CanonicalRelatedInformation, CanonicalSourceFileFacts, CanonicalSourceLanguage,
 };
 pub use escaped_name::{
     EscapedDisplay, EscapedName, EscapedNameRef, INTERNAL_SYMBOL_NAME_PREFIX, InternalSymbolName,
